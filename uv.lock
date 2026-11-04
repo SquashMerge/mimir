@@ -1898,7 +1898,7 @@ requires-dist = [
     { name = "slack-bolt", marker = "extra == 'slack'", specifier = ">=1.18" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'local-embeddings'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "sys_platform != 'linux' and extra == 'local-embeddings'", specifier = ">=2.2" },
-    { name = "transformers", marker = "extra == 'local-embeddings'", specifier = ">=4.56,<6" },
+    { name = "transformers", marker = "extra == 'local-embeddings'", specifier = ">=5.10,<6" },
 ]
 provides-extras = ["anthropic", "claude-code", "openai", "codex-plus", "mcp", "otel", "local-embeddings", "acp", "bench", "discord", "slack", "gepa", "dev"]
 
