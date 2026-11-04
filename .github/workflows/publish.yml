@@ -134,13 +134,19 @@ jobs:
           # Extract the ``## [<version>]`` section (header through the line
           # before the next ``## [`` heading) as the release notes.
           notes="$(awk -v v="$version" '/^## \[/{p=($0 ~ "\\["v"\\]")} p' CHANGELOG.md)"
+          # A PEP 440 pre-release (1.0.0rc1, 1.0.0a2, 1.0.0b1) must not become
+          # the repo's "Latest" release.
+          prerelease=()
+          if printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(a|b|rc)[0-9]+$'; then
+            prerelease=(--prerelease)
+          fi
           if [ -n "$notes" ]; then
             printf '%s\n' "$notes" > /tmp/relnotes.md
-            gh release create "$tag" --title "$tag" --verify-tag \
+            gh release create "$tag" --title "$tag" --verify-tag "${prerelease[@]}" \
               --notes-file /tmp/relnotes.md
           else
             # No CHANGELOG section (shouldn't happen for a release-prepped tag) —
             # fall back to GitHub's commit/PR auto-generated notes.
             echo "No CHANGELOG section for $version; using --generate-notes."
-            gh release create "$tag" --title "$tag" --verify-tag --generate-notes
+            gh release create "$tag" --title "$tag" --verify-tag "${prerelease[@]}" --generate-notes
           fi
