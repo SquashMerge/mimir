@@ -14,6 +14,7 @@ Changes awaiting release are recorded in [changelog.d/](changelog.d/).
   - **Plugin architecture.** Coding, Worklink and the feature factory moved out of core into the optional Cultivate plugin (`mimir-cultivate`, under the Business Source License 1.1). Core mimir stays MIT and runs without it.
   - **Licensing.** Core is MIT; `plugins/cultivate` is BSL 1.1 and converts to Apache 2.0 three years after first public distribution; brand assets are all rights reserved. See the README's License section.
   - **Repository move.** `jasoncarreira/mimir` is now `SquashMerge/mimir`. Update git remotes, `MIMIR_GIT_URL` overrides and pinned install URLs.
+  - **Security.** The `local-embeddings` extra now requires `transformers>=5.10,<6`, locked at 5.22.1. Every release below 5.10 is affected by at least one of GHSA-29pf-2h5f-8g72, GHSA-fgcw-684q-jj6r, GHSA-xrqw-3rrv-vx5w, GHSA-x9r9-c232-4q39 or GHSA-69w3-r845-3855 (remote code execution, path traversal and untrusted code download). voyage-4-nano embeddings are unchanged.
 
 - Move coding and Worklink into the optional BSL-licensed Cultivate plugin; keep MIT core usable without coding and add separate core and selected-provider CI coverage (#1949).
 
