@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saga"
+version = "2026.05.19"
+description = "Vendored LongMemEval bench shell. The runtime saga is now `mimir.saga`."
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    {name = "Jason Carreira"},
+]
+
+# Bench harness deps only. The full saga runtime moved into mimir.saga;
+# this shell exists so the LongMemEval bench runners under
+# benchmarks/longmemeval_via_*/ can still import the ingest + reader
+# helpers without pulling in the full vendored package.
+dependencies = [
+    "openai>=1.0",  # harness.call_reader (OpenAI-compatible reader)
+]
+
+[tool.setuptools.packages.find]
+include = ["saga*"]

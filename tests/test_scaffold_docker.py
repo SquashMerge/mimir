@@ -1,0 +1,1747 @@
+"""Tests for ``mimir.scaffold_docker`` and the ``mimir scaffold-docker``
+CLI.
+
+Covers:
+- fragment collection (home wins; bundled fallback for ungraded homes)
+- pollers.json env-var collection
+- compose.env idempotency (commented placeholders count as 'present',
+  operator values survive re-runs, new pollers append only missing keys)
+- the Dockerfile sentinel-block + skill fragment ordering
+- end-to-end ``scaffold(home)`` orchestration on a fresh + populated home
+"""
+
+from __future__ import annotations
+
+import json
+from importlib.metadata import PackageNotFoundError, version
+import os
+import re
+import stat
+import subprocess
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+FACTORY_VERSION = "0.12.1"
+OPENCODE_VERSION = "1.19.4"
+from mimir.scaffold_docker import (
+    DEFAULT_BASE_IMAGE,
+    Fragment,
+    collect_fragments,
+    collect_required_env_vars,
+    ensure_opencode_config,
+    existing_env_keys,
+    opencode_config_path,
+    render_compose_env,
+    render_dockerfile,
+    render_start_sh,
+    scaffold,
+)
+from mimir.plugin_dockerfile import cultivate_scripts, render_stage, select_plugins
+from mimir.plugins.discovery import PluginDiscoveryError
+
+
+def _scaffold_install_text(home: Path) -> str:
+    dockerfile = (home / "Dockerfile").read_text()
+    fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"
+    return dockerfile + (fragment.read_text() if fragment.is_file() else "")
+
+
+def _cultivate_installed() -> bool:
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        return False
+    return True
+
+
+def _cultivate_or_refusal():
+    if _cultivate_installed():
+        return select_plugins(enable="cultivate")
+    with pytest.raises(PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+        select_plugins(enable="cultivate")
+    return ()
+
+
+def _provider(tmp_path: Path):
+    root = tmp_path / "provider"
+    service = root / "services" / "worker"
+    service.mkdir(parents=True)
+    (root / "mimir-plugin.toml").write_text("test")
+    (service / "type").write_text("longrun\n")
+    run = service / "run"
+    run.write_text("#!/bin/sh\nprintf '%s:%s' \"$GREETING\" \"$USER\" > \"$RESULT\"\nexit 17\n")
+    run.chmod(0o755)
+    dist = SimpleNamespace(version="2.3.0", files=[Path("mimir-plugin.toml")],
+                           locate_file=lambda path: root / path)
+    spec = {"system_packages": ["libmagic1"], "build_args": {"TOOL_VERSION": "1.2"},
+            "users": ["worker"], "directories": ["/opt/worker"],
+            "root_run": ["true"], "s6_services": ["services/worker"]}
+    return SimpleNamespace(name="sample", distribution="example-provider",
+                           entry_point=SimpleNamespace(dist=dist),
+                           manifest=SimpleNamespace(dockerfile=spec), enabled=True, diagnostic=None)
+
+
+def test_plugin_stage_selection_and_order(tmp_path, monkeypatch):
+    a = _provider(tmp_path)
+    b = SimpleNamespace(**{**vars(a), "name": "zzz", "enabled": False,
+                           "manifest": SimpleNamespace(dockerfile={"system_packages": ["zlib1g"]})})
+    monkeypatch.setattr("mimir.plugin_dockerfile.discover_plugins", lambda **kwargs: (a, b))
+    assert select_plugins() == (a,)
+    assert select_plugins(all_installed=True) == (a, b)
+    assert "libmagic1" in render_stage((a,), "base")
+    assert "zlib1g" not in render_stage(select_plugins(), "base")
+    assert render_stage((a,), "build").index("ARG TOOL_VERSION") < render_stage((a,), "build").index("RUN useradd")
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path, monkeypatch, mode):
+    provider = _provider(tmp_path)
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (provider,))
+    home = tmp_path / "home"
+    home.mkdir()
+    result = scaffold(home, mode=mode)
+    assert result.plugins_with_services == ["sample-worker"]
+    dockerfile = (home / "Dockerfile").read_text()
+    assert 'ENTRYPOINT ["/init"]' in dockerfile
+    assert "s6-overlay-noarch.tar.xz" in dockerfile
+    assert "s6-overlay-${S6_ARCH}.tar.xz" in dockerfile
+    assert "USER root\nENTRYPOINT" in dockerfile
+    assert "COPY .mimir-scaffold/plugin-services/" in dockerfile
+    assert render_stage((provider,), "services").split("COPY .mimir-scaffold/", 1)[1] in dockerfile
+    if mode == "pypi":
+        assert 'pip install --no-cache-dir "example-provider==2.3.0"' in dockerfile
+    else:
+        start = (home / "start.sh").read_text()
+        assert "uv pip install --python .venv/bin/python" in start
+        assert "uv run --no-sync mimir run" in start
+        assert "touch /run/mimir-plugin-services/ready" in start
+        assert (home / ".mimir-scaffold/s6-rc.d/mimir-plugin-reset/up").exists()
+        assert (home / ".mimir-scaffold/s6-rc.d/sample-worker/dependencies.d/mimir-plugin-reset").exists()
+
+    context = home / ".mimir-scaffold" / "s6-rc.d"
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "s6-setuidgid").write_text(
+        '#!/bin/sh\nprintf "%s" "$1" > "$SHIM_USER"\nshift\nexec "$@"\n'
+    )
+    (shim / "s6-setuidgid").chmod(0o755)
+    output = tmp_path / "output"
+    shim_user = tmp_path / "shim-user"
+    wrapper = context / "sample-worker" / "run"
+    # The image wrapper's absolute path points to its image-owned script;
+    # substitute only that prefix to execute the generated copy locally.
+    local_wrapper = tmp_path / "run"
+    local_wrapper.write_text(wrapper.read_text().replace(
+        "/usr/local/libexec/mimir-plugin-services/sample/worker/run",
+        str(home / ".mimir-scaffold/plugin-services/sample/worker/run")).replace(
+        "/run/mimir-plugin-services/ready", str(tmp_path / "ready")))
+    local_wrapper.chmod(0o755)
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "GREETING": "hello",
+           "USER": "mimir", "RESULT": str(output), "SHIM_USER": str(shim_user)}
+    if mode == "workspace":
+        process = subprocess.Popen([str(local_wrapper)], env=env)
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.wait(timeout=0.2)
+            assert not output.exists(), "plugin ran before Mimir completed provider installation"
+            (tmp_path / "ready").touch()
+            assert process.wait(timeout=5) == 17
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+    else:
+        completed = subprocess.run([str(local_wrapper)], env=env, check=False)
+        assert completed.returncode == 17
+    assert shim_user.read_text() == "mimir"
+    assert output.read_text() == "hello:mimir"
+    assert 'exec s6-setuidgid mimir /usr/local/bin/start.sh' in (context / "mimir/run").read_text()
+    fake_start = tmp_path / "start.sh"
+    fake_start.write_text('#!/bin/sh\nprintf "%s" "$GREETING" > "$RESULT"\nexit 23\n')
+    fake_start.chmod(0o755)
+    mimir_wrapper = tmp_path / "mimir-wrapper"
+    mimir_wrapper.write_text((context / "mimir/run").read_text().replace(
+        "/usr/local/bin/start.sh", str(fake_start)))
+    mimir_wrapper.chmod(0o755)
+    completed = subprocess.run([str(mimir_wrapper)], env={**os.environ,
+        "PATH": f"{shim}:{os.environ['PATH']}", "GREETING": "mimir-start",
+        "RESULT": str(output), "SHIM_USER": str(shim_user)}, check=False)
+    assert completed.returncode == 23
+    assert shim_user.read_text() == "mimir"
+    assert output.read_text() == "mimir-start"
+    assert (context / "user/contents.d/mimir").exists()
+
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: ())
+    scaffold(home, mode=mode)
+    assert not (home / ".mimir-scaffold").exists()
+    assert 'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]' in (home / "Dockerfile").read_text()
+
+
+def test_workspace_boot_preserves_provider_across_sync_and_run(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (provider,))
+    home = tmp_path / "home"
+    home.mkdir()
+    scaffold(home, mode="workspace")
+    script = (home / "start.sh").read_text()
+    boot = script.split('UV_EXTRAS="', 1)[1].split("# ─── home seed", 1)[0]
+    boot = 'UV_EXTRAS="' + boot.replace("/run/mimir-plugin-services/ready", str(tmp_path / "ready"))
+    # The console build is unrelated to dependency retention and must not run
+    # npm against the repository while exercising the generated boot commands.
+    boot = (boot.split("# The workspace volume preserves", 1)[0] +
+            boot.split("# ─── skill-required extras", 1)[1].split("\n", 1)[1])
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    uv = shim / "uv"
+    uv.write_text('''#!/bin/sh
+case "$1" in
+  sync) rm -f "$PROVIDER_INSTALLED" ;;
+  pip) [ "$2" = install ] && touch "$PROVIDER_INSTALLED" ;;
+  run)
+    [ "$2" = --no-sync ] || { rm -f "$PROVIDER_INSTALLED"; exit 90; }
+    case "$3" in
+      python) [ -f "$PROVIDER_INSTALLED" ] || exit 91 ;;
+      mimir) [ "$4" = skills ] || [ -f "$PROVIDER_INSTALLED" ] || exit 92 ;;
+    esac ;;
+esac
+''')
+    uv.chmod(0o755)
+    state = tmp_path / "installed"
+    result = subprocess.run(["bash", "-eu", "-c", boot + "\nuv run --no-sync mimir setup\nuv run --no-sync mimir run\n"],
+                            env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
+                                 "PROVIDER_INSTALLED": str(state), "MIMIR_HOME": str(home)},
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert state.exists()
+    assert (tmp_path / "ready").exists()
+
+
+def test_workspace_pinned_plugin_without_services_boots_without_readiness_directory(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    provider.manifest.dockerfile["s6_services"] = []
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (provider,))
+    home = tmp_path / "home"
+    home.mkdir()
+    result = scaffold(home, mode="workspace")
+    assert result.plugins_with_services == []
+    assert not (home / ".mimir-scaffold").exists()
+    dockerfile = (home / "Dockerfile").read_text()
+    assert "USER mimir\n\nENTRYPOINT [\"/usr/bin/tini\", \"--\", \"/usr/local/bin/start.sh\"]" in dockerfile
+    assert 'ENTRYPOINT ["/init"]' not in dockerfile
+
+    script = (home / "start.sh").read_text()
+    assert 'touch /run/mimir-plugin-services/ready' not in script
+    assert 'uv pip install --python .venv/bin/python "example-provider==2.3.0"' in script
+    assert 'm.version("example-provider") == "2.3.0"' in script
+    # Exercise the generated boot commands without cloning source or building the UI.
+    boot = 'UV_EXTRAS="' + script.split('UV_EXTRAS="', 1)[1].split("# ─── home seed", 1)[0]
+    boot = (boot.split("# The workspace volume preserves", 1)[0] +
+            boot.split("# ─── skill-required extras", 1)[1].split("\n", 1)[1])
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    uv = shim / "uv"
+    uv.write_text('''#!/bin/sh
+case "$1" in
+  sync) rm -f "$PROVIDER_INSTALLED" ;;
+  pip) [ "$2" = install ] && [ "$5" = "example-provider==2.3.0" ] && touch "$PROVIDER_INSTALLED" ;;
+  run)
+    [ "$2" = --no-sync ] || exit 90
+    [ -f "$PROVIDER_INSTALLED" ] || exit 91
+    case "$3" in
+      python) [ "$4" = -c ] && case "$5" in *'m.version("example-provider") == "2.3.0"'*) ;; *) exit 92 ;; esac ;;
+      mimir) if [ "$4" = skills ]; then printf '%s' '--extra skill'; fi ;;
+    esac ;;
+esac
+''')
+    uv.chmod(0o755)
+    state = tmp_path / "installed"
+    completed = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", boot + "\nuv run --no-sync mimir run\n"],
+        env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
+             "PROVIDER_INSTALLED": str(state), "MIMIR_HOME": str(home)},
+        capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert state.exists()
+
+
+# ── fixtures ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def home_with_two_skills(tmp_path: Path) -> Path:
+    """Mimir home with two installed skills, one with a fragment, one
+    without. Sufficient for fragment + env-var collection tests."""
+    home = tmp_path / "home"
+    skills = home / "skills"
+    skills.mkdir(parents=True)
+
+    # Skill A: has dockerfile.fragment + pollers.json
+    a = skills / "skill-a"
+    a.mkdir()
+    (a / "SKILL.md").write_text("---\nname: skill-a\ndescription: A\n---\nbody")
+    (a / "dockerfile.fragment").write_text("RUN echo skill-a\n")
+    (a / "pollers.json").write_text(
+        '{"pollers": [{"name": "a", "command": "true", "pass_env": ["FOO", "BAR"]}]}'
+    )
+
+    # Skill B: no fragment, no pollers.json
+    b = skills / "skill-b"
+    b.mkdir()
+    (b / "SKILL.md").write_text("---\nname: skill-b\ndescription: B\n---\nbody")
+
+    return home
+
+
+# ── collect_fragments ───────────────────────────────────────────────
+
+
+def test_collect_fragments_picks_up_installed_fragment(home_with_two_skills: Path):
+    frags = collect_fragments(home_with_two_skills)
+    assert len(frags) == 1
+    assert frags[0].skill_name == "skill-a"
+    assert frags[0].content == "RUN echo skill-a"
+
+
+def test_collect_fragments_falls_back_to_bundled(tmp_path: Path, monkeypatch):
+    """When a skill is present in the home but lacks a dockerfile.fragment
+    locally, the scaffolder must look in the bundled source (mimir/skills/
+    or optional-skills/) as a backstop for homes seeded before fragments
+    existed in the bundle.
+    """
+    # Fake bundled root with a fragment for ``mimir/skills/skill-c``.
+    bundled = tmp_path / "bundled"
+    (bundled / "skill-c").mkdir(parents=True)
+    (bundled / "skill-c" / "dockerfile.fragment").write_text("RUN bundled-c")
+
+    # Home with skill-c installed but NO fragment of its own.
+    home = tmp_path / "home"
+    skills = home / "skills"
+    (skills / "skill-c").mkdir(parents=True)
+    (skills / "skill-c" / "SKILL.md").write_text(
+        "---\nname: skill-c\ndescription: C\n---\nbody"
+    )
+
+    monkeypatch.setattr(
+        "mimir.scaffold_docker._BUNDLED_SKILL_ROOTS",
+        (bundled,),
+    )
+    frags = collect_fragments(home)
+    assert len(frags) == 1
+    assert frags[0].skill_name == "skill-c"
+    assert frags[0].content == "RUN bundled-c"
+
+
+def test_collect_fragments_empty_home(tmp_path: Path):
+    assert collect_fragments(tmp_path / "no-such-home") == []
+
+
+def test_collect_fragments_walks_builtin_dir_too(tmp_path: Path):
+    """Bundled skills land under ``<home>/.mimir_builtin_skills/``
+    via :func:`refresh_builtin_skills` on every boot. The scaffolder
+    must walk that directory in addition to ``<home>/skills/`` so
+    bundled-skill OS deps (notably chainlink's ``chainlink-tracker``
+    build) get picked up without the operator having to duplicate
+    the skill into their operator dir.
+    """
+    home = tmp_path / "home"
+    builtin = home / ".mimir_builtin_skills"
+    (builtin / "chainlink").mkdir(parents=True)
+    (builtin / "chainlink" / "SKILL.md").write_text(
+        "---\nname: chainlink\ndescription: c\n---\nbody"
+    )
+    (builtin / "chainlink" / "dockerfile.fragment").write_text("RUN cargo install chainlink-tracker")
+    # No operator-side ``skills/chainlink``.
+    frags = collect_fragments(home)
+    assert len(frags) == 1
+    assert frags[0].skill_name == "chainlink"
+    assert "chainlink-tracker" in frags[0].content
+
+
+def test_collect_fragments_operator_shadows_builtin(tmp_path: Path):
+    """When a skill exists in BOTH locations, the operator copy wins
+    (matches SkillsMiddleware's last-source-wins shadowing). Operator
+    customization of OS deps is the supported override path."""
+    home = tmp_path / "home"
+    builtin = home / ".mimir_builtin_skills"
+    operator = home / "skills"
+    (builtin / "shared").mkdir(parents=True)
+    (builtin / "shared" / "dockerfile.fragment").write_text("RUN echo bundled-fragment")
+    (operator / "shared").mkdir(parents=True)
+    (operator / "shared" / "dockerfile.fragment").write_text("RUN echo operator-fragment")
+    frags = collect_fragments(home)
+    assert len(frags) == 1
+    assert frags[0].skill_name == "shared"
+    assert "operator-fragment" in frags[0].content
+    assert "bundled-fragment" not in frags[0].content
+
+
+def test_collect_fragments_ordered_by_skill_name(tmp_path: Path):
+    """Stable Dockerfile output across runs: fragments come out
+    alphabetically by skill name."""
+    home = tmp_path / "home"
+    skills = home / "skills"
+    skills.mkdir(parents=True)
+    for name in ("z-skill", "a-skill", "m-skill"):
+        d = skills / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(f"---\nname: {name}\n---\nbody")
+        (d / "dockerfile.fragment").write_text(f"RUN {name}\n")
+    frags = collect_fragments(home)
+    assert [f.skill_name for f in frags] == ["a-skill", "m-skill", "z-skill"]
+
+
+def test_bundled_chainlink_fragment_is_pinned_to_tag():
+    """The bundled chainlink fragment should not float git HEAD."""
+    fragment = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "skills"
+        / "chainlink"
+        / "dockerfile.fragment"
+    ).read_text()
+    assert "--git https://github.com/dollspace-gay/chainlink.git" in fragment
+    assert "--tag chainlink-1.6.0" in fragment
+
+
+def test_gmail_poller_fragment_pins_go_and_gogcli_versions():
+    """Optional gmail-poller builds should be reproducible, not @latest."""
+    fragment = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "optional-skills"
+        / "gmail-poller"
+        / "dockerfile.fragment"
+    ).read_text()
+    assert "go1.26.5.linux-${ARCH}.tar.gz" in fragment
+    assert "github.com/steipete/gogcli/cmd/gog@v0.9.0" in fragment
+    assert "@latest" not in fragment
+
+
+# ── collect_required_env_vars ───────────────────────────────────────
+
+
+def test_collect_required_env_vars_includes_baseline(home_with_two_skills: Path):
+    keys = collect_required_env_vars(home_with_two_skills)
+    assert "MIMIR_API_KEY" in keys
+    assert "VOYAGE_API_KEY" in keys
+    assert "GITHUB_TOKEN" in keys
+    assert "MIMIR_ENABLE_CLAUDE_CODE" not in keys
+    assert "MIMIR_ENABLE_OPENCODE" not in keys
+
+
+def test_collect_required_env_vars_appends_poller_pass_env(
+    home_with_two_skills: Path,
+):
+    keys = collect_required_env_vars(home_with_two_skills)
+    # skill-a's pollers.json adds FOO + BAR
+    assert "FOO" in keys
+    assert "BAR" in keys
+
+
+def test_collect_required_env_vars_dedupes(tmp_path: Path):
+    """If two pollers both declare the same pass_env entry, it appears
+    only once in the result."""
+    home = tmp_path / "home"
+    skills = home / "skills"
+    skills.mkdir(parents=True)
+    for name in ("a", "b"):
+        d = skills / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+        (d / "pollers.json").write_text(
+            '{"pollers": [{"name": "' + name + '", "command": "true", '
+            '"pass_env": ["SHARED_KEY"]}]}'
+        )
+    keys = collect_required_env_vars(home)
+    assert keys.count("SHARED_KEY") == 1
+
+
+# ── existing_env_keys ───────────────────────────────────────────────
+
+
+def test_existing_env_keys_picks_up_live_settings():
+    keys = existing_env_keys("FOO=value\nBAR=other\n")
+    assert keys == {"FOO", "BAR"}
+
+
+def test_existing_env_keys_picks_up_commented_placeholders():
+    """Commented placeholders (`# KEY=`) MUST count as 'key already
+    present'. Otherwise scaffold-docker would re-append every placeholder
+    on every run."""
+    keys = existing_env_keys("# FOO=\n# BAR=\nLIVE=val\n")
+    assert keys == {"FOO", "BAR", "LIVE"}
+
+
+def test_existing_env_keys_ignores_random_comments():
+    keys = existing_env_keys("# This is a header\n# Another comment\nFOO=v\n")
+    assert keys == {"FOO"}
+
+
+# ── render_compose_env idempotency ─────────────────────────────────
+
+
+def test_render_compose_env_fresh_emits_all_keys():
+    text, added = render_compose_env(None, ["FOO", "BAR"])
+    assert "# FOO=" in text
+    assert "# BAR=" in text
+    assert set(added) == {"FOO", "BAR"}
+
+
+def test_render_compose_env_preserves_operator_values():
+    existing = "FOO=secret_value\n# BAR=\n"
+    text, added = render_compose_env(existing, ["FOO", "BAR", "BAZ"])
+    assert "FOO=secret_value" in text
+    assert "# BAR=" in text  # was already there, untouched
+    assert "BAZ" in text  # newly appended
+    assert added == ["BAZ"]
+
+
+def test_render_compose_env_no_op_when_all_present():
+    """All keys already in the file (live OR commented) → return
+    unchanged + empty added list."""
+    existing = "FOO=v\n# BAR=\n"
+    text, added = render_compose_env(existing, ["FOO", "BAR"])
+    assert text == existing
+    assert added == []
+
+
+def test_render_compose_env_idempotent_on_re_run():
+    """Running render_compose_env back-to-back on its own output must
+    not keep appending. Tests the full round-trip."""
+    text1, _ = render_compose_env(None, ["FOO", "BAR"])
+    text2, added2 = render_compose_env(text1, ["FOO", "BAR"])
+    assert added2 == []
+    assert text1 == text2
+
+
+# ── render_dockerfile ──────────────────────────────────────────────
+
+
+_DOCKERFILE_INSTRUCTIONS = {
+    "ARG",
+    "COPY",
+    "ENTRYPOINT",
+    "ENV",
+    "EXPOSE",
+    "FROM",
+    "RUN",
+    "USER",
+    "WORKDIR",
+}
+
+
+def _assert_structurally_parseable_dockerfile(text: str) -> None:
+    """Reject physical lines that Docker would interpret as unknown instructions."""
+    continued = False
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not continued:
+            instruction = stripped.split(None, 1)[0].upper()
+            assert instruction in _DOCKERFILE_INSTRUCTIONS, (
+                f"line {line_number} starts unknown Docker instruction "
+                f"{instruction!r}: {line!r}"
+            )
+        continued = line.rstrip().endswith("\\")
+    assert not continued, "Dockerfile ends inside a continued instruction"
+
+
+def test_render_dockerfile_inserts_fragments():
+    frags = [
+        Fragment(skill_name="a", content="RUN echo a"),
+        Fragment(skill_name="b", content="RUN echo b"),
+    ]
+    out = render_dockerfile(frags)
+    assert "RUN echo a" in out
+    assert "RUN echo b" in out
+    assert "BEGIN mimir-scaffold-docker: skill fragments" in out
+    assert "END mimir-scaffold-docker: skill fragments" in out
+    # Fragments labeled with their skill names so the generated file is readable.
+    assert "# --- a ---" in out
+    assert "# --- b ---" in out
+
+
+def test_render_dockerfile_empty_fragments():
+    out = render_dockerfile([])
+    assert "no skills installed yet ship a dockerfile.fragment" in out
+    assert "BEGIN mimir-scaffold-docker" in out
+
+
+def test_render_dockerfile_has_base_layer():
+    """Sanity: regardless of fragments, the base image + tooling are
+    present (git, gh, uv, pinned mermaid). Claude Code is optional."""
+    out = render_dockerfile([])
+    assert f"ARG BASE_IMAGE={DEFAULT_BASE_IMAGE}" in out
+    assert "FROM ${BASE_IMAGE}" in out
+    assert "@mermaid-js/mermaid-cli@11.16.0" in out
+    assert "astral.sh/uv/install.sh" in out
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_render_dockerfile_uses_mirrored_base_image(mode):
+    out = render_dockerfile([], mode=mode)
+    instructions = [line for line in out.splitlines() if line.startswith(("ARG ", "FROM "))]
+    assert DEFAULT_BASE_IMAGE == "public.ecr.aws/docker/library/python:3.11-slim"
+    assert instructions[0] == f"ARG BASE_IMAGE={DEFAULT_BASE_IMAGE}"
+    assert instructions[1] == "FROM ${BASE_IMAGE}"
+    assert not any(line.startswith("FROM python:") for line in instructions)
+
+
+def test_render_dockerfile_uses_tini_as_init():
+    """Generated containers must run through tini so orphaned subprocesses
+    adopted by PID 1 are reaped instead of accumulating as zombies.
+    """
+    from mimir.scaffold_docker import render_dockerfile
+
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "tini \\" in out, mode
+        assert 'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]' in out, mode
+
+
+def test_render_dockerfile_does_not_bundle_claude_code_cli():
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "RUN npm install -g @mermaid-js/mermaid-cli@11.16.0" in out, mode
+        assert "RUN npm install -g @anthropic-ai/claude-code" not in out, mode
+
+
+def test_render_dockerfile_installs_jq_in_both_modes():
+    """jq ships in the generated image (both modes) for JSONL log parsing and
+    poller/skill shell workflows — parity with the published image (#560)."""
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "\n        jq \\" in out, mode
+
+
+def test_render_dockerfile_does_not_install_codex_cli():
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "npm install -g @openai/codex" not in out, mode
+
+
+def test_scaffold_codex_plus_extra_does_not_install_codex_cli(tmp_path: Path):
+    """The model adapter needs auth.json, not the separate Codex executable."""
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", mimir_extras=["codex-plus", "discord"])
+    assert "npm install -g @openai/codex" not in (home / "Dockerfile").read_text()
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+@pytest.mark.parametrize("install_opencode", [False, True])
+def test_render_dockerfile_is_structurally_parseable(mode, install_opencode):
+    _assert_structurally_parseable_dockerfile(
+        render_dockerfile([], mode=mode, install_opencode=install_opencode)
+    )
+
+
+def test_render_dockerfile_installs_opencode_when_selected():
+    """The selected provider supplies the OpenCode install in both modes."""
+    assert FACTORY_VERSION == "0.12.1"
+    plugins = _cultivate_or_refusal()
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode, install_opencode=True, plugins=plugins)
+        if not plugins:
+            assert "cultivate-docker" not in out
+            assert "opencode-ai@" not in out
+            continue
+        base = cultivate_scripts(plugins[0])["base.sh"]
+        assert "COPY .mimir-scaffold/cultivate-docker/" in out, mode
+        assert f"opencode-ai@{OPENCODE_VERSION}" in base, mode
+        assert "feature-factory@${FACTORY_VERSION}" in base, mode
+        assert "opencode-feature-factory@${FACTORY_VERSION}" in base, mode
+        assert "opencode-project-memory@0.1.0" in base, mode
+        assert "opencode-openai-codex-auth@4.4.0" in base, mode
+        assert "opencode-anthropic-auth@0.0.13" in base, mode
+        assert "MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js" in out, mode
+        assert "/home/mimir/.config/opencode/opencode.json" in out, mode
+        assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" in out, mode
+        assert "printf '%s'" not in out, mode
+        assert out.index("RUN sh /opt/cultivate-docker/users.sh") < out.index(
+            "chown -R mimir:mimir /home/mimir/.config"
+        ), mode
+
+
+def test_render_dockerfile_does_not_install_opencode_without_provider():
+    for mode in ("workspace", "pypi"):
+        out = render_dockerfile([], mode=mode)
+        assert "npm install --global --prefix /opt/mimir-opencode" not in out, mode
+        assert "MIMIR_ENABLE_OPENCODE" not in out, mode
+        assert "MIMIR_CODING_ENABLED" not in out, mode
+        assert "/home/mimir/.config/opencode/opencode.json" not in out, mode
+        assert "__OPENCODE_INSTALL__" not in out, mode
+        assert "__OPENCODE_CONFIG__" not in out, mode
+
+
+def test_scaffold_selected_missing_provider_refuses(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    if _cultivate_installed():
+        scaffold(tmp_path, mode="pypi")
+        assert (tmp_path / ".mimir-scaffold/cultivate-docker/base.sh").is_file()
+    else:
+        with pytest.raises(PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+            scaffold(tmp_path, mode="pypi")
+        assert not (tmp_path / "Dockerfile").exists()
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+@pytest.mark.parametrize("selected", [False, True])
+def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch):
+    import subprocess
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
+    monkeypatch.setenv("MIMIR_ENABLE_OPENCODE", "0")
+    plugins = _cultivate_or_refusal() if selected else ()
+    dockerfile = render_dockerfile([], mode=mode, plugins=plugins)
+    assert ("COPY .mimir-scaffold/cultivate-docker/" in dockerfile) is bool(plugins)
+    assert ("ARG MIMIR_ENABLE_OPENCODE=0" in dockerfile) is bool(plugins)
+    start = render_start_sh(mode=mode)
+    assert "MIMIR_CODING_ENABLED" not in start
+    guard = next(line for line in start.splitlines() if line.startswith("if python3"))
+    result = subprocess.run(
+        ["sh", "-c", guard + " printf bootstrapped; fi"],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout == ("bootstrapped" if selected else "")
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_selected_cultivate_scaffold_executes_gated_pinned_install(tmp_path, monkeypatch, mode):
+    plugins = _cultivate_or_refusal()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    scaffold(home, mode=mode)
+    dockerfile = (home / "Dockerfile").read_text()
+    fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"
+    if not plugins:
+        assert not fragment.exists()
+        assert "opencode-ai@" not in dockerfile
+        return
+
+    assert "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/" in dockerfile
+    assert 'sh /opt/cultivate-docker/base.sh' in dockerfile
+    assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in dockerfile
+    assert fragment.read_text() == cultivate_scripts(plugins[0])["base.sh"]
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for command in ("apt-get", "curl", "bash", "rm"):
+        script = bin_dir / command
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+    npm = bin_dir / "npm"
+    npm.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$NPM_LOG"\n')
+    npm.chmod(0o755)
+    log = tmp_path / "npm.log"
+    for enabled in ("0", "1"):
+        result = subprocess.run(
+            ["sh", str(fragment)],
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "NODE_VERSION": "22", "FACTORY_VERSION": FACTORY_VERSION,
+                 "MIMIR_ENABLE_OPENCODE": enabled, "NPM_LOG": str(log)},
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        assert result.returncode == 0
+        if enabled == "0":
+            assert not log.exists()
+        else:
+            assert log.read_text().splitlines() == [
+                "install", "--global", "--prefix", "/opt/mimir-opencode",
+                f"opencode-ai@{OPENCODE_VERSION}",
+                "@openai/codex@0.139.0",
+                f"feature-factory@{FACTORY_VERSION}",
+                f"opencode-feature-factory@{FACTORY_VERSION}",
+                "opencode-project-memory@0.1.0", "opencode-openai-codex-auth@4.4.0",
+                "opencode-anthropic-auth@0.0.13",
+            ]
+
+
+def test_scaffold_installs_opencode_when_selected(tmp_path: Path, monkeypatch):
+    """A selected provider supplies the runtime; the config flag alone does not."""
+    home = tmp_path / "opencode-home"
+    home.mkdir()
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    scaffold(home, mode="pypi", install_opencode=True)
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
+
+    plain = tmp_path / "plain-home"
+    plain.mkdir()
+    monkeypatch.delenv("MIMIR_PLUGINS")
+    scaffold(plain, mode="pypi", install_opencode=False)
+    assert f"opencode-ai@{OPENCODE_VERSION}" not in _scaffold_install_text(plain)
+    assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" not in (plain / "Dockerfile").read_text()
+
+
+def test_scaffold_installs_opencode_for_workspace_mode(tmp_path: Path, monkeypatch):
+    """Workspace mode respects install_opencode flag."""
+    home = tmp_path / "ws-opencode-home"
+    home.mkdir()
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    scaffold(home, mode="workspace", install_opencode=True)
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
+
+
+def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path):
+    """The global XDG config applies from outer repos and nested worktrees."""
+    home = tmp_path / "oc-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    oc_config = opencode_config_path(home)
+    assert oc_config == home / ".config" / "opencode" / "opencode.json"
+    assert oc_config.is_file(), "global opencode.json should be created"
+    content = oc_config.read_text()
+    assert "opencode-feature-factory" in content
+    assert "opencode-project-memory" in content
+    assert "opencode-openai-codex-auth" in content
+    assert "opencode-anthropic-auth" in content
+    assert '.opencode/memory' in content
+    assert '"maxIndexBytes": 8192' in content
+    assert '"maxIndexLines": 100' in content
+    assert '"gitExclude": false' in content
+
+
+def test_scaffold_skips_opencode_config_when_disabled(tmp_path: Path):
+    """When install_opencode=False, no global opencode.json is created."""
+    home = tmp_path / "no-oc-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=False)
+    assert not opencode_config_path(home).is_file()
+
+
+def test_ensure_opencode_config_preserves_existing_options_and_deduplicates(tmp_path: Path):
+    config_path = opencode_config_path(tmp_path)
+    config_path.parent.mkdir(parents=True)
+    existing_factory = [
+        "opencode-feature-factory",
+        {"profiles": {"review": ["openai", "gpt-5"]}},
+    ]
+    config_path.write_text(json.dumps({
+        "$schema": "custom-schema",
+        "theme": "tokyonight",
+        "plugin": [
+            "operator-plugin",
+            existing_factory,
+            "opencode-feature-factory",
+            ["opencode-project-memory", {"maxIndexLines": 17, "operator": True}],
+        ],
+    }))
+
+    assert ensure_opencode_config(config_path) is True
+    merged = json.loads(config_path.read_text())
+
+    assert merged["$schema"] == "custom-schema"
+    assert merged["theme"] == "tokyonight"
+    assert merged["plugin"][0] == "operator-plugin"
+    assert merged["plugin"][1] == existing_factory
+    assert sum(
+        1 for entry in merged["plugin"]
+        if entry == "opencode-feature-factory"
+        or isinstance(entry, list) and entry[0] == "opencode-feature-factory"
+    ) == 1
+    memory = next(
+        entry for entry in merged["plugin"]
+        if isinstance(entry, list) and entry[0] == "opencode-project-memory"
+    )
+    assert memory[1] == {
+        "memoryDir": ".opencode/memory",
+        "index": "MEMORY.md",
+        "maxIndexBytes": 8192,
+        "maxIndexLines": 100,
+        "gitExclude": False,
+        "operator": True,
+    }
+    assert merged["plugin"][-2:] == [
+        "opencode-openai-codex-auth",
+        "opencode-anthropic-auth",
+    ]
+    before = config_path.read_text()
+    assert ensure_opencode_config(config_path) is False
+    assert config_path.read_text() == before
+
+
+def test_scaffold_opencode_config_is_idempotent(tmp_path: Path):
+    home = tmp_path / "idempotent-home"
+    home.mkdir()
+    scaffold(home, mode="pypi", install_opencode=True)
+    second_result = scaffold(home, mode="pypi", install_opencode=True)
+    assert ".config/opencode/opencode.json (no changes)" in second_result.files_skipped
+
+
+def test_start_scripts_bootstrap_the_global_config_when_opencode_is_enabled():
+    workspace = render_start_sh(mode="workspace")
+    pypi = render_start_sh(mode="pypi")
+    assert 'os.environ.get("MIMIR_PLUGINS", "")' in workspace
+    assert 'uv run mimir opencode-bootstrap --home "$HOME"' in workspace
+    assert 'os.environ.get("MIMIR_PLUGINS", "")' in pypi
+    assert 'mimir opencode-bootstrap --home "$HOME"' in pypi
+
+
+# ── scaffold() end-to-end ──────────────────────────────────────────
+
+
+def test_scaffold_writes_all_four_files(home_with_two_skills: Path):
+    result = scaffold(home_with_two_skills)
+    for fname in ("Dockerfile", "compose.yml", "compose.env", "start.sh"):
+        assert (home_with_two_skills / fname).is_file(), \
+            f"{fname} not written"
+    assert "Dockerfile" in result.files_written
+    assert "compose.yml" in result.files_written
+    assert "start.sh" in result.files_written
+
+
+def test_scaffold_creates_compose_env_private(home_with_two_skills: Path):
+    scaffold(home_with_two_skills)
+    assert stat.S_IMODE((home_with_two_skills / "compose.env").stat().st_mode) == 0o600
+
+
+def test_scaffold_start_sh_is_executable(home_with_two_skills: Path):
+    scaffold(home_with_two_skills)
+    mode = (home_with_two_skills / "start.sh").stat().st_mode
+    assert mode & stat.S_IXUSR, "start.sh must be executable"
+
+
+def test_scaffold_picks_up_skills(home_with_two_skills: Path):
+    result = scaffold(home_with_two_skills)
+    assert result.skills_with_fragments == ["skill-a"]
+
+
+def test_scaffold_idempotent_compose_env(home_with_two_skills: Path):
+    """Re-running scaffold-docker on the same home must NOT append
+    duplicate env-var placeholders."""
+    result1 = scaffold(home_with_two_skills)
+    assert len(result1.env_vars_added) > 0
+
+    env_file = home_with_two_skills / "compose.env"
+    text_after_first = env_file.read_text()
+
+    result2 = scaffold(home_with_two_skills)
+    text_after_second = env_file.read_text()
+
+    assert text_after_first == text_after_second
+    assert result2.env_vars_added == []
+    assert "compose.env (no changes)" in result2.files_skipped
+
+
+def test_scaffold_picks_up_new_skill_after_install(
+    home_with_two_skills: Path,
+):
+    """Adding a new skill (with a fragment + pass_env) and re-running
+    scaffold-docker must add ITS fragment to the Dockerfile and ITS
+    env vars to compose.env — without touching what's already there.
+    """
+    home = home_with_two_skills
+    result1 = scaffold(home)
+    df_before = (home / "Dockerfile").read_text()
+    env_before = (home / "compose.env").read_text()
+
+    # Operator sets a value in compose.env.
+    env_text = env_before.replace("# FOO=", "FOO=operator_value")
+    (home / "compose.env").write_text(env_text)
+
+    # Install a new skill with its own fragment + pollers.json.
+    new = home / "skills" / "skill-new"
+    new.mkdir()
+    (new / "SKILL.md").write_text("---\nname: skill-new\n---\n")
+    (new / "dockerfile.fragment").write_text("RUN echo skill-new")
+    (new / "pollers.json").write_text(
+        '{"pollers": [{"name": "n", "command": "true", "pass_env": ["NEW_KEY"]}]}'
+    )
+
+    result2 = scaffold(home)
+    df_after = (home / "Dockerfile").read_text()
+    env_after = (home / "compose.env").read_text()
+
+    # Dockerfile picks up the new fragment.
+    assert "skill-new" in result2.skills_with_fragments
+    assert "RUN echo skill-new" in df_after
+    # Original fragment also still there.
+    assert "RUN echo skill-a" in df_after
+    # compose.env preserves the operator's value AND appends only the new key.
+    assert "FOO=operator_value" in env_after
+    assert "# NEW_KEY=" in env_after
+    assert result2.env_vars_added == ["NEW_KEY"]
+
+
+def test_scaffold_missing_home_raises(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        scaffold(tmp_path / "does-not-exist")
+
+
+# ── Dockerfile blocker — broken PATH ─────────────────────────────────
+
+
+def test_dockerfile_has_valid_path_env(home_with_two_skills: Path):
+    """Mimir #225 review caught ``${{PATH}}`` shipping literally in
+    the Dockerfile (because the template was rendered via .replace()
+    not .format()). Docker doesn't understand ${{VAR}}; the resulting
+    container had a broken PATH. Regression: no double-braces.
+    """
+    scaffold(home_with_two_skills)
+    df = (home_with_two_skills / "Dockerfile").read_text()
+    assert "${{PATH}}" not in df, (
+        "Dockerfile shipped literal ${{PATH}} — Docker doesn't parse "
+        "that as a variable reference; container PATH ends up broken."
+    )
+    assert "${PATH}" in df, "expected Docker-style ${PATH} expansion"
+
+
+# ── render_compose_yml() ─────────────────────────────────────────────
+
+
+def test_render_compose_yml_substitutes_service_name():
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="muninn-mimir", web_port=8091)
+    assert "container_name: muninn-mimir" in out
+    assert "muninn-mimir:" in out  # service key line
+    assert "127.0.0.1:8091:8080" in out
+
+
+def test_render_compose_yml_no_unresolved_placeholders():
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="x", web_port=1234)
+    # No leftover template tokens like {SERVICE_NAME} / {WEB_PORT}.
+    assert "{SERVICE_NAME}" not in out
+    assert "{WEB_PORT}" not in out
+
+
+def test_render_compose_yml_defaults_web_host_to_zero_zero_zero_zero():
+    """Inside-container bind must default to 0.0.0.0 so docker's
+    port-forward can reach the app. mimir's default since PR #323 is
+    127.0.0.1 (host-install safety); without this override containers
+    silently produce "Empty reply from server" through the host-side
+    forward. Host exposure stays loopback-only via the
+    ``127.0.0.1:<host_port>:8080`` binding in ``ports:``."""
+    from mimir.scaffold_docker import render_compose_yml
+    for mode in ("workspace", "pypi"):
+        out = render_compose_yml(service_name="x", web_port=8080, mode=mode)
+        assert "MIMIR_WEB_HOST: 0.0.0.0" in out, (
+            f"mode={mode!r}: expected MIMIR_WEB_HOST=0.0.0.0 in the "
+            f"environment block; got:\n{out}"
+        )
+        # And the host-side port forward stays loopback-only.
+        assert "127.0.0.1:8080:8080" in out
+
+
+# ── render_start_sh() ────────────────────────────────────────────────
+
+
+def test_render_start_sh_no_extras_by_default():
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh()
+    # Empty UV_EXTRAS = no --extra flags expanded.
+    assert "UV_EXTRAS=\"\"" in out
+    assert "{UV_EXTRAS}" not in out
+
+
+def test_render_start_sh_expands_extras():
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(uv_extras=["discord", "claude-code"])
+    assert "UV_EXTRAS=\"--extra discord --extra claude-code\"" in out
+
+
+def test_workspace_start_builds_frontend_only_when_absent(tmp_path):
+    import subprocess
+
+    out = render_start_sh()
+    guard = 'if [ ! -f "mimir/react_app/dist/index.html" ]; then'
+    start = out.index(guard)
+    end = out.index("\nfi", start) + len("\nfi")
+    assert out.index("uv sync $UV_EXTRAS") < start < out.index("uv run mimir setup")
+    assert "npm ci --include=dev\n    npm run build" in out[start:end]
+    assert "npm " not in render_start_sh(mode="pypi")
+
+    # Execute the rendered build block with npm stubbed, without network access.
+    script = 'set -euo pipefail\nnpm() { printf "%s\\n" "$*"; }\n' + out[start:end]
+    first = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    assert "ci --include=dev\nrun build\n" in first.stdout
+    dist = tmp_path / "mimir/react_app/dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("built console")
+    restart = subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    assert restart.stdout == ""
+
+
+def test_render_start_sh_enable_claude_code_adds_adapter_extra():
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(uv_extras=["discord"])
+    assert 'if [ "${MIMIR_ENABLE_CLAUDE_CODE:-0}" = "1" ]; then' in out
+    assert 'UV_EXTRAS="$UV_EXTRAS --extra claude-code"' in out
+    assert 'UV_EXTRAS="$--extra' not in out
+
+
+def test_render_start_sh_uv_sync_line_is_valid_shell_with_no_extras():
+    """Regression: the prior template had ``uv sync ${UV_EXTRAS}`` on
+    the invocation line. The Python renderer's
+    ``.replace("{UV_EXTRAS}", flags)`` matched the ``{UV_EXTRAS}``
+    substring INSIDE ``${UV_EXTRAS}`` and replaced it with the empty
+    string when no extras were configured — producing ``uv sync $``
+    (literal stray dollar, no variable). That crashed every
+    container at boot with ``error: unexpected argument '$' found``.
+
+    The fix uses bare ``$UV_EXTRAS`` shell expansion on the
+    invocation line so the ``{UV_EXTRAS}`` substring never appears
+    next to a leading ``$`` for the renderer to clobber.
+
+    Caught during muninn-mimir cutover on 2026-05-20."""
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh()
+    # The stray-$ bug would produce this exact line; if it shows up
+    # we've regressed.
+    assert "uv sync $\n" not in out
+    assert "uv sync $ " not in out
+    # The fix renders the invocation as bare shell expansion which
+    # still works correctly when UV_EXTRAS is empty.
+    assert "uv sync $UV_EXTRAS" in out
+
+
+# ── _resolve_home() precedence ───────────────────────────────────────
+
+
+def test_resolve_home_arg_wins(tmp_path: Path, monkeypatch):
+    from mimir.scaffold_docker import _resolve_home
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "from-env"))
+    arg_home = tmp_path / "from-arg"
+    arg_home.mkdir()
+    assert _resolve_home(arg_home) == arg_home.resolve()
+
+
+def test_resolve_home_env_used_when_no_arg(tmp_path: Path, monkeypatch):
+    from mimir.scaffold_docker import _resolve_home
+    env_home = tmp_path / "from-env"
+    env_home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(env_home))
+    assert _resolve_home(None) == env_home.resolve()
+
+
+def test_resolve_home_cwd_fallback(tmp_path: Path, monkeypatch):
+    from mimir.scaffold_docker import _resolve_home
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert _resolve_home(None) == tmp_path.resolve()
+
+
+# ── cmd() CLI handler ────────────────────────────────────────────────
+
+
+def test_cli_exposes_opencode_opt_in(tmp_path: Path, capsys, monkeypatch):
+    from mimir.scaffold_docker import add_argparse, cmd
+
+    parser = ArgumentParser()
+    add_argparse(parser)
+    assert parser.parse_args(["--opencode"]).opencode is True
+    assert parser.parse_args(["--no-opencode"]).opencode is False
+    assert "--opencode" in parser.format_help()
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    args = parser.parse_args(
+        ["--home", str(tmp_path), "--mode", "pypi", "--opencode"]
+    )
+    assert cmd(args) == 0
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(tmp_path)) is bool(plugins)
+
+
+@pytest.mark.parametrize("installed_version", ["0.0.1", OPENCODE_VERSION])
+def test_cmd_flagless_rerun_preserves_deployment_shape(
+    tmp_path: Path, capsys, installed_version: str, monkeypatch
+):
+    from mimir.scaffold_docker import add_argparse, cmd
+
+    home = tmp_path / "renamed-home"
+    home.mkdir()
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    scaffold(
+        home,
+        mode="pypi",
+        web_port=9000,
+        service_name="stable-service",
+        install_opencode=True,
+    )
+    fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"
+    install_path = fragment if fragment.is_file() else home / "Dockerfile"
+    install_path.write_text(install_path.read_text().replace(OPENCODE_VERSION, installed_version))
+    parser = ArgumentParser()
+    add_argparse(parser)
+    args = parser.parse_args(["--home", str(home)])
+
+    assert cmd(args) == 0
+    dockerfile = (home / "Dockerfile").read_text()
+    compose = (home / "compose.yml").read_text()
+    assert "Generated by `mimir scaffold-docker --mode pypi`" in dockerfile
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
+    assert "container_name: stable-service" in compose
+    assert '"127.0.0.1:9000:8080"' in compose
+
+
+def test_explicit_rerun_flags_override_recovered_shape(tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir()
+    scaffold(
+        home,
+        mode="pypi",
+        web_port=9000,
+        service_name="old",
+        install_opencode=True,
+    )
+    scaffold(
+        home,
+        mode="workspace",
+        web_port=9001,
+        service_name="new",
+        install_opencode=False,
+    )
+    dockerfile = (home / "Dockerfile").read_text()
+    compose = (home / "compose.yml").read_text()
+    assert "Generated by `mimir scaffold-docker --mode pypi`" not in dockerfile
+    assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" not in dockerfile
+    assert "container_name: new" in compose
+    assert '"127.0.0.1:9001:8080"' in compose
+
+
+def test_cmd_rejects_invalid_web_port(home_with_two_skills: Path, capsys):
+    """--web-port 99999 must error cleanly, not silently emit a broken
+    compose.yml."""
+    from mimir.scaffold_docker import cmd
+    args = Namespace(
+        home=home_with_two_skills, service_name=None,
+        web_port=99999, uv_extras="",
+    )
+    rc = cmd(args)
+    assert rc == 2
+    assert "out of range" in capsys.readouterr().out
+
+
+def test_cmd_returns_2_for_missing_home(tmp_path: Path, capsys):
+    from mimir.scaffold_docker import cmd
+    args = Namespace(
+        home=tmp_path / "does-not-exist", service_name=None,
+        web_port=8090, uv_extras="",
+    )
+    rc = cmd(args)
+    assert rc == 2
+    assert "not a directory" in capsys.readouterr().out
+
+
+def test_cmd_passes_extras_through(home_with_two_skills: Path, capsys):
+    """--uv-extras csv parses correctly and lands in start.sh."""
+    from mimir.scaffold_docker import cmd
+    args = Namespace(
+        home=home_with_two_skills, service_name=None,
+        web_port=8090, uv_extras="discord, claude-code",
+    )
+    rc = cmd(args)
+    assert rc == 0
+    start_sh = (home_with_two_skills / "start.sh").read_text()
+    assert "--extra discord --extra claude-code" in start_sh
+
+
+# ── Service name sanitization ────────────────────────────────────────
+
+
+def test_scaffold_sanitizes_home_dir_name_for_service_name(tmp_path: Path):
+    """Home dir with spaces / special chars → safe container name."""
+    weird = tmp_path / "My Weird Home!"
+    (weird / "skills").mkdir(parents=True)
+    result = scaffold(weird)
+    cy = (weird / "compose.yml").read_text()
+    # Allowed chars: alnum + hyphen + underscore; spaces / ! become hyphens.
+    assert "container_name: My-Weird-Home-" in cy
+    # No raw spaces in the service name.
+    for line in cy.splitlines():
+        if line.lstrip().startswith("container_name"):
+            assert " " not in line.split(":", 1)[1].strip()
+
+
+def test_scaffold_explicit_service_name_overrides_home_name(tmp_path: Path):
+    """Explicit service name wins over the home-dir-derived default."""
+    weird = tmp_path / "My Weird Home!"
+    (weird / "skills").mkdir(parents=True)
+    scaffold(weird, service_name="muninn")
+    cy = (weird / "compose.yml").read_text()
+    assert "container_name: muninn" in cy
+
+
+def test_scaffold_explicit_service_name_is_also_sanitized(tmp_path: Path, capsys):
+    """Operator typo in --service-name (spaces, slashes) gets fixed
+    instead of producing an invalid compose service name."""
+    weird = tmp_path / "agent-home"
+    (weird / "skills").mkdir(parents=True)
+    scaffold(weird, service_name="muninn alpha/v2")
+    cy = (weird / "compose.yml").read_text()
+    assert "container_name: muninn-alpha-v2" in cy
+    # And the operator gets told about the rewrite so it isn't silent.
+    captured = capsys.readouterr().out
+    assert "muninn alpha/v2" in captured
+    assert "muninn-alpha-v2" in captured
+
+
+# ── .gitignore belt-and-suspenders ───────────────────────────────────
+
+
+def test_scaffold_appends_compose_env_to_gitignore(home_with_two_skills: Path):
+    """compose.env contains secrets and should never be committed.
+    The scaffolder adds a never-track entry as belt-and-suspenders for
+    operators who switch from the default allowlist to a blocklist."""
+    home = home_with_two_skills
+    scaffold(home)
+    gi = (home / ".gitignore").read_text()
+    assert "compose.env\n" in gi
+    assert "compose.env.bak.*\n" in gi
+    assert "mimir-scaffold-docker" in gi  # sentinel comment
+
+
+def test_scaffold_does_not_double_append_gitignore(home_with_two_skills: Path):
+    """Re-running must not duplicate the .gitignore entry."""
+    home = home_with_two_skills
+    scaffold(home)
+    gi_first = (home / ".gitignore").read_text()
+    scaffold(home)
+    gi_second = (home / ".gitignore").read_text()
+    assert gi_first == gi_second
+    assert gi_second.count("mimir-scaffold-docker") == 1
+
+
+# ── Malformed pollers.json defensive handling ────────────────────────
+
+
+def test_collect_required_env_vars_survives_malformed_pollers_json(tmp_path: Path):
+    """A pollers.json that's valid JSON but wrong-shape must not
+    crash collection. Mimir #225 review flagged: ``"pollers": "oops"``
+    would raise TypeError on the next ``.get()`` chain."""
+    home = tmp_path / "home"
+    skills = home / "skills"
+    skills.mkdir(parents=True)
+    s = skills / "broken-skill"
+    s.mkdir()
+    (s / "SKILL.md").write_text("---\nname: broken\n---\n")
+    (s / "pollers.json").write_text('{"pollers": "oops"}')
+    keys = collect_required_env_vars(home)
+    # Must still return the baseline keys, not crash.
+    assert "MIMIR_API_KEY" in keys
+
+
+def test_collect_required_env_vars_skips_non_string_pass_env(tmp_path: Path):
+    """If pass_env is a list but contains non-strings, those entries
+    are skipped (not crashed-on)."""
+    home = tmp_path / "home"
+    skills = home / "skills"
+    skills.mkdir(parents=True)
+    s = skills / "weird-skill"
+    s.mkdir()
+    (s / "SKILL.md").write_text("---\nname: weird\n---\n")
+    (s / "pollers.json").write_text(
+        '{"pollers": [{"name": "w", "pass_env": ["GOOD_KEY", 42, null]}]}'
+    )
+    keys = collect_required_env_vars(home)
+    assert "GOOD_KEY" in keys
+    # 42 and null shouldn't crash and shouldn't end up in the list.
+    assert 42 not in keys
+
+
+# ── Sentinel-split fragment-insert robustness ────────────────────────
+
+
+def test_render_dockerfile_handles_sentinel_in_fragment(tmp_path: Path):
+    """A fragment containing the literal sentinel string must not
+    corrupt the insertion (sentinel split + partition is robust)."""
+    sentinel = "<!-- mimir-scaffold-docker:FRAGMENTS -->"
+    frag = Fragment(
+        skill_name="evil",
+        content=f"# Has the sentinel: {sentinel}\nRUN echo evil",
+    )
+    out = render_dockerfile([frag])
+    # Output should still have ONE BEGIN/END pair, not multiple.
+    assert out.count("BEGIN mimir-scaffold-docker") == 1
+    assert out.count("END mimir-scaffold-docker") == 1
+    # The fragment contents (including the embedded sentinel literal)
+    # should be present somewhere.
+    assert "RUN echo evil" in out
+
+
+# ── Re-review (#225 second round) regression tests ───────────────────
+
+
+def test_dockerfile_header_does_not_falsely_claim_preservation(home_with_two_skills):
+    """Mimir #225 re-review caught the Dockerfile header comment
+    promising "operator edits OUTSIDE the sentinel-marked blocks are
+    preserved" — but scaffold() does df_path.write_text() (full regen)
+    so the claim was false and would silently lose operator edits.
+    Header must now warn that the file is fully regenerated.
+    """
+    scaffold(home_with_two_skills)
+    df = (home_with_two_skills / "Dockerfile").read_text()
+    # Regression: must not promise preservation.
+    assert "are preserved across regenerations" not in df
+    # Must warn about regeneration.
+    assert "REGENERATED IN" in df
+    assert "do NOT edit" in df
+
+
+def test_compose_yml_header_warns_about_regen(home_with_two_skills):
+    scaffold(home_with_two_skills)
+    cy = (home_with_two_skills / "compose.yml").read_text()
+    assert "REGENERATED IN" in cy
+    assert "WILL be lost" in cy
+
+
+def test_start_sh_header_warns_about_regen(home_with_two_skills):
+    scaffold(home_with_two_skills)
+    ss = (home_with_two_skills / "start.sh").read_text()
+    assert "REGENERATED IN" in ss
+    assert "do NOT edit" in ss
+
+
+def test_scaffold_idempotent_reporting_no_changes(home_with_two_skills):
+    """Mimir #225 re-review: ``files_written`` was reporting Dockerfile
+    / compose.yml / start.sh on EVERY run, even when the rendered
+    content was byte-identical to what was already on disk. For an
+    idempotent tool, "written" should mean "something changed."
+    """
+    # First run — everything is new.
+    r1 = scaffold(home_with_two_skills)
+    assert "Dockerfile" in r1.files_written
+    assert "compose.yml" in r1.files_written
+    assert "start.sh" in r1.files_written
+
+    # Second run — no inputs changed → nothing should be reported as written.
+    r2 = scaffold(home_with_two_skills)
+    assert r2.files_written == [], (
+        f"expected no files written on re-run, got: {r2.files_written}"
+    )
+    # All three should land in skipped instead.
+    skipped_labels = {s.split(" ")[0] for s in r2.files_skipped}
+    for f in ("Dockerfile", "compose.yml", "start.sh"):
+        assert f in skipped_labels, f"{f} should be in skipped on idempotent re-run"
+
+
+def test_scaffold_reports_only_changed_files(home_with_two_skills):
+    """If only one input changes between runs, only that file should
+    appear in ``files_written`` — the others stay in ``files_skipped``.
+    """
+    scaffold(home_with_two_skills)
+    # Install a new skill with a fragment → Dockerfile changes; others don't.
+    new = home_with_two_skills / "skills" / "newcomer"
+    new.mkdir()
+    (new / "SKILL.md").write_text("---\nname: newcomer\n---\n")
+    (new / "dockerfile.fragment").write_text("RUN echo newcomer")
+
+    r = scaffold(home_with_two_skills)
+    assert "Dockerfile" in r.files_written
+    assert "compose.yml" not in r.files_written
+    assert "start.sh" not in r.files_written
+
+
+def test_start_sh_chmod_persists_through_no_change_runs(home_with_two_skills):
+    """The chmod call is unconditional (separate from write_if_changed)
+    so a previously-corrupted mode bit gets restored even when content
+    is unchanged. Sanity check: after an idempotent re-run, start.sh
+    is still executable.
+    """
+    import stat
+    scaffold(home_with_two_skills)
+    ss = home_with_two_skills / "start.sh"
+    # Drop the exec bit manually.
+    ss.chmod(0o644)
+    assert not (ss.stat().st_mode & stat.S_IXUSR)
+    # Re-run with no input changes — content stays same, mode bit gets restored.
+    scaffold(home_with_two_skills)
+    assert ss.stat().st_mode & stat.S_IXUSR
+
+
+def test_baseline_env_includes_mimir_git_url(home_with_two_skills, capsys):
+    """Mimir #225 re-review: MIMIR_GIT_URL is referenced in start.sh
+    via ${MIMIR_GIT_URL:-default} so non-mimir agent homes (Muninn,
+    forks) can override the clone source — but it wasn't in the
+    baseline keys list, so compose.env never templated a placeholder
+    for it. Operators got a silent footgun.
+    """
+    scaffold(home_with_two_skills)
+    env = (home_with_two_skills / "compose.env").read_text()
+    assert "MIMIR_GIT_URL" in env, (
+        "MIMIR_GIT_URL must be in compose.env's baseline placeholders "
+        "so operators forking the source can find the env var to set."
+    )
+
+
+def test_start_sh_has_mimir_git_url_inline_doc(home_with_two_skills):
+    """The MIMIR_GIT_URL reference in start.sh should carry an inline
+    comment explaining when to override (e.g. for Muninn-like forks)."""
+    scaffold(home_with_two_skills)
+    ss = (home_with_two_skills / "start.sh").read_text()
+    # The line right before the REPO_URL assignment should mention
+    # MIMIR_GIT_URL and forks.
+    assert "MIMIR_GIT_URL" in ss
+    assert "fork" in ss.lower() or "override" in ss.lower()
+
+
+def test_gmail_fragment_has_bump_comment():
+    """Mimir nit: hardcoded Go version should carry a bump-this comment
+    so future maintainers know it's a pin, not a load-bearing constant."""
+    frag_path = (
+        Path(__file__).parent.parent
+        / "mimir" / "optional-skills" / "gmail-poller" / "dockerfile.fragment"
+    )
+    text = frag_path.read_text()
+    # Some form of "bump" / "update" / "check" guidance near the version.
+    assert "Go version" in text
+    assert "Bump" in text or "bump" in text
+
+
+def test_social_cli_fragment_has_pin_comment():
+    """Mimir nit: cloning untagged main is non-deterministic — flag it
+    so a future maintainer pins when upstream stabilizes."""
+    frag_path = (
+        Path(__file__).parent.parent
+        / "mimir" / "optional-skills" / "social-cli" / "dockerfile.fragment"
+    )
+    text = frag_path.read_text()
+    assert "pin" in text.lower() or "tag" in text.lower()
+
+
+# ─── PyPI mode (issue #332) ─────────────────────────────────────────
+
+
+def test_render_dockerfile_pypi_mode_installs_from_pypi(tmp_path):
+    """``mode='pypi'`` emits a Dockerfile that runs
+    ``pip install mimir-agent[...]`` instead of cloning + ``uv sync``."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="pypi")
+    assert "pip install --no-cache-dir \"mimir-agent[" in out
+    assert "uv sync" not in out
+    assert "git clone" not in out
+    # User-owned venv at /home/mimir/venv (required for pending-update
+    # flow to ``pip install --upgrade`` without root).
+    assert "VIRTUAL_ENV=/home/mimir/venv" in out
+    # Optional claude-code support gated on a build-arg.
+    assert "MIMIR_ENABLE_CLAUDE_CODE" in out
+    assert 'pip install --no-cache-dir "mimir-agent[claude-code]"' in out
+
+
+def test_render_dockerfile_pypi_mode_default_extras(tmp_path):
+    """Default ``mimir_extras`` is the common multi-bridge production
+    set: anthropic + discord + slack + mcp."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="pypi", mimir_extras=None)
+    assert 'ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"' in out
+
+
+def test_render_dockerfile_pypi_mode_custom_extras(tmp_path):
+    """Operator-supplied ``mimir_extras`` flow into the build-arg
+    default, so ``docker build`` without ``--build-arg MIMIR_EXTRAS=…``
+    picks them up."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="pypi", mimir_extras=["anthropic", "discord"])
+    assert 'ARG MIMIR_EXTRAS="anthropic,discord"' in out
+
+
+def test_render_compose_yml_exposes_claude_code_build_switch():
+    from mimir.scaffold_docker import render_compose_yml
+
+    for mode in ("workspace", "pypi"):
+        out = render_compose_yml(service_name="x", web_port=8080, mode=mode)
+        assert (
+            out.count("MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}")
+            == 2
+        )
+        assert 'MIMIR_ENABLE_OPENCODE: "${MIMIR_ENABLE_OPENCODE:-0}"' in out
+        assert 'MIMIR_PLUGINS: "${MIMIR_PLUGINS:-}"' in out
+        assert "MIMIR_CODING_ENABLED" not in out
+        assert "Build switches live in .env or the shell" in out
+        assert "Compose interpolation does not read env_file" in out
+
+
+def test_render_dockerfile_pypi_mode_preserves_skill_fragments():
+    """Skill fragments (chainlink, hugo, etc.) still land in the
+    fragments block regardless of mode."""
+    from mimir.scaffold_docker import render_dockerfile, Fragment
+    f = Fragment(skill_name="myskill", content="RUN echo hello")
+    out = render_dockerfile([f], mode="pypi")
+    assert "# --- myskill ---" in out
+    assert "RUN echo hello" in out
+
+
+def test_render_dockerfile_workspace_mode_unchanged():
+    """Regression: default ``mode='workspace'`` produces the historic
+    template — uv installer present (sync runs at boot via start.sh),
+    workspace WORKDIR, no PyPI-mode artifacts."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode="workspace")
+    # uv installer present (the layer that places uv at /usr/local/bin)
+    assert "/usr/local/bin/uv" in out
+    # Workspace bind path
+    assert "WORKDIR /workspace" in out
+    # No PyPI-mode artifacts
+    assert "pip install --no-cache-dir \"mimir-agent[" not in out
+    assert "VIRTUAL_ENV=/home/mimir/venv" not in out
+
+
+def test_render_dockerfile_unknown_mode_raises():
+    from mimir.scaffold_docker import render_dockerfile
+    with pytest.raises(ValueError, match="unknown scaffold mode"):
+        render_dockerfile([], mode="kubernetes")
+
+
+# ─── compose.yml PyPI mode ──────────────────────────────────────────
+
+
+def test_render_compose_yml_pypi_drops_workspace_volume():
+    """No ``workspace`` named volume, no ``/workspace`` mount."""
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="foo", web_port=8091, mode="pypi")
+    assert "workspace:" not in out
+    assert "/workspace" not in out
+    # /mimir-home bind-mount preserved.
+    assert "- .:/mimir-home" in out
+    # Substitutions still work.
+    assert "container_name: foo" in out
+    assert "127.0.0.1:8091:8080" in out
+
+
+def test_render_compose_yml_workspace_mode_still_has_volume():
+    """Regression: workspace mode keeps the named volume."""
+    from mimir.scaffold_docker import render_compose_yml
+    out = render_compose_yml(service_name="foo", web_port=8091, mode="workspace")
+    assert "workspace:/workspace" in out
+    assert "volumes:\n  workspace:" in out
+
+
+# ─── start.sh PyPI mode ─────────────────────────────────────────────
+
+
+def test_render_start_sh_pypi_drops_clone_and_uv_sync():
+    """PyPI start.sh has no clone, no ``uv sync``, no ``uv run``."""
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(mode="pypi")
+    assert "git clone" not in out
+    assert "uv sync" not in out
+    assert "uv run" not in out
+    # Still does gh auth + mimir setup + exec mimir run.
+    assert "gh auth" in out
+    assert "mimir setup" in out
+    assert "exec mimir run" in out
+
+
+def test_render_start_sh_pypi_ignores_uv_extras():
+    """uv_extras has no effect in pypi mode — the Dockerfile carries
+    MIMIR_EXTRAS instead."""
+    from mimir.scaffold_docker import render_start_sh
+    out_no = render_start_sh(uv_extras=None, mode="pypi")
+    out_yes = render_start_sh(uv_extras=["discord", "slack"], mode="pypi")
+    assert out_no == out_yes  # extras have no effect
+
+
+def test_render_start_sh_workspace_mode_unchanged():
+    """Regression: workspace mode still has the clone + uv sync."""
+    from mimir.scaffold_docker import render_start_sh
+    out = render_start_sh(uv_extras=["discord"], mode="workspace")
+    assert "git clone" in out
+    assert "uv sync" in out
+    assert "--extra discord" in out
+
+
+# ─── scaffold() end-to-end in PyPI mode ─────────────────────────────
+
+
+def test_scaffold_pypi_mode_writes_pypi_flavored_files(tmp_path):
+    """End-to-end: ``mode='pypi'`` produces Dockerfile + compose.yml +
+    start.sh that all match the PyPI shape."""
+    from mimir.scaffold_docker import scaffold
+    result = scaffold(
+        tmp_path, service_name="test-agent", web_port=8092,
+        mode="pypi", mimir_extras=["anthropic"],
+    )
+    assert any("Dockerfile" in f for f in result.files_written)
+    df = (tmp_path / "Dockerfile").read_text()
+    cy = (tmp_path / "compose.yml").read_text()
+    ss = (tmp_path / "start.sh").read_text()
+    assert 'ARG MIMIR_EXTRAS="anthropic"' in df
+    assert "workspace:" not in cy
+    assert "uv sync" not in ss
+    # start.sh is executable.
+    assert (tmp_path / "start.sh").stat().st_mode & 0o111
+
+
+def test_scaffold_unknown_mode_raises(tmp_path):
+    from mimir.scaffold_docker import scaffold
+    with pytest.raises(ValueError, match="unknown scaffold mode"):
+        scaffold(tmp_path, mode="not-a-mode")
+
+
+# ─── defensive userdel before useradd (issue surfaced in muninn-mimir) ─
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_render_dockerfile_includes_defensive_userdel(mode):
+    """Skill fragments — notably 1Password's apt package — can install
+    service users that grab UID 1000 before our useradd runs. Without
+    the defensive userdel, the build fails with exit code 4 ("UID
+    not unique"). Both modes must include the detect-and-delete block
+    so any future skill fragment that grabs a UID doesn't break the
+    image build. Caught by the muninn-mimir migration."""
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile([], mode=mode)
+    # The defensive block detects existing users / groups at the
+    # target UID/GID and removes them before useradd.
+    assert "existing_uid_user=$(getent passwd" in out
+    assert "userdel" in out
+    assert "groupdel" in out
+    # The actual useradd still runs.
+    assert 'useradd --uid "${USER_UID}"' in out
+
+
+def test_render_dockerfile_pypi_preserves_shell_extras_ref():
+    """Regression: ``str.replace`` is substring-based, and an earlier
+    draft used ``{MIMIR_EXTRAS}`` as the Python placeholder. That
+    string ALSO appears inside the shell ref ``${MIMIR_EXTRAS}`` on
+    the ``pip install`` line, so the Python replacement would mangle
+    the shell expansion at the same time, leaving a stray
+    ``$<extras-list>`` that the shell would treat as a variable
+    lookup at build time — producing an invalid ``pip install
+    mimir-agent[,discord,slack,mcp]`` (leading empty extra). Caught
+    by mimir-carreira review on #336.
+
+    The fix swapped to ``__MIMIR_EXTRAS__`` as the marker (can't
+    appear inside ``${VAR}``). This test pins both ends of the
+    invariant.
+    """
+    from mimir.scaffold_docker import render_dockerfile
+    out = render_dockerfile(
+        [], mode="pypi", mimir_extras=["anthropic", "discord"],
+    )
+    # The shell variable reference survives intact for runtime
+    # expansion via docker ARG.
+    assert '"mimir-agent[${MIMIR_EXTRAS}]"' in out
+    # The ARG default got the operator-supplied csv.
+    assert 'ARG MIMIR_EXTRAS="anthropic,discord"' in out
+    # No stray ``$anthropic`` artifact — what the bug would leave.
+    # (``mimir-agent[${MIMIR_EXTRAS}]`` is the legitimate use; the
+    # bug shape would be ``mimir-agent[$anthropic,discord]`` where
+    # the shell would try to expand ``$anthropic``.)
+    assert "$anthropic" not in out
+    assert "$discord" not in out
+
+
+def test_workspace_start_sh_guards_safe_directory():
+    """``safe.directory`` must be registered only when absent. start.sh
+    runs on every container start, so a bare ``git config --global --add
+    safe.directory`` accumulates a duplicate ~/.gitconfig entry per boot
+    (observed: 5 dupes). The add must be guarded by a presence check."""
+    from mimir.scaffold_docker import _START_SH_TEMPLATE as tpl
+    assert "safe.directory" in tpl
+    assert "--get-all safe.directory" in tpl and "grep -qxF" in tpl, (
+        "safe.directory --add must be guarded by a presence check"
+    )

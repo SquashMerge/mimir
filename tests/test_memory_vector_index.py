@@ -1,0 +1,355 @@
+"""Tests for mimir.saga.vector_index — FAISS-backed ANN.
+
+If faiss-cpu isn't available these tests skip — the recall fallback
+path is exercised by test_memory_tier2.py instead.
+"""
+from __future__ import annotations
+
+import sqlite3
+import struct
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from mimir.saga.vector_index import FAISS_AVAILABLE, VectorIndex
+
+
+pytestmark = pytest.mark.skipif(
+    not FAISS_AVAILABLE,
+    reason="faiss-cpu not installed; FAISS path tested via fallback elsewhere",
+)
+
+
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "mimir" / "saga" / "schema.sql"
+
+
+@pytest.fixture
+def conn():
+    c = sqlite3.connect(":memory:")
+    c.executescript(SCHEMA_PATH.read_text())
+    return c
+
+
+def _vec_bytes(vec: list[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def _insert_atom_with_embedding(
+    conn: sqlite3.Connection,
+    atom_id: str,
+    content: str,
+    vec: list[float],
+    *,
+    tombstoned: int = 0,
+):
+    from hashlib import sha256
+    h = sha256(content.encode()).hexdigest()[:32]
+    conn.execute(
+        "INSERT INTO atoms (id, content, content_hash, created_at, tombstoned) "
+        "VALUES (?, ?, ?, '2026-05-12T00:00:00Z', ?)",
+        (atom_id, content, h, tombstoned),
+    )
+    conn.execute(
+        "INSERT INTO embeddings (atom_id, provider, model, dim, vec, embedded_at) "
+        "VALUES (?, 'test', 'test-3d', ?, ?, '2026-05-12T00:00:00Z')",
+        (atom_id, len(vec), _vec_bytes(vec)),
+    )
+    conn.commit()
+
+
+# ─── build_from_db ───────────────────────────────────────────────────
+
+
+def test_build_from_db_empty(conn):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    assert idx.built
+    assert idx.total_vectors == 0
+
+
+def test_build_from_db_loads_all_live_atoms(conn):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "beta", [0.0, 1.0, 0.0])
+    _insert_atom_with_embedding(conn, "a3", "gamma", [0.0, 0.0, 1.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    assert idx.total_vectors == 3
+
+
+def test_build_from_db_skips_tombstoned(conn):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "beta", [0.0, 1.0, 0.0], tombstoned=1)
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    assert idx.total_vectors == 1
+    results = idx.search([1.0, 0.0, 0.0], top_k=10)
+    ids = [aid for aid, _ in results]
+    assert "a2" not in ids
+
+
+def test_build_from_db_reports_dim_mismatch(conn, caplog):
+    """A provider-switch mismatch is counted and reported."""
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "wrong", [1.0, 0.0])  # 2d
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    assert idx.total_vectors == 1
+    assert idx.dimension_mismatch_count == 1
+    assert "dropped 1 atom vectors with dimension mismatch" in caplog.text
+
+
+def test_build_from_db_all_skipped_clears_previous_state(conn):
+    _insert_atom_with_embedding(conn, "old", "old", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    assert idx.total_vectors == 1
+
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = 'old'")
+    _insert_atom_with_embedding(conn, "wrong", "wrong", [1.0, 0.0])
+    idx.build_from_db(conn)
+
+    assert idx.total_vectors == 0
+    assert idx._id_to_pos == {}
+    assert idx.search([1.0, 0.0, 0.0], top_k=5) == []
+
+
+# ─── search ──────────────────────────────────────────────────────────
+
+
+def test_search_returns_top_k(conn):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "beta", [0.9, 0.1, 0.0])
+    _insert_atom_with_embedding(conn, "a3", "gamma", [0.0, 0.0, 1.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    results = idx.search([1.0, 0.0, 0.0], top_k=2)
+    ids = [aid for aid, _ in results]
+    assert ids[0] == "a1"
+    assert "a3" not in ids  # least similar; should not be in top-2
+
+
+def test_search_ordering_by_similarity(conn):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "beta", [0.5, 0.5, 0.0])
+    _insert_atom_with_embedding(conn, "a3", "gamma", [0.0, 1.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    results = idx.search([1.0, 0.0, 0.0], top_k=3)
+    # Sorted desc by similarity.
+    sims = [s for _, s in results]
+    assert sims == sorted(sims, reverse=True)
+
+
+def test_search_empty_index_returns_empty(conn):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)  # empty DB
+    results = idx.search([1.0, 0.0, 0.0], top_k=5)
+    assert results == []
+
+
+def test_search_unbuilt_index_returns_empty():
+    idx = VectorIndex(dimension=3)
+    # Don't call build_from_db
+    results = idx.search([1.0, 0.0, 0.0], top_k=5)
+    assert results == []
+
+
+@pytest.mark.parametrize(
+    ("query_vec", "reason", "observed_dimension"),
+    [
+        (None, "missing_query_vector", None),
+        ([], "empty_query_vector", 0),
+        ([1.0, 0.0], "query_dimension_mismatch", 2),
+        ([1.0, 0.0, 0.0, 0.0], "query_dimension_mismatch", 4),
+        (["not-a-float"], "malformed_query_vector", None),
+    ],
+)
+def test_search_rejects_and_reports_malformed_query_vector(
+    conn, caplog, monkeypatch, query_vec, reason, observed_dimension,
+):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.saga.vector_index"):
+        assert idx.search(query_vec, top_k=5) == []
+
+    assert idx.total_vectors == 1
+    assert reason in caplog.text
+    assert "expected_dim=3" in caplog.text
+    if reason in {"malformed_query_vector", "query_dimension_mismatch"}:
+        assert events == [
+            (
+                "saga_vector_search_degraded",
+                {
+                    "reason": reason,
+                    "expected_dimension": 3,
+                    "observed_dimension": observed_dimension,
+                },
+            )
+        ]
+    else:
+        assert events == []
+
+
+def test_search_dimension_mismatch_event_rearms_after_recovery(
+    conn, monkeypatch,
+):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    assert idx.search([1.0, 0.0], top_k=5) == []
+    assert idx.search([1.0, 0.0], top_k=5) == []
+    assert len(events) == 1
+
+    assert idx.search([1.0, 0.0, 0.0], top_k=5)
+    assert idx.search([1.0, 0.0], top_k=5) == []
+    assert len(events) == 2
+
+
+# ─── incremental add ─────────────────────────────────────────────────
+
+
+def test_add_grows_index(conn):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    assert idx.total_vectors == 1
+    idx.add("a2", _vec_bytes([0.0, 1.0, 0.0]))
+    assert idx.total_vectors == 2
+    results = idx.search([0.0, 1.0, 0.0], top_k=2)
+    ids = [aid for aid, _ in results]
+    assert "a2" in ids
+
+
+def test_add_reports_dim_mismatch(conn, caplog):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    idx.add("wrong", _vec_bytes([1.0, 0.0]))
+
+    assert idx.total_vectors == 0
+    assert idx.dimension_mismatch_count == 1
+    assert "dropped incremental vector wrong" in caplog.text
+
+
+def test_add_before_build_is_noop(conn):
+    """If build_from_db hasn't run, add() does nothing — the lazy build
+    will pick up the new atom from disk."""
+    idx = VectorIndex(dimension=3)
+    idx.add("a2", _vec_bytes([0.0, 1.0, 0.0]))
+    assert idx.total_vectors == 0
+
+
+def test_add_after_empty_build_initializes_index(conn):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    idx.add("a1", _vec_bytes([1.0, 0.0, 0.0]))
+
+    assert idx.total_vectors == 1
+    assert idx.search([1.0, 0.0, 0.0], top_k=1)[0][0] == "a1"
+
+
+def test_rebuild_if_needed_recovers_empty_built_index(conn):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+
+    assert idx.rebuild_if_needed(conn) is True
+    assert idx.search([1.0, 0.0, 0.0], top_k=1)[0][0] == "a1"
+
+
+# ─── remove (soft) ───────────────────────────────────────────────────
+
+
+def test_remove_filters_from_search(conn):
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "alpha2", [0.99, 0.01, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    idx.remove("a1")
+    results = idx.search([1.0, 0.0, 0.0], top_k=5)
+    ids = [aid for aid, _ in results]
+    assert "a1" not in ids
+    assert "a2" in ids
+
+
+# ─── chainlink #235: re-add must mark old position removed ──────────
+
+
+def test_readd_same_atom_id_marks_old_position_removed(conn):
+    """chainlink #235: calling add() twice for the same atom_id used to
+    leak the old position — FAISS retained the prior vector but
+    ``_id_to_pos`` overwrote the position pointer, so search() could
+    return a stale-vector entry mapped back to the same id (with the
+    old content's similarity score).
+
+    Verify the old position lands in ``_removed`` so search filters it
+    correctly.
+    """
+    _insert_atom_with_embedding(conn, "a1", "old", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    # Initial state: a1 at position 0.
+    pos_a1_v1 = idx._id_to_pos["a1"]
+    assert pos_a1_v1 not in idx._removed
+
+    # Re-add a1 with a new vector — simulates a re-embed.
+    idx.add("a1", _vec_bytes([0.0, 1.0, 0.0]))
+
+    # The old position must now be in _removed.
+    assert pos_a1_v1 in idx._removed, (
+        "old position not marked removed on re-add — chainlink #235 regression"
+    )
+    # _pos_to_id at the old position must be cleared (so search can't
+    # walk back to a1 via the orphan slot).
+    assert pos_a1_v1 not in idx._pos_to_id, (
+        "_pos_to_id still maps the orphan position back to a1"
+    )
+    # _id_to_pos now points at the NEW position.
+    assert idx._id_to_pos["a1"] != pos_a1_v1
+
+
+def test_readd_search_returns_new_vector_not_stale(conn):
+    """Functional end-to-end: re-adding a1 with a different vector,
+    search() must not return the stale (old-vector) similarity score.
+    """
+    _insert_atom_with_embedding(conn, "a1", "old", [1.0, 0.0, 0.0])
+    _insert_atom_with_embedding(conn, "a2", "other", [0.0, 0.0, 1.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    # Re-add a1 with a NEW vector pointing the opposite direction.
+    idx.add("a1", _vec_bytes([0.0, 1.0, 0.0]))
+
+    # Query for the OLD vector direction. With the fix, a1's old
+    # position is removed → a2 (the other unrelated atom) is closer
+    # OR a1 is returned but with the NEW vector's (low) similarity.
+    # Pre-fix, the stale a1 vector would have ~1.0 similarity for this
+    # query — the headline regression.
+    results = idx.search([1.0, 0.0, 0.0], top_k=3)
+    by_id = {aid: score for aid, score in results}
+
+    # If a1 is in the results, its similarity should reflect the NEW
+    # vector ([0,1,0] vs query [1,0,0] is orthogonal → ~0 similarity),
+    # not the OLD vector ([1,0,0] vs query [1,0,0] is identical → ~1.0).
+    if "a1" in by_id:
+        assert by_id["a1"] < 0.5, (
+            f"search returned a1 with stale-vector similarity "
+            f"{by_id['a1']:.3f}; expected <0.5 reflecting the new "
+            f"[0,1,0] vector. Pre-fix value was ~1.0."
+        )

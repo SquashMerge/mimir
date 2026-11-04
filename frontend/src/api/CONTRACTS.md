@@ -1,0 +1,109 @@
+# React Dashboard API Contracts
+
+## Strategy
+
+The aiohttp contract source of truth is `mimir/web_contracts.py`. React types
+are generated from that module into `frontend/src/api/generated/contracts.ts`;
+dashboard code must import generated types or compatibility aliases built from
+them, not copy Python response dictionaries by hand.
+
+Regenerate after contract edits with:
+
+```sh
+python -m mimir.web_contracts > frontend/src/api/generated/contracts.ts
+```
+
+This is deliberately not a full OpenAPI migration. The current scope is the
+React dashboard parity surface inventoried from the legacy pages:
+
+- `GET /api/v1/web/bootstrap`
+- `GET /api/v1/turns`
+- `GET /api/v1/events`
+- `GET /api/v1/live-events`
+- `GET /api/v1/ops`
+- `GET /api/v1/saga`
+- `POST /api/v1/saga/sql` when `MIMIR_SAGA_SQL_ENABLED=1`
+- `GET /api/v1/memory`
+- `GET /api/v1/chat/skills`
+- `POST /api/v1/chat`
+
+Legacy `/api/*` and `/chat` routes remain compatible with the static HTML pages
+until those pages are cut over.
+
+## Chat skill discovery
+
+`GET /api/v1/chat/skills` returns the standard v1 success envelope with
+`ChatSkillsData` in `data`.
+
+- Discovery disabled: `{"enabled": false, "skills": []}`
+- Discovery enabled with an empty operator allowlist: `{"enabled": true, "skills": []}`
+- Populated discovery: `{"enabled": true, "skills": [{"id": "github", "command": "/github", "label": "GitHub", "description": "Work with PRs, issues, and CI."}]}`
+
+This payload is server-authoritative. It only exposes the globally curated
+allowlisted skills returned by the endpoint and does not imply per-user RBAC or
+broader skill enumeration beyond the response itself.
+
+## Envelope
+
+Successful v1 REST responses use:
+
+```json
+{"ok": true, "version": "v1", "data": {}, "meta": {"cursor": null, "limit": 50, "total": 100, "truncated": true}}
+```
+
+Errors use:
+
+```json
+{"ok": false, "version": "v1", "error": {"code": "missing_query", "message": "q param required"}}
+```
+
+List-like responses use the same metadata fields whenever applicable:
+`cursor`, `limit`, `total`, and `truncated`.
+
+## Live Events
+
+Live stream payloads are a separate discriminated union because SSE transport
+details are outside the REST contract. The Python constructors and validator
+live in `mimir/web_contracts.py`; TypeScript receives the generated `LiveEvent`
+union with `kind` discriminators:
+
+- `chat.message`
+- `chat.reaction`
+- `turn.event`
+- `turn.lifecycle`
+
+Existing `/chat/stream` payloads also keep legacy fields such as `_event` for
+backward compatibility.
+
+`GET /api/v1/live-events` is the shared React dashboard SSE substrate. It uses
+fetch-based SSE with `X-API-Key` auth, never URL-carried keys. Each SSE data
+payload is a `LiveEventStreamItem`:
+
+```json
+{"id": "turn:t1:event:1", "cursor": "2026-01-01T00:00:00Z:t1:000001", "ts": "2026-01-01T00:00:00Z", "event": {"kind": "turn.event", "turn_id": "t1", "event": {"type": "tool_call"}}}
+```
+
+Reconnect with `?since=<last cursor>`; cursors are timestamp-prefixed so lexical order matches delivery order, and backfill is strict (`cursor > since`) so
+the last acknowledged item is not replayed. Clients should also deduplicate by
+`id`, because reconnects and log rewrites can overlap.
+
+TanStack Query integration policy: high-frequency events for the selected turn
+must update local/query state directly. Aggregate views should debounce and
+coalesce invalidation instead of calling `invalidateQueries` for every event.
+`LiveEventsProvider` implements this policy with a structural query-client
+interface so the frontend does not need to add TanStack Query before pages are
+cut over.
+
+## Dashboard Extensions
+
+`GET /api/v1/web/bootstrap` includes `dashboard_extensions`, the enabled
+first-party dashboard manifest list. This is trusted metadata for navigation and
+debugging, not a remote plugin loader. The manifest schema and security boundary
+are documented in `docs/react-dashboard-extensions.md`.
+
+## Versioning
+
+`/api/v1/*` may add optional fields without a version bump. Removing fields,
+renaming fields, changing discriminator values, or changing envelope semantics
+requires a new versioned path. Legacy non-v1 endpoints are compatibility
+surfaces for the static pages only and should not gain new React dependencies.

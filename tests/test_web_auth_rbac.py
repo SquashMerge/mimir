@@ -1,0 +1,744 @@
+"""Per-user web auth + RBAC: middleware gate, /whoami, chat attribution (#726)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import ssl
+from pathlib import Path
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
+
+from mimir.bridges.web_chat import WebChatBridge
+from mimir.turn_event_bus import TurnEventBus
+from mimir.identities import IdentityResolver
+from mimir.identities_populator import issue_web_key
+from mimir import web_ui
+from mimir.server import (_is_admin_required, _make_auth_middleware,
+                          _web_session_post, _web_session_get, _web_session_delete)
+from mimir.web_ui import _whoami_payload, web_gate_active
+from tests.timing import HANG_GUARD_SECONDS
+
+
+def test_legacy_dashboard_auth_exchanges_and_deletes_stored_key():
+    script = (Path(__file__).resolve().parents[1] / "mimir/web_auth.js").read_text()
+    assert 'window.localStorage.removeItem(API_KEY_LS)' in script
+    assert '"/api/v1/web/session"' in script
+    assert 'window.localStorage.setItem(API_KEY_LS' not in script
+
+
+async def _echo(request: web.Request) -> web.Response:
+    ident = request.get("auth_identity")
+    return web.json_response({
+        "canonical": ident.canonical if ident else None,
+        "is_master": bool(request.get("auth_is_master")),
+        "is_admin": bool(request.get("auth_is_admin")),
+    })
+
+
+async def test_cookie_session_requires_valid_header_and_keeps_csrf_gate(tmp_path: Path) -> None:
+    app = _app(tmp_path, "master-secret")
+    app["api_key"] = "master-secret"
+    app.router.add_post("/api/v1/web/session", _web_session_post)
+    app.router.add_get("/api/v1/web/session", _web_session_get)
+    app.router.add_delete("/api/v1/web/session", _web_session_delete)
+    app.router.add_post("/api/v1/turns", _echo)
+    async with TestClient(TestServer(app)) as c:
+        bad = await c.post("/api/v1/web/session", headers={"X-API-Key": "wrong"})
+        assert bad.status == 401 and "Set-Cookie" not in bad.headers
+        good = await c.post("/api/v1/web/session", headers={"X-API-Key": "master-secret"})
+        assert good.status == 200
+        cookie = good.cookies["mimir_session"]
+        assert cookie["httponly"] and cookie["samesite"] == "Strict"
+        assert not cookie["secure"]  # plain HTTP, including localhost
+        assert cookie["path"] == "/"
+        only_cookie = {"Cookie": "mimir_session=master-secret"}
+        assert (await c.get("/api/v1/turns", headers=only_cookie)).status == 200
+        assert (await c.post("/api/v1/turns", headers={**only_cookie, "Sec-Fetch-Site": "cross-site"})).status == 403
+        assert (await c.post("/api/v1/turns", headers={"X-API-Key": "master-secret"})).status == 200
+        cleared = await c.delete("/api/v1/web/session", headers=only_cookie)
+        assert cleared.cookies["mimir_session"]["max-age"] == "0"
+        for host in ("example.org", "192.168.1.20:8080", "localhost"):
+            public = await c.post("/api/v1/web/session", headers={"X-API-Key": "master-secret", "Host": host})
+            assert public.status == 200
+            cookie = public.cookies["mimir_session"]
+            assert not cookie["secure"], host
+            assert cookie["httponly"] and cookie["samesite"] == "Strict" and cookie["path"] == "/"
+        proxied = await c.post("/api/v1/web/session", headers={
+            "X-API-Key": "master-secret", "Host": "example.org", "X-Forwarded-Proto": "https, http",
+        })
+        cookie = proxied.cookies["mimir_session"]
+        assert cookie["secure"] and cookie["httponly"] and cookie["samesite"] == "Strict" and cookie["path"] == "/"
+
+    # A TLS transport cannot be downgraded by a forwarded HTTP claim.
+    for headers in ({}, {"X-Forwarded-Proto": "http"}):
+        request = make_mocked_request(
+            "POST", "/api/v1/web/session",
+            headers={"X-API-Key": "master-secret", "Host": "example.org", **headers},
+            app=app, sslcontext=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER),
+        )
+        assert request.secure
+        response = await _web_session_post(request)
+        cookie = response.cookies["mimir_session"]
+        assert cookie["secure"] and cookie["httponly"] and cookie["samesite"] == "Strict" and cookie["path"] == "/"
+
+    # The handler also refuses bad credentials independently of the middleware.
+    bad_request = make_mocked_request(
+        "POST", "/api/v1/web/session", headers={"X-API-Key": "wrong"}, app=app,
+    )
+    bad_response = await _web_session_post(bad_request)
+    assert bad_response.status == 401 and "mimir_session" not in bad_response.cookies
+
+
+def _resolver(home: Path) -> IdentityResolver:
+    r = IdentityResolver(home)
+    r.reload()
+    return r
+
+
+def _app(home: Path, master_key: str) -> web.Application:
+    app = web.Application(middlewares=[_make_auth_middleware(master_key)])
+    app["identity_resolver"] = _resolver(home)
+    app.router.add_get("/api/v1/turns", _echo)         # auth, non-admin
+    app.router.add_get("/api/v1/admin/config", _echo)  # auth + admin
+    app.router.add_get("/api/v1/saga", _echo)          # auth + admin: global atoms
+    app.router.add_post("/api/v1/saga/sql", _echo)     # auth + admin: global SQL
+    app.router.add_get("/api/v1/memory", _echo)        # auth + admin: global files
+    app.router.add_get("/api/v1/wiki", _echo)          # auth + admin: global wiki files
+    app.router.add_get("/api/v1/wiki/{slug:.+}", _echo)
+    app.router.add_get("/api/saga", _echo)             # legacy auth + admin: global atoms
+    app.router.add_post("/api/saga/sql", _echo)        # legacy auth + admin: global SQL
+    app.router.add_get("/api/memory", _echo)           # legacy auth + admin: global files
+    app.router.add_get("/api/ops", _echo)              # legacy global ops dashboard
+    app.router.add_get("/api/v1/ops", _echo)           # global ops dashboard
+    app.router.add_get("/api/v1/scheduler", _echo)     # global scheduler dashboard
+    app.router.add_get("/api/v1/chainlink-board", _echo)  # global task dashboard
+    app.router.add_get(
+        "/api/v1/chainlink-board/artifact", _echo,
+    )  # Worklink artifacts
+    app.router.add_get("/health", _echo)               # exempt
+    return app
+
+
+# ── middleware: the RBAC security gate ──────────────────────────────────
+
+
+async def test_user_key_allowed_on_normal_route_but_403_on_admin(tmp_path: Path) -> None:
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        r = await c.get("/api/v1/turns", headers={"X-API-Key": user_key})
+        assert r.status == 200
+        body = await r.json()
+        assert body["canonical"] == "alice" and body["is_admin"] is False
+        r2 = await c.get("/api/v1/admin/config", headers={"X-API-Key": user_key})
+        assert r2.status == 403  # the RBAC boundary — server-side, not UI
+
+
+
+
+async def test_saga_memory_and_wiki_routes_are_admin_only(tmp_path: Path) -> None:
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        for path in (
+            "/api/v1/saga",
+            "/api/v1/memory",
+            "/api/v1/wiki",
+            "/api/v1/wiki/alpha",
+            "/api/saga",
+            "/api/memory",
+        ):
+            user_resp = await c.get(path, headers={"X-API-Key": user_key})
+            assert user_resp.status == 403, path
+            admin_resp = await c.get(path, headers={"X-API-Key": admin_key})
+            assert admin_resp.status == 200, path
+            master_resp = await c.get(path, headers={"X-API-Key": "master-secret"})
+            assert master_resp.status == 200, path
+
+        for path in ("/api/v1/saga/sql", "/api/saga/sql"):
+            user_sql = await c.post(path, headers={"X-API-Key": user_key})
+            assert user_sql.status == 403, path
+            admin_sql = await c.post(path, headers={"X-API-Key": admin_key})
+            assert admin_sql.status == 200, path
+
+
+async def test_global_dashboard_routes_are_admin_only(tmp_path: Path) -> None:
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    admin_only_paths = (
+        "/api/ops",
+        "/api/v1/ops",
+        "/api/v1/scheduler",
+        "/api/v1/chainlink-board",
+        "/api/v1/chainlink-board/artifact",
+    )
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        for path in admin_only_paths:
+            denied = await c.get(path, headers={"X-API-Key": user_key})
+            assert denied.status == 403, path
+
+            admin = await c.get(path, headers={"X-API-Key": admin_key})
+            assert admin.status == 200, path
+
+            master = await c.get(path, headers={"X-API-Key": "master-secret"})
+            assert master.status == 200, path
+
+
+async def test_board_pagination_and_selected_detail_remain_admin_only(tmp_path: Path, monkeypatch) -> None:
+    from mimir import chainlink_board
+
+    calls = []
+
+    async def run(home, args):
+        calls.append(args)
+        if args == ["export", "--json"]:
+            return {"version": 1, "exported_at": "2026-06-18T03:00:00Z", "issues": [{
+                "id": 1214, "title": "Private task", "status": "open",
+                "priority": "normal", "labels": [], "parent_id": None,
+                "description": "Private summary", "comments": [], "closed_at": None,
+                "created_at": "2026-06-17T00:00:00Z", "updated_at": "2026-06-18T00:00:00Z",
+            }]}, None
+        return {"id": 1214, "description": "Private detail"}, None
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    app = web.Application(middlewares=[_make_auth_middleware("master-secret")])
+    app["identity_resolver"] = _resolver(tmp_path)
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    path = "/api/v1/chainlink-board?offset=250&show_completed=false&issue=1214"
+    async with TestClient(TestServer(app)) as client:
+        for key, status in (("", 401), ("invalid", 401), (user_key, 403)):
+            response = await client.get(path, headers={"X-API-Key": key})
+            assert response.status == status
+            assert calls == []
+        for key in (admin_key, "master-secret"):
+            response = await client.get(path, headers={"X-API-Key": key})
+            assert response.status == 200
+            data = (await response.json())["data"]
+            assert data["issues"] == []
+            assert data["selected_issue"]["description"] == "Private detail"
+        assert len(calls) == 4
+
+
+def test_admin_required_prefix_matching_is_segment_aware() -> None:
+    for path in (
+        "/api/v1/admin",
+        "/api/v1/admin/config",
+        "/api/ops",
+        "/api/ops/health",
+        "/api/v1/ops",
+        "/api/v1/ops/health",
+        "/api/v1/scheduler",
+        "/api/v1/scheduler/jobs",
+        "/api/v1/chainlink-board",
+        "/api/v1/chainlink-board/artifact",
+        "/api/v1/saga",
+        "/api/v1/saga/sql",
+        "/api/v1/memory",
+        "/api/v1/memory/file",
+        "/api/v1/wiki",
+        "/api/v1/wiki/alpha",
+        "/api/saga",
+        "/api/saga/sql",
+        "/api/memory",
+        "/api/memory/file",
+    ):
+        assert _is_admin_required(path), path
+
+    for path in (
+        "/api/v1/adminish",
+        "/api/opsical",
+        "/api/v1/opsical",
+        "/api/v1/schedulerish",
+        "/api/v1/chainlink-boardwalk",
+        "/api/v1/chainlink",
+        "/api/v1/factory-runsish",
+        "/api/v1/sagacity",
+        "/api/v1/memoryless",
+        "/api/v1/wikilinks",
+        "/api/sagacity",
+        "/api/memoryless",
+        "/api/v1/turns",
+    ):
+        assert not _is_admin_required(path), path
+
+
+def test_admin_dashboard_sections_are_server_gated() -> None:
+    """Every admin-only dashboard section must be enforced by the server-side
+    ``_ADMIN_REQUIRED_PREFIXES`` gate — not merely hidden from the React nav.
+
+    A manifest ``requires_role="admin"`` is UX only; the real boundary is the
+    server gate. This drift guard catches an admin section being added (or a
+    namespace renamed) without a matching server prefix — the exact shape of
+    the ``factory-runs`` gap, where the section was admin in the React nav but
+    ``/api/v1/factory-runs`` was reachable by any authenticated non-admin.
+    """
+    from mimir.dashboard_extensions import first_party_dashboard_extensions
+
+    registry = first_party_dashboard_extensions()
+    for manifest in registry.manifests:
+        if manifest.requires_role != "admin" or not manifest.api_namespace:
+            continue
+        ns = manifest.api_namespace
+        # admin-config / admin-users register their backend routes under
+        # /api/v1/admin/… (already covered by the /api/v1/admin prefix); their
+        # namespace deliberately differs from their route prefix.
+        if ns.startswith("admin"):
+            assert _is_admin_required("/api/v1/admin/config"), ns
+            continue
+        assert _is_admin_required(f"/api/v1/{ns}"), (
+            f"dashboard section {manifest.id!r} is admin-only in the manifest "
+            f"but /api/v1/{ns} is not covered by _ADMIN_REQUIRED_PREFIXES "
+            f"(React nav hiding is UX only)"
+        )
+
+
+async def test_admin_key_allowed_on_admin_route(tmp_path: Path) -> None:
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        r = await c.get("/api/v1/admin/config", headers={"X-API-Key": admin_key})
+        assert r.status == 200
+        body = await r.json()
+        assert body["canonical"] == "ops" and body["is_admin"] is True
+
+
+async def test_master_key_is_admin_but_no_identity(tmp_path: Path) -> None:
+    issue_web_key(tmp_path, "alice", roles=["user"])
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        r = await c.get("/api/v1/admin/config", headers={"X-API-Key": "master-secret"})
+        assert r.status == 200
+        body = await r.json()
+        assert body["is_master"] is True and body["is_admin"] is True
+        assert body["canonical"] is None  # master key carries no user identity
+
+
+async def test_unknown_and_missing_keys_rejected(tmp_path: Path) -> None:
+    issue_web_key(tmp_path, "alice", roles=["user"])
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        assert (await c.get("/api/v1/turns", headers={"X-API-Key": "nope"})).status == 401
+        assert (await c.get("/api/v1/turns")).status == 401  # no key
+
+
+async def test_exempt_route_needs_no_key(tmp_path: Path) -> None:
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        assert (await c.get("/health")).status == 200
+
+
+async def test_unauthorized_identity_rejected(tmp_path: Path) -> None:
+    # A person with a key but NO roles is authenticated-but-unauthorized.
+    key = issue_web_key(tmp_path, "stranger", roles=[])
+    async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
+        assert (await c.get("/api/v1/turns", headers={"X-API-Key": key})).status == 401
+
+
+async def test_dev_open_mode_when_no_key_and_no_users(tmp_path: Path) -> None:
+    # No master key + no web keys → legacy open path for ordinary localhost
+    # development, but administration is never part of that open surface.
+    async with TestClient(TestServer(_app(tmp_path, ""))) as c:
+        r = await c.get("/api/v1/turns")
+        assert r.status == 200
+        assert (await r.json())["canonical"] is None  # no identity attached
+        assert (await c.get("/api/v1/admin/config")).status == 401
+
+
+async def test_failsafe_gate_active_when_users_exist_without_master(tmp_path: Path) -> None:
+    # Web keys configured but MIMIR_API_KEY unset → gate must still activate,
+    # so adding users can't leave the server wide open.
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    async with TestClient(TestServer(_app(tmp_path, ""))) as c:
+        assert (await c.get("/api/v1/turns")).status == 401  # no key → blocked
+        ok = await c.get("/api/v1/turns", headers={"X-API-Key": user_key})
+        assert ok.status == 200 and (await ok.json())["canonical"] == "alice"
+
+
+async def test_gate_stays_closed_after_all_web_keys_disappear(
+    tmp_path: Path, caplog,
+) -> None:
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    app = _app(tmp_path, "")
+    resolver = app["identity_resolver"]
+    async with TestClient(TestServer(app)) as c:
+        assert (await c.get("/api/v1/turns", headers={"X-API-Key": user_key})).status == 200
+        from mimir.identities_populator import revoke_web_key
+
+        revoke_web_key(tmp_path, "alice")
+        with caplog.at_level("WARNING", logger="mimir.identities"):
+            resolver.reload()
+
+        assert web_gate_active("", resolver) is True
+        assert "removed every web key" in caplog.text
+        assert "gate closed" in caplog.text
+        assert (await c.get("/api/v1/turns")).status == 401
+        assert (await c.get("/api/v1/admin/config")).status == 401
+
+
+# ── /whoami payload ─────────────────────────────────────────────────────
+
+
+def test_whoami_payload_master() -> None:
+    p = _whoami_payload(None, True)
+    assert p["is_master"] and p["is_admin"] and p["roles"] == ["admin"] and p["canonical"] is None
+
+
+def test_whoami_payload_user(tmp_path: Path) -> None:
+    issue_web_key(tmp_path, "alice", roles=["user"])
+    from mimir.identities_populator import set_user_prefs
+
+    set_user_prefs(tmp_path, "alice", {"skin": "cosmic-nebula"})
+    ident = _resolver(tmp_path).identity("alice")
+    p = _whoami_payload(ident, False)
+    assert p == {
+        "canonical": "alice", "display_name": None,
+        "roles": ["user"], "is_admin": False, "is_master": False,
+        "prefs": {"skin": "cosmic-nebula"},
+    }
+
+
+def test_whoami_payload_empty() -> None:
+    assert _whoami_payload(None, False) == {
+        "canonical": None, "display_name": None,
+        "roles": [], "is_admin": False, "is_master": False,
+        "prefs": {},
+    }
+
+
+# ── gate predicate (shared by middleware + bootstrap) ───────────────────
+
+
+def test_web_gate_active_predicate(tmp_path: Path) -> None:
+    assert web_gate_active("master", None) is True            # master key set
+    assert web_gate_active("", None) is False                 # dev: no key, no resolver
+    assert web_gate_active("", _resolver(tmp_path)) is False  # resolver, but no web keys
+    issue_web_key(tmp_path, "alice", roles=["user"])          # now a web key exists
+    assert web_gate_active("", _resolver(tmp_path)) is True   # fail-safe: gate on w/o master
+    assert web_gate_active(None, _resolver(tmp_path)) is True
+
+
+class _Config:
+    web_host = "127.0.0.1"
+
+
+def _bootstrap_app(home: Path, master_key: str, *, with_user: bool) -> web.Application:
+    if with_user:
+        issue_web_key(home, "alice", roles=["user"])
+    app = web.Application()
+    app["api_key"] = master_key
+    app["config"] = _Config()
+    app["identity_resolver"] = _resolver(home)
+    web_ui.register_routes(
+        app,
+        turns_log=home / "t.jsonl",
+        events_log=home / "e.jsonl",
+        react_app_dist=home / "missing-dist",
+    )
+    return app
+
+
+async def test_bootstrap_reports_gate_active_with_webkeys_and_no_master(tmp_path: Path) -> None:
+    # The bug mimir caught: no MIMIR_API_KEY but per-user keys exist → the
+    # middleware gates, so bootstrap must tell the browser auth is required.
+    async with TestClient(TestServer(_bootstrap_app(tmp_path, "", with_user=True))) as c:
+        body = await (await c.get("/api/v1/web/bootstrap")).json()
+        assert set(body["data"]) == {"version", "auth"}
+        assert body["data"]["auth"] == {"required": True}
+
+
+async def test_bootstrap_dev_mode_reports_no_auth(tmp_path: Path) -> None:
+    async with TestClient(TestServer(_bootstrap_app(tmp_path, "", with_user=False))) as c:
+        body = await (await c.get("/api/v1/web/bootstrap")).json()
+        assert body["data"]["auth"]["required"] is False
+        assert body["data"]["server"]["unauthenticated_allowed"] is True
+
+
+# ── web-chat trusted attribution ────────────────────────────────────────
+
+
+class _FakeRequest(dict):
+    """Minimal request: a MutableMapping (for request.get) + async json()."""
+
+    def __init__(self, body: dict, **attrs) -> None:
+        super().__init__()
+        self.update(attrs)
+        self._body = body
+
+    async def json(self) -> dict:
+        return self._body
+
+
+def _bridge(tmp_path: Path) -> WebChatBridge:
+    async def _noop(_event) -> bool:
+        return True
+
+    return WebChatBridge(enqueue=_noop, home=tmp_path)
+
+
+async def test_chat_author_from_identity_not_client_body(tmp_path: Path) -> None:
+    issue_web_key(tmp_path, "alice", roles=["user"])
+    ident = _resolver(tmp_path).identity("alice")
+    req = _FakeRequest(
+        {"content": "hi", "author": "SPOOFED", "author_id": "SPOOFED"},
+        auth_identity=ident,
+        auth_is_master=False,
+    )
+    event, channel_id, err = await _bridge(tmp_path)._build_inbound_event(req)
+    assert err is None and event is not None
+    assert event.author_id == "alice"  # from the authenticated key, NOT spoofed
+    assert event.author == "alice"
+    # An authenticated user's default-channel post routes to their own per-user
+    # web channel (chainlink: web-chat history scoping), not the shared default.
+    assert channel_id == "web-alice"
+
+
+async def test_chat_master_key_rejected(tmp_path: Path) -> None:
+    req = _FakeRequest({"content": "hi"}, auth_is_master=True)
+    event, channel_id, err = await _bridge(tmp_path)._build_inbound_event(req)
+    assert event is None and err is not None and err.status == 403
+
+
+async def test_chat_dev_mode_rejected_without_identity(tmp_path: Path) -> None:
+    # Chat is always per-user state now: dev/open mode can leave non-chat routes
+    # unauthenticated, but chat may not fall back to client-asserted identity or
+    # a shared web-default channel.
+    req = _FakeRequest({"content": "hi", "author": "alice", "author_id": "web-alice"})
+    event, _channel, err = await _bridge(tmp_path)._build_inbound_event(req)
+    assert event is None and err is not None and err.status == 401
+
+
+# ── per-user data scoping for React log/session/live endpoints ───────────
+
+
+def _scoped_web_app(home: Path, master_key: str) -> tuple[web.Application, Path, Path]:
+    turns_log = home / "turns.jsonl"
+    events_log = home / "events.jsonl"
+    app = web.Application(middlewares=[_make_auth_middleware(master_key)])
+    app["identity_resolver"] = _resolver(home)
+    web_ui.register_routes(
+        app,
+        turns_log=turns_log,
+        events_log=events_log,
+        home=home,
+        react_app_dist=home / "missing-dist",
+        turn_event_bus=TurnEventBus(),
+    )
+    return app, turns_log, events_log
+
+
+def _jsonl(path: Path, rows: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+
+async def test_user_turns_endpoint_filters_to_own_web_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    bob_key = issue_web_key(tmp_path, "bob", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
+    _jsonl(turns_log, [
+        {"turn_id": "a1", "channel_id": "web-alice"},
+        {"turn_id": "b1", "channel_id": "web-bob"},
+    ])
+
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/v1/turns", headers={"X-API-Key": alice_key})
+        body = await r.json()
+        assert r.status == 200
+        assert [t["turn_id"] for t in body["data"]["turns"]] == ["a1"]
+
+        denied = await c.get(
+            "/api/v1/turns?channel=web-bob",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+        bob = await c.get("/api/v1/turns", headers={"X-API-Key": bob_key})
+        assert [t["turn_id"] for t in (await bob.json())["data"]["turns"]] == ["b1"]
+
+        admin = await c.get("/api/v1/turns", headers={"X-API-Key": admin_key})
+        assert [t["turn_id"] for t in (await admin.json())["data"]["turns"]] == ["a1", "b1"]
+
+
+async def test_user_sessions_endpoint_filters_and_rejects_cross_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
+    _jsonl(turns_log, [
+        {
+            "turn_id": "a1",
+            "ts": "2026-06-21T01:00:00Z",
+            "trigger": "user_message",
+            "channel_id": "web-alice",
+            "input": "alice prompt",
+        },
+        {
+            "turn_id": "b1",
+            "ts": "2026-06-21T01:00:00Z",
+            "trigger": "scheduled_tick",
+            "channel_id": "web-bob",
+            "input": "bob prompt",
+        },
+        {
+            "turn_id": "o1",
+            "ts": "2026-06-21T01:00:00Z",
+            "trigger": "ops_event",
+            "channel_id": "discord-ops",
+            "input": "ops prompt",
+        },
+    ])
+
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/v1/sessions", headers={"X-API-Key": alice_key})
+        body = await r.json()
+        assert r.status == 200
+        assert body["meta"]["total"] == 1
+        assert body["data"]["sessions"][0]["channel_id"] == "web-alice"
+        # Facets are part of the API response too; they must be derived from the
+        # caller-visible session set rather than all sessions in the store.
+        assert body["data"]["channels"] == ["web-alice"]
+        assert body["data"]["triggers"] == ["user_message"]
+
+        denied = await c.get(
+            "/api/v1/sessions?channel=web-bob",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+        admin = await c.get(
+            "/api/v1/sessions?channel=discord-ops",
+            headers={"X-API-Key": admin_key},
+        )
+        admin_body = await admin.json()
+        assert admin.status == 200
+        assert admin_body["meta"]["total"] == 1
+        assert admin_body["data"]["sessions"][0]["channel_id"] == "discord-ops"
+
+
+async def test_user_events_endpoints_filter_to_own_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    admin_key = issue_web_key(tmp_path, "ops", roles=["admin"])
+    app, _, events_log = _scoped_web_app(tmp_path, "master-secret")
+    _jsonl(events_log, [
+        {"timestamp": "2026-06-21T01:00:00Z", "type": "tool", "channel_id": "web-alice"},
+        {"timestamp": "2026-06-21T01:00:01Z", "type": "tool", "channel_id": "web-bob"},
+        {
+            "timestamp": "2026-06-21T01:00:02Z",
+            "type": "alert",
+            "extra": {"source_channel_id": "web-alice"},
+        },
+    ])
+
+    async with TestClient(TestServer(app)) as c:
+        v1 = await c.get("/api/v1/events", headers={"X-API-Key": alice_key})
+        assert [e["timestamp"] for e in (await v1.json())["data"]["events"]] == [
+            "2026-06-21T01:00:00Z",
+            "2026-06-21T01:00:02Z",
+        ]
+
+        admin = await c.get("/api/v1/events", headers={"X-API-Key": admin_key})
+        assert len((await admin.json())["data"]["events"]) == 3
+
+
+async def test_user_live_events_endpoint_filters_every_poll_to_own_channel(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
+    alice_first = {
+        "turn_id": "a1",
+        "ts": "2026-06-21T01:00:00Z",
+        "channel_id": "web-alice",
+        "events": [
+            {
+                "type": "text",
+                "phase": "chunk",
+                "turn_id": "a1",
+                "channel_id": "web-alice",
+                "seq": 1,
+                "ts": "2026-06-21T01:00:00Z",
+                "text": "a",
+            }
+        ],
+    }
+    bob = {
+        "turn_id": "b1",
+        "ts": "2026-06-21T01:01:00Z",
+        "channel_id": "web-bob",
+        "events": [
+            {
+                "type": "text",
+                "phase": "chunk",
+                "turn_id": "b1",
+                "channel_id": "web-bob",
+                "seq": 1,
+                "ts": "2026-06-21T01:01:00Z",
+                "text": "b",
+            }
+        ],
+    }
+    alice_second = {
+        "turn_id": "a2",
+        "ts": "2026-06-21T01:02:00Z",
+        "channel_id": "web-alice",
+        "events": [{
+            "type": "text",
+            "phase": "chunk",
+            "turn_id": "a2",
+            "channel_id": "web-alice",
+            "seq": 1,
+            "ts": "2026-06-21T01:02:00Z",
+            "text": "a2",
+        }],
+    }
+    _jsonl(turns_log, [alice_first])
+    monkeypatch.setattr(web_ui, "LIVE_EVENTS_POLL_S", 0.01)
+
+    async def read_data(response) -> dict:
+        while True:
+            line = await asyncio.wait_for(response.content.readline(), timeout=HANG_GUARD_SECONDS)
+            assert line, "live-events stream ended before another event arrived"
+            if line.startswith(b"data: "):
+                return json.loads(line.removeprefix(b"data: "))
+
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/api/v1/live-events?limit=10", headers={"X-API-Key": alice_key})
+        assert r.status == 200
+        first = await read_data(r)
+        assert first["event"]["channel_id"] == "web-alice"
+
+        _jsonl(turns_log, [alice_first, bob, alice_second])
+        while True:
+            subsequent = await read_data(r)
+            assert subsequent["event"]["channel_id"] == "web-alice"
+            if subsequent["event"]["turn_id"] == "a2":
+                break
+        r.close()
+
+        denied = await c.get(
+            "/api/v1/live-events?channel=web-bob&once=1",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+
+async def test_user_turn_events_rejects_wildcard_and_cross_channel(tmp_path: Path) -> None:
+    alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    app, _, _ = _scoped_web_app(tmp_path, "master-secret")
+
+    async with TestClient(TestServer(app)) as c:
+        wildcard = await c.get("/api/v1/turn-events?channel=*", headers={"X-API-Key": alice_key})
+        assert wildcard.status == 403
+
+        denied = await c.get(
+            "/api/v1/turn-events?channel=web-bob",
+            headers={"X-API-Key": alice_key},
+        )
+        assert denied.status == 403
+
+        allowed = await c.get(
+            "/api/v1/turn-events?channel=web-alice",
+            headers={"X-API-Key": alice_key},
+        )
+        assert allowed.status == 200
+        assert allowed.headers["X-Accel-Buffering"] == "no"
+        allowed.close()

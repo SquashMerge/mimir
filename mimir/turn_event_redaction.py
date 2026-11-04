@@ -1,0 +1,158 @@
+"""Shared redaction helpers for live turn-event detail."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from mimir.shared_redaction_patterns import (
+    BARE_PROVIDER_TOKEN_PATTERNS,
+    CREDENTIAL_WORD_PATTERN,
+    JWT_PATTERN,
+    LOG_SECRET_PATTERNS,
+)
+
+
+_SECRET_PATTERNS = (
+    # Authorization: Bearer value and bare Bearer value shapes. Keep this before
+    # the generic authorization key/value pattern so it consumes the token, not
+    # just the literal "Bearer" prefix.
+    re.compile(r"(?i)\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+"),
+    # key=value, key: value, JSON, and Python dict-repr secret values.
+    re.compile(
+        r"(?i)(['\"]?[A-Za-z0-9_.:-]*" + CREDENTIAL_WORD_PATTERN + r"['\"]?\s*[:=]\s*)"
+        r"(?:['\"][^'\"]*['\"]|[^,\s}]+)"
+    ),
+    # Common provider / GitHub / AWS token prefixes.
+    re.compile(r"\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16})\b"),
+    *BARE_PROVIDER_TOKEN_PATTERNS,
+    JWT_PATTERN,
+)
+_PATH_PATTERN = re.compile(
+    r"(?<![\w:])(?:/[^\s,'\"}]+|~/[^\s,'\"}]+|[A-Za-z]:\\[^\s,'\"}]+|"
+    r"(?:attachments|scratch|state|memory|mimir|tests|frontend|docs|uploads|tmp|workspace)[/\\][^\s,'\"}]+)"
+)
+_SENSITIVE_KEY_PATTERN = re.compile(
+    CREDENTIAL_WORD_PATTERN, re.IGNORECASE
+)
+_CREDENTIAL_KEY_RUN = re.compile(r"(?i)['\"]?[A-Za-z0-9_.:-]+")
+_JWT_SEGMENT = re.compile(r"[A-Za-z0-9_-]+")
+_JWT_START = re.compile(r"\beyJ")
+MAX_LIVE_STRING_CHARS = 64 * 1024
+
+
+def _sub_jwts(text: str) -> str:
+    parts: list[str] = []
+    copied_to = 0
+    for segment in _JWT_SEGMENT.finditer(text):
+        if segment.start() < copied_to or text[segment.end() : segment.end() + 1] != ".":
+            continue
+        # All starts in one header share the same payload/signature. If the
+        # earliest start fails the grammar, later (shorter) headers fail too.
+        start = _JWT_START.search(text, segment.start(), segment.end())
+        if start is None:
+            continue
+        match = JWT_PATTERN.match(text, start.start())
+        if match is None:
+            continue
+        parts.append(text[copied_to : match.start()])
+        parts.append(match.expand(r"\1[redacted]"))
+        copied_to = match.end()
+    if not parts:
+        return text
+    parts.append(text[copied_to:])
+    return "".join(parts)
+
+
+def _sub_credentials(text: str, pattern: re.Pattern[str]) -> str:
+    # Like redaction._sub_colon_credentials, only match the original grammar
+    # at candidate keys. Scan maximal runs once rather than revisiting a run
+    # for each credential word (including repeated words in a non-matching key).
+    parts: list[str] = []
+    copied_to = 0
+    cursor = 0
+    while (candidate := _CREDENTIAL_KEY_RUN.search(text, cursor)) is not None:
+        cursor = candidate.end()
+        if _SENSITIVE_KEY_PATTERN.search(candidate.group()) is None:
+            continue
+        match = pattern.match(text, candidate.start())
+        if match is None:
+            continue
+        parts.append(text[copied_to : match.start()])
+        parts.append("[redacted]")
+        copied_to = match.end()
+        cursor = copied_to
+    if not parts:
+        return text
+    parts.append(text[copied_to:])
+    return "".join(parts)
+
+
+def scrub_detail(value: Any, *, limit: int = 320) -> str | None:
+    text = _clean(value, limit=limit * 2)
+    if not text:
+        return None
+    return _finalize_detail(scrub_text(text), limit=limit)
+
+
+def scrub_turn_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Return a redacted copy while preserving private IFC metadata in-process."""
+    private = {
+        key: event[key]
+        for key in ("_ifc_labels", "_auth_context")
+        if key in event
+    }
+    public = {key: value for key, value in event.items() if key not in private}
+    cleaned = scrub_value(public)
+    if not isinstance(cleaned, dict):
+        return private
+    cleaned.update(private)
+    return cleaned
+
+
+def scrub_value(value: Any, *, key: str | None = None) -> Any:
+    if key is not None and _SENSITIVE_KEY_PATTERN.search(str(key)):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {k: scrub_value(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(scrub_value(item) for item in value)
+    if isinstance(value, str):
+        return scrub_text(value[:MAX_LIVE_STRING_CHARS])
+    return value
+
+
+def scrub_text(text: str) -> str:
+    redacted = text
+    for pattern in LOG_SECRET_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
+    for pattern in _SECRET_PATTERNS:
+        if pattern is _SECRET_PATTERNS[1]:
+            redacted = _sub_credentials(redacted, pattern)
+            continue
+        if pattern is JWT_PATTERN:
+            redacted = _sub_jwts(redacted)
+            continue
+        replacement = r"\1[redacted]" if pattern.groups == 2 else "[redacted]"
+        redacted = pattern.sub(replacement, redacted)
+    return _PATH_PATTERN.sub("[path]", redacted)
+
+
+def _finalize_detail(text: str, *, limit: int) -> str | None:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if len(text) > limit:
+        return text[: limit - 3].rstrip() + "..."
+    return text
+
+
+def _clean(value: Any, *, limit: int = 240) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:limit]

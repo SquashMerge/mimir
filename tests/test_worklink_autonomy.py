@@ -1,0 +1,3975 @@
+"""Worklink slice-3 autonomy (chainlink #444).
+
+Covers the two review criteria explicitly:
+  * a TIGHT severity window provably stops autonomous worker launches, and
+  * no path lets two workers hold the same issue (cap + lock-fail);
+plus the concurrency cap, the TTL reaper's stale-claim recovery, and the
+ready-queue poller's discovery/dispatch (cap-respecting, detached).
+"""
+
+from __future__ import annotations
+
+import ast
+from dataclasses import replace
+import importlib.util
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from types import SimpleNamespace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Sequence
+
+import pytest
+
+from tests.plugin_selection import cultivate_selected
+
+if not cultivate_selected():
+    pytest.skip("Worklink autonomy requires selected Cultivate", allow_module_level=True)
+
+pytest.importorskip("mimir_cultivate")
+from mimir_cultivate.worklink import autonomy, orchestrator
+from mimir_cultivate.worklink.autonomy import check_concurrency
+from mimir_cultivate.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord, ReapResult
+from mimir_cultivate.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
+from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+from mimir_cultivate.worklink.compute import LaunchHandle
+from mimir_cultivate.worklink.control import archive_worklink_factory_records
+from mimir_cultivate.worklink.factory_state import (
+    FactoryRunRecord,
+    factory_checkout_interlock,
+    list_factory_records,
+    save_factory_record,
+)
+from mimir_cultivate.worklink.dispatch_failures import (
+    autonomous_dispatch_block_reason,
+    dispatch_failure_state_dir,
+    failure_state_transaction,
+    load_failure_state,
+    mark_failure_notified,
+    pending_failure_alerts,
+    record_failure,
+    record_success,
+    resolve_failure_if_current,
+    save_failure_state,
+)
+from mimir.pollers import _write_delivery_receipt
+
+
+def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_incident_occurrence_is_stable_until_guarded_resolution(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first = record_failure(
+        state_dir,
+        issue_id=91,
+        attempt=2,
+        exit_status=1,
+        error="worker failed",
+        log_path="first.log",
+        preserved_ref="refs/heads/preserved",
+        work_path="/work/original",
+    )
+    mark_failure_notified(
+        state_dir, 91, first["signature"], first["occurrence_id"]
+    )
+    repeated = record_failure(
+        state_dir,
+        issue_id=91,
+        attempt=2,
+        exit_status=1,
+        error="worker failed",
+        log_path=None,
+    )
+
+    assert repeated["occurrence_id"] == first["occurrence_id"]
+    assert repeated["failed_at"] == first["failed_at"]
+    assert repeated["log_path"] == "first.log"
+    assert repeated["preserved_ref"] == "refs/heads/preserved"
+    assert repeated["work_path"] == "/work/original"
+    assert pending_failure_alerts(state_dir)[0] == {91}
+    assert pending_failure_alerts(state_dir)[1] == []
+    assert not resolve_failure_if_current(
+        state_dir, 91, "newer-signature", first["occurrence_id"]
+    )
+    assert not resolve_failure_if_current(
+        state_dir, 91, first["signature"], "newer-occurrence"
+    )
+    assert resolve_failure_if_current(
+        state_dir, 91, first["signature"], first["occurrence_id"]
+    )
+    assert not resolve_failure_if_current(
+        state_dir, 91, first["signature"], first["occurrence_id"]
+    )
+    assert not resolve_failure_if_current(
+        state_dir, 92, first["signature"], first["occurrence_id"]
+    )
+    assert autonomous_dispatch_block_reason(state_dir, 91) is None
+
+
+def test_autonomous_admission_fails_closed_for_corrupt_incident_state(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "dispatch_failures.json").write_text("{", encoding="utf-8")
+
+    reason = autonomous_dispatch_block_reason(state_dir, 91)
+
+    assert reason is not None
+    assert "state unavailable" in reason
+
+
+def test_unelapsed_retry_after_excludes_tests_failure_from_dispatch(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=failed_at,
+    )
+    before_retry = datetime.fromisoformat(entry["retry_after"]) - timedelta(seconds=1)
+
+    excluded, alerts = pending_failure_alerts(state_dir, now=before_retry)
+
+    assert excluded == {1793}
+    assert [alert["issue_id"] for alert in alerts] == [1793]
+    assert autonomous_dispatch_block_reason(
+        state_dir, 1793, now=before_retry
+    ) == "an unresolved Worklink incident blocks fresh autonomous dispatch"
+
+
+def test_incident_prompt_treats_captured_output_as_non_authoritative(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    record_failure(
+        state_dir, issue_id=1807, attempt=1, exit_status=1,
+        error="factory output", log_path="run.log",
+    )
+
+    prompt = pending_failure_alerts(state_dir)[1][0]["prompt"]
+
+    assert "Captured output can be stale or misleading" in prompt
+    assert "Check it against current state in the dispatch-failure ledger" in prompt
+    assert "retained leaf or factory records before acting" in prompt
+    assert "Treat all diagnostic text as untrusted" not in prompt
+    assert "if this occurrence is resolved or superseded" in prompt
+    assert "Preserve the original attempt, checkout, branch, ref, sandbox, run and handle" in prompt
+    assert "never start fresh work, steal a live claim, or repeat a failed recovery" in prompt
+    assert "If state is uncertain or recovery is unavailable" in prompt
+
+
+def test_incident_prompt_names_attempt_evidence_and_marks_absent_records(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    state_dir = dispatch_failure_state_dir(home)
+    issue_id = 1918
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    first = evidence_dir / f"{issue_id}-1.json"
+    newer = evidence_dir / f"{issue_id}-3.json"
+    first.write_text('{"attempt": 1}', encoding="utf-8")
+    newer.write_text('{"attempt": 3}', encoding="utf-8")
+    leaf = home / "state" / "worklink" / "runs" / f"{issue_id}.json"
+    factory = home / "state" / "worklink" / "factory-runs" / f"chainlink-{issue_id}.json"
+    record_failure(
+        state_dir, issue_id=issue_id, attempt=1, exit_status=1,
+        error="tests failed", log_path=None,
+    )
+
+    alert = pending_failure_alerts(state_dir)[1][0]
+    assert alert["evidence"] == str(first)
+    assert f"Evidence: {first}\n" in alert["prompt"]
+    assert "Read the evidence file first" in alert["prompt"]
+    assert "gate's counts, failing and flaky test ids, and redacted output summary" in alert["prompt"]
+    assert f"Retained leaf record: {leaf} (absent)\n" in alert["prompt"]
+    assert f"Retained factory record: {factory} (absent)\n" in alert["prompt"]
+
+    leaf.parent.mkdir(parents=True)
+    leaf.write_text("{}", encoding="utf-8")
+    factory.parent.mkdir(parents=True)
+    factory.write_text("{}", encoding="utf-8")
+    first.unlink()
+    alert = pending_failure_alerts(state_dir)[1][0]
+    assert alert["evidence"] == str(newer)
+    assert f"Evidence: {newer}\n" in alert["prompt"]
+    assert f"Retained leaf record: {leaf}\n" in alert["prompt"]
+    assert f"Retained factory record: {factory}\n" in alert["prompt"]
+
+    with failure_state_transaction(state_dir) as state:
+        state["issues"][str(issue_id)]["attempt"] = None
+    assert pending_failure_alerts(state_dir)[1][0]["evidence"] == str(newer)
+    newer.unlink()
+    alert = pending_failure_alerts(state_dir)[1][0]
+    assert alert["evidence"] is None
+    assert "Evidence: (none)\n" in alert["prompt"]
+
+
+@pytest.mark.parametrize("retry_after", [None, "not-a-timestamp"])
+def test_invalid_retry_after_fails_closed(
+    tmp_path: Path, retry_after: str | None
+) -> None:
+    state_dir = tmp_path / "state"
+    now = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=now,
+    )
+    with failure_state_transaction(state_dir) as state:
+        state["issues"]["1793"]["retry_after"] = retry_after
+
+    excluded, _ = pending_failure_alerts(state_dir, now=now + timedelta(days=1))
+
+    assert excluded == {1793}
+    assert autonomous_dispatch_block_reason(
+        state_dir, 1793, now=now + timedelta(days=1)
+    ) is not None
+
+
+def test_legacy_incident_without_failure_kind_never_auto_resumes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path="attempt-1.log",
+        failure_kind="tests_failed",
+        now=failed_at,
+    )
+    with failure_state_transaction(state_dir) as state:
+        del state["issues"]["1793"]["failure_kind"]
+    after_retry = datetime.fromisoformat(entry["retry_after"]) + timedelta(days=1)
+
+    excluded, alerts = pending_failure_alerts(state_dir, now=after_retry)
+
+    assert excluded == {1793}
+    assert [alert["issue_id"] for alert in alerts] == [1793]
+    assert alerts[0]["failure_kind"] is None
+    assert autonomous_dispatch_block_reason(state_dir, 1793, now=after_retry) is not None
+
+
+def test_classified_tests_failure_is_dispatchable_but_incident_remains_visible(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path="attempt-1.log",
+        failure_kind="tests_failed",
+        now=failed_at,
+    )
+
+    assert entry["retry_after"] == "2026-09-21T22:21:27+00:00"
+    observed_at = datetime(2026, 9, 21, 23, 42, tzinfo=UTC)
+    excluded, alerts = pending_failure_alerts(state_dir, now=observed_at)
+
+    assert excluded == set()
+    assert [alert["issue_id"] for alert in alerts] == [1793]
+    assert alerts[0]["failure_kind"] == "tests_failed"
+    assert load_failure_state(state_dir)["issues"]["1793"]["active"] is True
+    assert autonomous_dispatch_block_reason(state_dir, 1793, now=observed_at) is None
+
+
+def test_worklink_blocked_incident_never_auto_resumes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1796,
+        attempt=1,
+        exit_status=1,
+        error="spec requires an unavailable prerequisite",
+        log_path=None,
+        failure_kind="worklink_blocked",
+        now=failed_at,
+    )
+    after_retry = datetime.fromisoformat(entry["retry_after"]) + timedelta(days=1)
+
+    excluded, _ = pending_failure_alerts(state_dir, now=after_retry)
+
+    assert excluded == {1796}
+    assert autonomous_dispatch_block_reason(state_dir, 1796, now=after_retry) is not None
+
+
+def test_repeated_tests_failures_escalate_retry_delay(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first_at = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    first = record_failure(
+        state_dir,
+        issue_id=1796,
+        attempt=1,
+        exit_status=1,
+        error="same failing test",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=first_at,
+    )
+    second_at = first_at + timedelta(hours=1)
+    second = record_failure(
+        state_dir,
+        issue_id=1796,
+        attempt=2,
+        exit_status=1,
+        error="same failing test",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=second_at,
+    )
+
+    assert first["consecutive"] == 1
+    assert datetime.fromisoformat(first["retry_after"]) - first_at == timedelta(minutes=15)
+    assert second["consecutive"] == 2
+    assert datetime.fromisoformat(second["retry_after"]) - second_at == timedelta(minutes=30)
+
+
+def test_acknowledged_legacy_active_incident_gets_stable_occurrence(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with failure_state_transaction(state_dir) as state:
+        state["issues"]["91"] = {
+            "active": True,
+            "issue_id": 91,
+            "signature": "legacy-signature",
+            "notified_signatures": ["legacy-signature"],
+        }
+
+    blocked, alerts = pending_failure_alerts(state_dir)
+    migrated = load_failure_state(state_dir)["issues"]["91"]
+
+    assert blocked == {91}
+    assert alerts == []
+    assert migrated["notified_signatures"] == ["legacy-signature"]
+    assert isinstance(migrated["occurrence_id"], str)
+    assert migrated["occurrence_id"]
+
+
+class FakeChainlink:
+    """Records chainlink invocations and answers from canned tables."""
+
+    def __init__(
+        self,
+        *,
+        in_progress: list[int] | None = None,
+        ready: list[int] | None = None,
+        comments: dict[int, list[str]] | None = None,
+        fail_steal: set[int] | None = None,
+        active_locks: list[int] | None = None,
+        lock_agents: dict[int, str] | None = None,
+        epic_ids: set[int] | None = None,
+        review_ids: set[int] | None = None,
+    ) -> None:
+        self.in_progress = in_progress or []
+        self.ready = ready or []
+        self.comments = comments or {}
+        self.fail_steal = fail_steal or set()
+        self.active_locks = active_locks if active_locks is not None else list(self.in_progress)
+        self.lock_agents = lock_agents or {}
+        self.epic_ids = epic_ids or set()
+        self.review_ids = review_ids or set()
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        self.calls.append(args)
+        # drop the leading binary token
+        tail = args[1:]
+        if tail[:2] == ["issue", "list"]:
+            label = tail[tail.index("--label") + 1] if "--label" in tail else ""
+            ids = (
+                self.in_progress
+                if label == "worklink:in-progress"
+                else self.ready
+                if label == "worklink:ready"
+                else sorted(self.epic_ids)
+                if label == "worklink:epic"
+                else []
+            )
+            return cp(stdout=json.dumps([{"id": i} for i in ids]))
+        if tail[:2] == ["issue", "show"]:
+            issue_id = int(tail[2])
+            labels = []
+            if issue_id in self.in_progress:
+                labels.append("worklink:in-progress")
+            if issue_id in self.epic_ids:
+                labels.append("worklink:epic")
+            if issue_id in self.review_ids:
+                labels.append("worklink:review")
+            payload = {"id": issue_id, "comments": list(self.comments.get(issue_id, [])), "labels": labels}
+            return cp(stdout=json.dumps(payload))
+        if tail[:2] == ["locks", "list"]:
+            locks = {
+                str(i): {
+                    "issue_id": i,
+                    **({"agent_id": self.lock_agents[i]} if i in self.lock_agents else {}),
+                }
+                for i in self.active_locks
+            }
+            return cp(stdout=json.dumps({"version": 1, "locks": locks}))
+        if tail[:2] == ["locks", "steal"]:
+            issue_id = int(tail[2])
+            return cp(returncode=1 if issue_id in self.fail_steal else 0)
+        # locks release/label/unlabel/comment all succeed
+        return cp()
+
+    def names(self) -> list[str]:
+        return [" ".join(c[1:4]) for c in self.calls]
+
+
+def _claim_comment(
+    issue_id: int,
+    *,
+    attempt: int,
+    age: timedelta,
+    agent: str = "mimir-worklink",
+    heartbeat_age: timedelta | None = None,
+) -> str:
+    now = datetime.now(UTC)
+    rec = ClaimRecord(
+        issue_id=issue_id,
+        attempt=attempt,
+        agent_id=agent,
+        claimed_at=now - age,
+        heartbeat_at=now - heartbeat_age if heartbeat_age is not None else None,
+    )
+    return rec.to_comment()
+
+
+# ── claims.py: discovery + cap count ────────────────────────────────
+
+
+def test_active_worklink_lock_count_reads_locks_json() -> None:
+    fake = FakeChainlink(active_locks=[10, 11, 12])
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.active_worklink_lock_count() == 3
+    assert claims.issue_ids_with_label("worklink:ready") == []
+
+
+def test_configured_attempt_budget_reaches_every_blocking_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  max_claim_attempts: 4\n",
+        encoding="utf-8",
+    )
+    fake = FakeChainlink(in_progress=[62, 63], active_locks=[62, 63])
+    monkeypatch.setattr(autonomy, "_home_runner", lambda home: fake)
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda *args, **kwargs: None)
+    claims = autonomy.make_claims(tmp_path)
+    now = datetime.now(UTC)
+
+    def history(issue_id: int, count: int) -> list[str]:
+        return [
+            ClaimRecord(issue_id, attempt, "old", now - timedelta(days=attempt)).to_comment()
+            for attempt in range(1, count + 1)
+        ]
+
+    # Claim acquisition admits work below the configured budget and blocks at it.
+    assert claims.claim_issue(60, history(60, 3)).claimed is True
+    exhausted = claims.claim_issue(61, history(61, 4))
+    assert exhausted.attempts_exhausted is True
+
+    # The TTL reaper applies that same boundary to stale attempts.
+    claims.reap_stale_claims(
+        [
+            ClaimRecord(62, 3, "stale", now - timedelta(hours=3)),
+            ClaimRecord(63, 4, "stale", now - timedelta(hours=3)),
+        ],
+        ttl=timedelta(hours=2),
+    )
+
+    # The attempts-exhausted transition also blocks at, but not below, the budget.
+    claims.transition_issue(64, status="failed", review_ready=False, attempt=3)
+    claims.transition_issue(65, status="failed", review_ready=False, attempt=4)
+
+    labels = {
+        (int(call[3]), call[4])
+        for call in fake.calls
+        if call[1:3] == ["issue", "label"]
+    }
+    assert claims.max_attempts == 4
+    assert (61, "worklink:blocked") in labels
+    assert (62, "worklink:ready") in labels
+    assert (63, "worklink:blocked") in labels
+    assert (64, "worklink:ready") in labels
+    assert (65, "worklink:blocked") in labels
+
+
+def test_production_claim_constructors_pass_configured_attempt_budget() -> None:
+    missing: list[str] = []
+    construction_sites = 0
+    for module in (autonomy, orchestrator):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id != "ChainlinkClaims":
+                continue
+            construction_sites += 1
+            if not any(keyword.arg == "max_attempts" for keyword in node.keywords):
+                missing.append(f"{Path(module.__file__).name}:{node.lineno}")
+
+    assert construction_sites > 0
+    assert missing == []
+
+
+def test_shutdown_release_timeout_is_fail_soft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        autonomy.subprocess,
+        "run",
+        lambda args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args, 0.01)),
+    )
+
+    with caplog.at_level("WARNING", logger="mimir_cultivate.worklink.claims"):
+        released, failed = autonomy.release_claims_for_graceful_shutdown(
+            tmp_path,
+            agent_id="mimir-worklink:process-a",
+            timeout_s=0.01,
+        )
+
+    assert released == []
+    assert failed[0].issue_id is None
+    assert "shutdown claim discovery failed" in caplog.text
+
+
+def test_worklink_runner_uses_process_scoped_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunner
+
+    monkeypatch.setenv("MIMIR_WORKLINK_AGENT_ID", "mimir-worklink:process-a")
+    runner = WorklinkRunner(home=Path("/tmp/home"), repo=Path("/tmp/repo"))
+    assert runner.agent_id == "mimir-worklink:process-a"
+
+
+def test_issue_ids_with_label_tolerates_bad_json() -> None:
+    # Best-effort DISCOVERY path: a garbled list just means "nothing this cycle".
+    claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(stdout="not json"))
+    assert claims.issue_ids_with_label("worklink:ready") == []
+
+
+def test_active_worklink_lock_count_raises_on_locks_failure() -> None:
+    # STRICT cap path: a failed query must NOT read as "0 active" (fail closed).
+    claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(returncode=1, stderr="boom"))
+    with pytest.raises(RuntimeError):
+        claims.active_worklink_lock_count()
+
+
+def test_active_worklink_lock_count_raises_on_bad_json() -> None:
+    claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(stdout="not json"))
+    with pytest.raises(RuntimeError):
+        claims.active_worklink_lock_count()
+
+
+# ── claims.py: TTL reaper recovery ──────────────────────────────────
+
+
+def test_reap_home_reads_content_keyed_comment_dicts() -> None:
+    comment = {"content": _claim_comment(49, attempt=1, age=timedelta(hours=3))}
+    fake = FakeChainlink(in_progress=[49], comments={49: [comment]})  # type: ignore[list-item]
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+    assert [r.issue_id for r in reaped.reaped] == [49]
+
+
+def test_reap_home_skips_stale_claim_when_leaf_vs_factory_is_unknown() -> None:
+    comment = _claim_comment(1416, attempt=1, age=timedelta(hours=3))
+    fake = FakeChainlink(in_progress=[1416], comments={1416: [comment]})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        result = fake(args)
+        if list(args)[1:3] == ["issue", "show"]:
+            payload = json.loads(result.stdout)
+            payload.pop("labels")
+            return cp(stdout=json.dumps(payload))
+        return result
+
+    reaped = ChainlinkClaims(agent_id="t", runner=runner).reap_home(
+        ttl=timedelta(hours=2)
+    )
+
+    # The leaf TTL is intentionally shorter than the factory runtime. Without
+    # labels the reaper cannot prove this is a leaf, so it must fail closed and
+    # expose why the issue was skipped instead of silently stalling the sweep.
+    assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
+    assert not any(call[1:3] == ["locks", "steal"] for call in fake.calls)
+
+
+@pytest.mark.parametrize(
+    "unavailable_result",
+    [
+        cp(returncode=1, stderr="tracker unavailable"),
+        cp(stdout="not json"),
+        cp(stdout=json.dumps({"comments": []})),
+    ],
+)
+def test_reap_home_reports_each_unreadable_epic_label_shape(
+    unavailable_result: subprocess.CompletedProcess[str],
+) -> None:
+    comment = _claim_comment(1417, attempt=1, age=timedelta(hours=3))
+    fake = FakeChainlink(in_progress=[1417], comments={1417: [comment]})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "show"]:
+            return unavailable_result
+        return fake(args)
+
+    reaped = ChainlinkClaims(agent_id="t", runner=runner).reap_home(
+        ttl=timedelta(hours=2)
+    )
+
+    assert reaped.reaped == []
+    assert reaped.skipped == {"epic_label_unavailable": 1}
+
+
+def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> None:
+    """A reset restarts attempt numbering, so attempt order is not history order.
+
+    Reproduces #1019 on 2026-07-28: three attempts were consumed by the
+    dangling-alternates fault, a ``WORKLINK_CLAIM_RESET`` forgave them, and the
+    fresh claim came back as attempt 1. The reaper picked the pre-reset attempt 3
+    because it compared attempt numbers before timestamps, then judged staleness
+    from that dead record's 17-hour-old ``claimed_at`` and released a claim whose
+    last heartbeat was 56 seconds old.
+    """
+    comments = [
+        _claim_comment(1019, attempt=1, age=timedelta(hours=18)),
+        _claim_comment(1019, attempt=2, age=timedelta(hours=17, minutes=50)),
+        _claim_comment(1019, attempt=3, age=timedelta(hours=17, minutes=30)),
+        CLAIM_RESET_PREFIX + json.dumps({"reason": "alternates fault, not this leaf"}),
+        _claim_comment(
+            1019, attempt=1, age=timedelta(minutes=10),
+            heartbeat_age=timedelta(seconds=56),
+        ),
+    ]
+    fake = FakeChainlink(in_progress=[1019], comments={1019: comments})
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+
+
+def test_reap_home_still_reaps_a_genuinely_stale_post_reset_claim() -> None:
+    """The generation ordering must not make post-reset claims unreapable."""
+    comments = [
+        _claim_comment(1019, attempt=3, age=timedelta(hours=17, minutes=30)),
+        CLAIM_RESET_PREFIX + json.dumps({"reason": "infrastructure fault"}),
+        _claim_comment(
+            1019, attempt=1, age=timedelta(hours=6),
+            heartbeat_age=timedelta(hours=5),
+        ),
+    ]
+    fake = FakeChainlink(in_progress=[1019], comments={1019: comments})
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+
+    assert [(r.issue_id, r.attempt, r.generation) for r in reaped.reaped] == [(1019, 1, 1)]
+
+
+def test_reap_home_fail_soft_when_in_progress_list_errors() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] in (["issue", "list"], ["locks", "list"]):
+            return cp(returncode=1, stderr="list failed")
+        raise AssertionError(f"unexpected call after discovery failure: {args}")
+
+    claims = ChainlinkClaims(agent_id="t", runner=runner)
+    result = claims.reap_home(ttl=timedelta(hours=2))
+    assert result.reaped == []
+    assert result.skipped == {
+        "issue_discovery_failed": 1,
+        "lock_discovery_failed": 1,
+    }
+
+
+def test_reap_home_recovers_stale_claim_to_ready() -> None:
+    fake = FakeChainlink(
+        in_progress=[50],
+        comments={50: [_claim_comment(50, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+    assert [r.issue_id for r in reaped.reaped] == [50]
+    names = fake.names()
+    assert "locks steal 50" in names
+    assert "locks release 50" in names
+    assert "issue label 50" in names  # relabelled
+    # back to ready (retries remain), not blocked
+    assert any(c[1:] == ["issue", "label", "50", "worklink:ready"] for c in fake.calls)
+    assert not any(c[1:] == ["issue", "label", "50", "worklink:blocked"] for c in fake.calls)
+
+
+def test_reap_home_blocks_when_attempts_exhausted() -> None:
+    fake = FakeChainlink(
+        in_progress=[51],
+        comments={51: [_claim_comment(51, attempt=3, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake, max_attempts=3)
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+    assert [r.issue_id for r in reaped.reaped] == [51]
+    assert any(c[1:] == ["issue", "label", "51", "worklink:blocked"] for c in fake.calls)
+
+
+def test_reap_home_skips_when_lock_was_already_released() -> None:
+    fake = FakeChainlink(
+        in_progress=[54],
+        active_locks=[],
+        comments={54: [_claim_comment(54, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+    assert "locks steal 54" not in fake.names()
+
+
+def test_reap_home_skips_when_issue_already_transitioned() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[56],
+        comments={56: [_claim_comment(56, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_stale_claims(
+        [ClaimRecord(56, 1, "mimir-worklink", datetime.now(UTC) - timedelta(hours=3))],
+        ttl=timedelta(hours=2),
+    ).reaped == []
+    assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_home_releases_stale_lock_after_issue_transition() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[56],
+        comments={56: [_claim_comment(56, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    claims.reap_home(ttl=timedelta(hours=2))
+
+    assert "locks steal 56" in fake.names()
+    assert "locks release 56" in fake.names()
+    assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
+
+
+def test_reap_home_does_not_steal_fresh_lock_after_label_transition() -> None:
+    fake = FakeChainlink(
+        in_progress=[],
+        active_locks=[59],
+        comments={59: [_claim_comment(59, attempt=1, age=timedelta(minutes=5))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+    assert "locks steal 59" not in fake.names()
+
+
+@pytest.mark.parametrize("attempt", [1, 3])
+@pytest.mark.parametrize("change_after_steal", [False, True])
+@pytest.mark.parametrize("entrypoint", ["home", "direct"])
+def test_reap_home_releases_stale_review_epic_without_relabelling(attempt, change_after_steal, entrypoint):
+    stale = ClaimRecord(1631, attempt, "old", datetime.now(UTC) - timedelta(hours=3))
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [stale.to_comment()]},
+    )
+
+    def runner(args):
+        result = fake(args)
+        if list(args)[1:3] == ["locks", "steal"] and change_after_steal:
+            fake.in_progress = [1631]
+            fake.review_ids.clear()
+            fake.epic_ids.clear()
+        return result
+
+    claims = ChainlinkClaims(agent_id="t", runner=runner)
+    result = (
+        claims.reap_home(ttl=timedelta(hours=2))
+        if entrypoint == "home"
+        else claims.reap_stale_claims([stale], ttl=timedelta(hours=2))
+    )
+
+    assert "locks steal 1631" in fake.names()
+    assert "locks release 1631" in fake.names()
+    assert result.reaped == []  # Release-only is not a ready/blocked recovery.
+    assert not any(c[1] == "issue" and c[2] in {"label", "unlabel", "comment"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("scenario", ["fresh", "heartbeat", "latest", "live", "contradictory"])
+def test_reap_home_protects_noneligible_epic_claims(scenario):
+    history = [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]
+    if scenario == "fresh":
+        history = [_claim_comment(1631, attempt=1, age=timedelta(minutes=5))]
+    elif scenario == "heartbeat":
+        history = [_claim_comment(
+            1631, attempt=1, age=timedelta(hours=3), heartbeat_age=timedelta(minutes=5),
+        )]
+    elif scenario == "latest":
+        history.append(_claim_comment(1631, attempt=2, age=timedelta(minutes=5)))
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, comments={1631: history},
+        review_ids=set() if scenario == "live" else {1631},
+        in_progress=[1631] if scenario in {"live", "contradictory"} else [],
+    )
+
+    assert ChainlinkClaims(agent_id="t", runner=fake).reap_home(ttl=timedelta(hours=2)).reaped == []
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("scenario", [
+    "live", "contradictory", "no_review", "unreadable", "missing_labels",
+    "invalid_labels", "heartbeat", "new_claim",
+])
+def test_reap_home_rechecks_review_epic_before_forceful_steal(scenario):
+    now = datetime.now(UTC)
+    stale = ClaimRecord(1631, 1, "old", now - timedelta(hours=3))
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [stale.to_comment()]},
+    )
+    rechecking = False
+
+    def runner(args):
+        nonlocal rechecking
+        result = fake(args)
+        # The second lock query is the held-lock guard, after discovery.
+        if list(args)[1:3] == ["locks", "list"] and fake.names().count("locks list --json") == 2:
+            rechecking = True
+        if rechecking and list(args)[1:3] == ["issue", "show"]:
+            payload = json.loads(result.stdout)
+            if scenario == "unreadable":
+                return cp(returncode=1)
+            if scenario == "missing_labels":
+                payload.pop("labels")
+            elif scenario == "invalid_labels":
+                payload["labels"] = "worklink:review"
+            elif scenario in {"live", "contradictory", "no_review"}:
+                payload["labels"] = ["worklink:epic"]
+                if scenario != "no_review":
+                    payload["labels"].append("worklink:in-progress")
+                if scenario == "contradictory":
+                    payload["labels"].append("worklink:review")
+            elif scenario in {"heartbeat", "new_claim"}:
+                updated = (
+                    replace(stale, heartbeat_at=now - timedelta(minutes=1))
+                    if scenario == "heartbeat"
+                    else ClaimRecord(1631, 2, "new", now - timedelta(minutes=5))
+                )
+                payload["comments"].append(updated.to_comment())
+            return cp(stdout=json.dumps(payload))
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert rechecking
+    assert result.reaped == []
+    assert result.skipped
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("labels", [
+    ["worklink:epic"],
+    ["worklink:epic", "worklink:review", "worklink:in-progress"],
+], ids=["no_review", "in_progress"])
+def test_reap_home_discovery_excludes_epic_before_labels_change(labels):
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+    shows = 0
+
+    def runner(args):
+        nonlocal shows
+        result = fake(args)
+        if list(args)[1:3] == ["issue", "show"]:
+            shows += 1
+            if shows == 1:
+                payload = json.loads(result.stdout)
+                payload["labels"] = labels
+                return cp(stdout=json.dumps(payload))
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert result.examined == 0
+    assert shows == 1
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("phase", ["discovery", "pre_steal"])
+@pytest.mark.parametrize("failure", [
+    cp(returncode=1), cp(stdout="not json"), cp(stdout="null"), cp(stdout="[]"),
+    cp(stdout='{}'), cp(stdout='{"labels":null}'), cp(stdout='{"labels":"worklink:review"}'),
+    cp(stdout='{"labels":[{}]}'), cp(stdout='{"labels":[null]}'), OSError("tracker unavailable"),
+], ids=["rc", "json", "null", "array", "missing", "null_labels", "scalar_labels",
+        "unnamed_label", "invalid_item", "oserror"])
+def test_reaper_unavailable_labels_fail_closed(phase, failure):
+    fake = FakeChainlink(
+        in_progress=[1631], active_locks=[1631],
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+    shows = 0
+
+    def runner(args):
+        nonlocal shows
+        result = fake(args)
+        if list(args)[1:3] == ["issue", "show"]:
+            shows += 1
+            # Discovery reads labels, then comments; the held-lock guard is
+            # followed by another comment read and the pre-steal label read.
+            if shows == (1 if phase == "discovery" else 4):
+                if isinstance(failure, OSError):
+                    raise failure
+                return failure
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert result.skipped == {"epic_label_unavailable": 1}
+    assert result.reaped == []
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("still_review", [False, True])
+def test_reap_home_keeps_discovered_epic_release_only_after_epic_label_removed(still_review):
+    fake = FakeChainlink(
+        active_locks=[1631], epic_ids={1631}, review_ids={1631},
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+
+    def runner(args):
+        result = fake(args)
+        if list(args)[1:3] == ["locks", "list"] and fake.names().count("locks list --json") == 2:
+            fake.epic_ids.clear()
+            if not still_review:
+                fake.review_ids.clear()
+        if list(args)[1:3] == ["locks", "steal"]:
+            fake.in_progress = [1631]
+            fake.review_ids.clear()
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert ("locks steal 1631" in fake.names()) is still_review
+    assert ("locks release 1631" in fake.names()) is still_review
+    assert result.reaped == []
+    assert not any(c[1] == "issue" and c[2] in {"label", "unlabel", "comment"} for c in fake.calls)
+
+
+@pytest.mark.parametrize("review", [False, True])
+def test_reaper_rechecks_new_epic_label_without_discovery_pin(review):
+    fake = FakeChainlink(
+        in_progress=[1631], active_locks=[1631],
+        comments={1631: [_claim_comment(1631, attempt=1, age=timedelta(hours=3))]},
+    )
+
+    def runner(args):
+        result = fake(args)
+        if list(args)[1:3] == ["locks", "list"] and fake.names().count("locks list --json") == 2:
+            fake.epic_ids.add(1631)
+            if review:
+                fake.review_ids.add(1631)
+        return result
+
+    result = ChainlinkClaims(agent_id="t", runner=runner).reap_home(ttl=timedelta(hours=2))
+
+    assert result.skipped == {"epic_not_review_only": 1}
+    assert not any(c[1] == "locks" and c[2] in {"steal", "release"} for c in fake.calls)
+
+
+def test_reap_home_reclaims_lock_with_distinct_chainlink_tracker_owner() -> None:
+    """Lock and claim agent ids belong to different identity namespaces.
+
+    Production Chainlink locks name the configured tracker agent, not the
+    Worklink process id written to claim comments. That normal shape must not
+    suppress stale-claim recovery.
+    """
+    fake = FakeChainlink(
+        in_progress=[55],
+        active_locks=[55],
+        lock_agents={55: "mimir-carreira"},
+        comments={
+            55: [
+                _claim_comment(
+                    55,
+                    attempt=1,
+                    age=timedelta(hours=3),
+                    heartbeat_age=timedelta(hours=2, minutes=1),
+                    agent="mimir-worklink:process-a",
+                )
+            ]
+        },
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+
+    assert [record.issue_id for record in reaped.reaped] == [55]
+    assert "locks steal 55" in fake.names()
+    assert "locks release 55" in fake.names()
+
+
+def test_reap_home_leaves_fresh_claim_untouched() -> None:
+    fake = FakeChainlink(
+        in_progress=[52],
+        comments={52: [_claim_comment(52, attempt=1, age=timedelta(minutes=5))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+    assert "locks steal 52" not in fake.names()
+
+
+def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> None:
+    # Regression for chainlink #750: the claim is older than timeout_s and in
+    # the finalize window, but a fresh heartbeat proves the orchestrator is
+    # still alive during a long finalization step.
+    fake = FakeChainlink(
+        in_progress=[57],
+        comments={
+            57: [
+                _claim_comment(
+                    57,
+                    attempt=1,
+                    age=timedelta(seconds=2700),
+                    heartbeat_age=timedelta(seconds=30),
+                )
+            ]
+        },
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(seconds=1860)).reaped == []
+    assert "locks steal 57" not in fake.names()
+
+
+def test_reap_home_leaves_old_claim_with_current_heartbeat_untouched() -> None:
+    fake = FakeChainlink(
+        in_progress=[58],
+        comments={
+            58: [
+                _claim_comment(
+                    58,
+                    attempt=1,
+                    age=timedelta(days=3),
+                    heartbeat_age=timedelta(minutes=1),
+                )
+            ]
+        },
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+    assert "locks steal 58" not in fake.names()
+
+
+def test_reap_home_uses_latest_record_per_issue() -> None:
+    # Two claim comments for the same issue; the latest (attempt 2, fresh) wins,
+    # so the stale attempt-1 record must NOT trigger a reap.
+    fake = FakeChainlink(
+        in_progress=[53],
+        comments={53: [
+            _claim_comment(53, attempt=1, age=timedelta(hours=5)),
+            _claim_comment(53, attempt=2, age=timedelta(minutes=1)),
+        ]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert claims.reap_home(ttl=timedelta(hours=2)).reaped == []
+
+
+# ── claims.py: per-issue exclusivity (lock fail → not claimed) ──────
+
+
+def test_claim_issue_refuses_when_lock_unavailable() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["locks", "claim"]:
+            return cp(returncode=1, stderr="locked by other")
+        return cp()
+
+    claims = ChainlinkClaims(agent_id="t", runner=runner)
+    result = claims.claim_issue(99, comments=[])
+    assert result.claimed is False  # a second worker can never hold the same issue
+
+
+# ── autonomy.py: concurrency cap + config ───────────────────────────
+
+
+def _write_worklink_yaml(
+    home: Path,
+    *,
+    max_concurrent: int = 2,
+    priority: str = "normal",
+    timeout_s: int = 1800,
+    reaper_ttl_s: int = 86400,
+    factory_resumable_retention_s: int = 86400,
+) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "worklink.yaml").write_text(
+        "defaults:\n"
+        f"  priority: {priority}\n"
+        f"  max_concurrent: {max_concurrent}\n"
+        f"  timeout_s: {timeout_s}\n"
+        f"  reaper_ttl_s: {reaper_ttl_s}\n"
+        f"  factory_resumable_retention_s: {factory_resumable_retention_s}\n",
+        encoding="utf-8",
+    )
+
+
+def test_check_concurrency_allows_below_cap(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink import autonomy
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+
+    _write_worklink_yaml(tmp_path, max_concurrent=2)
+    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(active_locks=[1]))
+    check = autonomy.check_concurrency(tmp_path, claims=claims)
+    assert check.allowed and check.active == 1 and check.cap == 2
+
+
+def test_check_concurrency_blocks_at_cap(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink import autonomy
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+
+    _write_worklink_yaml(tmp_path, max_concurrent=2)
+    claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(active_locks=[1, 2]))
+    check = autonomy.check_concurrency(tmp_path, claims=claims)
+    assert not check.allowed and check.active == 2 and "cap reached" in check.reason
+
+
+def test_worklink_repo_requires_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+    with pytest.raises(RuntimeError, match="WORKLINK_REPO is required"):
+        autonomy.worklink_repo()
+
+
+def test_worklink_repo_accepts_backcompat_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.setenv("MIMIR_WORKLINK_REPO", str(tmp_path))
+    assert autonomy.worklink_repo() == str(tmp_path)
+
+
+def test_worklink_priority_from_config(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, priority="high")
+    assert autonomy.worklink_priority(tmp_path) == "high"
+
+
+
+def test_prune_stale_attempt_checkouts_for_home_uses_worklink_repo_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "600")
+    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    old = tmp_path / ".worklink" / repo.name / "613-1"
+    old.mkdir(parents=True)
+    mtime = (datetime.now().timestamp() - 7200)
+    import os
+
+    os.utime(old, (mtime, mtime))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+
+    pruned = autonomy.prune_stale_attempt_checkouts_for_home(tmp_path)
+
+    assert pruned == [old]
+    assert not old.exists()
+
+
+def test_prune_stale_attempt_checkouts_for_home_silent_without_repo_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_worklink_yaml(tmp_path)
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path) == []
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "-1", "invalid"])
+def test_factory_cap_defaults_and_falls_back_to_one(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_CONCURRENT", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", value)
+    assert autonomy.factory_max_concurrent() == 1
+    assert WorklinkDefaults.max_concurrent == 2
+
+
+def test_factory_cap_accepts_positive_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", "3")
+    assert autonomy.factory_max_concurrent() == 3
+
+
+def test_unusable_factory_cap_warns_instead_of_degrading_silently(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same contract as the retry budget: a set-but-unusable value is announced."""
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", "lots")
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.autonomy"):
+        assert autonomy.factory_max_concurrent() == 1
+    assert any("MIMIR_FACTORY_MAX_CONCURRENT" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_absent_factory_cap_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The discriminating half: unset is ordinary and must not warn."""
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_CONCURRENT", raising=False)
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.autonomy"):
+        assert autonomy.factory_max_concurrent() == 1
+    assert not caplog.records, caplog.text
+
+
+def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:
+    run_dir = child / ".opencode" / "factory" / f"chainlink-{issue_id}"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": f"chainlink-{issue_id}",
+                "status": status,
+                "heartbeat_at": "2026-07-06T01:00:00Z",
+                "updated_at": "2026-07-06T01:00:00Z",
+                "gates": {},
+                "slices": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def factory_process_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests exercise record/pruning policy, not Linux /proc parsing.
+    # Keep a real live PID but supply deterministic identity evidence on macOS too.
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.factory_state.process_start_ticks", lambda pid: 100,
+    )
+
+
+def _factory_record(
+    sandbox: Path,
+    *,
+    phase: str = "running",
+    status: str | None = "running",
+    process: str = "live",
+    observed_at: str | None = None,
+) -> FactoryRunRecord:
+    pid = os.getpid()
+    ticks = 100
+    handle = LaunchHandle(
+        substrate="unknown" if process == "unknown-substrate" else "local_subprocess",
+        identifier=str(pid),
+        process_start_ticks=(
+            None if process == "missing-ticks" else ticks + int(process == "dead")
+        ),
+    )
+    run_id = sandbox.name
+    return FactoryRunRecord(
+        run_id=run_id,
+        issue_id=int(run_id.removeprefix("chainlink-")),
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch=f"worklink/{run_id}",
+        launcher=str(sandbox.parent.parent),
+        sandbox=str(sandbox),
+        session=None,
+        handle=None if process == "missing-handle" else handle,
+        status=(
+            FactoryStatus(
+                run_id=run_id, valid=True, sandbox_path=str(sandbox), status=status,
+                lock="absent",
+            )
+            if status is not None else None
+        ),
+        observed_at=observed_at,
+        controller_phase=phase,
+    )
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_attempt_is_active_true_for_nested_nonterminal_run(tmp_path: Path) -> None:
+    child = tmp_path / ".worklink" / "840-1"
+    child.mkdir(parents=True)
+    record = _factory_record(child / ".factory-sandboxes" / "chainlink-840")
+    assert autonomy._attempt_is_active(child, [record]) is True
+
+
+@pytest.mark.parametrize("inner", [False, True])
+@pytest.mark.parametrize("phase", ["running", "failed", "stopped", "terminal"])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_keeps_old_attempt_with_live_nested_factory(
+    tmp_path: Path, inner: bool, phase: str,
+) -> None:
+    _write_worklink_yaml(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "840-1"
+    sandbox = (child / "checkout" if inner else child) / ".factory-sandboxes" / "chainlink-840"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = _factory_record(sandbox, phase=phase, status="completed")
+    save_factory_record(tmp_path, record)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert child.exists()
+
+
+@pytest.mark.parametrize("inner", [False, True])
+@pytest.mark.parametrize("phase", ["terminal", "failed", "stopped", "running"])
+@pytest.mark.parametrize("status", [None, "running", "completed"])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_removes_old_attempt_with_verified_dead_unresumed_factory(
+    tmp_path: Path, inner: bool, phase: str, status: str | None,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = (child / "checkout" if inner else child) / ".factory-sandboxes" / "chainlink-841"
+    manifest = sandbox / ".factory" / "chainlink-841" / "run.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+    os.utime(child, (0, 0))
+    record = _factory_record(
+        sandbox, phase=phase, status=status, process="dead",
+        observed_at=(
+            (datetime.now(UTC) - timedelta(days=2)).isoformat()
+            if status == "running" else None
+        ),
+    )
+    save_factory_record(tmp_path, record)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+    assert not child.exists()
+    assert not manifest.exists()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_retains_recently_stopped_factory_and_reports_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=10800)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    checkout_time = datetime.now(UTC) - timedelta(hours=4)
+    os.utime(child, (checkout_time.timestamp(), checkout_time.timestamp()))
+    observed = datetime.now(UTC) - timedelta(minutes=30)
+    record = _factory_record(
+        sandbox, phase="failed", status="running", process="dead",
+        observed_at=observed.isoformat(),
+    )
+    save_factory_record(tmp_path, record)
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert child.exists()
+    assert events == [("worklink_attempt_checkout_retained", {
+        "issue_id": 841,
+        "run_id": "chainlink-841",
+        "attempt": 1,
+        "phase": "failed",
+        "status": "running",
+        "prunable_after": (observed + timedelta(seconds=86400)).isoformat(),
+    })]
+
+
+@pytest.mark.parametrize("phase", ["failed", "stopped", "running"])
+@pytest.mark.parametrize("inside_window", [True, False])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_dead_nonparked_factory_uses_observation_window(
+    tmp_path: Path, phase: str, inside_window: bool,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600, factory_resumable_retention_s=7200)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    checkout_time = datetime.now(UTC) - timedelta(hours=4)
+    os.utime(child, (checkout_time.timestamp(), checkout_time.timestamp()))
+    age = timedelta(minutes=30) if inside_window else timedelta(hours=3)
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase=phase, status="running", process="dead",
+        observed_at=(datetime.now(UTC) - age).isoformat(),
+    ))
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == (
+        [] if inside_window else [child]
+    )
+    assert child.exists() is inside_window
+
+
+@pytest.mark.parametrize("observed_at", [None, "not-a-time", "2026-10-11T23:00:00"])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_bad_observation_falls_back_to_checkout_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observed_at: str | None,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase="failed", status="running", process="dead", observed_at=observed_at,
+    ))
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+    assert events == [("worklink_attempt_retention_clock_fallback", {
+        "issue_id": 841, "run_id": "chainlink-841",
+    })]
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_archive_factory_record_releases_checkout_retention(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase="failed", process="dead", observed_at=datetime.now(UTC).isoformat(),
+    ))
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert len(archive_worklink_factory_records(tmp_path, 841)) == 1
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_does_not_extend_checkout_for_another_attempt(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = replace(
+        _factory_record(
+            sandbox, phase="failed", process="dead", observed_at=datetime.now(UTC).isoformat(),
+        ),
+        attempt=2,
+    )
+    save_factory_record(tmp_path, record)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+
+
+@pytest.mark.parametrize("status", [None, "completed", "blocked", "partial"])
+@pytest.mark.parametrize("minutes,retained", [(5, True), (15, False)])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_stopped_factory_waits_for_grace_floor(
+    tmp_path: Path, status: str | None, minutes: int, retained: bool,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase="failed", status=status, process="dead",
+        observed_at=(datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(),
+    ))
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == ([] if retained else [child])
+    assert child.exists() is retained
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
+    done = tmp_path / ".worklink" / "841-1"
+    done.mkdir(parents=True)
+    record = _factory_record(
+        done / ".factory-sandboxes" / "chainlink-841",
+        phase="terminal", status="completed", process="dead",
+    )
+    assert autonomy._attempt_is_active(done, [record]) is False
+
+    bare = tmp_path / ".worklink" / "842-1"
+    bare.mkdir(parents=True)
+    assert autonomy._attempt_is_active(bare) is False
+
+
+@pytest.mark.parametrize("phase", ["parked", "running", "failed", "stopped", "terminal"])
+@pytest.mark.parametrize("observation_age", [None, timedelta(minutes=30), timedelta(hours=25)])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_preserves_parked_factory(
+    tmp_path: Path, phase: str, observation_age: timedelta | None,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = _factory_record(
+        sandbox, phase=phase, status="needs-human", process="dead",
+        observed_at=(
+            (datetime.now(UTC) - observation_age).isoformat()
+            if observation_age is not None else None
+        ),
+    )
+    save_factory_record(tmp_path, record)
+
+    assert autonomy._attempt_is_active(child, [record]) is True
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert sandbox.is_dir()
+
+
+@pytest.mark.parametrize("phase", ["running", "failed"])
+@pytest.mark.parametrize("status", [None, "running"])
+@pytest.mark.parametrize(
+    "process", ["missing-handle", "missing-ticks", "unknown-substrate", "unreadable-ticks"]
+)
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_fails_closed_without_process_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+    status: str | None, process: str,
+) -> None:
+    from mimir_cultivate.worklink import factory_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = _factory_record(sandbox, phase=phase, status=status, process=process)
+    save_factory_record(tmp_path, record)
+    if process == "unreadable-ticks":
+        monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: None)
+
+    assert autonomy._attempt_is_active(child, [record]) is True
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert sandbox.is_dir()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_preserves_unknown_factory_phase(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = _factory_record(
+        sandbox, phase="future-phase", status="completed", process="dead",
+    )
+    save_factory_record(tmp_path, record)
+
+    assert list_factory_records(tmp_path).records == (record,)
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert sandbox.is_dir()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_fails_closed_when_factory_record_is_unparseable(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    source = save_factory_record(
+        tmp_path,
+        _factory_record(sandbox, phase="running", status="running", process="dead"),
+    )
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["status"]["slices"] = [
+        {"id": "factory-070-migration", "status": "ready", "attempts": 0}
+    ]
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    listing = list_factory_records(tmp_path)
+    assert listing.records == ()
+    assert len(listing.failures) == 1
+    assert "slices.extra_attempts missing" in listing.failures[0].reason
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert child.is_dir()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_checks_live_record_after_dead_record_for_same_checkout(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "840-1"
+    dead = _factory_record(
+        child / ".factory-sandboxes" / "chainlink-840",
+        phase="terminal", status="completed", process="dead",
+    )
+    live = _factory_record(child / ".factory-sandboxes" / "chainlink-841")
+    Path(dead.sandbox).mkdir(parents=True)
+    Path(live.sandbox).mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, dead)
+    save_factory_record(tmp_path, live)
+
+    assert list_factory_records(tmp_path).records == (dead, live)
+    assert autonomy._attempt_is_active(child, [dead, live]) is True
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert Path(dead.sandbox).is_dir()
+    assert Path(live.sandbox).is_dir()
+
+
+@pytest.mark.parametrize("interlock", ["busy", "symlink", "directory", "hardlink"])
+def test_prune_refuses_interlock_before_record_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interlock: str,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    child.mkdir(parents=True)
+    os.utime(child, (0, 0))
+
+    def unexpected_read(home: Path) -> None:
+        pytest.fail("pruner read records without acquiring the checkout interlock")
+
+    for name in ("list_factory_records", "list_run_states", "list_orphan_block_records"):
+        monkeypatch.setattr(autonomy, name, unexpected_read)
+
+    if interlock == "busy":
+        with factory_checkout_interlock(tmp_path) as acquired:
+            assert acquired
+            assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    else:
+        lock = tmp_path / "state" / "worklink" / "factory-checkouts.lock"
+        lock.parent.mkdir(parents=True)
+        target = tmp_path / "lock-target"
+        target.write_text("untouched", encoding="utf-8")
+        if interlock == "symlink":
+            lock.symlink_to(target)
+        elif interlock == "hardlink":
+            lock.hardlink_to(target)
+        else:
+            lock.mkdir()
+        assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+        assert target.read_text(encoding="utf-8") == "untouched"
+    assert child.is_dir()
+
+
+def test_reap_for_home_uses_config_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # reaper_ttl_s = 1h; a 3h-old claim is stale and gets reaped.
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "600")
+    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
+    fake = FakeChainlink(
+        in_progress=[60],
+        comments={60: [_claim_comment(60, attempt=1, age=timedelta(hours=3))]},
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
+    assert [r.issue_id for r in reaped.reaped] == [60]
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["60"]
+    assert incident["active"] is True
+    assert incident["attempt"] == 1
+    assert incident["exit_status"] is None
+    assert incident["terminal_error"] == (
+        "stale autonomous claim reaped after heartbeat expiry; target worklink:ready"
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_ttl_s", "expected_ttl_s", "emits_violation"),
+    [
+        (3599, 3600, False),
+        (3600, 3600, False),
+        (3601, 3601, False),
+    ],
+)
+def test_reap_for_home_enforces_ttl_floor_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_ttl_s: int,
+    expected_ttl_s: int,
+    emits_violation: bool,
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "1800")
+    _write_worklink_yaml(
+        tmp_path, timeout_s=1800, reaper_ttl_s=configured_ttl_s
+    )
+    seen_ttls: list[timedelta] = []
+    events: list[tuple[str, dict[str, object]]] = []
+    claims = SimpleNamespace(
+        reap_home=lambda *, ttl: seen_ttls.append(ttl)
+        or ReapResult(reaped=[], examined=0, skipped={}, skipped_issue_ids={}),
+    )
+    monkeypatch.setattr(
+        autonomy,
+        "log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    assert autonomy.reap_stale_claims_for_home(tmp_path, claims=claims).reaped == []
+    assert seen_ttls == [timedelta(seconds=expected_ttl_s)]
+    assert bool(events) is emits_violation
+
+
+def test_config_load_does_not_raise_leaf_ttl_to_factory_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("MIMIR_FACTORY_RUN_TIMEOUT_S", raising=False)
+    _write_worklink_yaml(tmp_path, timeout_s=3600, reaper_ttl_s=7800)
+
+    with caplog.at_level("WARNING", logger="mimir_cultivate.worklink.backends.registry"):
+        config = WorklinkConfig.load(tmp_path / "worklink.yaml")
+
+    assert config.defaults.reaper_ttl_s == 7800
+    assert "below the safe floor" not in caplog.text
+
+
+def test_reaper_ttl_constraint_is_stated_once() -> None:
+    import inspect
+
+    from mimir_cultivate.worklink.backends.registry import minimum_reaper_ttl_s
+
+    floor_source = inspect.getsource(minimum_reaper_ttl_s)
+    validation_source = inspect.getsource(WorklinkDefaults.validate)
+    reaper_source = inspect.getsource(autonomy.reap_stale_claims_for_home)
+    assert (floor_source + validation_source + reaper_source).count(
+        "return 2 * timeout_s"
+    ) == 1
+
+
+def test_config_load_validates_the_complete_defaults_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "1800")
+    _write_worklink_yaml(tmp_path, max_concurrent=7, timeout_s=1800, reaper_ttl_s=3600)
+    validated: list[WorklinkDefaults] = []
+    original_validate = WorklinkDefaults.validate
+
+    def capture(defaults: WorklinkDefaults) -> None:
+        validated.append(defaults)
+        original_validate(defaults)
+
+    monkeypatch.setattr(WorklinkDefaults, "validate", capture)
+    config = WorklinkConfig.load(tmp_path / "worklink.yaml")
+
+    assert config.defaults in validated
+    assert config.defaults.max_concurrent == 7
+    assert config.defaults.timeout_s == 1800
+    assert config.defaults.reaper_ttl_s == 3600
+
+
+# ── worklink_run tool: arbiter shed (TIGHT) + cap + dispatch ────────
+
+
+class _FakeDecision:
+    def __init__(self, fire: bool, severity_name: str = "TIGHT", priority: str = "normal") -> None:
+        self.fire = fire
+        self.priority = priority
+        self.reason = "test"
+        self.severity = type("Sev", (), {"name": severity_name})()
+
+
+class _FakeArbiter:
+    def __init__(self, fire: bool) -> None:
+        self._fire = fire
+        self.calls: list[str] = []
+
+    def should_fire(self, *, priority: str = "normal", **_: object):
+        self.calls.append(priority)
+        return _FakeDecision(self._fire, priority=priority)
+
+
+@pytest.fixture
+def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    if not cultivate_selected():
+        pytest.skip("selected Cultivate tool requires the provider")
+    provider_autonomy = pytest.importorskip("mimir_cultivate.worklink.autonomy")
+    provider_orchestrator = pytest.importorskip("mimir_cultivate.worklink.orchestrator")
+    _write_worklink_yaml(tmp_path)
+    repo_dir = tmp_path / "src"  # distinct from cwd so we can prove WORKLINK_REPO is honored
+    repo_dir.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo_dir))
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+    from mimir.tools import registry
+    from mimir.plugins.manager import load_plugins
+
+    dispatched: list[dict] = []
+
+    def fake_run_worklink(*, home, repo, issue_id, backend=None, **kwargs):
+        dispatched.append({
+            "issue_id": issue_id,
+            "repo": str(repo),
+            "home": str(home),
+            "autonomous": kwargs.get("autonomous"),
+        })
+        return type("R", (), {
+            "issue_id": issue_id, "attempt": 1, "status": "completed",
+            "review_ready": True, "pr_url": None, "evidence_path": None, "reason": None,
+        })()
+
+    monkeypatch.setattr(provider_orchestrator, "run_worklink", fake_run_worklink, raising=True)
+    # keep concurrency below cap by default (0 active)
+    monkeypatch.setattr(provider_autonomy, "check_concurrency", lambda home, **_: provider_autonomy.ConcurrencyCheck(True, 0, 2))
+    selected_tool = load_plugins(enable="cultivate").policy.tools["worklink_run"].factory()
+    yield (SimpleNamespace(worklink_run=selected_tool, set_arbiter=registry.set_arbiter),
+           dispatched, repo_dir, provider_autonomy, provider_orchestrator)
+    registry.set_arbiter(None)
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_sheds_under_tight(_tool_env) -> None:
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    arbiter = _FakeArbiter(fire=False)  # severity TIGHT → should_fire False
+    registry.set_arbiter(arbiter)
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "shed" in out and "TIGHT" in out
+    assert dispatched == []          # provably no launch under TIGHT
+    assert arbiter.calls == ["normal"]
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_arbiter_gate_does_not_block_loop(_tool_env) -> None:
+    import asyncio
+    import threading
+
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    worker_thread: int | None = None
+    passed_loop = None
+
+    class SlowArbiter:
+        def should_fire(self, *, priority="normal", event_loop=None):
+            nonlocal worker_thread, passed_loop
+            worker_thread = threading.get_ident()
+            passed_loop = event_loop
+            loop.call_soon_threadsafe(entered.set)
+            # Fail promptly if the gate regresses to running on the loop;
+            # never block the loop while waiting for it to release us.
+            if worker_thread == loop_thread:
+                finished.set()
+                return _FakeDecision(False, priority=priority)
+            try:
+                if not release.wait(timeout=10):
+                    raise TimeoutError("test did not release arbiter gate")
+                return _FakeDecision(False, priority=priority)
+            finally:
+                finished.set()
+
+    registry.set_arbiter(SlowArbiter())
+    run_task = asyncio.create_task(
+        registry.worklink_run.ainvoke({"issue_id": 443})
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        # The loop itself releases the worker only after proving progress.
+        # A wall-clock timer can fire before the worker even starts on CI.
+        assert worker_thread != loop_thread
+        assert not finished.is_set()
+        assert passed_loop is loop
+    finally:
+        release.set()
+        out = await asyncio.wait_for(run_task, timeout=5)
+
+    assert finished.is_set()
+    assert "worklink_run shed" in out
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env) -> None:
+    registry, dispatched, repo_dir, provider_autonomy, provider_orchestrator = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "443" in out and "completed" in out
+    assert [d["issue_id"] for d in dispatched] == [443]
+    assert dispatched[0]["autonomous"] is True
+    # the executor runs against WORKLINK_REPO, not the server process cwd
+    assert dispatched[0]["repo"] == str(repo_dir)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [False, True], ids=["advisory", "enforced"])
+async def test_worklink_run_tool_reaches_core_incident_admission_in_both_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
+) -> None:
+    if not cultivate_selected():
+        pytest.skip("selected Cultivate tool requires the provider")
+    provider_autonomy = pytest.importorskip("mimir_cultivate.worklink.autonomy")
+    from mimir.tools import registry as core_registry
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+
+    _write_worklink_yaml(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    if enforced:
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    else:
+        monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    monkeypatch.setattr(
+        provider_autonomy,
+        "check_concurrency",
+        lambda home, **kwargs: provider_autonomy.ConcurrencyCheck(True, 0, 2),
+    )
+    core_registry.set_arbiter(None)
+    record_failure(
+        dispatch_failure_state_dir(tmp_path),
+        issue_id=443,
+        attempt=1,
+        exit_status=1,
+        error="retained recovery required",
+        log_path="run.log",
+    )
+
+    selected = load_plugins(enable="cultivate").policy.tools["worklink_run"].factory()
+    output = await selected.ainvoke({"issue_id": 443})
+
+    assert "worklink_run #443: refused" in output
+    assert "unresolved Worklink incident" in output
+    assert "attempt=" not in output
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_cancellation_leaves_executor_running(
+    _tool_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+
+    registry, dispatched, repo_dir, provider_autonomy, provider_orchestrator = _tool_env
+    orch = provider_orchestrator
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    fake_run_worklink = orch.run_worklink
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+    worker_thread: int | None = None
+    results = []
+
+    def blocked_run_worklink(**kwargs):
+        nonlocal worker_thread
+        worker_thread = threading.get_ident()
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release executor")
+            result = fake_run_worklink(**kwargs)
+            results.append(result)
+            return result
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    monkeypatch.setattr(orch, "run_worklink", blocked_run_worklink)
+    run_task = asyncio.create_task(
+        registry.worklink_run.ainvoke({"issue_id": 443})
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert worker_thread != threading.get_ident()
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, timeout=5)
+        assert run_task.cancelled()
+        assert not finished.is_set()
+        assert dispatched == []
+
+        # Cancellation ends the awaiter, not the synchronous executor.
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=5)
+        assert [result.status for result in results] == ["completed"]
+        assert [item["issue_id"] for item in dispatched] == [443]
+        assert dispatched[0]["repo"] == str(repo_dir)
+        assert dispatched[0]["autonomous"] is True
+    finally:
+        release.set()
+        if not run_task.done():
+            run_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(run_task, return_exceptions=True), timeout=5
+        )
+        if entered.is_set():
+            await asyncio.wait_for(finished.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_tool_propagates_refused_result(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+
+    def fake_refused(*, home, repo, issue_id, backend=None, **kwargs):
+        dispatched.append({"issue_id": issue_id, "autonomous": kwargs.get("autonomous")})
+        return type("R", (), {
+            "issue_id": issue_id, "attempt": None, "status": "refused",
+            "review_ready": False, "pr_url": None, "evidence_path": None,
+            "reason": "unsafe compute",
+        })()
+
+    orch = provider_orchestrator
+    monkeypatch.setattr(orch, "run_worklink", fake_refused, raising=True)
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "refused" in out and "unsafe compute" in out
+    assert dispatched == [{"issue_id": 443, "autonomous": True}]
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_fails_when_worklink_repo_unset(
+    _tool_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "WORKLINK_REPO is required" in out
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    monkeypatch.setattr(provider_autonomy, "check_concurrency", lambda home, **_: provider_autonomy.ConcurrencyCheck(False, 2, 2))
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "skipped" in out
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_leaf_cap_excludes_epic_locks(
+    _tool_env, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+    fake = FakeChainlink(active_locks=[100, 200], epic_ids={100})
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    assert check_concurrency.__module__ == "mimir_cultivate.worklink.autonomy"
+    assert check_concurrency(Path(os.environ["MIMIR_HOME"]), claims=claims).active == 1
+    monkeypatch.setattr(
+        provider_autonomy,
+        "check_concurrency",
+        lambda home, **_: check_concurrency(home, claims=claims),
+    )
+
+    allowed = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "completed" in allowed
+    assert [item["issue_id"] for item in dispatched] == [443]
+
+    fake.active_locks = [100, 200, 201]
+    observed = check_concurrency(Path(os.environ["MIMIR_HOME"]), claims=claims)
+    assert observed.active == observed.cap == 2
+    assert not observed.allowed
+    blocked = await registry.worklink_run.ainvoke({"issue_id": 444})
+    assert "concurrency cap reached (2/2 active claims)" in blocked
+    assert [item["issue_id"] for item in dispatched] == [443]
+
+
+@pytest.mark.asyncio
+async def test_worklink_run_fails_closed_when_cap_unreadable(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    registry.set_arbiter(_FakeArbiter(fire=True))
+
+    def boom(home, **_):
+        raise RuntimeError("chainlink unreachable")
+
+    monkeypatch.setattr(provider_autonomy, "check_concurrency", boom)
+    out = await registry.worklink_run.ainvoke({"issue_id": 443})
+    assert "concurrency check error" in out  # fail closed: surfaced, not dispatched
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_and_server_wire_worklink_arbiter_and_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect
+    import mimir.runtime as runtime
+    import mimir.server as server
+
+    runtime_source = inspect.getsource(runtime._install_runtime_globals)
+    server_source = inspect.getsource(server.build_app)
+    assert "tools.set_arbiter(bundle.agent._arbiter)" in runtime_source
+    assert '_server_hooks(config.plugin_manager.policy, "configure_jobs")' in server_source
+    assert "scheduler.add_worklink_reaper_job(" not in server_source
+
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+
+    from mimir.scheduler import Scheduler
+
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue)
+    (tmp_path / "worklink.yaml").write_text("repository: org/repo\n")
+    monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "*/7 * * * *")
+    monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
+
+    async def event(*args, **kwargs):
+        pytest.fail(f"unexpected scheduler error: {args}, {kwargs}")
+
+    policy = load_plugins(enable="cultivate").policy
+    hook = policy.server_hooks["cultivate", "configure_jobs"]
+    await hook(scheduler, tmp_path, "operator", object(), event)
+    assert scheduler._callables["worklink-reaper"].default_cron == "*/7 * * * *"
+    assert scheduler._scheduler.get_job("worklink-reaper") is not None
+    assert scheduler._callables["worklink-factory-park-alert"].default_cron == "*/5 * * * *"
+    assert scheduler._scheduler.get_job("worklink-factory-park-alert") is not None
+
+
+# ── ready-queue poller: discovery + cap-bounded detached dispatch ───
+
+
+POLLER = Path(__file__).resolve().parent.parent / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py"
+
+
+def _fake_chainlink_script(
+    tmp: Path,
+    *,
+    ready: list[int],
+    epics: list[int] | None = None,
+    blocked: list[int] | None = None,
+    review_epics: list[int] | None = None,
+    parents: dict[int, int] | None = None,
+    in_progress: list[int] | None = None,
+    active_locks: list[int] | None = None,
+    actionable: list[int] | None = None,
+) -> Path:
+    """A tiny stand-in chainlink for ready-label + actionable queries."""
+    script = tmp / "chainlink"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "a = sys.argv[1:]\n"
+        f"ready = {ready!r}\n"
+        f"epics = {(epics or [])!r}\n"
+        f"blocked = {(blocked or [])!r}\n"
+        f"review_epics = {(review_epics or [])!r}\n"
+        f"parents = {(parents or {})!r}\n"
+        f"actionable = {(ready if actionable is None else actionable)!r}\n"
+        f"inprog = {(in_progress or [])!r}\n"
+        f"locks = {(active_locks if active_locks is not None else (in_progress or []))!r}\n"
+        "if a[:2] == ['locks','list']:\n"
+        "    print(json.dumps({'version': 1, 'locks': {str(i): {'issue_id': i} for i in locks}}))\n"
+        "    sys.exit(0)\n"
+        "if a[:2] == ['issue','ready']:\n"
+        "    print(json.dumps([{'id': i} for i in actionable]))\n"
+        "    sys.exit(0)\n"
+        "if a[:2] == ['issue','list']:\n"
+        "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
+        "    ids = epics if label=='worklink:epic' else blocked if label=='worklink:blocked' else review_epics if label=='worklink:review' else inprog if label=='worklink:in-progress' else ready if label=='worklink:ready' else []\n"
+        "    print(json.dumps([{'id': i, 'parent_id': parents.get(i)} for i in ids]))\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def test_poller_import_path_repair_uses_explicit_source_dir_without_editable_install(tmp_path: Path) -> None:
+    """Exercise the actual repair helper without relying on editable-install .pths."""
+
+    skill_dir = tmp_path / "skills" / "chainlink-orchestrator"
+    skill_dir.mkdir(parents=True)
+    source_dir = tmp_path / "source"
+    (source_dir / "mimir").mkdir(parents=True)
+    (source_dir / "mimir" / "__init__.py").write_text("", encoding="utf-8")
+
+    # Run only the helper prelude from the real poller under `python -S`, which
+    # disables site initialization and therefore the project's editable .pth. If
+    # the helper is a no-op, the source dir will not appear on sys.path.
+    prelude = POLLER.read_text(encoding="utf-8").split("\n_ensure_mimir_import_path()\n", 1)[0]
+    script = prelude + "\n_ensure_mimir_import_path()\nimport sys; print(sys.path[0])\n"
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        cwd=str(skill_dir),
+        env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(source_dir)
+
+
+def test_poller_import_path_repair_adds_source_venv_site_packages(tmp_path: Path) -> None:
+    """System python plus source path also needs runtime deps from source .venv."""
+
+    skill_dir = tmp_path / "skills" / "chainlink-orchestrator"
+    skill_dir.mkdir(parents=True)
+    source_dir = tmp_path / "source"
+    (source_dir / "mimir").mkdir(parents=True)
+    (source_dir / "mimir" / "__init__.py").write_text("", encoding="utf-8")
+    site = source_dir / ".venv" / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "fake_runtime_dep.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    prelude = POLLER.read_text(encoding="utf-8").split("\n_ensure_mimir_import_path()\n", 1)[0]
+    script = (
+        prelude
+        + "\n_ensure_mimir_import_path()\n"
+        + "import fake_runtime_dep; print(fake_runtime_dep.VALUE)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        cwd=str(skill_dir),
+        env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "42"
+
+
+def _fake_run_bin(tmp: Path) -> Path:
+    """A run-bin that records each `worklink run <id>` dispatch to a file."""
+    record = tmp / "dispatched.txt"
+    pids = tmp / "fake-run-bin-pids.txt"
+    log = tmp / "fake-run-bin.log"
+    script = tmp / "fakemimir"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        f"log_path = {str(log)!r}\n"
+        "devnull = os.open(os.devnull, os.O_RDWR)\n"
+        "try:\n"
+        "    os.dup2(devnull, 0)\n"
+        "    os.dup2(os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644), 1)\n"
+        "    os.dup2(os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644), 2)\n"
+        "finally:\n"
+        "    os.close(devnull)\n"
+        f"open({str(pids)!r}, 'a', encoding='utf-8').write(str(os.getpid()) + '\\n')\n"
+        f"open({str(tmp / 'coding-enabled.txt')!r}, 'a', encoding='utf-8').write(os.environ.get('MIMIR_CODING_ENABLED', '<unset>') + '\\n')\n"
+        f"open({str(record)!r}, 'a', encoding='utf-8').write(' '.join(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _read_dispatch_lines(tmp: Path) -> list[str]:
+    record = tmp / "dispatched.txt"
+    if not record.exists():
+        return []
+    return record.read_text(encoding="utf-8").splitlines()
+
+
+def _wait_for_dispatch_lines(tmp: Path, expected: list[str], timeout: float = 10.0) -> list[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        lines = _read_dispatch_lines(tmp)
+        if lines == expected:
+            return lines
+        time.sleep(0.05)
+    lines = _read_dispatch_lines(tmp)
+    assert lines == expected
+    return lines
+
+
+def _wait_for_fake_run_bin_exit(tmp: Path, expected_count: int, timeout: float = 10.0) -> None:
+    pids_path = tmp / "fake-run-bin-pids.txt"
+    deadline = time.monotonic() + timeout
+    pids: list[int] = []
+    while time.monotonic() < deadline:
+        if pids_path.exists():
+            pids = [
+                int(line)
+                for line in pids_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        if len(pids) >= expected_count and not _live_pids(pids):
+            return
+        time.sleep(0.05)
+
+    assert len(pids) >= expected_count
+    live = _live_pids(pids)
+    for pid in live:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and _live_pids(pids):
+        time.sleep(0.05)
+    assert not _live_pids(pids)
+
+
+def _live_pids(pids: list[int]) -> list[int]:
+    live: list[int] = []
+    for pid in pids:
+        proc_stat = Path("/proc") / str(pid) / "stat"
+        try:
+            if proc_stat.exists() and proc_stat.read_text(encoding="utf-8").split()[2] == "Z":
+                continue
+        except (OSError, IndexError):
+            pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            live.append(pid)
+        else:
+            live.append(pid)
+    return live
+
+
+def _load_poller_module():
+    if not cultivate_selected():
+        pytest.skip("Cultivate poller is not selected")
+    spec = importlib.util.spec_from_file_location("chainlink_orchestrator_poller_under_test", POLLER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
+def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
+    if not cultivate_selected():
+        pytest.skip("Cultivate poller is not selected")
+    env = {k: v for k, v in os.environ.items() if k not in {
+        "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
+        "MIMIR_FACTORY_EPICS_ENABLED",
+    }}
+    env.update(env_extra)
+    proc = subprocess.Popen(
+        [sys.executable, str(POLLER)], cwd=str(tmp), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    assert proc.stdout is not None
+    events = []
+    for line in proc.stdout:
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        events.append(event)
+        if event.get("delivery_barrier") is True:
+            _write_delivery_receipt(
+                dispatch_failure_state_dir(Path(env["MIMIR_HOME"])),
+                event.get("delivery_key"),
+            )
+    _, stderr = proc.communicate(timeout=30)
+    assert proc.returncode == 0, stderr
+    expected_fake_runs = sum(1 for event in events if event.get("signal") == "worklink_dispatched")
+    _wait_for_fake_run_bin_exit(tmp, expected_fake_runs)
+    return events
+
+
+def test_ready_queue_dispatch_bypasses_agent_tool_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import ToolRegistry
+
+    poller = _load_poller_module()
+    launched: list[dict] = []
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("server-side dispatch routed through agent tool authorization")
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", forbidden)
+    monkeypatch.setattr(poller, "launch_detached_worklink", lambda **kwargs: launched.append(kwargs))
+    monkeypatch.setattr(poller, "_emit", lambda record: None)
+
+    assert poller._dispatch(
+        item=poller.DispatchItem(1896, "leaf"),
+        home=tmp_path, repo=str(tmp_path), state_dir=tmp_path,
+        run_bin=["mimir"], active=0, leaf_cap=2, factory_cap=1,
+    ) is True
+    assert len(launched) == 1
+    assert launched[0]["command"] == "run"
+    assert launched[0]["issue_id"] == 1896
+    assert launched[0]["run_bin"] == ["mimir"]
+
+
+def test_ready_dispatch_spawn_failure_records_intended_log_without_consuming_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poller = _load_poller_module()
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = dispatch_failure_state_dir(home)
+    state_dir.mkdir(parents=True)
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        poller.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn unavailable")),
+    )
+    monkeypatch.setattr(poller, "_emit", emitted.append)
+
+    dispatched = poller._dispatch(
+        item=poller.DispatchItem(201, "leaf"),
+        home=home,
+        repo=str(repo),
+        state_dir=state_dir,
+        run_bin=["mimir"],
+        active=0,
+        leaf_cap=2,
+        factory_cap=1,
+    )
+
+    incident = load_failure_state(state_dir)["issues"]["201"]
+    assert dispatched is False
+    assert incident["active"] is True
+    assert incident["attempt"] is None
+    assert incident["attempt_consumed"] is False
+    assert incident["log_path"] == str(state_dir / "run-201.log")
+    assert incident["work_path"] == str(repo)
+    assert emitted == [{
+        "signal": "worklink_dispatch_failed",
+        "issue_id": 201,
+        "reason": "spawn unavailable",
+    }]
+
+
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
+def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text("defaults:\n  max_concurrent: 3\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = tmp_path / "state"
+    chainlink = _fake_chainlink_script(tmp_path, ready=[10, 11, 12], active_locks=[10])
+    run_bin = _fake_run_bin(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, str(POLLER)],
+        env={
+            **os.environ,
+            "MIMIR_HOME": str(home),
+            "WORKLINK_REPO": str(repo),
+            "STATE_DIR": str(state),
+            "CHAINLINK_BIN": str(chainlink),
+            "WORKLINK_RUN_BIN": str(run_bin),
+        },
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert proc.returncode == 0
+    records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    _wait_for_fake_run_bin_exit(
+        tmp_path,
+        sum(1 for record in records if record.get("signal") == "worklink_dispatched"),
+    )
+    # 10 holds an active lock, so it is not a candidate; the cap of 3 still yields two slots
+    # and the two unlocked ready issues fill them.
+    assert [
+        r.get("issue_id") for r in records if r.get("signal") == "worklink_dispatched"
+    ] == [11, 12]
+
+
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
+def test_poller_excludes_actively_locked_issue_from_candidates(tmp_path: Path) -> None:
+    """A locked issue must not consume the slot its own worker already holds.
+
+    Slots are computed as cap minus active locks, so an actively locked issue left in the
+    sorted candidate list eats a slot by id order: the poller launches a second worker that
+    loses the atomic claim and exits, and the unlocked issue waits another cycle. `ready` and
+    `actionable` both remain true while a claim label transitions, so 100 below is a realistic
+    state rather than a contrived one. Without the exclusion this dispatches [100].
+    """
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text("defaults:\n  max_concurrent: 2\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[100, 200], active_locks=[100])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    dispatched = [e.get("issue_id") for e in events if e.get("signal") == "worklink_dispatched"]
+    assert dispatched == [200]
+    assert 100 not in dispatched
+
+
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
+def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text('defaults: {max_concurrent: "3"}\n', encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[10, 11, 12], active_locks=[10])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    # WorklinkConfig parses flow-style YAML and takes precedence over the legacy
+    # env cap: cap 3, 1 active lock → 2 free slots, and the locked issue 10 is not a
+    # candidate for either of them.
+    assert [
+        r.get("issue_id") for r in events if r.get("signal") == "worklink_dispatched"
+    ] == [11, 12]
+
+
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
+def test_poller_degrades_before_dispatch_for_invalid_backend_reference(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "worklink.yaml"
+    config_path.write_text(
+        "defaults:\n  backend_by_category:\n    coding-cli: codex\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[10], active_locks=[])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    assert not [event for event in events if event.get("signal") == "worklink_dispatched"]
+    invalid = [
+        event for event in events if event.get("signal") == "worklink_poller_misconfigured"
+    ]
+    assert len(invalid) == 1
+    assert str(config_path) in invalid[0]["reason"]
+    assert "defaults.backend_by_category.coding-cli" in invalid[0]["reason"]
+    assert "change defaults.backend_by_category.coding-cli" in invalid[0]["reason"]
+
+
+def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    chainlink = _fake_chainlink_script(tmp_path, ready=[201, 202, 203], active_locks=[100])
+    runbin = _fake_run_bin(tmp_path)
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    # cap 2, 1 already active → exactly 1 free slot → 1 dispatch
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert len(dispatched) == 1
+    assert dispatched[0]["issue_id"] == 201  # lowest id first
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 3 and scan["active"] == 1 and scan["dispatched"] == 1
+
+
+def test_poller_dispatch_does_not_report_retired_coding_flag(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[201], active_locks=[])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(tmp_path / "state"),
+    }
+    events = _run_poller(tmp_path, env)
+
+    dispatched = [event for event in events if event.get("signal") == "worklink_dispatched"]
+    assert len(dispatched) == 1
+    assert "coding_enabled" not in dispatched[0]
+
+
+def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = dispatch_failure_state_dir(home)
+    ambient_state_dir = tmp_path / "injected-state" / "different-poller"
+    log_path = state_dir / "run-201.log"
+    chainlink = _fake_chainlink_script(tmp_path, ready=[201], active_locks=[])
+    runbin = _fake_run_bin(tmp_path)
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(ambient_state_dir),
+        "POLLER_NAME": "different-poller",
+    }
+    monkeypatch.setenv("STATE_DIR", str(ambient_state_dir))
+    monkeypatch.setenv("POLLER_NAME", "different-poller")
+    monkeypatch.setenv("WORKLINK_RUN_LOG", str(log_path))
+    orchestrator._record_run_failure(
+        home=home,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: bad config token=top-secret",
+        autonomous=True,
+    )
+
+    failed_tick = tmp_path / "failed-poller-tick.py"
+    failed_tick.write_text(
+        "import runpy\n"
+        "try:\n"
+        f"    runpy.run_path({str(POLLER)!r}, run_name='__main__')\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    failed = subprocess.run(
+        [sys.executable, str(failed_tick)],
+        cwd=tmp_path,
+        env={**os.environ, **env, "POLLER_TIMEOUT_SECONDS": "10.1"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert failed.returncode == 1
+    first = [json.loads(line) for line in failed.stdout.splitlines() if line.strip()]
+    alerts = [e for e in first if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")]
+    assert len(alerts) == 1
+    assert alerts[0]["issue_id"] == 201
+    assert alerts[0]["log"] == str(log_path)
+    assert alerts[0]["terminal_error"] == "ValueError: bad config token=[REDACTED]"
+    assert alerts[0]["source_id"] == alerts[0]["delivery_key"]
+    assert "signal" not in alerts[0]
+    assert alerts[0]["poller"] == "worklink-ready-queue"
+    assert not [e for e in first if e.get("signal") == "worklink_dispatched"]
+    assert not ambient_state_dir.exists()
+    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == []
+
+    second = _run_poller(tmp_path, env)
+    retried = [e for e in second if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")]
+    assert len(retried) == 1
+    assert retried[0]["delivery_key"] == alerts[0]["delivery_key"]
+    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == []
+
+    _write_delivery_receipt(state_dir, alerts[0]["delivery_key"])
+    delivered = _run_poller(tmp_path, env)
+    assert not [e for e in delivered if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")]
+    assert not [e for e in second if e.get("signal") == "worklink_dispatched"]
+
+    orchestrator._record_run_failure(
+        home=home,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="RuntimeError: a distinct failure",
+        autonomous=True,
+    )
+    distinct = _run_poller(tmp_path, env)
+    distinct_alerts = [
+        e for e in distinct if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")
+    ]
+    assert len(distinct_alerts) == 1
+    assert distinct_alerts[0]["terminal_error"] == "RuntimeError: a distinct failure"
+    _write_delivery_receipt(state_dir, distinct_alerts[0]["delivery_key"])
+
+    state = load_failure_state(state_dir)
+    state["issues"]["201"]["retry_after"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    save_failure_state(state_dir, state)
+    record_success(state_dir, 201)
+    recovered = _run_poller(tmp_path, env)
+    assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
+
+
+def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatch-before-ack reintroduces #1361 and must fail this named test."""
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    poller = _load_poller_module()
+    alert = {
+        "prompt": "diagnose current incident",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+    }
+    with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
+        state["issues"]["201"] = {
+            "active": True, "signature": alert["error_signature"],
+            "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
+        }
+    order: list[str] = []
+    receipt = False
+
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _config: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _path: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state: ({201}, [alert]))
+
+    def emit(event: dict) -> None:
+        nonlocal receipt
+        if event.get("prompt"):
+            order.append("alert-emitted")
+
+    monkeypatch.setattr(poller, "_emit", emit)
+    monkeypatch.setattr(
+        poller, "delivery_receipt_exists", lambda _state, _key: receipt
+    )
+    monkeypatch.setattr(
+        poller,
+        "mark_failure_notified",
+        lambda *_args: order.append("alert-durably-acked"),
+    )
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        poller,
+        "_active_lock_issue_ids",
+        lambda _home: order.append("ready-scan") or set(),
+    )
+    monkeypatch.setattr(
+        poller,
+        "_worklink_dispatch_plan",
+        lambda *_args, **_kwargs: (
+            [poller.DispatchItem(201, "leaf"), poller.DispatchItem(202, "leaf")],
+            2,
+            0,
+            0,
+            set(),
+        ),
+    )
+    monkeypatch.setattr(poller, "_configured_cap", lambda _home: 2)
+    monkeypatch.setattr(poller, "factory_max_concurrent", lambda: 1)
+    monkeypatch.setattr(
+        poller,
+        "_dispatch",
+        lambda **kwargs: order.append(f"dispatch-{kwargs['item'].issue_id}") or True,
+    )
+
+    assert poller.main() == 0
+    assert order == ["alert-emitted"]
+    receipt = True
+    assert poller.main() == 0
+    assert order == [
+        "alert-emitted",
+        "alert-durably-acked",
+        "ready-scan",
+        "dispatch-202",
+    ]
+
+
+def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    poller = _load_poller_module()
+    alert = {
+        "prompt": "diagnose current incident",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+    }
+    with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
+        state["issues"]["201"] = {
+            "active": True, "signature": alert["error_signature"],
+            "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
+        }
+    events: list[dict] = []
+    receipt = False
+
+    class SpentAfterDelivery:
+        def hard_exhausted(self) -> bool:
+            return False
+
+        def hard_remaining(self) -> float:
+            return 1.0
+
+        def affords_ready_scan(self) -> bool:
+            return False
+
+    monkeypatch.setattr(poller, "TickBudget", SpentAfterDelivery)
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _config: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _path: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state: ({201}, [alert]))
+
+    def emit(event: dict) -> None:
+        nonlocal receipt
+        events.append(event.copy())
+
+    monkeypatch.setattr(poller, "_emit", emit)
+    monkeypatch.setattr(poller, "delivery_receipt_exists", lambda _state, _key: receipt)
+    monkeypatch.setattr(poller, "mark_failure_notified", lambda *_args: None)
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        poller,
+        "_active_lock_issue_ids",
+        lambda _home: pytest.fail("ready scan started without enough budget"),
+    )
+
+    assert poller.main() == 0
+    assert events[0]["prompt"] == "diagnose current incident"
+    assert events[1]["signal"] == "worklink_ready_scan"
+    assert events[-1]["dispatched"] == 0
+    assert "prompt emitted" in events[-1]["reason"]
+
+
+def test_epic_dispatch_backoff_prevents_attempt_each_poll_cycle(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = dispatch_failure_state_dir(home)
+    record_failure(
+        state_dir,
+        issue_id=100,
+        attempt=1,
+        exit_status=1,
+        error="deterministic epic failure",
+        log_path=None,
+    )
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(
+            _fake_chainlink_script(
+                tmp_path,
+                ready=[100],
+                epics=[100],
+                actionable=[100],
+                active_locks=[],
+            )
+        ),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    }
+
+    first = _run_poller(tmp_path, env)
+    second = _run_poller(tmp_path, env)
+
+    assert not [event for event in first if event.get("signal") == "worklink_dispatched"]
+    assert not [event for event in second if event.get("signal") == "worklink_dispatched"]
+    assert not (tmp_path / "dispatched.txt").exists()
+
+
+def test_poller_stops_after_emitting_when_later_failure_ack_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    poller = _load_poller_module()
+    first = {
+        "prompt": "first incident",
+        "issue_id": 201,
+        "error_signature": "first-signature",
+        "failure_occurrence_id": "first-occurrence",
+    }
+    second = {
+        "prompt": "second incident",
+        "issue_id": 202,
+        "error_signature": "second-signature",
+        "failure_occurrence_id": "second-occurrence",
+    }
+    with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
+        for alert in (first, second):
+            state["issues"][str(alert["issue_id"])] = {
+                "active": True, "signature": alert["error_signature"],
+                "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
+            }
+    emitted: list[dict] = []
+    continuation_called = False
+
+    # This test owns the failure-ack path, not the wall-clock tick budget.
+    # Under a loaded full suite the real budget can expire before the first
+    # alert is emitted, bypassing the ack failure being exercised here.
+    monkeypatch.setattr(poller, "TickBudget", lambda: SimpleNamespace(hard_exhausted=lambda: False))
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state_dir: ({201, 202}, [first, second]))
+    monkeypatch.setattr(
+        poller,
+        "delivery_receipt_exists",
+        lambda _state_dir, key: key.endswith("second-signature:second-occurrence"),
+    )
+    monkeypatch.setattr(
+        poller,
+        "mark_failure_notified",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("ack failed")),
+    )
+    monkeypatch.setattr(poller, "_emit", lambda event: emitted.append(event.copy()))
+
+    def consume(*_args, **_kwargs):
+        nonlocal continuation_called
+        continuation_called = True
+        return []
+
+    monkeypatch.setattr(poller, "consume_worklink_budget_continuations", consume)
+
+    assert poller.main() == 0
+    assert emitted[0]["prompt"] == "first incident"
+    assert [event["signal"] for event in emitted[1:]] == [
+        "worklink_dispatch_failure_state_error",
+    ]
+    assert emitted[0]["delivery_key"].endswith("first-signature:first-occurrence")
+    assert continuation_called is False
+
+
+def test_failure_alert_is_not_deduped_until_delivery_is_recorded(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    entry = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+
+    first_backoff, first_alerts = pending_failure_alerts(state_dir)
+    second_backoff, second_alerts = pending_failure_alerts(state_dir)
+    assert first_backoff == second_backoff == {201}
+    assert len(first_alerts) == len(second_alerts) == 1
+
+    mark_failure_notified(
+        state_dir, 201, entry["signature"], entry["occurrence_id"]
+    )
+    _, delivered_alerts = pending_failure_alerts(state_dir)
+    assert delivered_alerts == []
+
+
+def test_transient_preclaim_git_contention_does_not_enter_backoff(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    entry = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error=(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists.\n"
+            "Another git process seems to be running in this repository."
+        ),
+        log_path=None,
+    )
+
+    assert entry["transient_contention"] is True
+    assert load_failure_state(state_dir)["issues"] == {}
+
+
+def test_stale_delivery_ack_does_not_suppress_new_same_signature_failure(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    first = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+    record_success(state_dir, 201)
+    second = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+
+    mark_failure_notified(
+        state_dir, 201, first["signature"], first["occurrence_id"]
+    )
+
+    assert first["occurrence_id"] != second["occurrence_id"]
+    _, alerts = pending_failure_alerts(state_dir)
+    assert len(alerts) == 1
+    assert alerts[0]["failure_occurrence_id"] == second["occurrence_id"]
+
+
+def test_failure_transaction_does_not_persist_partial_mutation(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    save_failure_state(state_dir, {"version": 1, "issues": {}})
+
+    with pytest.raises(RuntimeError, match="abort mutation"):
+        with failure_state_transaction(state_dir) as state:
+            state["issues"]["201"] = {"active": True}
+            raise RuntimeError("abort mutation")
+
+    assert load_failure_state(state_dir)["issues"] == {}
+
+
+def test_record_success_clears_active_failure_and_notification_history(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    entry = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+    mark_failure_notified(
+        state_dir, 201, entry["signature"], entry["occurrence_id"]
+    )
+
+    record_success(state_dir, 201)
+
+    cleared = load_failure_state(state_dir)["issues"]["201"]
+    assert cleared["active"] is False
+    assert cleared["consecutive"] == 0
+    assert cleared["notified_signatures"] == []
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_does_not_dispatch_worklink_epic_issues(tmp_path: Path) -> None:
+    """chainlink #833: with MIMIR_FACTORY_EPICS_ENABLED unset (the default), an
+    actionable epic is excluded from leaf dispatch and NOT dispatched to the
+    feature-factory — so a deployment that hasn't opted in never
+    dispatches-then-refuses the epic every poll cycle."""
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[100],
+        epics=[100],
+        actionable=[100],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert dispatched == []
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_dispatches_only_ready_epic_when_factory_epics_enabled(tmp_path: Path) -> None:
+    """The ready label arms epic dispatch just as it arms leaf dispatch."""
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[100],
+        epics=[100, 101],
+        actionable=[100, 101],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert len(dispatched) == 1
+    assert dispatched[0]["issue_id"] == 100
+    assert dispatched[0]["mode"] == "epic"
+    assert 101 not in [event.get("issue_id") for event in dispatched]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_excludes_worklink_blocked_from_leaf_and_epic_dispatch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[100, 101, 200, 201],
+        epics=[100, 101],
+        blocked=[100, 200],
+        actionable=[100, 101, 200, 201],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+        "MIMIR_FACTORY_EPICS_ENABLED": "true",
+    })
+
+    dispatched = [
+        (event["mode"], event["issue_id"])
+        for event in events
+        if event.get("signal") == "worklink_dispatched"
+    ]
+    assert dispatched == [("leaf", 201), ("epic", 101)]
+    scan = [
+        event for event in events if event.get("signal") == "worklink_ready_scan"
+    ][-1]
+    assert scan["labeled_ready_count"] == 4
+    assert scan["blocked_ready_count"] == 0
+    assert scan["label_blocked_ready_count"] == 2
+
+
+def test_poller_keeps_bare_ready_leaf_on_per_leaf_run(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[201],
+        epics=[],
+        actionable=[201],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("leaf", 201)]
+    expected_lines = [
+        f"worklink run 201 --home {home} --repo {repo} --autonomous"
+    ]
+    assert _wait_for_dispatch_lines(tmp_path, expected_lines) == expected_lines
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_skips_leaf_under_active_epic_lock(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[101, 201],
+        epics=[100],
+        parents={101: 100},
+        actionable=[101, 201],
+        active_locks=[100],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert [(e["mode"], e["issue_id"]) for e in dispatched] == [("leaf", 201)]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_filters_worklink_ready_through_chainlink_actionable_set(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path,
+        ready=[201, 202, 203],
+        actionable=[101, 201, 203],
+        active_locks=[],
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert [e["issue_id"] for e in dispatched] == [201, 203]
+    assert 202 not in [e["issue_id"] for e in dispatched]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 2
+    assert scan["labeled_ready_count"] == 3
+    assert scan["blocked_ready_count"] == 1
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_leaves_blocked_worklink_ready_issues_untouched(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    chainlink = _fake_chainlink_script(
+        tmp_path, ready=[301, 302], actionable=[999], active_locks=[]
+    )
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    assert not [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert not (tmp_path / "dispatched.txt").exists()
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 0
+    assert scan["labeled_ready_count"] == 2
+    assert scan["blocked_ready_count"] == 2
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_dispatches_worklink_ready_after_blocker_closes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Simulates Chainlink's closed-blocker behavior: the issue remains labeled
+    # worklink:ready and appears in `issue ready` once its blocker closes.
+    chainlink = _fake_chainlink_script(
+        tmp_path, ready=[401], actionable=[401], active_locks=[]
+    )
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    assert [
+        e.get("issue_id") for e in events if e.get("signal") == "worklink_dispatched"
+    ] == [401]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 1
+    assert scan["labeled_ready_count"] == 1
+    assert scan["blocked_ready_count"] == 0
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_no_dispatch_when_cap_reached(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    chainlink = _fake_chainlink_script(tmp_path, ready=[201], active_locks=[100, 101])
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    assert not [e for e in events if e.get("signal") == "worklink_dispatched"]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["slots"] == 0
+
+
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_accepts_chainlink_ready_text_when_json_flag_is_ignored(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    script = tmp_path / "chainlink"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "a = sys.argv[1:]\n"
+        "if a[:2] == ['locks','list']:\n"
+        "    print(json.dumps({'version': 1, 'locks': {}}))\n"
+        "    sys.exit(0)\n"
+        "if a[:2] == ['issue','ready']:\n"
+        "    print('Ready issues (no blockers):')\n"
+        "    print('  #201  high     unblocked worklink leaf')\n"
+        "    print('  #203  medium   another unblocked leaf')\n"
+        "    sys.exit(0)\n"
+        "if a[:2] == ['issue','list']:\n"
+        "    label = a[a.index('--label')+1] if '--label' in a else ''\n"
+        "    ids = [201, 202, 203] if label == 'worklink:ready' else []\n"
+        "    print(json.dumps([{'id': i} for i in ids]))\n"
+        "    sys.exit(0)\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    runbin = _fake_run_bin(tmp_path)
+
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(script),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "3",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    dispatched = [e for e in events if e.get("signal") == "worklink_dispatched"]
+    assert [e["issue_id"] for e in dispatched] == [201, 203]
+    scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
+    assert scan["ready_count"] == 2
+    assert scan["labeled_ready_count"] == 3
+    assert scan["blocked_ready_count"] == 1
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_fails_closed_when_chainlink_errors(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    # a chainlink shim that always errors → poller can't read the queue
+    script = tmp_path / "chainlink"
+    script.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n", encoding="utf-8")
+    script.chmod(0x755)
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(script),
+        "WORKLINK_REPO": str(home),
+        "WORKLINK_MAX_CONCURRENT": "2",
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    assert any(e.get("signal") == "worklink_poller_degraded" for e in events)
+    assert not [e for e in events if e.get("signal") == "worklink_dispatched"]
+
+
+# ── chainlink #844: merged PR -> close worklink:review ───────────────────
+
+
+def test_normalize_pr_url() -> None:
+    assert autonomy._normalize_pr_url("https://github.com/owner/repo/pull/123") == "https://github.com/owner/repo/pull/123"
+    assert autonomy._normalize_pr_url("https://github.com/Owner/Repo/pull/456") == "https://github.com/owner/repo/pull/456"
+    assert autonomy._normalize_pr_url("http://github.com/owner/repo/pull/789") == "https://github.com/owner/repo/pull/789"
+    assert autonomy._normalize_pr_url("https://github.com/owner/repo/pull/123/") == "https://github.com/owner/repo/pull/123"
+    assert autonomy._normalize_pr_url("not-a-url") is None
+    assert autonomy._normalize_pr_url(None) is None
+    assert autonomy._normalize_pr_url("") is None
+
+
+def test_find_latest_attempt_from_comments() -> None:
+    comments = [
+        "WORKLINK_EVIDENCE issue=740 attempt=1 status=completed",
+        "WORKLINK_CLAIM {\"issue_id\": 740, \"attempt\": 1",
+        "WORKLINK_EVIDENCE issue=740 attempt=2 status=completed",
+    ]
+    assert autonomy._find_latest_attempt_from_comments(comments) == 2
+
+
+def test_find_latest_attempt_from_comments_none() -> None:
+    assert autonomy._find_latest_attempt_from_comments([]) is None
+    assert autonomy._find_latest_attempt_from_comments(["some other comment"]) is None
+
+
+def test_find_pr_url_from_comments() -> None:
+    comments = [
+        "WORKLINK_EVIDENCE issue=740 attempt=1 status=completed pr_url=None",
+        "WORKLINK_EVIDENCE issue=740 attempt=2 status=completed review_ready=true pr_url=https://github.com/owner/repo/pull/1029",
+    ]
+    assert autonomy._find_pr_url_from_comments(comments) == "https://github.com/owner/repo/pull/1029"
+
+
+def test_find_pr_url_from_epic_mirror_comment() -> None:
+    comments = [
+        "WORKLINK_EPIC gate approved: pre_pr",
+        "WORKLINK_EPIC draft PR opened: https://github.com/Owner/Repo/pull/1037",
+    ]
+    assert autonomy._find_pr_url_from_comments(comments) == "https://github.com/owner/repo/pull/1037"
+
+
+def test_find_pr_url_from_comments_none() -> None:
+    assert autonomy._find_pr_url_from_comments([]) is None
+    assert autonomy._find_pr_url_from_comments(["no pr url here"]) is None
+
+
+class FakeGh:
+    """Fake gh CLI that returns canned PR merge state."""
+
+    def __init__(
+        self,
+        pr_states: dict[str, dict],
+    ) -> None:
+        self.pr_states = pr_states
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        self.calls.append(args)
+        if len(args) >= 3 and args[1:3] == ["pr", "view"] and "--json" in args:
+            pr_num = args[3]
+            repo_idx = args.index("--repo") + 1 if "--repo" in args else None
+            if repo_idx and repo_idx < len(args):
+                repo = args[repo_idx]
+                pr_num = f"{repo}#{pr_num}"
+            state = self.pr_states.get(pr_num, {})
+            if not state:
+                state = self.pr_states.get(args[3], {})
+            data = {
+                "state": state.get("state", "OPEN"),
+                "mergedAt": state.get("mergedAt"),
+                "mergeCommit": {"oid": state.get("mergeCommit")} if state.get("mergeCommit") else None,
+            }
+            return cp(stdout=json.dumps(data))
+        return cp(returncode=1, stderr="unknown command")
+
+
+def test_check_pr_merged_via_gh_merged() -> None:
+    fake_gh = FakeGh({"owner/repo#1029": {"state": "MERGED", "mergedAt": "2026-07-05T12:00:00Z", "mergeCommit": "912e48d6abc"}})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return fake_gh(args)
+
+    result = autonomy._check_pr_merged_via_gh_runner("https://github.com/owner/repo/pull/1029", runner=runner)
+    assert result is not None
+    assert result.merged is True
+    assert result.merged_at == "2026-07-05T12:00:00Z"
+    assert result.merge_commit_sha == "912e48d6abc"
+
+
+def test_check_pr_merged_via_gh_open() -> None:
+    fake_gh = FakeGh({"owner/repo#1035": {"state": "OPEN", "mergedAt": "null", "mergeCommit": "null"}})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return fake_gh(args)
+
+    result = autonomy._check_pr_merged_via_gh_runner("https://github.com/owner/repo/pull/1035", runner=runner)
+    assert result is not None
+    assert result.merged is False
+
+
+def test_check_pr_merged_via_gh_closed_not_merged() -> None:
+    fake_gh = FakeGh({"owner/repo#1036": {"state": "CLOSED", "mergedAt": "null", "mergeCommit": "null"}})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return fake_gh(args)
+
+    result = autonomy._check_pr_merged_via_gh_runner("https://github.com/owner/repo/pull/1036", runner=runner)
+    assert result is not None
+    assert result.merged is False
+
+
+def test_check_pr_merged_via_gh_invalid_url() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return cp(returncode=0, stdout="MERGED\n")
+
+    result = autonomy._check_pr_merged_via_gh_runner("not-a-pr-url", runner=runner)
+    assert result is None
+
+
+def test_check_pr_merged_via_gh_error() -> None:
+    def boom(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return cp(returncode=1, stderr="gh not found")
+
+    result = autonomy._check_pr_merged_via_gh_runner("https://github.com/owner/repo/pull/123", runner=boom)
+    assert result is None
+
+
+class FakeChainlinkForReview:
+    """Fake chainlink for worklink:review queries."""
+
+    def __init__(
+        self,
+        review_ids: list[int] = None,
+        comments: dict[int, list[str]] | None = None,
+        open_ids: list[int] | None = None,
+    ) -> None:
+        self.review_ids = review_ids or []
+        self.open_ids = list(self.review_ids) if open_ids is None else open_ids
+        self.comments = comments or {}
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        self.calls.append(args)
+        tail = args[1:]
+        if tail[:2] == ["issue", "list"]:
+            label = tail[tail.index("--label") + 1] if "--label" in tail else ""
+            if not label:
+                return cp(stdout=json.dumps([{"id": i} for i in self.open_ids]))
+            if label == "worklink:review":
+                return cp(stdout=json.dumps([{"id": i} for i in self.review_ids]))
+            return cp(stdout=json.dumps([]))
+        if tail[:2] == ["issue", "show"]:
+            issue_id = int(tail[2])
+            return cp(stdout=json.dumps({"id": issue_id, "comments": self.comments.get(issue_id, [])}))
+        if tail[:2] == ["issue", "close"]:
+            self.review_ids = [issue_id for issue_id in self.review_ids if issue_id != int(tail[2])]
+            return cp()
+        return cp()
+
+    def names(self) -> list[str]:
+        return [" ".join(c[1:4]) for c in self.calls]
+
+
+def test_close_merged_chainlinks_public_wrapper_preserves_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate.worklink import merge_closure
+
+    chainlink_runner = lambda args: cp()  # noqa: E731
+    github_runner = lambda args: cp()  # noqa: E731
+    monkeypatch.setattr(
+        autonomy, "make_claims", lambda home: SimpleNamespace(runner=chainlink_runner),
+    )
+    captured = {}
+
+    def reconcile(home, **kwargs):
+        captured.update(home=home, **kwargs)
+        return [merge_closure.ClosureOutcome(
+            740,
+            "https://github.com/owner/repo/pull/1029",
+            "2026-07-05T12:00:00Z",
+            "912e48d6",
+        )]
+
+    monkeypatch.setattr(merge_closure, "reconcile_merged_leaves", reconcile)
+    result = autonomy.close_merged_chainlinks_for_home(
+        tmp_path, gh_bin="trusted-gh", dry_run=True, gh_runner=github_runner,
+    )
+    assert result == [autonomy.MergedChainlinkResult(
+        740,
+        "https://github.com/owner/repo/pull/1029",
+        "2026-07-05T12:00:00Z",
+        "912e48d6",
+    )]
+    assert captured["home"] == tmp_path
+    assert captured["gh_bin"] == "trusted-gh"
+    assert captured["dry_run"] is True
+    assert captured["chainlink_runner"] is chainlink_runner
+    assert captured["gh_runner"] is github_runner
+    assert callable(captured["git_runner"])
+
+
+def test_close_merged_chainlinks_dry_run_without_repository_trust(tmp_path: Path) -> None:
+    """Dry run mode reports what would be closed without making changes."""
+    home = tmp_path / "home"
+    home.mkdir()
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "740-1.json").write_text(
+        json.dumps({"issue": 740, "attempt": 1, "pr_url": "https://github.com/owner/repo/pull/1029"}),
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGh({"owner/repo#1029": {"state": "MERGED", "mergedAt": "2026-07-05T12:00:00Z", "mergeCommit": "912e48d6"}})
+    fake_cl = FakeChainlinkForReview(review_ids=[740])
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=True, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    # The public wrapper now fails closed when the home has no declared,
+    # attested repository inventory; qualification behavior is covered by the
+    # dedicated merge-closure tests.
+    assert results == []
+    assert "issue close 740" not in fake_cl.names()
+
+
+def test_close_merged_chainlinks_refuses_without_repository_trust(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "841-1.json").write_text(
+        json.dumps({"issue": 841, "attempt": 1, "pr_url": "https://github.com/owner/repo/pull/1035"}),
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGh({"owner/repo#1035": {"state": "MERGED", "mergedAt": "2026-07-06T10:00:00Z", "mergeCommit": "6026333b"}})
+    fake_cl = FakeChainlinkForReview(review_ids=[841])
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+        rerun_results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert "issue unlabel 841" not in fake_cl.names()
+    assert "issue close 841" not in fake_cl.names()
+    assert rerun_results == []
+
+
+def test_close_merged_chainlinks_leaves_reopened_non_review_issue_untouched(
+    tmp_path: Path,
+) -> None:
+    """Merged-PR reconciliation must not re-close an operator-reopened issue."""
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "849-1.json").write_text(
+        json.dumps(
+            {
+                "issue": 849,
+                "attempt": 1,
+                "status": "completed",
+                "pr_url": "https://github.com/owner/repo/pull/1046",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGh(
+        {
+            "owner/repo#1046": {
+                "state": "MERGED",
+                "mergedAt": "2026-07-22T11:00:00Z",
+                "mergeCommit": "abc8490",
+            }
+        }
+    )
+    # The unfiltered open scan sees 849, but the worklink:review query does not.
+    fake_cl = FakeChainlinkForReview(review_ids=[], open_ids=[849])
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = lambda home: ChainlinkClaims(agent_id="test", runner=fake_cl)
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(
+            home, dry_run=False, gh_runner=fake_gh
+        )
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    mutating_actions = {"unlabel", "comment", "close"}
+    assert not [
+        call
+        for call in fake_cl.calls
+        if call[1:2] == ["issue"] and len(call) > 2 and call[2] in mutating_actions
+    ]
+
+
+def test_close_merged_chainlinks_skips_open_pr(tmp_path: Path) -> None:
+    """Chainlinks with open PRs are left untouched."""
+    home = tmp_path / "home"
+    home.mkdir()
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "842-1.json").write_text(
+        json.dumps({"issue": 842, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1040"}),
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGh({"owner/repo#1040": {"state": "OPEN", "mergedAt": "null", "mergeCommit": "null"}})
+    fake_cl = FakeChainlinkForReview(review_ids=[842])
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    claims = ChainlinkClaims(agent_id="test", runner=fake_cl, home_path=home)
+    claim = claims.claim_issue(842, labels=["worklink:ready"])
+    assert claim.claimed is False
+    assert claim.reason == "review_ready_evidence_exists"
+
+
+def test_close_merged_chainlinks_does_not_archive_without_repository_trust(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    evidence_path = evidence_dir / "843-1.json"
+    evidence_path.write_text(
+        json.dumps({"issue": 843, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1041"}),
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGh({"owner/repo#1041": {"state": "CLOSED", "mergedAt": "null", "mergeCommit": "null"}})
+    fake_cl = FakeChainlinkForReview(
+        review_ids=[843],
+        comments={843: [
+            'WORKLINK_CLAIM {"issue_id": 843, "attempt": 1, "agent_id": "old", '
+            '"claimed_at": "2026-07-21T10:00:00+00:00", "heartbeat_at": null}'
+        ]},
+    )
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert evidence_path.exists()
+    assert not evidence_path.with_suffix(".json.closed-unmerged").exists()
+
+    claims = ChainlinkClaims(agent_id="test", runner=fake_cl, home_path=home)
+    claim = claims.claim_issue(
+        843,
+        comments=fake_cl.comments[843],
+        labels=["worklink:ready"],
+    )
+    assert claim.claimed is False
+    assert claim.reason == "review_ready_evidence_exists"
+
+
+def test_close_merged_chainlinks_closed_unmerged_dry_run_keeps_evidence(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    evidence_path = evidence_dir / "847-1.json"
+    evidence_path.write_text(
+        json.dumps({"issue": 847, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1044"}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGh({"owner/repo#1044": {"state": "CLOSED"}})
+    fake_cl = FakeChainlinkForReview(review_ids=[847])
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = lambda home: ChainlinkClaims(agent_id="test", runner=fake_cl)
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=True, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert evidence_path.exists()
+    assert not evidence_path.with_suffix(".json.closed-unmerged").exists()
+
+
+def test_close_merged_chainlinks_missing_trust_keeps_evidence(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    evidence_path = evidence_dir / "848-1.json"
+    evidence_path.write_text(
+        json.dumps({"issue": 848, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1045"}),
+        encoding="utf-8",
+    )
+    fake_cl = FakeChainlinkForReview(review_ids=[848])
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = lambda home: ChainlinkClaims(agent_id="test", runner=fake_cl)
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(
+            home,
+            gh_runner=lambda args: cp(returncode=1, stderr="network failure"),
+        )
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert evidence_path.exists()
+    assert not [call for call in fake_cl.calls if call[1:3] in (["issue", "unlabel"], ["issue", "comment"], ["issue", "close"])]
+
+
+def test_close_merged_chainlinks_refuses_epic_mirror_without_repository_trust(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    fake_gh = FakeGh({"owner/repo#1042": {"state": "MERGED", "mergedAt": "2026-07-07T04:00:00Z", "mergeCommit": "abc1234"}})
+    fake_cl = FakeChainlinkForReview(
+        review_ids=[845],
+        comments={845: ["WORKLINK_EPIC draft PR opened: https://github.com/owner/repo/pull/1042"]},
+    )
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert "issue unlabel 845" not in fake_cl.names()
+
+
+def test_close_merged_chainlinks_leaves_epic_with_open_pr(tmp_path: Path) -> None:
+    """Feature-factory epics stay in review while their mirrored PR is open."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    fake_gh = FakeGh({"owner/repo#1043": {"state": "OPEN", "mergedAt": "null", "mergeCommit": "null"}})
+    fake_cl = FakeChainlinkForReview(
+        review_ids=[846],
+        comments={846: ["WORKLINK_EPIC draft PR opened: https://github.com/owner/repo/pull/1043"]},
+    )
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert "issue unlabel 846" not in fake_cl.names()
+
+
+def test_close_merged_chainlinks_skips_missing_pr_url(tmp_path: Path) -> None:
+    """Chainlinks without a PR URL are left untouched."""
+    home = tmp_path / "home"
+    home.mkdir()
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "844-1.json").write_text(
+        json.dumps({"issue": 844, "attempt": 1, "pr_url": None}),
+        encoding="utf-8",
+    )
+
+    fake_cl = FakeChainlinkForReview(review_ids=[844])
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=lambda a: cp())
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+
+
+def test_close_merged_chainlinks_empty_queue(tmp_path: Path) -> None:
+    """No issues in worklink:review returns empty list."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    fake_cl = FakeChainlinkForReview(review_ids=[])
+
+    def make_claims_runner(home):
+        return ChainlinkClaims(agent_id="test", runner=fake_cl)
+
+    aut = autonomy
+    orig_make_claims = aut.make_claims
+    aut.make_claims = make_claims_runner
+
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=lambda a: cp())
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []

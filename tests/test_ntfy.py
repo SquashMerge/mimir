@@ -1,0 +1,1593 @@
+"""Tests for mimir/ntfy.py — phone-push alarm helper.
+
+Covers the helper's eight contractual behaviors:
+
+1. No NTFY_TOPIC env → emit ``ntfy_skip_no_topic``, no HTTP.
+2. 2xx happy path → emit ``ntfy_post_ok`` (chainlink #65 paired
+   positive), dedup table stamped, headers + body match.
+3. Re-fire within dedup window → no-op (no HTTP, no event).
+4. Re-fire after dedup window → posts again.
+5. Network failure → ``ntfy_post_failed`` with error repr; no
+   exception propagated.
+6. HTTP 5xx → ``ntfy_post_failed`` with ``status=503`` and
+   ``error="http_5xx"``.
+7. HTTP 4xx → ``ntfy_post_rejected`` with ``status=400`` and a
+   ``body_excerpt`` containing the response body.
+8. Header serialization: priority is a string, tags are comma-joined.
+
+The aiohttp mocking pattern matches ``tests/test_oauth_usage_poller.py``
+— a tiny canned ``ClientSession`` stand-in. No real network is hit.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import subprocess
+import sys
+import threading
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from unittest.mock import AsyncMock
+
+import aiohttp
+import pytest
+
+from mimir import ntfy
+
+
+# ─── aiohttp mocks ────────────────────────────────────────────────────
+
+
+class _MockResponse:
+    def __init__(self, status: int, body: str = ""):
+        self.status = status
+        self._body = body
+
+    async def text(self) -> str:
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _MockSession:
+    """Minimal ``aiohttp.ClientSession`` stand-in.
+
+    Records each ``post(...)`` call and returns the configured response
+    (or raises ``post_exc`` if set, to simulate network failures).
+    """
+
+    def __init__(
+        self,
+        post_resp: _MockResponse | None = None,
+        post_exc: BaseException | None = None,
+    ):
+        self.post_resp = post_resp
+        self.post_exc = post_exc
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def post(self, url, *, data=None, headers=None, **_):
+        self.calls.append((url, {"data": data, "headers": headers}))
+        if self.post_exc is not None:
+            raise self.post_exc
+        return self.post_resp
+
+
+def _install_session(monkeypatch: pytest.MonkeyPatch, session: _MockSession) -> None:
+    """Patch ``aiohttp.ClientSession`` in the ntfy module so the helper
+    picks up our mock instead of opening a real socket."""
+    monkeypatch.setattr(
+        ntfy.aiohttp,
+        "ClientSession",
+        lambda *a, **kw: session,
+    )
+
+
+# ─── fixtures ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_dedup() -> None:
+    """Each test starts with an empty dedup table."""
+    ntfy._reset_dedup_for_tests()
+
+
+@pytest.fixture
+def captured_events(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
+    """Replace ``ntfy.log_event`` with a recorder that captures
+    (event_type, payload) tuples without touching the real logger."""
+    events: list[tuple[str, dict]] = []
+
+    async def _fake_log_event(event_type: str, **payload: Any) -> None:
+        events.append((event_type, payload))
+
+    monkeypatch.setattr(ntfy, "log_event", _fake_log_event)
+    return events
+
+
+# ─── tests ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_topic_emits_skip_event(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    # If the helper ever tried to open a real session, this would blow
+    # up — proves no HTTP path was taken.
+    monkeypatch.setattr(
+        ntfy.aiohttp,
+        "ClientSession",
+        AsyncMock(side_effect=AssertionError("must not construct session")),
+    )
+
+    await ntfy.post_algedonic_alarm(
+        category="cost-runaway",
+        title="t",
+        body="b",
+        dedupe_key="cost-runaway:daily",
+    )
+
+    assert captured_events == [(
+        "ntfy_skip_no_topic",
+        {"category": "cost-runaway", "dedupe_key": "cost-runaway:daily"},
+    )]
+
+
+@pytest.mark.asyncio
+async def test_happy_path_2xx_emits_post_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """chainlink #65: 2xx now emits ``ntfy_post_ok`` as the paired
+    positive for the sticky ``ntfy_post_failed`` / ``ntfy_post_rejected``
+    failure lines. First-occurrence-only dedup at the feedback layer
+    keeps events.jsonl growth bounded in the algedonic block."""
+    monkeypatch.setenv("NTFY_TOPIC", "mimir-alarms-xyz")
+    session = _MockSession(post_resp=_MockResponse(200, "ok"))
+    _install_session(monkeypatch, session)
+
+    await ntfy.post_algedonic_alarm(
+        category="discord-down",
+        title="Discord outbound failing",
+        body="3 consecutive sends failed",
+        dedupe_key="discord-down:outbound",
+        priority=4,
+        tags=["warning"],
+    )
+
+    assert captured_events == [(
+        "ntfy_post_ok",
+        {"category": "discord-down", "dedupe_key": "discord-down:outbound"},
+    )]
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
+    assert url == "https://ntfy.sh/mimir-alarms-xyz"
+    assert kwargs["data"] == "3 consecutive sends failed"
+    assert kwargs["headers"]["Title"] == "Discord outbound failing"
+    assert kwargs["headers"]["Priority"] == "4"
+    assert kwargs["headers"]["Tags"] == "warning"
+    # Dedup table updated.
+    assert "discord-down:outbound" in ntfy._LAST_POST
+
+
+@pytest.mark.asyncio
+async def test_dedup_within_window_skips(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    session = _MockSession(post_resp=_MockResponse(200, ""))
+    _install_session(monkeypatch, session)
+
+    await ntfy.post_algedonic_alarm(
+        category="x", title="t", body="b", dedupe_key="same-key",
+    )
+    # Second call should be a silent no-op.
+    await ntfy.post_algedonic_alarm(
+        category="x", title="t", body="b", dedupe_key="same-key",
+    )
+
+    # Only the first call hit the wire.
+    assert len(session.calls) == 1
+    # The first call emitted ``ntfy_post_ok`` (chainlink #65 paired
+    # positive); the dedup-skipped second call emits nothing.
+    assert [evt[0] for evt in captured_events] == ["ntfy_post_ok"]
+
+
+@pytest.mark.asyncio
+async def test_dedup_window_expiry_re_posts(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    session = _MockSession(post_resp=_MockResponse(200, ""))
+    _install_session(monkeypatch, session)
+
+    # First fire stamps the dedup table at "now".
+    await ntfy.post_algedonic_alarm(
+        category="x", title="t", body="b",
+        dedupe_key="rotating-key",
+        dedup_window_seconds=60,
+    )
+    assert len(session.calls) == 1
+
+    # Advance "now" past the 60s window by patching _now_utc.
+    real_now = ntfy._LAST_POST["rotating-key"]
+    later = real_now + timedelta(seconds=120)
+    monkeypatch.setattr(ntfy, "_now_utc", lambda: later)
+
+    await ntfy.post_algedonic_alarm(
+        category="x", title="t", body="b",
+        dedupe_key="rotating-key",
+        dedup_window_seconds=60,
+    )
+
+    # Both calls hit the wire.
+    assert len(session.calls) == 2
+    # Each successful post emits ``ntfy_post_ok`` (chainlink #65).
+    assert [evt[0] for evt in captured_events] == ["ntfy_post_ok", "ntfy_post_ok"]
+
+
+@pytest.mark.asyncio
+async def test_network_failure_emits_post_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    session = _MockSession(
+        post_exc=aiohttp.ClientConnectionError("boom"),
+    )
+    _install_session(monkeypatch, session)
+
+    # Must not raise.
+    await ntfy.post_algedonic_alarm(
+        category="cost-runaway", title="t", body="b",
+        dedupe_key="cost-runaway:hourly",
+    )
+
+    assert len(captured_events) == 1
+    event_type, payload = captured_events[0]
+    assert event_type == "ntfy_post_failed"
+    assert payload["category"] == "cost-runaway"
+    assert payload["dedupe_key"] == "cost-runaway:hourly"
+    assert "boom" in payload["error"]
+    assert "ClientConnectionError" in payload["error"]
+    # Dedup table NOT stamped on failure — operator should be re-tried
+    # on the next cycle.
+    assert "cost-runaway:hourly" not in ntfy._LAST_POST
+
+
+@pytest.mark.asyncio
+async def test_5xx_emits_post_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    session = _MockSession(post_resp=_MockResponse(503, "service unavailable"))
+    _install_session(monkeypatch, session)
+
+    await ntfy.post_algedonic_alarm(
+        category="oauth", title="t", body="b",
+        dedupe_key="oauth:logged-out",
+    )
+
+    assert len(captured_events) == 1
+    event_type, payload = captured_events[0]
+    assert event_type == "ntfy_post_failed"
+    assert payload["status"] == 503
+    assert payload["error"] == "http_5xx"
+    assert "service unavailable" in payload["body_excerpt"]
+    # Not stamped — re-fire eligible.
+    assert "oauth:logged-out" not in ntfy._LAST_POST
+
+
+@pytest.mark.asyncio
+async def test_4xx_emits_post_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    session = _MockSession(post_resp=_MockResponse(400, "bad request"))
+    _install_session(monkeypatch, session)
+
+    await ntfy.post_algedonic_alarm(
+        category="x", title="t", body="b", dedupe_key="x:y",
+    )
+
+    assert len(captured_events) == 1
+    event_type, payload = captured_events[0]
+    assert event_type == "ntfy_post_rejected"
+    assert payload["status"] == 400
+    assert "bad request" in payload["body_excerpt"]
+    assert payload["category"] == "x"
+    assert payload["dedupe_key"] == "x:y"
+
+
+@pytest.mark.asyncio
+async def test_headers_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    session = _MockSession(post_resp=_MockResponse(200, ""))
+    _install_session(monkeypatch, session)
+
+    await ntfy.post_algedonic_alarm(
+        category="x",
+        title="Cost runaway: $$$",
+        body="b",
+        dedupe_key="cost:5h",
+        priority=5,
+        tags=["warning", "rotating_light"],
+    )
+
+    assert len(session.calls) == 1
+    _, kwargs = session.calls[0]
+    headers = kwargs["headers"]
+    assert headers["Title"] == "Cost runaway: $$$"
+    assert headers["Priority"] == "5"
+    assert isinstance(headers["Priority"], str)
+    assert headers["Tags"] == "warning,rotating_light"
+
+
+# ─── cost-runaway dead-man alarm tests (chainlink #66) ────────────────
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_fires_above_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """fire_cost_runaway_alarm_if_warranted calls post_algedonic_alarm when
+    the rate exceeds the threshold and NTFY_TOPIC is unset (emits skip event,
+    not a real push — but the alarm path is exercised)."""
+    # With no NTFY_TOPIC the helper emits ntfy_skip_no_topic, which is
+    # enough to prove the alarm function was invoked.
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 75.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Expected ntfy_skip_no_topic (alarm invoked but no topic configured); "
+        f"got events: {kinds}"
+    )
+    # Confirm category is correct in the skip event.
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    assert skip_evt[1]["category"] == "cost-runaway"
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_fires_for_advisory_kind(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """cost_rate_advisory (quota-billing mode) also triggers the alarm."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_advisory",
+        {"rate_now_usd_per_hour": 60.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_silent_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm when rate is below the threshold, even with NTFY_TOPIC set."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 25.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    # No events at all — short-circuited before calling post_algedonic_alarm.
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_silent_for_unrelated_event(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Non-cost events are ignored, even with a very high rate field."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "git_push_failed",
+        {"rate_now_usd_per_hour": 999.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_fires_at_exact_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Rate exactly at threshold fires the alarm (>= semantics: rate < threshold
+    is the short-circuit condition, so rate == threshold passes through)."""
+    # No NTFY_TOPIC → alarm path is invoked but returns ntfy_skip_no_topic,
+    # proving we reached post_algedonic_alarm.
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 50.0},
+        threshold_usd_per_hour=50.0,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Alarm should fire at exactly the threshold (>= semantics); "
+        f"got events: {kinds}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cost_runaway_alarm_silent_just_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Rate just below threshold is silent."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+
+    await ntfy.fire_cost_runaway_alarm_if_warranted(
+        "cost_rate_alert",
+        {"rate_now_usd_per_hour": 49.99},
+        threshold_usd_per_hour=50.0,
+    )
+
+    assert captured_events == []
+
+
+# ─── scheduler-wedge dead-man alarm tests (chainlink #66) ─────────────
+
+
+def _write_events(path, events: list[dict]) -> None:
+    """Write a list of event dicts to ``path`` as JSONL."""
+    import json as _json
+    path.write_text("\n".join(_json.dumps(e) for e in events) + "\n")
+
+
+def _heartbeat_event(ts: str) -> dict:
+    return {
+        "timestamp": ts,
+        "type": "scheduled_tick",
+        "channel_id": "scheduler:heartbeat",
+    }
+
+
+def _write_scheduler_yaml(tmp_path, cron: str = "*/45 * * * *"):
+    """Write a minimal scheduler.yaml with the given heartbeat cron to ``tmp_path``.
+
+    Default cron ``*/45 * * * *`` (45 min) × safety_factor 2.0 = 90 min
+    threshold — matching the intent of the original hardcoded constant.
+    """
+    import yaml as _yaml
+    content = [{
+        "name": "heartbeat",
+        "cron": cron,
+        "prompt_file": "heartbeat.md",
+        "authority_profile": "heartbeat",
+    }]
+    sched_path = tmp_path / "scheduler.yaml"
+    sched_path.write_text(_yaml.safe_dump(content), encoding="utf-8")
+    return sched_path
+
+
+def test_read_heartbeat_cron_ignores_authority_profile_and_disabled_records(
+    tmp_path,
+):
+    import yaml as _yaml
+
+    scheduler_yaml = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    assert ntfy._read_heartbeat_cron(scheduler_yaml) == "0 * * * *"
+
+    for records in (
+        [],
+        [{"name": "heartbeat", "prompt_file": "heartbeat.md"}],
+        [{"name": "heartbeat", "prompt_file": "heartbeat.md", "cron": ""}],
+    ):
+        scheduler_yaml.write_text(_yaml.safe_dump(records), encoding="utf-8")
+        assert ntfy._read_heartbeat_cron(scheduler_yaml) is None
+
+
+@pytest.mark.parametrize("jobs_last", [False, True])
+def test_read_heartbeat_cron_mapping_forms(tmp_path, jobs_last):
+    scheduler = tmp_path / "scheduler.yaml"
+    jobs = "jobs:\n  - name: heartbeat\n    cron: '0 * * * *'\n"
+    commands = "operator_shell_commands: []\n"
+    scheduler.write_text((commands + jobs) if jobs_last else (jobs + commands))
+    assert ntfy._read_heartbeat_cron(scheduler) == "0 * * * *"
+
+    scheduler.write_text(scheduler.read_text().replace("heartbeat", "reflect"))
+    assert ntfy._read_heartbeat_cron(scheduler) is None
+
+
+@pytest.mark.parametrize("text", [
+    "jobs: []\nunknown: true\n",
+    "jobs: false\noperator_shell_commands: []\n",
+])
+def test_read_heartbeat_cron_rejects_malformed_mapping(tmp_path, text):
+    scheduler = tmp_path / "scheduler.yaml"
+    scheduler.write_text(text)
+    assert ntfy._read_heartbeat_cron(scheduler) == "*/1 * * * *"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minutes_since_tick, should_alarm", [(40, False), (180, True)])
+async def test_mapping_heartbeat_hourly_ticks_use_hourly_wedge_threshold(
+    tmp_path, monkeypatch, minutes_since_tick, should_alarm,
+):
+    scheduler = tmp_path / "scheduler.yaml"
+    scheduler.write_text("jobs:\n  - name: heartbeat\n    cron: '0 * * * *'\noperator_shell_commands: []\n")
+    events_file = tmp_path / "events.jsonl"
+    last_tick = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    _write_events(events_file, [
+        _heartbeat_event((last_tick - timedelta(hours=hours)).isoformat())
+        for hours in (2, 1, 0)
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler,
+        now=last_tick + timedelta(minutes=minutes_since_tick),
+    )
+    if should_alarm:
+        alarm.assert_awaited_once()
+        assert alarm.call_args.kwargs["category"] == "scheduler-wedge"
+        assert "threshold: 120 min" in alarm.call_args.kwargs["body"]
+    else:
+        alarm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document", [
+    pytest.param("- name: [heartbeat", id="syntax"),
+    pytest.param("name: heartbeat\ncron: '*/45 * * * *'", id="mapping"),
+    pytest.param("false", id="false"),
+    pytest.param("0", id="zero"),
+    pytest.param("'oops'", id="scalar"),
+    pytest.param("{}", id="empty-mapping"),
+    pytest.param("- oops", id="non-mapping-entry"),
+    pytest.param("- name: heartbeat\n  cron: []", id="non-string-cron"),
+    pytest.param(b"\xff", id="invalid-utf8"),
+])
+async def test_malformed_scheduler_yaml_uses_eager_wedge_threshold(
+    tmp_path, monkeypatch, document,
+):
+    scheduler = tmp_path / "scheduler.yaml"
+    scheduler.write_bytes(document if isinstance(document, bytes) else document.encode())
+    events_file = tmp_path / "events.jsonl"
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    _write_events(events_file, [_heartbeat_event(now.isoformat())])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now + timedelta(minutes=1),
+    )
+    alarm.assert_not_awaited()
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now + timedelta(minutes=2),
+    )
+    alarm.assert_awaited_once()
+    assert alarm.call_args.kwargs["category"] == "scheduler-wedge"
+    assert "threshold: 2 min" in alarm.call_args.kwargs["body"]
+    assert ntfy._read_heartbeat_cron(scheduler) == "*/1 * * * *"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document", [
+    None, "", "# empty\n", "null", "[]",
+    "- name: reflect\n  cron: '0 * * * *'",
+    "- name: heartbeat", "- name: heartbeat\n  cron: null",
+    "- name: heartbeat\n  cron: ''", "- name: heartbeat\n  cron: '  '",
+    "- oops\n- name: heartbeat\n  cron: ''",
+])
+async def test_empty_or_disabled_scheduler_yaml_stays_silent(
+    tmp_path, monkeypatch, document,
+):
+    scheduler = tmp_path / "scheduler.yaml"
+    if document is not None:
+        scheduler.write_text(document)
+    assert ntfy._read_heartbeat_cron(scheduler) is None
+    events_file = tmp_path / "events.jsonl"
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    _write_events(events_file, [_heartbeat_event((now - timedelta(days=5)).isoformat())])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+    )
+    alarm.assert_not_awaited()
+
+
+def test_unreadable_scheduler_yaml_uses_eager_cadence(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    def deny_read(*args, **kwargs):
+        raise PermissionError("scheduler read denied")
+
+    monkeypatch.setattr(Path, "read_text", deny_read)
+    assert ntfy._read_heartbeat_cron(tmp_path / "scheduler.yaml") == "*/1 * * * *"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_offloads_log_assessment_from_event_loop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """chainlink #838: scheduler-health log scans must not run on the loop.
+
+    The wedge check reads scheduler.yaml and tail-scans events.jsonl.  Those
+    synchronous file operations belong behind ``asyncio.to_thread`` so the
+    health check itself does not create a ``scheduler_loop_lag`` sample.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=130)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    loop_thread = threading.get_ident()
+    observed_threads: list[int] = []
+    real_assess = ntfy._assess_scheduler_wedge
+
+    def wrapped_assess(*args: Any, **kwargs: Any):
+        observed_threads.append(threading.get_ident())
+        return real_assess(*args, **kwargs)
+
+    monkeypatch.setattr(ntfy, "_assess_scheduler_wedge", wrapped_assess)
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert observed_threads, "wedge assessment did not run"
+    assert all(thread_id != loop_thread for thread_id in observed_threads), (
+        "scheduler wedge assessment ran on the event-loop thread"
+    )
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds
+
+
+@pytest.mark.asyncio
+async def test_size_scaled_events_log_scan_does_not_lag_event_loop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """chainlink #843: a large events.jsonl scan must not monopolize the loop."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    old_ts = (now - timedelta(hours=48)).isoformat()
+    rows = [
+        {
+            "timestamp": old_ts,
+            "type": "other_event",
+            "channel_id": "other",
+            "payload": "x" * 200,
+        }
+        for _ in range(20_000)
+    ]
+    events_file.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    scan_started = asyncio.Event()
+    release_scan = threading.Event()
+    real_assess = ntfy._assess_scheduler_wedge
+
+    def gated_assess(*args: Any, **kwargs: Any):
+        # Fail promptly rather than blocking the loop if offloading regresses.
+        assert threading.get_ident() != loop_thread
+        loop.call_soon_threadsafe(scan_started.set)
+        assert release_scan.wait(timeout=5), "event loop did not release scan"
+        return real_assess(*args, **kwargs)
+
+    monkeypatch.setattr(ntfy, "_assess_scheduler_wedge", gated_assess)
+    alarm_task = asyncio.create_task(
+        ntfy.fire_scheduler_wedge_alarm_if_warranted(
+            events_file,
+            scheduler_yaml_path=sched_yaml,
+            now=now,
+        )
+    )
+    try:
+        # Prove loop progress while the scan is in flight, not merely that a
+        # ticker happened to run before/after a fast executor completion.
+        await asyncio.wait_for(scan_started.wait(), timeout=5)
+        assert not alarm_task.done()
+    finally:
+        release_scan.set()
+        await asyncio.wait_for(alarm_task, timeout=5)
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_fires_when_stale(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Alarm fires when heartbeat hasn't appeared for >threshold minutes."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    # Last tick was 100 minutes ago; threshold is 90.
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=100)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Expected ntfy_skip_no_topic (alarm invoked but no topic set); "
+        f"got events: {kinds}"
+    )
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    assert skip_evt[1]["category"] == "scheduler-wedge"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_silent_when_recent(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm when the last heartbeat is well within the threshold."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=30)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_silent_no_events_file(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm (no crash) when events.jsonl does not exist yet."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    missing = tmp_path / "nonexistent.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(missing, scheduler_yaml_path=sched_yaml)
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_silent_no_heartbeat_in_log(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No alarm when the log exists but contains no heartbeat tick events."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+    # Only non-heartbeat events.
+    _write_events(events_file, [
+        {"timestamp": "2026-05-27T03:00:00+00:00", "type": "oauth_ok", "channel_id": "other"},
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+    )
+
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_picks_last_heartbeat(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Uses the MOST RECENT heartbeat timestamp (not the oldest one)."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    old_tick_ts = (now - timedelta(minutes=200)).isoformat()
+    recent_tick_ts = (now - timedelta(minutes=20)).isoformat()
+
+    # Old tick first, then recent one — scanner should use the recent one.
+    _write_events(events_file, [
+        _heartbeat_event(old_tick_ts),
+        _heartbeat_event(recent_tick_ts),
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    # Recent tick is within threshold → no alarm.
+    assert captured_events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wedge_alarm_exact_threshold_fires(
+    tmp_path: "pytest.fixture",
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Elapsed == threshold does NOT fire (strictly-less-than guard)."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    # Exactly at threshold — elapsed == 90 min.
+    last_tick_ts = (now - timedelta(minutes=90)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    # elapsed (90.0) is NOT < threshold (90) → alarm fires.
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        "Alarm should fire at exactly the threshold (>= semantics); "
+        f"got events: {kinds}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_threshold_derives_from_30min_cron(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """*/30 cron × safety_factor 2.0 → 60 min threshold; 70 min stale fires."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path, cron="*/30 * * * *")
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=70)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds, (
+        f"Expected alarm: 70 min > threshold 60 min (*/30 × 2.0); got: {kinds}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_threshold_derives_from_2h_cron(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """0 */2 cron × safety_factor 2.0 → 240 min threshold; 90 min stale silent."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path, cron="0 */2 * * *")
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=90)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == [], (
+        f"No alarm expected: 90 min < threshold 240 min (0 */2 × 2.0); got: {captured_events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_heartbeat_in_scheduler_yaml_no_alarm(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """If scheduler.yaml has no heartbeat job, no alarm even with stale events."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+
+    import yaml as _yaml
+    sched_yaml = tmp_path / "scheduler.yaml"
+    sched_yaml.write_text(
+        _yaml.safe_dump([{"name": "reflect", "cron": "0 6 * * 0", "prompt_file": "reflect.md"}]),
+        encoding="utf-8",
+    )
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=300)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == [], (
+        f"No alarm when heartbeat absent from scheduler.yaml; got: {captured_events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_disabled_heartbeat_with_stale_events_no_alarm(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Operator removed heartbeat cron: stale last_tick must NOT alarm.
+
+    Regression guard: before this fix, disabling the heartbeat would still
+    fire alarms for ~30 days until the old tick rotated out of events.jsonl.
+    """
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    events_file = tmp_path / "events.jsonl"
+
+    import yaml as _yaml
+    sched_yaml = tmp_path / "scheduler.yaml"
+    sched_yaml.write_text(
+        _yaml.safe_dump([{"name": "heartbeat", "cron": "", "prompt_file": "heartbeat.md"}]),
+        encoding="utf-8",
+    )
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(days=5)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    assert captured_events == [], (
+        f"No alarm when heartbeat cron is empty (disabled); got: {captured_events}"
+    )
+
+
+# ─── chainlink #221: classify silence as quota-blocked vs genuine wedge ───
+
+
+def _suppress_event(ts: str, reason: str = "quota_saturated:anthropic:seven_day@1.00") -> dict:
+    """One ``scheduled_tick_suppressed`` event on the heartbeat channel."""
+    return {
+        "timestamp": ts,
+        "type": "scheduled_tick_suppressed",
+        "channel_id": "scheduler:heartbeat",
+        "schedule_name": "heartbeat",
+        "reason": reason,
+    }
+
+
+@pytest.mark.asyncio
+async def test_wedge_alarm_silent_when_silence_is_suppression(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """Today's mimirbot incident: heartbeat last completed 130 min ago,
+    threshold is 90 min, AND ``scheduled_tick_suppressed`` events
+    landed in the window. The scheduler is alive and intentionally
+    not firing; operator action is upstream (fix quota state, switch
+    spec, wait it out) — none of those warrant a phone push.
+
+    Skip the ntfy entirely. Log a
+    ``scheduler_suppressed_window_observed`` event for ops-dashboard
+    surfacing — same observability without waking the operator.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)  # */45 * * * *, threshold 90 min
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=130)).isoformat()
+    suppress_1_ts = (now - timedelta(minutes=85)).isoformat()
+    suppress_2_ts = (now - timedelta(minutes=40)).isoformat()
+
+    _write_events(events_file, [
+        _heartbeat_event(last_tick_ts),
+        _suppress_event(suppress_1_ts),
+        _suppress_event(suppress_2_ts),
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    # No ntfy events of any kind (no skip-no-topic, no post-ok, no post-failed).
+    ntfy_events = [k for k in kinds if k.startswith("ntfy_")]
+    assert ntfy_events == [], (
+        f"Expected NO ntfy events when silence is suppression; got: {ntfy_events}"
+    )
+    # But the observability event landed for ops-dashboard surfacing.
+    observed = [e for e in captured_events
+                if e[0] == "scheduler_suppressed_window_observed"]
+    assert len(observed) == 1
+    payload = observed[0][1]
+    assert payload["channel_id"] == "scheduler:heartbeat"
+    assert payload["suppress_reason"] == "quota_saturated:anthropic:seven_day@1.00"
+    assert payload["elapsed_minutes"] == pytest.approx(130.0, abs=0.1)
+    assert payload["threshold_minutes"] == pytest.approx(90.0, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_wedge_alarm_classifies_as_wedge_when_no_suppress_events(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """No ``scheduled_tick_suppressed`` events in the window → existing
+    ``scheduler-wedge`` alarm fires (behavior preserved). This is the
+    genuine wedge case: APScheduler is actually stuck.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick_ts = (now - timedelta(minutes=130)).isoformat()
+    _write_events(events_file, [_heartbeat_event(last_tick_ts)])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    kinds = [e[0] for e in captured_events]
+    assert "ntfy_skip_no_topic" in kinds
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    assert skip_evt[1]["category"] == "scheduler-wedge"
+    assert skip_evt[1]["dedupe_key"] == "scheduler-wedge:heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_wedge_alarm_ignores_suppress_events_outside_window(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """A ``scheduled_tick_suppressed`` event from BEFORE the last
+    completed heartbeat shouldn't classify the silence as suppressed —
+    it belongs to a prior incident. Fire the genuine-wedge alarm.
+    """
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    events_file = tmp_path / "events.jsonl"
+    sched_yaml = _write_scheduler_yaml(tmp_path)
+
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    # Old suppress event (4h before now), then the heartbeat ran fine
+    # (2h before now), then silence. The 4h-ago suppress shouldn't
+    # poison the classification of the current silence window.
+    old_suppress_ts = (now - timedelta(hours=4)).isoformat()
+    last_tick_ts = (now - timedelta(hours=2)).isoformat()
+    _write_events(events_file, [
+        _suppress_event(old_suppress_ts),
+        _heartbeat_event(last_tick_ts),
+    ])
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file,
+        scheduler_yaml_path=sched_yaml,
+        now=now,
+    )
+
+    skip_evt = next(e for e in captured_events if e[0] == "ntfy_skip_no_topic")
+    # Old suppress is outside the window → classifies as wedge.
+    assert skip_evt[1]["category"] == "scheduler-wedge"
+
+
+def test_classify_silence_picks_freshest_suppress_reason(
+    tmp_path,
+) -> None:
+    """When multiple suppress events fall in the window, the helper
+    returns the most-recent reason — that's the one the operator most
+    likely needs to act on.
+    """
+    events_file = tmp_path / "events.jsonl"
+    from datetime import timedelta
+    now = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc)
+    last_tick = now - timedelta(minutes=200)
+    earlier_suppress_ts = (now - timedelta(minutes=120)).isoformat()
+    later_suppress_ts = (now - timedelta(minutes=30)).isoformat()
+
+    _write_events(events_file, [
+        _heartbeat_event(last_tick.isoformat()),
+        _suppress_event(earlier_suppress_ts, reason="quota_saturated:anthropic:seven_day@0.92"),
+        _suppress_event(later_suppress_ts, reason="quota_saturated:anthropic:seven_day@1.00"),
+    ])
+
+    classification, reason = ntfy._classify_silence(
+        events_file,
+        channel_id="scheduler:heartbeat",
+        window_start=last_tick,
+        window_end=now,
+    )
+    assert classification == "suppressed"
+    # Freshest reason (the 1.00 one) wins.
+    assert reason == "quota_saturated:anthropic:seven_day@1.00"
+
+
+class TestParseEventTs:
+    """chainlink #259: event-ts parsing is Z-normalized + naive-coerced so
+    the downstream tz-aware comparison can't raise a TypeError that escapes
+    _classify_silence's 'never raises' contract."""
+
+    def test_naive_coerced_to_utc(self):
+        from datetime import timezone
+        from mimir.ntfy import _parse_event_ts
+        ts = _parse_event_ts("2026-05-27T04:00:00")  # no tz
+        assert ts is not None and ts.utcoffset() == timezone.utc.utcoffset(None)
+
+    def test_z_suffix_parses(self):
+        from mimir.ntfy import _parse_event_ts
+        ts = _parse_event_ts("2026-05-27T04:00:00Z")
+        assert ts is not None and ts.utcoffset().total_seconds() == 0
+
+    def test_offset_preserved(self):
+        from mimir.ntfy import _parse_event_ts
+        assert _parse_event_ts("2026-05-27T04:00:00+00:00") is not None
+
+    def test_bad_inputs_return_none(self):
+        from mimir.ntfy import _parse_event_ts
+        assert _parse_event_ts("garbage") is None
+        assert _parse_event_ts("") is None
+        assert _parse_event_ts(None) is None
+
+
+@pytest.mark.asyncio
+async def test_last_post_table_prunes_stale_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_events: list[tuple[str, dict]],
+) -> None:
+    """The per-process dedup table is pruned on successful posts so
+    non-repeating dedupe keys can't grow it for process lifetime."""
+    from datetime import timedelta
+
+    monkeypatch.setenv("NTFY_TOPIC", "mimir-alarms-xyz")
+    session = _MockSession(post_resp=_MockResponse(200, "ok"))
+    _install_session(monkeypatch, session)
+    ntfy._LAST_POST["ancient:key"] = ntfy._now_utc() - timedelta(days=8)
+
+    await ntfy.post_algedonic_alarm(
+        category="c",
+        title="t",
+        body="b",
+        dedupe_key="fresh:key",
+    )
+
+    assert "fresh:key" in ntfy._LAST_POST
+    assert "ancient:key" not in ntfy._LAST_POST
+
+
+@pytest.mark.parametrize("threshold", [60, 240])
+def test_heartbeat_scan_stops_at_time_bound(monkeypatch, tmp_path, threshold):
+    from mimir import _jsonl_tail
+
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    cutoff = now - timedelta(minutes=threshold)
+
+    def records(*args, **kwargs):
+        yield None
+        yield []
+        yield {"timestamp": "bad"}
+        yield {"timestamp": now.isoformat(), "type": "other"}
+        yield {"timestamp": cutoff.isoformat(), "type": "other"}
+        pytest.fail("heartbeat scan consumed history beyond the cron window")
+
+    monkeypatch.setattr(_jsonl_tail, "tail_jsonl_records", records)
+    assert ntfy._last_heartbeat_timestamp(
+        tmp_path / "events.jsonl", window_start=cutoff,
+    ) == (None, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cron,threshold", [("*/30 * * * *", 60), ("0 */2 * * *", 240)])
+async def test_old_wedge_cutoff_grace_survives_restart(
+    tmp_path, monkeypatch, cron, threshold,
+):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, cron)
+    _write_events(events_file, [
+        _heartbeat_event((now - timedelta(days=10)).isoformat()),
+        {"timestamp": (now - timedelta(days=2)).isoformat(), "type": "other"},
+        {"timestamp": now.isoformat(), "type": "other"},
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    for minutes in [0, threshold - 1]:
+        await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+            events_file, scheduler_yaml_path=scheduler,
+            now=now + timedelta(minutes=minutes),
+        )
+        alarm.assert_not_awaited()
+    state_file, = tmp_path.glob(".scheduler-wedge-*.json")
+    assert json.loads(state_file.read_text()) == {
+        "last_tick": None, "monitoring_since": now.isoformat(),
+    }
+    # A fresh interpreter must load the observation, not restart grace.
+    later = now + timedelta(minutes=threshold)
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from pathlib import Path
+from datetime import datetime
+from mimir.ntfy import _assess_scheduler_wedge
+a = _assess_scheduler_wedge(
+    Path(sys.argv[1]), scheduler_yaml_path=Path(sys.argv[2]),
+    channel_id='scheduler:heartbeat', safety_factor=2,
+    now=datetime.fromisoformat(sys.argv[3]),
+)
+assert a.classification == 'wedge'
+assert a.last_tick is None
+assert a.monitoring_since.isoformat() == sys.argv[4]
+""", str(events_file), str(scheduler), later.isoformat(), now.isoformat()],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=later,
+    )
+    alarm.assert_awaited_once()
+    assert "of monitoring" in alarm.call_args.kwargs["body"]
+    assert json.loads(state_file.read_text())["monitoring_since"] == now.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uptime_minutes,alarms", [(8, 0), (121, 1)])
+async def test_wedge_restart_floors_persisted_tick_without_rewriting_state(
+    tmp_path, monkeypatch, captured_events, uptime_minutes, alarms,
+):
+    now = datetime(2026, 10, 2, 13, 50, tzinfo=timezone.utc)
+    started = now - timedelta(minutes=uptime_minutes)
+    tick = now - timedelta(minutes=510)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    _write_events(events_file, [_heartbeat_event(tick.isoformat())])
+    ntfy._assess_scheduler_wedge(
+        events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+        channel_id="scheduler:heartbeat", now=tick,
+    )
+    state_file, = tmp_path.glob(".scheduler-wedge-*.json")
+    original_state = state_file.read_bytes()
+    assert json.loads(original_state)["last_tick"] == tick.isoformat()
+    # The old tick is no longer in the bounded scan; only durable state sees it.
+    recent_events = [
+        {"timestamp": (now - timedelta(minutes=140)).isoformat(), "type": "other"},
+    ]
+    if not alarms:
+        recent_events.append(_suppress_event((now - timedelta(minutes=5)).isoformat()))
+    recent_events.append({"timestamp": now.isoformat(), "type": "other"})
+    _write_events(events_file, recent_events)
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+        scheduler_started_at=started,
+    )
+
+    assert alarm.await_count == alarms
+    assert not [event for event, _ in captured_events
+                if event == "scheduler_suppressed_window_observed"]
+    assert state_file.read_bytes() == original_state
+    if alarms:
+        assert alarm.call_args.kwargs["category"] == "scheduler-wedge"
+        assert alarm.call_args.kwargs["priority"] == 5
+        assert alarm.call_args.kwargs["dedupe_key"] == "scheduler-wedge:heartbeat"
+        assert f"since the scheduler started at {started.isoformat()}" in alarm.call_args.kwargs["body"]
+
+
+@pytest.mark.asyncio
+async def test_wedge_restart_does_not_delay_tick_newer_than_start(tmp_path, monkeypatch):
+    now = datetime(2026, 10, 2, 13, 50, tzinfo=timezone.utc)
+    started = now - timedelta(hours=10)
+    tick = now - timedelta(hours=3)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    _write_events(events_file, [_heartbeat_event(tick.isoformat())])
+    ntfy._assess_scheduler_wedge(
+        events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+        channel_id="scheduler:heartbeat", now=tick,
+    )
+    _write_events(events_file, [
+        {"timestamp": (now - timedelta(minutes=140)).isoformat(), "type": "other"},
+        {"timestamp": now.isoformat(), "type": "other"},
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+        scheduler_started_at=started,
+    )
+    alarm.assert_awaited_once()
+    assert "hasn't fired in 180 min" in alarm.call_args.kwargs["body"]
+    assert "since the scheduler started" not in alarm.call_args.kwargs["body"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uptime_minutes,alarms", [(30, 0), (130, 1)])
+async def test_wedge_restart_uses_start_with_no_persisted_baseline(
+    tmp_path, monkeypatch, uptime_minutes, alarms,
+):
+    now = datetime(2026, 10, 2, 13, 50, tzinfo=timezone.utc)
+    started = now - timedelta(minutes=uptime_minutes)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    _write_events(events_file, [
+        {"timestamp": (now - timedelta(days=1)).isoformat(), "type": "other"},
+        {"timestamp": now.isoformat(), "type": "other"},
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+        scheduler_started_at=started,
+    )
+    assert alarm.await_count == alarms
+    if alarms:
+        assert f"since the scheduler started at {started.isoformat()}" in alarm.call_args.kwargs["body"]
+
+
+def test_retained_tick_alarms_beyond_bound_and_recent_tick_recovers(tmp_path):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+
+    def assess(at):
+        return ntfy._assess_scheduler_wedge(
+            events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+            channel_id="scheduler:heartbeat", now=at,
+        )
+
+    _write_events(events_file, [_heartbeat_event(now.isoformat())])
+    assert assess(now).last_tick == now
+    later = now + timedelta(days=3)
+    _write_events(events_file, [
+        _heartbeat_event(now.isoformat()),
+        _suppress_event((now + timedelta(minutes=10)).isoformat()),
+        {"timestamp": (later - timedelta(hours=2)).isoformat(), "type": "other"},
+        {"timestamp": later.isoformat(), "type": "other"},
+    ])
+    stale = assess(later)
+    assert stale.last_tick == now
+    assert stale.monitoring_since is None
+    assert stale.classification == "wedge"
+    assert stale.elapsed_minutes == 3 * 24 * 60
+    with events_file.open("a") as stream:
+        stream.write(json.dumps(_suppress_event(later.isoformat())) + "\n")
+    assert assess(later).classification == "suppressed"
+    with events_file.open("a") as stream:
+        stream.write(json.dumps(_heartbeat_event(later.isoformat())) + "\n")
+    recovered = assess(later)
+    assert recovered.last_tick == later
+    assert recovered.monitoring_since is None
+    assert recovered.classification is None
+
+
+def test_bof_without_tick_clears_observation_and_stays_silent(tmp_path):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+
+    def assess(at):
+        return ntfy._assess_scheduler_wedge(
+            events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+            channel_id="scheduler:heartbeat", now=at,
+        )
+
+    _write_events(events_file, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    assert assess(now).monitoring_since == now
+    for minutes in [0, 90, 180]:
+        later = now + timedelta(minutes=minutes)
+        _write_events(events_file, [{"timestamp": later.isoformat()}])
+        assessment = assess(later)
+        assert assessment.last_tick is None
+        assert assessment.monitoring_since is None
+        assert assessment.classification is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["state_write", "state_read", "log_read", "malformed_state"])
+async def test_wedge_state_failures_are_nonfatal(tmp_path, monkeypatch, failure):
+    from mimir import _atomic, _jsonl_tail
+    from pathlib import Path
+
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+    _write_events(events_file, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+    )
+    state_file, = tmp_path.glob(".scheduler-wedge-*.json")
+    if failure == "malformed_state":
+        state_file.write_text('{"last_tick": [], "monitoring_since": {}}')
+    elif failure == "state_read":
+        original = Path.open
+
+        def deny_state(path, *args, **kwargs):
+            if path == state_file:
+                raise PermissionError("test state read denied")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", deny_state)
+    elif failure == "state_write":
+        state_file.unlink()
+
+        def deny_write(*args, **kwargs):
+            raise PermissionError("test state write denied")
+
+        monkeypatch.setattr(_atomic, "atomic_write_json", deny_write)
+    else:
+        def deny_log(*args, read_status, **kwargs):
+            read_status.error = PermissionError("test log read denied")
+            return iter(())
+
+        monkeypatch.setattr(_jsonl_tail, "tail_jsonl_records", deny_log)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now + timedelta(minutes=90),
+    )
+    alarm.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cron,safety_factor,threshold", [
+    ("*/30 * * * *", 2, 60), ("0 */2 * * *", 3, 360),
+])
+def test_both_wedge_scans_use_cron_bound(
+    tmp_path, monkeypatch, cron, safety_factor, threshold,
+):
+    from mimir import _jsonl_tail
+
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, cron)
+    _write_events(events_file, [_heartbeat_event(now.isoformat())])
+    kwargs = dict(
+        scheduler_yaml_path=scheduler, safety_factor=safety_factor,
+        channel_id="scheduler:heartbeat",
+    )
+    ntfy._assess_scheduler_wedge(events_file, now=now, **kwargs)
+    later = now + timedelta(days=3)
+    boundary = later - timedelta(minutes=threshold)
+    scans = []
+
+    def records(*args, **kwargs):
+        scans.append(True)
+        # Busy logs cannot truncate the window at an arbitrary record cap.
+        for _ in range(10_000):
+            yield {"timestamp": later.isoformat(), "type": "other"}
+        yield {"timestamp": boundary.isoformat(), "type": "other"}
+        pytest.fail("scan crossed its cron-derived time boundary")
+
+    monkeypatch.setattr(_jsonl_tail, "tail_jsonl_records", records)
+    assessment = ntfy._assess_scheduler_wedge(events_file, now=later, **kwargs)
+    assert assessment.classification == "wedge"
+    assert assessment.last_tick == now
+    assert len(scans) == 2
+
+
+def test_wedge_state_isolated_by_log_scheduler_and_channel(tmp_path):
+    now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path)
+    _write_events(events_file, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    kwargs = dict(scheduler_yaml_path=scheduler, safety_factor=2,
+                  channel_id="scheduler:heartbeat")
+    ntfy._assess_scheduler_wedge(events_file, now=now, **kwargs)
+    later = now + timedelta(minutes=90)
+    assert ntfy._assess_scheduler_wedge(
+        events_file, now=later, **kwargs,
+    ).classification == "wedge"
+    other_log = tmp_path / "other.jsonl"
+    _write_events(other_log, [{"timestamp": (now - timedelta(days=1)).isoformat()}])
+    other_scheduler = tmp_path / "other.yaml"
+    other_scheduler.write_text(scheduler.read_text())
+    for path, overrides in [
+        (other_log, {}),
+        (events_file, {"scheduler_yaml_path": other_scheduler}),
+        (events_file, {"channel_id": "../../outside/channel"}),
+    ]:
+        assessment = ntfy._assess_scheduler_wedge(
+            path, now=later, **(kwargs | overrides),
+        )
+        assert assessment.monitoring_since == later
+        assert assessment.classification is None
+    state_files = list(tmp_path.glob(".scheduler-wedge-*.json"))
+    assert len(state_files) == 4
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in state_files)

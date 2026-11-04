@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from dataclasses import replace
+
+import pytest
+
+from mimir import access_control
+from mimir._context import reset_current_turn, set_current_turn
+from mimir.models import (
+    AuthContext, InformationFlowLabels, InformationFlowState,
+    SourceLabel, TurnContext, TurnInteractivity,
+)
+
+
+def _labels() -> InformationFlowLabels:
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal="external", domain="filesystem", resource_id="/private/secret.txt",
+        bridge_instance="local", sensitivity="private",
+        authorized_principals=frozenset({"operator"}), source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+
+
+def _auth(**changes) -> AuthContext:
+    labels = _labels()
+    return replace(AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="web:operator",
+        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels),
+    ), **changes)
+
+
+def test_human_acknowledgement_trusts_record_without_removing_provenance():
+    from mimir.agent import _effective_persisted_integrity
+
+    auth = _auth()
+    labels = auth.ifc_state.current()
+    assert labels.persisted_integrity == "untrusted"
+    assert _effective_persisted_integrity(labels, auth) == "untrusted"
+    assert auth.ifc_state.acknowledge_ingest_snapshot(
+        expected=labels, durable_audit=lambda _sources: True,
+    )
+    assert labels.persisted_integrity == "untrusted"  # Immutable source labels.
+    assert _effective_persisted_integrity(labels, auth) == "trusted"
+    assert not auth.ifc_state.permission_has_untrusted_active_ingest(labels)
+    auth.ifc_state.merge(InformationFlowLabels().with_source(replace(
+        labels.sources[0], resource_id="/private/new-secret.txt",
+    )))
+    assert _effective_persisted_integrity(auth.ifc_state.current(), auth) == "untrusted"
+    assert auth.ifc_state.permission_has_untrusted_active_ingest(labels)
+
+
+@pytest.fixture
+def live_turn(middleware_event_logger):
+    auth = _auth()
+    turn = TurnContext(
+        turn_id="untaint-turn", session_id="session", trigger="user_message",
+        channel_id=auth.channel_id, started_at=time.monotonic(), auth_context=auth,
+    )
+    token = set_current_turn(turn)
+    try:
+        yield turn
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize(("changes", "reason"), [
+    ({"roles": ("user",)}, "admin_required"),
+    ({"roles": (), "trigger": "poller"}, "admin_required"),
+    ({"principal": ""}, "missing_authenticated_admin"),
+    ({"canonical_principal": None}, "missing_authenticated_admin"),
+    ({"is_service": True}, "service_identity_forbidden"),
+    ({"roles": ("admin", "service")}, "service_identity_forbidden"),
+    ({"service_authority": object()}, "service_identity_forbidden"),
+    ({"principal": "service:poller"}, "service_identity_forbidden"),
+    ({"canonical_principal": " SERVICE:poller "}, "service_identity_forbidden"),
+    ({"trigger": "poller"}, "user_origin_required"),
+    ({"trigger": "shell_job_complete"}, "user_origin_required"),
+    ({"origin_trigger": "scheduled_tick"}, "user_origin_required"),
+    ({"event_ingress": "http_event"}, "user_origin_required"),
+    ({"ifc_state": None}, "missing_ifc_state"),
+])
+def test_declassification_refuses_non_operator_origins(live_turn, changes, reason):
+    auth = replace(live_turn.auth_context, **changes)
+    live_turn.auth_context = auth
+    destination = "https://attacker.test/x?d=secret"
+    assert access_control.approve_live_declassification(
+        auth, sink_category="network", destination=destination, reason="send output",
+        turn_id=live_turn.turn_id,
+    ) == (False, reason)
+    assert not auth.egress_state.is_url_approved(destination)
+    if isinstance(auth.ifc_state, InformationFlowState):
+        assert auth.ifc_state._declassification is None
+        assert auth.ifc_state.has_untrusted_active_ingest()
+
+
+@pytest.mark.parametrize("case", [
+    "auth", "turn", "id", "blank_id", "non_string_id", "carrier", "turn_auth",
+])
+def test_declassification_requires_matching_live_turn(live_turn, case, monkeypatch):
+    auth = live_turn.auth_context
+    state = auth.ifc_state
+    turn_id = live_turn.turn_id
+    if case == "auth":
+        auth = None
+    elif case == "id":
+        turn_id = "other"
+    elif case == "blank_id":
+        turn_id = " "
+        live_turn.turn_id = turn_id
+    elif case == "non_string_id":
+        turn_id = None
+        live_turn.turn_id = turn_id
+    elif case == "carrier":
+        auth = _auth()
+        # Equal label snapshots are not the same live state object.
+        assert auth.ifc_state == state
+        assert auth.ifc_state is not state
+    elif case == "turn_auth":
+        live_turn.auth_context = None
+    elif case == "turn":
+        monkeypatch.setattr("mimir._context.get_current_turn", lambda: None)
+    assert access_control.approve_live_declassification(
+        auth, turn_id=turn_id, sink_category="network",
+        destination="https://attacker.test/x?d=secret", reason="send output",
+    ) == (False, "missing_auth_context" if case == "auth" else "missing_live_turn")
+    assert state._declassification is None
+    if auth is not None:
+        assert auth.ifc_state._declassification is None
+        assert not auth.egress_state.is_url_approved("https://attacker.test/x?d=secret")
+
+
+@pytest.mark.parametrize("origin", [None, "user_message", "acp_session"])
+def test_operator_declassification_then_fetch(live_turn, origin):
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth = replace(live_turn.auth_context, origin_trigger=origin)
+    live_turn.auth_context = auth
+    destination = "https://example.test/operator-approved?d=secret"
+    middleware = BudgetGateMiddleware()
+    calls = []
+
+    def handler(request):
+        calls.append(request.tool_call["name"])
+        return ToolMessage(content="response", tool_call_id=request.tool_call["id"])
+
+    def invoke(name, args):
+        return middleware.wrap_tool_call(ToolCallRequest(
+            tool_call={"name": name, "args": args, "id": name, "type": "tool_call"},
+            tool=None, state=None, runtime=Runtime(context=auth),
+        ), handler)
+
+    assert invoke("fetch_url", {"url": destination}).status == "error"
+    assert invoke("approve_declassification", {
+        "sink_category": "network", "destination": destination, "reason": "operator consent",
+    }).status == "success"
+    assert auth.egress_state.is_url_approved(destination)
+    assert invoke("fetch_url", {"url": destination}).status == "success"
+    assert calls == ["fetch_url"]
+
+
+@pytest.mark.parametrize(("tool", "target"), [
+    ("write_file", "/tmp/shadow-approved-output.txt"),
+    ("http_request", "https://example.com/shadow-output"),
+])
+@pytest.mark.parametrize("case", ["matching", "destination", "principal", "expired"])
+def test_shadow_declassification_parity(live_turn, tool, target, case, monkeypatch):
+    auth = live_turn.auth_context
+    now = 100.0
+    monkeypatch.setattr("mimir.models.time.monotonic", lambda: now)
+    assert access_control.approve_live_declassification(
+        auth, sink_category=access_control.get_sink_category(tool).value,
+        turn_id=live_turn.turn_id,
+        destination=target, reason="approve one exact output",
+    ) == (True, "approved")
+    grant = auth.ifc_state._declassification
+    if case == "destination":
+        target += "/other"
+    elif case == "principal":
+        auth = replace(auth, canonical_principal="other")
+    elif case == "expired":
+        now += 31
+
+    shadow = [access_control.SinkGate.check_sink_flow(
+        tool, target, auth.ifc_labels, auth, enforce=False,
+    ) for _ in range(2)]
+    # The write veto never consults egress approvals, even expired ones;
+    # shadow egress only observes its capability without consuming it.
+    assert auth.ifc_state._declassification is grant
+    enforced = [access_control.SinkGate.check_sink_flow(
+        tool, target, auth.ifc_labels, auth, enforce=True,
+    ) for _ in range(2)]
+    for index, (observed, actual) in enumerate(zip(shadow, enforced)):
+        if tool == "write_file":
+            assert not observed.allowed and not actual.allowed
+            assert observed.reason == actual.reason == "write_blocked_by_untrusted_ingest"
+            assert observed.refusal_detail == actual.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+            continue
+        approved = case == "matching" and index == 0
+        assert observed.allowed
+        assert actual.allowed is approved
+        assert observed.would_block is (not approved)
+        assert observed.decision == actual.decision
+        assert observed.reason == actual.reason
+        assert (observed.reason == "ifc_declassification_approved") is approved
+    assert auth.ifc_state.current() is auth.ifc_labels
+
+
+@pytest.mark.parametrize(("tool", "target"), [
+    ("write_file", "/tmp/shadow-census-output.txt"),
+    ("http_request", "https://example.com/shadow-census-output"),
+])
+async def test_registry_shadow_approval_census(live_turn, tool, target, monkeypatch):
+    auth = live_turn.auth_context
+    # Isolate approval accounting from the uncataloged HTTP operation denial.
+    catalog = access_control.OperationCatalog()
+    catalog.register_operation("http_request", access_control.OperationDecision.ADMIN_REQUIRED)
+    monkeypatch.setattr(access_control, "get_operation_catalog", lambda: catalog)
+    registry = access_control.ToolRegistry()
+    registry.enable_shadow_logging()
+    captured = []
+
+    async def capture(kind, **fields):
+        captured.append((kind, fields))
+
+    assert access_control.approve_live_declassification(
+        auth, sink_category=access_control.get_sink_category(tool).value,
+        turn_id=live_turn.turn_id,
+        destination=target, reason="approve one census output",
+    ) == (True, "approved")
+    grant = auth.ifc_state._declassification
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    arguments = (
+        {"file_path": target, "content": "secret"}
+        if tool == "write_file"
+        else {"url": target}
+    )
+    shadow = []
+    for attempt in range(2):
+        result = registry.authorize_tool(
+            tool, auth, enforce=False, target_channel=target,
+            arguments=arguments, ifc_labels=auth.ifc_labels,
+        )
+        shadow.append(result)
+        await asyncio.sleep(0)
+        if tool == "write_file":
+            assert not result.allowed and result.reason == "write_blocked_by_untrusted_ingest"
+            assert auth.ifc_state._declassification is grant
+            continue
+        assert result.allowed
+        if attempt == 0:
+            assert not result.would_block
+        assert len(captured) == attempt
+        assert auth.ifc_state._declassification is grant
+
+    if tool == "write_file":
+        # This veto is enforced even in shadow mode and never spends the
+        # unrelated destination-only grant or records a shadow allowance.
+        assert captured == []
+        enforced = registry.authorize_tool(
+            tool, auth, enforce=True, target_channel=target,
+            arguments=arguments, ifc_labels=auth.ifc_labels,
+        )
+        assert not enforced.allowed and enforced.reason == "write_blocked_by_untrusted_ingest"
+        assert auth.ifc_state._declassification is grant
+        return
+    kind, fields = captured[0]
+    assert kind == "shadow_tool_decision"
+    assert fields["tool"] == tool
+    assert fields["would_block"] is True
+    assert fields["reason"] == f"ifc_label_blocked:{access_control.get_sink_category(tool).value}"
+    for attempt in range(2):
+        enforced = registry.authorize_tool(
+            tool, auth, enforce=True, target_channel=target,
+            arguments=arguments, ifc_labels=auth.ifc_labels,
+        )
+        assert enforced.allowed is (attempt == 0)
+        assert enforced.would_block is bool(attempt)
+        if attempt == 0:
+            assert enforced.reason == shadow[0].reason
+            assert enforced.decision == shadow[0].decision
+        else:
+            assert enforced.reason == fields["reason"]
+            assert enforced.decision.value == fields["decision"]
+    await asyncio.sleep(0)
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize(("tool", "target"), [
+    ("write_file", "/tmp/private-output.txt"),
+    ("fetch_url", "https://example.com/unapproved"),
+    ("http_request", "https://example.com/output"),
+    ("send_message", "slack-other"),
+    ("shell_exec", "curl https://example.com"),
+])
+async def test_egress_still_requires_declassification(live_turn, tool, target, tmp_path, monkeypatch):
+    from langchain.agents.middleware import ToolCallRequest
+    from langgraph.runtime import Runtime
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    owned_tasks = set()
+    monkeypatch.setattr("mimir.event_logger._background_event_tasks", owned_tasks)
+
+    auth = live_turn.auth_context
+    before = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)
+    assert not before.allowed
+    snapshot = auth.ifc_state.current()
+    assert auth.ifc_state.acknowledge_ingest_snapshot(
+        expected=snapshot, durable_audit=lambda _sources: True,
+    )
+    after = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)
+    assert not after.allowed
+    if tool == "write_file":
+        assert after.reason != "write_blocked_by_untrusted_ingest"
+    assert not auth.ifc_state.consume_sink_approval(
+        current=auth.ifc_labels, sink_category=access_control.get_sink_category(tool).value,
+        destination=target, canonical_principal=auth.canonical_principal,
+    )
+    arguments = {
+        "write_file": {"file_path": target, "content": "secret"},
+        "fetch_url": {"url": target},
+        "http_request": {"url": target, "method": "POST", "body": "secret"},
+        "send_message": {"channel_id": target, "text": "secret"},
+        "shell_exec": {"command": target},
+    }[tool]
+    request = ToolCallRequest(
+        tool_call={"name": tool, "args": arguments, "id": "sink", "type": "tool_call"},
+        tool=None, state=None, runtime=Runtime(context=auth),
+    )
+    def unreachable(request):
+        pytest.fail("untaint must not admit egress")
+
+    result = BudgetGateMiddleware().wrap_tool_call(request, unreachable)
+    assert result.status == "error"
+    await asyncio.gather(*tuple(owned_tasks))
+    events = [json.loads(line) for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()]
+    denied = [event for event in events if event["type"] == "tool_call" and event.get("denied")]
+    assert denied and denied[-1]["tool"] == tool, (result.content, events)
+    print(json.dumps({"tool": tool, "sink_reason": after.reason, "event": denied[-1]}))
+    if tool in {"write_file", "http_request"}:
+        assert access_control.approve_live_declassification(
+            auth, sink_category=access_control.get_sink_category(tool).value,
+            turn_id=live_turn.turn_id,
+            destination=target, reason="one output still needs its own approval",
+        )[0]
+        approved = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)
+        if tool == "write_file":
+            assert approved.allowed and approved.reason == "ifc_declassification_approved"
+        else:
+            assert not approved.allowed  # Network destination remains separately gated.
+        assert not access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True).allowed

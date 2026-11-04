@@ -1,0 +1,1026 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least-privilege at the workflow level. First workflow in the repo →
+# sets the template for everything that follows; explicit minimal scope
+# is the right default. Individual jobs can opt UP if needed.
+permissions:
+  contents: read
+
+# RUNNER_TEMP is beneath the controller's home on hosted runners. Fixtures
+# there trip controller-path scrubbing and non-owning-uid ancestor validation.
+# Keep evidence outside that home. Prepare steps canonicalize /tmp (which is
+# /private/tmp on macOS) and establish private ownership before exporting the root.
+env:
+  PYTEST_EVIDENCE_DIR_NAME: mimir-pytest-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+
+# Cancel in-flight runs for the same ref when a new commit lands. Saves
+# minutes on PR force-pushes; main-branch runs use ref=refs/heads/main
+# so cancel-in-progress only fires on PR events.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package:
+    # Exercise the same source-distribution-first build used for releases. A
+    # second, direct wheel catches file-selection differences between the two
+    # paths before a tag reaches publish.yml.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Build React app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Build sdist and wheel from sdist
+        run: uv build
+
+      - name: Build wheel directly from checkout
+        run: uv build --wheel --out-dir dist/direct
+
+      - name: Verify wheel contents and build-path parity
+        run: >-
+          python .github/assert_wheel_contents.py
+          --sdist-wheel dist/*.whl
+          --direct-wheel dist/direct/*.whl
+
+      - name: Smoke installed direct wheel
+        run: python .github/assert_installed_acp.py dist/direct/*.whl
+
+      - name: Smoke installed source sdist
+        run: python .github/assert_installed_acp.py dist/*.tar.gz
+
+  skill-conformance:
+    # Fast gate (<1s of pytest work). Surfaces a single status check
+    # SKILL-authors can grep for on a PR. Closes the body-vs-declared
+    # ``allowed-tools`` drift gap that pre-beta review flagged
+    # (chainlink #82 sub #88). Runs first so the slower pytest matrix
+    # below can fail-fast on conformance breaks via ``needs:``.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          # Pin to a known-good minor — ``latest`` is a slow-motion
+          # supply-chain risk + a reproducibility hole. Bump
+          # deliberately with a code review, not silently.
+          version: "0.11.12"
+          # Cache uv's resolver state keyed on the lockfile. Heavy
+          # deps (fastembed/faiss-cpu/aiohttp) reinstall on every run
+          # without this — the 4m32s install time on the cold 3.12
+          # run was almost entirely pip work.
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Sync dependencies (with dev and bench extras)
+        # uv sync also installs the default dev dependency group, which supplies
+        # the workspace-only saga bench harness. Neither published extra does.
+        run: uv sync --extra dev --extra bench
+
+      - name: Prepare pytest evidence directory
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Skill conformance + catalog tests
+        run: uv run pytest tests/test_skill_conformance.py tests/test_skill_catalog.py -v --basetemp "$PYTEST_EVIDENCE_ROOT/skill-conformance"
+
+      # Attempt-specific names preserve rerun evidence. Select raw sidecars, not
+      # wholesale temporary fixtures, to keep logs short without losing diagnostics.
+      # upload-artifact v4 hard-codes symlink following. Stage regular files only
+      # so loops, dangling links and links outside basetemp cannot break collection.
+      - &stage-pytest-evidence
+        name: Stage pytest evidence
+        id: stage-pytest-evidence
+        if: failure()
+        env:
+          PYTEST_EVIDENCE_PATHS: |
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress.wakeup
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress.diagnostics
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress.stacks
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/output
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/stderr
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/*.stdout.log
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/*.stderr.log
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/stdout.log
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/stderr.log
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/stdout.txt
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/stderr.txt
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/report.xml
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/events.jsonl
+            ${{ env.PYTEST_EVIDENCE_ROOT }}/**/turns.jsonl
+        run: |
+          python3 - <<'PY'
+          import fnmatch
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import tempfile
+          from urllib.parse import quote
+
+          def safe_component(part):
+              # Escape '%' too, so literal escape-looking names cannot collide.
+              # Escape dots to avoid upload-artifact's hidden-file exclusion.
+              encoded = quote(part, safe="", errors="surrogatepass").replace(".", "%2E")
+              # '+' is escaped by quote; '+/' uniquely marks a continuation.
+              return "+/".join(encoded[i:i + 200] for i in range(0, len(encoded), 200))
+
+          root_value = os.environ.get("PYTEST_EVIDENCE_ROOT")
+          if not root_value or not Path(root_value).is_dir():
+              print("no pytest evidence (setup failed before tests)")
+              raise SystemExit(0)
+          root = Path(root_value)
+          staged = Path(tempfile.mkdtemp(prefix="mimir-pytest-upload-", dir="/tmp")).resolve()
+          long_paths = {}
+          patterns = [Path(p).name for p in os.environ["PYTEST_EVIDENCE_PATHS"].splitlines()]
+          max_files = 5000
+          max_bytes = 100 * 1024 * 1024
+          max_file_bytes = 5 * 1024 * 1024
+          count = total = truncated = 0
+          stopped = False
+          for directory, directories, files in os.walk(root, followlinks=False):
+              directories.sort()
+              for name in sorted(files):
+                  source = Path(directory) / name
+                  if not stat.S_ISREG(source.lstat().st_mode):
+                      continue
+                  if not any(fnmatch.fnmatchcase(name, p) for p in patterns):
+                      continue
+                  if count >= max_files or total >= max_bytes:
+                      stopped = True
+                      break
+                  target = staged.joinpath(*(safe_component(part) for part in source.relative_to(root).parts))
+                  # Bound the entire physical path, not only NAME_MAX components.
+                  # Leave headroom below macOS PATH_MAX (1024, including NUL).
+                  if len(os.fsencode(target)) > 900:
+                      # '+' cannot appear literally in encoded source components.
+                      # The copy ordinal is unique without relying on hash collisions.
+                      relative = f"+long/{count:04d}"
+                      long_paths[relative] = "/".join(
+                          quote(part, safe="", errors="surrogatepass").replace(".", "%2E")
+                          for part in source.relative_to(root).parts
+                      )
+                      target = staged / relative
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  allowance = min(max_file_bytes, max_bytes - total)
+                  with source.open("rb") as incoming, target.open("wb") as outgoing:
+                      data = incoming.read(allowance)
+                      outgoing.write(data)
+                      truncated += bool(incoming.read(1))
+                  count += 1
+                  total += len(data)
+              if stopped:
+                  break
+          (staged / "STAGING.txt").write_text(
+              "Paths are percent-encoded per component (including dots). Decode by removing "
+              "'+/' continuations, then urllib.parse.unquote(path, errors='surrogatepass').\n"
+              f"Limits: {max_files} files, {max_bytes} payload bytes, {max_file_bytes} bytes/file.\n"
+              "Files retain their first bytes when truncated; traversal is sorted depth-first.\n"
+              f"Copied: {count} files, {total} bytes; truncated files: {truncated}; "
+              f"stopped before remaining evidence: {stopped}.\n"
+              "Paths exceeding 900 physical-path bytes use +long/<copy ordinal>.\n"
+              "Long-path mapping (JSON: staged path -> percent-encoded original path); "
+              "decode values with urllib.parse.unquote(value, errors='surrogatepass'):\n"
+              + json.dumps(long_paths, ensure_ascii=True, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"path={staged}", file=output)
+          PY
+
+      - name: Upload pytest evidence
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-evidence-skill-conformance-3.11-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
+
+  chainlink-cli-audit:
+    # Exercise the real pinned CLI help exactly once in CI. The full-suite jobs
+    # intentionally skip these two live audits when Chainlink is absent; this
+    # dedicated gate keeps upstream command drift executable without compiling
+    # the Rust CLI three times across the Python/enforcement matrix.
+    needs: skill-conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with dev and bench extras)
+        run: uv sync --extra dev --extra bench
+
+      - name: Prepare pytest evidence directory
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Fetch pinned Chainlink source
+        # Keep this tag in sync with mimir/skills/chainlink/dockerfile.fragment.
+        # Only trusted git commands receive the read-only token, never Cargo.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { if [ "$1" = get ]; then printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; fi; }; f'
+        run: |
+          set -euo pipefail
+          expected_sha=0e830bf230fdade13b148a99a1a3c19bfbd33b98
+          source_root="$RUNNER_TEMP/chainlink-source"
+          git init "$source_root"
+          for attempt in 1 2 3; do
+            if resolved="$(git ls-remote --exit-code https://x-access-token@github.com/dollspace-gay/chainlink.git refs/tags/chainlink-1.6.0)"; then
+              if [[ "$resolved" != "$expected_sha"$'\t'refs/tags/chainlink-1.6.0 ]]; then
+                echo "::error::Chainlink tag chainlink-1.6.0 no longer resolves to the pinned commit"
+                exit 1
+              fi
+              if git -C "$source_root" fetch --depth=1 https://x-access-token@github.com/dollspace-gay/chainlink.git refs/tags/chainlink-1.6.0; then
+                if [[ "$(git -C "$source_root" rev-parse FETCH_HEAD)" != "$expected_sha" ]]; then
+                  echo "::error::Fetched Chainlink source does not match the pinned commit"
+                  exit 1
+                fi
+                git -C "$source_root" checkout --detach "$expected_sha"
+                exit 0
+              fi
+            fi
+            if (( attempt == 3 )); then
+              echo "::error::Pinned Chainlink source fetch failed after 3 attempts"
+              exit 1
+            fi
+            sleep $((30 * attempt))
+          done
+
+      - name: Install pinned Chainlink CLI
+        run: |
+          set -euo pipefail
+          # Defense in depth: no authentication reaches third-party build scripts.
+          unset GITHUB_TOKEN GH_TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          source_root="$RUNNER_TEMP/chainlink-source"
+          # The pinned repository need not have a root Cargo.toml. Locate the
+          # named package from its manifests without invoking Cargo or assuming
+          # an upstream directory layout; ambiguity fails before any build.
+          crate_path="$(python - "$source_root" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          root = pathlib.Path(sys.argv[1]).resolve()
+          matches = []
+          for manifest in sorted(root.rglob("Cargo.toml")):
+              if manifest.is_symlink() or not manifest.resolve().is_relative_to(root):
+                  raise SystemExit("::error::Chainlink manifest escapes the source checkout")
+              with manifest.open("rb") as stream:
+                  data = tomllib.load(stream)
+              if data.get("package", {}).get("name") == "chainlink-tracker":
+                  matches.append(manifest.parent)
+          if len(matches) != 1:
+              raise SystemExit(f"::error::Expected exactly one chainlink-tracker manifest, found {len(matches)}")
+          print(matches[0])
+          PY
+          )"
+          for attempt in 1 2 3; do
+            if cargo install --path "$crate_path" --locked --root "$RUNNER_TEMP/chainlink"; then
+              echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if (( attempt == 3 )); then
+              echo "::error::Pinned Chainlink CLI install failed after 3 attempts"
+              exit 1
+            fi
+            sleep $((30 * attempt))
+          done
+
+      - name: Audit live Chainlink command surface
+        run: |
+          chainlink --version
+          uv run pytest -q tests/test_access_control.py \
+            --basetemp "$PYTEST_EVIDENCE_ROOT/audit" \
+            -k 'chainlink_issue_help_has_an_explicit_read_or_mutation_decision or chainlink_top_level_help_has_an_explicit_scope_decision'
+
+      - *stage-pytest-evidence
+
+      - name: Upload pytest evidence
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-evidence-chainlink-cli-audit-3.12-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
+
+  pytest:
+    # Full mimir test suite under py 3.11 + 3.12 + 3.13 matrix. ``needs:
+    # skill-conformance`` makes the fast gate fail-fast PRs that bust
+    # frontmatter, instead of waiting for the slower full matrix to
+    # come back red on the same root cause.
+    needs: skill-conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies (with dev and bench extras)
+        # The default dev dependency group supplies workspace-only saga;
+        # the published extras do not include it.
+        run: uv sync --extra dev --extra bench
+
+      - name: Verify selected Python
+        run: |
+          uv run python -c 'import os, sys; actual = ".".join(map(str, sys.version_info[:2])); print(sys.version); assert actual == os.environ["UV_PYTHON"], (actual, os.environ["UV_PYTHON"])'
+
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
+
+      - name: Prepare pytest evidence directory
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
+      - name: Run mimir test suite
+        # ``testpaths`` is set in pyproject.toml so no explicit path
+        # arg needed. Excludes saga/saga/tests/ (workspace member's
+        # nested test tree) and the mimir/optional-skills/ test trees
+        # (each needs its own skill-dir conftest, and they collide on the
+        # shared ``poller`` / ``tests.conftest`` module names). saga has
+        # its own conftest; the optional-skills trees run in the dedicated
+        # per-skill step below (chainlink #299).
+        # Keep tracebacks short; upload raw evidence files on failure instead of huge logs.
+        run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+
+      - name: Install pinned OpenCode for required child-session resume coverage
+        if: matrix.python-version == '3.12'
+        run: npm install --global opencode-ai@1.19.4
+
+      - name: Run selected Cultivate suite (shadow, Python 3.12)
+        if: matrix.python-version == '3.12'
+        env:
+          MIMIR_PLUGINS: cultivate
+          MIMIR_REQUIRE_OPENCODE_RESUME: "1"
+        run: env -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --locked --all-packages --extra dev --extra bench pytest -q --tb=short tests plugins/cultivate/tests --basetemp "$PYTEST_EVIDENCE_ROOT/cultivate-shadow"
+
+      - name: Run optional-skills tests (per-skill, isolated)
+        # Each optional skill under mimir/optional-skills/ ships its own
+        # poller.py + tests/conftest.py. Run together they collide
+        # (ImportPathMismatchError on the shared ``tests.conftest`` module
+        # name, plus duplicate ``poller`` modules), which is why the main
+        # suite excludes them. Run each skill's tests in its OWN pytest
+        # process so sys.modules starts fresh per skill. (chainlink #299)
+        run: |
+          set -e
+          ran=0
+          for tdir in mimir/optional-skills/*/tests plugins/cultivate/mimir_cultivate/defaults/skills/*/tests; do
+            if [ -d "$tdir" ]; then
+              test_files=("$tdir"/test_*.py)
+              [ -f "${test_files[0]}" ] || continue
+              echo "== $tdir =="
+              skill="${tdir%/tests}"
+              skill="${skill##*/}"
+              env -u MIMIR_PLUGINS uv run --locked --all-packages --extra dev --extra bench pytest -q "$tdir" --basetemp "$PYTEST_EVIDENCE_ROOT/optional-skills/$skill"
+              ran=$((ran + 1))
+            fi
+          done
+          # chainlink #330: fail loudly if the glob matched no test dirs
+          # (e.g. an optional-skills layout change) rather than passing
+          # vacuously and silently dropping this coverage.
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no optional-skills test dirs matched"
+            exit 1
+          fi
+          echo "ran optional-skills tests for $ran skill(s)"
+
+      - *stage-pytest-evidence
+
+      - name: Upload pytest evidence
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
+
+  pytest-worker-uid:
+    # Runs the suite as a uid that owns neither the checkout nor $HOME. That is the
+    # shape a Worklink gate runs in: the controller (`mimir`) owns the tree and its
+    # home, and the gate runs as `worklink` with HOME=/nonexistent. Every other leg
+    # here runs as the checkout's owner, so a test that reads ambient controller
+    # state passes in CI and fails only inside a build. Three such defects shipped
+    # undetected in ~18 hours on 2026-08-25/26 (PRs #1759, #1760, #1761).
+    #
+    # THE SEEDING BELOW IS LOAD-BEARING. These failures need the controller's state
+    # to EXIST and be unreadable, not to be absent: Config handles a missing
+    # credentials file gracefully, and an unset MIMIR_FILE_TOOL_ROOTS reproduces
+    # nothing. A version of this job that only switches user passes immediately and
+    # proves nothing.
+    needs: skill-conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with dev and bench extras and the Cultivate member)
+        # The real-identity coding tests below exercise the Cultivate worker, so
+        # the workspace provider must be installed BEFORE the tree is made
+        # read-only to the worker. The whole-suite leg re-syncs to core-only.
+        run: uv sync --locked --all-packages --extra dev --extra bench
+
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
+
+      - name: Seed controller-owned state the worker must not be able to read
+        # Mode 600 inside a mode 700 directory, owned by the runner. The worker uid
+        # can neither read the file nor traverse into the directory, which is what
+        # made Config raise PermissionError rather than fall back.
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.claude"
+          printf '{}\n' > "$HOME/.claude/.credentials.json"
+          chmod 700 "$HOME/.claude"
+          chmod 600 "$HOME/.claude/.credentials.json"
+          ls -ld "$HOME/.claude" "$HOME/.claude/.credentials.json"
+
+      - name: Create distinct controller and worker identities and make the tree readable
+        # The focused root leg below needs production's real split: a `mimir`
+        # controller in the `worklink` group and a distinct fixed worker account.
+        # The whole-suite leg still runs as the non-owning worker with the tree only
+        # group-readable -- deliberately not group-writable.
+        run: |
+          set -euo pipefail
+          sudo useradd --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin --user-group mimir
+          sudo useradd --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin --user-group worklink
+          sudo usermod --append --groups worklink mimir
+          mimir_uid="$(id -u mimir)"
+          worklink_uid="$(id -u worklink)"
+          worklink_gid="$(id -g worklink)"
+          test "$mimir_uid" != "$worklink_uid" \
+            || { echo "::error::mimir and worklink uids are not distinct"; exit 1; }
+          id -G mimir | tr ' ' '\n' | grep -qx "$worklink_gid" \
+            || { echo "::error::mimir is not in the worklink group"; exit 1; }
+          echo "controller uid=$mimir_uid worker uid=$worklink_uid worklink gid=$worklink_gid"
+          sudo chgrp -R worklink .
+          chmod -R g+rX .
+          chmod g+s .
+          # The worker must be able to traverse down to the checkout.
+          sudo chmod o+x "$HOME" "$(dirname "$PWD")" "$(dirname "$(dirname "$PWD")")"
+          sudo -u worklink test -r pyproject.toml \
+            || { echo "::error::worker uid cannot read the checkout"; exit 1; }
+          sudo -u worklink test -w pyproject.toml \
+            && { echo "::error::worker uid can WRITE the checkout; that is not the production shape"; exit 1; }
+          sudo -u worklink test -x .venv/bin/python \
+            || { echo "::error::worker uid cannot execute the venv interpreter"; exit 1; }
+          echo "worker uid can read and not write the checkout"
+          evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"
+          sudo install -d -m 710 -o worklink -g worklink "$evidence_root"
+          sudo install -d -m 750 -o root -g mimir "$evidence_root/remediation-root"
+          sudo install -d -m 700 -o worklink -g worklink "$evidence_root/main"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Run retained-remediation coverage as root with distinct identities
+        # Coding integration: Cultivate is installed (above) and selected here.
+        # All four tests importorskip mimir_cultivate and skip without Linux
+        # root or distinct identities, so a passing exit code alone proves
+        # nothing: the JUnit check below requires every one of them to EXECUTE.
+        env:
+          MIMIR_PLUGINS: cultivate
+        run: |
+          set -euo pipefail
+          junit="$PYTEST_EVIDENCE_ROOT/remediation-junit.xml"
+          sudo env \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            MIMIR_PLUGINS="$MIMIR_PLUGINS" \
+            .venv/bin/python -m pytest -q --tb=short -rs -p no:cacheprovider \
+              --basetemp "$PYTEST_EVIDENCE_ROOT/remediation-root" \
+              --junitxml "$junit" \
+              tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests \
+              tests/test_worklink_remediation_e2e.py::test_leaf_checkout_lets_the_worklink_uid_run_real_git \
+              tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller \
+              tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit
+          # Fail unless exactly the four selected tests ran and passed: one
+          # quiet skip (a missing account, a lost import) is the regression.
+          sudo .venv/bin/python - "$junit" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = list(root.iter("testcase"))
+          ran = [c.get("name") for c in cases
+                 if not any(c.find(tag) is not None for tag in ("skipped", "failure", "error"))]
+          if len(cases) != 4 or len(ran) != 4:
+              skipped = {c.get("name"): (c.find("skipped").get("message") if c.find("skipped") is not None else None)
+                         for c in cases}
+              print(f"::error::real-identity coding tests did not all execute: ran={ran} all={skipped}")
+              sys.exit(1)
+          print("executed and passed:", ", ".join(ran))
+          PY
+
+      - name: Return the venv to core-only for the whole-suite worker leg
+        # The non-owning-worker leg below keeps its core-only coverage: an exact
+        # sync removes the workspace provider again, and nothing selects it.
+        run: |
+          set -euo pipefail
+          uv sync --locked --extra dev --extra bench
+          if .venv/bin/python -c 'import mimir_cultivate' 2>/dev/null; then
+            echo "::error::mimir_cultivate is still installed for the core-only leg"; exit 1
+          fi
+          sudo -u worklink test -x .venv/bin/python \
+            || { echo "::error::worker uid cannot execute the re-synced venv interpreter"; exit 1; }
+
+      - name: Report pytest worker capacity
+        run: .venv/bin/python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
+      - name: Run mimir test suite as the non-owning worker uid
+        # `.venv/bin/python -m pytest`, not `uv run`: uv derives its cache from HOME,
+        # and this HOME is deliberately unwritable -- the gate invokes pytest directly
+        # for the same reason. Bytecode and cache writes are disabled because the tree
+        # is read-only to this uid, so leaving them on would fail during collection
+        # instead of naming a failing test.
+        env:
+          MIMIR_FILE_TOOL_ROOTS: /tmp
+        run: |
+          set -euo pipefail
+          # TERM is unset under `sudo -u`, so terminfo lookups write
+          # "No entry for terminal type" to stderr and trip a test asserting a quiet
+          # stderr. That is an artifact of how this leg invokes pytest, not a
+          # worker-uid defect, so give it a real terminal type.
+          #
+          # The two deselected tests run `docker buildx`, which needs a writable HOME
+          # and dies with "mkdir /nonexistent: permission denied" before reaching any
+          # assertion. HOME=/nonexistent is the production shape this leg exists to
+          # reproduce, so they cannot run here; worklink-image-identity already covers
+          # the image build.
+          sudo -u worklink env \
+            HOME=/nonexistent \
+            TERM=xterm \
+            PATH="$PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            MIMIR_FILE_TOOL_ROOTS="$MIMIR_FILE_TOOL_ROOTS" \
+            MIMIR_CLAUDE_OAUTH_CREDENTIALS="$HOME/.claude/.credentials.json" \
+            .venv/bin/python -m pytest -q --tb=short --durations=25 -p no:cacheprovider \
+              --basetemp "$PYTEST_EVIDENCE_ROOT/main" \
+              --deselect tests/test_root_dockerfile.py::test_build_without_provenance_args_fails_with_named_error \
+              --deselect tests/test_root_dockerfile.py::test_built_image_provides_process_tools
+
+      - name: Make worker pytest evidence readable for upload
+        if: failure()
+        run: |
+          if [ -n "${PYTEST_EVIDENCE_ROOT:-}" ] && [ -d "$PYTEST_EVIDENCE_ROOT" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$PYTEST_EVIDENCE_ROOT"
+          fi
+
+      - *stage-pytest-evidence
+
+      - name: Upload pytest evidence
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-evidence-pytest-worker-uid-3.12-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
+
+  pytest-macos:
+    # Keep this separate from the required pytest matrix so its existing
+    # ``pytest (3.11)`` and ``pytest (3.12)`` check names remain unchanged.
+    runs-on: macos-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies (with dev and bench extras)
+        run: uv sync --extra dev --extra bench
+
+      - name: Verify selected Python
+        run: |
+          uv run python -c 'import os, sys; actual = ".".join(map(str, sys.version_info[:2])); print(sys.version); assert actual == os.environ["UV_PYTHON"], (actual, os.environ["UV_PYTHON"])'
+
+      - name: Prepare pytest evidence directory
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
+      - name: Run mimir test suite
+        run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+
+      - name: Run optional-skills tests (per-skill, isolated)
+        run: |
+          set -e
+          ran=0
+          for tdir in mimir/optional-skills/*/tests plugins/cultivate/mimir_cultivate/defaults/skills/*/tests; do
+            if [ -d "$tdir" ]; then
+              test_files=("$tdir"/test_*.py)
+              [ -f "${test_files[0]}" ] || continue
+              echo "== $tdir =="
+              skill="${tdir%/tests}"
+              skill="${skill##*/}"
+              env -u MIMIR_PLUGINS uv run --locked --all-packages --extra dev --extra bench pytest -q "$tdir" --basetemp "$PYTEST_EVIDENCE_ROOT/optional-skills/$skill"
+              ran=$((ran + 1))
+            fi
+          done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no optional-skills test dirs matched"
+            exit 1
+          fi
+          echo "ran optional-skills tests for $ran skill(s)"
+
+      - *stage-pytest-evidence
+
+      - name: Upload pytest evidence
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
+
+  # Resolves dependencies FRESH instead of from uv.lock, so an upstream release
+  # inside a permitted range is exercised here before it reaches a deployment.
+  #
+  # This job exists because deepagents 0.7.10 shipped a signature change on
+  # 2026-08-28 and broke live turns the same day. CI could not have caught it: CI
+  # installs from uv.lock (then 0.7.1) while a source deployment's startup builds a
+  # wheel and pip-installs it, resolving fresh. The suite was green against a
+  # version nobody ran.
+  #
+  # continue-on-error: a new upstream release breaking us is information, not a
+  # reason to block a PR that did not cause it. Read this job when it is red and
+  # decide deliberately; it is a canary, not a gate.
+  pytest-fresh-resolve:
+    needs: skill-conformance
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Resolve dependencies at their newest permitted versions
+        run: uv sync --extra dev --extra bench --upgrade
+
+      - name: Report what resolved
+        run: uv pip list
+
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
+
+      - name: Prepare pytest evidence directory
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
+      - name: Run mimir test suite against the fresh resolution
+        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+
+      - *stage-pytest-evidence
+
+      - name: Upload pytest evidence
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-evidence-pytest-fresh-resolve-3.12-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
+
+  pytest-enforced:
+    # The same suite with MIMIR_ACCESS_CONTROL_ENFORCED=1.
+    #
+    # Why this job exists: authorization regressions are invisible to the
+    # unenforced matrix by construction. Every gate that fails closed only under
+    # enforcement passes silently with the flag off, which is how #999, #1000 and
+    # #1001 all reached main and had to be found by hand afterwards.
+    #
+    # MIMIR_MODEL_SPEC is deliberately LEFT UNSET so the run exercises the
+    # shipped default (codex-plus:gpt-5.6-luna) — the configuration a fresh
+    # install actually gets. That default is enforcement-compatible; a
+    # claude-code: default used to fail startup preflight outright.
+    #
+    # One Python version is enough: enforcement behavior is not
+    # version-specific, and the 3.11/3.12 matrix above already covers the
+    # interpreter axis. No provider credentials are required — model resolution
+    # is not exercised by the suite.
+    #
+    # A green run here means "nothing failed", NOT "enforcement is covered".
+    # tests/test_env_isolation.py::test_no_test_is_skipped_because_enforcement_is_on
+    # is what keeps those two the same claim, by failing if anyone silences an
+    # enforced failure with a skipif on the flag.
+    needs: skill-conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with dev and bench extras)
+        run: uv sync --extra dev --extra bench
+
+      - name: Install AppArmor syntax checker (no kernel enforcement required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor
+          /usr/sbin/apparmor_parser --version
+
+      - name: Prepare pytest evidence directory
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
+      - name: Run mimir test suite (enforcement on)
+        env:
+          MIMIR_ACCESS_CONTROL_ENFORCED: "1"
+        run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+
+      - name: Install pinned OpenCode for required child-session resume coverage
+        run: npm install --global opencode-ai@1.19.4
+
+      - name: Run selected Cultivate suite (enforcement on)
+        env:
+          MIMIR_PLUGINS: cultivate
+          MIMIR_ACCESS_CONTROL_ENFORCED: "1"
+          MIMIR_REQUIRE_OPENCODE_RESUME: "1"
+        run: uv run --locked --all-packages --extra dev --extra bench pytest -q --tb=short tests plugins/cultivate/tests --basetemp "$PYTEST_EVIDENCE_ROOT/cultivate-enforced"
+
+      - *stage-pytest-evidence
+
+      - name: Upload pytest evidence
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: pytest-evidence-pytest-enforced-3.12-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
+
+  worklink-image-identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      WORKLINK_REPO: /workspace/worklink-base
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+
+      - name: Prove shipped Worklink identities and permissions
+        run: uv run python scripts/worklink_image_identity.py
+
+  claude-code-extra-smoke:
+    # The claude-code extra is the permanent install path for Anthropic Max
+    # subprocess deployments. Keep a focused CI smoke so a dependency/metadata
+    # regression cannot hide behind the default dev-only sync.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Sync dependencies (with Claude Code extra)
+        run: uv sync --extra dev --extra claude-code
+
+      - name: Verify adapter, enforcement hook and bridged tool execution
+        run: |
+          uv run python - <<'PY'
+          import langchain_claude_code
+          from mimir import _langchain_claude_code_patches as patches
+
+          patches.assert_supported_langchain_claude_code_adapter(langchain_claude_code)
+          patches.ensure_tool_enforcement_hooks_installed(langchain_claude_code)
+          print("claude-code adapter smoke ok")
+          PY
+          uv run --extra dev --extra claude-code pytest -q -n 0 tests/test_langchain_claude_code_patches.py::test_bridged_structured_tool_executes
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Node
+        id: setup-node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Cache frontend dependencies
+        id: node-modules
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node${{ steps.setup-node.outputs.node-version }}-node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install frontend dependencies
+        if: steps.node-modules.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+
+      - name: Verify Vitest collection excludes factory checkouts
+        env:
+          MIMIR_REQUIRE_VITEST: "1"
+        run: uv run --extra dev pytest -q tests/test_vitest_config.py
+
+      - name: Typecheck and build React app
+        timeout-minutes: 5
+        run: |
+          npm run test
+          npm run build

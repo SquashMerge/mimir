@@ -1,0 +1,1272 @@
+"""WebChatBridge — POST /chat inbound + SSE /chat/stream outbound (SPEC §7.2.1)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from textwrap import dedent
+from types import SimpleNamespace
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from mimir.access_control import create_auth_context
+from mimir.agent import Agent, _initialize_ifc_labels
+from mimir.chat_skills import (
+    CHAT_SKILL_EXTRA_KEY,
+    ChatSkillDescriptor,
+    ChatSkillError,
+    ChatSkillInvocation,
+)
+from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
+from mimir.history import MessageBuffer, render_recent_activity
+from mimir.http_ingress import SERVER_OWNED_EXTRA_KEYS
+from mimir.identities import IdentityResolver
+from mimir.models import AgentEvent, SessionACL
+from mimir.saga.ownership import is_user_accessible
+from mimir.web_contracts import validate_api_envelope, validate_live_event
+from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_KEY, WORKLINK_HINT_EXTRA_KEYS
+from tests.timing import HANG_GUARD_SECONDS, wait_until
+
+
+class StubChatSkillRegistry:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        discoverable: tuple[ChatSkillDescriptor, ...] = (),
+        resolved: ChatSkillInvocation | ChatSkillError | None = None,
+    ) -> None:
+        self.enabled = enabled
+        self._discoverable = discoverable
+        self._resolved = resolved
+        self.resolve_calls: list[str] = []
+
+    def list_discoverable(self) -> tuple[ChatSkillDescriptor, ...]:
+        return self._discoverable
+
+    def resolve_post_content(self, content: str) -> ChatSkillInvocation | ChatSkillError | None:
+        self.resolve_calls.append(content)
+        return self._resolved
+
+
+def _authed_bridge_app(
+    tmp_path: Path,
+    *,
+    registry: StubChatSkillRegistry | None = None,
+    canonical: str = "alice",
+    display_name: str = "Alice",
+):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical=canonical,
+            display_name=display_name,
+        )
+        return await handler(request)
+
+    bridge = WebChatBridge(
+        enqueue=fake_enqueue,
+        home=tmp_path,
+        chat_skill_registry=registry,
+    )
+    app = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(app)
+    return bridge, app, enqueued
+
+
+@pytest.mark.parametrize("route", ["/chat", "/api/v1/chat"])
+async def test_chat_strips_server_and_worklink_extra(tmp_path: Path, route: str):
+    _, app, enqueued = _authed_bridge_app(tmp_path)
+    extra = dict.fromkeys(SERVER_OWNED_EXTRA_KEYS | WORKLINK_HINT_EXTRA_KEYS, "forged")
+    extra["keep"] = "me"
+    extra["nested"] = [dict.fromkeys(WORKLINK_HINT_EXTRA_KEYS, "forged")]
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(route, json={"content": "hello", "extra": extra})
+    assert response.status == 200
+    assert len(enqueued) == 1
+    assert enqueued[0].extra == {"keep": "me", "nested": [{}]}
+
+
+@pytest.fixture
+def bridge_app(tmp_path: Path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application()
+    bridge.register_routes(a)
+    return bridge, a, enqueued
+
+
+@pytest.fixture
+def authed_bridge_app(tmp_path: Path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def header_identity(request, handler):
+        if request.headers.get("X-API-Key") != "stream-secret":
+            return web.json_response({"error": "unauthorized"}, status=401)
+        request["auth_identity"] = SimpleNamespace(canonical="foo", display_name="Foo")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[header_identity])
+    bridge.register_routes(a)
+    return bridge, a, enqueued
+
+
+@pytest.mark.asyncio
+async def test_post_chat_enqueues_authenticated_user_message(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post(
+            "/chat",
+            json={"content": "hello", "author": "spoofed"},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body == {"ok": True, "channel_id": "web-alice"}
+    assert len(enqueued) == 1
+    e = enqueued[0]
+    assert e.channel_id == "web-alice"
+    assert e.content == "hello"
+    assert e.author == "alice"
+    assert e.author_display == "Alice"
+    assert e.author_id == "alice"
+    assert e.source == "web"
+
+
+def _cross_platform_resolver(tmp_path: Path) -> IdentityResolver:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            people:
+              - canonical: jason
+                display_name: Jason Renamed
+                aliases: [discord-238367217903730690]
+              - canonical: riley
+                display_name: Jason Carreira
+                aliases: [discord-999]
+            """
+        ),
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    return resolver
+
+
+@pytest.mark.asyncio
+async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path):
+    resolver = _cross_platform_resolver(tmp_path)
+    _, app, enqueued = _authed_bridge_app(
+        tmp_path,
+        canonical="jason",
+        display_name="Jason Carreira",
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/api/v1/chat", json={"content": "web question"})
+    assert response.status == 200
+
+    web_event = enqueued[0]
+    history_path = tmp_path / "chat_history.jsonl"
+    buf = MessageBuffer(history_path=history_path, resolver=resolver)
+    agent = SimpleNamespace(
+        _buffer=buf,
+        _INBOUND_SKIP_TRIGGERS=frozenset(),
+        _kind_for_trigger=Agent._kind_for_trigger,
+    )
+    await Agent._append_inbound_to_buffer(
+        agent,
+        web_event,
+        _initialize_ifc_labels(web_event, resolver=resolver),
+    )
+    await buf.append(
+        buf.make_message(
+            channel_id="web-jason",
+            kind="assistant_message",
+            content="web answer",
+            source="web",
+        )
+    )
+
+    discord_activity = buf.assemble_recent_activity_candidates(
+        channel_id="discord-general",
+        author="discord-238367217903730690",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    )
+    assert [message.content for message in discord_activity] == [
+        "web question",
+        "web answer",
+    ]
+    assert web_event.author == "jason"
+    assert web_event.author_display == "Jason Carreira"
+    assert "Jason Renamed:\n| web question" in render_recent_activity(
+        discord_activity,
+        resolver=resolver,
+    )
+
+    replayed = MessageBuffer(history_path=history_path, resolver=resolver)
+    assert replayed.replay() == 2
+    replayed_activity = replayed.assemble_recent_activity_candidates(
+        channel_id="discord-general",
+        author="discord-238367217903730690",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    )
+    assert [message.content for message in replayed_activity] == [
+        "web question",
+        "web answer",
+    ]
+
+    reverse = MessageBuffer(
+        history_path=tmp_path / "reverse_history.jsonl",
+        resolver=resolver,
+    )
+    await reverse.append(
+        reverse.make_message(
+            channel_id="discord-general",
+            kind="user_message",
+            content="discord question",
+            author="discord-238367217903730690",
+            author_display="jason_discord",
+            source="discord",
+        )
+    )
+    await reverse.append(
+        reverse.make_message(
+            channel_id="discord-general",
+            kind="assistant_message",
+            content="discord answer",
+            source="discord",
+        )
+    )
+    web_activity = reverse.assemble_recent_activity_candidates(
+        channel_id=web_event.channel_id,
+        author=web_event.author,
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    )
+    assert [message.content for message in web_activity] == [
+        "discord question",
+        "discord answer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_display_name_record_is_not_reassigned_on_replay(tmp_path):
+    resolver = _cross_platform_resolver(tmp_path)
+    history_path = tmp_path / "chat_history.jsonl"
+    buf = MessageBuffer(history_path=history_path, resolver=resolver)
+    await buf.append(
+        buf.make_message(
+            channel_id="web-jason",
+            kind="user_message",
+            content="legacy display-keyed message",
+            author="Jason Carreira",
+            author_display="Jason Carreira",
+            source="web",
+        )
+    )
+
+    replayed = MessageBuffer(history_path=history_path, resolver=resolver)
+    assert replayed.replay() == 1
+    assert replayed.cross_author_messages(
+        author="discord-238367217903730690",
+        exclude_channel="discord-general",
+        limit=10,
+        within_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_web_bridge_fetch_history_explicitly_requires_authenticated_route(tmp_path):
+    bridge, _, _ = _authed_bridge_app(tmp_path)
+    with pytest.raises(NotImplementedError, match="authenticated HTTP route"):
+        await bridge.fetch_history("web-alice")
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_enqueues_and_returns_contract_envelope(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={"channel_id": "web-bob", "content": "hello", "msg_id": "client-1"},
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {"channel_id": "web-alice", "source_id": "client-1"}
+    assert enqueued[0].source_id == "client-1"
+    assert enqueued[0].channel_id == "web-alice"
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_slash_passthrough_when_registry_disabled_strips_client_metadata(
+    tmp_path,
+):
+    registry = StubChatSkillRegistry(enabled=False)
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={
+                "content": "  /memory remember this  ",
+                "extra": {
+                    "keep": "ok",
+                    CHAT_SKILL_EXTRA_KEY: {"name": "github"},
+                    "chat_skill": {"name": "legacy"},
+                },
+            },
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert registry.resolve_calls == []
+    assert len(enqueued) == 1
+    assert enqueued[0].content == "/memory remember this"
+    assert enqueued[0].extra == {"keep": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_injects_server_owned_chat_skill_metadata(tmp_path, caplog):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillInvocation(
+            name="memory",
+            command="/memory",
+            args="remember this",
+            raw="  /memory remember this  ",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    caplog.set_level("INFO")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={
+                "content": "  /memory remember this  ",
+                "extra": {
+                    "keep": "ok",
+                    CHAT_SKILL_EXTRA_KEY: {"name": "tampered"},
+                    "chat_skill": {"name": "legacy-tampered"},
+                },
+            },
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert registry.resolve_calls == ["  /memory remember this  "]
+    assert len(enqueued) == 1
+    assert enqueued[0].content == "/memory remember this"
+    assert enqueued[0].extra == {
+        "keep": "ok",
+        CHAT_SKILL_EXTRA_KEY: {
+            "name": "memory",
+            "command": "/memory",
+            "args": "remember this",
+            "raw": "  /memory remember this  ",
+        },
+    }
+    assert "web chat slash command accepted: command=/memory skill=memory" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_strips_forged_http_event_ingress_marker(tmp_path):
+    _, app, enqueued = _authed_bridge_app(tmp_path)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={
+                "content": "hello",
+                "extra": {
+                    HTTP_EVENT_INGRESS_EXTRA_KEY: "http_event",
+                    "keep": "ok",
+                },
+            },
+        )
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert len(enqueued) == 1
+    assert enqueued[0].extra == {"keep": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_post_chat_strips_bridge_authority_and_keeps_durable_acl_private(tmp_path):
+    _, app, enqueued = _authed_bridge_app(
+        tmp_path, canonical="alice", display_name="alice"
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/chat",
+            json={
+                "content": "do not publish this",
+                "extra": {
+                    "channel_visibility": "public",
+                    "bridge_instance": "forged-bridge",
+                    "keep": "ok",
+                },
+            },
+        )
+
+    assert resp.status == 200
+    event = enqueued[0]
+    assert event.extra == {"keep": "ok"}
+    context = create_auth_context(event, enforce=True)
+    assert context.bridge_instance == "web"
+    durable_acl = SessionACL.from_auth_context(
+        context,
+        origin_domain=event.source,
+        visibility=event.extra.get("channel_visibility", "private"),
+    )
+    assert durable_acl.owner_principal == "alice"
+    assert durable_acl.visibility == "private"
+    # Session boundaries and extracted commitments inherit this ACL. An
+    # unrelated user has no owner match, and private visibility grants no read.
+    assert durable_acl.owner_principal != "bob"
+    assert is_user_accessible(durable_acl.visibility) is False
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_rejects_invalid_slash_commands_with_stable_code(tmp_path, caplog):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillError(
+            code="invalid_skill_name",
+            message="Chat skill name must be lowercase letters, digits, and hyphens.",
+            command="/memory!",
+            raw="/memory!",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    caplog.set_level("INFO")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "/memory!"})
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "invalid_slash_command"
+    assert body["error"]["message"] == (
+        "Chat skill name must be lowercase letters, digits, and hyphens."
+    )
+    assert enqueued == []
+    assert "web chat slash command rejected: reason=invalid command=/memory!" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_rejects_unavailable_slash_commands_with_stable_code(tmp_path, caplog):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillError(
+            code="skill_unavailable",
+            message="Chat skill '/github' is not available.",
+            command="/github",
+            raw="/github",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    caplog.set_level("INFO")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "/github"})
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "chat_skill_unavailable"
+    assert body["error"]["message"] == "Chat skill '/github' is not available."
+    assert enqueued == []
+    assert (
+        "web chat slash command rejected: reason=unavailable command=/github allowlist_size=0"
+        in caplog.text
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_chat_legacy_rejects_unavailable_slash_commands_without_enqueue(tmp_path):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        resolved=ChatSkillError(
+            code="skill_unavailable",
+            message="Chat skill '/github' is not available.",
+            command="/github",
+            raw="/github",
+        ),
+    )
+    _, app, enqueued = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/chat", json={"content": "/github"})
+        body = await resp.json()
+
+    assert resp.status == 400
+    assert body == {
+        "error": "chat_skill_unavailable",
+        "detail": "Chat skill '/github' is not available.",
+    }
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_requires_authenticated_identity(bridge_app):
+    _, app, _ = bridge_app
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 401
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "chat_login_required"
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_returns_disabled_surface_when_registry_absent(tmp_path):
+    _, app, _ = _authed_bridge_app(tmp_path)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {"enabled": False, "skills": []}
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_returns_enabled_empty_catalog(tmp_path):
+    registry = StubChatSkillRegistry(enabled=True)
+    _, app, _ = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {"enabled": True, "skills": []}
+
+
+@pytest.mark.asyncio
+async def test_get_chat_skills_returns_allowlisted_catalog(tmp_path):
+    registry = StubChatSkillRegistry(
+        enabled=True,
+        discoverable=(
+            ChatSkillDescriptor(
+                name="github",
+                command="/github",
+                label="GitHub",
+                description="Review pull requests.",
+            ),
+            ChatSkillDescriptor(
+                name="memory",
+                command="/memory",
+                label="Memory",
+                description="Capture durable context.",
+            ),
+        ),
+    )
+    _, app, _ = _authed_bridge_app(tmp_path, registry=registry)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/chat/skills")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"] == {
+        "enabled": True,
+        "skills": [
+            {
+                "id": "github",
+                "command": "/github",
+                "label": "GitHub",
+                "description": "Review pull requests.",
+            },
+            {
+                "id": "memory",
+                "command": "/memory",
+                "label": "Memory",
+                "description": "Capture durable context.",
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_chat_rejects_anonymous_dev_open_request(bridge_app):
+    _, a, enqueued = bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/chat", json={"content": "x"})
+        body = await resp.json()
+    assert resp.status == 401
+    assert body["error"] == "chat_login_required"
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_rejects_anonymous_dev_open_request(bridge_app):
+    _, a, enqueued = bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "x"})
+        body = await resp.json()
+    assert resp.status == 401
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "chat_login_required"
+    assert enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_post_chat_rejects_empty_content(tmp_path):
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/chat", json={"content": "   "})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_post_chat_v1_errors_use_stable_envelope(bridge_app):
+    _, a, _ = bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "   "})
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "bad_request"
+
+
+@pytest.mark.asyncio
+async def test_post_chat_rejects_bad_json(bridge_app):
+    _, a, _ = bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/chat", data="not json")
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_send_fans_out_to_authenticated_subscribers(authed_bridge_app):
+    """An SSE subscriber receives its own-channel JSON event when the bridge sends."""
+    bridge, a, _ = authed_bridge_app
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/chat/stream", headers={"X-API-Key": "stream-secret"})
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+        assert resp.headers["X-Accel-Buffering"] == "no"
+
+        await wait_until(lambda: len(bridge._subscribers) == 1)
+        await bridge.send("web-other", "not for this user")
+        result = await bridge.send("web-foo", "hello there")
+        assert result.sent is True
+
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        while chunk and not chunk.startswith(b"data:"):
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        assert chunk.startswith(b"data: ")
+        payload = json.loads(chunk[len(b"data: "):].strip())
+        validate_live_event(payload)
+        assert payload["kind"] == "chat.message"
+        assert payload["channel_id"] == "web-foo"
+        assert payload["text"] == "hello there"
+        assert payload["message_id"] == result.message_id
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_anonymous_dev_open_request(bridge_app):
+    _, a, _ = bridge_app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/chat/stream")
+        body = await resp.json()
+    assert resp.status == 401
+    assert body["error"] == "chat_login_required"
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_rejects_when_subscriber_cap_reached(authed_bridge_app):
+    bridge, a, _ = authed_bridge_app
+    bridge.max_subscribers = 1
+
+    async with TestClient(TestServer(a)) as client:
+        resp1 = await client.get("/chat/stream", headers={"X-API-Key": "stream-secret"})
+        assert resp1.status == 200
+        await wait_until(lambda: len(bridge._subscribers) == 1)
+        assert len(bridge._subscribers) == 1
+
+        resp2 = await client.get("/chat/stream", headers={"X-API-Key": "stream-secret"})
+        assert resp2.status == 429
+        assert await resp2.text() == "too many chat streams"
+        assert len(bridge._subscribers) == 1
+
+
+def test_empty_subscriber_cap_does_not_crash_web_chat_import() -> None:
+    child_env = os.environ.copy()
+    child_env["MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS"] = ""
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import mimir.bridges.web_chat"],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_stream_auth_uses_header_not_query_param(authed_bridge_app):
+    bridge, a, _ = authed_bridge_app
+    async with TestClient(TestServer(a)) as client:
+        query_resp = await client.get("/chat/stream?api_key=stream-secret")
+        assert query_resp.status == 401
+
+        resp = await client.get(
+            "/chat/stream",
+            headers={"X-API-Key": "stream-secret"},
+        )
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+
+        await wait_until(lambda: len(bridge._subscribers) == 1)
+        await bridge.send("web-foo", "header authed")
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        while chunk and not chunk.startswith(b"data:"):
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        payload = json.loads(chunk[len(b"data: "):].strip())
+        assert payload["text"] == "header authed"
+
+
+@pytest.mark.asyncio
+async def test_send_with_no_subscribers_succeeds(bridge_app):
+    """No SSE clients connected — send still succeeds (drops on the floor)."""
+    bridge, _, _ = bridge_app
+    result = await bridge.send("web-x", "hi")
+    assert result.sent is True
+    assert result.message_id is not None
+
+
+@pytest.mark.asyncio
+async def test_react_emits_event(tmp_path):
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="x", display_name="X")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/chat/stream")
+        await wait_until(lambda: len(bridge._subscribers) == 1)
+        ok = await bridge.react("web-x", "msg-1", "👍")
+        assert ok is True
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        while chunk and not chunk.startswith(b"data:"):
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        payload = json.loads(chunk[len(b"data: "):].strip())
+        validate_live_event(payload)
+        assert payload["kind"] == "chat.reaction"
+        assert payload["_event"] == "react"
+        assert payload["emoji"] == "👍"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_drains_subscribers(tmp_path: Path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(e: AgentEvent) -> bool:
+        enqueued.append(e)
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    # Subscribe by hand to test the close path without an HTTP client.
+    q: asyncio.Queue = asyncio.Queue(maxsize=4)
+    bridge._subscribers.append(_Subscriber(q))
+    await bridge.disconnect()
+    assert q.get_nowait() is None  # sentinel pushed
+
+
+@pytest.mark.asyncio
+async def test_chat_history_returns_authenticated_user_conversation(tmp_path):
+    """GET /api/v1/chat/history restores the authenticated user's conversation."""
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id="web-alice", kind="user_message", content="hello", author="alice"))
+    await buf.append(buf.make_message(channel_id="web-alice", kind="assistant_message", content="hi alice", author="mimir"))
+    await buf.append(buf.make_message(channel_id="web-other", kind="user_message", content="elsewhere", author="bob"))
+    await buf.append(buf.make_message(channel_id="web-alice", kind="system_note", content="note", author=None))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history?channel_id=web-other")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["channel_id"] == "web-alice"
+    msgs = body["data"]["messages"]
+    assert [m["text"] for m in msgs] == ["hello", "hi alice"]
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert all(m["channel_id"] == "web-alice" for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_chat_history_empty_without_buffer(tmp_path):
+    """No global buffer registered (test paths) → empty history, not a 500."""
+    import mimir.history as history_mod
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    prev = history_mod.get_global_buffer()
+    history_mod._global_buffer = None
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 200
+    assert body["data"] == {"channel_id": "web-alice", "messages": []}
+
+
+def test_web_channel_for_uses_canonical_verbatim():
+    """The canonical is the unique per-user key, so the channel uses it verbatim —
+    a lossy slug could collapse distinct ids onto one channel and leak history."""
+    from mimir.bridges.web_chat import DEFAULT_CHANNEL, _web_channel_for
+
+    assert _web_channel_for("alice") == "web-alice"
+    # distinct canonicals a slug would collapse must stay DISTINCT channels
+    assert _web_channel_for("a.b") != _web_channel_for("a_b")
+    assert _web_channel_for("Alice") != _web_channel_for("alice")
+    # Empty canonicals still map to the historical constant at the pure helper
+    # layer, but no chat route can reach this without an authenticated identity.
+    assert _web_channel_for("") == DEFAULT_CHANNEL
+    # reserved shared default channel must not be reachable by a real identity
+    assert _web_channel_for("default") != DEFAULT_CHANNEL
+
+
+@pytest.mark.asyncio
+async def test_authenticated_default_channel_routes_per_user(tmp_path):
+    """An authenticated user's post routes to web-<canonical>;
+    client-supplied channel ids are ignored."""
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+    async with TestClient(TestServer(a)) as client:
+        r1 = await client.post("/api/v1/chat", json={"content": "hi"})
+        b1 = await r1.json()
+        r2 = await client.post("/api/v1/chat", json={"content": "yo", "channel_id": "web-bob"})
+        b2 = await r2.json()
+
+    assert b1["data"]["channel_id"] == "web-alice"
+    assert enqueued[0].channel_id == "web-alice" and enqueued[0].author == "alice"
+    assert b2["data"]["channel_id"] == "web-alice"
+    assert enqueued[1].channel_id == "web-alice"
+
+
+@pytest.mark.asyncio
+async def test_history_authenticated_resolves_to_per_user_channel(tmp_path):
+    """GET /api/v1/chat/history with no channel resolves to the authed user's
+    channel and returns only their conversation, not another user's."""
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id="web-alice", kind="user_message", content="alice question", author="Alice"))
+    await buf.append(buf.make_message(channel_id="web-alice", kind="assistant_message", content="alice answer", author="mimir"))
+    await buf.append(buf.make_message(channel_id="web-bob", kind="user_message", content="bob question", author="Bob"))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history")  # no channel_id
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert body["data"]["channel_id"] == "web-alice"
+    assert [m["text"] for m in body["data"]["messages"]] == ["alice question", "alice answer"]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_default_canonical_does_not_share_web_default(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical="default",
+            display_name="Default User",
+        )
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "hi"})
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["channel_id"] != DEFAULT_CHANNEL
+    assert body["data"]["channel_id"].startswith("web-user:")
+    assert enqueued[0].channel_id == body["data"]["channel_id"]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_user_channel_body_is_ignored(tmp_path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.post("/api/v1/chat", json={"content": "yo", "channel_id": "web-bob"})
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["channel_id"] == "web-alice"
+    assert enqueued[0].channel_id == "web-alice"
+
+
+@pytest.mark.asyncio
+async def test_default_canonical_history_does_not_read_shared_web_default(tmp_path):
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical="default",
+            display_name="Default User",
+        )
+        return await handler(request)
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id=DEFAULT_CHANNEL, kind="user_message", content="shared", author="curl"))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get(f"/api/v1/chat/history?channel_id={DEFAULT_CHANNEL}")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 200
+    assert body["data"]["channel_id"] != DEFAULT_CHANNEL
+    assert body["data"]["messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_authenticated_history_ignores_other_web_channel_query(tmp_path):
+    import mimir.history as history_mod
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    (tmp_path / "hist").mkdir()
+    buf = MessageBuffer(history_path=tmp_path / "hist" / "chat_history.jsonl")
+    await buf.append(buf.make_message(channel_id="web-bob", kind="user_message", content="bob question", author="Bob"))
+
+    prev = history_mod.get_global_buffer()
+    set_global_buffer(buf)
+    try:
+        async with TestClient(TestServer(a)) as client:
+            resp = await client.get("/api/v1/chat/history?channel_id=web-bob")
+            body = await resp.json()
+    finally:
+        history_mod._global_buffer = prev
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["channel_id"] == "web-alice"
+    assert body["data"]["messages"] == []
+
+
+@pytest.mark.asyncio
+async def test_authenticated_stream_only_receives_own_web_channel(tmp_path):
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        return True
+
+    @web.middleware
+    async def inject_identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    bridge = WebChatBridge(enqueue=fake_enqueue, home=tmp_path)
+    a = web.Application(middlewares=[inject_identity])
+    bridge.register_routes(a)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/chat/stream")
+        assert resp.status == 200
+        await asyncio.sleep(0.05)
+
+        await bridge.send("web-bob", "bob secret")
+        await bridge.send("web-alice", "alice visible")
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        while chunk and not chunk.startswith(b"data:"):
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
+        payload = json.loads(chunk[len(b"data: "):].strip())
+
+    assert payload["channel_id"] == "web-alice"
+    assert payload["text"] == "alice visible"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/chat", "/api/v1/chat"])
+async def test_forged_deliver_cannot_send_agent_failure_to_private_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
+):
+    import mimir.event_logger as event_logger
+    from mimir.config import Config
+    from mimir.identities_populator import issue_web_key
+    from mimir.index import IndexGenerator
+    from mimir.server import _make_auth_middleware
+    from mimir.turn_logger import TurnLogger
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "false")
+    monkeypatch.setattr(
+        event_logger, "_logger",
+        event_logger.EventLogger(tmp_path / "logs" / "events.jsonl", "test"),
+    )
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    _, app, enqueued = _authed_bridge_app(tmp_path)
+    app.middlewares[:] = [_make_auth_middleware("master-secret")]
+    app["identity_resolver"] = resolver
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            route,
+            headers={"X-API-Key": user_key},
+            json={
+                "content": "hello",
+                "extra": {
+                    "deliver": "slack-C0PRIVATE",
+                    "schedule_name": "forged-job",
+                },
+            },
+        )
+        assert response.status == 200
+
+    assert len(enqueued) == 1
+    assert enqueued[0].author == "alice"
+
+    class FailingGraph:
+        async def astream(self, *args, **kwargs):
+            raise RuntimeError("forged deliver regression failure")
+            yield  # pragma: no cover
+
+    class RecordingChannels:
+        def __init__(self):
+            self.finds = []
+            self.sends = []
+
+        def find(self, channel_id):
+            self.finds.append(channel_id)
+            return None
+
+        async def send(self, channel_id, text, **kwargs):
+            self.sends.append((channel_id, text))
+            return SimpleNamespace(sent=True, message_id="recorded")
+
+    channels = RecordingChannels()
+    agent = Agent(
+        config=Config.from_env(),
+        turn_logger=TurnLogger(tmp_path / "logs" / "turns.jsonl"),
+        message_buffer=MessageBuffer(
+            history_path=tmp_path / "messages.jsonl", resolver=resolver,
+        ),
+        index_generator=IndexGenerator(tmp_path),
+        channel_registry=channels,
+        turn_hooks=[],
+    )
+    agent._agent = FailingGraph()
+
+    record = await agent.run_turn(enqueued[0])
+
+    assert record.error == "RuntimeError: forged deliver regression failure"
+    assert "web-alice" in channels.finds
+    assert not any(channel == "slack-C0PRIVATE" for channel, _ in channels.sends)

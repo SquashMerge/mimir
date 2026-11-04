@@ -1,0 +1,4045 @@
+"""Pollers framework — subprocess-shaped external-state watchers.
+
+chainlink #3. Pollers live alongside skills under
+``<home>/skills/<name>/`` with a ``pollers.json`` manifest that
+declares one or more poller scripts. The scheduler discovers them at
+startup (and on the ``mcp__mimir__reload_pollers`` MCP tool call), runs
+each on its declared cron, and parses the script's stdout as JSONL.
+Each emitted line becomes an ``AgentEvent`` that wakes mimir on a
+known channel, exactly like an inbound bridge message.
+
+Why a separate framework from ``register_callable``: in-process
+callables are mimir-internal maintenance (saga consolidation, OAuth
+quota poll, etc.) — they mutate in-memory state and run regardless
+of whether anything changed. Pollers are user-facing watch jobs
+that emit events when external state changes; they're isolated as
+subprocesses (any language, no mimir import path coupling) and
+silence-on-no-change is the filter. New pollers ship as a skill
+directory drop, no mimir release required.
+
+Ported from open-strix's ``open_strix.scheduler._discover_pollers`` /
+``_on_poller_fire`` (2026-04 vintage).
+
+Output contract (matches open-strix):
+- **stdout**: JSONL, one record per actionable event OR algedonic
+  signal. Two record shapes share the channel:
+
+  *Event records* — ``{"poller": str, "prompt": str, ...extras}``.
+  Each becomes one ``AgentEvent``. Other keys flow through to the
+  event's ``extra``.
+
+  *Signal records* — ``{"poller": str, "signal": "<event_type>",
+  ...extras}``. These DO NOT spawn an AgentEvent; instead the
+  framework writes them to ``events.jsonl`` via ``log_event``, where
+  ``feedback._EVENT_RULES`` classifies recognized signal types into
+  the algedonic block of the next turn's prompt. Used for
+  external-state health signals (auth-token expiry, upstream
+  service outages, rate-limit hits) that the agent should see but
+  that shouldn't each fire a turn of their own.
+
+  Recognized signal event types (algedonic-classified — see
+  ``mimir/feedback.py``):
+    ``poller_oauth_expired``       — OAuth token expired/revoked
+    ``poller_auth_failed``         — Non-OAuth auth failure
+    ``poller_service_outage``      — Upstream service unreachable (5xx, DNS, refused)
+    ``poller_rate_limited``        — Upstream rate-limit hit
+    ``poller_signal``              — Generic / unclassified poller signal
+
+  A record with neither ``prompt`` nor ``signal`` is silently
+  dropped. A record with BOTH is treated as a signal-only record
+  (the ``prompt`` is ignored; emit a separate record per shape).
+
+- **stderr**: free-form diagnostic output. Captured and emitted as
+  a ``poller_stderr`` event for observability; not forwarded to the
+  agent.
+- **exit 0**: success (zero events is fine — silence means nothing
+  to report). **Non-zero**: error, surfaces as ``poller_nonzero_exit``.
+
+Subprocess gets these env vars injected automatically:
+- ``STATE_DIR`` — the poller's persistent state directory.
+- ``POLLER_NAME`` — the poller's name from pollers.json.
+- ``MIMIR_HOME`` — the authoritative agent home path from ``Config.home``.
+- A scrubbed subset of the host process environment, explicit ``pass_env``
+  passthrough keys, plus literal ``env`` overrides from the poller's
+  pollers.json entry.
+
+The subprocess timeout is hard-capped at ``POLLER_TIMEOUT_SECONDS`` (120s), and
+clamped further per poller so it always stays below that poller's own fire
+interval. The effective value is exported to the child as
+``POLLER_TIMEOUT_SECONDS`` so a poller can bound its own work against the cap it
+will actually be killed at. Longer-running pollers should still run faster or
+restructure as ``async-tasks``-style background jobs that emit on completion —
+overrunning discards all buffered events, leaving an unsaved cursor to retry.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import dataclasses
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import re
+import signal
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from .background_io import run_in_pool
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from .plugins.registry import PolicyRegistry
+
+from .plugins.core import scoped_policy_call
+from .billing import Priority, normalize_priority
+from .config import trusted_github_bot_logins
+from .access_control import (
+    BOUNDED_PROFILE_CAPABILITIES,
+    CapabilityTier,
+    ServicePrincipal,
+    SinkCategory,
+    TRIGGER_AUTHORITY_PROFILES,
+    TRIGGER_CAPABILITY_TIERS,
+    agent_writable_roots,
+    build_trigger_service_principal,
+    normalize_sink_destination,
+    parse_declared_shell_commands,
+)
+from .event_logger import log_event, log_event_sync, get_events_path, get_logger
+from .models import AgentEvent, InformationFlowLabels, SourceLabel
+from .otel_credentials import filter_otlp_env, is_sensitive_otlp_env
+from .redaction import redact_text
+from . import poller_recovery
+from .poller_hooks import (
+    ItemAttestation,
+    PollerHooks,
+    github_recovery_relevance_check as _github_recovery_relevance_check,
+    reserved_hook_profile_for_name,
+    reserved_skill_for_name,
+    resolve_poller_hooks,
+)
+from .poller_tracker import (
+    LIFECYCLE_EVENTS,
+    NOTICE_REASONS,
+    TRACKER_EXTRA_KEYS,
+    TRACKER_KINDS,
+    TRACKER_SIGNALS,
+    TRACKER_STDERR_CODE_RE,
+    WITHHELD_REASONS,
+    safe_actor,
+    safe_adapter,
+    safe_delivery_key,
+    safe_event_id,
+    safe_ref,
+    safe_url,
+    transition_line,
+    withheld_lines,
+)
+from .poller_budget import (
+    PollerBudgetConfig,
+    parse_poller_budget_config,
+    validate_poller_usage_signal,
+)
+from .poller_write_paths import refused_poller_write_paths
+
+log = logging.getLogger(__name__)
+
+_ATTESTATION_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poller-attest")
+
+
+def _safe_signal_login(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", value, re.ASCII,
+    ):
+        return value
+    return "<invalid-login>"
+
+
+def _safe_signal_url(value: object, repo: object) -> str | None:
+    if not isinstance(value, str) or not isinstance(repo, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo, re.ASCII,
+    ):
+        return None
+    pattern = rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/[0-9]+(?:\#[A-Za-z0-9_-]{{1,64}})?"
+    return value if re.fullmatch(pattern, value, re.ASCII) else None
+
+
+# Wall-clock ceiling for one poller subprocess. Overrunning it is not a partial
+# result: the timeout path discards the stdout already collected (see the
+# ``asyncio.TimeoutError`` handler in ``run_poller``). No buffered AgentEvents
+# are delivered: a child that saves its cursor at completion can retry safely.
+# Signals already acknowledged through a durable delivery barrier are retained.
+#
+# Raised 60 -> 120 (chainlink #1433). Safe against fire-stacking because the
+# shortest configured cadence is ``*/10`` (600s) and jobs register with
+# ``max_instances=1``; the APScheduler misfire grace is an independent 5s and was
+# deliberately decoupled from this value (see the PR #107 note in scheduler.py).
+# Keep this comfortably below the shortest poller cadence — a cap longer than the
+# interval means a slow run silently swallows the next fire. Enforced by
+# ``test_poller_timeout_stays_below_every_shipped_cadence``.
+#
+# ``run_poller`` exports the effective value as POLLER_TIMEOUT_SECONDS in the
+# subprocess env so a poller can size its own internal deadlines against the real
+# cap instead of hardcoding a copy that drifts.
+POLLER_TIMEOUT_SECONDS = 120
+
+# Bounded attestation retries per (repo, author) within one poller fire.
+# 2 = the initial attempt plus one retry: enough for chainlink #1441's
+# "a later event re-resolves", bounded so a same-author batch cannot turn an
+# unresolved attestation into O(items) network calls in an unbounded loop.
+GITHUB_TRUST_ATTEMPTS_PER_FIRE = 2
+TRACKER_ATTESTATIONS_PER_FIRE = 10
+TRACKER_ATTESTATION_SECONDS_PER_FIRE = 60.0
+# Shared phase-3 network budget, including actor lookup and both trust endpoints.
+# 6 x 10s = 60s nominal attestation wait, chosen to avoid multi-minute slot
+# starvation. This is not a hard wall-clock deadline: urlopen's timeout bounds
+# socket operations, not the whole response, and phase 3 also logs/enqueues.
+GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL = 6
+# Cap stderr text recorded in events.jsonl so a chatty poller doesn't
+# blow the algedonic stream's storage budget.
+POLLER_STDERR_LOG_CHARS = 2000
+# Cap the per-line stdout payload kept in events.jsonl on parse error
+# (bad JSON line). Truncated for the same reason.
+POLLER_INVALID_LINE_CHARS = 500
+# Cap the prompt text on each emitted poller event (~5x typical
+# Discord message). Pollers that need to send larger payloads should
+# stash to a file and emit a path reference instead — matches the
+# ``<send-file>`` directive shape. A buggy poller that emits a 10 MB
+# JSON line would otherwise blow the prompt-build cache and burn
+# budget on the next turn (Mimir's PR #88 review nit 4).
+POLLER_PROMPT_CHARS = 16_000
+_TRUNCATION_MARKER = "\n[…truncated by poller framework…]\n"
+_ITEM_TAIL_CHARS = 600
+# Hard byte ceilings on a poller subprocess's stdout/stderr (chainlink
+# #258). The POLLER_PROMPT_CHARS cap above only applies AFTER the bytes
+# are read — ``communicate()`` buffers the ENTIRE stream first, so a
+# runaway poller writing gigabytes in its timeout window would OOM mimir
+# before any char cap engaged. We instead drain incrementally and kill
+# the process once cumulative output crosses these ceilings. 8 MB is far
+# above any legitimate poller (the prompt cap is 16 KB) while bounding
+# worst-case memory; stderr is diagnostic, so a tighter 1 MB.
+MAX_POLLER_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_POLLER_STDERR_BYTES = 1 * 1024 * 1024
+# Truncated preview of the rejected prompt kept in
+# ``poller_event_rejected`` events for back-pressure debugging.
+POLLER_REJECTION_PREVIEW_CHARS = 200
+# Default ``batch_size`` when a pollers.json entry doesn't specify
+# one. ``1`` preserves the per-event-per-turn shape that matches
+# open-strix's framework — every emitted JSONL line becomes one
+# AgentEvent, the agent runs once per item. Pollers that produce
+# bursty events (github-poller during PR-review activity, RSS during
+# heavy publish hours) opt into ``batch_size > 1`` to coalesce items
+# into fewer turns.
+POLLER_BATCH_SIZE_DEFAULT = 1
+_POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system", "tracker"})
+_GITHUB_ACTOR_EVENT_TYPES = {
+    "issue_opened": "issue author",
+    "pr_opened": "pull request author",
+    "issue_comment": "comment author",
+    "pr_review_comment": "review comment author",
+    "pr_review": "reviewer",
+    "pr_synchronize": "server-linked head commit author or committer",
+    "pr_review_requested": "review requester",
+    "pr_checks_completed": "pull request author",
+}
+_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = {
+    "pr_changes_requested_stale": "derived from live review and pull request state",
+    "pr_ci_failure": "derived from checks on the agent's live pull request head",
+    "pr_mergeability_rebase": "derived from live pull request mergeability",
+    "pr_mergeability_conflicting": "derived from live pull request mergeability",
+}
+_GITHUB_ACTIVITY_EVENT_TYPES = frozenset(
+    _GITHUB_ACTOR_EVENT_TYPES | _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
+)
+_GITHUB_PR_EVENT_TYPES = frozenset(
+    event_type
+    for event_type in _GITHUB_ACTIVITY_EVENT_TYPES
+    if event_type not in {"issue_opened", "issue_comment"}
+)
+_DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
+
+
+def _prune_delivery_receipts(poller: PollerConfig, home: Path | None = None) -> None:
+    """Run a poller's declared receipt-liveness sweep, if any."""
+    hook = poller.hooks.receipt_liveness if poller.hooks is not None else None
+    if hook is None:
+        return
+    try:
+        persist_fd = os.open(
+            poller.resolved_persist_dir(),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            receipts_fd = os.open(
+                _DELIVERY_RECEIPTS_DIR,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=persist_fd,
+            )
+        finally:
+            os.close(persist_fd)
+        try:
+            with os.scandir(receipts_fd) as entries:
+                candidates = {
+                    entry.name for entry in entries
+                    if re.fullmatch(r"[0-9a-f]{64}", entry.name)
+                    and entry.is_file(follow_symlinks=False)
+                }
+
+            def prune_stale(live: object) -> None:
+                if not isinstance(live, (set, frozenset)) or not all(
+                    isinstance(name, str) and re.fullmatch(r"[0-9a-f]{64}", name)
+                    for name in live
+                ):
+                    raise ValueError("receipt liveness hook returned invalid digests")
+                for name in candidates - set(live):
+                    os.unlink(name, dir_fd=receipts_fd)
+                os.fsync(receipts_fd)
+
+            hook(poller.resolved_persist_dir(), home, prune_stale)
+        finally:
+            os.close(receipts_fd)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RuntimeError) as exc:
+        log.warning("Poller %r receipt pruning skipped or incomplete: %s", poller.name, exc)
+
+
+def _write_delivery_receipt(persist_dir: Path, delivery_key: object) -> None:
+    """Durably acknowledge one poller item only after framework handoff."""
+    if not isinstance(delivery_key, str) or not delivery_key or len(delivery_key) > 512:
+        return
+    directory = persist_dir / _DELIVERY_RECEIPTS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(delivery_key.encode()).hexdigest()
+    fd = os.open(directory / digest, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+# Circuit-breaker: after this many consecutive failures the poller is
+# suspended for ``POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS``. "Failure"
+# means a non-zero exit, timeout, or subprocess launch error — clean
+# exits (even with no events emitted) reset the count.
+POLLER_CIRCUIT_BREAKER_THRESHOLD = 3
+# How long (seconds) to hold the circuit open after tripping.  5 min
+# is long enough to avoid a storm-of-bad-runs while short enough not
+# to leave a flaky poller dark for too long.
+POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
+# Grace window (seconds) for the subprocess to exit after both pipe
+# drains hit EOF (chainlink #410). EOF only proves the child CLOSED
+# its stdout/stderr fds — not that it exited. A poller that closes
+# both fds and keeps running (daemonizing helper, post-cleanup hang)
+# would otherwise pin a bare ``proc.wait()`` — and the caller's
+# concurrency-semaphore slot — forever. Capped by the poller's own
+# timeout for the normal EOF path. Also bounds post-kill drains/reaping:
+# five seconds allows buffered output to drain without letting escaped
+# descendants holding pipe writers pin a scheduler slot indefinitely.
+POLLER_EXIT_GRACE_SECONDS = 5.0
+
+#: Channel-id prefix for synthetic poller-tick channels. Each registered
+#: poller emits events on ``poller:<name>``. Exported so other modules
+#: (recent-activity assembly, scheduler-tick routing) can recognize the
+#: prefix without duplicating the literal. Sibling of
+#: :data:`mimir.scheduler.SCHEDULER_CHANNEL_PREFIX`.
+POLLER_CHANNEL_PREFIX = "poller:"
+
+
+_BUILTIN_POLLER_ENV_ALLOWLIST = frozenset({
+    # Shell + locale
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TZ",
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+    "LC_COLLATE", "LC_NUMERIC", "LC_TIME",
+    # XDG basedirs (gh + other CLIs respect XDG_CONFIG_HOME)
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR", "XDG_STATE_HOME",
+    # Temp-dir overrides for noexec-/tmp setups
+    "TMPDIR", "TMP", "TEMP",
+    # CA bundles for custom-cert containers
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # Python
+    "PYTHONUNBUFFERED",
+    # Terminal
+    "TERM", "COLUMNS", "LINES",
+})
+_DENY_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+_DENY_ENV_PREFIXES = ("MIMIR_",)
+# chainlink #229: hard-deny on process-control / loader env vars that can
+# hijack the subprocess. Unlike suffix/prefix names (which can pass via
+# ``pass_env`` with an audit event), these never pass through.
+_PROCESS_CONTROL_ENV_DENY = frozenset({
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FORCE_FLAT_NAMESPACE",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+})
+_POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
+
+_NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
+    "MIMIR_GITHUB_SELF_LOGIN",
+    "MIMIR_HOME",
+    "MIMIR_SOURCE_DIR",
+    "GITHUB_REPOS",
+    "MIMIR_GITHUB_REPOS",
+    "MIMIR_PLUGINS",
+    "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL",
+    "MIMIR_GITHUB_REVIEW_SKILL_PATH",
+    "JIRA_SITE",
+})
+"""Forwarded configuration values that poller payload redaction must preserve.
+
+The GitHub login is identity used by authorization and review reconciliation;
+the two home/source values are filesystem locations; the repository values are
+public repository selectors; plugin selection; the Jira site host is a public
+tenant selector; and the remaining values are feature flags or a review-skill path. None is a credential. This is deliberately closed: every
+other value forwarded through ``pass_env`` or manifest ``env`` remains redacted.
+"""
+
+
+def _validate_non_secret_forwarded_env_keys() -> None:
+    """Fail startup if the payload-redaction exemption becomes credential-like."""
+    invalid = {
+        key for key in _NON_SECRET_FORWARDED_ENV_KEYS
+        if key in _PROCESS_CONTROL_ENV_DENY
+        or any(key.endswith(suffix) for suffix in _DENY_ENV_SUFFIXES)
+    }
+    if invalid:
+        raise RuntimeError(
+            "poller non-secret redaction exemptions match environment deny patterns: "
+            + ", ".join(sorted(invalid))
+        )
+
+
+_validate_non_secret_forwarded_env_keys()
+
+# Runner-process lifetime, including manifest reloads; retain names, never values.
+_poller_named_secrets_seen: set[tuple[str, str]] = set()
+
+
+async def _log_poller_named_secret_once(*, poller: str, key: str) -> None:
+    identity = (poller, key)
+    if identity in _poller_named_secrets_seen:
+        return
+    # Claim before awaiting so overlapping fires cannot duplicate the audit.
+    _poller_named_secrets_seen.add(identity)
+    # The legacy "key" field is redacted by EventLogger; env_name is audit metadata.
+    await log_event(
+        "poller_env_passthrough_named_secret", poller=poller, key=key, env_name=key,
+    )
+
+
+def _extra_poller_env_allowlist() -> set[str]:
+    return {
+        k.strip()
+        for k in os.environ.get("MIMIR_POLLER_ENV_ALLOWLIST", "").split(",")
+        if k.strip()
+    }
+
+
+def _allowed_poller_env_key(k: str, *, allowed: set[str] | frozenset[str] | None = None) -> bool:
+    if allowed is None:
+        allowed = _BUILTIN_POLLER_ENV_ALLOWLIST | _extra_poller_env_allowlist()
+    if k not in allowed:
+        return False
+    if is_sensitive_otlp_env(k, os.environ.get(k)):
+        return False
+    if any(k.endswith(s) for s in _DENY_ENV_SUFFIXES):
+        return False
+    if any(k.startswith(p) for p in _DENY_ENV_PREFIXES):
+        return False
+    return True
+
+
+def _poller_env_available_at_discovery(
+    *,
+    env_raw: dict[str, object],
+    pass_env: list[str],
+    injected_keys: set[str] | frozenset[str] = _POLLER_INJECTED_ENV_KEYS,
+) -> set[str]:
+    """Return env keys that will exist in the assembled subprocess env.
+
+    Mirrors ``run_poller`` without values or async logging: scrubbed host env,
+    explicit ``pass_env`` passthrough except process-control hard-denies, literal
+    manifest ``env`` overrides, and framework-injected names. Discovery uses this
+    to decide whether ``env_required`` pollers are schedulable.
+    """
+    allowed = _BUILTIN_POLLER_ENV_ALLOWLIST | _extra_poller_env_allowlist()
+    available = {
+        k for k in os.environ
+        if _allowed_poller_env_key(k, allowed=allowed)
+    }
+    available.update(
+        k for k in pass_env
+        if k not in _PROCESS_CONTROL_ENV_DENY and k in os.environ
+        and not is_sensitive_otlp_env(k, os.environ[k])
+    )
+    # Manifest ``env`` keys are also process-control-filtered at runtime
+    # (chainlink #421) — mirror that here so an ``env_required`` name
+    # that the runtime would strip doesn't count as available.
+    available.update(
+        str(k) for k, value in env_raw.items()
+        if str(k) not in _PROCESS_CONTROL_ENV_DENY
+        and not is_sensitive_otlp_env(str(k), value)
+    )
+    # Literal overrides win over host values, including when an override makes
+    # a previously safe endpoint unsafe.
+    available.difference_update(
+        str(k) for k, value in env_raw.items()
+        if is_sensitive_otlp_env(str(k), value)
+    )
+    available.update(injected_keys)
+    return available
+
+
+def _redact_poller_env_values(
+    text: str,
+    env: dict[str, str],
+    redact_keys: set[str] | frozenset[str],
+) -> str:
+    """Redact exact explicitly-forwarded subprocess env values from diagnostics.
+
+    Token-shaped redaction is global in ``event_logger``, but pollers can receive
+    secrets with no recognizable shape (bare DB passwords, shared HMACs, DSNs,
+    etc.) through explicit ``pass_env`` passthrough or manifest ``env`` entries.
+    Poller stdout/stderr is the place those values are most likely to be echoed.
+    Redact exact values for those explicit keys before line/length truncation so
+    a long leaked value cannot leave its prefix behind in durable events.
+
+    This intentionally does *not* infer secrecy from env-key deny suffixes: the
+    subprocess still receives the assembled env unchanged, while diagnostics only
+    mask values that came from per-poller explicit forwarding surfaces.
+    """
+    if not text:
+        return text
+    out = redact_text(text)
+    secret_values = {
+        env[key]
+        for key in redact_keys
+        if key in env
+    }
+    # Longest first prevents a short value from partially masking inside a
+    # longer one and leaving the suffix visible. Skip tiny values to avoid
+    # shredding ordinary diagnostics like PATH separators or boolean flags.
+    for value in sorted(secret_values, key=len, reverse=True):
+        if len(value) < 6:
+            continue
+        out = out.replace(value, "[REDACTED]")
+    return out
+
+
+def _redact_poller_payload(
+    value: Any, env: dict[str, str], redact_keys: set[str] | frozenset[str],
+) -> Any:
+    """Copy JSON metadata, masking explicitly forwarded values at every depth."""
+    if isinstance(value, str):
+        return _redact_poller_env_values(value, env, redact_keys)
+    if isinstance(value, dict):
+        return {
+            (_redact_poller_env_values(key, env, redact_keys)
+             if isinstance(key, str) else key): _redact_poller_payload(item, env, redact_keys)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_poller_payload(item, env, redact_keys) for item in value]
+    return value
+
+
+@dataclasses.dataclass
+class _GithubFireAttestation:
+    attempts: int = 0
+    framework_cache: dict[tuple[str, int], tuple[int, Any] | None] = dataclasses.field(
+        default_factory=dict,
+    )
+
+
+_github_fire_attestation: contextvars.ContextVar[_GithubFireAttestation | None] = (
+    contextvars.ContextVar("github_fire_attestation", default=None)
+)
+_github_attestation_failure: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("github_attestation_failure", default=None)
+)
+_github_author_trust_cause: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("github_author_trust_cause", default=None)
+)
+_github_author_diagnostic_sink: contextvars.ContextVar[Any] = (
+    contextvars.ContextVar("github_author_diagnostic_sink", default=None)
+)
+GITHUB_AUTHOR_FAILURE_CLASSES = frozenset({
+    "budget", "timeout", "transport", "malformed_payload", "unexpected_status",
+})
+GITHUB_AUTHOR_UNAVAILABLE_CAUSES = frozenset({
+    "budget_exhausted", "deadline_exceeded", "author_unresolved",
+    "verdict_missing", "no_turn_verdict", "non_collaborator",
+}) | frozenset(
+    f"{request}_{failure}" for request in ("collaborator", "membership")
+    for failure in GITHUB_AUTHOR_FAILURE_CLASSES
+)
+
+
+def bounded_github_author_cause(cause: object) -> str:
+    """Never serialize free-form GitHub failures as durable refusal causes."""
+    return (cause if isinstance(cause, str) and cause in GITHUB_AUTHOR_UNAVAILABLE_CAUSES
+            else "author_unresolved")
+
+
+def github_author_trust_cause() -> str | None:
+    """Bounded cause of the last unavailable author verdict in this context."""
+    return _github_author_trust_cause.get()
+
+
+def _github_api_attestation(
+    endpoint: str,
+    token: str,
+    *,
+    timeout: float = 10.0,
+) -> tuple[int, Any] | None:
+    """Read one GitHub API endpoint from the server process, failing closed."""
+    fire = _github_fire_attestation.get()
+    if fire is not None:
+        if fire.attempts >= GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL:
+            _github_attestation_failure.set("budget")
+            return None
+        fire.attempts += 1
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "mimir-integrity-attestation",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"https://api.github.com/{endpoint.lstrip('/')}", headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            raw = response.read()
+            payload = json.loads(raw) if raw else None
+            return response.status, payload
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read()
+            payload = json.loads(raw) if raw else None
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        return exc.code, payload
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            reason = "malformed_payload"
+        elif isinstance(exc, TimeoutError) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)
+        ):
+            reason = "timeout"
+        else:
+            reason = "transport"
+        _github_attestation_failure.set(reason)
+        return None
+
+
+def _github_author_is_trusted(
+    repo: Any, author: Any, token: str, *, timeout: float | None = None,
+) -> bool | None:
+    """Resolve collaborator/org or operator-allowlisted bot trust, never from poller claims.
+
+    ``None`` means the server attestation was unavailable and is retryable. It
+    must not be persisted as an untrusted verdict. ``timeout`` bounds each of the
+    two attestation requests this makes; see ``_github_content_author`` for why
+    callers on a budget must pass it.
+    """
+    _github_author_trust_cause.set(None)
+    if not isinstance(repo, str) or not isinstance(author, str):
+        return False
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(parts):
+        return False
+    if author.casefold() in trusted_github_bot_logins():
+        return True
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.",
+    )
+    if any(set(value) - allowed for value in (*parts, author)):
+        return False
+
+    def unavailable(request: str, failure_class: str) -> None:
+        failure_class = (failure_class if failure_class in GITHUB_AUTHOR_FAILURE_CLASSES
+                         else "transport")
+        _github_author_trust_cause.set(f"{request}_{failure_class}")
+        sink = _github_author_diagnostic_sink.get()
+        if sink is not None:
+            try:
+                sink(
+                    "github_author_attestation_unavailable", repository=repo,
+                    author=author, request=request, failure_class=failure_class,
+                )
+            except Exception:
+                pass  # Diagnostics must never change a trust verdict.
+        try:
+            get_logger().log_sync(
+                "github_author_attestation_unavailable",
+                repository=repo, author=author, request=request,
+                failure_class=failure_class,
+            )
+        except Exception:
+            # Diagnostics must not change a trust verdict or trigger a retry.
+            pass
+
+    escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
+    escaped_author = urllib.parse.quote(author, safe="")
+    # The permission endpoint reports ``read`` for any user on a public repo,
+    # including non-collaborators.  The collaborator-existence endpoint keeps
+    # those cases distinct: 204 means collaborator, 404 means not one.
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    # Existing mocks may return None without setting a diagnostic reason.
+    _github_attestation_failure.set(None)
+    collaborator = _github_api_attestation(
+        f"repos/{escaped_repo}/collaborators/{escaped_author}", token, **kwargs,
+    )
+    if collaborator is None:
+        unavailable("collaborator", _github_attestation_failure.get() or "transport")
+        return None
+    if collaborator[0] == 204:
+        return True
+    if collaborator[0] != 404:
+        unavailable("collaborator", "unexpected_status")
+        return None
+
+    _github_attestation_failure.set(None)
+    membership = _github_api_attestation(
+        f"orgs/{urllib.parse.quote(parts[0], safe='')}/memberships/{escaped_author}",
+        token, **kwargs,
+    )
+    if membership is None:
+        unavailable("membership", _github_attestation_failure.get() or "transport")
+        return None
+    if membership[0] == 404:
+        return False
+    if membership[0] != 200 or not isinstance(membership[1], dict):
+        unavailable(
+            "membership",
+            "unexpected_status" if membership[0] != 200 else "malformed_payload",
+        )
+        return None
+    return membership[1].get("state") == "active"
+
+
+def _github_content_author(
+    repo: Any, extras: Any, token: str, *, timeout: float | None = None,
+) -> str | None:
+    """Resolve a GitHub activity actor from GitHub, never poller output.
+
+    ``timeout`` bounds the attestation request; callers running under a
+    wall-clock budget pass their remaining time so this transport cannot outlive
+    it (chainlink #1433 — the poller's other transport is `gh api`, and bounding
+    only that one left this path free to overrun).
+    """
+    if not isinstance(repo, str) or not isinstance(extras, dict):
+        return None
+    event_type = extras.get("event_type")
+    url = extras.get("url")
+    if not isinstance(event_type, str) or not isinstance(url, str):
+        return None
+    parts = repo.split("/")
+    parsed = urllib.parse.urlsplit(url)
+    path = [urllib.parse.unquote(value) for value in parsed.path.split("/") if value]
+    if len(parts) != 2 or parsed.hostname not in {"github.com", "www.github.com"}:
+        return None
+    if (len(path) < 4 or [value.casefold() for value in path[:2]]
+        != [value.casefold() for value in parts] or path[2] not in {"issues", "pull"}):
+        return None
+    number = path[3]
+    if not number.isdigit():
+        return None
+    if event_type not in _GITHUB_ACTOR_EVENT_TYPES:
+        return None
+
+    endpoint: str | None = None
+    fragment = parsed.fragment
+    if event_type in {"issue_opened", "pr_opened"} and not fragment:
+        endpoint = f"repos/{repo}/issues/{number}"
+    elif event_type == "issue_comment" and fragment.startswith("issuecomment-"):
+        comment_id = fragment.removeprefix("issuecomment-")
+        if comment_id.isdigit():
+            endpoint = f"repos/{repo}/issues/comments/{comment_id}"
+    elif event_type == "pr_review_comment" and fragment.startswith("discussion_r"):
+        comment_id = fragment.removeprefix("discussion_r")
+        if comment_id.isdigit():
+            endpoint = f"repos/{repo}/pulls/comments/{comment_id}"
+    elif event_type == "pr_review" and fragment.startswith("pullrequestreview-"):
+        review_id = fragment.removeprefix("pullrequestreview-")
+        if review_id.isdigit():
+            endpoint = f"repos/{repo}/pulls/{number}/reviews/{review_id}"
+    elif event_type == "pr_review":
+        endpoint = f"repos/{repo}/pulls/{number}/reviews"
+    elif event_type == "pr_synchronize":
+        previous_head = extras.get("previous_head")
+        new_head = extras.get("new_head")
+        if all(
+            isinstance(value, str)
+            and 7 <= len(value) <= 64
+            and all(character in "0123456789abcdefABCDEF" for character in value)
+            for value in (previous_head, new_head)
+        ):
+            endpoint = f"repos/{repo}/compare/{previous_head}...{new_head}"
+    elif event_type == "pr_review_requested":
+        endpoint = f"repos/{repo}/issues/{number}/timeline?per_page=100"
+    elif event_type == "pr_checks_completed" and path[2] == "pull" and not fragment:
+        endpoint = f"repos/{repo}/pulls/{number}"
+    if endpoint is None:
+        return None
+    attestation = _github_api_attestation(
+        endpoint, token, **({} if timeout is None else {"timeout": timeout}),
+    )
+    if (
+        attestation is None
+        or attestation[0] != 200
+    ):
+        return None
+
+    payload = attestation[1]
+    if event_type == "pr_synchronize":
+        commits = payload.get("commits") if isinstance(payload, dict) else None
+        commit = commits[-1] if isinstance(commits, list) and commits else None
+        if not isinstance(commit, dict):
+            return None
+        # GitHub's web-flow committer represents a UI action, not an actor.
+        # Attest exactly one mapped identity, preferring the real committer.
+        for user in (commit.get("committer"), commit.get("author")):
+            login = user.get("login") if isinstance(user, dict) else None
+            if isinstance(login, str) and login and login != "web-flow":
+                return login
+        return None
+    elif event_type == "pr_review_requested":
+        requested_reviewer = extras.get("requested_reviewer")
+        if not isinstance(payload, list) or not isinstance(requested_reviewer, str):
+            return None
+        matching = [
+            event for event in payload
+            if isinstance(event, dict)
+            and event.get("event") == "review_requested"
+            and isinstance(event.get("requested_reviewer"), dict)
+            and event["requested_reviewer"].get("login") == requested_reviewer
+        ]
+        if not matching:
+            return None
+        user = matching[-1].get("actor")
+    elif event_type == "pr_review" and isinstance(payload, list):
+        matching = [
+            review for review in payload
+            if isinstance(review, dict) and review.get("html_url") == url
+        ]
+        if not matching:
+            return None
+        user = matching[-1].get("user")
+    elif event_type == "pr_checks_completed":
+        if (not isinstance(payload, dict) or not isinstance(payload.get("head"), dict)
+                or payload["head"].get("sha") != extras.get("head_sha")):
+            return None
+        user = payload.get("user")
+    else:
+        user = payload.get("user") if isinstance(payload, dict) else None
+    author = user.get("login") if isinstance(user, dict) else None
+    return author if isinstance(author, str) and author else None
+
+
+def _github_framework_trigger_is_trusted(
+    repo: Any,
+    extras: Any,
+    token: str,
+    self_login: str,
+) -> bool:
+    """Attest one framework-authored remediation trigger against live PR state."""
+    if (
+        not isinstance(repo, str)
+        or not isinstance(extras, dict)
+        or extras.get("event_type") not in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES
+        or not isinstance(self_login, str)
+        or not self_login
+    ):
+        return False
+    parts = repo.split("/")
+    number = extras.get("number")
+    if (
+        len(parts) != 2
+        or not all(parts)
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number < 1
+    ):
+        return False
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    if any(set(value) - allowed for value in (*parts, self_login)):
+        return False
+    escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
+    fire = _github_fire_attestation.get()
+    cache_key = (repo, number)
+    if fire is not None and cache_key in fire.framework_cache:
+        attestation = fire.framework_cache[cache_key]
+    else:
+        attestation = _github_api_attestation(
+            f"repos/{escaped_repo}/pulls/{number}", token,
+        )
+        if fire is not None:
+            # Cache live input, not the verdict: every item's claimed head/base
+            # must still match. Failures are also cached for this fire only.
+            fire.framework_cache[cache_key] = attestation
+    if attestation is None or attestation[0] != 200 or not isinstance(attestation[1], dict):
+        return False
+    pull_request = attestation[1]
+    user = pull_request.get("user")
+    head = pull_request.get("head")
+    base = pull_request.get("base")
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    return bool(
+        pull_request.get("state") == "open"
+        and pull_request.get("number") == number
+        and isinstance(user, dict)
+        and user.get("login") == self_login
+        and extras.get("author") == self_login
+        and isinstance(head, dict)
+        and isinstance(head_repo, dict)
+        and head_repo.get("full_name") == repo
+        and extras.get("head_repo") == repo
+        and extras.get("head_remote") == "origin"
+        and extras.get("head_ref") == head.get("ref")
+        and extras.get("head_sha") == head.get("sha")
+        and isinstance(base, dict)
+        and extras.get("base_ref") == base.get("ref")
+        and extras.get("base_sha") == base.get("sha")
+        and extras.get("url") == pull_request.get("html_url")
+    )
+
+
+@dataclass
+class _TrackerAttestationBudget:
+    """Attestor calls and wall-clock seconds one fire may spend on tracker items."""
+
+    calls: int
+    seconds: float
+
+
+def _validated_tracker_extras(extras: dict[str, Any]) -> dict[str, Any] | None:
+    """Reduce an item's extras to the attestable keys, or None when any is invalid."""
+    reduced = {key: extras[key] for key in TRACKER_EXTRA_KEYS if key in extras}
+    adapter = safe_adapter(reduced.get("adapter"))
+    ref = safe_ref(reduced.get("ref"))
+    if (
+        adapter is None
+        or ref is None
+        or safe_url(reduced.get("url"), ref) is None
+        or safe_delivery_key(reduced.get("delivery_key")) is None
+        or reduced.get("kind") not in TRACKER_KINDS
+        or ("attested_event_id" in reduced
+            and safe_event_id(reduced["attested_event_id"]) is None)
+    ):
+        return None
+    return reduced
+
+
+async def _attest_tracker_batch(
+    poller: PollerConfig,
+    batch: list[dict[str, Any]],
+    env: dict[str, str],
+    *,
+    redact: Callable[[str], str],
+    attest_in_fire: Callable[..., Any],
+    budget: _TrackerAttestationBudget,
+) -> list[dict[str, Any]]:
+    """Return ``batch`` only when the server-side attestor vouches for its one item.
+
+    Poller-written extras are never authority: they are reduced to the allowlisted
+    keys, validated, and replaced by the attestor's verdict. Anything else is
+    dropped with a log naming validated identifiers only; the poller re-emits it.
+    """
+    item = batch[0] if batch else {"extras": {}}
+    adapter = safe_adapter(item["extras"].get("adapter"))
+    ref = safe_ref(item["extras"].get("ref"))
+
+    async def withhold(reason: str) -> list[dict[str, Any]]:
+        await log_event(
+            "poller_item_withheld",
+            poller=poller.name, adapter=adapter, ref=ref, reason=reason,
+        )
+        return []
+
+    if len(batch) != 1 or item.get("batch_context") is not None:
+        return await withhold("invalid_item")
+    extras = _validated_tracker_extras(item["extras"])
+    if extras is None:
+        return await withhold("invalid_item")
+    attestor = poller.hooks.trust_attestor if poller.hooks is not None else None
+    attestation: ItemAttestation | None = None
+    if attestor is not None and budget.calls > 0 and budget.seconds > 0:
+        budget.calls -= 1
+        started = time.monotonic()
+        try:
+            attestation = await asyncio.wait_for(
+                run_in_pool(_ATTESTATION_POOL, attest_in_fire, attestor, dict(extras), env),
+                timeout=budget.seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - attestation fails closed
+            log.warning("poller %r: tracker attestation failed (%s)", poller.name,
+                        type(exc).__name__)
+        budget.seconds -= time.monotonic() - started
+    reason: str | None = None
+    actor: str | None = None
+    try:
+        if attestation is None or attestation.trusted is None:
+            reason = "attestation_unavailable"
+        elif attestation.trusted is not True:
+            reason = "attestation_refused"
+        elif (
+            attestation.prompt is None
+            or redact(attestation.prompt.strip()) != item["prompt"]
+        ):
+            reason = "prompt_mismatch"
+        else:
+            actor = safe_actor(attestation.actor)
+    except Exception as exc:  # noqa: BLE001 - a malformed verdict fails closed
+        log.warning("poller %r: tracker attestation malformed (%s)", poller.name,
+                    type(exc).__name__)
+        reason = "attestation_refused"
+    if reason is not None:
+        return await withhold(reason)
+    item["extras"] = extras | {
+        "actor": actor or None,
+        "author_is_trusted": True,
+        "tracker_attested": True,
+    }
+    return batch
+
+
+def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Discard stale framework snapshots after our own verified fast-forward."""
+    from .plugins.core import selected_policy_registry
+
+    from .event_logger import log_event_sync
+
+    hooks = selected_policy_registry().policy_consumer_hooks
+    retained = []
+    for item in batch:
+        extras = item["extras"]
+        if (
+            extras.get("event_type") in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES
+            and isinstance(extras.get("repo"), str)
+            and type(extras.get("number")) is int
+            and isinstance(extras.get("head_sha"), str)
+            and hooks is not None
+            and hooks.superseded_push(extras["repo"], extras["number"], extras["head_sha"])
+        ):
+            log_event_sync(
+                "github_stale_trigger_dropped", stage="poller_fire",
+                reason="superseded_by_verified_own_push",
+            )
+            continue
+        retained.append(item)
+    return retained
+
+
+# Pollers manifest schema version history:
+#
+#   v1 (2026-05-26, chainlink #91): introduced the ``schema_version`` field.
+#     Manifests without ``schema_version`` are treated as v1 for backwards
+#     compatibility. Manifests with an unknown version emit a warning but are
+#     still parsed on a best-effort basis (breaking changes require a bump).
+#
+#: Current pollers.json manifest schema version understood by this build.
+#: Manifests with ``schema_version`` absent are treated as v1 (backwards
+#: compatible). Manifests with a *higher* version emit a warning but are
+#: still parsed on a best-effort basis — most field additions are additive
+#: and can be ignored safely; breaking changes would require a major bump.
+POLLER_MANIFEST_SCHEMA_VERSION = 1
+
+
+
+@dataclass
+class _CircuitBreakerState:
+    """Per-poller failure-run tracker for the circuit-breaker guard.
+
+    ``consecutive_failures`` counts runs that ended in a non-zero exit,
+    timeout, or subprocess launch error since the last clean exit.
+    ``disabled_until`` is a monotonic-clock deadline; when it is in the future
+    the poller is suppressed and ``run_poller`` returns immediately.  Both
+    fields reset to their defaults on the first clean run after a trip.
+    """
+
+    consecutive_failures: int = 0
+    disabled_until: float = 0.0  # 0.0 → not disabled
+
+
+#: Module-level per-poller circuit-breaker state.  Keyed by
+#: :attr:`PollerConfig.name`.  Lives at module scope (not per-Scheduler)
+#: so it survives ``reload_pollers`` calls — a poller that was tripped
+#: stays tripped even after the manifest is reloaded.
+_circuit_breakers: dict[str, _CircuitBreakerState] = {}
+
+
+def _cb_record_failure(name: str) -> bool:
+    """Increment the consecutive-failure counter for *name*.
+
+    Returns ``True`` the first time the count reaches
+    ``POLLER_CIRCUIT_BREAKER_THRESHOLD`` (i.e. the circuit just tripped),
+    so the caller can emit a ``poller_circuit_tripped`` event exactly once.
+    Returns ``False`` on subsequent failures (circuit re-armed, not newly
+    tripped) or when the threshold hasn't been reached yet.
+    """
+    cb = _circuit_breakers.setdefault(name, _CircuitBreakerState())
+    cb.consecutive_failures += 1
+    # ``>=`` not ``==`` (chainlink #409): the counter only resets on a
+    # clean run, so once it passes the threshold it keeps climbing —
+    # with exact equality the single backoff window armed at the
+    # threshold expires and a hard-down poller storms every tick
+    # forever after. Every failure at or past the threshold re-arms
+    # the window; only the threshold-crossing failure reports a trip.
+    if cb.consecutive_failures >= POLLER_CIRCUIT_BREAKER_THRESHOLD:
+        cb.disabled_until = time.monotonic() + POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS
+        return cb.consecutive_failures == POLLER_CIRCUIT_BREAKER_THRESHOLD
+    return False
+
+
+def _cb_record_success(name: str) -> None:
+    """Reset the circuit-breaker state for *name* after a clean run."""
+    if name in _circuit_breakers:
+        state = _circuit_breakers[name]
+        state.consecutive_failures = 0
+        state.disabled_until = 0.0
+
+
+def forget_circuit_breakers_except(active_names: set[str]) -> None:
+    """Drop circuit-breaker state for pollers no longer registered.
+
+    The circuit-breaker map is intentionally module-level so a still-installed
+    poller that trips remains suppressed across ``reload_pollers``. A poller
+    that has been removed or renamed, however, no longer has a future success
+    path to reset its state; pruning it during scheduler reload prevents stale
+    keys from accumulating for the lifetime of the process.
+    """
+    for name in list(_circuit_breakers):
+        if name not in active_names:
+            del _circuit_breakers[name]
+
+
+@dataclass
+class PollerConfig:
+    """One poller declared in a skill's ``pollers.json``.
+
+    ``skill_dir`` is the absolute path to the skill directory; the
+    subprocess runs with that as its cwd. ``persist_dir`` is the
+    poller's writable cursor/state location — under
+    ``<home>/state/pollers/<name>/`` when discovered via
+    ``Scheduler.add_poller_jobs`` (filing-rules-aligned, on the
+    persistent volume regardless of how the skill itself was
+    installed). Tests that construct PollerConfig directly may set
+    ``persist_dir == skill_dir`` for compactness.
+
+    ``env`` are extra env vars from the json entry's ``env`` map
+    (already coerced to ``dict[str, str]``). Values are literal —
+    no shell expansion. Use this when the poller needs a fixed
+    config value the operator declared in pollers.json itself.
+
+    ``pass_env`` (chainlink #82 sub #83/#85): explicit list of env
+    var names to pass through from the mimir process's environment
+    to the subprocess, **bypassing the deny-suffix/deny-prefix
+    filter**. This is the supported path for getting secrets
+    (``GITHUB_TOKEN``, ``ANTHROPIC_API_KEY``, etc.) and
+    ``MIMIR_*``-prefixed knobs (``MIMIR_GITHUB_SELF_LOGIN``) into a
+    poller subprocess — the global allowlist
+    (``MIMIR_POLLER_ENV_ALLOWLIST``) does NOT bypass the deny
+    filter, so it can't be used for ``*_TOKEN`` keys. Each name in
+    ``pass_env`` is opt-in per pollers.json entry, so a poller
+    declares exactly what it needs and operator-review of the
+    manifest is sufficient to audit the trust boundary. Keys named
+    in ``pass_env`` that aren't set in the process env are silently
+    skipped (no error — that's the operator's signal to set the
+    env var); keys named in ``pass_env`` whose names match a
+    deny-list pattern emit a ``poller_env_passthrough_named_secret``
+    event for visibility (not blocking — it's how operators get
+    secrets through).
+
+    ``batch_size`` (chainlink: framework-level coalescing): how
+    many emitted JSONL items to bundle into one AgentEvent (= one
+    turn the agent sees). ``1`` (default) preserves the per-item-
+    per-turn shape that matches open-strix. ``>1`` makes the
+    framework collect items from one cron tick and emit
+    ``ceil(N/batch_size)`` AgentEvents, each carrying a rendered
+    summary of up to ``batch_size`` items + per-item metadata in
+    ``extra.items``. Pollers with bursty output (github-poller
+    during PR-review storms, RSS during heavy publish hours) set
+    this to ``5`` or so to keep the agent's turn count bounded
+    without losing the per-item information."""
+
+    name: str
+    command: str
+    cron: str
+    env: dict[str, str]
+    skill_dir: Path
+    persist_dir: Path | None = None
+    batch_size: int = POLLER_BATCH_SIZE_DEFAULT
+    #: ``recover_failed_turns`` (chainlink #262): opt into framework-side
+    #: recovery of poller turns whose triggered turn FAILED. All accepted
+    #: poller events are stashed for unclean-restart recovery; when this is
+    #: True, the next cycle also reads ``turn_failed`` outcomes
+    #: to re-enqueue (capped) the failed ones — closing the "poll advanced
+    #: the cursor but the triggered turn died" drop (#299) for pollers with
+    #: no live state to reconcile against (gmail, github issue/comment
+    #: turns). OFF by default; leave OFF for pollers that recover another
+    #: way — github-poller uses #516's ``requested_reviewers``
+    #: reconciliation, so framework re-enqueue on top would double-fire
+    #: review turns. See :mod:`mimir.poller_recovery`.
+    recover_failed_turns: bool = False
+    #: ``priority`` (priority-banded suppression): how much resource
+    #: pressure this poller rides through before the scheduler sheds
+    #: it. ``low`` yields at the first sign of pressure (ELEVATED),
+    #: ``normal`` (default) sheds when quota is tight, ``high`` keeps
+    #: firing until the provider actively refuses (recorded 429).
+    #: See ``HomeostaticArbiter.should_fire`` for the fire matrix.
+    #: Suppressed fires skip the subprocess entirely, so the poller's
+    #: cursor stays frozen and catches up on the next tick after
+    #: recovery — no events are lost, only delayed.
+    priority: Priority = Priority.NORMAL
+    pass_env: tuple[str, ...] = ()
+    # Server-owned trust derivation selected from operator-reviewed manifest
+    # configuration. Poller stdout cannot override this value.
+    trust_source: str = "external"
+    #: ``env_required`` (chainlink #108): env var names the poller
+    #: **must** have in its subprocess env to function correctly.
+    #: Checked at the start of each ``run_poller`` invocation — after
+    #: the env dict is fully assembled (allowlist + pass_env + env
+    #: overrides). Any name that's absent from the final env causes the
+    #: poller to skip that run, emit ``poller_missing_required_env``
+    #: algedonically, and return 0 (no events enqueued). The intent
+    #: is "fail loudly at runtime rather than silently misfire" —
+    #: operators can see the algedonic signal and provision the missing
+    #: var. Names in ``env_required`` that ARE in ``pass_env`` will
+    #: naturally be present if the operator set the var; names that
+    #: AREN'T in ``pass_env`` but are in the global allowlist also flow
+    #: through. Secrets that aren't in either surface are always absent,
+    #: so listing a deny-filter secret in ``env_required`` WITHOUT
+    #: also listing it in ``pass_env`` is always a misconfiguration.
+    env_required: tuple[str, ...] = ()
+    #: Absolute path to the ``pollers.json`` manifest this config was
+    #: parsed from, as yielded by ``Path.rglob("pollers.json")`` over
+    #: ``skills_dir``. Not explicitly symlink-resolved — two manifests
+    #: reachable via different symlink chains would conflate (PR #141
+    #: review item #4). Given the ``skills_dir/<skill>/pollers.json``
+    #: layout this isn't a realistic concern; if a deployment exposes
+    #: ``skills_dir`` as a symlink farm, normalize with ``.resolve()``
+    #: at the assignment site in ``discover_pollers``. ``None`` only
+    #: when ``PollerConfig`` is constructed directly (most tests).
+    #: Used by the scheduler to identify previously-installed entries
+    #: whose manifest fails to parse on reload and preserve them
+    #: in-place (chainlink #84) — without this back-reference the
+    #: scheduler can't tell "manifest deleted on purpose" apart from
+    #: "manifest typo'd mid-edit", and the latter silently drops a
+    #: working poller.
+    manifest_path: Path | None = None
+    #: ``deliver`` (chainlink #508): optional channel id the agent should
+    #: deliver this poller's surfaced output to. Injected into the triggered
+    #: turn's context as an instruction (the agent judges + uses send_message —
+    #: NOT an auto-dump); on a hard turn failure the framework posts a ``⚠️``
+    #: notice there. The literal ``OPERATOR_CHANNEL`` resolves to the operator
+    #: alert channel. Unset → today's silent behavior. Does NOT change the
+    #: event's own ``channel_id`` (the poller keeps its per-poller queue).
+    deliver: str | None = None
+    #: Optional per-poller budget caps parsed from ``pollers.json`` and/or
+    #: ``<home>/pollers-overrides.yaml``. Malformed budget config is ignored
+    #: fail-open so a tuning typo cannot drop the poller itself.
+    budget: PollerBudgetConfig | None = None
+    #: Immutable, per-instance authority resolved from this manifest. ``None``
+    #: means an explicit empty grant, never the former shared poller principal.
+    authority: ServicePrincipal | None = None
+    #: Optional recovery and receipt-liveness behavior selected by the
+    #: operator-reviewed manifest, independent of the poller's runtime name.
+    hooks: PollerHooks | None = None
+
+    def channel_id(self) -> str:
+        """Synthetic channel for emitted events. Mirrors the
+        ``scheduler:<name>`` convention used for null-channel
+        scheduler.yaml jobs — keeps poller events queue-isolated
+        per-poller (parallel across pollers, serialized within)."""
+        return f"{POLLER_CHANNEL_PREFIX}{self.name}"
+
+    def resolved_persist_dir(self) -> Path:
+        """Effective persist dir — falls back to skill_dir when not
+        explicitly set (compactness for tests + niche call sites)."""
+        return self.persist_dir if self.persist_dir is not None else self.skill_dir
+
+    def resolved_authority(self) -> ServicePrincipal:
+        if self.authority is not None:
+            authority = self.authority
+        else:
+            canonical = f"poller:{self.name}"
+            authority = build_trigger_service_principal(
+                canonical=canonical,
+                trigger="poller",
+                profile="custom",
+                tier=CapabilityTier.SCOPE_CONTAINED,
+                capabilities=(),
+                roots=(self.resolved_persist_dir().resolve(),),
+                owned_skill_directory=self.skill_dir,
+                channel_memory_directory=canonical,
+                creation_path="mimir.pollers.run_poller",
+            )
+        return dataclasses.replace(
+            authority, configured_delivery_channel=self.deliver,
+        )
+
+
+#: Per-poller fields an operator may override from
+#: ``<home>/pollers-overrides.yaml`` — the same set skill updates treat
+#: as deployment tuning. The overrides file lives in the HOME, not the
+#: skill directory: skill updates can never touch it, drift detection
+#: never sees it, and a rotation/retune survives any reinstall. Mirrors
+#: the ``scheduler.yaml`` pattern for callable crons (operator config
+#: overrides shipped defaults at load time).
+POLLER_OVERRIDE_KEYS = frozenset(
+    {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env",
+     "deliver", "budget"}
+)
+#: Non-secret deployment tuning that the agent-facing override tool may place in
+#: a poller's environment. Operator-authored manifests and override files remain
+#: lenient; this allowlist applies only to the strict write path.
+POLLER_OVERRIDE_ENV_KEYS = frozenset({
+    "MIMIR_GMAIL_MAX_FETCH",
+    "MIMIR_SOCIAL_FEED_LIMIT",
+    "MIMIR_SOCIAL_LIMIT",
+    "WORKLINK_MAX_CONCURRENT",
+})
+#: Names whose operator-controlled host values the agent may select for a
+#: poller. Scope selectors are safe here but not as agent-provided literals.
+POLLER_OVERRIDE_PASS_ENV_KEYS = POLLER_OVERRIDE_ENV_KEYS | frozenset({
+    "GITHUB_REPOS",
+    "GOG_ACCOUNT",
+    "MIMIR_GMAIL_QUERY",
+    "MIMIR_SOCIAL_PLATFORMS",
+})
+
+POLLER_AUTHORITY_FIELDS = frozenset({
+    "authority", "capabilities", "tier", "profile", "principal_id",
+    "scoped_roots", "saga_full_corpus_read", "operator_alert",
+    "operator_alert_destination",
+})
+
+_AUTHORITY_KEYS = frozenset({"profile", "tier", "capabilities", "scoped_roots"})
+#: Additive, and optional so every manifest written before it existed still
+#: registers. The required-key check above is deliberately "missing" rather than
+#: an exact-set comparison for that reason.
+_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands", "saga_full_corpus_read", "approved_urls", "proposal_surface"})
+_TIER_RANK = {
+    CapabilityTier.SCOPE_CONTAINED: 0,
+    CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
+    CapabilityTier.CODE_EXECUTION: 2,
+    CapabilityTier.UNBOUNDED: 3,
+}
+
+
+def _validate_path_component(value: str, *, label: str) -> None:
+    """Reject values that are not one non-special filesystem component."""
+    path = Path(value)
+    if (
+        not value
+        or "/" in value
+        or "\\" in value
+        or path.is_absolute()
+        or path.name != value
+        or value in {".", ".."}
+    ):
+        raise ValueError(f"invalid {label}: {value!r}")
+
+
+def _resolve_direct_child(candidate: Path, base: Path, *, label: str) -> Path:
+    """Resolve and require ``candidate`` to remain an immediate child of ``base``."""
+    resolved = candidate.resolve()
+    if resolved.parent != base.resolve():
+        raise ValueError(f"{label} escapes allowed base: {candidate}")
+    return resolved
+
+
+def _is_selected_cultivate_default(manifest_path: Path, policy: PolicyRegistry) -> bool:
+    if not policy._selected_first_party("cultivate") or manifest_path.is_symlink():
+        return False
+    candidate = next(candidate for candidate in policy.selected_plugin_candidates
+                     if candidate.name == "cultivate")
+    dist = candidate.entry_point.dist
+    root_files = [file for file in dist.files if file.name == "mimir-plugin.toml"]
+    if len(root_files) != 1:
+        return False
+    root = Path(dist.locate_file(root_files[0])).parent.resolve()
+    declared = {Path(directory) for directory in (*candidate.manifest.defaults.get("skills", ()),
+                                                  *(path for path, _ in candidate.manifest.optional_skills))}
+    for file in dist.files:
+        if (file.name != "pollers.json"
+                or not file.parent.is_relative_to(root_files[0].parent)
+                or file.parent.relative_to(root_files[0].parent) not in declared):
+            continue
+        source = Path(dist.locate_file(file))
+        if (source.is_symlink() or source.parent.parent != root / "defaults/skills"
+                or not source.is_file()):
+            continue
+        if manifest_path == source:
+            return True
+        if manifest_path.parent.name == f"cultivate-{source.parent.name}":
+            from .plugins.skills import PluginSkill, skill_state
+
+            if skill_state(manifest_path.parents[2], PluginSkill(candidate, source.parent.name, None, True)) == "installed":
+                return True
+    return False
+
+
+def _validate_poller_identity(
+    name: str, manifest_path: Path, *, plugin_owner: str | None = None,
+) -> None:
+    """Bind names with special server-side authority to their shipped skill identity."""
+    required_skill = reserved_skill_for_name(name)
+    cultivated = plugin_owner == "cultivate" and name in {
+        "github-activity", "github-ci-watch", "worklink-ready-queue"
+    }
+    allowed_skill = (
+        {required_skill, f"cultivate-{required_skill}"} if cultivated
+        else {required_skill}
+    )
+    if required_skill is not None and (
+        manifest_path.parent.name not in allowed_skill
+        or (plugin_owner is not None and not cultivated)
+    ):
+        raise ValueError(
+            f"reserved poller name {name!r} may only be declared by "
+            f"the {required_skill!r} skill"
+        )
+
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def _parse_poller_authority(
+    raw: object,
+    *,
+    name: str,
+    persist_dir: Path,
+    state_root: Path | None,
+    manifest_path: Path,
+    policy: PolicyRegistry | None = None,
+    plugin_owner: str | None = None,
+) -> ServicePrincipal:
+    """Strictly resolve one manifest authority declaration or raise ValueError."""
+    if policy is not None and not policy.frozen:
+        raise ValueError("poller authority requires a frozen policy")
+    profiles = policy.authority_profiles if policy is not None else TRIGGER_AUTHORITY_PROFILES
+    tiers = policy.tiers if policy is not None else TRIGGER_CAPABILITY_TIERS
+    _validate_poller_identity(name, manifest_path, plugin_owner=plugin_owner)
+    if not isinstance(raw, dict):
+        raise ValueError("authority must be an object")
+    unknown = set(raw) - _AUTHORITY_KEYS - _OPTIONAL_AUTHORITY_KEYS
+    if unknown:
+        raise ValueError(f"unknown authority fields: {', '.join(sorted(map(str, unknown)))}")
+    missing = _AUTHORITY_KEYS - set(raw)
+    if missing:
+        raise ValueError(f"missing authority fields: {', '.join(sorted(missing))}")
+
+    profile = raw["profile"]
+    if not isinstance(profile, str) or profile not in profiles:
+        raise ValueError(f"unknown authority profile: {profile!r}")
+    first_party_defaults = (plugin_owner == "cultivate" and policy is not None
+                            and _is_selected_cultivate_default(manifest_path, policy))
+    if plugin_owner == "cultivate" and not first_party_defaults:
+        raise ValueError("cultivate poller authority requires an inventoried default")
+    if plugin_owner is not None and not first_party_defaults and (
+        policy is None or policy.profiles[profile].owner != plugin_owner
+    ):
+        raise ValueError(f"poller authority profile {profile!r} is not owned by {plugin_owner!r}")
+    proposal_surface = raw.get("proposal_surface", "wiki")
+    if not isinstance(proposal_surface, str) or proposal_surface not in ("wiki", "social-outbox"):
+        raise ValueError(f"unknown proposal_surface: {proposal_surface!r}")
+    if proposal_surface != "wiki" and profile != "research":
+        raise ValueError("proposal_surface requires research profile")
+    try:
+        tier = CapabilityTier(raw["tier"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unknown authority tier: {raw['tier']!r}") from exc
+    capabilities_raw = raw["capabilities"]
+    if (
+        not isinstance(capabilities_raw, list)
+        or not all(isinstance(item, str) and item for item in capabilities_raw)
+    ):
+        raise ValueError("authority capabilities must be a list of non-empty names")
+    capabilities = tuple(dict.fromkeys(capabilities_raw))
+    if plugin_owner is not None and not first_party_defaults and any(
+        policy.capabilities.get(capability) != plugin_owner
+        or capability not in policy.tools
+        or policy.tools[capability].owner != plugin_owner
+        for capability in capabilities
+    ):
+        raise ValueError(f"poller capabilities must be registered tools owned by {plugin_owner!r}")
+    approved_urls: list[str] = []
+    if "approved_urls" in raw:
+        if profile not in {"research", "github"}:
+            raise ValueError("authority approved_urls is only supported by research and github profiles")
+        urls_raw = raw["approved_urls"]
+        if not isinstance(urls_raw, list):
+            raise ValueError("authority approved_urls must be a list of HTTPS URLs")
+        for url in urls_raw:
+            if not isinstance(url, str) or not url or any(
+                char.isspace() or ord(char) < 32 or char in "*\\" for char in url
+            ):
+                raise ValueError(f"invalid approved_urls entry: {url!r}")
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, url)
+            parsed = urllib.parse.urlsplit(normalized) if normalized else None
+            if (
+                parsed is None
+                or parsed.scheme != "https"
+                or "#" in url
+                or not parsed.hostname
+                or not all(
+                    re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                    for label in parsed.hostname.split(".")
+                )
+                or len(parsed.hostname.split(".")) < 2
+                or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+            ):
+                raise ValueError(f"invalid approved_urls entry: {url!r}")
+            if profile == "github" and parsed.hostname not in {"api.github.com", "github.com"}:
+                raise ValueError(f"poller {name!r}: approved_urls requires a GitHub host: {url!r}")
+            approved_urls.append(normalized)
+    if profile == "research":
+        if "fetch_url" in capabilities and not approved_urls:
+            raise ValueError("fetch_url requires non-empty authority approved_urls")
+        if approved_urls and "fetch_url" not in capabilities:
+            capabilities += ("fetch_url",)
+    unknown_caps = set(capabilities) - set(tiers)
+    if unknown_caps:
+        raise ValueError(f"unknown capabilities: {', '.join(sorted(unknown_caps))}")
+    outside_profile = set(capabilities) - profiles[profile]
+    if outside_profile:
+        raise ValueError(
+            f"capabilities outside {profile!r} profile: {', '.join(sorted(outside_profile))}"
+        )
+    builtin_profile = {
+        "heartbeat": "heartbeat",
+        "session-boundary": "session-boundary",
+    }.get(name)
+    if builtin_profile is not None:
+        if profile != builtin_profile:
+            raise ValueError(
+                f"built-in {name!r} may only narrow profile {builtin_profile!r}"
+            )
+        if name == "session-boundary" and _TIER_RANK[tier] > _TIER_RANK[CapabilityTier.SCOPED_WITH_PROVENANCE]:
+            raise ValueError("session-boundary manifest cannot widen the built-in tier")
+    # Generic fetches are unbounded, but these profiles bind a destination adapter.
+    bounded_profile_capabilities = (
+        policy.profiles[profile].bounded_capabilities if policy is not None
+        else BOUNDED_PROFILE_CAPABILITIES.get(profile, frozenset())
+    )
+    if any(
+        _TIER_RANK[CapabilityTier(tiers[cap])] > _TIER_RANK[tier]
+        for cap in capabilities
+        if cap not in bounded_profile_capabilities
+    ):
+        raise ValueError(f"capability exceeds declared tier {tier.value!r}")
+    if tier is CapabilityTier.UNBOUNDED or any(
+        CapabilityTier(tiers[cap]) is CapabilityTier.UNBOUNDED for cap in capabilities
+        if cap not in bounded_profile_capabilities
+    ):
+        raise ValueError("skill pollers cannot declare unbounded authority")
+
+    saga_full_corpus_read = raw.get("saga_full_corpus_read", False)
+    if not isinstance(saga_full_corpus_read, bool):
+        raise ValueError("authority saga_full_corpus_read must be a boolean")
+    if plugin_owner is not None and not first_party_defaults and saga_full_corpus_read:
+        raise ValueError("plugin pollers cannot request full corpus read")
+
+    roots_raw = raw["scoped_roots"]
+    if not isinstance(roots_raw, list) or not all(isinstance(item, str) for item in roots_raw):
+        raise ValueError("authority scoped_roots must be a list of names")
+    if profile == "research" and set(capabilities) & {
+        "open_proposal", "submit_proposal", "abandon_proposal",
+    } and any(root != "state" for root in roots_raw):
+        raise ValueError("research proposal pollers may only declare their own state root")
+    roots: list[Path] = []
+    expected_state = persist_dir.resolve()
+    home = state_root.parent.parent.resolve() if state_root is not None else None
+    for root_name in roots_raw:
+        if root_name == "state":
+            if state_root is None:
+                candidate = expected_state
+            else:
+                candidate = _resolve_direct_child(
+                    expected_state,
+                    state_root,
+                    label="scoped root 'state'",
+                )
+        elif root_name.startswith("wiki:") and home is not None:
+            slug = root_name.removeprefix("wiki:")
+            try:
+                _validate_path_component(slug, label="scoped root")
+            except ValueError as exc:
+                raise ValueError(f"invalid scoped root: {root_name!r}") from exc
+            wiki_base = (home / "state" / "wiki").resolve()
+            candidate = _resolve_direct_child(
+                wiki_base / slug,
+                wiki_base,
+                label=f"scoped root {root_name!r}",
+            )
+        else:
+            raise ValueError(f"unknown scoped root: {root_name!r}")
+        if not candidate.exists() or not candidate.is_dir():
+            raise ValueError(f"scoped root does not exist: {root_name!r}")
+        roots.append(candidate)
+    if {"write_file", "edit_file", "replace_file"} & set(capabilities) and not roots:
+        raise ValueError("file capabilities require at least one scoped root")
+
+    home_root = state_root.parent.parent if state_root is not None else None
+    raw_shell_commands = raw.get("shell_commands")
+    if plugin_owner is not None and raw_shell_commands is not None:
+        raise ValueError("plugin pollers cannot declare shell commands")
+    declared_shell_commands = parse_declared_shell_commands(
+        raw_shell_commands,
+        # The roots only matter to declared commands; skip the lookup otherwise.
+        writable_roots=(
+            agent_writable_roots(home_root) if raw_shell_commands is not None else ()
+        ),
+    )
+    if declared_shell_commands and "shell_exec" not in capabilities:
+        raise ValueError(
+            "shell_commands declared without the shell_exec capability; the "
+            "capability gate runs first and would refuse every one of them",
+        )
+
+    canonical = f"poller:{name}"
+    return build_trigger_service_principal(
+        canonical=canonical,
+        trigger="poller",
+        profile=profile,
+        tier=tier,
+        capabilities=capabilities,
+        roots=tuple(roots),
+        owned_skill_directory=manifest_path.parent,
+        channel_memory_directory=canonical,
+        saga_full_corpus_read=saga_full_corpus_read,
+        declared_shell_commands=declared_shell_commands,
+        approved_urls=tuple(approved_urls),
+        proposal_surface=proposal_surface,
+        creation_path=f"mimir.pollers.run_poller:{manifest_path}",
+        policy=policy,
+        poller_owner=plugin_owner,
+    )
+
+#: Recognized string spellings for boolean overrides. YAML 1.1 already maps
+#: bare ``yes``/``no``/``on``/``off``/``true``/``false`` to real bools, but a
+#: *quoted* value (``recover_failed_turns: "false"``) arrives as a string —
+#: and ``bool("false")`` is ``True``. So coerce strictly rather than by Python
+#: truthiness, or an operator turning a flag OFF could silently turn it ON.
+_OVERRIDE_BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
+_OVERRIDE_BOOL_FALSE = frozenset({"false", "no", "off", "0"})
+
+
+class PollerOverridesValidationError(ValueError):
+    """Raised when agent-authored ``pollers-overrides.yaml`` is invalid."""
+
+
+def _parse_override_bool(value: object) -> bool | None:
+    """Strict bool coercion for an override value, or ``None`` if unparseable.
+
+    ``None`` means "not a recognizable bool" — the caller keeps the manifest
+    value and warns, never falling back to Python truthiness (which would make
+    the quoted-``"false"`` YAML footgun read as ``True``).
+    """
+    if isinstance(value, bool):  # must precede the int check — bool ⊂ int
+        return value
+    if isinstance(value, int):
+        return bool(value) if value in (0, 1) else None
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _OVERRIDE_BOOL_TRUE:
+            return True
+        if s in _OVERRIDE_BOOL_FALSE:
+            return False
+    return None
+
+
+def _parse_poller_overrides_raw(
+    raw: object,
+    *,
+    path: Path,
+    strict: bool,
+    rejections: list[tuple[Path, str, str]] | None = None,
+) -> dict[str, dict]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        msg = (
+            f"poller_overrides_invalid: {path} — root must be a mapping of "
+            "poller name → overrides"
+        )
+        if strict:
+            raise PollerOverridesValidationError(msg)
+        log.warning("%s; ignoring file", msg)
+        if rejections is not None:
+            rejections.append((path, "<overrides>", "root must be a mapping"))
+        return {}
+    out: dict[str, dict] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            msg = (
+                f"poller_overrides_invalid_entry: {path} — {name!r} must map "
+                "to a dict of fields"
+            )
+            if strict:
+                raise PollerOverridesValidationError(msg)
+            log.warning("%s; skipping", msg)
+            if rejections is not None:
+                rejections.append((path, str(name), "override entry must be a mapping"))
+            continue
+        kept = {}
+        for key, value in entry.items():
+            if key not in POLLER_OVERRIDE_KEYS:
+                msg = (
+                    f"poller_overrides_unknown_field: {path} — {name}.{key} "
+                    "is not overridable (allowed: "
+                    f"{', '.join(sorted(POLLER_OVERRIDE_KEYS))})"
+                )
+                if strict:
+                    raise PollerOverridesValidationError(msg)
+                log.warning("%s; dropping", msg)
+                if rejections is not None:
+                    rejections.append((path, str(name), f"unknown override field {key!r}"))
+                continue
+            if key == "priority":
+                try:
+                    value = Priority(
+                        value.strip().lower() if isinstance(value, str) else value
+                    )
+                except (ValueError, TypeError):
+                    reason = f"invalid priority override {value!r}; expected low|normal|high"
+                    msg = f"poller_overrides_invalid_priority: {path} - {name}.priority={value!r}"
+                    if strict:
+                        raise PollerOverridesValidationError(msg)
+                    log.error("%s; keeping skill default", msg)
+                    if rejections is not None:
+                        rejections.append((path, str(name), reason))
+                    try:
+                        log_event_sync(
+                            "poller_overrides_invalid_priority",
+                            path=str(path), name=str(name), value=value,
+                            action="keep_skill_default",
+                        )
+                    except Exception:  # telemetry must not interrupt boot
+                        log.exception("Could not emit priority configuration error")
+                    continue
+            if strict and key == "env":
+                if not isinstance(value, dict):
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_invalid_env: {path} — {name}.env "
+                        "must be a mapping"
+                    )
+                invalid = [
+                    env_key for env_key in value
+                    if not isinstance(env_key, str)
+                    or env_key not in POLLER_OVERRIDE_ENV_KEYS
+                ]
+                if invalid:
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_disallowed_env: {path} — {name}.env "
+                        f"contains disallowed names: {', '.join(sorted(map(str, invalid)))} "
+                        f"(allowed: {', '.join(sorted(POLLER_OVERRIDE_ENV_KEYS))})"
+                    )
+            if strict and key == "pass_env":
+                if not isinstance(value, list) or not all(
+                    isinstance(env_key, str) for env_key in value
+                ):
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_invalid_pass_env: {path} — "
+                        f"{name}.pass_env must be a list of strings"
+                    )
+                invalid = [
+                    env_key for env_key in value
+                    if env_key not in POLLER_OVERRIDE_PASS_ENV_KEYS
+                ]
+                if invalid:
+                    raise PollerOverridesValidationError(
+                        f"poller_overrides_disallowed_env: {path} — "
+                        f"{name}.pass_env contains disallowed names: "
+                        f"{', '.join(sorted(invalid))} (allowed: "
+                        f"{', '.join(sorted(POLLER_OVERRIDE_PASS_ENV_KEYS))})"
+                    )
+            kept[str(key)] = value
+        if kept:
+            out[str(name)] = kept
+    return out
+
+
+def validate_poller_overrides_text(text: str, *, path: Path) -> dict[str, dict]:
+    """Strictly validate agent-authored ``pollers-overrides.yaml`` content.
+
+    Discovery deliberately uses fail-safe parsing so a bad operator edit cannot
+    kill all pollers. The agent-facing write path needs the same schema but a
+    hard failure before persistence, so unknown fields or malformed roots cannot
+    be committed.
+    """
+    try:
+        import yaml
+        raw = yaml.safe_load(text)
+    except Exception as exc:  # noqa: BLE001 - surface parser diagnostics to tool
+        raise PollerOverridesValidationError(
+            f"poller_overrides_invalid: {path} — {exc}",
+        ) from exc
+    return _parse_poller_overrides_raw(raw, path=path, strict=True)
+
+
+def load_poller_overrides(
+    path: Path | None,
+    *,
+    rejections: list[tuple[Path, str, str]] | None = None,
+) -> dict[str, dict]:
+    """Parse ``pollers-overrides.yaml`` → ``{poller_name: {field: value}}``.
+
+    Best-effort and fail-safe: a missing file is a no-op, a malformed
+    file logs one warning and applies nothing (the manifests keep
+    working), and unknown FIELDS inside an entry are dropped with a
+    warning so a typo can't smuggle arbitrary keys into PollerConfig.
+    Invalid priorities are rejected here, with an error event even when no
+    discovery diagnostics collector is supplied. Other fields still apply;
+    the skill priority is retained and boot continues.
+    """
+    if path is None or not path.is_file():
+        return {}
+    try:
+        import yaml
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — config parse must never abort discovery
+        log.warning("poller_overrides_invalid: %s — %s; ignoring file", path, exc)
+        if rejections is not None:
+            rejections.append((path, "<overrides>", f"{type(exc).__name__}: {exc}"))
+        return {}
+    return _parse_poller_overrides_raw(
+        raw, path=path, strict=False, rejections=rejections,
+    )
+
+
+def _apply_poller_overrides(
+    poller: "PollerConfig",
+    overrides: dict,
+    *,
+    source: Path,
+    rejections: list[tuple[Path, str, str]] | None = None,
+) -> "PollerConfig":
+    """Return ``poller`` with validated operator overrides applied.
+
+    Field-level fail-safety: each invalid value warns and keeps the
+    manifest value rather than dropping the poller — an override typo
+    must degrade to shipped behavior, never to a dead poller. Cron is
+    validated here (lazy APScheduler import) because the scheduler's
+    invalid-cron preservation path (#419) protects RELOADS, not first
+    installs — an unvalidated bad override cron on a fresh start would
+    skip the poller entirely.
+    """
+    import dataclasses
+
+    updates: dict = {}
+
+    def reject(reason: str) -> None:
+        if rejections is not None:
+            rejections.append((source, poller.name, reason))
+
+    if "cron" in overrides:
+        cron = str(overrides["cron"]).strip()
+        try:
+            # Import lazily to avoid the scheduler -> pollers module cycle.
+            # Validation must use the exact parser that installs the trigger.
+            from .scheduler import _cron_trigger_from_standard_crontab
+            _cron_trigger_from_standard_crontab(cron)
+            updates["cron"] = cron
+        except Exception as exc:  # noqa: BLE001 — keep manifest cron on any parse failure
+            log.warning(
+                "poller_overrides_invalid_cron: %s — %s.cron=%r (%s); "
+                "keeping manifest cron %r",
+                source, poller.name, cron, exc, poller.cron,
+            )
+            reject(f"invalid cron override {cron!r}: {exc}")
+    if "priority" in overrides:
+        updates["priority"] = overrides["priority"]
+    if "batch_size" in overrides:
+        try:
+            bs = int(overrides["batch_size"])
+            if bs >= 1:
+                updates["batch_size"] = bs
+            else:
+                raise ValueError(bs)
+        except (TypeError, ValueError):
+            log.warning(
+                "poller_overrides_invalid_batch_size: %s — %s.batch_size=%r; "
+                "keeping %d", source, poller.name,
+                overrides["batch_size"], poller.batch_size,
+            )
+            reject(f"invalid batch_size override {overrides['batch_size']!r}")
+    if "recover_failed_turns" in overrides:
+        parsed = _parse_override_bool(overrides["recover_failed_turns"])
+        if parsed is None:
+            log.warning(
+                "poller_overrides_invalid_recover_failed_turns: %s — "
+                "%s.recover_failed_turns=%r (expected a bool: "
+                "true/false/yes/no/1/0); keeping %r",
+                source, poller.name, overrides["recover_failed_turns"],
+                poller.recover_failed_turns,
+            )
+            reject(
+                "invalid recover_failed_turns override "
+                f"{overrides['recover_failed_turns']!r}"
+            )
+        else:
+            updates["recover_failed_turns"] = parsed
+    if "env" in overrides:
+        env_o = overrides["env"]
+        if isinstance(env_o, dict):
+            updates["env"] = {str(k): str(v) for k, v in env_o.items()}
+        else:
+            log.warning(
+                "poller_overrides_invalid_env: %s — %s.env must be a "
+                "mapping; keeping manifest env", source, poller.name,
+            )
+            reject("env override must be a mapping")
+    if "pass_env" in overrides:
+        pe = overrides["pass_env"]
+        if isinstance(pe, list) and all(isinstance(x, str) for x in pe):
+            updates["pass_env"] = tuple(x.strip() for x in pe if x.strip())
+        else:
+            log.warning(
+                "poller_overrides_invalid_pass_env: %s — %s.pass_env must "
+                "be a list of strings; keeping manifest pass_env",
+                source, poller.name,
+            )
+            reject("pass_env override must be a list of strings")
+    if "deliver" in overrides:  # chainlink #508
+        dv = overrides["deliver"]
+        if dv is None or isinstance(dv, str):
+            updates["deliver"] = (dv.strip() or None) if isinstance(dv, str) else None
+        else:
+            log.warning(
+                "poller_overrides_invalid_deliver: %s — %s.deliver must be a "
+                "string (channel id or OPERATOR_CHANNEL) or null; keeping %r",
+                source, poller.name, poller.deliver,
+            )
+            reject(f"deliver override must be a string or null, got {dv!r}")
+    if "budget" in overrides:
+        budget_rejections: list[str] = []
+        budget = parse_poller_budget_config(
+            overrides["budget"],
+            source=source,
+            poller_name=poller.name,
+            rejections=budget_rejections,
+        )
+        if budget_rejections:
+            reject("; ".join(budget_rejections))
+        if budget is not None:
+            updates["budget"] = budget
+    if not updates:
+        return poller
+    log.info(
+        "poller_overrides_applied: %s — %s: %s",
+        source, poller.name, ", ".join(sorted(updates)),
+    )
+    return dataclasses.replace(poller, **updates)
+
+
+_UNSPECIFIED_PLUGIN_POLICY = object()
+
+
+def discover_pollers(
+    skills_dir: Path,
+    *,
+    state_root: Path | None = None,
+    invalid_manifests: list[tuple[Path, str]] | None = None,
+    invalid_entries: list[tuple[Path, str, str]] | None = None,
+    overrides_path: Path | None = None,
+    policy: PolicyRegistry | None | object = _UNSPECIFIED_PLUGIN_POLICY,
+    plugin_candidates: tuple[object, ...] | None = None,
+) -> list[PollerConfig]:
+    """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
+
+    Sync — called from the Scheduler at startup before the event loop
+    spins up. Per-file failures (bad JSON, missing required fields)
+    log a stderr-visible warning but don't abort the walk; one bad
+    skill shouldn't take the whole framework down. Returns an empty
+    list when ``skills_dir`` doesn't exist (most installs).
+
+    ``state_root`` (when set, typically ``<home>/state/pollers``) is
+    where each poller's persistent cursor/state files belong. The
+    framework injects ``state_root/<poller_name>`` as ``STATE_DIR``
+    in the subprocess env so cursors survive container rebuilds even
+    when the skill itself ships in the image. ``state_root=None``
+    falls back to ``skill_dir`` (back-compat for tests + skill setups
+    where the skill directory itself is on a persistent volume).
+
+    ``invalid_manifests`` (chainlink #84): out-parameter list. When
+    provided, each ``pollers.json`` whose **JSON parse** failed (the
+    "operator typo'd mid-edit" case) is appended as a
+    ``(manifest_path, error_message)`` tuple. The scheduler uses this
+    to distinguish "manifest deleted on purpose" from "manifest broke
+    mid-edit" on reload and preserve previously-installed pollers in
+    the latter case. Format-level failures (top-level type wrong,
+    missing 'pollers' key, etc.) are NOT reported here — those are
+    structural manifest bugs, not transient typos, and treating them
+    as "preserve previously installed" would mask real misconfig.
+    Out-list rather than tuple return so existing call sites that
+    don't care about the new signal need no unpacking change.
+
+    ``invalid_entries`` collects rejected entries and rejected optional fields
+    as ``(source_path, poller_name, reason)`` tuples. The scheduler emits them
+    after discovery returns, keeping this parser safe in synchronous contexts.
+    Callers discovering plugin-seeded skills must pass the active frozen policy;
+    omitting it raises rather than misreporting selected seeds as unselected.
+    """
+    # Keep legacy core-only callers working, but never let a new caller
+    # silently classify a seeded provider manifest without a selected policy.
+    policy_omitted = policy is _UNSPECIFIED_PLUGIN_POLICY
+    if policy_omitted:
+        policy = None
+    _validate_non_secret_forwarded_env_keys()
+    pollers: list[PollerConfig] = []
+    if plugin_candidates is None:
+        plugin_candidates = policy.selected_plugin_candidates if policy is not None else ()
+    if policy is not None and "github" in policy.poller_hooks:
+        raise ValueError("plugin poller hooks collide with reserved core profiles")
+    if not skills_dir.exists() and not plugin_candidates:
+        return pollers
+
+    # chainlink #420: poller names are the registry/job/persist_dir/
+    # circuit-breaker key, so two manifests declaring the same name
+    # would silently conflate all of that state (and overcount
+    # installs). First successfully-parsed occurrence in the
+    # deterministic discovery order wins; later duplicates are
+    # skipped loudly, naming both manifests so the operator can see
+    # which skill lost.
+    seen_names: dict[str, Path] = {}
+
+    manifests: dict[Path, str | None] = {
+        path: None for path in skills_dir.rglob("pollers.json")
+    } if skills_dir.exists() else {}
+    validated_seeds: set[Path] = set()
+    # Packaged manifest -> the byte-identical home seed that supersedes it.
+    packaged_seeds: dict[Path, Path] = {}
+    upgrade_seeds: set[Path] = set()
+    for candidate in plugin_candidates:
+        if not candidate.enabled or candidate.manifest is None:
+            continue
+        if policy is None or not policy.frozen:
+            raise ValueError("plugin pollers require frozen selected policy")
+        if candidate.name == "cultivate" and not policy._selected_first_party("cultivate"):
+            raise ValueError("cultivate pollers require selected first-party owner")
+        dist = candidate.entry_point.dist
+        if dist is None or dist.files is None:
+            raise ValueError(f"plugin {candidate.name!r} has no package file inventory")
+        manifest_files = [file for file in dist.files if file.name == "mimir-plugin.toml"]
+        if len(manifest_files) != 1:
+            raise ValueError(f"plugin {candidate.name!r} has no unique package root")
+        root = Path(dist.locate_file(manifest_files[0])).parent.resolve()
+        defaults = (candidate.manifest.defaults or {}) if candidate.name == "cultivate" else {}
+        declared_skills = {
+            Path(directory) for directory in (*defaults.get("skills", ()),
+                                            *(path for path, _ in candidate.manifest.optional_skills))
+        } if candidate.name == "cultivate" else set()
+        optional_skills = ({Path(path) for path, _ in candidate.manifest.optional_skills}
+                           if candidate.name == "cultivate" else set())
+        for file in dist.files:
+            if file.name != "pollers.json":
+                continue
+            path = Path(dist.locate_file(file))
+            rel = path.relative_to(root) if path.is_relative_to(root) else None
+            skill = rel.parent if rel is not None else None
+            valid_skill = (
+                skill is not None and (
+                    skill.parent == Path("skills")
+                    or (candidate.name == "cultivate" and skill in declared_skills
+                        and skill.parent == Path("defaults/skills"))
+                )
+            )
+            if (path.is_symlink() or not path.resolve().is_relative_to(root)
+                    or not valid_skill
+                    or not path.is_file()):
+                raise ValueError(f"plugin {candidate.name!r}: invalid skill poller resource {path}")
+            # Fresh homes do not opt in merely by selecting the distribution.
+            # Existing seeds retain the packaged fallback and manifest-only
+            # takeover used before defaults became optional. Whole-tree identity
+            # still governs the home copy's authority at dispatch time.
+            if skill in optional_skills:
+                installed = skills_dir / f"{candidate.name}-{skill.name}" / "pollers.json"
+                if installed not in manifests:
+                    continue
+            if path in manifests:
+                raise ValueError(f"plugin poller resource collision: {path}")
+            manifests[path] = candidate.name
+            # Reserved home-seed takeover is currently Cultivate-only. Other
+            # plugins retain their existing manifest/ownership policy here;
+            # generic release inventories alone do not grant that authority.
+            if candidate.name == "cultivate":
+                seeded = skills_dir / f"cultivate-{path.parent.name}" / "pollers.json"
+                if seeded in manifests:
+                    from .plugins.skills import PluginSkill, skill_state
+
+                    seeded_skill = PluginSkill(candidate, path.parent.name, None, True)
+                    if skill_state(skills_dir.parent, seeded_skill) == "upgrade available":
+                        # An old release has no authority to run. Let the
+                        # *current* packaged manifest run in its place.
+                        upgrade_seeds.add(seeded)
+                if seeded in manifests and not seeded.is_symlink() and seeded.is_file():
+                    # A local copy cannot claim reserved provider identity after
+                    # its manifest diverges from the inventoried distribution.
+                    try:
+                        identical_manifest = seeded.read_bytes() == path.read_bytes()
+                    except OSError:
+                        identical_manifest = False
+                    if identical_manifest:
+                        manifests[seeded] = candidate.name
+                        validated_seeds.add(seeded)
+                        packaged_seeds[path] = seeded
+
+    # A home skill that a plugin's defaults seeded keeps that plugin's identity
+    # even after the operator deselects the plugin; running it as an ordinary
+    # core-home poller would hand provider pollers (and their write authority)
+    # to core. Ownership is decided from package metadata and the home's seed
+    # markers only: a disabled provider is never imported to decide it.
+    from .plugins.defaults import seed_namespaces, selected_plugin_owners
+
+    namespaces = seed_namespaces(skills_dir.parent)
+    selected_owners = set(selected_plugin_owners(policy))
+    selected_owners.update(
+        candidate.name for candidate in plugin_candidates
+        if candidate.enabled and candidate.name != "cultivate"
+    )
+
+    # Only inventory-matched selected seeds precede packaged resources. All
+    # other manifests retain their absolute-path ordering and first-wins rule.
+    for pollers_file, plugin_owner in sorted(
+        manifests.items(), key=lambda item: (item[0] not in validated_seeds, item[0]),
+    ):
+        if pollers_file in upgrade_seeds:
+            continue
+        from ._paths import live_loader_path_allowed
+        if not live_loader_path_allowed(pollers_file):
+            continue
+        # Skip manifests under hidden directories (observed live
+        # 2026-06-11): ``skill_install`` keeps full pre-update snapshots
+        # at ``<skill>/.pre-update-backup/<ts>/`` — INCLUDING the
+        # snapshot's pollers.json — and ``rglob`` walks into them. With
+        # the #420 first-wins duplicate-name guard, the backup manifest
+        # (``.pre-…`` sorts before the skill's own ``pollers.json``)
+        # SHADOWED the freshly-updated live manifest: the scheduler
+        # registered the BACKUP directory as skill_dir and ran the old
+        # poller.py every tick, while the duplicate warning sat only in
+        # container stderr. (Pre-#420 last-wins silently picked the live
+        # one, masking the hazard.) Hidden directories are never valid
+        # skill roots — backups, scratch, VCS internals — so exclude
+        # them from discovery wholesale.
+        try:
+            _rel_dirs = pollers_file.relative_to(skills_dir).parts[:-1]
+        except ValueError:  # pragma: no cover — rglob yields children only
+            _rel_dirs = ()
+        if any(part.startswith(".") for part in _rel_dirs):
+            log.info(
+                "poller_manifest_hidden_dir_skipped: %s", pollers_file,
+            )
+            continue
+        seed_owner = (
+            namespaces.skill_owner(_rel_dirs[0])
+            if plugin_owner is None and _rel_dirs else None
+        )
+        if seed_owner is not None and policy_omitted:
+            raise ValueError("discover_pollers requires an explicit plugin policy for seeded skills")
+        if seed_owner is not None and seed_owner not in selected_owners:
+            reason = (
+                f"skill seeded by plugin {seed_owner!r}, which is not selected; "
+                f"set MIMIR_PLUGINS to include {seed_owner!r} to run it"
+            )
+            log.warning(
+                "poller_plugin_seed_unselected: %s — %s; manifest skipped",
+                pollers_file, reason,
+            )
+            if invalid_entries is not None:
+                invalid_entries.append((pollers_file, "<manifest>", reason))
+            continue
+        skill_dir = pollers_file.parent
+        try:
+            raw = json.loads(pollers_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning(
+                "poller_invalid_json: %s — %s", pollers_file, exc,
+            )
+            if invalid_manifests is not None:
+                invalid_manifests.append(
+                    (pollers_file, f"{type(exc).__name__}: {exc}"),
+                )
+            continue
+
+        if not isinstance(raw, dict) or "pollers" not in raw:
+            log.warning(
+                "poller_invalid_format: %s — expected dict with 'pollers' key",
+                pollers_file,
+            )
+            if invalid_entries is not None:
+                invalid_entries.append((
+                    pollers_file,
+                    "<manifest>",
+                    "expected a mapping with a 'pollers' key",
+                ))
+            continue
+
+        # Schema-version gate: absent means v1 (backwards compatible).
+        # Present-but-unknown → warn and continue best-effort — field
+        # additions across minor bumps are typically additive, so the
+        # entries we *can* parse are still worth registering.
+        schema_version = raw.get("schema_version")
+        if schema_version is not None and schema_version != POLLER_MANIFEST_SCHEMA_VERSION:
+            log.warning(
+                "poller_manifest_unknown_version: %s — got schema_version=%r, "
+                "expected %d; attempting best-effort parse",
+                pollers_file,
+                schema_version,
+                POLLER_MANIFEST_SCHEMA_VERSION,
+            )
+
+        entries = raw.get("pollers")
+        if not isinstance(entries, list):
+            log.warning(
+                "poller_invalid_format: %s — 'pollers' must be a list",
+                pollers_file,
+            )
+            if invalid_entries is not None:
+                invalid_entries.append((
+                    pollers_file, "<manifest>", "'pollers' must be a list",
+                ))
+            continue
+
+        for entry_index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        f"entry[{entry_index}]",
+                        "entry must be a mapping",
+                    ))
+                continue
+            name_raw = entry.get("name")
+            command_raw = entry.get("command")
+            cron_raw = entry.get("cron")
+            deliver_raw = entry.get("deliver")
+            name = (name_raw.strip() or None) if isinstance(name_raw, str) else None
+            command = (
+                (command_raw.strip() or None)
+                if isinstance(command_raw, str) else None
+            )
+            cron = (cron_raw.strip() or None) if isinstance(cron_raw, str) else None
+            deliver = (
+                (deliver_raw.strip() or None)
+                if isinstance(deliver_raw, str) else None
+            )  # chainlink #508
+            if not name or not command or not cron:
+                log.warning(
+                    "poller_missing_fields: %s — entry %r",
+                    pollers_file, entry,
+                )
+                if invalid_entries is not None:
+                    missing = [
+                        field for field, value in (
+                            ("name", name), ("command", command), ("cron", cron),
+                        ) if not value
+                    ]
+                    invalid_entries.append((
+                        pollers_file,
+                        name or f"entry[{entry_index}]",
+                        f"missing required field(s): {', '.join(missing)}",
+                    ))
+                continue
+            try:
+                _validate_path_component(name, label="poller name")
+                _validate_poller_identity(name, pollers_file, plugin_owner=plugin_owner)
+            except ValueError as exc:
+                log.warning(
+                    "poller_invalid_name: %s name=%r — %s; poller not registered",
+                    pollers_file, name, exc,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((pollers_file, name, str(exc)))
+                continue
+            hooks_raw = entry.get("hooks")
+            try:
+                hooks = resolve_poller_hooks(
+                    hooks_raw, pollers_file, policy=policy, plugin_owner=plugin_owner,
+                )
+            except ValueError as exc:
+                log.warning(
+                    "poller_hooks_rejected: %s name=%r — %s; poller not registered",
+                    pollers_file, name, exc,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((pollers_file, name, str(exc)))
+                continue
+            expected_hooks = reserved_hook_profile_for_name(name)
+            if expected_hooks is not None and hooks_raw is None:
+                log.warning(
+                    "poller_hooks_undeclared: %s name=%r expected_profile=%r — "
+                    "poller registered without reserved recovery hooks",
+                    pollers_file, name, expected_hooks,
+                )
+                try:
+                    log_event_sync(
+                        "poller_hooks_undeclared",
+                        path=str(pollers_file),
+                        poller=name,
+                        expected_profile=expected_hooks,
+                    )
+                except Exception:  # telemetry must not interrupt discovery
+                    pass
+            misplaced_authority = (set(entry) & POLLER_AUTHORITY_FIELDS) - {"authority"}
+            if misplaced_authority:
+                log.warning(
+                    "poller_authority_rejected: %s name=%r — authority fields must "
+                    "be inside authority: %s",
+                    pollers_file, name, ", ".join(sorted(misplaced_authority)),
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "authority fields must be inside authority: "
+                        f"{', '.join(sorted(misplaced_authority))}",
+                    ))
+                continue
+            # chainlink #420: duplicate-name guard. ``log.warning``
+            # (sync context, same as the other discovery warnings —
+            # ``log_event`` is async and there may be no loop here).
+            if name in seen_names and seen_names[name] == packaged_seeds.get(pollers_file):
+                # Expected pair: the inventory-matched home seed already
+                # registered this name, so its packaged original is redundant.
+                log.debug(
+                    "poller_packaged_default_superseded: %s name=%r by seed %s",
+                    pollers_file, name, seen_names[name],
+                )
+                continue
+            if name in seen_names:
+                log.warning(
+                    "poller_duplicate_name: %s declares name=%r already "
+                    "taken by %s; skipping duplicate (first occurrence "
+                    "wins)",
+                    pollers_file, name, seen_names[name],
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        f"duplicate name already declared by {seen_names[name]}",
+                    ))
+                continue
+            env_raw = entry.get("env", {})
+            if not isinstance(env_raw, dict):
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file, name, "env must be a mapping; ignored",
+                    ))
+                env_raw = {}
+            pass_env_raw = entry.get("pass_env", [])
+            if not isinstance(pass_env_raw, list):
+                log.warning(
+                    "poller_invalid_pass_env: %s name=%r value=%r "
+                    "(expected list of strings); ignoring",
+                    pollers_file, name, pass_env_raw,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "pass_env must be a list of strings; ignored",
+                    ))
+                pass_env_raw = []
+            pass_env_clean: list[str] = []
+            for item in pass_env_raw:
+                if not isinstance(item, str):
+                    log.warning(
+                        "poller_invalid_pass_env_item: %s name=%r "
+                        "item=%r (expected string); skipping",
+                        pollers_file, name, item,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"pass_env item {item!r} is not a string; skipped",
+                        ))
+                    continue
+                key = item.strip()
+                if key:
+                    pass_env_clean.append(key)
+            # chainlink #108: env_required — names the poller needs in its env.
+            env_required_raw = entry.get("env_required", [])
+            if not isinstance(env_required_raw, list):
+                log.warning(
+                    "poller_invalid_env_required: %s name=%r value=%r "
+                    "(expected list of strings); ignoring",
+                    pollers_file, name, env_required_raw,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "env_required must be a list of strings; ignored",
+                    ))
+                env_required_raw = []
+            env_required_clean: list[str] = []
+            for item in env_required_raw:
+                if not isinstance(item, str):
+                    log.warning(
+                        "poller_invalid_env_required_item: %s name=%r "
+                        "item=%r (expected string); skipping",
+                        pollers_file, name, item,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"env_required item {item!r} is not a string; skipped",
+                        ))
+                    continue
+                key = item.strip()
+                if key:
+                    env_required_clean.append(key)
+            persist_dir: Path | None = None
+            if state_root is not None:
+                try:
+                    persist_dir = _resolve_direct_child(
+                        state_root / name,
+                        state_root,
+                        label=f"poller persist_dir for {name!r}",
+                    )
+                except (OSError, ValueError) as exc:
+                    log.warning(
+                        "poller_persist_dir_rejected: %s name=%r — %s; "
+                        "poller not registered",
+                        pollers_file, name, exc,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((pollers_file, name, str(exc)))
+                    continue
+            # Create the per-poller STATE_DIR at discovery time so
+            # operators can drop credentials (`.env`) and cursor seed
+            # files into a known location BEFORE the first cron tick
+            # fires. ``run_poller`` also mkdir's defensively at run
+            # time, but doing it here too means the dir is visible to
+            # ``ls`` immediately after ``reload_pollers`` / container
+            # boot — the operator doesn't have to wait for the cron
+            # schedule to mature.
+            if persist_dir is not None:
+                try:
+                    persist_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    log.warning(
+                        "poller_persist_dir_create_failed: %s name=%r "
+                        "persist_dir=%s — %s",
+                        pollers_file, name, persist_dir, exc,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"could not create persist directory: {exc}",
+                        ))
+                    continue
+            authority: ServicePrincipal | None = None
+            if "authority" in entry:
+                if schema_version not in (None, POLLER_MANIFEST_SCHEMA_VERSION):
+                    log.warning(
+                        "poller_authority_rejected: %s name=%r — authority cannot "
+                        "be interpreted under unknown schema_version=%r",
+                        pollers_file, name, schema_version,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            "authority cannot be interpreted under unknown "
+                            f"schema_version {schema_version!r}",
+                        ))
+                    continue
+                try:
+                    authority = _parse_poller_authority(
+                        entry["authority"],
+                        name=name,
+                        persist_dir=persist_dir or skill_dir,
+                        state_root=state_root,
+                        manifest_path=pollers_file,
+                        policy=policy,
+                        plugin_owner=plugin_owner,
+                    )
+                except (OSError, ValueError) as exc:
+                    log.warning(
+                        "poller_authority_rejected: %s name=%r — %s; poller not registered",
+                        pollers_file, name, exc,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((pollers_file, name, str(exc)))
+                    continue
+            # ``batch_size`` is optional; defaults to per-item-per-turn
+            # to preserve the open-strix-equivalent shape. Garbage
+            # values (negative, non-int, zero) fall back to default
+            # with a stderr-visible warning so a typo doesn't silently
+            # break batching for a skill the operator just installed.
+            #
+            # Discovery remains synchronous, so diagnostics are collected in
+            # ``invalid_entries`` and emitted by the scheduler on its loop.
+            batch_size = POLLER_BATCH_SIZE_DEFAULT
+            raw_batch = entry.get("batch_size", POLLER_BATCH_SIZE_DEFAULT)
+            try:
+                cand = int(raw_batch)
+                if cand >= 1:
+                    batch_size = cand
+                else:
+                    log.warning(
+                        "poller_invalid_batch_size: %s name=%r value=%r "
+                        "(expected positive int); using default %d",
+                        pollers_file, name, raw_batch,
+                        POLLER_BATCH_SIZE_DEFAULT,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"batch_size {raw_batch!r} is invalid; using default",
+                        ))
+            except (TypeError, ValueError):
+                log.warning(
+                    "poller_invalid_batch_size: %s name=%r value=%r "
+                    "(expected positive int); using default %d",
+                    pollers_file, name, raw_batch,
+                    POLLER_BATCH_SIZE_DEFAULT,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        f"batch_size {raw_batch!r} is invalid; using default",
+                    ))
+            # Recovery is opt-in; quoted false and invalid values must not enable it.
+            raw_recovery = entry.get("recover_failed_turns", False)
+            recover_failed_turns = _parse_override_bool(raw_recovery)
+            if recover_failed_turns is None:
+                recover_failed_turns = False
+                log.warning(
+                    "poller_invalid_recover_failed_turns: %s name=%r value=%r "
+                    "(expected a bool); using default False",
+                    pollers_file, name, raw_recovery,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file, name,
+                        f"recover_failed_turns {raw_recovery!r} is invalid; using default False",
+                    ))
+            # ``priority`` (priority-banded suppression): low | normal |
+            # high. Garbage values fall back to the default with a
+            # warning — a typo shouldn't silently promote a poller to
+            # ride through quota pressure (or demote it to shed early).
+            raw_priority = entry.get("priority")
+            priority = Priority.NORMAL
+            if raw_priority is not None:
+                priority = normalize_priority(raw_priority)
+                if not (
+                    isinstance(raw_priority, str)
+                    and raw_priority.strip().lower() == priority
+                ):
+                    log.warning(
+                        "poller_invalid_priority: %s name=%r value=%r "
+                        "(expected low|normal|high); using %r",
+                        pollers_file, name, raw_priority, priority,
+                    )
+                    if invalid_entries is not None:
+                        invalid_entries.append((
+                            pollers_file,
+                            name,
+                            f"priority {raw_priority!r} is invalid; using {priority!r}",
+                        ))
+            budget_rejections: list[str] = []
+            budget = parse_poller_budget_config(
+                entry.get("budget"),
+                source=pollers_file,
+                poller_name=name,
+                rejections=budget_rejections,
+            )
+            if invalid_entries is not None:
+                if budget_rejections:
+                    invalid_entries.append((
+                        pollers_file, name, "; ".join(budget_rejections),
+                    ))
+            raw_trust_source = entry.get("trust_source", "external")
+            trust_source = (
+                raw_trust_source.strip()
+                if isinstance(raw_trust_source, str)
+                else "external"
+            )
+            if trust_source not in _POLLER_TRUST_SOURCES:
+                log.warning(
+                    "poller_invalid_trust_source: %s name=%r value=%r; "
+                    "using fail-closed external",
+                    pollers_file, name, raw_trust_source,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        f"trust_source {raw_trust_source!r} is invalid; using 'external'",
+                    ))
+                trust_source = "external"
+            if trust_source == "tracker" and (
+                hooks is None or hooks.trust_attestor is None or batch_size != 1
+            ):
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "trust_source 'tracker' requires a trust-attestor hooks "
+                        "profile and batch_size 1; items fail closed",
+                    ))
+            seen_names[name] = pollers_file
+            if state_root is not None:
+                home = state_root.parent.parent
+                for path in refused_poller_write_paths(skill_dir, entry, home):
+                    log.warning(
+                        "poller_agent_write_vetoed: poller=%s path=%s; "
+                        "use this turn's scratch directory or a proposal worktree",
+                        name, path,
+                    )
+            pollers.append(
+                PollerConfig(
+                    name=name,
+                    command=command,
+                    cron=cron,
+                    env={str(k): str(v) for k, v in env_raw.items()},
+                    skill_dir=skill_dir,
+                    persist_dir=persist_dir,
+                    batch_size=batch_size,
+                    recover_failed_turns=recover_failed_turns,
+                    priority=priority,
+                    pass_env=tuple(pass_env_clean),
+                    trust_source=trust_source,
+                    env_required=tuple(env_required_clean),
+                    manifest_path=pollers_file,
+                    deliver=deliver,
+                    budget=budget,
+                    authority=authority,
+                    hooks=hooks,
+                ),
+            )
+
+    # Operator overrides (``<home>/pollers-overrides.yaml``): applied
+    # AFTER manifest parse + duplicate-name dedupe so the override keys
+    # win over whatever the skill shipped. Unknown poller names warn —
+    # a renamed/uninstalled poller shouldn't silently orphan its tuning.
+    overrides = load_poller_overrides(
+        overrides_path, rejections=invalid_entries,
+    )
+    if overrides:
+        by_name = {p.name for p in pollers}
+        for name in sorted(set(overrides) - by_name):
+            log.warning(
+                "poller_overrides_unknown_poller: %s — %r has no installed "
+                "poller; overrides not applied", overrides_path, name,
+            )
+            if invalid_entries is not None and overrides_path is not None:
+                invalid_entries.append((
+                    overrides_path, name, "override names no installed poller",
+                ))
+        pollers = [
+            _apply_poller_overrides(
+                p,
+                overrides[p.name],
+                source=overrides_path,
+                rejections=invalid_entries,
+            )
+            if p.name in overrides else p
+            for p in pollers
+        ]
+    # Check the runtime env model only after overrides replace env/pass_env.
+    schedulable = []
+    for poller in pollers:
+        if poller.env_required:
+            available = _poller_env_available_at_discovery(
+                env_raw=poller.env, pass_env=poller.pass_env,
+            )
+            missing = [key for key in poller.env_required if key not in available]
+            if missing:
+                log.warning(
+                    "poller_skipped_unset_env: %s name=%r — not scheduling; "
+                    "required env unset: %s",
+                    poller.manifest_path, poller.name, ", ".join(missing),
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        poller.manifest_path,
+                        poller.name,
+                        f"required environment unset: {', '.join(missing)}",
+                    ))
+                continue
+        schedulable.append(poller)
+    log.info(
+        "poller_priorities: %s",
+        json.dumps([
+            {
+                "name": p.name,
+                "priority": p.priority,
+                "source": (
+                    "operator_override" if "priority" in overrides.get(p.name, {})
+                    else "skill_default"
+                ),
+                "path": str(
+                    overrides_path if "priority" in overrides.get(p.name, {})
+                    else p.manifest_path
+                ),
+            }
+            for p in schedulable
+        ]),
+    )
+    return schedulable
+
+
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Kill a shell poller and any child process it spawned.
+
+    ``create_subprocess_shell`` starts a shell wrapper; killing only the
+    shell can leave the actual poller child holding stdout/stderr pipes
+    open, which makes timeout handling hang while drain tasks wait for
+    EOF. Pollers are launched in their own session, so POSIX platforms can
+    kill the whole process group. Fall back to ``proc.kill()`` where
+    process groups are unavailable.
+    """
+    # Once reaped, the PID/PGID may belong to an unrelated process. In
+    # particular an escaped descendant can overflow a pipe after reap.
+    if proc.returncode is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # pragma: no cover - non-POSIX fallback
+            proc.kill()
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+async def _drain_capped(
+    stream: "asyncio.StreamReader | None",
+    limit: int,
+    on_overflow: Callable[[], None],
+    on_line: Callable[[bytes], Awaitable[None]] | None = None,
+    *,
+    buffer: bytearray | None = None,
+) -> bytes:
+    """Read from *stream* up to *limit* bytes, then stop accumulating.
+
+    chainlink #258: bounds memory regardless of how much the subprocess
+    writes. Once cumulative output exceeds *limit*, invoke *on_overflow*
+    (which kills the process so both pipes EOF) and keep draining to EOF
+    but discard the excess — so the killed process's pipe closes cleanly
+    without buffering gigabytes. Returns the first *limit* bytes.
+    """
+    if stream is None:
+        return b""
+    buf = buffer if buffer is not None else bytearray()
+    line_buf = bytearray()
+    overflowed = False
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        if not overflowed:
+            accepted = chunk[: max(0, limit - len(buf))]
+            buf.extend(chunk)
+            if len(buf) > limit:
+                del buf[limit:]
+                overflowed = True
+                on_overflow()
+            if on_line is not None:
+                line_buf.extend(accepted)
+                while b"\n" in line_buf:
+                    line, _, remainder = line_buf.partition(b"\n")
+                    line_buf = bytearray(remainder)
+                    await on_line(bytes(line))
+        # Past the cap: keep reading to EOF (the kill closes the pipe
+        # shortly) but discard — never grow `buf` beyond `limit`.
+    if on_line is not None and line_buf and not overflowed:
+        await on_line(bytes(line_buf))
+    return bytes(buf)
+
+
+async def run_poller(
+    poller: PollerConfig,
+    *,
+    enqueue: Callable[..., Awaitable[bool]],
+    timeout: float = POLLER_TIMEOUT_SECONDS,
+    home: Path | None = None,
+    operator_notice: Callable[[str], Awaitable[None]] | None = None,
+    operator_live_notice: Callable[[str, str], Awaitable[None]] | None = None,
+) -> int:
+    """Run one poller subprocess; parse its stdout JSONL; enqueue
+    each emitted event. Returns the count of events successfully
+    enqueued (excludes dispatcher-rejected events; those land in
+    ``poller_event_rejected`` events for back-pressure auditing).
+    Timeouts retain stderr diagnostics but discard events (the child may
+    not have committed its cursor); errors and silence return 0.
+
+    **Command parsing**: ``poller.command`` is parsed by ``/bin/sh -c``
+    via ``asyncio.create_subprocess_shell``. Shell features (env-var
+    expansion, pipes, redirection) are available — and skill authors
+    are responsible for quoting args that contain whitespace or shell
+    metacharacters (``"python scripts/poller.py 'arg with spaces'"`` —
+    NOT ``"python scripts/poller.py arg with spaces"``). For arg-handling
+    safety, prefer compiling the script to a single binary or quoting
+    consistently in ``pollers.json``.
+
+    **Subprocess hygiene**: a ``finally`` block ensures the process is
+    killed and reaped on every exit path (timeout, exception, normal
+    completion), so cancellation mid-run doesn't leak orphan
+    subprocesses or kernel-side zombies on long-lived mimir processes.
+
+    ``home`` is the authoritative agent home path supplied by the scheduler
+    from ``Config.home``. It is injected as ``MIMIR_HOME`` for pollers that
+    need to resolve files under the agent home without depending on host env.
+
+    Logs ``poller_complete`` (or ``poller_timeout`` for partial ticks) at the end so the operator
+    can audit "did the poll cycle run?" even when nothing was emitted.
+    The complete event carries both ``events_emitted`` (successful
+    enqueues) and ``events_rejected`` (dispatcher said no, indicating
+    queue back-pressure) so a mismatch between them is grep-able.
+    """
+    # --- Circuit-breaker guard -------------------------------------------
+    # Check whether this poller is currently suspended due to consecutive
+    # failures.  When the circuit is open we skip the subprocess entirely
+    # and emit a ``poller_circuit_open`` event so events.jsonl shows the
+    # suppression (operator can see "poller X is tripped" without needing
+    # to wonder why it went silent).
+    _cb = _circuit_breakers.setdefault(poller.name, _CircuitBreakerState())
+    _now = time.monotonic()
+    if _cb.disabled_until > _now:
+        _remaining = int(_cb.disabled_until - _now)
+        await log_event(
+            "poller_circuit_open",
+            poller=poller.name,
+            remaining_seconds=_remaining,
+            consecutive_failures=_cb.consecutive_failures,
+        )
+        return 0
+    # --- End circuit-breaker guard ----------------------------------------
+
+    persist_dir = poller.resolved_persist_dir()
+    relevance_check = (
+        poller.hooks.recovery_relevance(poller)
+        if poller.hooks is not None
+        and poller.hooks.recovery_relevance is not None
+        else None
+    )
+
+    async def enqueue_for_delivery(event: AgentEvent) -> bool:
+        if relevance_check is None:
+            return await enqueue(event)
+        return await enqueue(event, relevance_check=relevance_check)
+
+    async def enqueue_recovered(event: AgentEvent) -> bool:
+        accepted = await enqueue_for_delivery(event)
+        if accepted:
+            items = event.extra.get("items") if isinstance(event.extra, dict) else None
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        await asyncio.to_thread(
+                            _write_delivery_receipt,
+                            persist_dir,
+                            item.get("delivery_key"),
+                        )
+        return accepted
+
+    # Lazy-create the persist dir on first use. Skill authors who
+    # write a cursor file to STATE_DIR can rely on the dir existing.
+    try:
+        persist_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        await log_event(
+            "poller_persist_dir_create_failed",
+            poller=poller.name,
+            persist_dir=str(persist_dir),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        # Fall through; the subprocess might handle a missing dir,
+        # OR fail and surface as poller_nonzero_exit.
+
+    # CR2 (external I/O) fix: previously this passed ``{**os.environ,
+    # **poller.env}`` — the entire mimir process env (including
+    # MIMIR_API_KEY, ANTHROPIC_API_KEY, DISCORD_TOKEN,
+    # SLACK_BOT_TOKEN, GITHUB_TOKEN, etc.) flowed to every poller
+    # subprocess. A buggy poller that printed ``env`` to stderr would
+    # leak every secret to events.jsonl (truncated to 2000 chars but
+    # still). Skill authors don't expect their poller scripts to
+    # inherit these, and we shouldn't expand the trust boundary
+    # unnecessarily.
+    #
+    # Allowlist: shell/locale basics, XDG paths, CA bundles, TMPDIR.
+    # PR #111 review widening — initial allowlist was too narrow and
+    # would break common pollers (``gh`` users with custom XDG,
+    # custom-CA containers, noexec-/tmp setups). Skill authors who need
+    # additional keys use manifest ``env``, manifest ``pass_env``, or the
+    # global ``MIMIR_POLLER_ENV_ALLOWLIST``. Keep this path in sync with
+    # ``_poller_env_available_at_discovery``.
+    allowed_env = _BUILTIN_POLLER_ENV_ALLOWLIST | _extra_poller_env_allowlist()
+    env = {
+        k: v for k, v in os.environ.items()
+        if _allowed_poller_env_key(k, allowed=allowed_env)
+    }
+    explicit_env_redact_keys: set[str] = set()
+    # Per-poller pass_env (chainlink #82 sub #83/#85): explicit
+    # whitelist of env keys that bypass the deny-suffix/deny-prefix
+    # filter AND the built-in allowlist. This is how pollers get
+    # secrets (``GITHUB_TOKEN``) and ``MIMIR_*``-prefixed knobs
+    # (``MIMIR_GITHUB_SELF_LOGIN``) — the global
+    # ``MIMIR_POLLER_ENV_ALLOWLIST`` does NOT bypass the deny filter,
+    # so it can't be used for any ``*_TOKEN`` key. It's also the path
+    # for arbitrary non-secret keys not in ``_BUILTIN_ALLOWLIST``
+    # (e.g. ``GITHUB_REPOS``): pass_env's job is "give the poller these
+    # keys regardless of deny / allowlist gating," not specifically
+    # "bypass the deny filter."
+    #
+    # **Precedence**: a key in ``pass_env`` that's ALSO in the
+    # allowlist-filtered env unconditionally replaces the allowlist
+    # value here (``env[key] = os.environ[key]``). No built-in
+    # allowlist key currently matches a typical ``pass_env`` shape,
+    # but operators re-declaring ``PATH`` / ``HOME`` etc. in
+    # ``pass_env`` for emphasis will see their ``os.environ`` value
+    # take precedence over whatever the allowlist filter selected.
+    # The ``env`` overlay (``poller.env``) below wins over both —
+    # that's the explicit literal-value path and the highest
+    # precedence by design.
+    #
+    # Keys named in pass_env whose names match a deny pattern emit a
+    # ``poller_env_passthrough_named_secret`` event for visibility
+    # (operators get a paper trail of "this poller pulls a secret
+    # named env var through"); the value is not logged. Keys named
+    # here that aren't set in os.environ are silently skipped — that
+    # absence is itself the operator's signal that the env var wasn't
+    # provisioned.
+    for key in poller.pass_env:
+        # chainlink #229: hard-deny process-control / loader vars BEFORE
+        # the os.environ check, so the deny fires even when the var is
+        # set in os.environ (the only interesting case from a security
+        # standpoint — if it's unset, propagation is moot).
+        if key in _PROCESS_CONTROL_ENV_DENY:
+            await log_event(
+                "poller_env_process_control_blocked",
+                poller=poller.name,
+                key=key,
+            )
+            continue
+        if key not in os.environ:
+            continue
+        if is_sensitive_otlp_env(key, os.environ[key]):
+            continue
+        env[key] = os.environ[key]
+        explicit_env_redact_keys.add(key)
+        if any(key.endswith(s) for s in _DENY_ENV_SUFFIXES) or any(
+            key.startswith(p) for p in _DENY_ENV_PREFIXES
+        ):
+            await _log_poller_named_secret_once(
+                poller=poller.name,
+                key=key,
+            )
+    # Explicit per-skill ``env`` overlay still wins — EXCEPT for the
+    # chainlink #229 process-control hard-denies (chainlink #421). The
+    # manifest map is literal operator config, but it's also the one
+    # env surface a malicious/compromised skill fully controls; an
+    # ``env: {"LD_PRELOAD": ...}`` entry would hijack the loader of
+    # every subsequent run. The #95 check below only matches
+    # secret-NAME patterns (and only warns), so the hard-deny has to
+    # fire here, at assembly time — same block-and-surface contract as
+    # the pass_env loop above: key logged, value never.
+    for key, value in poller.env.items():
+        if key in _PROCESS_CONTROL_ENV_DENY:
+            await log_event(
+                "poller_env_process_control_blocked",
+                poller=poller.name,
+                key=key,
+            )
+            continue
+        if is_sensitive_otlp_env(key, value):
+            env.pop(key, None)
+            continue
+        env[key] = value
+        explicit_env_redact_keys.add(key)
+    # chainlink #95: warn when poller.env re-introduces a key whose name
+    # matches the deny-list patterns.  ``pass_env`` is the documented path
+    # for forwarding live secrets from os.environ; ``poller.env`` is the
+    # literal-value path meant for static config — not secrets.  Operators
+    # who accidentally write ``env: { MY_API_KEY: "${MY_API_KEY}" }`` in
+    # pollers.json re-expose a denied key without realising it (the
+    # ``${…}`` is NOT shell-expanded — pollers.py coerces values to str
+    # at parse time, so the literal string "${MY_API_KEY}" reaches the
+    # subprocess, which is confusing but also signals the operator put
+    # the wrong thing in ``env``).  Emit a negative event so the algedonic
+    # block surfaces this configuration smell.  The value is NOT logged.
+    for key in poller.env:
+        if any(key.endswith(s) for s in _DENY_ENV_SUFFIXES) or any(
+            key.startswith(p) for p in _DENY_ENV_PREFIXES
+        ):
+            await log_event(
+                "poller_env_secret_reintroduced",
+                poller=poller.name,
+                key=key,
+            )
+    explicit_env_redact_keys.difference_update(_NON_SECRET_FORWARDED_ENV_KEYS)
+    env["STATE_DIR"] = str(persist_dir)
+    env["POLLER_NAME"] = poller.name
+    # Let a poller bound its own work against the cap it will actually be killed
+    # at, rather than duplicating the constant. Injected like the vars above, so
+    # it is not subject to ``pass_env`` gating.
+    # ``:g`` keeps whole values clean ("120") while preserving fractional ones
+    # ("0.5"). ``int()`` truncated 0.5 to "0", so a poller sizing its deadlines
+    # from this would have read a cap of zero.
+    env["POLLER_TIMEOUT_SECONDS"] = f"{float(timeout):g}"
+    # Scheduler passes Config.home here. Direct test/niche callers that omit
+    # it still get a deterministic home path from the install layout
+    # (``<home>/skills/<skill>`` → home) rather than reading
+    # os.environ["MIMIR_HOME"], which may be absent or stale when mimir is
+    # launched with --home.
+    env["MIMIR_HOME"] = str(
+        home if home is not None else poller.skill_dir.parent.parent
+    )
+    env = filter_otlp_env(env)
+
+    # Framework recovery of prior lost/failed turns. Before this cycle's
+    # subprocess poll, reconcile in-flight events against turn outcomes.
+    # Share the assembled fire environment so attestation credentials obey
+    # the same filtering, pass_env and literal-overlay precedence rules.
+    # Recovery remains independent of env_required and cannot break polling.
+    _events_path = get_events_path()
+    if _events_path is not None:
+        try:
+            authority = poller.resolved_authority()
+            _rec = await poller_recovery.reconcile_failed_turns(
+                poller_name=poller.name,
+                channel_id=poller.channel_id(),
+                persist_dir=persist_dir,
+                events_path=_events_path,
+                enqueue=enqueue_recovered,
+                service_principal=authority.canonical,
+                service_authority=authority,
+                trust_source=poller.trust_source,
+                github_token=env.get("GITHUB_TOKEN", ""),
+                github_self_login=env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+                trust_attestor=poller.hooks.trust_attestor if poller.hooks else None,
+                attestor_env=env,
+                attestation_redact=lambda text: _redact_poller_env_values(
+                    text, env, explicit_env_redact_keys,
+                ),
+                recover_failed_turns=poller.recover_failed_turns,
+                relevance_check=relevance_check,
+            )
+            if _rec["state_unreadable"]:
+                await log_event(
+                    "poller_recovery_state_unreadable",
+                    poller=poller.name,
+                    path=_rec["state_unreadable"],
+                )
+            if any(
+                _rec[key]
+                for key in (
+                    "reenqueued", "gave_up", "expired", "dropped", "stale_dropped",
+                )
+            ):
+                await log_event(
+                    "poller_recovery",
+                    poller=poller.name,
+                    reenqueued=_rec["reenqueued"],
+                    completed=_rec["completed"],
+                    gave_up=_rec["gave_up"],
+                    unclean_reenqueued=_rec["unclean_reenqueued"],
+                    expired=_rec["expired"],
+                    dropped=_rec["dropped"],
+                    stale_dropped=_rec["stale_dropped"],
+                )
+        except Exception as exc:  # noqa: BLE001 — recovery must not break polling
+            log.warning(
+                "poller recovery: reconcile failed for %s: %s",
+                poller.name, exc,
+            )
+
+    # chainlink #108: env_required validation — check after the env dict is
+    # fully assembled (allowlist + pass_env + poller.env + injected vars).
+    # Missing vars mean "don't run this tick and surface an algedonic signal."
+    # The operator sees the event, provisions the var, and the next tick runs
+    # cleanly.  We collect ALL missing names (not short-circuit) so the
+    # operator can fix them all in one pass.
+    if poller.env_required:
+        missing = [k for k in poller.env_required if k not in env]
+        if missing:
+            await log_event(
+                "poller_missing_required_env",
+                poller=poller.name,
+                missing=missing,
+            )
+            return 0
+
+    delivery_barriers_accepted: set[str] = set()
+
+    async def _accept_delivery_barrier(line: bytes) -> None:
+        """Accept barrier signals while the poller is still running.
+
+        A barrier receipt is the poller's permission to begin later destructive
+        or detached work. All other output retains the normal process-exit
+        transaction boundary.
+        """
+        try:
+            parsed = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(parsed, dict) or parsed.get("delivery_barrier") is not True:
+            return
+        signal_name = parsed.get("signal")
+        delivery_key = parsed.get("delivery_key")
+        if (
+            not isinstance(signal_name, str)
+            or not signal_name.strip()
+            or not isinstance(delivery_key, str)
+            or not delivery_key
+            or len(delivery_key) > 512
+            or delivery_key in delivery_barriers_accepted
+        ):
+            return
+        # Tracker output never takes the mid-run path: the post-exit path
+        # rewrites tracker signals to fixed fields, and an early write here
+        # would persist the raw payload.
+        if poller.trust_source == "tracker" or signal_name.strip() in TRACKER_SIGNALS:
+            return
+        payload = {
+            k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
+            if isinstance(v, str) else v
+            for k, v in parsed.items()
+            if k not in (
+                "signal", "poller", "prompt", "event_type", "delivery_barrier",
+            )
+        }
+        try:
+            # The receipt is the child's permission to begin detached dispatch, so
+            # the alert it acknowledges must be durable FIRST. log_event() is
+            # best-effort: not fsynced, and EventLogger.log() swallows write
+            # failures internally, so a receipt could outlive an alert that was
+            # never written -- reopening the permanent-loss window this barrier
+            # exists to close. log_durable_sync() fsyncs and propagates failure.
+            await asyncio.to_thread(
+                get_logger().log_durable_sync,
+                signal_name.strip(),
+                poller=poller.name,
+                **payload,
+            )
+            await asyncio.to_thread(_write_delivery_receipt, persist_dir, delivery_key)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "poller %r: delivery barrier emit failed (%s); record not acknowledged",
+                poller.name,
+                exc,
+            )
+            return
+        delivery_barriers_accepted.add(delivery_key)
+
+    proc: asyncio.subprocess.Process | None = None
+    stdout_bytes = b""
+    stderr_bytes = b""
+    fatal_error: str | None = None
+    timed_out = False
+    drains: list[asyncio.Task[bytes]] = []
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    try:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                poller.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(poller.skill_dir),
+                env=filter_otlp_env(env),
+                start_new_session=True,
+            )
+            # chainlink #258: drain stdout/stderr with hard byte ceilings
+            # rather than communicate() (which buffers the WHOLE stream
+            # before any cap), so a runaway poller can't OOM mimir. On
+            # overflow we kill the process — both pipes EOF, the drains
+            # finish — and treat the tick as a failure instead of acting on
+            # truncated output.
+            _overflow = {"hit": False}
+
+            def _on_overflow() -> None:
+                if not _overflow["hit"]:
+                    _overflow["hit"] = True
+                    _kill_process_group(proc)
+
+            stdout_task = asyncio.create_task(
+                _drain_capped(
+                    proc.stdout,
+                    MAX_POLLER_STDOUT_BYTES,
+                    _on_overflow,
+                    _accept_delivery_barrier,
+                    buffer=stdout_buffer,
+                ),
+            )
+            stderr_task = asyncio.create_task(
+                _drain_capped(
+                    proc.stderr, MAX_POLLER_STDERR_BYTES, _on_overflow,
+                    buffer=stderr_buffer,
+                ),
+            )
+            drains = [stdout_task, stderr_task]
+            _, pending = await asyncio.wait(
+                {stdout_task, stderr_task}, timeout=timeout,
+            )
+            if pending:
+                timed_out = True
+                _kill_process_group(proc)
+                # An escaped descendant can retain pipe writers after SIGKILL.
+                # wait_for cancels both drains; their capped buffers survive.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(stdout_task, stderr_task),
+                        timeout=POLLER_EXIT_GRACE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    for task in drains:
+                        task.cancel()
+            stdout_bytes = bytes(stdout_buffer) if stdout_task.cancelled() else stdout_task.result()
+            stderr_bytes = bytes(stderr_buffer) if stderr_task.cancelled() else stderr_task.result()
+            # chainlink #410: the ``asyncio.wait`` above bounds only the
+            # pipe drains. Both drains hitting EOF means the child closed
+            # its fds, not that it exited — a poller that closes stdout/
+            # stderr and keeps running would hang a bare ``wait()`` here
+            # with the caller's semaphore slot pinned. Bound the reap and
+            # route an overrun into the existing timeout path
+            # (``poller_timeout`` event + circuit-breaker failure).
+            try:
+                await asyncio.wait_for(
+                    proc.wait(),
+                    timeout=min(POLLER_EXIT_GRACE_SECONDS, timeout),
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+                _kill_process_group(proc)
+            if _overflow["hit"]:
+                await log_event(
+                    "poller_output_overflow",
+                    poller=poller.name,
+                    stdout_limit_bytes=MAX_POLLER_STDOUT_BYTES,
+                    stderr_limit_bytes=MAX_POLLER_STDERR_BYTES,
+                )
+                if _cb_record_failure(poller.name):
+                    await log_event(
+                        "poller_circuit_tripped",
+                        poller=poller.name,
+                        consecutive_failures=_circuit_breakers[
+                            poller.name
+                        ].consecutive_failures,
+                        backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                        reason="output_overflow",
+                    )
+                return 0
+            if timed_out:
+                raise asyncio.TimeoutError
+        except asyncio.TimeoutError:
+            if _cb_record_failure(poller.name):
+                await log_event(
+                    "poller_circuit_tripped",
+                    poller=poller.name,
+                    consecutive_failures=_circuit_breakers[poller.name].consecutive_failures,
+                    backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                    reason="timeout",
+                )
+            # The child may not have committed its cursor. Delivering even
+            # complete records would duplicate turns when the next tick retries.
+            stdout_bytes = b""
+        except Exception as exc:  # noqa: BLE001 — never let a poller break the scheduler
+            fatal_error = f"{type(exc).__name__}: {exc}"
+            await log_event(
+                "poller_exec_error",
+                poller=poller.name,
+                error=fatal_error,
+            )
+            if _cb_record_failure(poller.name):
+                await log_event(
+                    "poller_circuit_tripped",
+                    poller=poller.name,
+                    consecutive_failures=_circuit_breakers[poller.name].consecutive_failures,
+                    backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                    reason="exec_error",
+                )
+            return 0
+    finally:
+        for task in drains:
+            if not task.done():
+                task.cancel()
+        if drains:
+            await asyncio.gather(*drains, return_exceptions=True)
+        if proc is not None:
+            # Process has no public pipe-close API. Close our read transports,
+            # not the escaped writer's process, to release descriptors and let
+            # asyncio's process waiter complete even without pipe EOF.
+            for fd in (1, 2):
+                transport = proc._transport.get_pipe_transport(fd)
+                if transport is not None:
+                    transport.close()
+        # Kill + reap on every exit path. The ``returncode is None``
+        # gate makes this a no-op on the happy path (process already
+        # exited via ``communicate``); on timeout or exception it
+        # ensures we don't leak orphans / zombies.
+        if proc is not None and proc.returncode is None:
+            _kill_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=POLLER_EXIT_GRACE_SECONDS)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                pass
+
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+    tracker_non_code_lines: int | None = None
+    if stderr_text and poller.trust_source == "tracker":
+        stderr_lines = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()]
+        code_lines = [ln for ln in stderr_lines if TRACKER_STDERR_CODE_RE.fullmatch(ln)]
+        tracker_non_code_lines = len(stderr_lines) - len(code_lines)
+        stderr_text = "\n".join(code_lines)
+    if stderr_text or tracker_non_code_lines:
+        # Include the subprocess exit code so downstream readers can
+        # distinguish diagnostic progress noise (exit_code=0, e.g. ``gh``
+        # writing auth progress to stderr on a successful run) from actual
+        # errors (exit_code != 0). Without this field every stderr emission
+        # looks like a failure in events.jsonl — chainlink #93.
+        await log_event(
+            "poller_stderr",
+            poller=poller.name,
+            stderr=(await asyncio.to_thread(
+                _redact_poller_env_values,
+                stderr_text,
+                env,
+                explicit_env_redact_keys,
+            ))[:POLLER_STDERR_LOG_CHARS],
+            exit_code=proc.returncode if proc is not None else None,
+            **(
+                {"non_code_lines": tracker_non_code_lines}
+                if tracker_non_code_lines is not None else {}
+            ),
+        )
+
+    if not timed_out and (proc is None or proc.returncode != 0):
+        await log_event(
+            "poller_nonzero_exit",
+            poller=poller.name,
+            returncode=proc.returncode if proc is not None else None,
+        )
+        if _cb_record_failure(poller.name):
+            await log_event(
+                "poller_circuit_tripped",
+                poller=poller.name,
+                consecutive_failures=_circuit_breakers[poller.name].consecutive_failures,
+                backoff_seconds=POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
+                reason="nonzero_exit",
+            )
+        return 0
+
+    # Clean exit (returncode == 0) — reset the circuit breaker.  This
+    # covers both the "has events" and "silent / no events" outcomes;
+    # both mean the subprocess ran to successful completion.
+    if not timed_out:
+        _cb_record_success(poller.name)
+        await asyncio.to_thread(_prune_delivery_receipts, poller, Path(env["MIMIR_HOME"]))
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+
+    # Phase 1: parse + clean every JSONL line into a list of items.
+    # Each item keeps its prompt and optional shared context separately;
+    # neither context nor framework keys are included in extras.
+    # When ``batch_size > 1`` a per-item soft cap also fires here so
+    # one chatty item can't starve others by consuming the whole
+    # batch-level prompt budget. Single-item batches (default) skip
+    # the per-item cap to preserve verbatim pass-through; the
+    # batch-level cap below handles single giant prompts.
+    items: list[dict[str, Any]] = []
+    # Per-item soft cap: divide the prompt budget across the batch,
+    # reserving a small slice (50 chars) per item for the numbered
+    # marker + newline overhead in the rendered batch. Floors at 100
+    # chars to keep tiny batch_sizes from collapsing items to nothing.
+    if poller.batch_size > 1:
+        per_item_cap: int | None = max(
+            100,
+            (POLLER_PROMPT_CHARS // poller.batch_size) - 50,
+        )
+    else:
+        per_item_cap = None
+    signals_emitted = len(delivery_barriers_accepted)
+    outsider_notices: list[str] = []
+    tracker_live_notices: list[tuple[str, str]] = []
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            if poller.trust_source == "tracker":
+                await log_event(
+                    "poller_invalid_line", poller=poller.name, chars=len(line),
+                )
+                continue
+            await log_event(
+                "poller_invalid_line",
+                poller=poller.name,
+                line=(await asyncio.to_thread(
+                    _redact_poller_env_values,
+                    line,
+                    env,
+                    explicit_env_redact_keys,
+                ))[:POLLER_INVALID_LINE_CHARS],
+            )
+            continue
+
+        if not isinstance(parsed, dict):
+            continue
+
+        if (
+            parsed.get("delivery_barrier") is True
+            and parsed.get("delivery_key") in delivery_barriers_accepted
+        ):
+            continue
+
+        # Signal-shaped record? Route to events.jsonl via log_event
+        # instead of building an AgentEvent. The ``signal`` value is
+        # the event_type; ``feedback._EVENT_RULES`` decides whether
+        # it surfaces algedonically. Unknown signal types still land
+        # in events.jsonl (grep-able for operator debugging) but
+        # don't enter the algedonic block.
+        #
+        # Strip-list rationale:
+        #   ``signal``      — discriminator, becomes the event_type arg
+        #   ``poller``      — re-stamped explicitly below
+        #   ``prompt``      — defensive: a record carrying both
+        #                     ``signal`` and ``prompt`` routes as
+        #                     signal-only; the ``prompt`` would be
+        #                     misleading in the payload
+        #   ``event_type``  — collides with ``log_event``'s positional
+        #                     parameter; without stripping, a payload
+        #                     key called ``event_type`` (e.g. a poller
+        #                     surfacing ``"event_type": "invalid_grant"``)
+        #                     would raise TypeError on the **payload
+        #                     expansion and the signal would drop
+        #                     silently. Mimir PR #235 nit.
+        signal_type = parsed.get("signal")
+        if isinstance(signal_type, str) and signal_type.strip():
+            signal_name = signal_type.strip()
+            if (
+                poller.trust_source == "tracker"
+                and signal_name not in TRACKER_SIGNALS
+                and signal_name != "poller_usage"
+            ):
+                await log_event(
+                    "poller_signal_refused",
+                    poller=poller.name,
+                    signal=signal_name if re.fullmatch(r"[a-z_]{1,64}", signal_name) else "invalid",
+                )
+                continue
+            if signal_name == "poller_usage":
+                payload, invalid_reason = validate_poller_usage_signal(
+                    parsed,
+                    poller_name=poller.name,
+                )
+                if payload is None:
+                    await log_event(
+                        "poller_invalid_usage_signal",
+                        poller=poller.name,
+                        reason=invalid_reason or "invalid_usage_signal",
+                    )
+                    continue
+                payload = {
+                    k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
+                    if isinstance(v, str) else v
+                    for k, v in payload.items()
+                }
+                if poller.trust_source == "tracker" and not (
+                    isinstance(payload.get("source"), str)
+                    and TRACKER_STDERR_CODE_RE.fullmatch(payload["source"])
+                ):
+                    payload.pop("source", None)
+            else:
+                payload = {
+                    k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
+                    if isinstance(v, str) else v
+                    for k, v in parsed.items()
+                    if k not in (
+                        "signal", "poller", "prompt", "event_type", "delivery_barrier",
+                    )
+                }
+            tracker_title: str | None = None
+            tracker_fields: dict[str, str | None] | None = None
+            if signal_name in TRACKER_SIGNALS:
+                tracker_adapter = safe_adapter(payload.get("adapter"))
+                tracker_ref = safe_ref(payload.get("ref"))
+                tracker_url = safe_url(payload.get("url"), tracker_ref)
+                if signal_name == "tracker_transition_unavailable" and payload.get("url") == "":
+                    tracker_url = ""
+                raw_reason = payload.get("reason")
+                if signal_name == "tracker_issue_withheld":
+                    raw_title = payload.get("title")
+                    tracker_title = raw_title if isinstance(raw_title, str) else None
+                    payload = {
+                        "adapter": tracker_adapter,
+                        "ref": tracker_ref,
+                        "url": tracker_url,
+                        "reason": (
+                            raw_reason
+                            if isinstance(raw_reason, str) and raw_reason in WITHHELD_REASONS
+                            else "withheld"
+                        ),
+                    }
+                else:
+                    lifecycle = payload.get("lifecycle_event")
+                    payload = {
+                        "adapter": tracker_adapter,
+                        "ref": tracker_ref,
+                        "url": tracker_url,
+                        "lifecycle_event": (
+                            lifecycle
+                            if isinstance(lifecycle, str) and lifecycle in LIFECYCLE_EVENTS
+                            else None
+                        ),
+                        "reason": (
+                            raw_reason
+                            if isinstance(raw_reason, str) and raw_reason in NOTICE_REASONS
+                            else "failed"
+                        ),
+                    }
+                tracker_fields = payload
+            if signal_name in {
+                "github_outsider_issue_withheld",
+                "pr_auto_review_skipped_untrusted_author",
+                "github_issue_notice",
+            }:
+                repo = payload.get("repo")
+                number = payload.get("number")
+                title = payload.get("title")
+                author_trusted = payload.get("author_trusted") is True
+                payload = {
+                    "repo": repo if isinstance(repo, str) and _safe_signal_url(
+                        f"https://github.com/{repo}/issues/1", repo,
+                    ) else None,
+                    "number": number if type(number) is int and number > 0 else None,
+                    "author": _safe_signal_login(payload.get("author")),
+                    "url": _safe_signal_url(payload.get("url"), repo),
+                }
+                if signal_name == "github_issue_notice":
+                    from .prompt_safety import sanitize_prompt_field
+
+                    payload["title"] = sanitize_prompt_field(title or "")
+                    payload["author_trusted"] = author_trusted
+            try:
+                # Same ordering rule as the mid-run barrier: the receipt durably
+                # acknowledges this signal, so the signal must be durable first.
+                # log_event() is best-effort and swallows write failures.
+                await asyncio.to_thread(
+                    get_logger().log_durable_sync,
+                    signal_name,
+                    poller=poller.name,
+                    **payload,
+                )
+                await asyncio.to_thread(
+                    _write_delivery_receipt, persist_dir, parsed.get("delivery_key"),
+                )
+                signals_emitted += 1
+                if (
+                    tracker_fields is not None
+                    and poller.trust_source == "tracker"
+                    and tracker_fields["adapter"]
+                    and tracker_fields["ref"]
+                    and tracker_fields["url"] is not None
+                ):
+                    if signal_name == "tracker_issue_withheld":
+                        tracker_live_notices.append(withheld_lines(
+                            tracker_fields["adapter"], tracker_fields["ref"],
+                            tracker_fields["url"], tracker_fields["reason"],
+                            tracker_title,
+                        ))
+                    else:
+                        outsider_notices.append(transition_line(
+                            tracker_fields["adapter"], tracker_fields["ref"],
+                            tracker_fields["url"],
+                            tracker_fields["lifecycle_event"] or "unknown",
+                            tracker_fields["reason"],
+                        ))
+                if poller.name in {"github-activity", "github-ci-watch"} and signal_name in {
+                    "github_outsider_issue_withheld",
+                    "pr_auto_review_skipped_untrusted_author",
+                    "github_issue_notice",
+                }:
+                    from .bridges._mentions import neutralize_display_name
+
+                    repo = payload.get("repo")
+                    url = _safe_signal_url(payload.get("url"), repo)
+                    if url:
+                        login = neutralize_display_name(
+                            _safe_signal_login(payload.get("author")),
+                        )
+                        if signal_name == "github_issue_notice":
+                            # Titles stay exclusively in authenticated Signals
+                            # UI/events storage, never bot-authored history.
+                            prefix = ("GitHub issue notice" if payload["author_trusted"]
+                                      else "Outsider issue withheld")
+                            outsider_notices.append(f"{prefix}: {login} {url}")
+                        else:
+                            kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
+                            outsider_notices.append(f"Outsider {kind} withheld: {login} {url}")
+            except Exception as exc:  # noqa: BLE001
+                # log_event should be best-effort but defend against
+                # an unexpected payload shape (non-string keys, etc.)
+                # tripping the JSONL writer.
+                log.warning(
+                    "poller %r: signal emit failed (%s); record dropped",
+                    poller.name, exc,
+                )
+            continue
+
+        prompt = str(parsed.get("prompt", "")).strip()
+        if not prompt:
+            continue
+
+        # Mask before either prompt cap can leave a partial secret behind.
+        prompt = _redact_poller_env_values(prompt, env, explicit_env_redact_keys)
+        raw_context = parsed.get("batch_context")
+        context = None
+        if isinstance(raw_context, str):
+            context = _redact_poller_env_values(raw_context, env, explicit_env_redact_keys)
+            context_cap = POLLER_PROMPT_CHARS // 2
+            if len(context) > context_cap:
+                await log_event(
+                    "poller_prompt_truncated",
+                    poller=poller.name,
+                    original_chars=len(context),
+                    scope="batch_context",
+                )
+                context = context[:context_cap - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+        # Per-item cap: only when batch_size > 1. Prevents one runaway
+        # item from starving others in a batched render. Marks the
+        # truncation as ``scope=per_item`` so an operator can tell it
+        # apart from the batch-level cap below.
+        if per_item_cap is not None and len(prompt) > per_item_cap:
+            await log_event(
+                "poller_prompt_truncated",
+                poller=poller.name,
+                original_chars=len(prompt),
+                scope="per_item",
+            )
+            prompt = _keep_item_tail(prompt, per_item_cap)
+
+        # Strip the framework-required keys before stuffing the rest
+        # into AgentEvent.extra so downstream prompt rendering can
+        # surface platform-specific metadata (source_platform, urls,
+        # etc.) without colliding with the AgentEvent dataclass shape.
+        extras = {
+            k: v for k, v in parsed.items()
+            if k not in ("prompt", "batch_context", "poller", "integrity", "integrity_effect")
+        }
+        items.append({"prompt": prompt, "extras": extras,
+                      "context_key": raw_context if isinstance(raw_context, str) else None,
+                      "batch_context": context})
+
+    # Phase 2: first-arrival-ordered context groups, each chunked into
+    # batches of up to ``poller.batch_size``. The original context is the
+    # key: distinct instructions must not merge just because redaction or
+    # truncation happened to produce the same rendered text.
+    # ``max(1, ...)`` is defense-in-depth: ``discover_pollers``
+    # already filters non-positive values, but tests construct
+    # ``PollerConfig`` directly bypassing that path.
+    batch_size = max(1, poller.batch_size)
+    groups: dict[str | None, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(item["context_key"], []).append(item)
+    batches: list[list[dict[str, Any]]] = [
+        group[i:i + batch_size]
+        for group in groups.values()
+        for i in range(0, len(group), batch_size)
+    ]
+    # Per-fire timestamp scoped to source_id — disambiguates events
+    # across overlapping fires (manual fire racing a scheduled fire,
+    # two scheduled ticks delivered out-of-order). ms granularity is
+    # enough for any realistic fire cadence; no risk of collision in
+    # practice.
+    fire_ts_ms = int(time.time() * 1000)
+    github_trust_cache: dict[tuple[str, str], bool] = {}
+    # chainlink #1441 review: an unresolved attestation is retryable, but the retry
+    # must be BOUNDED. This loop runs after the subprocess drains, so
+    # POLLER_TIMEOUT_SECONDS does not cover it and scheduler.py awaits run_poller()
+    # without wait_for while holding a poller semaphore slot. Unbounded, a large
+    # same-author batch under a GitHub outage or rate limit turns into O(items)
+    # attestation calls at up to 2 x 10s each, pinning that slot. One retry per
+    # (repo, author) per fire keeps the #1441 requirement -- a later event does
+    # re-resolve -- while capping the amplification at a constant.
+    github_trust_attempts: dict[tuple[str, str], int] = {}
+    github_fire = _GithubFireAttestation()
+
+    def attest_in_fire(function, *args):
+        # Only these sequential worker calls share the budget. Reset even on
+        # failure so neither other fires nor later executor work inherit it.
+        token = _github_fire_attestation.set(github_fire)
+        try:
+            return function(*args)
+        finally:
+            _github_fire_attestation.reset(token)
+
+    # Phase 3: assemble + dispatch each batch as one AgentEvent.
+    event_count = 0
+    rejected_count = 0
+    # One immutable principal serves every batch of this fire.
+    authority = poller.resolved_authority()
+    service_principal = f"service:{authority.canonical}"
+    tracker_budget = _TrackerAttestationBudget(
+        TRACKER_ATTESTATIONS_PER_FIRE, TRACKER_ATTESTATION_SECONDS_PER_FIRE,
+    )
+    for batch_idx, batch in enumerate(batches):
+        if poller.trust_source == "tracker":
+            batch = await _attest_tracker_batch(
+                poller,
+                batch,
+                env,
+                redact=lambda text: _redact_poller_env_values(
+                    text, env, explicit_env_redact_keys,
+                ),
+                attest_in_fire=attest_in_fire,
+                budget=tracker_budget,
+            )
+            if not batch:
+                continue
+        if poller.name == "github-activity":
+            batch = _drop_superseded_github_framework_items(batch)
+            if not batch:
+                continue
+        content = _render_batch(poller.name, batch, batch_idx, len(batches))
+        # Apply the prompt cap once more on the assembled batch — even
+        # with per-item caps, ``batch_size × cap`` could exceed the
+        # prompt-build budget on a worst-case fire.
+        if len(content) > POLLER_PROMPT_CHARS:
+            await log_event(
+                "poller_prompt_truncated",
+                poller=poller.name,
+                original_chars=len(content),
+                batch_index=batch_idx,
+                scope="batch",
+            )
+            # Re-render after cutting *items*, not the assembled string: a
+            # head-first cut can erase every later item's decisive last line.
+            content = _fit_batch(poller.name, batch, batch_idx, len(batches))
+
+        # Per-batch extra. ``items`` carries per-item metadata so the
+        # agent can react to specific items without re-parsing the
+        # rendered prompt. ``batch_index`` / ``batch_count`` let
+        # multi-batch fires identify "this is part 2 of 3" without
+        # the agent having to read the prompt header.
+        extra: dict[str, Any] = {
+            "poller_name": poller.name,
+            "batch_index": batch_idx,
+            "batch_count": len(batches),
+            "items": [item["extras"] for item in batch],
+        }
+        if poller.deliver:  # chainlink #508 — raw value; resolved at turn time
+            extra["deliver"] = poller.deliver
+        channel_id = poller.channel_id()
+        item_labels = InformationFlowLabels()
+        for item in batch:
+            item_extras = item["extras"]
+            trusted = poller.trust_source == "trusted_system"
+            if poller.trust_source == "tracker":
+                trusted = item_extras.get("tracker_attested") is True
+            if poller.trust_source == "github":
+                repo = item_extras.get("repo")
+                event_type = item_extras.get("event_type")
+                trusted = False
+                if event_type in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES:
+                    # These contain repository facts computed by the poller, not
+                    # third-party prose. Trust still requires a matching live,
+                    # agent-owned PR; active ingest remains recorded below.
+                    trusted = await run_in_pool(
+                        _ATTESTATION_POOL,
+                        attest_in_fire,
+                        _github_framework_trigger_is_trusted,
+                        repo,
+                        item_extras,
+                        env.get("GITHUB_TOKEN", ""),
+                        env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+                    )
+                elif event_type in _GITHUB_ACTOR_EVENT_TYPES:
+                    author = await run_in_pool(
+                        _ATTESTATION_POOL,
+                        attest_in_fire,
+                        _github_content_author,
+                        repo,
+                        item_extras,
+                        env.get("GITHUB_TOKEN", ""),
+                    )
+                    cache_key = (
+                        repo if isinstance(repo, str) else "",
+                        author if isinstance(author, str) else "",
+                    )
+                    if cache_key in github_trust_cache:
+                        trusted = github_trust_cache[cache_key]
+                    elif (
+                        github_trust_attempts.get(cache_key, 0)
+                        >= GITHUB_TRUST_ATTEMPTS_PER_FIRE
+                    ):
+                        # Budget spent for this key in this fire. Fail closed
+                        # without another request; the next fire starts fresh.
+                        trusted = None
+                    else:
+                        github_trust_attempts[cache_key] = (
+                            github_trust_attempts.get(cache_key, 0) + 1
+                        )
+                        resolved_trust = await run_in_pool(
+                            _ATTESTATION_POOL,
+                            attest_in_fire,
+                            _github_author_is_trusted,
+                            repo,
+                            author,
+                            env.get("GITHUB_TOKEN", ""),
+                        )
+                        # Unknown still fails closed for this event, but is not a
+                        # durable verdict: a later event in the fire may retry,
+                        # up to GITHUB_TRUST_ATTEMPTS_PER_FIRE.
+                        trusted = resolved_trust
+                        if resolved_trust is not None:
+                            github_trust_cache[cache_key] = resolved_trust
+                    # Replace any subprocess claims with the server-attested
+                    # actor and verdict consumed by PR scope authorization.
+                    item_extras["actor"] = author
+                    item_extras["author_is_trusted"] = trusted is True
+            item_labels = item_labels.with_source(SourceLabel(
+                principal=service_principal,
+                domain="channel",
+                resource_id=channel_id,
+                bridge_instance="poller",
+                sensitivity="internal",
+                authorized_principals=frozenset({service_principal}),
+                source_kind="service",
+                integrity="trusted" if trusted else "untrusted",
+                integrity_effect="active_ingest",
+            ))
+        event = AgentEvent(
+            trigger="poller",
+            channel_id=channel_id,
+            service_principal=authority.canonical,
+            service_authority=authority,
+            content=content,
+            source="poller",
+            source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
+            extra=_redact_poller_payload(extra, env, explicit_env_redact_keys),
+            # Stamp provenance before recovery stashes the event. Retries now
+            # round-trip the exact service label instead of rebuilding it from
+            # ambient state after a failed turn.
+            ifc_labels=item_labels,
+        )
+        enqueued_at = datetime.now(tz=timezone.utc).isoformat()
+        try:
+            accepted = await enqueue_for_delivery(event)
+        except Exception as exc:  # noqa: BLE001
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at, pending_enqueue=True,
+            )
+            await log_event(
+                "poller_enqueue_error",
+                poller=poller.name,
+                error=f"{type(exc).__name__}: {exc}",
+                batch_index=batch_idx,
+            )
+            continue
+        if accepted:
+            event_count += 1
+            # Best-effort durable handoff: every accepted poller event is
+            # stashed so an unclean restart cannot erase the in-memory turn.
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at,
+            )
+            for item in batch:
+                await asyncio.to_thread(
+                    _write_delivery_receipt,
+                    persist_dir,
+                    item["extras"].get("delivery_key"),
+                )
+        else:
+            rejected_count += 1
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at, pending_enqueue=True,
+            )
+            # Back-pressure observability: when the dispatcher refuses
+            # an event (queue cap hit, channel saturated, etc.) record
+            # it so the events_emitted vs events_rejected gap on
+            # poller_complete is grep-able. Truncated preview keeps
+            # events.jsonl small for chatty pollers.
+            if poller.trust_source == "tracker":
+                await log_event(
+                    "poller_event_rejected",
+                    poller=poller.name,
+                    prompt_chars=len(content),
+                    batch_index=batch_idx,
+                )
+            else:
+                await log_event(
+                    "poller_event_rejected",
+                    poller=poller.name,
+                    prompt_preview=_redact_poller_env_values(
+                        content,
+                        env,
+                        explicit_env_redact_keys,
+                    )[:POLLER_REJECTION_PREVIEW_CHARS],
+                    batch_index=batch_idx,
+                )
+
+    # ``events_emitted`` counts AgentEvents enqueued (= batches that
+    # the dispatcher accepted). Pre-batching it counted parsed JSONL
+    # lines, which was 1:1 with items. With ``batch_size > 1`` the
+    # two diverge: ``items_collected`` is the per-item count (what
+    # the old field meant) and ``events_emitted`` is now the per-
+    # turn count (= batches enqueued, what the agent actually sees).
+    # Operator queries reading ``events_emitted`` for "how many items
+    # came in?" should switch to ``items_collected``; queries asking
+    # "how many turns will this fire?" stay on ``events_emitted``.
+    if tracker_live_notices and not timed_out:
+        if operator_live_notice is not None:
+            try:
+                await operator_live_notice(
+                    "\n".join(live for live, _ in tracker_live_notices),
+                    "\n".join(free for _, free in tracker_live_notices),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "poller tracker live notice delivery failed (%s)", type(exc).__name__,
+                )
+        else:
+            outsider_notices.extend(free for _, free in tracker_live_notices)
+    if outsider_notices and operator_notice is not None and not timed_out:
+        try:
+            await operator_notice("\n".join(outsider_notices))
+        except Exception:
+            log.warning("poller outsider operator notice delivery failed", exc_info=True)
+    await log_event(
+        "poller_timeout" if timed_out else "poller_complete",
+        poller=poller.name,
+        events_emitted=event_count,
+        events_rejected=rejected_count,
+        items_collected=len(items),
+        batches_emitted=len(batches),
+        signals_emitted=signals_emitted,
+        **({
+            "timeout_seconds": int(timeout),
+            "events_recovered": event_count,
+        } if timed_out else {}),
+    )
+    return event_count
+
+
+def _keep_item_tail(prompt: str, limit: int) -> str:
+    """Cut the middle of an item while preserving its decisive suffix."""
+    if len(prompt) <= limit:
+        return prompt
+    available = max(0, limit - len(_TRUNCATION_MARKER))
+    tail_len = min(_ITEM_TAIL_CHARS, available)
+    return prompt[:available - tail_len] + _TRUNCATION_MARKER + prompt[-tail_len:]
+
+
+def _fit_batch(
+    poller_name: str, batch: list[dict[str, Any]], index: int, count: int,
+) -> str:
+    """Fit the rendered batch by shrinking items, retaining their tails."""
+    working = [dict(item) for item in batch]
+    content = _render_batch(poller_name, working, index, count)
+    # Rendering inserts indentation on continuation lines, so measure the
+    # actual result after each cut rather than estimating prompt lengths.
+    while len(content) > POLLER_PROMPT_CHARS:
+        excess = len(content) - POLLER_PROMPT_CHARS
+        candidates = [item for item in working
+                      if len(item["prompt"]) > _ITEM_TAIL_CHARS + len(_TRUNCATION_MARKER)]
+        if not candidates:
+            # Pathological batch_size values may leave insufficient room for
+            # 600 chars per item. Preserve as much of each suffix as fits.
+            candidates = [item for item in working
+                          if len(item["prompt"]) > len(_TRUNCATION_MARKER) + 1]
+        if not candidates:
+            break
+        item = max(candidates, key=lambda entry: len(entry["prompt"]))
+        minimum = (_ITEM_TAIL_CHARS if len(item["prompt"]) > _ITEM_TAIL_CHARS + len(_TRUNCATION_MARKER)
+                   else 1) + len(_TRUNCATION_MARKER)
+        item["prompt"] = _keep_item_tail(
+            item["prompt"], max(minimum, len(item["prompt"]) - excess),
+        )
+        content = _render_batch(poller_name, working, index, count)
+    # If the header/markers alone exceed the budget (e.g. hundreds of
+    # one-character items), no representation can preserve every item.
+    return content[:POLLER_PROMPT_CHARS] if len(content) > POLLER_PROMPT_CHARS else content
+
+
+def _render_batch(
+    poller_name: str,
+    batch: list[dict[str, Any]],
+    batch_index: int,
+    batch_count: int,
+) -> str:
+    """Render a batch of items into the prompt body for one
+    ``AgentEvent``. Single-item batches return the item's prompt
+    verbatim — preserves the open-strix-equivalent rendering for
+    pollers with ``batch_size=1`` (default). Multi-item batches
+    render with a header (``poller-name reported N items``) and a
+    numbered list of per-item prompts so the agent can scan + react
+    to specific items.
+
+    Multi-batch fires (when ``batch_count > 1``) include a "batch X
+    of Y" suffix on the header so the agent can tell the rest of the
+    items are coming on subsequent turns and decide whether to wait
+    or act on each batch independently.
+    """
+    context = batch[0].get("batch_context")
+    if len(batch) == 1:
+        return (context + "\n\n" if context is not None else "") + batch[0]["prompt"]
+    header = f"{poller_name} reported {len(batch)} items"
+    if batch_count > 1:
+        header += f" (batch {batch_index + 1} of {batch_count})"
+    header += ":"
+    body_lines = [header]
+    # Width of the largest marker — left-pad smaller numbers so
+    # ``" 1. "`` and ``"10. "`` align in batches that cross 10 items.
+    # Continuation indent matches the marker width + 2 (period +
+    # space) so multi-line item prompts stay visually grouped under
+    # their parent.
+    width = len(str(len(batch)))
+    cont_indent = " " * (width + 2)
+    for i, item in enumerate(batch, start=1):
+        item_lines = item["prompt"].splitlines() or [""]
+        body_lines.append(f"{i:>{width}}. {item_lines[0]}")
+        for tail in item_lines[1:]:
+            body_lines.append(f"{cont_indent}{tail}")
+    rendered = "\n".join(body_lines)
+    return context + "\n\n" + rendered if context is not None else rendered
+
+
+__all__ = (
+    "PollerConfig",
+    "discover_pollers",
+    "run_poller",
+    "POLLER_TIMEOUT_SECONDS",
+    "POLLER_EXIT_GRACE_SECONDS",
+    "POLLER_PROMPT_CHARS",
+    "POLLER_CIRCUIT_BREAKER_THRESHOLD",
+    "POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS",
+    "_circuit_breakers",  # exposed for tests + introspection; prefixed as internal
+)

@@ -1,0 +1,2110 @@
+"""Tests for mimir.saga.migrations (chainlink #242, Phase 1).
+
+The migration registry and applier moved out of saga/client.py into a
+dedicated module. SagaStore-via-monkeypatch coverage lives in
+test_saga_correctness_regressions.py; these tests pin the
+module-level surface directly.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+import sqlite3
+
+import pytest
+
+from mimir.saga import migrations as m
+
+
+def _create_unstamped_v4_db(
+    db_path: Path,
+    *,
+    include_observations_metadata: bool = True,
+    include_triples: bool = True,
+) -> None:
+    """Create the structural v4 shape used by real-open migration tests."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE atoms (
+            id TEXT PRIMARY KEY, content TEXT NOT NULL,
+            content_hash TEXT NOT NULL, source_type TEXT DEFAULT 'conversation',
+            metadata TEXT DEFAULT '{}', tombstoned INTEGER DEFAULT 0,
+            agent_id TEXT DEFAULT 'default', session_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, channel_id TEXT, started_at TEXT NOT NULL,
+            ended_at TEXT, summary TEXT, reflected_at TEXT,
+            topics_discussed TEXT NOT NULL DEFAULT '[]',
+            decisions_made TEXT NOT NULL DEFAULT '[]',
+            unfinished TEXT NOT NULL DEFAULT '[]', emotional_state TEXT,
+            closed_since TEXT NOT NULL DEFAULT '[]', embedding BLOB,
+            embedding_dim INTEGER
+        );
+        CREATE TABLE access_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, atom_id TEXT NOT NULL,
+            ts TEXT NOT NULL, source TEXT NOT NULL, weight REAL DEFAULT 1.0,
+            session_id TEXT, metadata TEXT DEFAULT '{}'
+        );
+        CREATE TABLE atom_access_summary (
+            atom_id TEXT PRIMARY KEY, recent_ts_json TEXT DEFAULT '[]',
+            recent_weights_json TEXT DEFAULT '[]', old_count INTEGER DEFAULT 0,
+            old_weight_sum REAL DEFAULT 0.0, old_oldest_ts TEXT,
+            last_updated_ts TEXT
+        );
+        CREATE TABLE embeddings (
+            atom_id TEXT PRIMARY KEY, provider TEXT NOT NULL,
+            model TEXT NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL,
+            embedded_at TEXT NOT NULL
+        );
+        CREATE TABLE atom_topics (
+            atom_id TEXT NOT NULL, topic TEXT NOT NULL,
+            PRIMARY KEY (atom_id, topic)
+        );
+        CREATE TABLE atom_relations (
+            source_id TEXT NOT NULL, target_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL, confidence REAL DEFAULT 1.0,
+            created_at TEXT NOT NULL, metadata TEXT DEFAULT '{}',
+            PRIMARY KEY (source_id, target_id, relation_type)
+        );
+        """
+    )
+    if include_observations_metadata:
+        conn.execute(
+            "CREATE TABLE observations_metadata ("
+            "atom_id TEXT PRIMARY KEY, evidence_count INTEGER DEFAULT 0, "
+            "trend TEXT, last_evidence_at TEXT, consolidated_at TEXT NOT NULL, "
+            "consolidation_session TEXT)"
+        )
+    if include_triples:
+        conn.execute(
+            "CREATE TABLE triples ("
+            "id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL, "
+            "object TEXT NOT NULL, source_atom_id TEXT, confidence REAL DEFAULT 1.0, "
+            "valid_from TEXT, valid_until TEXT, embedding BLOB, "
+            "embedding_dim INTEGER, tombstoned INTEGER DEFAULT 0, "
+            "created_at TEXT NOT NULL, metadata TEXT DEFAULT '{}')"
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestModuleSurface:
+    def test_current_schema_version_is_int(self) -> None:
+        assert isinstance(m.CURRENT_SCHEMA_VERSION, int)
+        assert m.CURRENT_SCHEMA_VERSION >= 6
+
+    def test_migrations_dict_is_contiguous_from_2(self) -> None:
+        """Adding a v7 migration MUST be the only change needed to bump
+        the schema version; tightly contiguous keys make that contract
+        explicit."""
+        keys = sorted(m.MIGRATIONS.keys())
+        assert keys == list(range(2, m.CURRENT_SCHEMA_VERSION + 1)), (
+            f"MIGRATIONS keys must be contiguous 2..{m.CURRENT_SCHEMA_VERSION}, "
+            f"got {keys}"
+        )
+
+    def test_all_migrations_are_non_empty_sql(self) -> None:
+        for version, ddl in m.MIGRATIONS.items():
+            assert isinstance(ddl, str), f"migration {version} not a string"
+            assert ddl.strip(), f"migration {version} is empty"
+
+
+class TestDetectSchemaVersion:
+    def test_no_sessions_table_returns_v1(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        assert m.detect_schema_version(conn) == 1
+
+    def test_bare_sessions_returns_v2(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+        assert m.detect_schema_version(conn) == 2
+
+    def test_sessions_with_topics_returns_v3(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, topics_discussed TEXT)"
+        )
+        assert m.detect_schema_version(conn) == 3
+
+    def test_sessions_with_embedding_returns_v4(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, topics_discussed TEXT, "
+            "embedding_dim INTEGER)"
+        )
+        assert m.detect_schema_version(conn) == 4
+
+    def test_access_events_fk_returns_v6(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE atoms (id TEXT PRIMARY KEY)")
+        conn.execute(
+            "CREATE TABLE access_events ("
+            "id INTEGER PRIMARY KEY, atom_id TEXT, "
+            "FOREIGN KEY (atom_id) REFERENCES atoms(id))"
+        )
+        assert m.detect_schema_version(conn) == 6
+
+    def test_atoms_visibility_returns_v7(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE atoms (id TEXT PRIMARY KEY, visibility TEXT)")
+        assert m.detect_schema_version(conn) == 7
+
+    def test_atom_provenance_columns_return_v10(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE atoms (id TEXT PRIMARY KEY, integrity TEXT, "
+            "origin_trigger TEXT, origin_ref TEXT)"
+        )
+        assert m.detect_schema_version(conn) == 10
+
+    def test_query_indexes_return_v11(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE triples (id TEXT, created_at TEXT, tombstoned INTEGER, embedding BLOB);"
+            "CREATE TABLE sessions (id TEXT, channel_id TEXT, ended_at TEXT, reflected_at TEXT);"
+            + m.MIGRATIONS[11]
+        )
+        assert m.detect_schema_version(conn) == 11
+
+    def test_v12_schema_version_stamp_returns_v12(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT);"
+            "INSERT INTO schema_version VALUES (12, '2026-08-30T00:00:00+00:00');"
+        )
+        assert m.detect_schema_version(conn) == 12
+
+    def test_v13_marker_returns_v13(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE atoms (integrity TEXT);" + m.MIGRATIONS[13]
+        )
+        assert m.detect_schema_version(conn) == 13
+
+    def test_missing_session_backfill_targets_data_repair_through_real_open(
+        self, tmp_path: Path
+    ) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "missing-session-backfill.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, source_type, metadata, session_id, created_at) "
+            "VALUES (?, ?, ?, 'session_boundary', ?, ?, ?)",
+            (
+                "b1",
+                "Decided to migrate ACP to feature/acp; Jason approved",
+                "boundary-hash",
+                '{"topics_discussed":["ACP"],"decisions_made":["migrate"]}',
+                "sess-1",
+                "2026-08-15T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO embeddings "
+            "(atom_id, provider, model, dim, vec, embedded_at) "
+            "VALUES ('b1', 'stub', 'stub-1d', 1, x'01020304', "
+            "'2026-08-15T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, source_type, created_at, "
+            "owner_principal, origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('o1', 'private observation', 'observation-hash', "
+            "'observation', '2026-08-15T00:00:00+00:00', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO observations_metadata "
+            "(atom_id, evidence_count, consolidated_at, owner_principal, "
+            "origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('o1', 1, '2026-08-15T00:00:00+00:00', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO triples "
+            "(id, subject, predicate, object, source_atom_id, created_at, "
+            "owner_principal, origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('t1', 'Jason', 'uses', 'ACP', 'o1', "
+            "'2026-08-15T00:00:00+00:00', 'U_jason', 'slack:C1', "
+            "'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        conn.commit()
+
+        ownership_sql = (
+            "owner_principal, origin_channel, origin_domain, visibility, provenance"
+        )
+        expected_ownership = (
+            "U_jason", "slack:C1", "workspace:T1", "private", '{"k":1}'
+        )
+        assert m.detect_schema_version(conn) == m.CURRENT_SCHEMA_VERSION
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM observations_metadata WHERE atom_id = 'o1'"
+        ).fetchone() == expected_ownership
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM triples WHERE id = 't1'"
+        ).fetchone() == expected_ownership
+        conn.close()
+
+        migrated = SagaStore(db_path=db_path)._ensure_conn()
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM atoms WHERE source_type = 'session_boundary'"
+        ).fetchone() == (0,)
+        assert migrated.execute(
+            "SELECT summary, topics_discussed, decisions_made, embedding, "
+            "embedding_dim FROM sessions WHERE id = 'sess-1'"
+        ).fetchone() == (
+            "Decided to migrate ACP to feature/acp; Jason approved",
+            '["ACP"]',
+            '["migrate"]',
+            b"\x01\x02\x03\x04",
+            1,
+        )
+        assert {
+            row[0] for row in migrated.execute("SELECT version FROM schema_version")
+        } == set(range(1, m.CURRENT_SCHEMA_VERSION + 1))
+        atom_ownership = migrated.execute(
+            f"SELECT {ownership_sql} FROM atoms WHERE id = 'o1'"
+        ).fetchone()
+        assert migrated.execute(
+            f"SELECT {ownership_sql} FROM observations_metadata WHERE atom_id = 'o1'"
+        ).fetchone() == expected_ownership
+        assert migrated.execute(
+            f"SELECT {ownership_sql} FROM triples WHERE id = 't1'"
+        ).fetchone() == expected_ownership
+        assert atom_ownership == expected_ownership
+
+
+class TestApplyPendingMigrations:
+    def test_fresh_true_stamps_target_only(self) -> None:
+        """``fresh=True`` means ``schema.sql`` just ran — the table shape
+        is at *target_version*, so just stamp without applying any DDL."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        m.apply_pending_migrations(
+            conn,
+            fresh=True,
+            target_version=3,
+            migrations={2: "SELECT 1; ", 3: "SELECT 2; "},
+        )
+        versions = {r[0] for r in conn.execute(
+            "SELECT version FROM schema_version"
+        )}
+        assert versions == {3}
+
+    def test_uses_custom_detector(self) -> None:
+        """Tests can pass an instance-bound detector so monkey-patching
+        per-instance is honored."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        # Create the log table that our custom migration script writes to.
+        conn.execute("CREATE TABLE _log (v INTEGER)")
+        detector_called = []
+
+        def _fake_detector(c: sqlite3.Connection) -> int:
+            detector_called.append(c)
+            return 2  # report DB as already at v2
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=3,
+            migrations={2: "INSERT INTO _log VALUES (2);",
+                        3: "INSERT INTO _log VALUES (3);"},
+            detector=_fake_detector,
+        )
+        assert detector_called == [conn]
+        # v2 baseline was stamped from the detector, only v3 DDL ran.
+        log = {r[0] for r in conn.execute("SELECT v FROM _log")}
+        assert log == {3}, f"expected only v3 to run, got {log}"
+
+    def test_default_detector_used_when_omitted(self) -> None:
+        """No detector argument → uses the module-level
+        :func:`detect_schema_version`."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        # No sessions table → detect_schema_version returns 1.
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=1,  # nothing to apply, just stamp
+            migrations={},
+        )
+        versions = {r[0] for r in conn.execute(
+            "SELECT version FROM schema_version"
+        )}
+        assert versions == {1}
+
+    def test_unstamped_add_column_migration_can_be_replayed(self) -> None:
+        """Regression for an interrupted v4 migration.
+
+        Older migration code ran ``executescript(ddl)`` and stamped
+        ``schema_version`` afterward. If the process died after v4's
+        ``ALTER TABLE`` statements but before the v4 stamp committed, the
+        next open retried v4 and raised ``duplicate column name``.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                emotional_state TEXT,
+                closed_since TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                embedding_dim INTEGER
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (3, '2000-01-01T00:00:00+00:00');
+            """
+        )
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=4,
+            migrations={4: m.MIGRATIONS[4]},
+        )
+
+        versions = {r[0] for r in conn.execute(
+            "SELECT version FROM schema_version"
+        )}
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+        assert versions == {3, 4}
+        assert columns.count("embedding") == 1
+        assert columns.count("embedding_dim") == 1
+
+    def test_failed_migration_rolls_back_ddl_and_stamp_together(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (1, '2000-01-01T00:00:00+00:00');
+            """
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            m.apply_pending_migrations(
+                conn,
+                fresh=False,
+                target_version=2,
+                migrations={
+                    2: (
+                        "CREATE TABLE should_roll_back (id INTEGER);"
+                        "INSERT INTO missing_table VALUES (1);"
+                    ),
+                },
+            )
+
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='should_roll_back'"
+        ).fetchone()
+        versions = {r[0] for r in conn.execute(
+            "SELECT version FROM schema_version"
+        )}
+        assert table_exists is None
+        assert versions == {1}
+
+    def test_current_stamp_with_missing_ownership_columns_is_rejected(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            f"""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                ({m.CURRENT_SCHEMA_VERSION}, '2000-01-01T00:00:00+00:00');
+            CREATE TABLE atoms (id TEXT PRIMARY KEY);
+            """
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"schema_version reports version .*atoms\.visibility",
+        ):
+            m.apply_pending_migrations(conn, fresh=False)
+
+    def test_current_schema_with_current_stamp_is_unchanged(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (m.CURRENT_SCHEMA_VERSION, "2000-01-01T00:00:00+00:00"),
+        )
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchall() == [(m.CURRENT_SCHEMA_VERSION,)]
+
+    def test_detected_v8_incomplete_world_ownership_fails_after_migrations(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        ownership = """
+            owner_principal TEXT, origin_channel TEXT, origin_domain TEXT,
+            visibility TEXT, provenance TEXT
+        """
+        conn.executescript(
+            f"""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+            );
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY, content_hash TEXT, agent_id TEXT,
+                tombstoned INTEGER DEFAULT 0, created_at TEXT, {ownership}
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, channel_id TEXT, ended_at TEXT,
+                reflected_at TEXT, {ownership}
+            );
+            CREATE TABLE observations_metadata (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY, created_at TEXT,
+                tombstoned INTEGER DEFAULT 0, embedding BLOB, {ownership}
+            );
+            CREATE TABLE world_state (
+                id TEXT PRIMARY KEY, owner_principal TEXT,
+                origin_channel TEXT, visibility TEXT
+            );
+            """
+        )
+
+        assert m.detect_schema_version(conn) == 8
+        with pytest.raises(
+            RuntimeError,
+            match=r"world_state\.origin_domain.*world_state\.provenance",
+        ):
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone() == (m.CURRENT_SCHEMA_VERSION,)
+
+    def test_add_column_migration_identifies_missing_table(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO schema_version VALUES "
+            "(6, '2000-01-01T00:00:00+00:00')"
+        )
+
+        with pytest.raises(
+            sqlite3.OperationalError,
+            match="required table 'triples' does not exist",
+        ):
+            m.apply_pending_migrations(
+                conn,
+                fresh=False,
+                target_version=7,
+                migrations={
+                    7: "ALTER TABLE triples ADD COLUMN visibility TEXT;"
+                },
+            )
+
+
+class TestSagaStoreInitialization:
+    def test_zero_byte_file_gets_full_greenfield_schema(self, tmp_path: Path) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "empty.db"
+        db_path.touch()
+
+        conn = SagaStore(db_path=db_path)._ensure_conn()
+
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"atoms", "sessions", "schema_version"} <= tables
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone() == (m.CURRENT_SCHEMA_VERSION,)
+        assert [
+            row[2]
+            for row in conn.execute("PRAGMA index_info(idx_atoms_dedup)")
+        ] == ["content_hash", "agent_id", "owner_principal"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE tombstoned != 0"
+        ).fetchone() == (0,)
+
+    def test_partial_schema_does_not_commit_inferred_version_rows(
+        self, tmp_path: Path
+    ) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "partial.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, started_at TEXT NOT NULL, "
+            "topics_discussed TEXT NOT NULL DEFAULT '[]', "
+            "embedding BLOB, embedding_dim INTEGER)"
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(sqlite3.OperationalError):
+            SagaStore(db_path=db_path)._ensure_conn()
+
+        check = sqlite3.connect(db_path)
+        version_table = check.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone()
+        if version_table is not None:
+            assert check.execute("SELECT version FROM schema_version").fetchall() == []
+        check.close()
+
+
+class TestV5BoundaryCleanup:
+    def test_v5_refuses_without_session_backfill(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "v5-guard.db"
+        _create_unstamped_v4_db(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, source_type, session_id, created_at) "
+            "VALUES ('b1', 'boundary', 'hash', 'session_boundary', 'sess-1', "
+            "'2026-08-15T00:00:00+00:00')"
+        )
+        conn.commit()
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="session_boundary atom has no matching sessions row",
+        ):
+            m._execute_migration_script(conn, m.MIGRATIONS[5])
+        conn.rollback()
+        conn.close()
+
+        check = sqlite3.connect(db_path)
+        assert check.execute("SELECT id FROM atoms WHERE id = 'b1'").fetchone() == (
+            "b1",
+        )
+        check.close()
+
+
+class TestV6RebuildDataPreservation:
+    def test_v6_replay_preserves_complete_ownership_columns(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute(
+            "INSERT INTO schema_version VALUES "
+            "(5, '2000-01-01T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, created_at, owner_principal, "
+            "origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('o1', 'private observation', 'hash', '2024-01-01', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO observations_metadata "
+            "(atom_id, consolidated_at, owner_principal, origin_channel, "
+            "origin_domain, visibility, provenance) VALUES "
+            "('o1', '2024-01-01', 'U_jason', 'slack:C1', 'workspace:T1', "
+            "'private', '{\"k\":1}')"
+        )
+        conn.execute(
+            "INSERT INTO triples "
+            "(id, subject, predicate, object, source_atom_id, created_at, "
+            "owner_principal, origin_channel, origin_domain, visibility, provenance) "
+            "VALUES ('t1', 's', 'p', 'o', 'o1', '2024-01-01', "
+            "'U_jason', 'slack:C1', 'workspace:T1', 'private', '{\"k\":1}')"
+        )
+        ownership_sql = (
+            "owner_principal, origin_channel, origin_domain, visibility, provenance"
+        )
+        expected = ("U_jason", "slack:C1", "workspace:T1", "private", '{"k":1}')
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=6,
+            migrations={6: m.MIGRATIONS[6]},
+        )
+
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM observations_metadata"
+        ).fetchone() == expected
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM triples"
+        ).fetchone() == expected
+        assert conn.execute(
+            f"SELECT {ownership_sql} FROM atoms WHERE id = 'o1'"
+        ).fetchone() == expected
+
+    def test_v6_replay_refuses_partial_ownership_schema(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, "
+            "applied_at TEXT NOT NULL);"
+            "INSERT INTO schema_version VALUES "
+            "(5, '2000-01-01T00:00:00+00:00');"
+            "CREATE TABLE observations_metadata ("
+            "atom_id TEXT PRIMARY KEY, owner_principal TEXT);"
+            "CREATE TABLE triples (id TEXT PRIMARY KEY);"
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"migration v6 refused.*observations_metadata.*incomplete",
+        ):
+            m.apply_pending_migrations(
+                conn,
+                fresh=False,
+                target_version=6,
+                migrations={6: m.MIGRATIONS[6]},
+            )
+
+        assert conn.execute(
+            "PRAGMA table_info(observations_metadata)"
+        ).fetchall()[-1][1] == "owner_principal"
+
+    def test_v6_rebuild_preserves_populated_rows_exactly(self) -> None:
+        """Protect the CREATE/COPY/DROP/RENAME path from SELECT-* drift.
+
+        A new column on any v5 source table must not shift or break the v6
+        copy. This fixture includes every table rebuilt by v6, plus the SAGA
+        tables that must remain untouched, and compares all values before and
+        after the migration.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            CREATE TABLE atoms (id TEXT PRIMARY KEY);
+            INSERT INTO atoms VALUES ('a1'), ('a2');
+
+            CREATE TABLE access_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                atom_id TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                source TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                session_id TEXT,
+                metadata TEXT DEFAULT '{}'
+            );
+            INSERT INTO access_events VALUES
+                (7, 'a1', '2024-01-02', 'retrieval', 1.5, 's1', '{"event":1}');
+
+            CREATE TABLE atom_access_summary (
+                atom_id TEXT PRIMARY KEY,
+                recent_ts_json TEXT DEFAULT '[]',
+                recent_weights_json TEXT DEFAULT '[]',
+                old_count INTEGER DEFAULT 0,
+                old_weight_sum REAL DEFAULT 0.0,
+                old_oldest_ts TEXT,
+                last_updated_ts TEXT
+            );
+            INSERT INTO atom_access_summary VALUES
+                ('a1', '["2024-01-02"]', '[1.5]', 3, 2.5,
+                 '2023-01-01', '2024-01-03');
+
+            CREATE TABLE embeddings (
+                atom_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vec BLOB NOT NULL,
+                embedded_at TEXT NOT NULL
+            );
+            INSERT INTO embeddings VALUES
+                ('a1', 'stub', 'stub-2d', 2, X'0102', '2024-01-03');
+
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                evidence_count INTEGER DEFAULT 0,
+                trend TEXT,
+                last_evidence_at TEXT,
+                consolidated_at TEXT NOT NULL,
+                consolidation_session TEXT
+            );
+            INSERT INTO observations_metadata VALUES
+                ('a1', 4, 'stable', '2024-01-02', '2024-01-03', 's1');
+
+            CREATE TABLE atom_topics (
+                atom_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                PRIMARY KEY (atom_id, topic)
+            );
+            INSERT INTO atom_topics VALUES ('a1', 'migration');
+
+            CREATE TABLE atom_relations (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}',
+                PRIMARY KEY (source_id, target_id, relation_type)
+            );
+            INSERT INTO atom_relations VALUES
+                ('a1', 'a2', 'evidenced_by', 0.75, '2024-01-04', '{"rel":1}');
+
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                source_atom_id TEXT,
+                confidence REAL DEFAULT 1.0,
+                valid_from TEXT,
+                valid_until TEXT,
+                embedding BLOB,
+                embedding_dim INTEGER,
+                tombstoned INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}'
+            );
+            INSERT INTO triples VALUES
+                ('t1', 'subject', 'predicate', 'object', 'a1', 0.8,
+                 '2024-01-01', NULL, X'0304', 2, 0, '2024-01-05',
+                 '{"triple":1}');
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT,
+                reflected_at TEXT,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                emotional_state TEXT,
+                closed_since TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                embedding_dim INTEGER
+            );
+            INSERT INTO sessions VALUES
+                ('s1', 'channel-1', '2024-01-01', '2024-01-02', 'summary',
+                 '2024-01-03', '["topic"]', '["decision"]', '["todo"]',
+                 'focused', '["old"]', X'0506', 2);
+
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                (5, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        preserved = (
+            "access_events",
+            "atom_access_summary",
+            "embeddings",
+            "observations_metadata",
+            "atom_topics",
+            "atom_relations",
+            "triples",
+            "sessions",
+        )
+        before = {
+            table: conn.execute(f"SELECT * FROM {table}").fetchall()
+            for table in preserved
+        }
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=6,
+            migrations={6: m.MIGRATIONS[6]},
+        )
+
+        after = {
+            table: conn.execute(f"SELECT * FROM {table}").fetchall()
+            for table in preserved
+        }
+        assert after == before
+        assert conn.execute(
+            "SELECT version FROM schema_version ORDER BY version"
+        ).fetchall() == [(5,), (6,)]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }.issuperset(
+            {
+                "idx_access_atom_ts",
+                "idx_emb_provider",
+                "idx_topics_topic",
+                "idx_relations_source",
+                "idx_triples_spo",
+            }
+        )
+
+
+class TestV7OwnershipMigration:
+    def test_v7_adds_ownership_columns_to_atoms(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                closed_since TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                consolidated_at TEXT NOT NULL
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(atoms)")}
+        assert "owner_principal" in cols
+        assert "origin_channel" in cols
+        assert "origin_domain" in cols
+        assert "visibility" in cols
+        assert "provenance" in cols
+
+    def test_v7_sets_legacy_admin_visibility_default(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                closed_since TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                consolidated_at TEXT NOT NULL
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        conn.execute("INSERT INTO atoms VALUES ('a1', 'test', 'hash', '2024-01-01')")
+        conn.execute("INSERT INTO sessions VALUES ('s1', NULL, '2024-01-01', '[]', '[]', '[]', '[]')")
+        conn.execute("INSERT INTO observations_metadata VALUES ('a1', '2024-01-01')")
+        conn.execute("INSERT INTO triples VALUES ('t1', 'subj', 'pred', 'obj', '2024-01-01')")
+        conn.commit()
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+
+        atom_vis = conn.execute(
+            "SELECT visibility FROM atoms WHERE id = 'a1'"
+        ).fetchone()[0]
+        assert atom_vis == "legacy_admin"
+
+        sess_vis = conn.execute(
+            "SELECT visibility FROM sessions WHERE id = 's1'"
+        ).fetchone()[0]
+        assert sess_vis == "legacy_admin"
+
+        obs_vis = conn.execute(
+            "SELECT visibility FROM observations_metadata WHERE atom_id = 'a1'"
+        ).fetchone()[0]
+        assert obs_vis == "legacy_admin"
+
+        triple_vis = conn.execute(
+            "SELECT visibility FROM triples WHERE id = 't1'"
+        ).fetchone()[0]
+        assert triple_vis == "legacy_admin"
+
+    def test_v7_creates_ownership_indexes(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                closed_since TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                consolidated_at TEXT NOT NULL
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+        indexes = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        )}
+        assert "idx_atoms_visibility" in indexes
+        assert "idx_atoms_owner" in indexes
+        assert "idx_sessions_visibility" in indexes
+        assert "idx_sessions_owner" in indexes
+        assert "idx_sessions_channel" in indexes
+        assert "idx_obs_metadata_visibility" in indexes
+        assert "idx_obs_metadata_owner" in indexes
+        assert "idx_triples_visibility" in indexes
+        assert "idx_triples_owner" in indexes
+
+    def test_v6_without_observations_metadata_migrates_to_v7(
+        self, tmp_path: Path
+    ) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "without-observations-metadata.db"
+        _create_unstamped_v4_db(db_path, include_observations_metadata=False)
+        conn = SagaStore(db_path=db_path)._ensure_conn()
+
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(observations_metadata)")
+        }
+        assert {
+            "atom_id",
+            "evidence_count",
+            "trend",
+            "last_evidence_at",
+            "consolidated_at",
+            "consolidation_session",
+            "owner_principal",
+            "origin_channel",
+            "origin_domain",
+            "visibility",
+            "provenance",
+        } <= columns
+        assert 6 in {
+            row[0] for row in conn.execute("SELECT version FROM schema_version")
+        }
+
+    def test_v6_without_triples_migrates_to_v7(self, tmp_path: Path) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "without-triples.db"
+        _create_unstamped_v4_db(db_path, include_triples=False)
+        conn = SagaStore(db_path=db_path)._ensure_conn()
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(triples)")}
+        assert {
+            "id",
+            "source_atom_id",
+            "owner_principal",
+            "visibility",
+            "provenance",
+        } <= columns
+        assert any(
+            row[2] == "atoms" and row[6] == "SET NULL"
+            for row in conn.execute("PRAGMA foreign_key_list(triples)")
+        )
+        assert 6 in {
+            row[0] for row in conn.execute("SELECT version FROM schema_version")
+        }
+
+    def test_v7_preserves_existing_data(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                stream TEXT DEFAULT 'semantic',
+                profile TEXT DEFAULT 'standard',
+                memory_type TEXT DEFAULT 'raw',
+                arousal REAL DEFAULT 0.5,
+                valence REAL DEFAULT 0.0,
+                encoding_confidence REAL DEFAULT 0.7,
+                topics TEXT DEFAULT '[]',
+                source_type TEXT DEFAULT 'conversation',
+                metadata TEXT DEFAULT '{}',
+                tombstoned INTEGER DEFAULT 0,
+                is_pinned INTEGER DEFAULT 0,
+                agent_id TEXT DEFAULT 'default',
+                session_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT,
+                reflected_at TEXT,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                emotional_state TEXT,
+                closed_since TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                embedding_dim INTEGER
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                evidence_count INTEGER DEFAULT 0,
+                trend TEXT,
+                last_evidence_at TEXT,
+                consolidated_at TEXT NOT NULL,
+                consolidation_session TEXT
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                source_atom_id TEXT,
+                confidence REAL DEFAULT 1.0,
+                valid_from TEXT,
+                valid_until TEXT,
+                embedding BLOB,
+                embedding_dim INTEGER,
+                tombstoned INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}'
+            );
+            CREATE TABLE atom_relations (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0,
+                created_at TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}',
+                PRIMARY KEY (source_id, target_id, relation_type)
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        conn.execute(
+            "INSERT INTO atoms VALUES "
+            "('a1', 'test content', 'hash123', 'semantic', 'standard', 'raw', "
+            "0.5, 0.0, 0.7, '[]', 'conversation', '{}', 0, 0, 'default', NULL, '2024-01-01')"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES "
+            "('s1', 'ch1', '2024-01-01', '2024-01-02', 'summary', '2024-01-02', "
+            "'[]', '[]', '[]', NULL, '[]', NULL, 4)"
+        )
+        conn.execute(
+            "INSERT INTO observations_metadata VALUES "
+            "('a1', 5, 'stable', '2024-01-01', '2024-01-01', 's1')"
+        )
+        conn.execute(
+            "INSERT INTO triples VALUES "
+            "('t1', 'subject', 'predicate', 'object', 'a1', 1.0, NULL, NULL, NULL, NULL, 0, '2024-01-01', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO atom_relations VALUES "
+            "('a1', 'a2', 'evidenced_by', 1.0, '2024-01-01', '{}')"
+        )
+        conn.commit()
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+
+        atom = conn.execute("SELECT id, content, content_hash, stream FROM atoms WHERE id = 'a1'").fetchone()
+        assert atom == ("a1", "test content", "hash123", "semantic")
+
+        sess = conn.execute("SELECT id, channel_id, summary FROM sessions WHERE id = 's1'").fetchone()
+        assert sess == ("s1", "ch1", "summary")
+
+        obs = conn.execute("SELECT atom_id, evidence_count, trend FROM observations_metadata WHERE atom_id = 'a1'").fetchone()
+        assert obs == ("a1", 5, "stable")
+
+        triple = conn.execute("SELECT id, subject, predicate, object FROM triples WHERE id = 't1'").fetchone()
+        assert triple == ("t1", "subject", "predicate", "object")
+
+        rel = conn.execute("SELECT source_id, target_id, relation_type FROM atom_relations").fetchone()
+        assert rel == ("a1", "a2", "evidenced_by")
+
+        versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
+        assert 7 in versions
+
+    @pytest.mark.parametrize(
+        ("table", "seed_sql", "required_column"),
+        [
+            (
+                "atoms",
+                "INSERT INTO atoms "
+                "(id, content, content_hash, created_at, {column}) "
+                "VALUES ('a1', 'content', 'hash', '2024-01-01', NULL)",
+                "owner_principal",
+            ),
+            (
+                "atoms",
+                "INSERT INTO atoms "
+                "(id, content, content_hash, created_at, {column}) "
+                "VALUES ('a1', 'content', 'hash', '2024-01-01', NULL)",
+                "visibility",
+            ),
+            (
+                "atoms",
+                "INSERT INTO atoms "
+                "(id, content, content_hash, created_at, {column}) "
+                "VALUES ('a1', 'content', 'hash', '2024-01-01', NULL)",
+                "provenance",
+            ),
+            (
+                "sessions",
+                "INSERT INTO sessions (id, started_at, {column}) "
+                "VALUES ('s1', '2024-01-01', NULL)",
+                "owner_principal",
+            ),
+            (
+                "sessions",
+                "INSERT INTO sessions (id, started_at, {column}) "
+                "VALUES ('s1', '2024-01-01', NULL)",
+                "visibility",
+            ),
+            (
+                "sessions",
+                "INSERT INTO sessions (id, started_at, {column}) "
+                "VALUES ('s1', '2024-01-01', NULL)",
+                "provenance",
+            ),
+            (
+                "observations_metadata",
+                "INSERT INTO observations_metadata "
+                "(atom_id, consolidated_at, {column}) "
+                "VALUES ('a1', '2024-01-01', NULL)",
+                "owner_principal",
+            ),
+            (
+                "observations_metadata",
+                "INSERT INTO observations_metadata "
+                "(atom_id, consolidated_at, {column}) "
+                "VALUES ('a1', '2024-01-01', NULL)",
+                "visibility",
+            ),
+            (
+                "observations_metadata",
+                "INSERT INTO observations_metadata "
+                "(atom_id, consolidated_at, {column}) "
+                "VALUES ('a1', '2024-01-01', NULL)",
+                "provenance",
+            ),
+            (
+                "triples",
+                "INSERT INTO triples "
+                "(id, subject, predicate, object, created_at, {column}) "
+                "VALUES ('t1', 's', 'p', 'o', '2024-01-01', NULL)",
+                "owner_principal",
+            ),
+            (
+                "triples",
+                "INSERT INTO triples "
+                "(id, subject, predicate, object, created_at, {column}) "
+                "VALUES ('t1', 's', 'p', 'o', '2024-01-01', NULL)",
+                "visibility",
+            ),
+            (
+                "triples",
+                "INSERT INTO triples "
+                "(id, subject, predicate, object, created_at, {column}) "
+                "VALUES ('t1', 's', 'p', 'o', '2024-01-01', NULL)",
+                "provenance",
+            ),
+        ],
+    )
+    def test_v7_rejects_null_ownership_fields(
+        self, table: str, seed_sql: str, required_column: str
+    ) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                consolidated_at TEXT NOT NULL
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at)
+                VALUES (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+            conn.execute(seed_sql.format(column=required_column))
+
+    def test_v8_preserves_world_state_rows_and_defaults_acl(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE world_state (
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                value TEXT NOT NULL,
+                valid_from TEXT,
+                valid_until TEXT,
+                is_current INTEGER DEFAULT 1,
+                source_triple_id TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (subject, predicate, valid_from)
+            );
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE observations_metadata (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                (7, '2000-01-01T00:00:00+00:00');
+            INSERT INTO world_state
+                (subject, predicate, value, valid_from, updated_at)
+                VALUES ('Alice', 'status', 'active', '2024-01-01', '2024-01-01');
+            """
+        )
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=8,
+            migrations={8: m.MIGRATIONS[8]},
+        )
+        m._execute_migration_script(conn, m.MIGRATIONS[8])
+
+        row = conn.execute(
+            "SELECT subject, predicate, value, owner_principal, visibility, provenance "
+            "FROM world_state"
+        ).fetchone()
+        assert row == (
+            "Alice", "status", "active", "legacy_admin", "legacy_admin", "{}"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            conn.execute(
+                "INSERT INTO world_state "
+                "(subject, predicate, value, valid_from, updated_at, visibility) "
+                "VALUES ('Bob', 'status', 'active', '2024-01-01', "
+                "'2024-01-01', 'unexpected')"
+            )
+
+    def test_v7_without_world_state_migrates_to_current(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                agent_id TEXT DEFAULT 'default',
+                tombstoned INTEGER DEFAULT 0,
+                created_at TEXT,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX idx_atoms_dedup
+                ON atoms(content_hash, agent_id) WHERE tombstoned = 0;
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT,
+                reflected_at TEXT,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                emotional_state TEXT,
+                closed_since TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                embedding_dim INTEGER,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                evidence_count INTEGER DEFAULT 0,
+                trend TEXT,
+                last_evidence_at TEXT,
+                consolidated_at TEXT NOT NULL,
+                consolidation_session TEXT,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                created_at TEXT,
+                tombstoned INTEGER DEFAULT 0,
+                embedding BLOB,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                (7, '2000-01-01T00:00:00+00:00');
+            """
+        )
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        versions = {
+            row[0] for row in conn.execute("SELECT version FROM schema_version")
+        }
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(world_state)")
+        }
+        observations_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(observations_metadata)")
+        }
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' AND tbl_name = 'world_state'"
+            )
+        }
+        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 14
+        assert {
+            "owner_principal",
+            "origin_channel",
+            "origin_domain",
+            "visibility",
+            "provenance",
+        } <= columns
+        assert {
+            "owner_principal",
+            "origin_channel",
+            "origin_domain",
+            "visibility",
+            "provenance",
+        } <= observations_columns
+        assert {
+            "idx_world_current",
+            "idx_world_subject",
+            "idx_world_visibility",
+            "idx_world_owner",
+        } <= indexes
+
+
+class TestV9OwnerScopedDedupMigration:
+    @pytest.mark.parametrize("reverse_insert", [False, True])
+    def test_legacy_collision_is_deterministically_tombstoned(
+        self, tmp_path: Path, reverse_insert: bool
+    ) -> None:
+        from mimir.saga.client import SagaStore
+        from mimir.saga.forget import forget
+
+        db_path = tmp_path / f"v9-collision-{reverse_insert}.db"
+        _create_unstamped_v4_db(db_path)
+        rows = [
+            (
+                "a-survivor",
+                "same logical content",
+                "H",
+                "default",
+                "2024-01-01T00:00:00+00:00",
+            ),
+            (
+                "z-loser",
+                "same logical content",
+                "H",
+                "default",
+                "2024-01-01T00:00:00+00:00",
+            ),
+        ]
+        if reverse_insert:
+            rows.reverse()
+        seed = sqlite3.connect(db_path)
+        seed.executemany(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, agent_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        seed.commit()
+        seed.close()
+
+        migrated = SagaStore(db_path=db_path)._ensure_conn()
+
+        assert migrated.execute(
+            "SELECT id FROM atoms WHERE content_hash = 'H' AND agent_id = 'default' "
+            "AND owner_principal = 'legacy_admin' AND tombstoned = 0"
+        ).fetchall() == [("a-survivor",)]
+        tombstoned, tombstoned_at, tombstoned_reason = migrated.execute(
+            "SELECT tombstoned, tombstoned_at, tombstoned_reason "
+            "FROM atoms WHERE id = 'z-loser'"
+        ).fetchone()
+        assert tombstoned == 1
+        assert tombstoned_at is not None
+        assert tombstoned_at.endswith("+00:00")
+        assert tombstoned_reason == "merged"
+        assert migrated.execute(
+            "SELECT version FROM schema_version ORDER BY version"
+        ).fetchall() == [
+            (version,) for version in range(1, m.CURRENT_SCHEMA_VERSION + 1)
+        ]
+        assert [
+            row[2]
+            for row in migrated.execute("PRAGMA index_info(idx_atoms_dedup)")
+        ] == ["content_hash", "agent_id", "owner_principal"]
+
+        # Runtime exact-dedup sees only the survivor, and ordinary forget is
+        # idempotent for the migration-created tombstone.
+        assert migrated.execute(
+            "SELECT id FROM atoms WHERE content_hash = 'H' AND agent_id = 'default' "
+            "AND owner_principal = 'legacy_admin' AND tombstoned = 0"
+        ).fetchone() == ("a-survivor",)
+        assert forget(migrated, ["z-loser"]).tombstoned_count == 0
+        migrated.close()
+
+        reopened = SagaStore(db_path=db_path)._ensure_conn()
+        assert reopened.execute(
+            "SELECT id, tombstoned FROM atoms ORDER BY id"
+        ).fetchall() == [("a-survivor", 0), ("z-loser", 1)]
+        reopened.close()
+
+    def test_unresolvable_collision_reports_same_key_on_every_open(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "v9-unresolvable.db"
+        seed = sqlite3.connect(db_path)
+        seed.executescript(
+            "CREATE TABLE atoms ("
+            "id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, "
+            "agent_id TEXT, owner_principal TEXT NOT NULL, "
+            "tombstoned INTEGER DEFAULT 0, created_at TEXT NOT NULL);"
+            "CREATE TABLE schema_version ("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);"
+        )
+        seed.executemany(
+            "INSERT INTO schema_version VALUES (?, '2000-01-01T00:00:00+00:00')",
+            [(version,) for version in range(1, 9)],
+        )
+        # SQLite permits NULL in a non-INTEGER PRIMARY KEY. With neither a
+        # stable id nor another durable difference, v9 must refuse to guess.
+        seed.executemany(
+            "INSERT INTO atoms VALUES (NULL, 'H', 'agent', 'owner', 0, '2024-01-01')",
+            [(), ()],
+        )
+        seed.commit()
+        seed.close()
+
+        messages = []
+        for _ in range(2):
+            conn = sqlite3.connect(db_path)
+            with pytest.raises(sqlite3.IntegrityError) as raised:
+                m.apply_pending_migrations(
+                    conn,
+                    fresh=False,
+                    target_version=9,
+                    migrations={9: m.MIGRATIONS[9]},
+                )
+            messages.append(str(raised.value))
+            assert conn.execute(
+                "SELECT version FROM schema_version ORDER BY version"
+            ).fetchall() == [(version,) for version in range(1, 9)]
+            assert {
+                row[1] for row in conn.execute("PRAGMA table_info(atoms)")
+            }.isdisjoint({"tombstoned_at", "tombstoned_reason"})
+            conn.close()
+
+        assert messages[0] == messages[1]
+        assert (
+            "idx_atoms_dedup(content_hash, agent_id, owner_principal)" in messages[0]
+        )
+        assert (
+            "content_hash='H', agent_id='agent', owner_principal='owner'"
+            in messages[0]
+        )
+
+
+def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        from pathlib import Path
+
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        columns = [
+            row[2] for row in conn.execute(
+                "PRAGMA index_info(idx_atoms_dedup)"
+            ).fetchall()
+        ]
+        assert columns == ["content_hash", "agent_id", "owner_principal"]
+        atom_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(atoms)").fetchall()
+        }
+        assert {"origin_trigger", "origin_ref"} <= atom_columns.keys()
+        assert "integrity" not in atom_columns
+        assert m.detect_schema_version(conn) == m.CURRENT_SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_v10_migration_backfills_legacy_atoms_fail_closed() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            "CREATE TABLE atoms (id TEXT PRIMARY KEY);"
+            "INSERT INTO atoms (id) VALUES ('legacy');"
+        )
+        m._execute_migration_script(conn, m.MIGRATIONS[10])
+        assert conn.execute(
+            "SELECT integrity, origin_trigger, origin_ref FROM atoms"
+        ).fetchone() == ("untrusted", None, None)
+        # Interrupted migrations may retry ADD COLUMN statements safely.
+        m._execute_migration_script(conn, m.MIGRATIONS[10])
+    finally:
+        conn.close()
+
+
+def test_v11_fresh_and_migrated_indexes_have_identical_pragma_output() -> None:
+    schema = Path("mimir/saga/schema.sql").read_text()
+    fresh = sqlite3.connect(":memory:")
+    migrated = sqlite3.connect(":memory:")
+    try:
+        fresh.executescript(schema)
+        migrated.executescript(schema)
+        for name in (
+            "idx_triples_embedding_recency",
+            "idx_sessions_recency",
+            "idx_sessions_channel_recency",
+        ):
+            migrated.execute(f"DROP INDEX {name}")
+        migrated.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT")
+        assert m.detect_schema_version(migrated) == 10
+        m._execute_migration_script(migrated, m.MIGRATIONS[11])
+        assert m.detect_schema_version(migrated) == 11
+
+        for name in (
+            "idx_triples_embedding_recency",
+            "idx_sessions_recency",
+            "idx_sessions_channel_recency",
+        ):
+            fresh_pragma = fresh.execute(f"PRAGMA index_xinfo({name})").fetchall()
+            migrated_pragma = migrated.execute(f"PRAGMA index_xinfo({name})").fetchall()
+            assert migrated_pragma == fresh_pragma
+    finally:
+        fresh.close()
+        migrated.close()
+
+
+class TestV12LegacyIntegrityMigration:
+    @staticmethod
+    def _database(*, include_v10: bool = True) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT NOT NULL DEFAULT 'untrusted'")
+        versions = [(version, "2000-01-01T00:00:00+00:00") for version in range(1, 12)]
+        if include_v10:
+            versions[9] = (10, "2026-07-20 20:15:00")
+        else:
+            versions.pop(9)
+        conn.executemany(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", versions
+        )
+        conn.executemany(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, created_at, integrity, origin_trigger) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("legacy", "legacy", "h1", "2026-07-20T20:14:59+00:00", "untrusted", None),
+                ("boundary", "boundary", "h2", "2026-07-20T20:15:00+00:00", "untrusted", None),
+                ("post-null", "post null", "h3", "2026-07-20T20:15:01+00:00", "untrusted", None),
+                ("post-origin", "post origin", "h4", "2026-07-20T20:15:02+00:00", "untrusted", "turn"),
+                ("already-trusted", "trusted", "h5", "2026-07-20T20:14:58+00:00", "trusted", None),
+            ],
+        )
+        conn.commit()
+        return conn
+
+    def test_only_pre_v10_untrusted_atoms_become_trusted(self, caplog) -> None:
+        conn = self._database()
+
+        with caplog.at_level("INFO", logger=m.__name__):
+            m.apply_pending_migrations(conn, fresh=False, target_version=12)
+
+        assert conn.execute(
+            "SELECT id, integrity FROM atoms ORDER BY id"
+        ).fetchall() == [
+            ("already-trusted", "trusted"),
+            ("boundary", "untrusted"),
+            ("legacy", "trusted"),
+            ("post-null", "untrusted"),
+            ("post-origin", "untrusted"),
+        ]
+        assert "Applied SAGA migration v12: 1 rows changed" in caplog.text
+
+    def test_migration_is_idempotent(self) -> None:
+        conn = self._database()
+
+        assert m._execute_migration_script(conn, m.MIGRATIONS[12]) == 1
+        assert m._execute_migration_script(conn, m.MIGRATIONS[12]) == 0
+
+    def test_missing_v10_boundary_is_safe_no_op(self) -> None:
+        conn = self._database(include_v10=False)
+        before = conn.execute(
+            "SELECT id, integrity FROM atoms ORDER BY id"
+        ).fetchall()
+
+        m.apply_pending_migrations(conn, fresh=False, target_version=12)
+
+        assert conn.execute(
+            "SELECT id, integrity FROM atoms ORDER BY id"
+        ).fetchall() == before
+        assert conn.execute(
+            "SELECT version FROM schema_version WHERE version = 12"
+        ).fetchone() == (12,)
+
+
+class TestV13TrustedBoundaryMigration:
+    def test_all_untrusted_atoms_are_flipped_without_other_changes(self, caplog) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT NOT NULL DEFAULT 'untrusted'")
+        m._execute_migration_script(conn, m.MIGRATIONS[12])
+        conn.executemany(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            [(version, "2000-01-01T00:00:00+00:00") for version in range(1, 13)],
+        )
+        rows = [
+            (
+                "trusted", "already trusted", "h1", "2026-08-29T00:00:00+00:00",
+                "trusted", "user_message", "message:1", '{"kept":1}',
+            ),
+            (
+                "poller", "external ingest residue", "h2",
+                "2026-08-30T00:00:00+00:00", "untrusted",
+                "github-poller:github-activity", "github:event:2", '{"kept":2}',
+            ),
+            (
+                "legacy", "other residue", "h3", "2024-01-01T00:00:00+00:00",
+                "untrusted", None, None, '{"kept":3}',
+            ),
+        ]
+        conn.executemany(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, created_at, integrity, origin_trigger, "
+            "origin_ref, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        before = conn.execute("SELECT * FROM atoms ORDER BY id").fetchall()
+        integrity_index = next(
+            row[0] for row in conn.execute("PRAGMA table_info(atoms)")
+            if row[1] == "integrity"
+        )
+
+        assert m.detect_schema_version(conn) == 12
+        with caplog.at_level("INFO", logger=m.__name__):
+            m.apply_pending_migrations(conn, fresh=False, target_version=13)
+
+        assert m.detect_schema_version(conn) == 13
+        assert conn.execute(
+            "SELECT COUNT(*) FROM atoms WHERE integrity = 'untrusted'"
+        ).fetchone() == (0,)
+        after = conn.execute("SELECT * FROM atoms ORDER BY id").fetchall()
+        assert [row[:integrity_index] + row[integrity_index + 1:] for row in after] == [
+            row[:integrity_index] + row[integrity_index + 1:] for row in before
+        ]
+        assert conn.execute(
+            "SELECT version FROM schema_version WHERE version = 13"
+        ).fetchone() == (13,)
+        assert "Applied SAGA migration v13: 2 rows changed" in caplog.text
+
+        versions = conn.execute(
+            "SELECT version, applied_at FROM schema_version ORDER BY version"
+        ).fetchall()
+        m.apply_pending_migrations(conn, fresh=False, target_version=13)
+        assert conn.execute(
+            "SELECT version, applied_at FROM schema_version ORDER BY version"
+        ).fetchall() == versions
+        assert m._execute_migration_script(conn, m.MIGRATIONS[13]) == 0
+
+
+class TestV14IntegrityRemoval:
+    @staticmethod
+    def _v11_database(db_path: str | Path = ":memory:") -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path)
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        # v14 only removed integrity from the shipped v11 schema. Restoring its
+        # exact definition reconstructs the on-disk schema produced by 0.8.8.
+        conn.execute(
+            "ALTER TABLE atoms ADD COLUMN integrity TEXT NOT NULL DEFAULT 'untrusted' "
+            "CHECK(integrity IN ('trusted', 'untrusted'))"
+        )
+        conn.executemany(
+            "INSERT INTO schema_version VALUES (?, '2026-08-01T00:00:00+00:00')",
+            [(version,) for version in range(1, 12)],
+        )
+        conn.executemany(
+            "INSERT INTO atoms (id, content, content_hash, created_at, tombstoned) "
+            "VALUES (?, ?, ?, '2020-01-01', ?)",
+            [
+                ("live", "searchable live", "h1", 0),
+                ("dead", "searchable tombstone", "h2", 1),
+            ],
+        )
+        conn.commit()
+        assert m.detect_schema_version(conn) == 11
+        return conn
+
+    @staticmethod
+    def _database(
+        version: int = 13, db_path: str | Path = ":memory:"
+    ) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path)
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Nullable to also exercise fail-closed handling of malformed legacy data.
+        conn.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT DEFAULT 'untrusted'")
+        if version < 11:
+            for index in (
+                "idx_triples_embedding_recency", "idx_sessions_recency",
+                "idx_sessions_channel_recency",
+            ):
+                conn.execute(f"DROP INDEX {index}")
+        for migration in range(12, version + 1):
+            m._execute_migration_script(conn, m.MIGRATIONS[migration])
+        conn.executemany(
+            "INSERT INTO schema_version VALUES (?, '2026-08-01T00:00:00+00:00')",
+            [(v,) for v in range(1, version + 1)],
+        )
+        conn.executemany(
+            "INSERT INTO atoms (rowid, id, content, content_hash, created_at, "
+            "integrity, tombstoned, origin_trigger, origin_ref) "
+            "VALUES (?, ?, ?, ?, '2020-01-01', 'trusted', ?, 'turn', 'message:1')",
+            [(7, "live", "searchable live", "h1", 0),
+             (42, "dead", "searchable tombstone", "h2", 1)],
+        )
+        conn.execute(
+            "INSERT INTO embeddings VALUES ('live', 'stub', 'stub', 1, x'01020304', '2020-01-01')"
+        )
+        conn.execute("INSERT INTO atom_topics VALUES ('dead', 'retained')")
+        conn.execute(
+            "INSERT INTO triples (id, subject, predicate, object, source_atom_id, created_at) "
+            "VALUES ('triple', 's', 'p', 'o', 'live', '2020-01-01')"
+        )
+        conn.commit()
+        assert m.detect_schema_version(conn) == version
+        return conn
+
+    def test_v11_default_untrusted_atoms_migrate_through_v14(self) -> None:
+        conn = self._v11_database()
+        before = conn.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall()
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall() == before
+        assert conn.execute(
+            "SELECT version FROM schema_version WHERE version >= 12 ORDER BY version"
+        ).fetchall() == [(12,), (13,), (14,)]
+        assert "integrity" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(atoms)")
+        }
+        conn.close()
+
+    def test_saga_store_opens_v11_default_untrusted_atoms(self, tmp_path: Path) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "v11-default-untrusted.db"
+        conn = self._v11_database(db_path)
+        expected = conn.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        migrated = SagaStore(db_path=db_path)._ensure_conn()
+
+        assert migrated.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall() == expected
+        assert migrated.execute(
+            "SELECT version FROM schema_version WHERE version >= 12 ORDER BY version"
+        ).fetchall() == [(12,), (13,), (14,)]
+        assert "integrity" not in {
+            row[1] for row in migrated.execute("PRAGMA table_info(atoms)")
+        }
+        migrated.close()
+
+    @pytest.mark.parametrize("version", [10, 11, 12, 13])
+    def test_trusted_rows_and_dependents_survive(self, version: int) -> None:
+        conn = self._database(version)
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(atoms)")
+                   if r[1] != "integrity"]
+        atom_query = "SELECT rowid, " + ", ".join(columns) + " FROM atoms ORDER BY rowid"
+        before = conn.execute(atom_query).fetchall()
+        dependents = {table: conn.execute(f"SELECT * FROM {table}").fetchall()
+                      for table in ("embeddings", "atom_topics", "triples")}
+        stamps = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(atom_query).fetchall() == before
+        assert {table: conn.execute(f"SELECT * FROM {table}").fetchall()
+                for table in dependents} == dependents
+        assert "integrity" not in {r[1] for r in conn.execute("PRAGMA table_info(atoms)")}
+        assert not {"idx_atoms_integrity_created_at", "idx_atoms_trusted_boundary_v13"} & {
+            r[1] for r in conn.execute("PRAGMA index_list(atoms)")
+        }
+        assert conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()[:version] == stamps
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT rowid FROM atoms_fts WHERE atoms_fts MATCH 'searchable' ORDER BY rowid"
+        ).fetchall() == [(7,), (42,)]
+        conn.execute("UPDATE atoms SET content = 'replacement' WHERE id = 'live'")
+        assert conn.execute(
+            "SELECT rowid FROM atoms_fts WHERE atoms_fts MATCH 'replacement'"
+        ).fetchall() == [(7,)]
+        conn.execute("DELETE FROM atoms WHERE id = 'live'")
+        assert conn.execute("SELECT * FROM embeddings").fetchall() == []
+        assert conn.execute("SELECT source_atom_id FROM triples").fetchone() == (None,)
+        assert conn.execute(
+            "SELECT rowid FROM atoms_fts WHERE atoms_fts MATCH 'replacement'"
+        ).fetchall() == []
+        conn.commit()
+        conn.execute("DELETE FROM schema_version")
+        conn.commit()
+        assert m.detect_schema_version(conn) == 14
+        m.apply_pending_migrations(conn, fresh=False)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
+        conn.close()
+
+    @pytest.mark.parametrize("version", [13])
+    @pytest.mark.parametrize("stamps", ["present", "empty", "missing"])
+    @pytest.mark.parametrize("atom_id", ["live", "dead"])
+    @pytest.mark.parametrize("integrity", ["untrusted", None, "unknown"])
+    def test_nontrusted_refusal_changes_nothing(
+        self, version: int, stamps: str, atom_id: str, integrity: str | None
+    ) -> None:
+        conn = self._database(version)
+        conn.execute("UPDATE atoms SET integrity = ? WHERE id = ?", (integrity, atom_id))
+        if stamps == "empty":
+            conn.execute("DELETE FROM schema_version")
+        elif stamps == "missing":
+            conn.execute("DROP TABLE schema_version")
+        conn.commit()
+        before = list(conn.iterdump())
+
+        with pytest.raises(sqlite3.IntegrityError, match="v14 refused.*nontrusted.*tombstones") as exc:
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert f"{integrity!r}=1" in str(exc.value)
+        assert list(conn.iterdump()) == before
+        assert not conn.in_transaction
+        assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        conn.close()
+
+    @pytest.mark.parametrize("version", [10, 11, 12])
+    @pytest.mark.parametrize("atom_id", ["live", "dead"])
+    @pytest.mark.parametrize("integrity", [None, "unknown"])
+    def test_pre_v13_malformed_integrity_reaches_v14_guard(
+        self, version: int, atom_id: str, integrity: str | None
+    ) -> None:
+        conn = self._database(version)
+        conn.execute("UPDATE atoms SET integrity = ? WHERE id = ?", (integrity, atom_id))
+        conn.commit()
+        before = conn.execute(
+            "SELECT id, content, tombstoned, integrity FROM atoms ORDER BY id"
+        ).fetchall()
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="migration_v14_refused_nontrusted_atoms",
+        ):
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT id, content, tombstoned, integrity FROM atoms ORDER BY id"
+        ).fetchall() == before
+        assert "integrity" in {
+            row[1] for row in conn.execute("PRAGMA table_info(atoms)")
+        }
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (13,)
+        conn.close()
+
+    @pytest.mark.parametrize("atom_id", ["live", "dead"])
+    def test_v14_sql_guard_independently_refuses_nontrusted(self, atom_id: str) -> None:
+        conn = self._database()
+        conn.execute("UPDATE atoms SET integrity = 'untrusted' WHERE id = ?", (atom_id,))
+        conn.commit()
+        before = list(conn.iterdump())
+        with pytest.raises(sqlite3.IntegrityError, match="migration_v14_refused_nontrusted_atoms"):
+            with conn:
+                conn.execute("BEGIN")
+                m._execute_migration_script(conn, m.MIGRATIONS[14])
+        assert list(conn.iterdump()) == before
+        assert conn.execute("SELECT name FROM sqlite_temp_master").fetchall() == []
+        conn.close()
+
+    @pytest.mark.parametrize("fresh", [True, False])
+    def test_fresh_schema_has_no_integrity(self, fresh: bool) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        m.apply_pending_migrations(conn, fresh=fresh)
+        assert m.detect_schema_version(conn) == 14
+        assert "integrity" not in {r[1] for r in conn.execute("PRAGMA table_info(atoms)")}
+        assert not {"idx_atoms_integrity_created_at", "idx_atoms_trusted_boundary_v13"} & {
+            r[1] for r in conn.execute("PRAGMA index_list(atoms)")
+        }
+        conn.close()

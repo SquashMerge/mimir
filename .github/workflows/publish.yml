@@ -1,0 +1,146 @@
+name: Publish to PyPI
+
+# Triggered by a tag matching ``v*`` (e.g. ``v0.1.0``) — push the tag
+# and the workflow builds + publishes via PyPI trusted publishing (OIDC,
+# no API token in repo secrets).
+#
+# One-time setup before the first publish works:
+#
+# 1. Register the project name on PyPI by adding a *pending publisher*:
+#       https://pypi.org/manage/account/publishing/
+#    Fields:
+#       - PyPI Project Name : mimir-agent
+#       - Owner             : SquashMerge
+#       - Repository name   : mimir
+#       - Workflow filename : publish.yml
+#       - Environment name  : pypi
+#
+# 2. Create a ``pypi`` environment under the repo's Settings →
+#    Environments and (optionally) add deployment branch / tag
+#    protection rules.
+#
+# Subsequent releases need no manual step — bump ``version`` in
+# ``pyproject.toml``, commit, ``git tag v<version>`` + ``git push --tags``,
+# and this workflow does the rest.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # The React app (mimir/react_app/dist/) is gitignored and force-included
+      # via [tool.hatch.build] artifacts — but it must EXIST before uv build
+      # packages it, so build it here first. (0.6.0 shipped without it because
+      # this step did not exist and the dist was never built in CI.)
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22"
+      - name: Build React app
+        run: |
+          npm ci
+          npm run build
+          test -f mimir/react_app/dist/index.html
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+      - name: Set up Python
+        run: uv python install 3.11
+      - name: Build distributions
+        run: uv build
+      - name: Assert the wheel ships the built React app
+        run: |
+          python3 - <<'PY'
+          import glob, zipfile, sys
+          whl = sorted(glob.glob("dist/*.whl"))[-1]
+          names = zipfile.ZipFile(whl).namelist()
+          if not any(n.endswith("mimir/react_app/dist/index.html") for n in names):
+              print("FAIL:", whl, "missing mimir/react_app/dist/index.html", file=sys.stderr)
+              sys.exit(1)
+          print("OK:", whl, "ships React dist:",
+                [n for n in names if "react_app/dist" in n][:5])
+          PY
+      - name: List artifacts
+        run: ls -la dist/
+      - name: Upload distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mimir-agent
+    # OIDC trusted publishing requires the workflow job to mint an
+    # OIDC token; ``id-token: write`` is the only extra permission
+    # the official PyPA action asks for.
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # release/v1
+        # Trusted publishing — no ``password`` / ``username`` /
+        # ``api_token`` needed. PyPI verifies the OIDC claim against
+        # the pending-publisher config registered for this project.
+
+  github-release:
+    name: Create GitHub Release
+    # Runs only after the PyPI publish (and its ``pypi`` environment gate)
+    # succeeds, so a GitHub Release always implies a published package. Before
+    # this job, ``publish.yml`` only shipped to PyPI and never created a Release
+    # object — so tags showed up on PyPI but not the repo's Releases sidebar
+    # (only the one manually-created v0.2.11 did). This closes that gap: every
+    # ``v*`` tag now gets a Release with notes from its CHANGELOG section.
+    needs: publish
+    # Guard to tag refs: the workflow also has a ``workflow_dispatch`` trigger,
+    # and on a manual dispatch from a branch ``GITHUB_REF_NAME`` is the branch
+    # (e.g. ``main``), which would make ``gh release create main --verify-tag``
+    # fail (or target the wrong ref). Only run this job on a ``v*`` tag push.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write  # the only job that needs write; build/publish stay read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Create the GitHub Release from the tag + CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"        # e.g. v0.2.15
+          version="${tag#v}"              # e.g. 0.2.15
+          # Idempotent: a re-run on an existing tag must not fail the workflow.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to do."
+            exit 0
+          fi
+          # Extract the ``## [<version>]`` section (header through the line
+          # before the next ``## [`` heading) as the release notes.
+          notes="$(awk -v v="$version" '/^## \[/{p=($0 ~ "\\["v"\\]")} p' CHANGELOG.md)"
+          if [ -n "$notes" ]; then
+            printf '%s\n' "$notes" > /tmp/relnotes.md
+            gh release create "$tag" --title "$tag" --verify-tag \
+              --notes-file /tmp/relnotes.md
+          else
+            # No CHANGELOG section (shouldn't happen for a release-prepped tag) —
+            # fall back to GitHub's commit/PR auto-generated notes.
+            echo "No CHANGELOG section for $version; using --generate-notes."
+            gh release create "$tag" --title "$tag" --verify-tag --generate-notes
+          fi

@@ -1,0 +1,1807 @@
+"""Core dataclasses passed through the call chain.
+
+Per-turn state lives on TurnContext (never module globals — see SPEC §4.6).
+TurnRecord is the on-disk turns.jsonl shape (SPEC §10.2).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+import threading
+import uuid
+from dataclasses import InitVar, dataclass, field, fields as dataclass_fields
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any
+
+from pydantic import PlainSerializer
+
+if TYPE_CHECKING:
+    from .channel_audience import ChannelAudienceProvider
+    from .proposals import PollerProposalScope
+else:
+    ChannelAudienceProvider = Any
+    PollerProposalScope = Any
+
+
+class TurnInteractivity(StrEnum):
+    """Server-owned interactivity classification for a turn."""
+
+    INTERACTIVE = "interactive"
+    NON_INTERACTIVE = "non_interactive"
+
+
+@dataclass(frozen=True)
+class NormalizedPullRequestSnapshot:
+    """Provider-neutral observed pull-request state supplied by an adapter.
+
+    Hosting-provider payloads must be normalized before they cross into the
+    authority layer.  The scope factory therefore never needs to understand a
+    GitHub ``head.repo.full_name``, Bitbucket source branch, or GitLab merge-
+    request payload.
+    """
+
+    repo: str
+    state: str
+    number: int
+    author: str
+    head_repo: str
+    head_remote: str
+    head_ref: str
+    head_sha: str
+    base_ref: str
+    base_sha: str
+
+
+class FlowLabel(StrEnum):
+    """Immutable information flow control labels (chainlink #871).
+
+    These labels track data sensitivity through the turn lifecycle. Labels
+    are monotonic - they can only be added, never removed (except via
+    explicit audited admin declassification). This ensures that private/
+    confidential data cannot leak to incompatible sinks.
+    """
+
+    PRIVATE = "private"
+    CONFIDENTIAL = "confidential"
+    INTERNAL = "internal"
+    PUBLIC = "public"
+
+
+class SourceKind(StrEnum):
+    """Kinds accepted from IFC producers; persisted labels may carry unknown kinds."""
+
+    ACP_HANDS_RESULT = "acp_hands_result"
+    AGENT_SELF = "agent_self"
+    AUTO_RECALL = "auto_recall"
+    CHANNEL = "channel"
+    CHANNEL_BOUND_UNOWNED_FEEDBACK = "channel_bound_unowned_feedback"
+    CHANNEL_SCOPED_FEEDBACK = "channel_scoped_feedback"
+    FEEDBACK_CHAIN = "feedback_chain"
+    MCP = "mcp"
+    OWNER_ATTESTED_FEEDBACK = "owner_attested_feedback"
+    PROTECTED_PROMPT = "protected_prompt"
+    PROTECTED_TOOL = "protected_tool"
+    RECENT_ACTIVITY_ASSISTANT = "recent_activity_assistant"
+    RECENT_ACTIVITY_USER = "recent_activity_user"
+    SERVICE = "service"
+
+
+class Integrity(StrEnum):
+    """Server-derived content trust, not a turn-gating decision.
+
+    UNTRUSTED informational content does not taint a turn. Ask
+    ``has_untrusted_active_ingest`` instead of testing this axis alone.
+    """
+
+    TRUSTED = "trusted"
+    UNTRUSTED = "untrusted"
+
+
+class IntegrityEffect(StrEnum):
+    """The operative axis: participation in the current turn's integrity gate.
+
+    Only UNTRUSTED + ACTIVE_INGEST taints; INFORMATIONAL never adds taint,
+    even when the content is untrusted (for example ordinary shell output).
+    TRUSTED content does not taint with either effect. Informational sources
+    still retain their provenance, sensitivity and audience restrictions.
+
+    Labelling code assigns the two axes independently. Gate consumers must
+    ask ``has_untrusted_active_ingest`` on a source/carrier, or its live-state
+    variants, rather than reconstructing the rule. Keep ``integrity_effect``
+    as the wire name for existing turn records, recovery events and approvals.
+    """
+
+    ACTIVE_INGEST = "active_ingest"
+    INFORMATIONAL = "informational"
+
+
+_OWNER_ATTESTATION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class OwnerAttestation:
+    canonical_principal: str
+    raw_author: str
+    source_channel: str
+
+    def __init__(
+        self,
+        canonical_principal: str,
+        raw_author: str,
+        source_channel: str,
+        *,
+        _token: object,
+    ) -> None:
+        if _token is not _OWNER_ATTESTATION_TOKEN:
+            raise TypeError("owner attestations must be minted by the server factory")
+        object.__setattr__(self, "canonical_principal", canonical_principal)
+        object.__setattr__(self, "raw_author", raw_author)
+        object.__setattr__(self, "source_channel", source_channel)
+
+
+def _mint_owner_attestation(
+    canonical_principal: str,
+    raw_author: str,
+    source_channel: str,
+) -> OwnerAttestation:
+    return OwnerAttestation(
+        canonical_principal,
+        raw_author,
+        source_channel,
+        _token=_OWNER_ATTESTATION_TOKEN,
+    )
+
+
+_RedactedOwnerAttestation = Annotated[
+    OwnerAttestation | None,
+    PlainSerializer(lambda _value: None, return_type=type(None)),
+]
+_RedactedAudienceProvider = Annotated[
+    ChannelAudienceProvider | None,
+    PlainSerializer(lambda _value: None, return_type=type(None)),
+]
+
+
+class _SourceLabelAuthoritySlot:
+    __slots__ = (
+        "_authorized_principals",
+        "_owner_attestation",
+        "_principal",
+        "_resource_id",
+    )
+
+
+_MISSING_SOURCE_VALUE: Any = object()
+
+
+@dataclass(frozen=True, eq=False)
+class SourceLabel(_SourceLabelAuthoritySlot):
+    """Server-authoritative provenance for one protected input.
+
+    ``authorized_principals`` is the effective read ACL. Derived service data
+    must carry the intersection of its inputs' ACLs; an empty ACL is unknown,
+    not public. All identity fields are required for ordinary channel egress.
+    ``domain`` is flat; subtypes belong in ``domain_qualifier``. Only the
+    persisted-record decoder accepts the former colon-separated representation.
+    """
+
+    principal: InitVar[str | None] = _MISSING_SOURCE_VALUE
+    domain: str | None = _MISSING_SOURCE_VALUE
+    resource_id: InitVar[str | None] = _MISSING_SOURCE_VALUE
+    bridge_instance: str | None = _MISSING_SOURCE_VALUE
+    sensitivity: str = _MISSING_SOURCE_VALUE
+    authorized_principals: InitVar[frozenset[str]] = frozenset()
+    source_kind: SourceKind = SourceKind.CHANNEL
+    integrity: str = Integrity.UNTRUSTED
+    # Gate participation, not content trust; see IntegrityEffect's contract.
+    integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
+    owner_attestation: InitVar[_RedactedOwnerAttestation] = None
+    domain_qualifier: str | None = None
+
+    def __post_init__(
+        self,
+        principal: str | None,
+        resource_id: str | None,
+        authorized_principals: frozenset[str],
+        owner_attestation: OwnerAttestation | None,
+    ) -> None:
+        if any(
+            value is _MISSING_SOURCE_VALUE
+            for value in (
+                principal, self.domain, resource_id,
+                self.bridge_instance, self.sensitivity,
+            )
+        ):
+            raise TypeError("missing required source label field")
+        if isinstance(self.domain, str) and ":" in self.domain:
+            raise ValueError("source domain must not contain ':'")
+        if self.source_kind not in SourceKind._value2member_map_:
+            raise ValueError(f"invalid source kind: {self.source_kind!r}")
+        if self.integrity not in Integrity._value2member_map_:
+            raise ValueError(f"invalid source integrity: {self.integrity!r}")
+        if self.integrity_effect not in IntegrityEffect._value2member_map_:
+            raise ValueError(
+                f"invalid source integrity effect: {self.integrity_effect!r}"
+            )
+        object.__setattr__(self, "_principal", principal)
+        object.__setattr__(self, "_resource_id", resource_id)
+        object.__setattr__(self, "_authorized_principals", authorized_principals)
+        object.__setattr__(self, "_owner_attestation", owner_attestation)
+
+    def __getattribute__(self, name: str) -> Any:
+        hidden = {
+            "authorized_principals": "_authorized_principals",
+            "owner_attestation": "_owner_attestation",
+            "principal": "_principal",
+            "resource_id": "_resource_id",
+        }
+        if name in hidden:
+            return object.__getattribute__(self, hidden[name])
+        if name == "__dict__":
+            values = dict(object.__getattribute__(self, "__dict__"))
+            values.update(
+                principal=object.__getattribute__(self, "_principal"),
+                resource_id=object.__getattribute__(self, "_resource_id"),
+                authorized_principals=object.__getattribute__(
+                    self, "_authorized_principals",
+                ),
+            )
+            return values
+        return object.__getattribute__(self, name)
+
+    def _identity(self) -> tuple[Any, ...]:
+        return (
+            self.principal,
+            self.domain,
+            self.domain_qualifier,
+            self.resource_id,
+            self.bridge_instance,
+            self.sensitivity,
+            self.authorized_principals,
+            self.source_kind,
+            self.integrity,
+            self.integrity_effect,
+            self.owner_attestation,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SourceLabel):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        from pydantic_core import core_schema
+
+        schema = handler(source)
+        schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
+            lambda value: {
+                "principal": None,
+                "domain": value.domain,
+                "domain_qualifier": value.domain_qualifier,
+                "resource_id": None,
+                "bridge_instance": value.bridge_instance,
+                "sensitivity": value.sensitivity,
+                "authorized_principals": frozenset(),
+                "source_kind": value.source_kind,
+                "integrity": value.integrity,
+                "integrity_effect": value.integrity_effect,
+                "owner_attestation": None,
+            },
+        )
+        return schema
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "SourceLabel":
+        """Decode persisted label fields, including the legacy qualified domain."""
+        values = dict(record)
+        domain = values.get("domain")
+        if isinstance(domain, str) and ":" in domain:
+            domain, qualifier = domain.split(":", 1)
+            if values.get("domain_qualifier") not in (None, qualifier):
+                raise ValueError("conflicting persisted domain qualifier")
+            values.update(domain=domain, domain_qualifier=qualifier)
+        values["authorized_principals"] = frozenset(
+            values.get("authorized_principals") or ()
+        )
+        # A different build may have written a future or retired kind. Retain
+        # that string for the policy's unknown-kind handling rather than crash
+        # recovery on version skew; all other constructor checks still apply.
+        source_kind = values.pop("source_kind", SourceKind.CHANNEL)
+        source = cls(**values)
+        object.__setattr__(source, "source_kind", source_kind)
+        return source
+
+    @property
+    def has_untrusted_active_ingest(self) -> bool:
+        """Whether this source contributes taint, not whether a sink is allowed."""
+        return (
+            self.integrity == Integrity.UNTRUSTED
+            and self.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+        )
+
+    @property
+    def is_complete(self) -> bool:
+        return bool(
+            self.principal
+            and self.domain
+            and self.resource_id
+            and self.bridge_instance
+            and self.sensitivity in FlowLabel._value2member_map_
+            and self.authorized_principals
+        )
+
+    @classmethod
+    def derived(
+        cls,
+        inputs: tuple["SourceLabel", ...],
+        *,
+        principal: str,
+        domain: str,
+        resource_id: str,
+        bridge_instance: str,
+        sensitivity: str,
+        source_kind: str = "service",
+        domain_qualifier: str | None = None,
+    ) -> "SourceLabel":
+        """Create service-derived provenance without attenuating input trust."""
+        acl: frozenset[str] = frozenset()
+        if inputs and all(source.is_complete for source in inputs):
+            iterator = iter(inputs)
+            acl = next(iterator).authorized_principals
+            for source in iterator:
+                acl &= source.authorized_principals
+        integrity = (
+            Integrity.TRUSTED
+            if inputs and all(source.integrity == Integrity.TRUSTED for source in inputs)
+            else Integrity.UNTRUSTED
+        )
+        integrity_effect = (
+            IntegrityEffect.ACTIVE_INGEST
+            if any(source.has_untrusted_active_ingest for source in inputs)
+            else IntegrityEffect.INFORMATIONAL
+        )
+        return cls(
+            principal=principal,
+            domain=domain,
+            domain_qualifier=domain_qualifier,
+            resource_id=resource_id,
+            bridge_instance=bridge_instance,
+            sensitivity=sensitivity,
+            authorized_principals=acl,
+            source_kind=source_kind,
+            integrity=integrity,
+            integrity_effect=integrity_effect,
+        )
+
+
+def _dedup_source_labels(sources: Any) -> tuple["SourceLabel", ...]:
+    """Coerce ``sources`` to a stable, de-duplicated tuple of ``SourceLabel``.
+
+    ``sources`` is a tuple, never a ``frozenset[SourceLabel]``: a set of models
+    crashes pydantic's generic serializer (unhashable dict) on the Any-typed
+    runtime path (chainlink #971). Dedup preserves the "unique + append-only"
+    contract for direct construction — ``with_source`` stays the incremental
+    fast path but callers may also build ``sources=`` directly.
+    """
+    seen: set[SourceLabel] = set()
+    unique: list[SourceLabel] = []
+    for source in sources:
+        if not isinstance(source, SourceLabel):
+            raise TypeError(
+                f"sources must contain SourceLabel, got {type(source).__name__}"
+            )
+        if source in seen:
+            continue
+        seen.add(source)
+        unique.append(source)
+    return tuple(unique)
+
+
+@dataclass(frozen=True)
+class InformationFlowLabels:
+    """Immutable/monotonic information flow control labels (chainlink #871).
+
+    Tracks data sensitivity from various sources to enforce the sink gate.
+    Labels are monotonic - they can only be added, never removed except via
+    explicit audited admin declassification action. Unknown labels fail closed.
+
+    Sources:
+    - inbound/folded messages
+    - recent history
+    - automatic memory/session/skill/file injection
+    - attachments
+    - continuation context
+    - protected/partial tool/subagent results
+    """
+
+    labels: frozenset[str] = frozenset()
+    source_channels: frozenset[str] = frozenset()
+    # A TUPLE, not a frozenset (chainlink #971): mimir tools use postponed
+    # annotations, so langchain's ``_injected_args_keys`` is empty and the
+    # injected ToolRuntime is included in the model_dump that ``_parse_input``
+    # runs to enumerate fields. In a real graph run that runtime's
+    # ``config["configurable"]["__pregel_runtime"]`` (a langgraph Runtime) carries
+    # ``context=AuthContext``; dict values serialize DUCK-TYPED, bypassing
+    # type-level serializers, so #1173's opaque AuthContext serializer never
+    # fires on that path and a frozenset[SourceLabel] rebuilds a set of
+    # serialized dicts -> ``TypeError: unhashable type: 'dict'`` -> the whole
+    # turn panics. This is the crash that survived #1173 in production. A tuple
+    # fixes the data itself, so every serialization path is safe;
+    # ``_dedup_source_labels`` keeps it unique + append-only.
+    sources: tuple[SourceLabel, ...] = ()
+    created_at: float = field(default_factory=time.monotonic, compare=False)
+
+    def __post_init__(self) -> None:
+        # Enforce the invariant at construction: a serialization-safe tuple (never
+        # a frozenset[SourceLabel], which re-introduces the #971 turn-crash) that
+        # is stably de-duplicated, so direct ``sources=`` construction honors the
+        # same unique+append-only contract as ``with_source``.
+        object.__setattr__(self, "sources", _dedup_source_labels(self.sources))
+        # Direct construction must not let source-bearing carriers skip the sink gate.
+        object.__setattr__(
+            self, "labels", self.labels | frozenset(s.sensitivity for s in self.sources),
+        )
+
+    def with_label(self, label: str) -> "InformationFlowLabels":
+        """Return new instance with added label (monotonic - only adds)."""
+        if label in self.labels:
+            return self
+        return InformationFlowLabels(
+            labels=self.labels | frozenset({label}),
+            source_channels=self.source_channels,
+            sources=self.sources,
+            created_at=self.created_at,
+        )
+
+    def with_channel(self, channel: str) -> "InformationFlowLabels":
+        """Return new instance with added source channel."""
+        if channel in self.source_channels:
+            return self
+        return InformationFlowLabels(
+            labels=self.labels,
+            source_channels=self.source_channels | frozenset({channel}),
+            sources=self.sources,
+            created_at=self.created_at,
+        )
+
+    def with_source(self, source: SourceLabel) -> "InformationFlowLabels":
+        """Return a carrier with one immutable source record added."""
+        if source in self.sources:
+            return self
+        channels = self.source_channels
+        if source.source_kind == "channel" and source.resource_id:
+            channels |= frozenset({source.resource_id})
+        return InformationFlowLabels(
+            labels=self.labels | frozenset({source.sensitivity}),
+            source_channels=channels,
+            sources=(*self.sources, source),
+            created_at=self.created_at,
+        )
+
+    @property
+    def has_untrusted_active_ingest(self) -> bool:
+        """The supported taint query for a snapshot; live gates use live state.
+
+        False is not authorization: provenance completeness, ACLs and sink
+        policy remain separate checks. An empty source set has no taint.
+        """
+        return any(source.has_untrusted_active_ingest for source in self.sources)
+
+    @property
+    def persisted_integrity(self) -> Integrity:
+        """Derive durable trust from active-ingest sources only."""
+        return (
+            Integrity.TRUSTED
+            if self.sources
+            and all(
+                source.integrity == Integrity.TRUSTED
+                for source in self.sources
+                if source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            )
+            else Integrity.UNTRUSTED
+        )
+
+    @property
+    def persisted_integrity_effect(self) -> IntegrityEffect:
+        """Summarize whether an untrusted source actively tainted this turn."""
+        return (
+            IntegrityEffect.ACTIVE_INGEST
+            if self.has_untrusted_active_ingest
+            else IntegrityEffect.INFORMATIONAL
+        )
+
+    def can_flow_to(self, sink: str, allowed_sinks: frozenset[str]) -> bool:
+        """Check if labels permit flow to the given sink.
+
+        Unknown labels fail closed (deny). Unknown sinks fail closed (deny).
+        Same-principal/same-channel flows pass only when every label is
+        destination-compatible.
+        """
+        if not self.labels:
+            return True
+        if not allowed_sinks:
+            return False
+        for label in self.labels:
+            if label not in ("private", "confidential", "internal", "public"):
+                return False
+        return sink in allowed_sinks or "*" in allowed_sinks
+
+
+@dataclass
+class RepositoryAuthorTrustCache:
+    """Turn-local GitHub verdicts; transport uncertainty is never cached."""
+
+    _verdicts: dict[tuple[str, str], bool] = field(default_factory=dict, repr=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def trusted(self, repository: str, author: str) -> bool:
+        """Inspect an existing affirmative verdict without contacting the forge."""
+        with self._lock:
+            return self._verdicts.get((repository.casefold(), author.casefold())) is True
+
+    def resolve(self, repository: str, author: str, attest: Any) -> bool | None:
+        key = (repository.casefold(), author.casefold())
+        # Serialize concurrent reads so one author incurs only one attestation.
+        # Callers execute in worker threads, never on the event loop.
+        with self._lock:
+            if key in self._verdicts:
+                return self._verdicts[key]
+            verdict = attest()
+            if type(verdict) is bool:
+                self._verdicts[key] = verdict
+                return verdict
+            return None
+
+
+@dataclass
+class IngestAcknowledgement:
+    """Bounded human trust only: no labels, ACLs, capabilities or sensitivities.
+
+    Chat cells expire after one idle hour and are also bounded by the owner's
+    channel cache. ACP cells are owned by (and die with) their session.
+    """
+
+    MAX_SOURCES = 1024
+    IDLE_SECONDS = 60 * 60
+    _acknowledged_ingest: frozenset[str] = field(default_factory=frozenset)
+    arrival_ordinal: int = 0
+    acknowledged_ordinal: int = 0
+    last_used: float = field(default_factory=time.monotonic)
+    _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
+
+    @staticmethod
+    def source_identity(source: SourceLabel) -> str:
+        # Stable fixed-size identity; do not retain source content, ACLs or IDs.
+        attestation = source.owner_attestation
+        record = [source.principal, source.domain, source.domain_qualifier,
+                  source.resource_id, source.bridge_instance, str(source.sensitivity),
+                  sorted(source.authorized_principals), str(source.source_kind),
+                  str(source.integrity), str(source.integrity_effect),
+                  [attestation.canonical_principal, attestation.raw_author]
+                  if attestation is not None else None]
+        return hashlib.sha256(json.dumps(record, ensure_ascii=True).encode()).hexdigest()
+
+    def touch(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if now - self.last_used >= self.IDLE_SECONDS:
+                self._acknowledged_ingest = frozenset()
+                # Expiry also invalidates outstanding snapshots.
+                self.arrival_ordinal += 1
+            self.last_used = now
+
+
+@dataclass
+class InformationFlowState:
+    """Turn-local monotonic IFC state shared by frozen runtime carriers."""
+
+    repository_author_trust: RepositoryAuthorTrustCache = field(
+        default_factory=RepositoryAuthorTrustCache, repr=False, compare=False, init=False,
+    )
+    # Acquisition verdicts keyed by immutable scope ID (including PR author/head).
+    pr_checkout_author_trust: dict[str, bool | None] = field(
+        default_factory=dict, repr=False, compare=False, init=False,
+    )
+    pr_checkout_author_trust_cause: dict[str, str] = field(
+        default_factory=dict, repr=False, compare=False, init=False,
+    )
+    _own_push_lineage: dict[tuple[str, int], frozenset[str]] = field(
+        default_factory=dict, repr=False, compare=False, init=False,
+    )
+    labels: InformationFlowLabels | None = None
+    _declassification: "DeclassificationCapability | None" = field(
+        default=None, repr=False, compare=False,
+    )
+    _shadow_declassification_used: bool = field(default=False, repr=False, compare=False)
+    _sink_category_capabilities: dict[str, "SinkCategoryCapability"] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+    _source_arrival_ordinal: int = field(default=0, repr=False, compare=False)
+    ingest_acknowledgement: IngestAcknowledgement = field(
+        default_factory=IngestAcknowledgement, repr=False, compare=False,
+    )
+    _receipt_identity: Any = field(default_factory=object, repr=False, compare=False)
+    # Bound once from the server-issued approval request. This lives on the
+    # durable IFC cell carried by AuthContext so forked SDK/MCP tasks do not
+    # depend on the ambient _current_turn ContextVar to retain turn authority.
+    _sink_category_turn_id: str | None = field(default=None, repr=False, compare=False)
+    _author_attestation_unavailable: bool = field(default=False, repr=False, compare=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
+        with self._lock:
+            return self.labels if self.labels is not None else fallback
+
+    def record_own_push(self, repository: str, pull_request: int, previous_head: str) -> None:
+        """Remember a superseded head only after an exact verified publication."""
+        key = (repository.casefold(), pull_request)
+        with self._lock:
+            self._own_push_lineage[key] = self._own_push_lineage.get(key, frozenset()) | {
+                previous_head.casefold(),
+            }
+
+    def own_push_lineage(self) -> dict[tuple[str, int], frozenset[str]]:
+        with self._lock:
+            return dict(self._own_push_lineage)
+
+    def record_author_attestation_unavailable(self) -> None:
+        """Diagnostic history only; never clears taint or changes authority."""
+        with self._lock:
+            self._author_attestation_unavailable = True
+
+    def author_attestation_was_unavailable(self) -> bool:
+        with self._lock:
+            return self._author_attestation_unavailable
+
+    def has_untrusted_active_ingest(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> bool:
+        """Uncovered active ingest in the live carrier (labels remain append-only)."""
+        with self._lock, self.ingest_acknowledgement._lock:
+            self.ingest_acknowledgement.touch()
+            current = self.labels if self.labels is not None else fallback
+            ack = self.ingest_acknowledgement
+            return bool(
+                isinstance(current, InformationFlowLabels)
+                and current.has_untrusted_active_ingest
+                and (ack.arrival_ordinal > ack.acknowledged_ordinal
+                     or any(source.has_untrusted_active_ingest
+                            and ack.source_identity(source) not in ack._acknowledged_ingest
+                            for source in current.sources))
+            )
+
+    def source_arrival_ordinal(self) -> int:
+        with self._lock:
+            return self._source_arrival_ordinal
+
+    def permission_has_untrusted_active_ingest(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> bool:
+        """The same effective taint as every other live sink gate."""
+        current = self.current(fallback)
+        return (not isinstance(current, InformationFlowLabels)
+                or self.has_untrusted_active_ingest(fallback))
+
+    def acknowledge_ingest_snapshot(
+        self, *, expected: InformationFlowLabels, durable_audit: Any,
+        expected_ordinal: int | None = None,
+    ) -> bool:
+        """Acknowledge reviewed untrusted ingest; intervening trusted reads are OK."""
+        with self._lock, self.ingest_acknowledgement._lock:
+            ack = self.ingest_acknowledgement
+            ack.touch()
+            current = self.labels
+            reviewed = frozenset(source for source in expected.sources
+                                 if source.has_untrusted_active_ingest)
+            if (not isinstance(current, InformationFlowLabels)
+                    or any(source.has_untrusted_active_ingest and source not in reviewed
+                           and ack.source_identity(source) not in ack._acknowledged_ingest
+                           for source in current.sources)
+                    or (expected_ordinal is not None
+                        and ack.arrival_ordinal != expected_ordinal)):
+                return False
+            sources = tuple(source for source in reviewed
+                            if ack.source_identity(source) not in ack._acknowledged_ingest)
+            if not reviewed or (not sources and ack.arrival_ordinal <= ack.acknowledged_ordinal):
+                return False
+            covered = ack._acknowledged_ingest | frozenset(
+                ack.source_identity(source) for source in reviewed
+            )
+            if len(covered) > ack.MAX_SOURCES or not durable_audit(sources):
+                return False
+            ack._acknowledged_ingest = covered
+            ack.acknowledged_ordinal = ack.arrival_ordinal
+            return True
+
+    def ingest_snapshot(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> tuple[InformationFlowLabels | None, int]:
+        """Human request snapshot bound to untrusted arrivals only."""
+        with self._lock, self.ingest_acknowledgement._lock:
+            self.ingest_acknowledgement.touch()
+            current = self.labels if self.labels is not None else fallback
+            return current, self.ingest_acknowledgement.arrival_ordinal
+
+    def source_snapshot(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> tuple[InformationFlowLabels | None, int]:
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            return current, self._source_arrival_ordinal
+
+    def merge(
+        self,
+        added: InformationFlowLabels,
+        fallback: InformationFlowLabels | None = None,
+    ) -> InformationFlowLabels:
+        """Atomically union labels so concurrent tool results cannot attenuate state."""
+        merged, _ = self.merge_with_receipt(added, fallback=fallback)
+        return merged
+
+    def merge_with_receipt(
+        self,
+        added: InformationFlowLabels,
+        fallback: InformationFlowLabels | None = None,
+        *,
+        event_identity: Any = None,
+        fresh_untrusted_ingest: bool = False,
+    ) -> tuple[InformationFlowLabels, "SourceFoldReceipt"]:
+        with self._lock, self.ingest_acknowledgement._lock:
+            self.ingest_acknowledgement.touch()
+            current = self.labels if self.labels is not None else fallback
+            merged = current if isinstance(current, InformationFlowLabels) else InformationFlowLabels()
+            if isinstance(added, InformationFlowLabels):
+                for label in added.labels:
+                    merged = merged.with_label(label)
+                for channel in added.source_channels:
+                    merged = merged.with_channel(channel)
+                for source in added.sources:
+                    merged = merged.with_source(source)
+            changed = not isinstance(current, InformationFlowLabels) or merged != current
+            source_changed = (
+                changed
+                and isinstance(current, InformationFlowLabels)
+                and merged.sources != current.sources
+            ) or (changed and not isinstance(current, InformationFlowLabels) and bool(merged.sources))
+            source_arrived = source_changed or (
+                event_identity is not None
+                and isinstance(added, InformationFlowLabels)
+                and bool(added.sources)
+            ) or fresh_untrusted_ingest
+            pre_ordinal = self._source_arrival_ordinal
+            if source_arrived:
+                self._source_arrival_ordinal += 1
+                if (fresh_untrusted_ingest or (
+                    isinstance(added, InformationFlowLabels)
+                    and any(source.has_untrusted_active_ingest
+                            and self.ingest_acknowledgement.source_identity(source)
+                            not in self.ingest_acknowledgement._acknowledged_ingest
+                            and (not isinstance(current, InformationFlowLabels)
+                                 or source not in current.sources)
+                            for source in added.sources)
+                )):
+                    self.ingest_acknowledgement.arrival_ordinal += 1
+            if changed and current is not None:
+                self._declassification = None
+            if (changed and current is not None) or source_arrived:
+                self._sink_category_capabilities.clear()
+            self.labels = merged
+            receipt = SourceFoldReceipt(
+                pre_carrier=current if isinstance(current, InformationFlowLabels) else None,
+                post_carrier=merged,
+                pre_source_arrival_ordinal=pre_ordinal,
+                post_source_arrival_ordinal=self._source_arrival_ordinal,
+                event_identity=event_identity,
+                source_changed=source_changed,
+                source_arrived=source_arrived,
+                _state_identity=self._receipt_identity,
+            )
+            return merged, receipt
+
+    def sink_category_turn_id(self) -> str | None:
+        """Return the immutable turn binding for reusable sink authority."""
+        with self._lock:
+            return self._sink_category_turn_id
+
+    def install_sink_category_capability(
+        self,
+        *,
+        sink_category: str,
+        turn_id: str,
+        canonical_principal: str,
+        request_carrier: InformationFlowLabels,
+        request_source_arrival_ordinal: int,
+        approval_event: Any,
+        reply_source: SourceLabel,
+        fold_receipt: "SourceFoldReceipt",
+    ) -> bool:
+        with self._lock:
+            live = self.labels
+            expected_post = request_carrier.with_source(reply_source)
+            if (
+                approval_event is None
+                or fold_receipt.event_identity is None
+                or fold_receipt._state_identity is not self._receipt_identity
+                or fold_receipt.event_identity is not approval_event
+                or fold_receipt.pre_carrier != request_carrier
+                or fold_receipt.pre_source_arrival_ordinal != request_source_arrival_ordinal
+                or fold_receipt.post_source_arrival_ordinal != request_source_arrival_ordinal + 1
+                or not fold_receipt.source_arrived
+                or fold_receipt.post_carrier != expected_post
+                or live != fold_receipt.post_carrier
+                or not isinstance(turn_id, str)
+                or not turn_id
+                or self._sink_category_turn_id not in (None, turn_id)
+            ):
+                return False
+            # The request's turn id was server-issued and all request/state/fold
+            # bindings above have been authenticated. Bind it once to the same
+            # durable IFC cell that AuthContext carries through execution forks.
+            self._sink_category_turn_id = turn_id
+            self._sink_category_capabilities[sink_category] = SinkCategoryCapability(
+                sink_category=sink_category,
+                turn_id=turn_id,
+                canonical_principal=canonical_principal,
+                labels=live.labels,
+                source_channels=live.source_channels,
+                sources=live.sources,
+            )
+            return True
+
+    def approve_sink_once(
+        self,
+        *,
+        fallback: InformationFlowLabels | None,
+        sink_category: str,
+        destination: str,
+        canonical_principal: str,
+        lifetime_seconds: float,
+        durable_audit: Any,
+    ) -> bool:
+        """Durably audit and install one capability for the exact live carrier."""
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            if not isinstance(current, InformationFlowLabels) or not current.labels:
+                return False
+            issued_at = time.monotonic()
+            expires_at = issued_at + lifetime_seconds
+            if not durable_audit(current, issued_at, expires_at):
+                return False
+            self._declassification = DeclassificationCapability(
+                sink_category=sink_category,
+                destination=destination,
+                canonical_principal=canonical_principal,
+                labels=current.labels,
+                source_channels=current.source_channels,
+                sources=current.sources,
+                issued_at=issued_at,
+                expires_at=expires_at,
+            )
+            self._shadow_declassification_used = False
+            return True
+
+    def consume_sink_approval(
+        self,
+        *,
+        current: InformationFlowLabels,
+        sink_category: str,
+        destination: str,
+        canonical_principal: str,
+        turn_id: str | None = None,
+        shadow: bool = False,
+    ) -> bool:
+        """Admit a capability, accounting shadow one-shot use without spending it."""
+        with self._lock:
+            live = self.labels if self.labels is not None else current
+            capability = self._declassification
+            if capability is not None and not (shadow and self._shadow_declassification_used):
+                if time.monotonic() > capability.expires_at:
+                    if not shadow:
+                        self._declassification = None
+                else:
+                    matches = (
+                        capability.sink_category == sink_category
+                        and capability.destination == destination
+                        and capability.canonical_principal == canonical_principal
+                        and isinstance(live, InformationFlowLabels)
+                        and capability.labels == live.labels == current.labels
+                        and capability.source_channels == live.source_channels == current.source_channels
+                        and capability.sources == live.sources == current.sources
+                    )
+                    if matches:
+                        if shadow:
+                            self._shadow_declassification_used = True
+                        else:
+                            self._declassification = None
+                        return True
+            category_capability = self._sink_category_capabilities.get(sink_category)
+            return bool(
+                turn_id is not None
+                and category_capability is not None
+                and category_capability.turn_id == turn_id
+                and category_capability.canonical_principal == canonical_principal
+                and isinstance(live, InformationFlowLabels)
+                and category_capability.labels == live.labels == current.labels
+                and category_capability.source_channels == live.source_channels == current.source_channels
+                and category_capability.sources == live.sources == current.sources
+            )
+
+
+@dataclass(frozen=True)
+class SourceFoldReceipt:
+    pre_carrier: InformationFlowLabels | None
+    post_carrier: InformationFlowLabels
+    pre_source_arrival_ordinal: int
+    post_source_arrival_ordinal: int
+    event_identity: Any
+    source_changed: bool
+    source_arrived: bool
+    _state_identity: Any = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class SinkCategoryCapability:
+    sink_category: str
+    turn_id: str
+    canonical_principal: str
+    labels: frozenset[str]
+    source_channels: frozenset[str]
+    sources: tuple[SourceLabel, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sources", _dedup_source_labels(self.sources))
+
+
+@dataclass(frozen=True)
+class DeclassificationCapability:
+    """One audited egress capability bound to a live turn and source snapshot."""
+
+    sink_category: str
+    destination: str
+    canonical_principal: str
+    labels: frozenset[str]
+    source_channels: frozenset[str]
+    sources: tuple[SourceLabel, ...]
+    issued_at: float
+    expires_at: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sources", _dedup_source_labels(self.sources))
+
+
+@dataclass
+class EgressSessionState:
+    """Server-owned exact-URL approvals shared by turns in one session."""
+
+    _approved_urls: set[str] = field(default_factory=set, repr=False, compare=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def approve_url(self, url: str) -> None:
+        with self._lock:
+            self._approved_urls.add(url)
+
+    def is_url_approved(self, url: str) -> bool:
+        with self._lock:
+            return url in self._approved_urls
+
+    def approved_urls(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._approved_urls)
+
+
+@dataclass
+class IngestedURLState:
+    """Turn-local exact URLs observed in untrusted active ingest."""
+
+    MAX_URLS: int = field(default=1000, init=False, repr=False)
+    _urls: set[str] = field(default_factory=set, repr=False, compare=False)
+    _cap_logged: bool = field(default=False, repr=False, compare=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def add(self, url: str) -> None:
+        cap_reached = False
+        with self._lock:
+            if url in self._urls:
+                return
+            if len(self._urls) >= self.MAX_URLS:
+                if not self._cap_logged:
+                    self._cap_logged = True
+                    cap_reached = True
+            else:
+                self._urls.add(url)
+        if cap_reached:
+            from .event_logger import log_event_sync
+
+            log_event_sync("ingested_url_cap_reached", cap=self.MAX_URLS)
+
+    def contains(self, url: str) -> bool:
+        with self._lock:
+            return url in self._urls
+
+    def urls(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._urls)
+
+
+@dataclass
+class AgentEvent:
+    """Inbound event from a bridge, scheduler tick, or HTTP injection.
+
+    Author identity convention (FUTURE_WORK §6.1):
+    - ``author``         — platform-prefixed stable id used as the
+      matching key (e.g. ``"discord-99"``, ``"slack-U05ALICE"``).
+      ``MessageBuffer.cross_author_messages`` compares on this field
+      after resolving through ``IdentityResolver`` to a canonical.
+    - ``author_display`` — human-readable name for prompt rendering
+      (e.g. ``"alice#1234"``, ``"Alice Smith"``). Falls back to
+      ``author`` when not set.
+    - ``author_id``      — raw platform user id without the prefix
+      (e.g. ``"99"``, ``"U05ALICE"``). Diagnostic / cross-reference;
+      not the matching key.
+    """
+
+    trigger: str                      # "user_message" | "scheduled_tick" | "saga_session_end" | ...
+    channel_id: str | None
+    content: str = ""
+    author: str | None = None
+    author_display: str | None = None
+    author_id: str | None = None
+    source_id: str | None = None
+    # Origin tag for the Recent activity allowlist (SPEC §5.4). Real
+    # conversation sources ("slack", "discord", "bluesky", "web", "stdin")
+    # default into the recent-messages render; programmatic injections
+    # ("api") and synthetic events ("scheduler", "system") stay out unless
+    # the operator opts them in via MIMIR_RECENT_SOURCES.
+    source: str | None = None
+    attachment_names: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+    # Server-owned service identity. Only trusted internal event constructors
+    # set this field; generic HTTP ingress deliberately never copies it from a
+    # request body. ``create_auth_context`` validates it against the registered
+    # principal for ``trigger`` before granting service authority.
+    service_principal: str | None = None
+    # Exact immutable service grant selected by a trusted internal constructor.
+    # Public ingress never copies this object from request data.
+    service_authority: Any = None
+    # Optional server-discovered heartbeat authority. Poller scopes are always
+    # rebuilt from their trusted payload items and never accepted here.
+    repo_pr_action_scope: Any = None
+    # Server-carried IFC state for continuations/resumed events. This must be
+    # propagated from a trusted TurnContext; generic ingress must not accept a
+    # client assertion as a declassification or authority signal.
+    ifc_labels: "InformationFlowLabels | None" = None
+    # Frozen authority inherited by a trusted server-created continuation.
+    # Generic ingress constructors must not copy this field from client input.
+    continuation_auth_context: "AuthContext | None" = None
+    # ACL accumulated from the authoritative turns in a completed channel
+    # session. Only the server-owned synthesis constructor sets this carrier.
+    source_session_acl: "SessionACL | None" = None
+
+
+@dataclass(frozen=True)
+class SessionACL:
+    """Immutable, monotonically intersected ACL for synthesis outputs."""
+
+    owner_principal: str = "legacy_admin"
+    origin_channel: str | None = None
+    origin_domain: str | None = None
+    visibility: str = "legacy_admin"
+    provenance_complete: bool = False
+
+    @classmethod
+    def from_auth_context(
+        cls,
+        auth_context: "AuthContext | None",
+        *,
+        origin_domain: str | None,
+        visibility: str,
+    ) -> "SessionACL":
+        if auth_context is None:
+            return cls()
+        owner = auth_context.canonical_principal or auth_context.principal
+        channel = auth_context.channel_id
+        if not owner or not channel or not origin_domain:
+            return cls()
+        if auth_context.is_service:
+            owner = f"service:{owner}"
+            visibility = "service"
+        if visibility not in {"public", "private", "service"}:
+            return cls()
+        return cls(
+            owner_principal=owner,
+            origin_channel=channel,
+            origin_domain=origin_domain,
+            visibility=visibility,
+            provenance_complete=True,
+        )
+
+    def intersect(self, other: "SessionACL") -> "SessionACL":
+        """Return a no-wider ACL; ambiguous provenance permanently fails closed."""
+        if not self.provenance_complete or not other.provenance_complete:
+            return SessionACL()
+        if (
+            self.owner_principal != other.owner_principal
+            or self.origin_channel != other.origin_channel
+            or self.origin_domain != other.origin_domain
+        ):
+            return SessionACL()
+        rank = {"public": 0, "private": 1, "service": 2, "legacy_admin": 3}
+        visibility = max(
+            (self.visibility, other.visibility), key=lambda value: rank.get(value, 3)
+        )
+        return SessionACL(
+            owner_principal=self.owner_principal,
+            origin_channel=self.origin_channel,
+            origin_domain=self.origin_domain,
+            visibility=visibility,
+            provenance_complete=True,
+        )
+
+
+@dataclass
+class PollerProposalState:
+    """Runtime-owned proposal binding; only a verified open activates access."""
+
+    scope: PollerProposalScope | None = None
+    worktree: Path | None = None
+    active: bool = False
+    # Held through the synchronous Git operation, including after async cancellation.
+    _operation_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def deactivate(self) -> None:
+        self.active = False
+
+
+class _AuthContextAuthoritySlot:
+    __slots__ = (
+        "_audience_provider",
+        "_canonical_principal",
+        "_channel_id",
+        "_principal",
+        "_resource_id",
+    )
+
+
+_MISSING_AUTH_VALUE: Any = object()
+
+
+def _validate_plugin_slot(policy: Any, registrar: Any, value: Any) -> str:
+    from .plugins.registry import PolicyRegistrar
+
+    if (policy is None or not policy.frozen or not isinstance(registrar, PolicyRegistrar)
+            or registrar._registry is not policy):
+        raise ValueError("plugin state requires a frozen, matching owner registrar")
+    owner = registrar.plugin
+    slot_type = policy.state_slots.get(owner)
+    if slot_type is None or type(value) is not slot_type:
+        raise TypeError(f"{owner}: plugin state must have its registered slot type")
+    return owner
+
+
+@dataclass(frozen=True, eq=False)
+class AuthContext(_AuthContextAuthoritySlot):
+    """Frozen, server-created authorization context (chainlink #864).
+
+    This context carries immutable authorization state from the server's ingress
+    point through the entire turn execution. It is created BEFORE model execution
+    and CANNOT be widened or mutated by the model, tools, or downstream handlers.
+
+    The key invariant: authority is derived ONLY from this frozen carrier, NOT from:
+    - Model-passed session_id
+    - ContextVar fallback heuristics
+    - Single-active-turn heuristics
+
+    Fields are immutable (frozen=True) to prevent post-creation widening.
+
+    The ifc_labels field carries per-turn IFC labels on the durable carrier,
+    ensuring sink-flow checks survive forked SDK/MCP tasks where the
+    _current_turn ContextVar is lost (chainlink #891).
+    """
+
+    principal: InitVar[str | None] = _MISSING_AUTH_VALUE
+    canonical_principal: InitVar[str | None] = _MISSING_AUTH_VALUE
+    roles: tuple[str, ...] = _MISSING_AUTH_VALUE
+    event_ingress: str | None = _MISSING_AUTH_VALUE
+    trigger: str = _MISSING_AUTH_VALUE
+    channel_id: InitVar[str | None] = _MISSING_AUTH_VALUE
+    interactivity: "TurnInteractivity | None" = _MISSING_AUTH_VALUE
+    policy_version: str | None = None
+    is_service: bool = False
+    service_authority: Any = field(default=None, repr=False)
+    enforcement_enabled: bool = False
+    ifc_labels: "InformationFlowLabels | None" = None
+    domain: str | None = None
+    resource_id: InitVar[str | None] = None
+    bridge_instance: str | None = None
+    # Write provenance selected at ingress. These are deliberately absent from
+    # model-facing tool arguments and cannot be changed after construction.
+    origin_trigger: str | None = None
+    origin_ref: str | None = None
+    # Mutable only through its monotonic merge API. Keeping this cell on the
+    # frozen carrier lets later forked requests observe post-tool taint without
+    # making identity, roles, or any authority field mutable.
+    ifc_state: InformationFlowState = field(
+        default_factory=InformationFlowState, repr=False, compare=False,
+    )
+    ingested_url_state: IngestedURLState = field(
+        default_factory=IngestedURLState, repr=False, compare=False,
+    )
+    egress_state: EgressSessionState = field(
+        default_factory=EgressSessionState, repr=False, compare=False,
+    )
+    poller_proposal_state: PollerProposalState = field(
+        default_factory=PollerProposalState, repr=False, compare=False,
+    )
+    proposal_revision: Any = field(default=None, repr=False, compare=False)
+    # Server-created immutable registry for all valid PR items in one trusted
+    # poller payload. Each state carries its own monotonic checkout proof.
+    repo_pr_scope_registry: Any = field(
+        default=None, repr=False, compare=False,
+    )
+    # Single-scope aliases retained for callers whose trusted event can only
+    # carry one PR (notably server-discovered heartbeat turns).
+    repo_review_state: Any = field(
+        default=None, repr=False, compare=False,
+    )
+    repo_pr_action_scope: Any = field(
+        default=None, repr=False, compare=False,
+    )
+    scoped_pr_grants: Any = field(default=None, repr=False, compare=False)
+    # Exact CI selectors from the server-delivered github-ci-watch record.
+    ci_run_targets: frozenset[tuple[str, int]] = frozenset()
+    ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
+    # (adapter, ref, url) of the one attested tracker issue behind a tracker poller turn.
+    tracker_issue_targets: frozenset[tuple[str, str, str]] = frozenset()
+    # Standing review authority is resolved lazily from a live server fetch.
+    # This cache is per turn and stores only immutable server-issued scopes.
+    server_discovered_pr_states: Any = field(default=None, repr=False, compare=False)
+    # Agent-owned server provenance retained across turns. It contains only
+    # immutable scopes, never mutable checkout state, and is not model input.
+    server_discovered_pr_scope_store: Any = field(
+        default=None, repr=False, compare=False,
+    )
+    retained_factory_scope: Any = field(
+        default=None, repr=False, compare=False,
+    )
+    retained_factory_scope_refusal: str | None = field(
+        default=None, repr=False, compare=False,
+    )
+    # Resource ACL for outputs derived by a trusted synthesis turn. This does
+    # not grant execution authority; it only attenuates durable output scope.
+    source_session_acl: SessionACL | None = None
+    # Server-selected SAGA resource for a synthesis turn. Model-supplied
+    # session IDs are only selectors and must match this immutable value.
+    saga_session_id: str | None = None
+    audience_provider: InitVar[_RedactedAudienceProvider] = None
+    cross_platform_pull: bool = True
+    domain_qualifier: str | None = None
+    plugin_slots: tuple[tuple[str, Any], ...] = field(default=(), repr=False, compare=False)
+    _plugin_slot_policy: Any = field(default=None, repr=False, compare=False)
+
+    def plugin_state(self, owner: str) -> Any | None:
+        return dict(self.plugin_slots).get(owner)
+
+    def with_plugin_state(self, registrar: Any, value: Any) -> "AuthContext":
+        """Set only the calling registrar's declared slot on this live carrier."""
+        owner = _validate_plugin_slot(self._plugin_slot_policy, registrar, value)
+        from dataclasses import replace
+
+        slots = dict(self.plugin_slots)
+        slots[owner] = value
+        return replace(self, plugin_slots=tuple(sorted(slots.items())))
+
+    def __post_init__(
+        self,
+        principal: str | None,
+        canonical_principal: str | None,
+        channel_id: str | None,
+        resource_id: str | None,
+        audience_provider: Any,
+    ) -> None:
+        if any(
+            value is _MISSING_AUTH_VALUE
+            for value in (
+                principal,
+                canonical_principal,
+                self.roles,
+                self.event_ingress,
+                self.trigger,
+                channel_id,
+                self.interactivity,
+            )
+        ):
+            raise TypeError("missing required authorization context field")
+        if isinstance(self.domain, str) and ":" in self.domain:
+            raise ValueError("authorization domain must not contain ':'")
+        object.__setattr__(self, "_principal", principal)
+        object.__setattr__(self, "_canonical_principal", canonical_principal)
+        object.__setattr__(self, "_channel_id", channel_id)
+        object.__setattr__(self, "_resource_id", resource_id)
+        object.__setattr__(self, "_audience_provider", audience_provider)
+        policy = self._plugin_slot_policy
+        if policy is not None and policy.frozen:
+            if object.__getattribute__(self, "server_discovered_pr_states") is None:
+                for protocol in policy.scoped_actions.values():
+                    constructors = getattr(protocol, "trusted_scope", None)
+                    if constructors is not None:
+                        object.__setattr__(self, "server_discovered_pr_states", constructors.discovered())
+            slots = dict(self.plugin_slots)
+            for owner, slot_type in policy.state_slots.items():
+                if owner not in policy.scoped_actions:
+                    continue
+                project = getattr(slot_type, "project_trusted_auth", None)
+                if project is not None and slot_type.__dataclass_fields__.keys() <= self.__dataclass_fields__.keys():
+                    state = project(self)
+                    if state is None:
+                        slots.pop(owner, None)
+                        continue
+                    if type(state) is not slot_type:
+                        raise TypeError("registered state projection returned the wrong type")
+                    slots[owner] = state
+            object.__setattr__(self, "plugin_slots", tuple(sorted(slots.items())))
+
+    def __getattribute__(self, name: str) -> Any:
+        # A selected owner's state is projected from trusted ingress. It cannot
+        # override the host-issued fields via with_plugin_state or a tool result.
+        if name in {
+            "repo_pr_scope_registry", "repo_review_state", "repo_pr_action_scope",
+            "server_discovered_pr_states", "server_discovered_pr_scope_store",
+            "retained_factory_scope", "retained_factory_scope_refusal",
+            "ci_run_targets", "ci_branch_targets", "tracker_issue_targets",
+        }:
+            policy = object.__getattribute__(self, "_plugin_slot_policy")
+            if policy is None or not policy.state_slots:
+                return object.__getattribute__(self, name)
+            if policy.frozen:
+                slots = dict(object.__getattribute__(self, "plugin_slots"))
+                for owner, slot_type in policy.state_slots.items():
+                    if (owner not in policy.scoped_actions
+                            or not hasattr(slot_type, "project_trusted_auth")
+                            or name not in slot_type.__dataclass_fields__
+                            or not slot_type.__dataclass_fields__.keys() <= type(self).__dataclass_fields__.keys()):
+                        continue
+                    state = slots.get(owner)
+                    fields = slot_type.__dataclass_fields__
+                    if type(state) is not slot_type or any(
+                        (getattr(state, key) != object.__getattribute__(self, key)
+                         if key in {"ci_run_targets", "ci_branch_targets", "tracker_issue_targets",
+                                    "retained_factory_scope_refusal"}
+                         else getattr(state, key) is not object.__getattribute__(self, key))
+                        for key in fields
+                    ):
+                        return frozenset() if name in {
+                            "ci_run_targets", "ci_branch_targets", "tracker_issue_targets",
+                        } else None
+                    return getattr(state, name)
+        hidden = {
+            "audience_provider": "_audience_provider",
+            "canonical_principal": "_canonical_principal",
+            "channel_id": "_channel_id",
+            "principal": "_principal",
+            "resource_id": "_resource_id",
+        }
+        if name in hidden:
+            return object.__getattribute__(self, hidden[name])
+        if name == "__dict__":
+            values = dict(object.__getattribute__(self, "__dict__"))
+            values.update(
+                principal=object.__getattribute__(self, "_principal"),
+                canonical_principal=object.__getattribute__(
+                    self, "_canonical_principal",
+                ),
+                channel_id=object.__getattribute__(self, "_channel_id"),
+                resource_id=object.__getattribute__(self, "_resource_id"),
+            )
+            return values
+        return object.__getattribute__(self, name)
+
+    def _identity(self) -> tuple[Any, ...]:
+        compared = tuple(
+            getattr(self, model_field.name)
+            for model_field in dataclass_fields(self)
+            if model_field.compare
+        )
+        return (
+            self.principal,
+            self.canonical_principal,
+            self.channel_id,
+            self.resource_id,
+            *compared,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AuthContext):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        """Serialize opaquely wherever pydantic dumps an AuthContext.
+
+        AuthContext is injected into tools as ``ToolRuntime[AuthContext]``.
+        langchain's tool input-parsing (`_parse_input`) calls ``model_dump()`` on
+        the parsed args purely to compute the field set; the delivered values are
+        taken from ``getattr`` on the validated model, so the real runtime object
+        still reaches the tool regardless of what this serializer emits. But the
+        default dataclass serializer would recurse into fields pydantic cannot
+        python-serialize (``ifc_state``'s ``threading.Lock``), which raised and
+        panicked the ENTIRE turn (chainlink #971). Keep the default *validation*
+        schema so instances still validate; override only serialization to a
+        stable opaque placeholder. Nothing consumes the serialized form.
+
+        This covers only paths where pydantic consults the AuthContext schema
+        (the typed ``runtime.context`` field). It is BYPASSED wherever the
+        AuthContext is reached through duck-typed traversal — notably
+        ``runtime.config["configurable"]["__pregel_runtime"]`` (a langgraph
+        Runtime holding ``context=AuthContext``) during real graph runs — so
+        ``InformationFlowLabels.sources`` is a ``tuple`` (not a
+        ``frozenset[SourceLabel]``) to make the data itself serialization-safe.
+        That tuple is the fix for the crash that survived #1173 in production.
+        See ``InformationFlowLabels.sources``.
+        """
+        from pydantic_core import core_schema
+
+        schema = handler(source)
+        schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
+            lambda _value: {"audience_provider": None},
+        )
+        return schema
+
+
+@dataclass(frozen=True)
+class PromptBlock:
+    """Protected prompt content paired with immutable source provenance."""
+
+    content: str
+    labels: InformationFlowLabels
+
+
+@dataclass
+class TurnContext:
+    """Per-turn state. One instance per run_turn — never shared across turns."""
+
+    turn_id: str
+    session_id: str                   # = channel_id (viewer scope, SPEC §4.6)
+    trigger: str
+    channel_id: str | None
+    started_at: float
+    # Logical agent name — sourced from ``Config.agent_id`` at run_turn
+    # entry. Threaded into TurnRecord + emitted with every event so a
+    # cross-process operator running two agents on the same hardware
+    # (each in its own process) can filter the merged log streams by
+    # agent. ``None`` only in tests that construct TurnContext directly
+    # without going through Agent.
+    agent_id: str | None = None
+    saga_session_id: str | None = None
+    saga_atom_ids: list[str] = field(default_factory=list)
+    # chainlink #266 slice 6: skill-learning atom IDs injected into this
+    # turn's prompt (poller auto_skill_block + non-poller read_file
+    # middleware). run_turn folds these into the TurnRecord's
+    # ``saga_atom_ids`` so the session-boundary synthesis turn votes them
+    # via saga_feedback — but deliberately NOT into the per-turn
+    # auto-feedback credit pass, which writes a weight-2.0 boost on every
+    # cited atom each successful turn and would inflate every injected
+    # learning uniformly (defeating activation ranking). Populated
+    # best-effort; empty when no skill loads this turn.
+    injected_skill_atom_ids: list[str] = field(default_factory=list)
+    # Tool-call budget tracking (SPEC §4.5 follow-on / FUTURE_WORK).
+    # Incremented on every ALLOWED PreToolUse; the budget hook denies
+    # once at-cap (without incrementing) and warns once when the soft
+    # threshold is first crossed. 0 = no budget enforced.
+    tool_call_count: int = 0
+    tool_call_budget: int = 0
+    # Durable hard-denial markers for continuation/recovery paths.
+    # Populated only when a NON-exempt tool is refused at/over the cap;
+    # allowed calls leave them untouched. ``first_denied_at_count`` records
+    # the already-used count seen at the first refusal (normally == budget
+    # because denied calls do not increment ``tool_call_count``).
+    tool_call_budget_exhausted: bool = False
+    tool_call_budget_denied_count: int = 0
+    tool_call_budget_denied_tools: list[str] = field(default_factory=list)
+    tool_call_budget_first_denied_at_count: int | None = None
+    # Framework-owned record of actions refused by an always-on authorization
+    # or tool boundary. The model only receives rendered ToolMessages and cannot
+    # populate this classification itself.
+    hard_boundary_denials: list[dict[str, str]] = field(default_factory=list)
+    # IDs of results successfully offloaded by deepagents during this turn.
+    # Only these artifacts may be read back by session-boundary synthesis.
+    evicted_tool_result_ids: list[str] = field(default_factory=list)
+    # Successful server-observed actions that prove a remediation turn started.
+    # A later refusal cannot make one of these partially executed turns free.
+    remediation_effects: list[str] = field(default_factory=list)
+    # CR2 (agent runtime) fix: soft-warning idempotency. Without this
+    # flag, the previous ``count == soft_threshold`` trigger could miss
+    # a warning if any code path skipped an increment, AND could fire
+    # repeatedly if a future change ever decremented the count. One-shot
+    # flag means the warning fires exactly once per turn at the first
+    # crossing.
+    _tool_call_soft_warning_emitted: bool = False
+    # chainlink #511: per-turn model-iteration ceiling — 3-tier, belt-and-
+    # suspenders alongside the tool-call budget + homeostat.
+    # ``IterationGateMiddleware`` counts model iterations (before_model) and
+    # escalates: 75% gentle wrap-up nudge (no event), 90% urgent nudge (+event),
+    # 100% hard stop (force-end the turn + event). Each one-shot flag fires its
+    # tier exactly once. ``iteration_hard_stopped`` tells ``run_turn`` to send a
+    # cap notice to the channel (the model never got to deliver). 0 = disabled.
+    iteration_count: int = 0
+    iteration_budget: int = 0
+    _iteration_warn_75_emitted: bool = False
+    _iteration_warn_90_emitted: bool = False
+    _iteration_cap_emitted: bool = False
+    iteration_hard_stopped: bool = False
+    # Origin source of the inbound event (carried from AgentEvent.source so
+    # outbound assistant replies on the same channel inherit it).
+    channel_source: str | None = None
+    # Runtime access-control context for tool middleware. Populated by
+    # Agent.run_turn from the inbound AgentEvent and Config/IdentityResolver.
+    author: str | None = None
+    identity_resolver: Any | None = None
+    access_control_enforced: bool = False
+    # Frozen authorization context (chainlink #864). Created at ingress before
+    # model execution and supplied as LangGraph runtime context for ordinary,
+    # built-in, and wrapped MCP tools. Immutable - authority derives ONLY from
+    # this carrier, NOT from model session_id, ContextVar fallback, or
+    # single-active-turn heuristics.
+    auth_context: AuthContext | None = None
+    plugin_slots: tuple[tuple[str, Any], ...] = field(default=(), repr=False)
+
+    def __post_init__(self) -> None:
+        if self.auth_context is not None:
+            if self.plugin_slots:
+                raise ValueError("turn plugin state must originate from its auth context")
+            self.plugin_slots = self.auth_context.plugin_slots
+
+    def plugin_state(self, owner: str) -> Any | None:
+        return dict(self.plugin_slots).get(owner)
+
+    def set_plugin_state(self, registrar: Any, value: Any) -> None:
+        """Replace this turn's immutable owner slot after host validation."""
+        policy = self.auth_context._plugin_slot_policy if self.auth_context else None
+        owner = _validate_plugin_slot(policy, registrar, value)
+        slots = dict(self.plugin_slots)
+        slots[owner] = value
+        self.plugin_slots = tuple(sorted(slots.items()))
+
+    def auth_with_plugin_state(self) -> AuthContext | None:
+        """Snapshot live turn slots for a child or continuation carrier."""
+        auth = self.auth_context
+        if auth is None or not self.plugin_slots:
+            return auth
+        from dataclasses import replace
+
+        return replace(auth, plugin_slots=self.plugin_slots)
+    # Server-owned chat trust delivery and ingress binding (never model arguments).
+    operator_ingress_event: AgentEvent | None = None
+    trust_notice_sender: Any = None
+    trust_owner_loop: Any = None
+    trust_cleared_notice: bool = False
+    # Information flow control labels (chainlink #871). Immutable/monotonic
+    # labels tracking data sensitivity from various sources. Initialized before
+    # the first model call from inbound/folded messages, recent history,
+    # automatic memory/session/skill/file injection, attachments, and
+    # continuation context. Propagated to subagents, spawns, continuations,
+    # and resumed turns. Blocked at incompatible sinks.
+    ifc_labels: InformationFlowLabels | None = None
+    # Number of successful send_message deliveries in this turn (incremented
+    # only after the bridge confirms ``SendResult.sent``). The forgot-to-send
+    # guard emits ``interactive_turn_no_send_message`` when an interactive turn
+    # produced final text but this is still 0 — i.e. the reply never went out
+    # (0.3.0: send_message is the sole delivery path).
+    send_message_count: int = 0
+    # Calls to the notify-only operator_alert tool are separately bounded and
+    # do not count as replies to an interactive triggering channel.
+    operator_alert_count: int = 0
+    # Number of successful react tool calls this turn. A react is a valid
+    # interactive response (an acknowledgment), so the forgot-to-send guard
+    # treats react_count > 0 the same as a delivered send_message — otherwise
+    # a react-only reply gets falsely flagged as "no reply" (0.3.2).
+    react_count: int = 0
+    # Channels that received a CONFIRMED delivery this turn (send_message
+    # with SendResult.sent, or a confirmed react — tool or directive).
+    # chainlink #423: the forgot-to-send guard is channel-scoped — an
+    # interactive turn must deliver to the TRIGGERING channel; a
+    # cross-channel send (e.g. an ops-channel alert) doesn't count as
+    # replying to the user who asked. The plain counters above stay for
+    # observability; this set is what the guard reads.
+    delivered_channel_ids: set = field(default_factory=set)
+    # Channel-layer state (Phase 6.3) — populated by the agent at run_turn start.
+    loop_detector: object | None = None
+    last_assistant_message_id: str | None = None
+    # Synthesis-turn observability (CR#19). The synthesis prompt instructs
+    # the agent to call ``saga_end_session`` (step 3); this flag flips True
+    # in the tool handler on success. The agent's post-message hook checks
+    # it at synthesis-turn end and emits ``saga_synthesis_skipped_boundary``
+    # when False, so silent contract failures (agent didn't follow step 3)
+    # become a visible algedonic signal instead of empty session-summary
+    # blocks for the next session.
+    saga_end_session_called: bool = False
+    # WikiBacklinksHook snapshot: ``{absolute_page_path: st_mtime}`` taken
+    # at ``pre_query``, compared at ``finalize`` to detect which wiki
+    # pages were modified during the turn. Same multi-channel-safety
+    # Empty dict when the hook didn't populate it (e.g. tests that drive
+    # ``finalize`` directly).
+    wiki_mtime_snapshot: dict[str, float] = field(default_factory=dict)
+    # Per-turn saga call audit log. Populated by the
+    # ``RecordingSagaClient`` wrapper around every saga method invocation
+    # (query / store / feedback / mark_contributions / end_session /
+    # contextual rewrite). Surfaces in turns.jsonl so the turn viewer
+    # can show "what saga did this turn" without joining to events.jsonl.
+    # Each entry: ``SagaCallRecord`` (call type, args summary, result
+    # summary, latency_ms, error). Empty when no saga calls fired (e.g.
+    # synthetic ticks with no inbound, scheduled callables).
+    saga_calls: list[SagaCallRecord] = field(default_factory=list)
+    # Durable server-owned ingress provenance copied from ``AgentEvent.extra``
+    # when present (for example generic HTTP ``POST /event`` stamping). Tool
+    # middleware reads this instead of trusting client-controlled trigger /
+    # source / author fields for admin-sensitive decisions.
+    event_ingress: str | None = None
+    # Server-owned turn classification. Optional so older call sites and
+    # fail-closed guards can distinguish "not classified yet" from an explicit
+    # interactive/non-interactive decision.
+    interactivity: TurnInteractivity | None = None
+
+
+@dataclass
+class SagaCallRecord:
+    """One saga API call captured during a turn.
+
+    Recorded by ``RecordingSagaClient`` (mimir/saga_client.py) which
+    wraps the underlying ``SagaStore`` and appends
+    to ``TurnContext.saga_calls`` on every method invocation. The
+    rollup writes these into ``turns.jsonl`` so the turn viewer can
+    display saga's per-turn behavior inline without joining to
+    events.jsonl.
+
+    Field rationale:
+    - ``call_type`` — saga method name (``query`` / ``store`` /
+      ``feedback`` / ``mark_contributions`` / ``end_session`` /
+      ``rewrite``). ``rewrite`` is the contextual-rewrite path that
+      fires inside ``query`` when a non-empty ``context`` is passed.
+    - ``args`` — input summary as a JSON-able dict. Strings are
+      truncated to 200 chars to bound row size. Full content lives
+      in events.jsonl if needed.
+    - ``result`` — output summary (atom IDs retrieved, atom ID stored,
+      etc.). Bounded for the same reason.
+    - ``latency_ms`` — wall-clock duration of the call.
+    - ``t_ms`` — wall-clock offset from ``ctx.started_at`` to the
+      moment the call STARTED (not finished). Lets the turn viewer
+      interleave saga calls with SDK events on a single chronological
+      timeline. ``None`` when the recorder couldn't resolve the active
+      ctx (e.g. saga calls fired outside any turn — consolidation cron,
+      decay sweeps).
+    - ``error`` — exception message if the call raised, else ``None``.
+      An errored call still produces a record so the turn viewer can
+      surface failures.
+    """
+
+    call_type: str
+    args: dict
+    result: dict
+    latency_ms: float
+    error: str | None = None
+    t_ms: float | None = None
+
+    def to_dict(self) -> dict:
+        out = {
+            "call_type": self.call_type,
+            "args": self.args,
+            "result": self.result,
+            "latency_ms": round(self.latency_ms, 2),
+        }
+        if self.t_ms is not None:
+            out["t_ms"] = round(self.t_ms, 2)
+        if self.error is not None:
+            out["error"] = self.error
+        return out
+
+
+@dataclass
+class TurnRecord:
+    """One JSONL record per agent turn (SPEC §10.2)."""
+
+    ts: str
+    turn_id: str
+    session_id: str
+    saga_session_id: str | None
+    trigger: str
+    channel_id: str | None
+    input: str
+    # Logical agent name — sourced from ``Config.agent_id``. Tagging
+    # every turn record lets a cross-process operator running two
+    # agents filter merged turns.jsonl output by agent without grepping
+    # by MIMIR_HOME path. ``None`` on records written by code paths
+    # predating this field — the turn viewer treats absent agent_id as
+    # "unknown / single-agent legacy run".
+    agent_id: str | None = None
+    # Monotonically increasing turn sequence number, assigned by TurnLogger on
+    # write. Survives retention trimming (the high-water mark is re-seeded from
+    # the newest retained record), so the latest record's ``seq`` is the running
+    # turn total surfaced in the web dossier. ``None`` on legacy records until
+    # TurnLogger backfills them on startup.
+    seq: int | None = None
+    saga_atom_ids: list[str] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    # True when events come from an interrupted stream, not a final snapshot.
+    # None on legacy records and callers that do not track stream completion.
+    events_partial: bool | None = None
+    # Partial evidence omitted events due to size limits or malformed metadata.
+    # Individual payload previews carry their own truncation markers.
+    events_truncated: bool = False
+    output: str = ""
+    # chainlink #376: user messages that arrived mid-turn and were FOLDED into
+    # this turn at a before_model boundary. Each entry is ``{"t_ms": float,
+    # "text": str}`` (PR 4) — the rendered text the model saw plus a
+    # start-relative fold offset (same axis as event/saga ``t_ms``) so the turn
+    # viewer can place it on the timeline. One entry per fold, in fold order.
+    # ``input`` stays the original turn prompt; these are the additional inputs
+    # this single turn absorbed. Empty for the overwhelming majority of turns.
+    # Threaded here so the durable surfaces — turn log, synthesis summary, turn
+    # viewer — report what the turn consumed, not just the live message list.
+    # (PR 3 shipped this as ``list[str]``; readers tolerate both.)
+    injected_inputs: list[dict[str, Any]] = field(default_factory=list)
+    duration_ms: int = 0
+    error: str | None = None
+    # SDK ResultMessage capture (Phase 8 — resume detection + cost). Populated
+    # from the final ``ResultMessage`` the SDK emits per turn. ``None`` when
+    # no ResultMessage was received (e.g. query() crashed mid-stream).
+    result_subtype: str | None = None
+    result_is_error: bool | None = None
+    stop_reason: str | None = None
+    num_turns: int | None = None           # SDK's internal model-turn count
+    total_cost_usd: float | None = None    # None for non-Anthropic gateways
+    usage: dict[str, Any] | None = None    # input/output/cache token counts
+    # Final allowed-call count from TurnContext. Kept outside ``events`` because
+    # that array is size-bounded and cannot support accurate budget sizing.
+    tool_call_count: int = 0
+    permission_denials: list[Any] = field(default_factory=list)
+    # Discriminator for synthetic, non-conversational records (chainlink #60).
+    # ``None`` for ordinary agent turns (the existing case). Set to
+    # Legacy logs may contain ``"claude_code_spawn"`` records. Keep the
+    # discriminator readable for persisted turn-log compatibility.
+    kind: str | None = None
+    # Inline saga call audit. Each entry is a ``SagaCallRecord.to_dict()``
+    # populated by ``RecordingSagaClient`` during the turn. Empty list
+    # for turns that didn't touch saga (synthetic ticks, no-op heartbeats,
+    # synthesis turns that didn't call back). Surfaces in the turn viewer
+    # so "what saga did this turn" is visible inline without joining to
+    # events.jsonl.
+    saga_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Server-owned turn classification carried into the durable turn log.
+    # Optional for backward compatibility and fail-closed downstream guards.
+    interactivity: TurnInteractivity | None = None
+    # Derived from the final live IFC carrier. Optional defaults preserve
+    # compatibility with records written before turn integrity was persisted.
+    integrity: Integrity | None = None
+    integrity_effect: IntegrityEffect | None = None
+    integrity_sources: list[dict[str, Any]] = field(default_factory=list)
+    integrity_sources_omitted: int = 0
+    # Counts and taint domains cover all sources, including those beyond the
+    # bounded integrity_sources preview. Empty on records from older writers.
+    integrity_source_counts: dict[str, int] = field(default_factory=dict)
+    untrusted_active_ingest_domains: list[str] = field(default_factory=list)
+
+
+def make_turn_id() -> str:
+    # CR2 (agent runtime) fix: was ``hex[:12]`` = 48 bits. The
+    # ``_active_turns`` registry (and the budget hook's
+    # ``client_cell.turn_id`` foreign key) is keyed on this id;
+    # birthday-bound 50% collision arrived at ~16M turns. With 64
+    # bits, 50% collision is ~4B turns — well past the lifetime of
+    # any single mimir process. The id is a key, not a display
+    # string, so the brevity-vs-collision trade-off favors safety.
+    return uuid.uuid4().hex[:16]
+
+
+def make_process_session_id() -> str:
+    """events.jsonl session_id — one per process lifetime (open-strix convention)."""
+    return f"{int(time.time())}-{uuid.uuid4().hex[:8]}"

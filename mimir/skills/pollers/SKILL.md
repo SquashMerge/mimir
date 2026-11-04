@@ -1,0 +1,435 @@
+---
+name: pollers
+description: Build and manage pollers — subprocess scripts that check external services on a cron schedule, emit JSONL events on change, and stay silent otherwise (silence-as-filter). Use when authoring a poller (`pollers.json` plus a script in any language), debugging why one isn't firing, or extending an existing one. Tool-dependent steps require tools in the current turn's tool list; poller service turns may lack tools. The framework discovers `<home>/skills/<name>/pollers.json` at startup and via `reload_pollers`; each event starts a fresh turn on a `poller:<name>` channel. Companion to `world-scanning`, which catalogs what to poll. Distinct from `async-tasks` (one-shot wake-up via bash_async) and in-process scheduler callables (saga-consolidate, oauth-usage-poll), which mutate internal state without subprocess isolation.
+success_criteria:
+  # The pollers skill is for *building* or *fixing* pollers — both
+  # produce a write under skills/<poller>/pollers.json (the manifest)
+  # or the poller's script, plus a reload_pollers call to register
+  # the change. A turn that reads the SKILL.md but doesn't touch a
+  # poller dir is consulting, not authoring.
+  any_of:
+    - tool_call:
+        name: write_file
+        args:
+          file_path_glob: "*skills/*/pollers.json"
+    - tool_call:
+        name: write_file
+        args:
+          file_path_glob: "*skills/*/poller*"
+    - tool_call:
+        name: edit_file
+        args:
+          file_path_glob: "*skills/*/pollers.json"
+    - tool_call:
+        name: reload_pollers
+---
+
+<!-- desc: Build and manage pollers that check services on a schedule; tool-dependent steps require tools in the current turn's tool list, which service turns can lack. -->
+
+# Pollers — Event-Driven Monitoring
+
+**Tool availability:** Authoring and management steps below apply only when their
+required tools are present in the current turn's tool list. Poller service turns
+can have a restricted tool list or no tools at all; a manifest capability is not
+proof that a tool is available. Check before shell execution (`shell_exec`),
+`bash_async`, `reload_pollers`, `send_message`, or saga writes such as
+`memory_store` and `saga_feedback`. If a required tool is absent, state the
+limitation rather than inventing alternate tools or claiming the action happened.
+Existing admin instructions and the authority/scoping rules below still apply.
+
+### Poller skill tool conformance
+
+The fast skill-conformance test scans built-in and optional `SKILL.md` files.
+For skills shipping `pollers.json`, each named tool must be in **every** poller's
+declared capabilities or in an explicitly operator-only sentence. Profiles are
+capability ceilings, not default grants; omitted authority grants no tools.
+Capabilities still do not guarantee tool availability in the current turn.
+
+The qualifier grammar is literal: start the sentence with
+`Operator/admin turns only:` and put the tool instruction in that same sentence.
+For example:
+
+Operator/admin turns only: an interactive admin with the `reload_pollers` tool
+available can apply manifest changes without restarting.
+
+A sentence ends at punctuation (`.`, `!`, or `?`) followed by whitespace, a blank
+line, or a new Markdown list item, heading, or code fence; wrapping lines is allowed.
+The qualifier does not carry into another sentence, list item, or code block.
+Do not use an operator heading or an unrelated nearby sentence as a qualifier.
+For bridge-only tools, the operator sentence must also require a configured
+bridge channel and the tool in the current turn's inventory.
+
+The scanner uses the registry's tool names plus framework capability names and
+matches whole identifiers, not substrings. Underscored identifiers are recognized
+in prose, frontmatter, and code; ordinary words such as `react` and `task` count
+only when backtick-quoted or written as calls, so prose like "react to CI" is not
+a tool instruction. Use code markup for ordinary-word tool names when authoring
+instructions. Prefer poller-owned actions (such as notification outbox writes)
+over operator-only tool instructions when the poller needs to respond itself.
+
+Pollers are lightweight scripts that check external services on a schedule and report back when something needs attention. They live inside skills and are discovered automatically by the scheduler.
+
+## Contract
+
+**Trigger**: Authoring a new poller (a `pollers.json` manifest + script), debugging
+why an existing poller isn't firing, or extending an existing one (new emit type,
+schedule change, new pass-through env var). Distinct from `world-scanning` (which
+catalogs *what* to poll) and from `async-tasks` (one-shot subprocess via
+`bash_async`, not recurring).
+
+**Requires**: A clear answer to "what state am I checking?"; the cron expression for
+the check cadence; the ability to write the script in any language (the framework
+cares about JSONL stdout shape, not language). A skill directory at
+`<home>/skills/<name>/` to host both `pollers.json` and the script — the framework
+discovers `<home>/skills/<name>/pollers.json` automatically.
+
+**Guarantees**:
+- New poller registers automatically via `reload_pollers` (or process restart) — no
+  manual `scheduler.yaml` edit.
+- Emitted events route to a synthetic channel `poller:<name>` so the agent treats
+  each as a fresh trigger.
+- **Silence is the filter** — a poller that has nothing to report outputs nothing
+  and the agent stays asleep. Only state-changes wake the agent.
+- Subprocess isolation — a poller crash can't take down the parent agent. Stderr
+  surfaces as `poller_stderr` events for debugging.
+
+**Does not**: Decide *what* to poll (that's `world-scanning`); manage in-process
+state changes (use scheduler callables for those — `saga-consolidate`,
+`oauth-usage-poll`, `viability-report`, etc. — they're not subprocess-isolated and
+can mutate mimir-internal state directly); replace `async-tasks` for one-shot
+async work; guarantee a successful emit (poller bugs surface as `poller_stderr` /
+`poller_nonzero_exit` algedonic events, not as silent failures).
+
+## How It Works
+
+1. A skill includes a `pollers.json` file alongside its `SKILL.md`
+2. The scheduler discovers all `pollers.json` files at startup and when `reload_pollers` is called
+3. On each cron tick, the scheduler runs the poller command as a subprocess
+4. Each line of stdout is parsed as JSON and delivered to the agent as an event
+5. If there's nothing to report, the poller outputs nothing — silence is the filter
+
+## Creating a Poller
+
+### Research Notes, Memory Candidates, and Wiki Proposals
+
+Poller turns are tainted from their trigger and cannot use durable-memory tools
+to write directly. For durable facts, use
+`memory_propose(content, stream, rationale)` to queue a candidate carrying the
+poller's provenance for operator approval; never write memory directly with
+`memory_store` on a tainted turn. For knowledge, write drafts and notes under
+your own persist directory (`state/pollers/<name>/`) — the poller's `STATE_DIR`
+— then `open_proposal(source="<paper ID or URL>")` to propose wiki changes;
+never write to `state/wiki` directly. Edit only `state/wiki/` inside the returned
+worktree, then call `submit_proposal(title, rationale)`, or `abandon_proposal()` to discard
+it. Omit `lane`; research pollers are automatically confined to the poller lane.
+Finish the proposal in the same turn. Merge is approval, not opening the PR.
+
+The operator must declare `memory_propose` for memory candidates and
+`open_proposal`, `submit_proposal`, and `abandon_proposal` for wiki proposals in
+the research poller's `authority.capabilities`, with tier
+`scoped-with-provenance` or higher and `scoped_roots: ["state"]`. Keep the file
+read/write capabilities needed to draft and edit. Proposal-enabled research
+pollers cannot declare live `wiki:<slug>` roots or write to unrelated scratch
+directories. See [writing a proposal poller](../../../docs/proposal-pollers.md)
+for the arxiv pattern and [proposal operations](../../../docs/proposals.md)
+for lane details.
+
+### 1. Write the poller script
+
+The script runs with the skill directory as its **cwd**. It receives these environment variables automatically:
+
+| Variable | Description |
+|----------|-------------|
+| `STATE_DIR` | Persistent cursor/state directory at `<home>/state/pollers/<poller_name>/` — created lazily on first run, on the home volume so cursor files survive container rebuilds even when the skill itself ships in the image. |
+| `POLLER_NAME` | The poller's name from pollers.json (matches the `STATE_DIR` subpath). |
+| `POLLER_TIMEOUT_SECONDS` | Seconds this run will be killed after — the framework cap clamped below this poller's own fire interval. Parse with `float()`; it may be fractional. Size any internal deadlines against this rather than a hardcoded constant, and leave headroom to finish writing state. |
+
+Plus any literal env vars from the `env` field, plus any pass-throughs declared in `pass_env` (see field docs below), plus the deny-filtered allowlist of the agent's process environment.
+
+**Why STATE_DIR is separate from the skill dir**: skills are deployable artifacts (resettable via `seed_skills`, image-shippable, optionally reset on container rebuild). Cursor files are persistent runtime data — losing them means re-emitting the entire backlog of "events since cursor=0" on next run, which for a github-poller would be every PR comment in every watched repo. Mimir's filing rules separate these — skills under `skills/`, runtime state under `state/`.
+
+**Command parsing (`pollers.json` `command` field)**: parsed by `/bin/sh -c` via `asyncio.create_subprocess_shell`. Shell features (env-var expansion `$FOO`, pipes, redirection) are available — and you're responsible for quoting args containing whitespace or shell metacharacters: `"python scripts/poller.py 'arg with spaces'"` not `"python scripts/poller.py arg with spaces"`.
+
+**Output contract:**
+- **stdout:** JSONL (one JSON object per line). Two record shapes:
+
+  *Event records* — `{"poller": "<name>", "prompt": "<text>", "batch_context": "<shared instructions>", ...extras}`. `batch_context` is optional; it is rendered once before the batch header (or before the prompt for a single item). Items batch only with others whose context is exactly equal; missing context forms its own group. Both text fields are redacted for poller env secrets before capping; context is capped at half the 16 KB budget and excluded from `AgentEvent.extra`. Other keys flow into `AgentEvent.extra` as platform metadata (URLs, IDs, `source_platform`).
+
+  *Signal records* — `{"poller": "<name>", "signal": "<event_type>", ...payload}`. These do NOT spawn an `AgentEvent`. The framework writes them to `events.jsonl` via `log_event(event_type, poller=<name>, **payload)` — recognized signal event types (below) surface in the next turn's **algedonic block** as negative signals (pain). Use for external-state health that the agent should see but that shouldn't each fire a turn of their own: OAuth token expiry, upstream 5xx outage, rate-limit cliffs.
+
+  Recognized signal event types (`feedback._EVENT_RULES`):
+
+  | event_type | When to emit |
+  |---|---|
+  | `poller_oauth_expired` | OAuth token expired or revoked (refresh failed) |
+  | `poller_auth_failed` | Non-OAuth auth failure (invalid API key, 401 from upstream) |
+  | `poller_service_outage` | Upstream service unreachable (5xx, DNS failure, connection refused) |
+  | `poller_rate_limited` | Upstream rate-limit hit (429 / explicit retry-after) |
+  | `poller_signal` | Generic / unclassified pain signal |
+  | `poller_turn_gave_up` | Framework gave up recovering a failed poller turn after the retry cap (`recover_failed_turns`). Recognized via the `*_gave_up` suffix convention rather than an explicit `_EVENT_RULES` entry — any `*_gave_up` event classifies as a negative `gave_up` signal. |
+
+  A record with neither `prompt` nor `signal` is silently dropped. A record with BOTH is treated as signal-only (the `prompt` is ignored — emit a separate record per shape).
+
+- **stderr:** Free-form diagnostic logging. Captured and emitted as a `poller_stderr` event in `events.jsonl` for observability — not forwarded as a turn-prompt, but greppable from `mimir introspection` / log scraping.
+- **Exit 0:** Success. **Non-zero:** Error — the framework drops stdout entirely (events AND signals from this run are NOT processed) and auto-emits `poller_nonzero_exit` (negative algedonic) so the operator sees recurring failures. The next cron tick retries.
+
+  **Circuit-breaker (chainlink #94):** after 3 consecutive failures (non-zero exit, timeout, or subprocess launch error) the framework suspends the poller for 5 minutes. A `poller_circuit_tripped` event fires once at trip time (negative algedonic — operator-visible). Subsequent suppressed runs emit `poller_circuit_open` with a `remaining_seconds` countdown. The circuit resets automatically on the first clean (exit-0) run after the backoff expires. This protects the scheduler from a persistently broken poller spinning up costly turns.
+
+  **Implication for skill authors**: to surface a signal (e.g. "OAuth token expired"), emit the signal record then `return 0` — that's a successful detection, not a runtime failure. Reserve non-zero exit for catastrophic failures (script crashed, can't parse own config) where dropping stdout is the right move. The common pattern:
+
+  ```python
+  if oauth_token_expired:
+      emit({"signal": "poller_oauth_expired", "account": acct, "detail": "..."})
+      return 0  # we successfully detected the problem
+  ```
+
+Example poller script:
+
+```python
+#!/usr/bin/env python3
+"""Check for new items since last poll."""
+import json, os, sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("STATE_DIR", "."))
+CURSOR_FILE = STATE_DIR / "cursor.json"
+
+def load_cursor():
+    if CURSOR_FILE.exists():
+        return json.loads(CURSOR_FILE.read_text())
+    return {}
+
+def save_cursor(cursor):
+    CURSOR_FILE.write_text(json.dumps(cursor, indent=2))
+
+def main():
+    cursor = load_cursor()
+    # ... check your service, compare against cursor ...
+
+    new_items = []  # your logic here
+
+    for item in new_items:
+        event = {
+            "poller": os.environ.get("POLLER_NAME", "my-poller"),
+            "prompt": f"New item: {item['title']}"
+        }
+        print(json.dumps(event))
+
+    # Update cursor so next run skips these items
+    save_cursor(cursor)
+
+if __name__ == "__main__":
+    main()
+```
+
+### 2. Create pollers.json in the skill directory
+
+```json
+{
+  "pollers": [
+    {
+      "name": "my-service-check",
+      "command": "python scripts/poller.py",
+      "cron": "*/5 * * * *",
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["write_file", "send_message", "memory_propose", "open_proposal", "submit_proposal", "abandon_proposal"],
+        "scoped_roots": ["state"]
+      },
+      "env": {
+        "SERVICE_URL": "https://example.com/api"
+      }
+    }
+  ]
+}
+```
+
+**Top-level must be a dict** with a `pollers` key (not a bare array).
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Unique identifier. Used in logs and event routing. |
+| `command` | yes | Shell command, relative to the skill directory. |
+| `cron` | yes | Cron expression (5-field, UTC). |
+| `authority` | no | The sole authority declaration for this instance. Required fields are `profile`, `tier`, `capabilities`, and `scoped_roots`; optional fields include research-only `approved_urls` (see below). Missing authority means an empty capability set. Profiles are `research`, `github`, or `custom`; tiers are `scope-contained`, `scoped-with-provenance`, or `code-execution`. Capability names are checked against the executable tier table. Skill pollers cannot declare unbounded capabilities. `state` resolves only to `state/pollers/<name>`; `wiki:<name>` resolves only to an existing direct child of `state/wiki`. Unknown values, missing/unknown authority fields, tier violations, missing roots, and path escapes reject the whole poller. `operator_alert` grants `send_message` only to the single `MIMIR_OPERATOR_ALERT_CHANNEL` destination. Each event carries the resulting immutable `poller:<name>` principal through continuations. |
+| `env` | no | Additional environment variables for the script. Values are literal — no shell expansion. Use this for fixed config (URLs, feature flags) declared in pollers.json itself. **Do not put secrets here** — `env` is a static config surface (values are literal strings, no shell expansion), not a secret-forwarding path. If a key's name matches a deny-list pattern (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `MIMIR_*`), the framework emits a `poller_env_secret_reintroduced` algedonic warning. Use `pass_env` to forward live secrets from `os.environ`. |
+| `pass_env` | no | List of env var names to pass through from mimir's process environment to the subprocess, **bypassing the deny-suffix/deny-prefix filter** (see [security.md](security.md)). This is the supported path for getting secrets (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`) and `MIMIR_*`-prefixed knobs into a poller subprocess — the global allowlist `MIMIR_POLLER_ENV_ALLOWLIST` does NOT bypass the deny filter, so it can't be used for `*_TOKEN` keys. Keys not set in `os.environ` are silently skipped; keys whose names match a deny pattern emit a `poller_env_passthrough_named_secret` event (visibility, not blocking). |
+| `batch_size` | no | Coalesce up to N items per emitted AgentEvent (= per turn the agent sees). Default `1` (per-item-per-turn, matches open-strix). Use `>1` for bursty pollers (github-poller, RSS) so the agent sees one turn per cron tick instead of one per item. Items beyond `batch_size` overflow into additional batches with `batch_index` / `batch_count` set in `extra` so the agent can tell it's seeing part of a multi-batch fire. |
+| `recover_failed_turns` | no | Opt into framework recovery of turns whose triggered turn **failed** (chainlink #262). When `true`, the framework stashes each enqueued event by `source_id`, then each cycle reads `turn_failed` / `turn_completed` outcomes to **re-enqueue** (capped) the ones whose turn died — emitting a one-shot `poller_turn_gave_up` signal when the cap is hit. Closes the "poll advanced the cursor but the triggered review/processing turn died" drop (#299) for pollers with no live state to reconcile against (gmail, github issue/comment turns). Default `false`. Leave **off** for pollers that recover another way — github-poller reconciles against `requested_reviewers`, so framework re-enqueue on top would double-fire turns. |
+| `priority` | no | `low` \| `normal` (default) \| `high` — how much resource pressure this poller rides through before the scheduler sheds its fires. The homeostat grades quota/cost pressure into a severity ladder (CLEAR / ELEVATED / TIGHT / BLOCKED): `low` sheds at ELEVATED, `normal` at TIGHT, `high` keeps firing until the provider actively refuses (recorded 429 → BLOCKED sheds everything). A suppressed fire **skips the subprocess entirely** — the cursor stays frozen, so events are delayed, not lost; the next tick after recovery catches up. Each shed fire emits `poller_fire_suppressed` with priority, severity, and the deciding reason. Use `high` for near-interactive feeds the operator actively waits on, `low` for nice-to-have ambient monitoring. |
+
+### Bounded Research Fetches
+
+Research pollers may opt into `fetch_url` with an `authority.approved_urls` list:
+
+```json
+{
+  "profile": "research",
+  "tier": "scoped-with-provenance",
+  "capabilities": ["write_file", "memory_propose", "open_proposal", "submit_proposal", "abandon_proposal"],
+  "scoped_roots": ["state"],
+  "approved_urls": [
+    "https://arxiv.org/",
+    "https://papers.example/paper?id=42"
+  ]
+}
+```
+
+A nonempty list automatically includes the bounded `fetch_url` capability; you
+do not need to repeat it in `capabilities`. Omitting the list or setting it to
+`[]` preserves the existing default: no fetch capability. Explicitly requesting
+`fetch_url` in a research profile without a nonempty list rejects the poller.
+The `approved_urls` field is research-profile-only, including when empty.
+
+Entries are exact HTTPS URLs, except that the host-root `https://arxiv.org/`
+grants paths on that host. An exact URL does not approve child paths, other
+papers, or different queries. A host grant does not approve subdomains or
+lookalike hosts. Do not use wildcard syntax anywhere in a manifest URL, including
+paths or queries. The framework represents the host-root grant internally as
+`https://arxiv.org/*`; that internal policy syntax is not manifest syntax.
+
+Malformed URLs, non-HTTPS schemes, userinfo, fragments, whitespace, invalid
+hosts, non-list values, and non-string entries reject the whole poller with a
+diagnostic naming the manifest, poller, and `approved_urls` field. Use a reviewed
+manifest change and `reload_pollers` to change these grants, not an environment
+value, event payload, or operator tuning override.
+
+The builder binds these URLs as a JSON literal in the instance's `approved_urls`
+`ServiceSinkPolicy` destination. This does not change GitHub or built-in fetch
+policies, grant shell network access, or widen filesystem write roots. Existing
+fetch safety and information-flow checks still apply.
+
+## Operator overrides (`<home>/pollers-overrides.yaml`)
+
+Skill-shipped `pollers.json` files are code; per-deployment tuning is config —
+and the two used to share a file, so `mimir skills update --apply` could
+silently reset operator tuning (observed live: a `priority: high` reverted by
+an update). The overrides file separates them for good. It lives in the agent
+HOME (never the skill dir), so updates can't touch it and drift detection
+never sees it — the same pattern as `scheduler.yaml` overriding callable crons.
+
+```yaml
+# <home>/pollers-overrides.yaml — poller name → overridden fields
+github-activity:
+  cron: "*/5 * * * *"     # poll faster than the shipped */15
+  priority: high           # ride through quota pressure (see priority docs)
+some-feed:
+  batch_size: 10
+  recover_failed_turns: true
+```
+
+Overridable fields: `cron`, `priority`, `batch_size`, `recover_failed_turns`,
+`env`, `pass_env`, `deliver`, `budget` — tuning only. Authority fields including
+`authority`, `capabilities`, `tier`, `profile`, `principal_id`, `scoped_roots`,
+and `operator_alert` are rejected by the strict write path and dropped during
+discovery. Environment values never add capabilities.
+The agent-facing `set_poller_overrides` tool accepts `env` and `pass_env` names
+only from narrow allowlists of non-secret poller tuning variables. Literal
+`env` overrides are narrower than operator-controlled `pass_env` passthroughs,
+so the agent cannot supply a new repository or account selector. Operator edits
+loaded during discovery remain fail-safe and lenient for custom pollers.
+Anything else (notably `command`) is refused with a warning: overrides tune
+behavior, they don't redefine what runs. Field-level fail-safety: an invalid
+value (typo'd cron, unknown priority) warns and keeps the manifest value —
+an override mistake degrades to shipped behavior, never to a dead poller.
+Unknown poller names warn so a rename/uninstall can't silently orphan tuning.
+Applied at discovery time (startup + `reload_pollers`).
+
+Built-in `heartbeat` and `session-boundary` triggers use server-owned profiles,
+not skill manifests. Those profiles are authoritative; a manifest declaration
+using a built-in profile is validated only as a narrowing subset and cannot add
+capabilities or destinations. Resolution is deterministic: built-in profile,
+then optional narrowing; skill pollers resolve only from their manifest.
+
+**On `batch_size`**: the poller script always emits per-item JSONL lines (clean contract). The framework groups items by exact `batch_context` in first-arrival group order, preserving each group's item order, then emits batches of up to `batch_size` items with per-item metadata in `extra.items`. Without a context, single-item batches render the prompt verbatim — no header. Multi-item batches render with a header (`<poller-name> reported N items` plus a `(batch X of Y)` suffix on multi-batch fires) and a numbered list of per-item prompts. The per-item cap applies only to `prompt`; truncated items keep their last 600 characters with a middle marker, including when the assembled batch exceeds its cap.
+
+### 3. Register the pollers
+
+After creating or updating `pollers.json`, call the `reload_pollers` tool. This re-scans `<home>/skills/**/pollers.json` and registers any new pollers with the scheduler. Removed pollers (skill uninstalled, manifest deleted) get dropped on the same call.
+
+```
+reload_pollers()
+# → "reload_pollers ok: 2 poller(s) registered — github-activity, bluesky-mentions"
+```
+
+Pollers are also loaded automatically at startup, so a fresh container restart picks up any new skills without an explicit reload call.
+
+## Ready-built poller skills
+
+Core ships no coding or GitHub pollers. Select Cultivate with
+`MIMIR_PLUGINS=cultivate` in the process environment. It seeds forge-neutral
+skills automatically. GitHub activity and CI-watch are optional: the operator
+can run `mimir skills list-optional` and `mimir skills install --forge github`
+or `mimir skills install cultivate:github-poller`. To restore an edited plugin
+poller, run `mimir skills install cultivate:github-poller --restore`; this backs
+up the old directory before replacing it. Reload pollers or restart afterward.
+
+Other opt-in poller skills live under ``mimir/optional-skills/`` (for example
+`gmail-poller` and `dependency-advisory-watch`). Each is a standalone skill
+directory whose ``SKILL.md`` documents its env vars and what it watches. To
+install one:
+
+```
+mimir skills install <name>
+# (set the skill's required env vars — see its SKILL.md)
+reload_pollers
+```
+
+Removing a skill: delete the directory under `<home>/skills/` and call `reload_pollers` to drop the cron job.
+
+## File Layout
+
+```
+skills/my-monitor/
+├── SKILL.md
+├── pollers.json        ← declares pollers
+├── scripts/
+│   └── poller.py       ← the script
+├── cursor.json         ← poller state (managed by script)
+└── events.jsonl        ← optional local event log
+```
+
+## Design Patterns
+
+See [design-patterns.md](design-patterns.md) for detailed guidance on:
+- **State management** — cursor pattern, timestamp vs URI cursors, external service state, recovery on first run
+- **Filtering** — selecting actionable notification types, avoiding shared `is_read` traps
+- **Prompt quality** — including URIs/CIDs so the agent can act, not just observe
+- **Error handling** — fail silently (exit non-zero), never emit on error
+- **Anti-patterns** — common mistakes and how to avoid them
+
+## Security & Privacy
+
+See [security.md](security.md) for guidance on:
+- **Trust tiers** — the follow-gate pattern for sorting trusted vs unknown sources
+- **Operator in the loop** — keeping the human informed without locking everything down
+- **Credential handling** — env vars, per-agent accounts, what not to log
+- **Prompt injection** — honest reporting with context, not sanitization
+
+## Key Constraints
+
+- **Subprocess timeout.** The framework cap is 120s, and it is clamped further per poller so it always stays below that poller's own fire interval (`max_instances=1` means a run spanning the next fire makes that fire be skipped). Read the value you will actually be killed at from the injected `POLLER_TIMEOUT_SECONDS` rather than hardcoding it. Overrunning is not a partial result: the run is killed and **every event it had already emitted is discarded**, so bound your own work against the cap. The framework reaps the subprocess on every exit path so long-lived mimir processes don't accumulate zombies.
+- **Silence means nothing to report.** Only output lines when there's something actionable.
+- **One JSON object per line.** Each line must parse independently.
+- **`prompt` is the only required field.** Lines missing it are silently dropped (a poller can emit metadata-only diagnostic lines without firing turns). Other keys flow into the AgentEvent's `extra` for prompt rendering.
+- **Pollers are dumb.** No LLM calls. Check a service, output what changed, exit. Keep them fast and pure.
+- **State management is the poller's job.** Use `STATE_DIR` to store cursors, history, or any persistent state. The scheduler doesn't track state for you, but it does provide a persistent path under `<home>/state/pollers/<name>/` (see above).
+- **16 KB prompt cap.** Each emitted event's `prompt` is capped at ~16 KB. Larger payloads get truncated with a marker — emit multiple events or stash to a file + send a path reference instead. Protects against chatty pollers blowing the prompt-build cache.
+- **Back-pressure surfaces in events.jsonl.** When the dispatcher refuses an event (queue cap hit, channel saturated), it lands as a `poller_event_rejected` event; the run's `poller_complete` carries both `events_emitted` and `events_rejected` counts so a mismatch is grep-able.
+
+## Debugging
+
+If a poller isn't working:
+
+1. **Check it was discovered:** `reload_pollers` reports the count and names
+2. **Run it manually:** `cd skills/my-monitor && STATE_DIR=. POLLER_NAME=test python scripts/poller.py`
+3. **Check stderr:** Poller stderr is logged as `poller_stderr` events
+4. **Check exit code:** Non-zero exits are logged as `poller_nonzero_exit`
+5. **Check JSON format:** Each stdout line must be valid JSON with at least a `prompt` key
+
+## Available Tool
+
+| Tool | Description |
+|------|-------------|
+| `reload_pollers` | Re-scan `<home>/skills/**/pollers.json` and register pollers. Call after installing or updating a skill. Also picks up skills with their `pollers.json` deleted (drops the corresponding cron jobs). |

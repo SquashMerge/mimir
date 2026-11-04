@@ -1,0 +1,2282 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import subprocess
+import shlex
+import sys
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+pytest.importorskip("mimir_cultivate", reason="Worklink backends belong to Cultivate")
+
+from tests.nested_pytest import pytest_command
+from tests.opencode_fixtures import opencode_binary
+
+from mimir_cultivate.opencode import OpenCodeInvocation
+from mimir_cultivate.worklink.backends.base import RawResult, WorkOrder, blocked_reason_from_output
+from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+from mimir_cultivate.worklink.backends.registry import (
+    WORKLINK_MERGED_LABEL, BackendRegistry, TieredReviewConfig,
+    WorklinkConfig, WorklinkDefaults, SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS,
+)
+from mimir_cultivate.worklink.tool_pins import ToolPin
+from mimir_cultivate.worklink.compute import (
+    ComputeCaps, ComputeLaunchError, ComputeResult, LaunchHandle, WorkSpec, LocalSubprocessComputeBackend,
+)
+import mimir_cultivate.worklink.compute as compute_module
+import mimir_cultivate.worklink.backends.opencode as opencode_module
+
+
+class FakeProcess:
+    def __init__(self, *, returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> None:
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self.killed = False
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, self._stderr
+
+    async def wait(self) -> int:
+        while self.returncode is None:
+            await asyncio.sleep(0)
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+
+def test_worklink_config_routes_first_match_and_defaults(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: opencode
+  compute_backend: local_subprocess
+  timeout_s: 45
+  backend_by_category:
+    renderer: feature_factory
+routes:
+  - label: render
+    backend: feature_factory
+    compute_backend: local_subprocess
+  - repo: jasoncarreira/mimir
+    backend: opencode
+backends:
+  opencode:
+    bin: /opt/bin/opencode
+    args: [--verbose]
+  feature_factory:
+    entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
+""".strip()
+    )
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.defaults.timeout_s == 45
+    assert config.select_backend_name(labels={"render"}, repo="jasoncarreira/mimir") == "feature_factory"
+    assert config.select_backend_name(labels={"worklink"}, repo="jasoncarreira/mimir") == "opencode"
+    assert (
+        config.select_backend_name(
+            labels={"worklink"}, repo="elsewhere/repo", tool_category="renderer"
+        )
+        == "feature_factory"
+    )
+    assert config.select_backend_name(labels={"worklink"}, repo="elsewhere/repo") == "opencode"
+    registry = BackendRegistry(config)
+    opencode = registry.get("opencode")
+    assert isinstance(opencode, OpenCodeBackend)
+    assert opencode.bin == "/opt/bin/opencode"
+    assert opencode.extra_args == ("--verbose",)
+    feature_factory = registry.get("feature_factory")
+    assert isinstance(feature_factory, FeatureFactoryBackend)
+    assert (
+        feature_factory.entrypoint
+        == "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
+    )
+    assert config.defaults.compute_backend == "local_subprocess"
+    assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
+    assert config.defaults.base_branch == "main"
+    assert config.tool_pins == ()
+
+
+@pytest.mark.parametrize("retired", ["bin", "args", "ready", "reviewer"])
+def test_feature_factory_rejects_retired_settings(retired: str) -> None:
+    value: object = [] if retired == "args" else "legacy"
+    config = WorklinkConfig(backend_settings={"feature_factory": {retired: value}})
+    with pytest.raises(ValueError, match="retired setting"):
+        BackendRegistry(config)
+
+
+def test_feature_factory_retired_settings_error_names_every_key() -> None:
+    """A config carrying several retired keys must name them all in one error.
+
+    The live ``<home>/worklink.yaml`` carried both ``bin`` and ``args``. Naming
+    only the first means the operator fixes it, redeploys, and hits the second —
+    and each cycle is a silent dispatch outage, because Worklink crashes emit no
+    events (the failure is visible only in ``run-<id>.log``).
+    """
+    config = WorklinkConfig(
+        backend_settings={"feature_factory": {"bin": "legacy", "args": []}}
+    )
+    with pytest.raises(ValueError) as excinfo:
+        BackendRegistry(config)
+    message = str(excinfo.value)
+    assert "'args'" in message
+    assert "'bin'" in message
+
+
+def test_feature_factory_requires_absolute_entrypoint() -> None:
+    config = WorklinkConfig(
+        backend_settings={"feature_factory": {"entrypoint": "feature-factory/bin/factory.js"}}
+    )
+    with pytest.raises(ValueError, match="absolute"):
+        BackendRegistry(config)
+
+
+@pytest.mark.parametrize("value", [0, 3, 10])
+def test_gate_rerun_max_failures_config(tmp_path: Path, value: int) -> None:
+    path = tmp_path / "worklink.yaml"
+    assert WorklinkConfig.load(path).defaults.gate_rerun_max_failures == 10
+    path.write_text(f"defaults:\n  gate_rerun_max_failures: {value}\n", encoding="utf-8")
+    assert WorklinkConfig.load(path).defaults.gate_rerun_max_failures == value
+    assert WorklinkDefaults(gate_rerun_max_failures=value).gate_rerun_max_failures == value
+
+
+@pytest.mark.parametrize("value", [-1, True, False, 1.5, 1.0, "3", None, [], {}])
+def test_gate_rerun_max_failures_rejects_nonnegative_nonintegers(
+    tmp_path: Path, value: object
+) -> None:
+    with pytest.raises(ValueError, match="gate_rerun_max_failures.*nonnegative integer"):
+        WorklinkDefaults(gate_rerun_max_failures=value)
+    path = tmp_path / "worklink.yaml"
+    path.write_text(
+        json.dumps({"defaults": {"gate_rerun_max_failures": value}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="gate_rerun_max_failures.*nonnegative integer"):
+        WorklinkConfig.load(path)
+
+
+def test_worklink_config_malformed_autonomy_ints_fall_back(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  max_concurrent: definitely-not-an-int
+  reaper_ttl_s: -5
+  max_claim_attempts: unlimited
+""",
+        encoding="utf-8",
+    )
+    defaults = WorklinkConfig.load(config_path).defaults
+    assert defaults.max_concurrent == 2
+    assert defaults.reaper_ttl_s == 86400
+    assert defaults.max_claim_attempts == 3
+
+
+def test_worklink_config_epic_defaults_and_merged_label_constant(tmp_path: Path) -> None:
+    old_config = tmp_path / "worklink.yaml"
+    old_config.write_text(
+        """
+defaults:
+  backend: opencode
+  timeout_s: 60
+""".strip(),
+        encoding="utf-8",
+    )
+
+    defaults = WorklinkConfig.load(old_config).defaults
+
+    assert defaults.epic_branch_prefix == "epic/"
+    assert defaults.max_review_retries == 3
+    assert defaults.max_claim_attempts == 3
+    assert defaults.reviewer_backend == "opencode"
+    assert defaults.tiered_review.multi_vote_reviewer_count == 3
+    assert "**/migrations/**" in defaults.tiered_review.high_risk_scope_patterns
+    assert "**/*secret*" in defaults.tiered_review.high_risk_scope_patterns
+    assert "auth" in defaults.tiered_review.high_risk_labels
+    assert "generated-code" in defaults.tiered_review.high_risk_labels
+    assert "*.lock" in defaults.tiered_review.high_risk_scope_patterns
+    assert all("mimir/" not in pattern for pattern in defaults.tiered_review.high_risk_scope_patterns)
+    assert WorklinkDefaults(backend="opencode").reviewer_backend == "opencode"
+    assert WORKLINK_MERGED_LABEL == "worklink:merged"
+
+
+def test_reaper_ttl_floor_is_dimensioned_by_leaf_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "5000.5")
+
+    with pytest.raises(ValueError) as excinfo:
+        WorklinkDefaults(timeout_s=1800, reaper_ttl_s=3599)
+
+    assert excinfo.value.configured_value == 3599
+    assert excinfo.value.required_value == 3600
+    assert "configured 3599; required 3600" in str(excinfo.value)
+    assert WorklinkDefaults(timeout_s=1800, reaper_ttl_s=3600).reaper_ttl_s == 3600
+
+
+def test_factory_resumable_retention_defaults_and_override(tmp_path: Path) -> None:
+    path = tmp_path / "worklink.yaml"
+    assert WorklinkConfig.load(path).defaults.factory_resumable_retention_s == 86400
+    path.write_text(
+        "defaults:\n  reaper_ttl_s: 3600\n  factory_resumable_retention_s: 7200\n",
+        encoding="utf-8",
+    )
+    assert WorklinkConfig.load(path).defaults.factory_resumable_retention_s == 7200
+
+
+@pytest.mark.parametrize("settings", [
+    {"reaper_ttl_s": 172800},
+    {"timeout_s": 86400, "reaper_ttl_s": 3600},
+])
+def test_factory_resumable_retention_default_tracks_effective_ttl(
+    tmp_path: Path, settings: dict[str, int],
+) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"defaults": settings}), encoding="utf-8")
+    defaults = WorklinkConfig.load(path).defaults
+    assert defaults.reaper_ttl_s == 172800
+    assert defaults.factory_resumable_retention_s == 172800
+
+    # An explicit value remains strict, including against a timeout-clamped TTL.
+    path.write_text(
+        json.dumps({"defaults": {**settings, "factory_resumable_retention_s": 86400}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="factory_resumable_retention_s.*reaper_ttl_s"):
+        WorklinkConfig.load(path)
+
+
+@pytest.mark.parametrize("value", [0, -1, 3599, True, 1.5, "7200", None])
+def test_factory_resumable_retention_rejects_invalid_values(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ValueError, match="factory_resumable_retention_s.*positive integer.*reaper_ttl_s"):
+        WorklinkDefaults(reaper_ttl_s=3600, factory_resumable_retention_s=value)
+    path = tmp_path / "worklink.yaml"
+    path.write_text(
+        json.dumps({"defaults": {"reaper_ttl_s": 3600, "factory_resumable_retention_s": value}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="factory_resumable_retention_s.*positive integer.*reaper_ttl_s"):
+        WorklinkConfig.load(path)
+
+
+def test_worklink_config_epic_overrides_and_tiered_review_parse(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: opencode
+  epic_branch_prefix: stacked/
+  max_review_retries: 5
+  max_claim_attempts: 10
+  reviewer_backend: feature_factory
+  tiered_review:
+    high_risk_scope_patterns:
+      - "**/security/**"
+      - "**/migrations/prod/**"
+    high_risk_labels:
+      - risk:high
+      - production-data
+    multi_vote_reviewer_count: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    defaults = WorklinkConfig.load(config_path).defaults
+
+    assert defaults.epic_branch_prefix == "stacked/"
+    assert defaults.max_review_retries == 5
+    assert defaults.max_claim_attempts == 10
+    assert defaults.reviewer_backend == "feature_factory"
+    assert defaults.tiered_review == TieredReviewConfig(
+        high_risk_scope_patterns=("**/security/**", "**/migrations/prod/**"),
+        high_risk_labels=("risk:high", "production-data"),
+        multi_vote_reviewer_count=4,
+    )
+
+
+def test_worklink_config_builds_local_subprocess_compute_backend(tmp_path: Path) -> None:
+    """chainlink #832: local_subprocess is the only built-in compute backend."""
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  backend: opencode
+  compute_backend: local-subprocess
+routes:
+  - label: docs
+    backend: feature_factory
+""".strip()
+    )
+
+    config = WorklinkConfig.load(config_path)
+    registry = BackendRegistry(config)
+
+    assert config.defaults.compute_backend == "local_subprocess"
+    backend = registry.select_compute(labels={"worklink"})
+    assert isinstance(backend, LocalSubprocessComputeBackend)
+    assert backend.name == "local_subprocess"
+    assert backend.capabilities() == ComputeCaps(
+        shared_filesystem=True,
+        network_isolated=False,
+        handle_cancel=True,
+        persistent_after_disconnect=False,
+    )
+
+
+def test_worklink_config_rejects_retired_docker_sibling_compute_backend(tmp_path: Path) -> None:
+    """chainlink #832: docker_sibling was retired. An old config stanza must
+    fail clean — registry rejects unknown compute_backend names — instead of
+    silently rebuilding it from the docker_sibling/ecs_runtask paths."""
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: docker-sibling
+compute_backends:
+  docker-sibling:
+    broker_url: "unix:///run/worklink-broker.sock"
+    image: mimirbot-mimirbot
+""".strip()
+    )
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
+
+    # A selected unknown name remains fatal without a matching settings block.
+    config_path.write_text("defaults:\n  compute_backend: docker_sibling\n")
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
+
+
+def test_worklink_config_rejects_retired_ecs_runtask_compute_backend(tmp_path: Path) -> None:
+    """chainlink #832: ecs_runtask was retired alongside docker_sibling."""
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+defaults:
+  compute_backend: ecs-runtask
+compute_backends:
+  ecs-runtask:
+    cluster: worklink
+    task_definition: worklink-worker
+    container_name: worker
+    subnets: [subnet-a]
+""".strip()
+    )
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
+
+    config_path.write_text("defaults:\n  compute_backend: ecs_runtask\n")
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
+
+
+def test_worklink_config_rejects_local_subprocess_with_settings(tmp_path: Path) -> None:
+    """local_subprocess is the only built-in compute backend and it does not
+    accept any operator-supplied settings (chainlink #832)."""
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+compute_backends:
+  local_subprocess:
+    something: unexpected
+""".strip()
+    )
+    with pytest.raises(
+        ValueError,
+        match="worklink local-subprocess compute backend does not accept settings",
+    ):
+        BackendRegistry(WorklinkConfig.load(config_path))
+
+
+def test_worklink_config_loads_base_branch(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text("defaults:\n  base_branch: integration/worklink\n")
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.defaults.base_branch == "integration/worklink"
+
+    # Absent file and absent key both default to main.
+    assert WorklinkConfig.load(tmp_path / "missing.yaml").defaults.base_branch == "main"
+    (tmp_path / "nobase.yaml").write_text("defaults:\n  backend: opencode\n")
+    assert WorklinkConfig.load(tmp_path / "nobase.yaml").defaults.base_branch == "main"
+
+
+def test_worklink_config_parses_tool_pins(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+tool_pins:
+  - name: codex
+    category: coding-cli
+    pin: "0.139.0"
+    smoke: "codex --version"
+    source: npm
+    package: "@openai/codex"
+    install: "scaffold Dockerfiles"
+    risk: "high"
+  - name: chainlink
+    category: tracker
+    pin: "chainlink-1.6.0"
+    smoke: "chainlink --help"
+    source: github-release
+    repo: dollspace-gay/chainlink
+""".strip()
+    )
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.tool_pins == (
+        ToolPin(
+            name="codex",
+            category="coding-cli",
+            pin="0.139.0",
+            smoke="codex --version",
+            source="npm",
+            package="@openai/codex",
+            install="scaffold Dockerfiles",
+            risk="high",
+        ),
+        ToolPin(
+            name="chainlink",
+            category="tracker",
+            pin="chainlink-1.6.0",
+            smoke="chainlink --help",
+            source="github-release",
+            repo="dollspace-gay/chainlink",
+        ),
+    )
+
+
+def test_worklink_config_allows_missing_or_empty_tool_pins(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.yaml"
+    missing_path.write_text("defaults:\n  backend: opencode\n")
+    empty_path = tmp_path / "empty.yaml"
+    empty_path.write_text("tool_pins: []\n")
+    null_path = tmp_path / "null.yaml"
+    null_path.write_text("tool_pins:\n")
+
+    assert WorklinkConfig.load(missing_path).tool_pins == ()
+    assert WorklinkConfig.load(empty_path).tool_pins == ()
+    assert WorklinkConfig.load(null_path).tool_pins == ()
+
+
+def test_worklink_config_rejects_invalid_tool_pins(tmp_path: Path) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        """
+tool_pins:
+  - name: codex
+    category: coding-cli
+    pin: "0.139.0"
+""".strip()
+    )
+
+    with pytest.raises(ValueError, match=r"worklink tool_pins\[0\] missing required field"):
+        WorklinkConfig.load(config_path)
+
+    config_path.write_text("tool_pins: not-a-list\n")
+    with pytest.raises(ValueError, match="worklink tool_pins must be a list"):
+        WorklinkConfig.load(config_path)
+
+
+
+def test_registry_resolves_only_shipping_backends() -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+
+    config = WorklinkConfig(routes=())
+    registry = BackendRegistry(config)
+
+    assert registry.select(labels={"worklink"}, repo="jasoncarreira/mimir").name == "opencode"
+    assert registry.get("opencode").name == "opencode"
+    assert registry.get("feature_factory").name == "feature_factory"
+    with pytest.raises(KeyError, match="unknown Worklink backend: codex"):
+        registry.get("codex")
+    with pytest.raises(KeyError, match="unknown Worklink backend: claude_cli"):
+        registry.get("claude_cli")
+
+
+def test_shipping_backend_names_match_constructed_registries() -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.registry import (
+        BackendRegistry, SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS,
+    )
+
+    registry = BackendRegistry()
+
+    assert set(registry._backends) == SHIPPING_BACKENDS
+    assert set(registry._compute_backends) == SHIPPING_COMPUTE_BACKENDS
+
+
+@pytest.mark.parametrize("name", ["codex", "claude_cli"])
+def test_registry_rejects_retired_backend_config(name: str) -> None:
+    config = WorklinkConfig(backend_settings={name: {}})
+    with pytest.raises(ValueError, match=f"unknown Worklink backend config: {name}"):
+        BackendRegistry(config)
+
+
+@pytest.mark.parametrize("name", ["codex", "claude_cli"])
+def test_registry_rejects_retired_selected_backend(name: str) -> None:
+    registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(backend=name)))
+    with pytest.raises(KeyError, match=f"unknown Worklink backend: {name}"):
+        registry.select()
+
+
+def test_config_ignores_unreferenced_stale_backend_settings_with_actionable_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        "backends:\n  codex:\n    bin: codex\n"
+        "compute_backends:\n  docker-sibling:\n    image: old\n",
+        encoding="utf-8",
+    )
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.backend_settings == {}
+    assert config.compute_backend_settings == {}
+    assert f"unreferenced unknown Worklink backend config 'codex' in {config_path}" in caplog.text
+    assert f"remove backends.codex from {config_path}" in caplog.text
+    assert (
+        f"unreferenced unknown Worklink compute backend config 'docker-sibling' in {config_path}"
+        in caplog.text
+    )
+    assert f"remove compute_backends.docker-sibling from {config_path}" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "reference"),
+    [
+        ("defaults:\n  backend: codex\n", "defaults.backend"),
+        (
+            "defaults:\n  backend_by_category:\n    coding-cli: codex\n",
+            "defaults.backend_by_category.coding-cli",
+        ),
+        ("routes:\n  - label: legacy\n    backend: codex\n", "routes[0].backend"),
+        (
+            "routes:\n  - label: remote\n    backend: opencode\n    compute_backend: docker-sibling\n",
+            "routes[0].compute_backend",
+        ),
+    ],
+)
+def test_config_rejects_every_referenced_unknown_backend_with_path_and_fix(
+    tmp_path: Path, yaml_text: str, reference: str
+) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(yaml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        WorklinkConfig.load(config_path)
+
+    message = str(raised.value)
+    assert f"referenced by {reference}" in message
+    assert str(config_path) in message
+    assert f"change {reference}" in message
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        kwargs["stdout"].write(b"ok")
+        return FakeProcess(returncode=0, stdout=b"ok", stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    backend = LocalSubprocessComputeBackend()
+
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="other_tool",
+        timeout_s=5,
+        env={"PATH": "/custom/bin", "X": "1"},
+        backend_config={"bin": "other", "args": ["ignored"]},
+        local_checkout=tmp_path,
+        local_argv=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+        output_root=tmp_path / "transcripts",
+    )
+    handle = await backend.launch(spec)
+    result = await backend.wait(handle, 5)
+    await backend.cleanup(handle)
+
+    assert backend.capabilities() == ComputeCaps(
+        shared_filesystem=True,
+        network_isolated=False,
+        handle_cancel=True,
+        persistent_after_disconnect=False,
+    )
+    assert result == ComputeResult(
+        exit_code=0,
+        stdout="ok",
+        stderr="",
+        handle=result.handle,
+        command=("tool", "arg", "--cd", str(tmp_path), "prompt"),
+        stdout_path=result.stdout_path,
+        stderr_path=result.stderr_path,
+    )
+    expected_kwargs = {
+        "stdin": asyncio.subprocess.DEVNULL,
+        "stdout": calls[0]["kwargs"]["stdout"],
+        "stderr": calls[0]["kwargs"]["stderr"],
+        "cwd": str(tmp_path),
+        "env": {"PATH": "/custom/bin", "X": "1"},
+        "start_new_session": True,
+    }
+    if compute_module.sys.platform.startswith("linux"):
+        expected_kwargs["preexec_fn"] = calls[0]["kwargs"]["preexec_fn"]
+    assert calls == [
+        {
+            "args": ("tool", "arg", "--cd", str(tmp_path), "prompt"),
+            "kwargs": expected_kwargs,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_omits_parent_death_hook_off_linux(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr(compute_module, "sys", SimpleNamespace(platform="darwin"))
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="echo ok",
+        backend="other_tool",
+        timeout_s=5,
+        local_checkout=tmp_path,
+        local_argv=("tool", "arg"),
+        output_root=tmp_path / "transcripts",
+    )
+
+    handle = await backend.launch(spec)
+    await backend.wait(handle, 5)
+    await backend.cleanup(handle)
+
+    assert len(calls) == 1
+    assert "preexec_fn" not in calls[0]["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    process = FakeProcess(returncode=None, stdout=b"abcdefgh", stderr=b"err")
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        kwargs["stdout"].write(b"abcdefgh")
+        kwargs["stderr"].write(b"err")
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "4")
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+        local_checkout=tmp_path,
+        local_argv=("opencode", "run"),
+        output_root=tmp_path / "transcripts",
+    )
+
+    handle = await backend.launch(spec)
+    result = await backend.wait(handle, 5)
+
+    assert process.killed is True
+    assert result.stdout == "abcd"
+    assert result.stderr == "err"
+    assert result.output_overflow is True
+    assert result.stdout_path is not None
+    assert result.stderr_path is not None
+    assert result.stdout_path.read_bytes() == b"abcd"
+    assert result.stderr_path.read_bytes() == b"err"
+
+    order = WorkOrder(
+        issue_id=1,
+        checkout=tmp_path,
+        prompt="prompt",
+        rules=None,
+        timeout_s=5,
+        transcript_root=tmp_path / "transcripts",
+    )
+    raw = await OpenCodeBackend().interpret(order, result)
+    assert raw.backend_status == "output_overflow"
+    assert raw.output_overflow is True
+    assert raw.error == "backend output exceeded configured Worklink limit"
+    assert raw.transcript_path is not None
+    transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
+    assert transcript["stdout"] == "abcd"
+    assert transcript["output_overflow"] is True
+    assert transcript["stdout_path"] == str(result.stdout_path)
+    assert transcript["stderr_path"] == str(result.stderr_path)
+
+
+def test_output_paths_require_explicit_run_owned_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "ambient-home"))
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+    )
+
+    assert compute_module._output_paths(spec, "run") == (None, None)
+    assert not (tmp_path / "ambient-home").exists()
+
+
+def test_output_paths_reject_backend_path_components(tmp_path: Path) -> None:
+    for backend in ("../escape", "nested/tool", ".", "bad name"):
+        spec = WorkSpec(
+            issue_id=1,
+            attempt=1,
+            repo_url="repo",
+            base_ref="main",
+            branch="issue/1-a1",
+            prompt="prompt",
+            rules=None,
+            test_command="true",
+            backend=backend,
+            timeout_s=5,
+            output_root=tmp_path,
+        )
+        with pytest.raises(ComputeLaunchError, match="safe output path component"):
+            compute_module._output_paths(spec, "run")
+
+
+@pytest.mark.asyncio
+async def test_anonymous_launch_failure_does_not_unlink_none_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    async def fail_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    backend = LocalSubprocessComputeBackend()
+    spec = WorkSpec(
+        issue_id=1,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1-a1",
+        prompt="prompt",
+        rules=None,
+        test_command="true",
+        backend="opencode",
+        timeout_s=5,
+        local_checkout=tmp_path,
+        local_argv=("opencode", "run"),
+    )
+
+    with pytest.raises(ComputeLaunchError, match="spawn failed"):
+        await backend.launch(spec)
+
+
+def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", raising=False)
+    assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
+
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "123")
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", "456")
+    assert compute_module._worklink_output_limits() == (123, 456)
+
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "invalid")
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", "0")
+    assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
+
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", str(128 * 1024 * 1024))
+    monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDERR_BYTES", str(32 * 1024 * 1024))
+    assert compute_module._worklink_output_limits() == (64 * 1024 * 1024, 16 * 1024 * 1024)
+
+
+def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> None:
+    result = ComputeResult(
+        exit_code=1,
+        stdout="I cannot implement this safely.\nWORKLINK_BLOCKED: design requires raw docker.sock access",
+        stderr="",
+        command=("opencode",),
+    )
+    order = WorkOrder(
+        issue_id=466,
+        checkout=tmp_path,
+        prompt="do it",
+        rules=None,
+        timeout_s=30,
+        transcript_root=tmp_path / "transcripts",
+    )
+
+    raw = asyncio.run(OpenCodeBackend().interpret(order, result))
+
+    assert raw.backend_status == "blocked"
+    assert raw.blocked_reason == "design requires raw docker.sock access"
+    assert raw.error == "design requires raw docker.sock access"
+
+
+@pytest.mark.asyncio
+async def test_opencode_retries_transient_sqlite_startup_contention() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return ComputeResult(1, "", "SqliteError: database is locked")
+        return ComputeResult(0, "completed", "")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        sleeper=sleep,
+    )
+
+    assert result.exit_code == 0
+    assert attempts == 3
+    assert sleeps == [0.1, 0.2]
+    assert [(event, payload["outcome"]) for event, payload in events] == [
+        ("worklink_backend_startup_contention", "retrying"),
+        ("worklink_backend_startup_contention", "retrying"),
+        ("worklink_backend_startup_contention", "succeeded"),
+    ]
+    assert all(
+        payload["resource"] == "opencode_sqlite_session_store"
+        for _event, payload in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_persistent_sqlite_contention_exhausts_with_named_reason(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    events: list[dict[str, object]] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "", "SqliteError: SQLITE_BUSY: database is locked")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    backend = OpenCodeBackend()
+    result = await backend.invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
+        event_logger=lambda _event, **payload: events.append(payload),
+        sleeper=sleep,
+    )
+    order = WorkOrder(1085, tmp_path, "p", None, 30, transcript_root=tmp_path / "t")
+    raw = await backend.interpret(order, result)
+
+    assert attempts == 5
+    assert sleeps == [0.1, 0.2, 0.4, 0.8]
+    assert raw.error == "opencode_startup_sqlite_contention_exhausted"
+    assert [event["outcome"] for event in events] == [
+        "retrying",
+        "retrying",
+        "retrying",
+        "retrying",
+        "exhausted",
+    ]
+    assert events[-1]["max_attempts"] == 5
+    assert raw.transcript_path is not None
+    transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
+    assert "SQLITE_BUSY" in transcript["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_non_transient_startup_failure_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "", "configuration file is invalid")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
+        sleeper=sleep,
+    )
+
+    assert result.stderr == "configuration file is invalid"
+    assert attempts == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_late_sqlite_failure_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    times = iter((10.0, 16.0))
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "work performed", "SqliteError: database is locked")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
+        sleeper=sleep,
+        clock=lambda: next(times),
+    )
+
+    assert result.stderr == "SqliteError: database is locked"
+    assert attempts == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_sqlite_failure_after_checkout_mutation_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    snapshots = iter((("head", ""), ("head", " M changed.py")))
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "", "SqliteError: database is locked")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: next(snapshots),
+        sleeper=sleep,
+    )
+
+    assert result.stderr == "SqliteError: database is locked"
+    assert attempts == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_stdout_only_sqlite_mention_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "recovered from database is locked", "other failure")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
+        sleeper=sleep,
+    )
+
+    assert result.stdout == "recovered from database is locked"
+    assert attempts == 1
+    assert sleeps == []
+
+
+def test_blocked_reason_from_output_requires_final_line_marker() -> None:
+    # No marker → no block.
+    assert blocked_reason_from_output("did the work\n", "") is None
+    # Marker as the final non-empty line (trailing blank lines tolerated) → reason.
+    assert blocked_reason_from_output("WORKLINK_BLOCKED: real reason\n\n", "") == "real reason"
+    # Whitespace-only reason is not a signal.
+    assert blocked_reason_from_output("WORKLINK_BLOCKED:    \n", "") is None
+    # Marker on stderr's final line is honored too.
+    assert blocked_reason_from_output("", "boom\nWORKLINK_BLOCKED: env missing") == "env missing"
+    # Regression (#671 review): a backend that echoes the prompt's marker line
+    # near the top and then COMPLETES NORMALLY must not be mislabeled blocked —
+    # the real final line is its success output, not the echoed marker.
+    echo_then_success = (
+        "WORKLINK_BLOCKED: <one-line reason>\n"  # echoed instruction placeholder
+        "I completed the work successfully\n"
+    )
+    assert blocked_reason_from_output(echo_then_success, "") is None
+    # But an early echo followed by a real FINAL marker is a genuine block.
+    echo_then_block = (
+        "WORKLINK_BLOCKED: <one-line reason>\n"
+        "...did some analysis...\n"
+        "WORKLINK_BLOCKED: acceptance criteria contradict #438\n"
+    )
+    assert blocked_reason_from_output(echo_then_block, "") == "acceptance criteria contradict #438"
+
+
+@pytest.mark.asyncio
+async def test_feature_factory_launch_remains_shell_free_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from types import SimpleNamespace
+
+    async def fake_exec(args, capability, env, projections, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs, "checkout": capability.path})
+        capability._contained_started(SimpleNamespace(pid=None))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.execute_contained", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.setenv("MIMIR_MODEL_REASONING_EFFORT", "high")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+    order = WorkOrder(
+        issue_id=1606,
+        checkout=tmp_path,
+        prompt="factory owns the prompt",
+        rules=None,
+        timeout_s=30,
+        env={
+            "MIMIR_HOME": str(tmp_path),
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1606", "title": "epic", "body": "build"}
+            ),
+        },
+    )
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:owner/repo.git",
+        base_ref="main",
+        branch="issue/1606-a1",
+        test_command="uv run pytest -q",
+    )
+    # Execution is mocked: do not resolve production OS accounts for this argv test.
+    compute = LocalSubprocessComputeBackend(_worker_client=object())
+
+    handle = await compute.launch(spec)
+    await compute.wait(handle, 30)
+    await compute.cleanup(handle)
+
+    assert calls[0]["args"] == (
+        "opencode",
+        "run",
+        "--log-level",
+        "DEBUG",
+        "--print-logs",
+        "-m",
+        "openai/gpt-5.6-luna",
+        "--dir",
+        str(tmp_path),
+        "--command",
+        "feature",
+        " --autonomous --max-retries 5 chainlink-1606",
+    )
+    assert "--variant" not in spec.local_argv
+    assert "shell" not in calls[0]["kwargs"]
+    assert calls[0]["checkout"] == tmp_path
+
+
+@pytest.mark.asyncio
+async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """chainlink #830: the opencode backend runs `opencode run --dir <worktree>
+    -- <prompt>` and interprets its output."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    calls: list[dict[str, Any]] = []
+    binary = tmp_path / "controller/bin/opencode"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(opencode_module, "IMAGE_OPENCODE_BIN", tmp_path / "absent-image-bin")
+    monkeypatch.setattr(opencode_module.shutil, "which", lambda name: str(binary) if name == "opencode" else None)
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0, stdout=b"done\n", stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.setenv("MIMIR_MODEL_REASONING_EFFORT", "high")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+    backend = OpenCodeBackend()
+    transcript_root = tmp_path / "state" / "worklink" / "transcripts"
+    order = WorkOrder(
+        issue_id=782,
+        checkout=tmp_path / "worktree",
+        prompt="-starts with dash",
+        rules=None,
+        timeout_s=30,
+        env={
+            "PATH": "/bin",
+            "MIMIR_MODEL_SPEC": "codex-plus:gpt-5.6-luna",
+        },
+        transcript_root=transcript_root,
+    )
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/782-a1",
+        test_command="uv run pytest -q",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await backend.interpret(order, compute_result)
+
+    assert result.backend_status == "success"
+    assert calls[0]["args"] == (
+        str(binary), "run", "--dir", str(order.checkout),
+        "-m", "openai/gpt-5.6-luna", "--variant", "high", "--", "-starts with dash"
+    )
+    assert calls[0]["args"].count("-m") == 1
+    assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
+    assert spec.backend_config["model_diverged"] is False
+    assert spec.backend_config["variant"] == "high"
+    assert spec.backend_config["variant_source"] == "agent"
+    assert spec.test_command == "uv run pytest -q"
+    assert "MIMIR_MODEL_SPEC" not in calls[0]["kwargs"]["env"]
+    permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
+    assert permission == {
+        "external_directory": {"/**": "deny"},
+        "bash": {"*": "deny", "git *": "allow", "uv *": "allow"},
+    }
+    assert result.transcript_path is not None
+    assert result.transcript_path.parent == transcript_root
+    transcript = json.loads(result.transcript_path.read_text())
+    assert transcript["backend"] == "opencode"
+
+
+def test_opencode_backend_rejects_direct_duplicate_model_flag() -> None:
+    with pytest.raises(ValueError, match=r"cannot contain '--model'.*remove it"):
+        OpenCodeBackend(extra_args=("--model", "openai/stale-worklink-setting"))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.usefixtures("stub_opencode")
+def test_opencode_test_env_reaches_pytest_through_bash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool, opencode_binary: Path
+) -> None:
+    monkeypatch.setattr(opencode_module, "_coding_enabled", lambda: enabled)
+    monkeypatch.setattr(
+        opencode_module, "resolve_opencode_invocation",
+        lambda **_: OpenCodeInvocation(
+            model="openai/test-model", provider="openai", model_source="test",
+            config_path=tmp_path / "absent.json", auth_path=tmp_path / "auth.json",
+            auth_type=None,
+        ),
+    )
+    monkeypatch.setattr(
+        opencode_module, "opencode_worker_documents",
+        lambda *_: SimpleNamespace(config_document=b"{}", auth_document=None),
+    )
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        'backends:\n  opencode:\n    test_env:\n      PYTEST_ADDOPTS: "-n 2"\n',
+        encoding="utf-8",
+    )
+    backend = BackendRegistry(WorklinkConfig.load(config_path)).get("opencode")
+    spec = backend.work_spec(
+        WorkOrder(1566, tmp_path, "p", None, 30, {"MIMIR_MODEL_SPEC": "codex-plus:test"}),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1566-a1",
+        test_command="uv run pytest -q -n 6",
+    )
+    assert spec.env["PYTEST_ADDOPTS"] == "-n 2"
+    assert spec.backend_config["test_env"] == {"PYTEST_ADDOPTS": "-n 2"}
+    assert "MIMIR_MODEL_SPEC" not in spec.env
+    assert spec.test_command == "uv run pytest -q -n 6"
+    if enabled:
+        assert spec.backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
+        env = compute_module._enabled_child_env(spec, "test-1566")
+    else:
+        env = {**compute_module._local_child_env(), **spec.env}
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\naddopts = "-n 3"\n', encoding="utf-8"
+    )
+    (tmp_path / "test_workers.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    # Stand in for the CLI with a process that launches a bash tool, not a direct
+    # pytest call: the grandchild must inherit the computed executor environment.
+    launcher = "import subprocess, sys; sys.exit(subprocess.call(['/bin/bash', '-c', sys.argv[1]]))"
+    for options, workers in [("", 2), ("-n 1", 1)]:
+        result = subprocess.run(
+            [sys.executable, "-c", launcher,
+             shlex.join(pytest_command(tmp_path, *shlex.split(options)))],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        noun = "worker" if workers == 1 else "workers"
+        assert f"created: {workers}/{workers} {noun}" in result.stdout
+
+
+@pytest.mark.parametrize("key", [
+    "OPENAI_API_KEY", "MIMIR_MODEL_SPEC", "OPENCODE_CONFIG", "PATH", "BASH_ENV",
+    "PYTHONPATH", "pytest_addopts",
+])
+def test_opencode_test_env_rejects_disallowed_key(tmp_path: Path, key: str) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"backends": {"opencode": {"test_env": {key: "text"}}}}))
+    with pytest.raises(ValueError, match=key):
+        WorklinkConfig.load(path)
+    with pytest.raises(ValueError, match=key):
+        OpenCodeBackend(test_env={key: "text"})
+
+
+@pytest.mark.parametrize("value", ["-n 2\n", "-n 2\r", "-n\x002", "-n\t2", 2, None, [], {}])
+def test_opencode_test_env_rejects_non_plain_text(tmp_path: Path, value: object) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"backends": {"opencode": {"test_env": {"PYTEST_ADDOPTS": value}}}}))
+    with pytest.raises(ValueError, match="PYTEST_ADDOPTS"):
+        WorklinkConfig.load(path)
+
+
+@pytest.mark.parametrize("value", [None, [], "-n 2", 6])
+def test_opencode_test_env_requires_mapping(tmp_path: Path, value: object) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"backends": {"opencode": {"test_env": value}}}))
+    with pytest.raises(ValueError, match="test_env must be a mapping"):
+        WorklinkConfig.load(path)
+
+
+@pytest.mark.usefixtures("stub_opencode")
+def test_opencode_backend_logs_native_model_divergence_from_home_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    opencode_binary: Path,
+) -> None:
+    (tmp_path / ".env").write_text(
+        "MIMIR_MODEL_SPEC=codex-plus:gpt-agent\n", encoding="utf-8"
+    )
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"model":"openai/gpt-native","plugin":["opencode-openai-codex-auth"]}', encoding="utf-8")
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    order = WorkOrder(
+        issue_id=1063,
+        checkout=tmp_path / "worktree",
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={"MIMIR_HOME": str(tmp_path)},
+    )
+
+    with caplog.at_level("WARNING", logger="mimir_cultivate.worklink.backends.opencode"):
+        spec = OpenCodeBackend().work_spec(
+            order,
+            attempt=1,
+            repo_url="u",
+            base_ref="main",
+            branch="issue/1063-a1",
+            test_command="true",
+        )
+
+    assert spec.backend_config["model"] == "openai/gpt-native"
+    assert spec.backend_config["configured_model"] == "openai/gpt-agent"
+    assert spec.backend_config["model_diverged"] is True
+    assert "differs from configured agent model" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> None:
+    order = WorkOrder(
+        issue_id=782,
+        checkout=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend()
+
+    blocked = await backend.interpret(
+        order, ComputeResult(0, "some work\nWORKLINK_BLOCKED: needs a decision", "")
+    )
+    assert blocked.backend_status == "blocked"
+    assert blocked.blocked_reason == "needs a decision"
+
+    auth = await backend.interpret(order, ComputeResult(1, "", "provider: unauthorized token"))
+    assert auth.backend_status == "auth_error"
+    assert "provider 'unknown'" in (auth.error or "")
+
+    quota = await backend.interpret(order, ComputeResult(1, "Error: Rate limit exceeded", ""))
+    assert quota.backend_status == "quota_exhausted"
+
+    plain = await backend.interpret(order, ComputeResult(3, "", "boom"))
+    assert plain.backend_status == "failed"
+    assert plain.error == "boom"
+
+
+@pytest.mark.parametrize("line", [
+    "\x1b[91m\x1b[1mError: \x1b[0mThe usage limit has been reached",
+    "Error: The usage limit has been reached",
+    "Error: HTTP 429 Too Many Requests",
+    "Error: Too Many Requests",
+    'Error: Too Many Requests: {"error":{"message":"Try again later"}}',
+    "Error: Rate limit reached",
+])
+def test_opencode_provider_quota_error_records(line: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, line, "") == "quota_exhausted"
+
+
+@pytest.mark.parametrize("line", [
+    "HTTP 429 Too Many Requests", "HTTP/1.1 429", "HTTP/2 429",
+    "status 429", "status code: 429", "429 Too Many Requests",
+    "Rate limit reached", "The usage limit has been reached",
+])
+def test_opencode_stderr_unprefixed_quota_error(line: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, "→ Read mimir/budget.py", line) == "quota_exhausted"
+    assert _status_from_output(1, f"Error: {line}", "") == "quota_exhausted"
+
+
+@pytest.mark.parametrize("stdout, stderr", [
+    ("", "Error: tests failed: 3 failed, 429 passed"),
+    ("", "Error: SyntaxError at foo.py line 429"),
+    ("provider: id 429 not found", ""),
+    ("codex rate limit reached in docs", ""),
+    ("openai: HTTP 429 in docs", ""),
+    ("provider: The usage limit has been reached", ""),
+    ("HTTP 429 Too Many Requests", ""),
+])
+def test_opencode_non_provider_quota_false_positives(stdout: str, stderr: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, stdout, stderr) == "failed"
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("line", [
+    "ERROR: pip: 429 Too Many Requests while fetching index",
+    "ERROR: HTTP 429 Too Many Requests",
+    "Error: test_quota: status code 429 expected",
+    "Error: test_quota: HTTP 429 Too Many Requests expected",
+    "Error: test_quota: The usage limit has been reached expected",
+    "Error:HTTP 429 Too Many Requests",
+    "error: HTTP 429 Too Many Requests",
+    "Error: HTTP 4290",
+    "Error: assert response.status_code == 429",
+    "npm ERR! 429 Too Many Requests",
+    "stack frame: status: 429",
+], ids=[
+    "pip-uppercase", "uppercase-prefix", "test-status-substring",
+    "test-http-substring", "test-usage-substring", "missing-prefix-space",
+    "lowercase-prefix", "not-429", "assertion", "npm", "stack-frame",
+])
+def test_opencode_tool_quota_messages_remain_failures(line: str, stream: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
+
+    stdout, stderr = (line, "") if stream == "stdout" else ("", line)
+    assert _status_from_output(1, stdout, stderr) == "failed"
+
+
+@pytest.mark.parametrize("line", [
+    "→ Read mimir/rate_limits.py", "→ Read mimir/budget.py",
+    "→ Grep quota mimir/quota_pause.py",
+    "→ Error: The usage limit has been reached",
+    "| Error: HTTP 429",
+])
+def test_opencode_quoted_quota_is_not_provider_error(line: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, line, line) == "failed"
+
+
+def test_opencode_auth_error_wins_over_echoed_quota_and_real_quota() -> None:
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(
+        1, "→ Read mimir/rate_limits.py\nError: Rate limit reached",
+        "\x1b[91mError: \x1b[0mToken refresh failed: 401",
+    ) == "auth_error"
+
+
+@pytest.mark.parametrize("stderr", [
+    "→ Read mimir/access_control.py [offset=7433, limit=13]\n",
+    "auth login credential = source_text\n→ Read mimir/access_control.py [offset=7433, limit=13]\n",
+    "→ HTTP 401 in a source file\n→ Read mimir/access_control.py\n",
+    "\x1b[0m→ \x1b[0mRead mimir/access_control.py\x1b[90m [offset=7433, limit=13]\n",
+    "\x1b[0m→ \x1b[0mHTTP 401 in a source file\x1b[90m\n",
+    "\x1b[0m→ \x1b[0mError: Token refresh failed: 401\n",
+    "\x1b[90m> \x1b[0mError: Token refresh failed: 401\n",
+    "\x1b[90m| \x1b[0mHTTP 401 Unauthorized\n",
+])
+def test_opencode_builder_output_is_not_provider_auth(stderr: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, "", stderr) == "failed"
+
+
+@pytest.mark.parametrize("line, evidence", [
+    ("HTTP 401 Unauthorized", "HTTP 401 Unauthorized"),
+    ("HTTP 403 Forbidden", "HTTP 403 Forbidden"),
+    ("OpenAI error: invalid or expired token", "OpenAI error: invalid or expired token"),
+    ("Error: refresh refused: oauth/token 401", "Error: refresh refused: oauth/token 401"),
+    ("provider: unauthorized token", "provider: unauthorized token"),
+    ("Token refresh failed: 401", "Token refresh failed: 401"),
+    ("Token refresh failed: 403", "Token refresh failed: 403"),
+    (
+        "\x1b[91m\x1b[1mError: \x1b[0mToken refresh failed: 401",
+        "Error: Token refresh failed: 401",
+    ),
+    ("\x1b[91mToken refresh failed: 401\x1b[0m", "Token refresh failed: 401"),
+])
+def test_opencode_provider_auth_quotes_evidence_line(line: str, evidence: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _error_from_status, _status_from_output
+
+    stderr = f"{line}\n→ Read mimir/access_control.py [offset=7433, limit=13]\n"
+    status = _status_from_output(1, "", stderr)
+    assert status == "auth_error"
+    message = _error_from_status(status, "", stderr, ["opencode", "-m", "openai/gpt"])
+    assert message == f"OpenCode provider 'openai' authentication failed: {evidence}"
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize('cause', ['',
+    'level=ERROR service=session message=failed ref=err_1cfd5f57 '
+    'error="ProviderModelNotFoundError: Model not found: openai/gpt-6.1-sol"\n',
+])
+@pytest.mark.parametrize('trailing', ['', '\nadditional shutdown diagnostic\n'])
+def test_opencode_unknown_error_reports_json_and_diagnostic(cause: str, trailing: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _error_from_status, _unknown_error_detail
+
+    # Verbatim observed trellisbot stderr: ANSI Error: prefix shares the opening
+    # JSON line, and the reference lives inside data, not at the top level.
+    stderr = cause + (
+        '\x1b[91m\x1b[1mError: \x1b[0m{\n'
+        '  "name": "UnknownError",\n'
+        '  "data": {\n'
+        '    "message": "Unexpected server error. Check server logs for details.",\n'
+        '    "ref": "err_1cfd5f57"\n'
+        '  }\n'
+        '}\n'
+    ) + trailing
+    expected = 'Unexpected server error. Check server logs for details. | ref: err_1cfd5f57'
+    if cause:
+        expected = cause.strip() + ' | ' + expected
+    assert _unknown_error_detail(stderr) == expected
+    assert _error_from_status('failed', '', stderr) == expected
+
+
+def test_opencode_unknown_error_scrubs_diagnostic_and_ref() -> None:
+    from mimir_cultivate.worklink.backends.opencode import _error_from_status
+
+    secret = 'ghp_' + 'a' * 36
+    stderr = (f'level=ERROR error=ProviderModelNotFoundError token={secret}\n'
+              '{\n"name":"UnknownError",\n"data":{"message":"Unexpected server error"},\n'
+              f'"ref":"{secret}"\n}}')
+    message = _error_from_status('failed', '', stderr)
+    assert message is not None
+    assert secret not in message
+    assert 'ProviderModelNotFoundError' in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("stub_opencode")
+async def test_opencode_backend_transcript_filename_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, opencode_binary: Path
+) -> None:
+    """chainlink #831: regression test that opencode transcript filenames use
+    the 'opencode-' prefix (not 'codex-') and embed the issue id, so mixed
+    deployments can tell runs apart."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0, stdout=b'done\n', stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "test-refresh"}}),
+        encoding="utf-8",
+    )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path, "test-refresh")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
+    backend = OpenCodeBackend()
+    transcript_root = tmp_path / "state" / "worklink" / "transcripts"
+    issue_id = 831
+    order = WorkOrder(
+        issue_id=issue_id,
+        checkout=tmp_path / "worktree",
+        prompt="Do the work",
+        rules=None,
+        timeout_s=30,
+        env={"PATH": "/bin"},
+        transcript_root=transcript_root,
+    )
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="issue/831-a1",
+        test_command="echo ok",
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    compute_result = await compute.wait(handle, spec.timeout_s)
+    await compute.cleanup(handle)
+    result = await backend.interpret(order, compute_result)
+
+    assert result == RawResult(
+        exit_code=0,
+        transcript_path=result.transcript_path,
+        backend_status="success",
+        error=None,
+    )
+    assert result.transcript_path is not None
+    filename = result.transcript_path.name
+    assert filename.startswith("opencode-"), f"expected 'opencode-' prefix, got {filename}"
+    assert str(issue_id) in filename, f"expected issue id {issue_id} in filename, got {filename}"
+    transcript = json.loads(result.transcript_path.read_text())
+    assert transcript["backend"] == "opencode"
+
+
+def test_shared_transcript_writer_scrubs_bounds_tail_and_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(opencode_module, "TRANSCRIPT_STREAM_MAX_BYTES", 80)
+    monkeypatch.setattr(opencode_module, "TRANSCRIPTS_PER_ISSUE", 3)
+    paths: list[Path] = []
+    output_paths: list[tuple[Path, Path]] = []
+    for index in range(5):
+        path = opencode_module.transcript_path(tmp_path, 1344)
+        stdout_path = tmp_path / f"opencode-1344-a1-{index}.stdout.log"
+        stderr_path = tmp_path / f"opencode-1344-a1-{index}.stderr.log"
+        stdout_path.write_text(f"raw stdout {index}")
+        stderr_path.write_text(f"raw stderr {index}")
+        opencode_module.write_transcript(
+            path,
+            command=("opencode", "run"),
+            exit_code=index,
+            status="failed",
+            stdout="x" * 100 + f" stdout-tail-{index}",
+            stderr="api_key=super-secret-value\n" + f"stderr-tail-{index}",
+            timed_out=False,
+            output_overflow=False,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        paths.append(path)
+        output_paths.append((stdout_path, stderr_path))
+
+    retained = sorted(tmp_path.glob("opencode-1344-*.json"))
+    assert len(retained) == 3
+    assert not paths[0].exists()
+    assert all(not output.exists() for pair in output_paths[:2] for output in pair)
+    assert all(output.exists() for pair in output_paths[2:] for output in pair)
+    newest = json.loads(paths[-1].read_text(encoding="utf-8"))
+    assert newest["stdout"].startswith("[earlier output omitted by Worklink]")
+    assert newest["stdout"].endswith("stdout-tail-4")
+    assert newest["stderr"].endswith("stderr-tail-4")
+    assert "super-secret-value" not in newest["stderr"]
+    assert paths[-1].stat().st_size <= opencode_module.TRANSCRIPT_MAX_BYTES
+
+
+def test_registry_builds_opencode_backend_with_settings() -> None:
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(test_command="npm test"),
+        backend_settings={"opencode": {
+            "bin": "/usr/local/bin/opencode",
+            "args": ["--verbose"],
+            "bash_allowlist": ["git *", "npm *"],
+        }},
+    )
+    backend = BackendRegistry(config).get("opencode")
+    assert backend.bin == "/usr/local/bin/opencode"
+    assert backend.extra_args == ("--verbose",)
+    assert backend.bash_allowlist == ("git *", "npm *")
+
+
+@pytest.mark.parametrize(
+    "args, flag",
+    [
+        (["--model", "openai/gpt-5.5"], "--model"),
+        (["-m", "openai/gpt-5.5"], "-m"),
+        (["--model=openai/gpt-5.5"], "--model=openai/gpt-5.5"),
+        (["--variant", "high"], "--variant"),
+        (["--variant=high"], "--variant=high"),
+        (["--dir", "/tmp/other"], "--dir"),
+        (["--"], "--"),
+    ],
+)
+def test_registry_rejects_opencode_injected_flags(args: list[str], flag: str) -> None:
+    config = WorklinkConfig(backend_settings={"opencode": {"args": args}})
+
+    with pytest.raises(ValueError, match=r"cannot contain .*remove it") as exc_info:
+        BackendRegistry(config)
+    assert repr(flag) in str(exc_info.value)
+
+
+@pytest.mark.parametrize("allowlist", ["git *", [""], ["*"]])
+def test_registry_rejects_invalid_opencode_bash_allowlist(allowlist: object) -> None:
+    config = WorklinkConfig(backend_settings={"opencode": {"bash_allowlist": allowlist}})
+    with pytest.raises(ValueError, match="bash_allowlist"):
+        BackendRegistry(config)
+
+
+def test_registry_keeps_and_logs_python_default_bash_allowlist(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("INFO", logger="mimir_cultivate.worklink.backends.registry"):
+        backend = BackendRegistry().get("opencode")
+
+    assert backend.bash_allowlist == ("git *", "uv *")
+    assert "effective bash allowlist from defaults.test_command: ['git *', 'uv *']" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("test_command", "runner_pattern"),
+    [
+        ("npm test", "npm *"),
+        ("go test ./...", "go *"),
+        ("./gradlew test", "./gradlew *"),
+    ],
+)
+@pytest.mark.usefixtures("stub_opencode")
+def test_registry_derives_only_configured_non_python_runner(
+    monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str,
+    opencode_binary: Path,
+) -> None:
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.backends.opencode.resolve_opencode_invocation",
+        lambda **_: OpenCodeInvocation(
+            model="openai/test-model",
+            provider="openai",
+            model_source="test",
+            config_path=Path("/nonexistent/opencode.jsonc"),
+            auth_path=Path("/nonexistent/auth.json"),
+            auth_type=None,
+        ),
+    )
+    config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
+
+    backend = BackendRegistry(config).get("opencode")
+    permission = json.loads(
+        backend.work_spec(
+            WorkOrder(1, Path("/tmp/worktree"), "p", None, 30, {}),
+            attempt=1,
+            repo_url="u",
+            base_ref="main",
+            branch="issue/1-a1",
+            test_command=test_command,
+        ).env["OPENCODE_PERMISSION"]
+    )
+
+    assert backend.bash_allowlist == ("git *", runner_pattern)
+    assert permission["bash"] == {"*": "deny", "git *": "allow", runner_pattern: "allow"}
+    assert "uv *" not in permission["bash"]
+    assert "rm *" not in permission["bash"]
+
+
+def test_operator_bash_allowlist_beats_derivation() -> None:
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(test_command="npm test"),
+        backend_settings={"opencode": {"bash_allowlist": ["npm test"]}},
+    )
+
+    backend = BackendRegistry(config).get("opencode")
+
+    assert backend.bash_allowlist == ("npm test",)
+
+
+@pytest.mark.parametrize(
+    "test_command",
+    [
+        "env -u MIMIR_MODEL_SPEC uv run pytest -q",
+        "make test",
+        "sh -c 'npm test'",
+        "bash -c 'npm test'",
+        "python -m pytest",
+    ],
+)
+def test_registry_refuses_nonderivable_test_runner(test_command: str) -> None:
+    config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
+
+    with pytest.raises(ValueError, match=r"defaults\.test_command=.*runner.*not a derivable"):
+        BackendRegistry(config)
+
+
+def test_registry_reports_explicit_allowlist_mismatch_with_both_values() -> None:
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(test_command="npm test"),
+        backend_settings={"opencode": {"bash_allowlist": ["git *", "uv *"]}},
+    )
+
+    with pytest.raises(ValueError, match=r"test_command='npm test'.*bash_allowlist=.*uv"):
+        BackendRegistry(config)
+
+
+def test_empty_operator_allowlist_fails_closed() -> None:
+    config = WorklinkConfig(
+        backend_settings={"opencode": {"bash_allowlist": []}},
+    )
+
+    with pytest.raises(ValueError, match=r"test_command=.*bash_allowlist=\[\]"):
+        BackendRegistry(config)
+
+
+@pytest.mark.asyncio
+async def test_opencode_permission_refusal_names_effective_allowlist(tmp_path: Path) -> None:
+    """The refusal message names the patterns that produced it.
+
+    Fixture unchanged across Chainlink #1152: the refusal is the executor's final
+    output line and the exit code is 0, so this also pins the fail-closed case
+    that a refusal reported last still fails the run without a nonzero exit.
+    """
+    backend = OpenCodeBackend(bash_allowlist=("git *", "npm *"))
+    order = WorkOrder(1, tmp_path, "p", None, 30, {}, transcript_root=tmp_path / "t")
+
+    result = await backend.interpret(
+        order,
+        ComputeResult(0, "Error: permission denied for bash command rm -rf build", ""),
+    )
+
+    assert result.backend_status == "failed"
+    assert result.error == (
+        "OpenCode refused an executor shell command because it is not allowed by "
+        "backends.opencode.bash_allowlist; effective patterns: ['git *', 'npm *']"
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_startup_permission_error_surfaces_backend_stderr(
+    tmp_path: Path,
+) -> None:
+    backend = OpenCodeBackend(bash_allowlist=("git *", "uv *"))
+    order = WorkOrder(1259, tmp_path, "p", None, 30, {}, transcript_root=tmp_path / "t")
+    stderr = (
+        "EACCES: permission denied, lstat\n"
+        "  '/var/lib/mimir-worklink/checkouts/scope/1259-1/checkout'"
+    )
+
+    result = await backend.interpret(order, ComputeResult(1, "", stderr))
+
+    assert result.backend_status == "failed"
+    assert result.error == stderr
+    assert "bash_allowlist" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """chainlink #830: autonomous local_subprocess must hand the coding CLI its
+    provider creds + HOME (so opencode finds config/plugins/auth) while never
+    leaking bridge/operator secrets. Inert until the docker->worktree pivot."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    captured: dict[str, Any] = {}
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        captured["env"] = kwargs.get("env", {})
+        return FakeProcess(returncode=0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("HOME", "/home/mimir")
+    monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "bridge-secret")
+    monkeypatch.setenv("MIMIR_API_KEY", "operator-secret")
+
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+    from mimir_cultivate.worklink.compute import WorkSpec
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    spec = WorkSpec(
+        issue_id=782, attempt=1, repo_url="u", base_ref="main", branch="issue/782-a1",
+        prompt="p", rules=None, test_command="true", backend="opencode", timeout_s=30,
+        env={"MIMIR_HOME": "/mimir-home"},
+        local_checkout=wt, local_argv=("opencode", "run", "--dir", str(wt), "--", "p"),
+    )
+    compute = LocalSubprocessComputeBackend()
+    handle = await compute.launch(spec)
+    await compute.wait(handle, 30)
+    await compute.cleanup(handle)
+
+    env = captured["env"]
+    assert env["HOME"] == "/home/mimir"
+    assert env["MINIMAX_API_KEY"] == "mm-key"
+    assert env["OPENAI_API_KEY"] == "sk-oai"
+    assert env["MIMIR_HOME"] == "/mimir-home"  # spec.env still applied
+    assert "DISCORD_BOT_TOKEN" not in env
+    assert "MIMIR_API_KEY" not in env
+
+
+# The exact literal that discarded three completed builds (chainlink #1152):
+# a build editing authorization code writes these words into source and tests.
+_AUTHZ_SOURCE_LINE = (
+    '                    content=f"Error: permission denied for read on {permission_path}",'
+)
+
+
+@pytest.mark.asyncio
+async def test_permission_words_in_executor_source_do_not_fail_a_successful_run(
+    tmp_path: Path,
+) -> None:
+    """A completed run is not failed because its diff contains the words.
+
+    Chainlink #1152: `_permission_refusal_reason` substring-scanned free-form
+    output, so a build editing read-policy code incriminated itself. #1123,
+    #1149 and #1152's own first two attempts each finished with a passing gate
+    and were discarded.
+    """
+    order = WorkOrder(
+        issue_id=1152,
+        checkout=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend()
+
+    raw = await backend.interpret(
+        order,
+        ComputeResult(0, f"edited a file\n{_AUTHZ_SOURCE_LINE}\nall todos complete", ""),
+    )
+
+    assert raw.backend_status == "success"
+    assert raw.error is None
+
+
+@pytest.mark.asyncio
+async def test_permission_refusal_that_stopped_the_executor_still_fails_with_its_reason(
+    tmp_path: Path,
+) -> None:
+    """A refusal that actually stopped the run is reported, and names itself."""
+    order = WorkOrder(
+        issue_id=1152,
+        checkout=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend(bash_allowlist=("git *",))
+
+    raw = await backend.interpret(
+        order, ComputeResult(1, "", "permission denied: bash command not allowed")
+    )
+
+    assert raw.backend_status == "failed"
+    assert "OpenCode refused an executor shell command" in (raw.error or "")
+    assert "git *" in (raw.error or "")
+
+
+@pytest.mark.asyncio
+async def test_midstream_refusal_that_crashed_the_executor_is_still_reported(
+    tmp_path: Path,
+) -> None:
+    """Position is not the only signal: a nonzero exit reports a refusal anywhere.
+
+    The refusal here sits mid-stream with unrelated output after it, which is
+    what a refusal followed by the executor's own teardown looks like. Position
+    alone would miss it, so the nonzero exit must independently fail the run —
+    otherwise Chainlink #1152's fix would trade one silent misclassification for
+    another.
+    """
+    order = WorkOrder(
+        issue_id=1152,
+        checkout=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend(bash_allowlist=("git *",))
+
+    raw = await backend.interpret(
+        order,
+        ComputeResult(
+            2,
+            "",
+            "permission denied for bash command\naborting run\nsession closed",
+        ),
+    )
+
+    assert raw.backend_status == "failed"
+    assert "OpenCode refused an executor shell command" in (raw.error or "")
+
+
+def test_blocked_marker_in_echoed_output_does_not_block_a_completed_run() -> None:
+    """The sibling matcher is not exposed to the same defect, by position.
+
+    `blocked_reason_from_output` honors its marker only as the final non-empty
+    line, so a run that echoes the instruction and then completes normally is
+    not mislabeled. Pinned here because #1152 audited it as a candidate for the
+    same bug and it is the precedent the refusal fix follows.
+    """
+    echoed = "reminder: emit WORKLINK_BLOCKED: <reason> and stop\nwork finished cleanly"
+
+    assert blocked_reason_from_output(echoed, "") is None
+    assert blocked_reason_from_output("done\nWORKLINK_BLOCKED: real", "") == "real"
+
+
+class _CheckoutCapability:
+    path = Path("/checkout")
+
+    def verify(self, path: Path | None) -> None:
+        pass
+
+    def duplicate_fd(self) -> int:
+        return -1
+
+
+def test_registry_compute_is_unbound_and_authorized_backends_are_fresh() -> None:
+    registry = BackendRegistry()
+    selected = registry.select_compute()
+    authorization = _CheckoutCapability()
+
+    first = selected.for_authorized_checkout(authorization)
+    second = selected.for_authorized_checkout(authorization)
+
+    assert isinstance(selected, LocalSubprocessComputeBackend)
+    assert selected._authorized_checkout is None
+    assert first is not selected
+    assert second is not selected
+    assert first is not second
+    assert first._authorized_checkout is authorization
+    assert second._authorized_checkout is authorization
+    assert first._jobs is not second._jobs
+
+
+def _provider_env(tmp_path: Path, spec: str, **values: str) -> dict[str, str]:
+    """Hermetic env for a Worklink resolution selecting an arbitrary provider."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    if spec.startswith("codex-plus:"):
+        from tests.opencode_fixtures import seed_codex_subscription
+        seed_codex_subscription(tmp_path)
+    return {
+        "HOME": str(tmp_path),
+        "MIMIR_HOME": str(home),
+        "MIMIR_MODEL_SPEC": spec,
+        "OPENCODE_CONFIG": "",
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "XDG_DATA_HOME": str(tmp_path / ".local" / "share"),
+        **values,
+    }
+
+
+def _write_opencode_auth(tmp_path: Path, payload: object) -> None:
+    path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    if (tmp_path / ".codex/auth.json").exists():
+        from tests.opencode_fixtures import seed_codex_subscription
+        seed_codex_subscription(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("agent", "override", "expected", "source"),
+    [
+        ("high", None, "high", "agent"),
+        ("high", "xhigh", "xhigh", "worklink_override"),
+        ("high", "", "high", "agent"),
+        (None, None, None, "none"),
+        ("none", None, None, "none"),
+        ("high", "none", None, "none"),
+        ("max", None, "max", "agent"),
+        ("ultra", None, "ultra", "agent"),
+    ],
+)
+@pytest.mark.usefixtures("stub_opencode")
+def test_opencode_leaf_reasoning_variant(
+    tmp_path: Path, agent: str | None, override: str | None,
+    expected: str | None, source: str, opencode_binary: Path,
+) -> None:
+    env = _provider_env(tmp_path, "codex-plus:gpt-agent")
+    _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
+    if agent is not None:
+        env["MIMIR_MODEL_REASONING_EFFORT"] = agent
+    if override is not None:
+        env["MIMIR_WORKLINK_REASONING_EFFORT"] = override
+    spec = OpenCodeBackend().work_spec(
+        WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+        test_command="uv run pytest -q",
+    )
+    args = spec.backend_config["args"]
+    assert args[:2] == ["-m", "openai/gpt-agent"]
+    assert args[2:] == (["--variant", expected] if expected else [])
+    assert spec.backend_config["variant"] == expected
+    assert spec.backend_config["variant_source"] == source
+    assert spec.backend_config["model_source"] == "agent_model"
+    assert spec.local_argv[4:4 + len(args)] == tuple(args)
+
+
+@pytest.mark.usefixtures("stub_opencode")
+def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(tmp_path: Path) -> None:
+    env = _provider_env(tmp_path, "codex-plus:gpt-agent")
+    env.pop("MIMIR_MODEL_SPEC")
+    home = Path(env["MIMIR_HOME"])
+    (home / ".env").write_text(
+        "MIMIR_MODEL_SPEC=codex-plus:gpt-agent\n"
+        "MIMIR_MODEL_REASONING_EFFORT=low\n"
+        "MIMIR_WORKLINK_REASONING_EFFORT=xhigh\n", encoding="utf-8",
+    )
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('{"model":"openai/gpt-native","plugin":["opencode-openai-codex-auth"]}', encoding="utf-8")
+    _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
+    spec = OpenCodeBackend().work_spec(
+        WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+        test_command="true",
+    )
+    assert spec.backend_config["args"] == ["-m", "openai/gpt-native", "--variant", "xhigh"]
+    assert spec.backend_config["model_source"] == "opencode_config"
+    assert spec.backend_config["variant_source"] == "worklink_override"
+
+
+@pytest.mark.parametrize("name", ["MIMIR_MODEL_REASONING_EFFORT", "MIMIR_WORKLINK_REASONING_EFFORT"])
+@pytest.mark.usefixtures("stub_opencode")
+def test_opencode_leaf_invalid_openai_effort_fails_before_invocation(
+    tmp_path: Path, name: str, opencode_binary: Path,
+) -> None:
+    env = _provider_env(tmp_path, "codex-plus:gpt-agent", **{name: "turbo"})
+    _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
+    with pytest.raises(ValueError) as excinfo:
+        OpenCodeBackend().work_spec(
+            WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+            attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+            test_command="true",
+        )
+    assert name in str(excinfo.value)
+    assert "turbo" in str(excinfo.value)
+    assert "max" in str(excinfo.value) and "ultra" in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("stub_opencode")
+def test_opencode_leaf_other_provider_passes_variant_through(tmp_path: Path) -> None:
+    env = _provider_env(tmp_path, "openrouter:anthropic/claude-opus", MIMIR_MODEL_REASONING_EFFORT="turbo")
+    _write_opencode_auth(tmp_path, {"openrouter": {"type": "api", "key": "synthetic"}})
+    spec = OpenCodeBackend().work_spec(
+        WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+        test_command="true",
+    )
+    assert spec.backend_config["args"] == [
+        "-m", "openrouter/anthropic/claude-opus", "--variant", "turbo",
+    ]
+
+
+@pytest.mark.parametrize("credential", ["saved_auth", "ambient_key"])
+def test_worklink_resolution_admits_any_configured_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential: str,
+) -> None:
+    """Worklink resolution carries whichever provider the operator configured.
+
+    Provider choice belongs to whoever runs the deployment, so the resolver must
+    not special-case particular vendors. Both credential transports are covered
+    because each reaches the worker through the projected auth document rather
+    than the worker environment allowlist, so a regression could hide in either.
+    """
+    from mimir_cultivate.worklink.backends.opencode import resolve_worklink_opencode_invocation
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    env = _provider_env(tmp_path, "openrouter:anthropic/claude-opus-4.8")
+    if credential == "saved_auth":
+        _write_opencode_auth(tmp_path, {"openrouter": {"type": "api", "key": "sk-or-synthetic"}})
+    else:
+        env["OPENROUTER_API_KEY"] = "sk-or-synthetic"
+
+    resolution = resolve_worklink_opencode_invocation(env)
+
+    assert resolution.invocation.provider == "openrouter"
+    assert resolution.invocation.model == "openrouter/anthropic/claude-opus-4.8"
+    assert resolution.invocation.auth_type == "api"
+    assert "sk-or-synthetic" not in repr(resolution.invocation)
+
+
+def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
+    """The factory launch policy denies dotenv reads rather than prompting.
+
+    The leaf backend sends a permission override; the factory path did not, so
+    OpenCode's built-in `ask` rule for secret files stayed live and the first
+    prompt wedged an autonomous run with no way to answer it.
+
+    This asserts the policy fragment Worklink emits. It is NOT a guarantee that
+    no interactive ask remains: OpenCode merges this with its own defaults, and
+    other ask categories are untouched by this change. Proving that would need an
+    integration check against the pinned OpenCode permission evaluator.
+    """
+    from mimir_cultivate.worklink.backends.feature_factory import _FACTORY_PERMISSION
+
+    home = tmp_path / "home"
+    home.mkdir()
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"zai": {"type": "api", "key": "zai-key"}}), encoding="utf-8")
+    env = {
+        "HOME": str(tmp_path),
+        "MIMIR_HOME": str(home),
+        "MIMIR_MODEL_SPEC": "zai:glm-5",
+        "OPENCODE_CONFIG": "",
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "XDG_DATA_HOME": str(tmp_path / ".local" / "share"),
+    }
+    backend = FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js")
+    order = WorkOrder(4242, tmp_path, "prompt", None, 30, env=env)
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="feature/chainlink-4242",
+        test_command="uv run pytest -q",
+    )
+
+    permission = json.loads(spec.env["OPENCODE_PERMISSION"])
+    assert permission["read"] == {
+        ".env": "deny", "**/.env": "deny", "**/.env.*": "deny",
+    }
+
+    # An operator-supplied override still wins.
+    order_override = WorkOrder(
+        4242, tmp_path, "prompt", None, 30,
+        env={**env, "OPENCODE_PERMISSION": '{"read":{"**":"deny"}}'},
+    )
+    spec_override = backend.work_spec(
+        order_override,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="feature/chainlink-4242",
+        test_command="uv run pytest -q",
+    )
+    assert spec_override.env["OPENCODE_PERMISSION"] == '{"read":{"**":"deny"}}'
+    assert spec_override.env["OPENCODE_PERMISSION"] != _FACTORY_PERMISSION

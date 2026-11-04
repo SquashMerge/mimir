@@ -1,0 +1,5666 @@
+"""mimir.Agent — deepagents-backed.
+
+Post-cutover (2026-05-14): replaces the 2459-LOC SDK-backed
+Agent class with a thin wrapper around LangGraph's deepagents.
+
+Public API preserved:
+  - Agent(config, turn_logger, message_buffer, ..., dispatcher=)
+  - agent.run_turn(event) -> TurnRecord
+  - dispatcher.set_run_turn(agent.run_turn)
+
+What's gone:
+  - ClientPool + _PoolEntry + _AcquireContext (~370 LOC) —
+    CompiledStateGraph is thread-safe; one shared singleton.
+  - SDK message-type handling — turn_logger walks LangChain
+    messages instead.
+  - HookMatcher chains — replaced by the external wrapper
+    pattern (memory pre-inject + post-message credit pass).
+  - InMemorySessionStore.delete() per turn — LangGraph handles
+    per-call state isolation via the ``thread_id`` config key.
+  - claude_agent_sdk dependency at the import level.
+
+What's kept:
+  - mimir.SessionManager / ChannelRegistry /
+    Dispatcher constructor wiring (runtime-agnostic infrastructure).
+  - TurnRecord schema (mimir/models.py).
+  - The Agent class shape so server.py + tests don't need
+    constructor-call rewrites.
+
+Subagent ``task`` tool: deepagents has one built-in. mimir's
+spawn-claude-code is a separate runtime concern (subprocess spawn);
+currently stubbed — re-wire in a follow-up.
+"""
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import contextlib
+import functools
+import hashlib
+import json
+import logging
+import os
+import re
+import subprocess
+import time
+import traceback
+import threading
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from collections.abc import Callable, Mapping
+from typing import Any
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+
+from .channel_registry import (
+    ChannelRegistry,
+    classify_turn_interactivity,
+    post_job_failure_notice,
+    resolve_deliver_channel,
+)
+from .channel_audience import ServerChannelAudienceProvider, attest_owner
+from .chat_skills import CHAT_SKILL_EXTRA_KEY, ChatSkillRegistry
+from .config import Config
+from .model_registry import DEFAULT_MODEL_SPEC
+from .event_logger import (
+    log_durable_event_sync,
+    log_event,
+    log_event_sync,
+    safe_log_event,
+)
+from .feedback import FeedbackLog
+from . import health
+from . import mid_turn_injection
+from . import _deepagents_patches
+from .skill_visibility import (
+    SeedFilteredSkillsMiddleware,
+    hidden_home_skill_dirs,
+    visible_skill_names,
+)
+from .history import Message, MessageBuffer
+from .harness_egress import harness_sink_allowed
+from .index import IndexGenerator
+from . import _langchain_claude_code_patches as _lcc_patches
+from ._langchain_codex_plus_patches import (
+    reset_codex_plus_stream_buffering,
+    set_codex_plus_stream_buffering,
+)
+from ._deepagents_summarization import install_offload_traceback_logging_patch
+from ._jsonl_tail import tail_jsonl_records
+from ._llm_retry import _is_retryable_error
+from ._reasoning_effort import EFFORT_LEVELS as _EFFORT_LEVELS
+from ._reasoning_effort import validate_effort as _validate_effort
+from .jsonl_snapshot import JsonlSnapshot
+from .models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    IngestAcknowledgement,
+    IngestedURLState,
+    Integrity,
+    IntegrityEffect,
+    PromptBlock,
+    OwnerAttestation,
+    SourceLabel,
+    TurnInteractivity,
+    TurnContext,
+    TurnRecord,
+)
+from .access_control import (
+    ChannelResourceAdapter,
+    _source_is_triggering_channel_compatible,
+    create_auth_context,
+    ensure_turn_scratch,
+    get_event_service_principal,
+    get_trusted_service_from_auth_context,
+    record_ingested_urls,
+)
+from .prompts import ENFORCEMENT_GUIDANCE, build_system_prompt, build_turn_prompt
+from . import prompt_sources
+from .rate_limits import RateLimitStore
+from .saga_client import SagaClient
+from .session_boundary_log import (
+    count_turns_since_many,
+    has_validatable_unfinished_work,
+    render_session_summaries,
+    validate_unfinished_work,
+)
+from .plugins.core import scoped_policy_call, selected_policy_registry
+from .templates import render_saga_session_end
+from .usage_stats import event_recently_emitted
+
+# Cache BaseTool->OpenAI schema conversion in DeepAgents token counting;
+# otherwise summarization middleware can rebuild Pydantic tool schemas on
+# the asyncio loop at every model boundary (chainlink #600).
+_deepagents_patches.patch_deepagents_token_counter_tool_schema_cache()
+# Replace DeepAgents' fixed grep schema with Mimir's bounded -A/-B equivalent.
+_deepagents_patches.install_deepagents_grep_context_tool()
+# DeepAgents deliberately treats history-offload failures as non-fatal. Keep
+# summarization progressing, but retain the swallowed exception's traceback.
+install_offload_traceback_logging_patch()
+# Register PreToolUse/PostToolUse/PostToolUseFailure SDK hooks so every
+# tool invocation (built-in Bash/Read/Edit/etc, bridged langchain tools,
+# MCP tools) is captured into ``generation_info["tool_events"]`` as an
+# ordered list paired by ``tool_use_id``. Without this patch, built-in
+# tools never surface results, and bridged-tool calls/results can't be
+# paired (call uses the prefixed name, result the bare name). No-op
+# when claude-code extra not installed.
+_lcc_patches.install_tool_event_hooks()
+from .sagatools import (
+    _atom_ids_from_response,
+    _format_saga_payload,
+    _source_atom_ids_from_triples,
+)
+from .search import Indexer
+from .session_manager import SessionManager
+from .turn_event_bus import TurnEventEmitter
+from .turn_hooks import TurnHook, fire_hooks
+from .turn_logger import (
+    TurnLogger,
+    derive_result_fields,
+    extract_turn_events,
+    extract_partial_tool_events,
+    make_turn_id,
+    slim_turn_record,
+    truncate_input,
+)
+from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+
+log = logging.getLogger(__name__)
+
+_STATIC_PROMPT_BLOCKS: dict[int, tuple[Any, str]] = {}
+_PLUGIN_PROMPT_OVER_CAP_REPORTED: set[str] = set()
+_PLUGIN_PROMPT_REPORT_LOCK = threading.Lock()
+_STATIC_PROMPT_LOCK = threading.Lock()
+
+
+def _render_plugin_prompt(provider: Any, auth: AuthContext, event: AgentEvent,
+                          home: Path) -> tuple[str, tuple[str, ...]]:
+    """Run a provider with a host-controlled read surface on a worker thread."""
+    from .core_blocks import PromptReadRefused, read_plugin_prompt_file
+
+    served: list[str] = []
+    refused = False
+
+    def reader(requested: str | Path) -> str:
+        nonlocal refused
+        if provider.static:
+            refused = True
+            raise PromptReadRefused("static prompt cannot read turn resources")
+        try:
+            text, resource = read_plugin_prompt_file(home, requested)
+        except PromptReadRefused:
+            refused = True
+            raise
+        served.append(resource)
+        return text
+
+    reader.home = home  # type: ignore[attr-defined]  # Configured by the host, never by the provider.
+
+    if provider.static:
+        with _STATIC_PROMPT_LOCK:
+            cached = _STATIC_PROMPT_BLOCKS.get(id(provider))
+            if cached is not None and cached[0] is provider:
+                return cached[1], ()
+            content = provider.render(auth, event, reader)
+            if refused:
+                raise PromptReadRefused("prompt resource refused")
+            if not isinstance(content, str):
+                raise TypeError("prompt renderer must return text")
+            _STATIC_PROMPT_BLOCKS[id(provider)] = (provider, content)
+            return content, ()
+    content = provider.render(auth, event, reader)
+    if refused:
+        raise PromptReadRefused("prompt resource refused")
+    if not isinstance(content, str):
+        raise TypeError("prompt renderer must return text")
+    return content, tuple(dict.fromkeys(served))
+
+
+def _cap_plugin_prompt(content: str, limit: int) -> tuple[str, bool]:
+    data = content.encode("utf-8")
+    if len(data) <= limit:
+        return content, False
+    suffix = "…[truncated]" if limit >= len("…[truncated]".encode()) else ("…" if limit >= 3 else "?")
+    remaining = limit - len(suffix.encode())
+    return data[:remaining].decode("utf-8", errors="ignore") + suffix, True
+
+
+def _report_plugin_prompt(kind: str, name: str) -> None:
+    """Prompt telemetry is best effort and never includes provider content."""
+    if kind == "plugin_prompt_over_cap":
+        # Process-wide, not per Agent or turn. Claim before logging so concurrent
+        # turns (and an unavailable logger) cannot produce a recurring alert.
+        with _PLUGIN_PROMPT_REPORT_LOCK:
+            if name in _PLUGIN_PROMPT_OVER_CAP_REPORTED:
+                return
+            _PLUGIN_PROMPT_OVER_CAP_REPORTED.add(name)
+    try:
+        log_event_sync(kind, provider=name)
+    except Exception:  # noqa: BLE001 — logger availability cannot fail prompt assembly
+        log.debug("plugin prompt telemetry unavailable", exc_info=True)
+
+
+def _selected_turn_hooks(policy: Any, name: str) -> tuple[Callable[..., Any], ...]:
+    """Use only callbacks published by the selected, frozen policy."""
+    return tuple(callback for (_owner, stage), callback in policy.turn_hooks.items()
+                 if stage == name)
+
+
+def _unready_tool_owners(policy: Any) -> frozenset[str]:
+    owners = {tool.owner for tool in policy.tools.values() if tool.owner != "core"}
+    return frozenset(owner for (owner, stage), hook in policy.turn_hooks.items()
+                     if stage == "tool_readiness" and owner in owners and hook() is False)
+
+
+def _transient_provider_failure(exc: BaseException) -> tuple[str | None, float | None]:
+    """Only a raised provider/transport exception can exempt a poller attempt."""
+    name = type(exc).__name__
+    if name in {"Exception", "RuntimeError"} or not (
+        name in {"ReadError", "ConnectError", "RemoteProtocolError", "ReadTimeout",
+                 "ConnectTimeout", "PoolTimeout", "Timeout", "ConnectionError",
+                 "CodexResponseError", "OverloadedError", "RateLimitError"}
+        or name.endswith(("APIError", "APIStatusError", "HTTPStatusError"))
+        or getattr(exc, "status_code", None) is not None
+        or getattr(getattr(exc, "response", None), "status_code", None) is not None
+    ):
+        return None, None
+    retryable, reason = _is_retryable_error(exc)
+    if not retryable:
+        return None, None
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        headers = getattr(exc, "headers", None)
+    raw = headers.get("retry-after") if hasattr(headers, "get") else None
+    from email.utils import parsedate_to_datetime
+    try:
+        retry_after = float(raw)
+    except (TypeError, ValueError):
+        try:
+            retry_after = (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds() if raw else 0
+        except (TypeError, ValueError, IndexError, OverflowError):
+            retry_after = 0
+    return reason, retry_after if 0 < retry_after < float("inf") else None
+
+# Reflection is the sole turn whose session summaries are assembled across
+# channels: its own synthetic scheduler channel has no user sessions.
+_REFLECTION_CHANNEL_ID = "scheduler:reflect"
+
+# Triggers for which saga.query() adds no value — the turn has no
+# meaningful user-authored query anchor, so the memory-inject pass
+# is skipped entirely. Extraction as a frozenset constant keeps the
+# condition readable and easy to extend.
+NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
+    {"saga_session_end", "scheduled_tick", "poller", "upgrade", "proposal_revision"}
+)
+
+# Only identity-attributed interactive adapters may establish trusted input.
+OPERATOR_USER_MESSAGE_SOURCES: frozenset[str] = frozenset(
+    {"slack", "discord", "web", "acp"}
+)
+
+# Autonomous-work triggers — cron-fired and poller-fired turns that
+# don't anchor a back-and-forth conversation. After one of these turns
+# completes, force-end the saga session immediately instead of letting
+# the standard idle-minutes countdown run: the channel won't see more
+# turns on the same session anyway (the next cron fire / poller batch
+# creates its own session via ``SessionManager.touch``), so a 10-minute
+# idle wait just defers the synthesis with no recall benefit.
+# ``saga_session_end`` is excluded — that IS the synthesis turn; ending
+# the session that just produced it would loop.
+IMMEDIATE_SESSION_END_TRIGGERS: frozenset[str] = frozenset(
+    {"scheduled_tick", "poller", "upgrade", "proposal_revision"}
+)
+
+
+# Budget-exhaustion continuation recovery is best-effort durability work that
+# may run git / chainlink / gh subprocesses. Bound it separately from finalize
+# hooks so a hung recovery path cannot strand the rest of turn finalization.
+_WORKLINK_CONTINUATION_TIMEOUT_SECONDS = 30.0
+
+
+def _worklink_continuation_timeout_seconds(config: Config) -> float:
+    configured = int(getattr(config, "post_turn_timeout_seconds", 0) or 0)
+    if configured <= 0:
+        return _WORKLINK_CONTINUATION_TIMEOUT_SECONDS
+    return float(min(configured, int(_WORKLINK_CONTINUATION_TIMEOUT_SECONDS)))
+
+
+# ────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────
+
+
+def _turn_record_ts(rec: dict) -> datetime | None:
+    """Return the timestamp for a turns.jsonl record, if parseable.
+
+    Older code looked only for ``timestamp`` even though turn records are
+    written with ``ts``. Keep the ``timestamp`` fallback for compatibility
+    with tests or historical records that used the expanded field name.
+    """
+    ts_str = rec.get("ts") or rec.get("timestamp")
+    if not isinstance(ts_str, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _turn_is_interactive(interactivity: TurnInteractivity | None) -> bool:
+    """Return True only for an explicit interactive classification."""
+    return interactivity == TurnInteractivity.INTERACTIVE
+
+
+def _require_auth_context(auth_context: AuthContext | None) -> AuthContext:
+    if not isinstance(auth_context, AuthContext):
+        raise TypeError("protected prompt loading requires the exact AuthContext")
+    return auth_context
+
+
+def _prompt_source_labels(
+    auth_context: AuthContext,
+    *,
+    domain: str,
+    resource: str,
+    channel_id: str | None = None,
+    principal: str | None = None,
+    bridge: str | None = None,
+    authorized_principals: frozenset[str] | None = None,
+    source_kind: str = "protected_prompt",
+    self_authored: bool,
+    owner_attestation: OwnerAttestation | None = None,
+) -> InformationFlowLabels:
+    """Create one complete, server-authoritative protected prompt source."""
+    requester = auth_context.canonical_principal or auth_context.principal
+    effective_requester = (
+        f"service:{requester}" if auth_context.is_service and requester else requester
+    )
+    owner = principal or effective_requester
+    bridge_instance = bridge or auth_context.bridge_instance or "mimir"
+    acl = authorized_principals
+    if acl is None:
+        acl = frozenset({effective_requester}) if effective_requester else frozenset()
+    if self_authored and source_kind == "protected_prompt":
+        source_kind = "agent_self"
+    return InformationFlowLabels().with_source(prompt_sources.prompt_source_label(
+        auth_context,
+        principal=owner,
+        domain=domain,
+        resource=resource,
+        channel_id=channel_id,
+        bridge_instance=bridge_instance,
+        authorized_principals=acl,
+        source_kind=source_kind,
+        self_authored=self_authored,
+        owner_attestation=owner_attestation,
+    ))
+
+
+def _recent_message_is_self_authored(message: Any) -> bool:
+    """Use persisted server provenance, never message text or model claims."""
+    return message.integrity == Integrity.TRUSTED
+
+
+def _auto_recall_source_labels(
+    auth_context: AuthContext,
+    payload: Mapping[str, Any],
+) -> InformationFlowLabels:
+    """Build per-atom informational labels from authorized recall metadata."""
+    labels = InformationFlowLabels()
+    sources = payload.get("_ifc_sources")
+    if not isinstance(sources, list):
+        return labels
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("owner_principal")
+        resource_id = item.get("resource_id")
+        if not isinstance(resource_id, str) or not resource_id:
+            continue
+        integrity = item.get("integrity")
+        if integrity not in Integrity._value2member_map_:
+            integrity = Integrity.UNTRUSTED
+        labels = labels.with_source(SourceLabel(
+            principal=owner if isinstance(owner, str) and owner else None,
+            domain="saga",
+            resource_id=resource_id,
+            bridge_instance="saga",
+            sensitivity="private",
+            authorized_principals=_protected_owner_acl(
+                auth_context,
+                owner if isinstance(owner, str) else None,
+                requester_visible=True,
+            ),
+            source_kind="auto_recall",
+            integrity=integrity,
+            # Recall is retained for audit but does not participate in the
+            # durable-write trust boundary.
+            integrity_effect=IntegrityEffect.INFORMATIONAL,
+        ))
+    return labels
+
+
+def _is_prompt_operator(auth_context: AuthContext) -> bool:
+    return auth_context.is_service or "admin" in auth_context.roles
+
+
+def _protected_owner_acl(
+    auth_context: AuthContext,
+    owner: str | None,
+    *,
+    requester_visible: bool = False,
+) -> frozenset[str]:
+    """Return an owner-anchored ACL, preserving explicit privileged access."""
+    requester = auth_context.canonical_principal or auth_context.principal
+    effective_requester = (
+        f"service:{requester}" if auth_context.is_service and requester else requester
+    )
+    principals = {owner} if owner else set()
+    if requester_visible or _is_prompt_operator(auth_context):
+        if effective_requester:
+            principals.add(effective_requester)
+    return frozenset(principals)
+
+
+def _merge_ifc_labels(
+    *label_sets: Any,
+    source_channel: str | None = None,
+) -> InformationFlowLabels:
+    """Union immutable IFC carriers without permitting label attenuation."""
+    merged = InformationFlowLabels()
+    for current in label_sets:
+        if not isinstance(current, InformationFlowLabels):
+            continue
+        for label in current.labels:
+            merged = merged.with_label(label)
+        for channel in current.source_channels:
+            merged = merged.with_channel(channel)
+        for source in current.sources:
+            merged = merged.with_source(source)
+    if source_channel:
+        merged = merged.with_channel(source_channel)
+    return merged
+
+
+def _shell_completion_labels(job: Any) -> InformationFlowLabels:
+    """Carry the same metadata and output sources as bash_job_output."""
+    from .access_control import protected_result_source
+
+    auth = getattr(job, "auth_context", None)
+    sources = [protected_result_source(
+        auth, principal="mimir:shell-jobs", domain="shell_jobs",
+        resource_id=f"job:{job.job_id}", bridge_instance="shell",
+    )]
+    inherited = getattr(job, "ifc_labels", None)
+    if isinstance(inherited, InformationFlowLabels):
+        sources.extend(inherited.sources)
+    else:
+        sources.append(protected_result_source(
+            auth, principal=None, domain="shell_jobs",
+            resource_id=f"job:{job.job_id}:output", bridge_instance="shell",
+        ))
+    return _merge_ifc_labels(
+        _propagate_ifc_labels(inherited, job.channel_id),
+        InformationFlowLabels(sources=tuple(sources)), source_channel=job.channel_id,
+    )
+
+
+def _persisted_integrity(ifc_labels: InformationFlowLabels) -> Integrity:
+    return ifc_labels.persisted_integrity
+
+
+def _effective_persisted_integrity(
+    ifc_labels: InformationFlowLabels, auth_context: AuthContext | None,
+) -> Integrity:
+    """Record the human-cleared turn as trusted without rewriting provenance."""
+    from .access_control import _turn_has_untrusted_active_ingest
+
+    if (auth_context is not None and ifc_labels.sources
+            and not _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+        return Integrity.TRUSTED
+    return ifc_labels.persisted_integrity
+
+
+def _initialize_ifc_labels(
+    event: AgentEvent,
+    attachments: list[str] | None = None,
+    *,
+    preloaded_labels: InformationFlowLabels | None = None,
+    resolver: Any = None,
+    policy: Any = None,
+) -> InformationFlowLabels:
+    """Initialize monotonic IFC labels before prompt/model construction.
+
+    ``preloaded_labels`` covers server-supplied memory/history/session/skill/file
+    context. ``event.ifc_labels`` carries trusted continuation/resume state. Both
+    are unioned with ingress-derived labels; neither can replace or clear them.
+    """
+    labels = _merge_ifc_labels(
+        event.ifc_labels,
+        preloaded_labels,
+        source_channel=event.channel_id,
+    )
+
+    continuation_auth = _shell_continuation_auth_context(event)
+    canonical_principal = event.author
+    source_kind = "channel"
+    registered_service = get_event_service_principal(event, policy=policy)
+    if HTTP_EVENT_INGRESS_EXTRA_KEY in (
+        event.extra if isinstance(event.extra, dict) else {}
+    ):
+        registered_service = None
+    poller_own_channel = (
+        event.trigger == "poller"
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in (
+            event.extra if isinstance(event.extra, dict) else {}
+        )
+        and isinstance(registered_service.channel_memory_directory, str)
+        and event.channel_id == registered_service.channel_memory_directory
+    )
+    if (
+        canonical_principal is None
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+    ):
+        # Trusted constructors stamp service_principal; generic HTTP ingress does
+        # not copy it from the request. Complete service provenance lets an
+        # author-less scheduled/poller/synthesis turn flow back to its own
+        # triggering channel without inventing human ownership.
+        canonical_principal = f"service:{registered_service.canonical}"
+        source_kind = "service"
+    canonical_resource = event.channel_id
+    if continuation_auth is not None:
+        canonical_principal = (
+            continuation_auth.canonical_principal or continuation_auth.principal
+        )
+        if continuation_auth.is_service and canonical_principal:
+            canonical_principal = f"service:{canonical_principal}"
+        canonical_resource = continuation_auth.resource_id or event.channel_id
+        source_kind = "service" if continuation_auth.is_service else "channel"
+    elif resolver is not None:
+        if event.author:
+            canonical_principal = resolver.resolve(event.author)
+        canonical_resource = resolver.resolve_channel(event.channel_id)
+    extra = event.extra if isinstance(event.extra, dict) else {}
+    normalized_source = (
+        event.source.strip().lower() if isinstance(event.source, str) else ""
+    )
+    visibility = extra.get("channel_visibility")
+    domain = (
+        continuation_auth.domain
+        if continuation_auth is not None
+        else "channel"
+    )
+    domain_qualifier = (
+        continuation_auth.domain_qualifier
+        if continuation_auth is not None
+        else visibility if isinstance(visibility, str) and visibility else None
+    )
+    bridge_instance = extra.get("bridge_instance")
+    if continuation_auth is not None:
+        bridge_instance = continuation_auth.bridge_instance
+    if not isinstance(bridge_instance, str) or not bridge_instance:
+        bridge_instance = event.source
+    if (
+        (not isinstance(bridge_instance, str) or not bridge_instance)
+        and source_kind == "service"
+        and registered_service is not None
+    ):
+        bridge_instance = f"service:{registered_service.canonical}"
+    sensitivity = "private"
+    if event.source in ("api", "http") or event.trigger in (
+        "saga_session_end", "scheduled_tick", "poller",
+    ):
+        sensitivity = "internal"
+    integrity = Integrity.UNTRUSTED
+    if (
+        registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and event.trigger in ("scheduled_tick", "saga_session_end", "upgrade", "proposal_revision")
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
+    ) or (
+        event.trigger == "user_message"
+        and bool(event.author)
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
+        and normalized_source in OPERATOR_USER_MESSAGE_SOURCES
+        and resolver is not None
+        and resolver.access_metadata(event.author).is_authorized
+    ):
+        integrity = Integrity.TRUSTED
+    elif (
+        event.trigger == "poller"
+        and event.ifc_labels is not None
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
+    ):
+        # Poller content is classified by the framework before enqueue. The
+        # service stamp makes this carrier server-owned; public HTTP ingress
+        # cannot provide either the stamp or ifc_labels.
+        if event.ifc_labels.sources and all(
+            source.integrity == Integrity.TRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            for source in event.ifc_labels.sources
+        ):
+            integrity = Integrity.TRUSTED
+    if poller_own_channel:
+        # The synthetic queue channel is framework-owned routing metadata, not
+        # poller content. Exact equality with the server-carried authority's
+        # configured memory directory establishes that boundary; per-item
+        # labels already merged above continue to classify external content.
+        integrity = Integrity.TRUSTED
+    # The boundary service authors the summary; it does not turn the completed
+    # session into a fresh external ingest. Inherited session sources remain on
+    # the carrier and continue to gate channel/network egress.
+    informational_ingress = event.trigger == "saga_session_end" or poller_own_channel
+    labels = labels.with_source(SourceLabel(
+        principal=canonical_principal,
+        domain=domain,
+        domain_qualifier=domain_qualifier,
+        resource_id=canonical_resource,
+        bridge_instance=bridge_instance,
+        sensitivity=sensitivity,
+        authorized_principals=(
+            frozenset({canonical_principal}) if canonical_principal else frozenset()
+        ),
+        source_kind=source_kind,
+        integrity=integrity,
+        integrity_effect=(
+            IntegrityEffect.INFORMATIONAL
+            if informational_ingress else IntegrityEffect.ACTIVE_INGEST
+        ),
+    ))
+
+    for attachment in attachments or event.attachment_names:
+        if _is_private_attachment(attachment):
+            labels = labels.with_label("private")
+
+    if event.source in ("api", "http"):
+        labels = labels.with_label("internal")
+
+    if event.trigger in ("saga_session_end", "scheduled_tick", "poller"):
+        labels = labels.with_label("internal")
+
+    return labels
+
+
+def _shell_continuation_auth_context(event: AgentEvent) -> AuthContext | None:
+    """Return a trusted shell continuation carrier only for its origin channel."""
+    inherited = event.continuation_auth_context
+    if (
+        event.trigger == "shell_job_complete"
+        and isinstance(inherited, AuthContext)
+        and inherited.channel_id == event.channel_id
+    ):
+        return inherited
+    return None
+
+
+def _create_turn_auth_context(
+    event: AgentEvent,
+    resolver: Any,
+    *,
+    policy_version: str | None,
+    enforce: bool,
+    ifc_labels: InformationFlowLabels,
+    audience_provider: Any = None,
+    cross_platform_pull: bool = True,
+    server_discovered_pr_scope_store: Any = None,
+    policy: Any = None,
+) -> AuthContext:
+    inherited = _shell_continuation_auth_context(event)
+    if inherited is None:
+        context = create_auth_context(
+            event,
+            resolver,
+            policy_version=policy_version,
+            enforce=enforce,
+            ifc_labels=ifc_labels,
+            audience_provider=audience_provider,
+            cross_platform_pull=cross_platform_pull,
+            policy=policy,
+        )
+    else:
+        context = replace(
+            inherited,
+            # Continuation ownership is inherited, not a fresh human request.
+            trigger=event.trigger,
+            origin_trigger=inherited.origin_trigger or inherited.trigger,
+            policy_version=policy_version,
+            enforcement_enabled=enforce,
+            ifc_labels=ifc_labels,
+            ifc_state=InformationFlowState(labels=ifc_labels),
+            ingested_url_state=IngestedURLState(),
+        )
+    from .proposals import ProposalRevision, PollerProposalScope, poller_worktree_path
+    from .access_control import get_trusted_service_from_auth_context
+
+    revision = (event.extra or {}).get("proposal_revision")
+    service = get_trusted_service_from_auth_context(context)
+    if (
+        isinstance(revision, ProposalRevision)
+        and service is not None
+        and event.service_principal == service.canonical
+        and event.source == "system"
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in (event.extra or {})
+        and ((revision.lane == "poller" and event.trigger == "poller"
+              and service.canonical == "poller:" + revision.branch.split("/")[1]
+              and service.authority_profile == "research"
+              and service.proposal_surface == revision.surface)
+             or (revision.lane == "upgrade" and event.trigger == "upgrade"
+                 and service.canonical == "system")
+             or (revision.lane == "agent" and event.trigger == "proposal_revision"
+                 and service.canonical == "proposal-revision"))
+    ):
+        context = replace(context, proposal_revision=revision)
+        if revision.lane == "poller" and context.origin_ref:
+            scope = PollerProposalScope(service.canonical, event.source_id, "review revision",
+                                        context.origin_ref, revision.surface, revision.branch)
+            context.poller_proposal_state.scope = scope
+            home = os.environ.get("MIMIR_HOME")
+            if home:
+                context.poller_proposal_state.worktree = poller_worktree_path(Path(home), scope)
+    _seed_trigger_ingested_urls(event, ifc_labels, context)
+    if server_discovered_pr_scope_store is None:
+        return context
+    registry = context.repo_pr_scope_registry
+    if registry is not None:
+        for state in registry.review_states:
+            if state.action_scope.provenance == "server_discovered":
+                server_discovered_pr_scope_store.remember_server_discovery(
+                    state.action_scope,
+                )
+    return replace(
+        context,
+        server_discovered_pr_scope_store=server_discovered_pr_scope_store,
+    )
+
+
+def _seed_trigger_ingested_urls(
+    event: AgentEvent, labels: InformationFlowLabels, auth_context: AuthContext,
+) -> None:
+    """Seed URLs from trigger text only when that text is untrusted active ingest."""
+    inherited_sources = (
+        event.ifc_labels.sources
+        if isinstance(event.ifc_labels, InformationFlowLabels)
+        else ()
+    )
+    trigger_labels = InformationFlowLabels(sources=tuple(
+        source for source in labels.sources if source not in inherited_sources
+    ))
+    if (
+        event.trigger == "poller"
+        and isinstance(event.ifc_labels, InformationFlowLabels)
+        and event.ifc_labels.has_untrusted_active_ingest
+    ):
+        trigger_labels = event.ifc_labels
+    record_ingested_urls(auth_context, event.content, trigger_labels)
+
+
+def _is_private_attachment(filename: str) -> bool:
+    """Check if an attachment name suggests private content."""
+    private_patterns = ("private", "confidential", "secret", "internal", "restricted")
+    return any(p in filename.lower() for p in private_patterns)
+
+
+def _propagate_ifc_labels(
+    labels: Any,
+    target_channel: str | None = None,
+    auth_context: Any = None,
+    *,
+    derived_by: str | None = None,
+    source_kind: str = "service",
+) -> InformationFlowLabels:
+    """Copy labels into delegation/continuation carriers monotonically.
+
+    When a service actually transforms protected inputs, ``derived_by`` stamps a
+    production source whose ACL is the intersection of every input ACL. Unknown
+    or incomplete input provenance therefore yields an incomplete derived source
+    and fails closed at egress instead of silently inheriting broad authority.
+    """
+    propagated = _merge_ifc_labels(labels, source_channel=target_channel)
+    if not derived_by or not propagated.sources:
+        return propagated
+
+    domain = getattr(auth_context, "domain", None) or "service"
+    resource_id = target_channel or getattr(auth_context, "resource_id", None)
+    bridge_instance = getattr(auth_context, "bridge_instance", None) or derived_by
+    sensitivity = (
+        "private"
+        if "private" in propagated.labels or "confidential" in propagated.labels
+        else "internal" if "internal" in propagated.labels else "public"
+    )
+    return propagated.with_source(SourceLabel.derived(
+        propagated.sources,
+        principal=f"service:{derived_by}",
+        domain=domain,
+        domain_qualifier=getattr(auth_context, "domain_qualifier", None),
+        resource_id=resource_id or "unknown",
+        bridge_instance=bridge_instance,
+        sensitivity=sensitivity,
+        source_kind=source_kind,
+    ))
+
+
+def _filter_session_turns(
+    turns_path: Path,
+    saga_session_id: str,
+    *,
+    channel_id: str,
+    idle_minutes: int = 10,
+) -> list[dict]:
+    """Return records for the given session and channel in chronological order.
+
+    Time-based break: saga ends a session after ``idle_minutes`` of no
+    activity, so any record older than ``newest_match_ts - 2 *
+    idle_minutes`` cannot belong to this session. The 2× margin
+    tolerates clock skew + a single out-of-order record at the
+    boundary. Walks back at most ``2 * idle_minutes`` worth of file
+    activity past the last match — O(session_window) rather than
+    O(file_size). (Ported verbatim from main.)
+    """
+    if not turns_path.is_file():
+        return []
+    margin_seconds = 2 * idle_minutes * 60
+    out: list[dict] = []
+    newest_match_ts: datetime | None = None
+    try:
+        for rec in tail_jsonl_records(turns_path):
+            rec_ts = _turn_record_ts(rec)
+            if (
+                rec.get("saga_session_id") == saga_session_id
+                and rec.get("channel_id") == channel_id
+            ):
+                # Old records have no integrity field and therefore cannot be
+                # proven clean. Excluding them is the fail-closed compatibility
+                # behavior; ordinary readers still accept either schema.
+                if rec.get("integrity") == Integrity.TRUSTED:
+                    out.append(rec)
+                if rec_ts is not None and (
+                    newest_match_ts is None or rec_ts > newest_match_ts
+                ):
+                    newest_match_ts = rec_ts
+            elif newest_match_ts is not None and rec_ts is not None:
+                if (newest_match_ts - rec_ts).total_seconds() > margin_seconds:
+                    break
+    except OSError:
+        return []
+    out.reverse()  # tail yields newest-first; restore chronological
+    return out
+
+
+# ────────────────────────────────────────────────────────────────────
+# Model / tool resolution helpers
+# ────────────────────────────────────────────────────────────────────
+
+
+_PROVIDER_EXTRAS: dict[str, str] = {
+    "anthropic": "anthropic",
+    "claude-code": "claude-code",
+    "openai": "openai",
+    "codex-plus": "codex-plus",
+}
+
+
+def _is_acp_delivery_turn() -> bool:
+    """True when this turn delivers through the ACP bridge.
+
+    On ACP turns ``send_message`` is removed from the tool surface
+    (``_request_for_acp_model``) and refused if called anyway
+    (``_acp_send_message_refusal``), so harness auto-delivery is not an opt-in
+    recovery for a tool-shy model — it is the only path the reply can take.
+    Read through the same capability context those two sites use, so all three
+    agree on what an ACP turn is.
+
+    Module-level rather than a method: the resend-nudge path is exercised with
+    a SimpleNamespace stub for ``self``, so an attribute lookup there would
+    raise instead of answering the question.
+    """
+    try:
+        from .tools.client_provider import get_turn_capability_context
+
+        context = get_turn_capability_context()
+    except Exception:  # noqa: BLE001 — delivery must not break on import.
+        return False
+    return getattr(context, "acp_delivery", None) is True
+
+
+def _supports_responses_api() -> bool:
+    """Heuristic for whether to flip ``use_responses_api=True`` on OpenAI.
+
+    Real OpenAI implements the Responses API (``POST /responses``); drop-in
+    proxies (Groq, Together, DeepSeek, GLM, …) usually only implement
+    ``/chat/completions``, so defaulting to Responses would 404 every turn.
+    True when ``OPENAI_BASE_URL`` is unset or its parsed hostname equals
+    ``api.openai.com``. ``MIMIR_USE_RESPONSES_API=1|0`` overrides.
+
+    Uses ``urlparse(...).hostname`` rather than substring containment so
+    a crafted env value like ``https://api.openai.com.evil.example/v1``
+    doesn't trip the flag — the hostname comparison is exact.
+    """
+    from urllib.parse import urlparse as _urlparse
+
+    override = os.environ.get("MIMIR_USE_RESPONSES_API", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    if not base_url:
+        return True
+    parsed_host = (_urlparse(base_url).hostname or "").lower()
+    return parsed_host == "api.openai.com"
+
+
+def _turn_human_message(
+    prompt: str, stable_prefix: str, model: BaseChatModel | None,
+) -> HumanMessage:
+    """Mark the stable turn run only for Anthropic's API message transport.
+
+    DeepAgents' own caching middleware still marks the system prompt and tools.
+    Claude Code manages caching in its CLI; other providers receive plain text.
+    """
+    if stable_prefix and prompt.startswith(stable_prefix) and model is not None:
+        try:
+            from langchain_anthropic import ChatAnthropic
+        except ImportError:  # Optional provider extra is absent.
+            pass
+        else:
+            if isinstance(model, ChatAnthropic):
+                return HumanMessage(content=[
+                    {"type": "text", "text": stable_prefix,
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": prompt[len(stable_prefix):]},
+                ])
+    return HumanMessage(content=prompt)
+
+
+def resolve_model_from_config(
+    config: Any,
+    *,
+    rate_limit_callback: Callable[[Any], None] | None = None,
+    model_spec: str | None = None,
+) -> BaseChatModel:
+    """Resolve the chat model described by a mimir ``Config``-like object.
+
+    This is the single Config → model-kwargs mapping. Callers that already
+    have a Config should use this helper rather than re-threading
+    ``model_spec`` / retry / token / reasoning fields by hand; that keeps
+    provider-specific gates (notably the claude-code opt-in/home dotenv path)
+    and future model knobs in one place. ``MIMIR_MODEL_SPEC`` remains an
+    ad-hoc bench/smoke override for callers whose Config was not built from
+    the current environment.
+    """
+    if model_spec is None:
+        model_spec = os.environ.get(
+            "MIMIR_MODEL_SPEC", getattr(config, "model_spec", DEFAULT_MODEL_SPEC),
+        )
+    return _resolve_model(
+        model_spec,
+        max_retries=getattr(config, "model_max_retries", 6),
+        max_tokens=getattr(config, "model_max_tokens", 0),
+        reasoning_effort=getattr(config, "model_reasoning_effort", ""),
+        rate_limit_callback=rate_limit_callback,
+    )
+
+
+def _resolve_model(
+    spec: str | BaseChatModel,
+    *,
+    max_retries: int = 6,
+    max_tokens: int = 0,
+    reasoning_effort: str = "",
+    rate_limit_callback: Callable[[Any], None] | None = None,
+) -> BaseChatModel:
+    """Translate a mimir-friendly model spec into a constructed BaseChatModel.
+
+    Supported:
+      - ``claude-code:<model>`` → ChatClaudeCode (Max OAuth subprocess)
+      - ``codex-plus:<model>`` → ChatCodexPlus (ChatGPT-account
+                                  subscription protocol via
+                                  ``chatgpt.com/backend-api/codex/responses``)
+      - ``<provider>:<model>``  → init_chat_model with ``max_retries`` (and,
+                                  for OpenAI hitting api.openai.com,
+                                  ``use_responses_api=True``; and ``max_tokens``
+                                  when a non-zero output cap is configured)
+      - BaseChatModel instance  → pass-through (Bedrock/Vertex/custom)
+
+    ``max_retries`` / ``max_tokens`` only apply to the non-subprocess paths.
+    ``reasoning_effort`` is forwarded to every provider that supports it —
+    Codex Plus (default ``"none"``), OpenAI, real Claude (``anthropic:`` +
+    ``claude-code:``) — and validated against that provider's accepted set
+    (``_EFFORT_LEVELS``). Minimax / Kimi (anthropic-compat) are excluded.
+
+    ``rate_limit_callback`` is currently honored only for
+    ``codex-plus:``. Pass it from the agent so successful Codex Plus
+    responses transcribe their ``x-codex-*`` headers into the
+    ``RateLimitStore`` keys that :class:`OpenAIQuotaProvider` reads.
+
+    The model-provider package (``langchain-claude-code-mimir``,
+    ``langchain-anthropic``, ``langchain-codex-plus``, etc.) is a pip
+    extra (see pyproject.toml's ``[project.optional-dependencies]``).
+    We lazy-import here so installing only the extras you'll use keeps
+    the dep graph small — raising a clear hint on ImportError tells
+    the operator exactly which extra they're missing.
+    """
+    if isinstance(spec, BaseChatModel):
+        return spec
+    if not isinstance(spec, str):
+        raise TypeError(f"unexpected model spec type: {type(spec).__name__}")
+    if spec.startswith("claude-code:"):
+        from .providers import claude_code_auth_status
+
+        auth_status = claude_code_auth_status()
+        if not auth_status.ok:
+            raise RuntimeError(
+                "MIMIR_MODEL_SPEC=claude-code:* uses Claude Code / "
+                "Anthropic Max subscription auth, not Anthropic API spend. "
+                f"{auth_status.reason}. {auth_status.remediation}"
+            )
+        # chainlink #426/#735: Claude Code executes built-in, bridged
+        # LangChain, and MCP tools inside the Claude SDK subprocess path, not
+        # through LangGraph's tool middleware. Keep this provider fail-closed
+        # unless the adapter exposes the PreToolUse hook surface Mimir uses to
+        # run the same budget/prohibited-action guards before execution.
+        try:
+            import langchain_claude_code as _lcc  # type: ignore[import-untyped]
+            from langchain_claude_code import ChatClaudeCode  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "MIMIR_MODEL_SPEC=claude-code:* requires the "
+                "'claude-code' extra and the Claude Code CLI. Install "
+                "the adapter with `pip install 'mimir-agent[claude-code]'` "
+                "(or `uv sync --extra claude-code` in a checkout), install "
+                "the CLI with `npm install -g @anthropic-ai/claude-code`, "
+                "then authenticate on the host with `claude setup-token` "
+                "or `claude login`. Verify without exposing secrets by "
+                "running `claude --version`, `claude -p 'ping'`, and "
+                "`mimir setup --home <home> --subscription`."
+            ) from exc
+        _lcc_patches.assert_supported_langchain_claude_code_adapter(_lcc)
+        _lcc_patches.ensure_tool_enforcement_hooks_installed(_lcc)
+        model_name = spec.split(":", 1)[1]
+        # ``permission_mode="bypassPermissions"`` matches SDK-era
+        # mimir's ClaudeAgentOptions setting — without it the claude
+        # CLI subprocess gates Write/Bash on user approval and the
+        # agent reports "the Write tool is pending approval" instead
+        # of actually writing. There's no human in the loop for any
+        # mimir deployment (bench / production mimirbot / future
+        # daemons), so the approval gate is pure friction. Match the
+        # SDK invariant.
+        # Thread reasoning effort when set to a real level; "none"/unset →
+        # omit it so Claude keeps its adaptive default. Needs the maintained
+        # langchain-claude-code-mimir adapter's ``effort`` field.
+        cc_kwargs: dict[str, Any] = {
+            "model": model_name,
+            "permission_mode": "bypassPermissions",
+        }
+        _cc_eff = (reasoning_effort or "").strip()
+        if _cc_eff and _cc_eff != "none":
+            cc_kwargs["effort"] = _validate_effort("claude-code", _cc_eff)
+        return ChatClaudeCode(**cc_kwargs)
+    if spec.startswith("codex-plus:"):
+        try:
+            from langchain_codex_plus import ChatCodexPlus  # type: ignore[import-untyped]
+        except ImportError as exc:
+            # Source the extra name from the registry (chainlink #292) so the
+            # hint stays correct as the table evolves; also the package is
+            # ``mimir-agent``, not ``mimir`` (the old hint named it wrong).
+            from .providers import extra_for_spec
+            extra = extra_for_spec(spec) or "codex-plus"
+            raise ImportError(
+                f"MIMIR_MODEL_SPEC=codex-plus:* requires the '{extra}' extra. "
+                f"Install via `pip install 'mimir-agent[{extra}]'` "
+                "(or `uv pip install langchain-codex-plus`)."
+            ) from exc
+        from ._langchain_codex_plus_patches import (
+            install_codex_plus_transient_retry_patch,
+        )
+        install_codex_plus_transient_retry_patch(ChatCodexPlus)
+        model_name = spec.split(":", 1)[1]
+        # An unset effort lets the model apply its own default. Explicit
+        # values, including "none" for older models, pass through unchanged.
+        return ChatCodexPlus(
+            model=model_name,
+            reasoning_effort=_validate_effort("codex-plus", reasoning_effort),
+            rate_limit_callback=rate_limit_callback,
+        )
+    # langchain ``init_chat_model`` resolves provider extras at call time
+    # (``anthropic:`` → langchain-anthropic, ``openai:`` → langchain-openai).
+    # We wrap it here so we can thread max_retries + the responses-API flag
+    # through; if the extra isn't installed, init_chat_model raises with
+    # the right hint.
+    from langchain.chat_models import init_chat_model
+    init_params: dict[str, Any] = {"max_retries": max(0, int(max_retries))}
+    # Output token cap. 0 = leave the provider default. Set it (via
+    # MIMIR_MODEL_MAX_TOKENS) for thinking-via-Anthropic-compat models
+    # (Minimax / Kimi), whose reasoning blocks count against the output
+    # budget — a small default gets consumed entirely by thinking and the
+    # turn hits ``max_tokens`` mid-reasoning with an empty response.
+    if max_tokens and int(max_tokens) > 0:
+        init_params["max_tokens"] = int(max_tokens)
+    if spec.startswith("openai:") and _supports_responses_api():
+        init_params["use_responses_api"] = True
+    # Reasoning effort, per provider. Skip when unset or "none" (only Codex
+    # has a "none" level). OpenAI reasoning models take ``reasoning_effort``;
+    # real Claude (langchain-anthropic) takes ``effort``. Gate the Anthropic
+    # case on a claude-named spec so Minimax / Kimi on the anthropic-compat
+    # endpoint — which don't support effort — are left untouched.
+    _effort = (reasoning_effort or "").strip()
+    if _effort and _effort != "none":
+        if spec.startswith("openai:"):
+            init_params["reasoning_effort"] = _validate_effort("openai", _effort)
+        elif spec.startswith("anthropic:") and "claude" in spec.lower():
+            init_params["effort"] = _validate_effort("anthropic", _effort)
+    return init_chat_model(spec, **init_params)
+
+
+# ────────────────────────────────────────────────────────────────────
+# Memory injection (pre-message hook equivalent)
+# ────────────────────────────────────────────────────────────────────
+
+
+# Match atom-id-shaped strings in tool result text (16-char hex).
+_ATOM_ID_RE = re.compile(r"\b[0-9a-f]{16}\b")
+
+
+def _extract_atom_ids_from_tool_results(messages: list[Any]) -> list[str]:
+    from langchain_core.messages import ToolMessage
+    found: set[str] = set()
+    out: list[str] = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            for match in _ATOM_ID_RE.findall(content):
+                if match not in found:
+                    found.add(match)
+                    out.append(match)
+    return out
+
+
+async def _resolve_heuristic_atom_ids(
+    saga_client: SagaClient,
+    atom_ids: list[str],
+    *,
+    auth_context: Any = None,
+) -> list[str]:
+    """Keep only heuristic ids that resolve to live SAGA atoms.
+
+    Query-response ids are already known-real; this is only for ids
+    discovered by shape in tool output or source_atom_id fields. Validation
+    is best-effort: if the exact-id lookup is unavailable or fails, fail open
+    so turn assembly never raises.
+    """
+    clean = [aid for aid in atom_ids if isinstance(aid, str) and aid]
+    if not clean:
+        return []
+    get_atoms = getattr(saga_client, "get_atoms", None)
+    if not callable(get_atoms):
+        return clean
+    try:
+        payload = await get_atoms(clean, auth_context=auth_context)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("heuristic saga atom id validation failed: %s", exc)
+        return clean
+    found = {
+        str(atom.get("id") or atom.get("atom_id"))
+        for atom in (payload.get("atoms") or [])
+        if isinstance(atom, dict) and (atom.get("id") or atom.get("atom_id"))
+    }
+    return [aid for aid in clean if aid in found]
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# Window for the saga contextual-rewrite context. Matches
+# ``mimir.saga.query_rewrite._MAX_CONTEXT_MESSAGES`` so the rewriter's
+# last-10-msgs trim doesn't waste effort on entries we'd ship and
+# then chop.
+_REWRITE_CONTEXT_MESSAGES = 10
+
+
+def _rewrite_context_from_buffer(
+    buffer: MessageBuffer, channel_id: str,
+) -> list[dict[str, str]] | None:
+    """Render the channel's recent transcript in the shape SagaStore's
+    contextual rewrite expects: ``[{role, content}, …]`` with role in
+    ``{"user", "assistant"}``.
+
+    ``system_note`` kinds and any other non-conversational records are
+    dropped — the rewrite needs reference antecedents, not algedonic
+    signals. Returns ``None`` when the channel has no recent
+    conversational history so SagaStore short-circuits the LLM call.
+    """
+    recent = buffer.recent_for_channel(
+        channel_id, limit=_REWRITE_CONTEXT_MESSAGES,
+    )
+    out: list[dict[str, str]] = []
+    for msg in recent:
+        if msg.kind == "user_message":
+            role = "user"
+        elif msg.kind == "assistant_message":
+            role = "assistant"
+        else:
+            continue  # skip system_note
+        content = (msg.content or "").strip()
+        if not content:
+            continue
+        out.append({"role": role, "content": content})
+    return out or None
+
+
+# Default system prompt — production cutover replaces this with mimir's
+def _turn_outcome_identity(event: AgentEvent) -> dict:
+    """Origin-correlation fields stamped onto the turn-outcome events
+    (``turn_failed`` / ``turn_completed``) so a turn's outcome can be
+    traced back to its triggering event — and, for poller turns, to the
+    specific item(s) the turn was meant to process (chainlink #262).
+
+    The framework consumer (``mimir.pollers``) reads these off
+    events.jsonl to gate a per-poller watermark: advance past items
+    whose turn succeeded, re-emit (capped) items whose turn failed —
+    closing the "poll advanced the cursor but the triggered turn died"
+    drop (#299) for pollers that have no live state to reconcile against
+    (gmail, issue comments), the way #516 did for review requests via
+    ``requested_reviewers``.
+
+    Returns ``source_id`` for any event that has one (the poller batch's
+    stable per-fire id); adds ``poller_name`` + ``items`` (the per-item
+    extras list) only for poller-triggered turns, so non-poller turns
+    don't bloat their outcome events with absent fields.
+    """
+    out: dict = {}
+    if event.source_id:
+        out["source_id"] = event.source_id
+    if event.trigger == "poller":
+        extra = event.extra or {}
+        poller_name = extra.get("poller_name")
+        if poller_name:
+            out["poller_name"] = poller_name
+        items = extra.get("items")
+        if items is not None:
+            out["items"] = items
+    return out
+
+
+def _count_expected_tool_calls(events: list, markers: dict) -> int:
+    """How many ``tool_call`` events satisfy ``markers`` — i.e. how many
+    submissions the turn actually made.
+
+    ``markers`` is a dict declared by the event source (e.g. a poller
+    putting an entry in its emitted JSONL's ``expected_tool_call``
+    field). Shape:
+
+      {
+        "tool_names":      ["pull_request_review_write", ...],   # exact name match
+        "bash_substrings": ["gh pr review "],                      # substr in shell command
+        "signal_on_missing": "poller_review_missed_submission",     # event_type to emit
+      }
+
+    Matches an exact tool name (MCP path) OR a shell command containing a
+    declared substring. The shell tool is ``shell_exec`` (deepagents);
+    ``Bash`` is also matched for the legacy claude-code runtime — pre-fix
+    only ``Bash`` was checked, so a ``gh pr review`` run via deepagents'
+    shell was invisible to this check (chainlink #299 follow-up).
+
+    Conservative on substring match: a passing reference to a declared
+    substring in some other context (echo, sed, grep) would over-count.
+    The cost asymmetry (missed signal vs over-counted success) favors
+    over-counting.
+    """
+    if not isinstance(markers, dict):
+        return 0
+    tool_names = set(markers.get("tool_names") or [])
+    bash_substrings = list(markers.get("bash_substrings") or [])
+    if not tool_names and not bash_substrings:
+        return 0
+    count = 0
+    for ev in events or []:
+        if not isinstance(ev, dict) or ev.get("type") != "tool_call":
+            continue
+        name = ev.get("name") or ""
+        if name and name in tool_names:
+            count += 1
+            continue
+        if name in ("shell_exec", "Bash") and bash_substrings:
+            args = ev.get("args") or {}
+            command = args.get("command") if isinstance(args, dict) else ""
+            if isinstance(command, str) and any(s in command for s in bash_substrings):
+                count += 1
+    return count
+
+
+def _turn_matched_expected_tool_call(events: list, markers: dict) -> bool:
+    """Back-compat boolean: did the turn make at least one matching
+    submission? (Equivalent to ``_count_expected_tool_calls(...) > 0``.)"""
+    return _count_expected_tool_calls(events, markers) > 0
+
+
+def _gh_review_submitted_for_marker(markers: dict) -> bool:
+    """Best-effort GitHub API reconciliation for PR review expectations.
+
+    The github-poller missed-submission marker is intentionally noisy when a
+    turn drafts a review but never submits it. Tool-call matching is only local
+    to the current turn, though: if the tool transcript shape changes, a prior
+    retry already submitted, or the poller batches duplicates, local matching
+    can false-fire. When the marker names a concrete repo/PR and reviewer, ask
+    GitHub whether that reviewer has already submitted a substantive review on
+    the expected head before emitting algedonic noise. Fail closed (False) so
+    genuine misses remain noisy when GitHub is unavailable.
+    """
+    if not isinstance(markers, dict):
+        return False
+    repo = str(markers.get("repo") or "").strip()
+    number = markers.get("number")
+    reviewer = str(markers.get("reviewer") or "").strip()
+    head_sha = str(markers.get("head_sha") or "").strip()
+    if not repo or not number or not reviewer:
+        return False
+    try:
+        int_number = int(number)
+    except (TypeError, ValueError):
+        return False
+    cmd = [
+        "gh", "api",
+        f"repos/{repo}/pulls/{int_number}/reviews",
+        "--paginate",
+    ]
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    env = {**os.environ, "GH_TOKEN": token} if token else None
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, list):
+        return False
+    substantive = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED"}
+    for review in data:
+        if not isinstance(review, dict):
+            continue
+        login = (review.get("user") or {}).get("login")
+        state = str(review.get("state") or "").upper()
+        commit_id = str(review.get("commit_id") or "")
+        if login != reviewer or state not in substantive:
+            continue
+        if head_sha and commit_id != head_sha:
+            continue
+        return True
+    return False
+
+
+def _expected_submission_markers(event_extra: dict) -> list[dict]:
+    """The expected-tool-call markers for an event — one per review-needed
+    item.
+
+    Per-item markers under ``extra["items"]`` (poller batch events wrap
+    per-item metadata there) are authoritative: when present they ARE the
+    set. A top-level ``expected_tool_call`` is consulted ONLY when there are
+    no per-item markers (a direct, non-batch event). Including both would
+    double-count ``expected`` — the top-level marker on a batch is the
+    shared declaration, not an extra Nth item (chainlink #308 / finding
+    #38).
+
+    The per-item lookup itself was chainlink #299's follow-up: every poller
+    AgentEvent is batch-wrapped (``extra={"items": [...]}``), so a
+    top-level-only read found no marker and the missed-submission check
+    never ran for poller reviews — letting "drafted but never submitted"
+    reviews pass silently (observed: a turn claimed it approved PR #522 on
+    GitHub but never called ``gh pr review``)."""
+    if not isinstance(event_extra, dict):
+        return []
+    item_markers = [
+        item["expected_tool_call"]
+        for item in (event_extra.get("items") or [])
+        if isinstance(item, dict) and isinstance(item.get("expected_tool_call"), dict)
+    ]
+    if item_markers:
+        return item_markers
+    top = event_extra.get("expected_tool_call")
+    return [top] if isinstance(top, dict) else []
+
+
+# full system-prompt assembly (core memory + skills + persona).
+_DEFAULT_SYSTEM_PROMPT = """\
+You are a memory-augmented assistant. The user is asking about facts \
+from their past conversations.
+
+Use the ``memory_query`` tool to search the user's persistent memory. \
+The tool returns observations (synthesized beliefs), evidence (raw \
+chat history with dates — prefer for specifics), and triples \
+(structured facts with valid-date ranges).
+
+When the memory tool's result is truncated or incomplete, call \
+``memory_query`` again with a more specific query.
+
+`write_file` creates a new file only. It never overwrites an existing path; \
+when the target exists, use `edit_file` instead.
+
+Think step by step:
+1. Which atoms / triples answer the question?
+2. If multiple conflict, which is most recent?
+3. If no evidence answers, say so plainly.
+
+Then give the final answer on its own line. Be concise."""
+
+
+# ────────────────────────────────────────────────────────────────────
+# Agent class — public API surface preserved
+# ────────────────────────────────────────────────────────────────────
+
+
+def _trace_turn(body: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(body)
+    async def wrapped(self: Agent, event: AgentEvent, **kwargs: Any) -> TurnRecord:
+        return await self._trace_run_turn(event, body=body, **kwargs)
+
+    return wrapped
+
+
+def _trace_usage(message: AIMessage) -> dict[str, int] | None:
+    """Provider usage is optional telemetry, not a condition for turn success."""
+    from .tracing import _usage
+
+    try:
+        return _usage(message)
+    except Exception:  # noqa: BLE001 — provider metadata can have arbitrary shapes
+        log.warning("Tracing usage metadata unavailable.")
+        return None
+
+
+class Agent:
+    """Deepagents-backed mimir Agent.
+
+    Constructor signature matches the legacy SDK-backed Agent so
+    server.py + tests don't need rewrites at the call site. Internally
+    builds a deepagents CompiledStateGraph singleton and dispatches
+    each event through ``run_turn``.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        turn_logger: TurnLogger,
+        message_buffer: MessageBuffer,
+        index_generator: IndexGenerator,
+        indexer: Indexer | None = None,
+        saga_client: SagaClient | None = None,
+        session_manager: SessionManager | None = None,
+        scheduler: Any = None,
+        channel_registry: ChannelRegistry | None = None,
+        dispatcher: Any = None,
+        commitments_store: Any = None,
+        turn_hooks: list[Any] | None = None,
+        turn_event_bus: Any = None,
+        chat_skill_registry: ChatSkillRegistry | None = None,
+        trace_controller: Any = None,
+    ) -> None:
+        self._config = config
+        self._trace_controller = trace_controller
+        self._turn_logger = turn_logger
+        self._buffer = message_buffer
+        self._identity_resolver = getattr(message_buffer, "resolver", None)
+        self._audience_provider = ServerChannelAudienceProvider(
+            config.home,
+            identity_resolver=self._identity_resolver,
+        )
+        self._indexes = index_generator
+        self._indexer = indexer
+        self._saga = saga_client
+        # chainlink #266: concrete SagaStore handle (peeled from the
+        # saga_client wrapper chain in _try_inject_memory_client), used by
+        # the skill-memory load injection. None until/unless a SagaStore
+        # is found.
+        self._saga_store: Any = None
+        self._sessions = session_manager
+        # Only bounded human acknowledgements persist, never turn IFC labels.
+        self._chat_ingest_acknowledgements: dict[tuple[str, str], IngestAcknowledgement] = {}
+        self._server_discovered_pr_scope_store = None
+        for protocol in selected_policy_registry().scoped_actions.values():
+            constructors = getattr(protocol, "trusted_scope", None)
+            if constructors is not None:
+                self._server_discovered_pr_scope_store = constructors.store()
+        self._scheduler = scheduler
+        self._channels = channel_registry
+        self._dispatcher = dispatcher
+        # chainlink #583 slice 1: optional live turn-event bus. When wired
+        # (build_app passes one shared with the web SSE layer), run_turn
+        # brackets the turn and the model loop publishes reasoning/tool spans
+        # in real time so the dashboard character animates live instead of
+        # replaying post-hoc from turns.jsonl. None → feature off (no-op).
+        self._turn_event_bus = turn_event_bus
+        # chainlink #783: chat-skill slash-command prompt injection is driven
+        # only by the injected registry; Agent must not construct its own.
+        self._chat_skill_registry = chat_skill_registry
+        # Phase 2b due-check poller (server.py:_on_startup) reads this
+        # attribute via getattr. Pre-fix it was always None — every
+        # commitment_complete / _snooze / _dismiss / _list tool call
+        # also returned "no commitments store" because the registry
+        # setter was never invoked. Both paths now wired by build_app.
+        self._commitments = commitments_store
+        from .commitment_proposals import configure_approvals as configure_closures
+        configure_closures(config.home, config.operator_alert_channel, commitments_store)
+        # Turn lifecycle hooks (re-introduced in PR #213 after the
+        # SDK-era chain was dropped in #181). Fired by
+        # ``mimir.turn_hooks.fire_hooks(stage, self._hooks, ...)``
+        # with per-hook exception isolation; failures emit a
+        # ``turn_hook_failed`` event. When the caller passes
+        # ``turn_hooks=None``, the agent installs the default
+        # commitments-extraction hook so single-agent deployments
+        # get the same finalize behavior they had pre-refactor.
+        # Pass ``turn_hooks=[]`` to opt out entirely (test paths).
+        # Use ``Agent.add_hook(...)`` to append after construction.
+        if turn_hooks is None:
+            from .turn_hooks import CommitmentExtractionHook
+            self._hooks: list[TurnHook] = [
+                CommitmentExtractionHook(commitments_store),
+            ]
+        else:
+            self._hooks = list(turn_hooks)
+
+        # CR#10: per-Agent JsonlSnapshot caches for events.jsonl +
+        # turns.jsonl. Six per-turn call sites (feedback, usage, self-
+        # state, session summaries, subagent aggregate, budget
+        # partition) used to re-stream both files each time. The
+        # snapshot wraps tail_jsonl_records with an mtime-checked TTL so
+        # within one turn (~1s wall-clock) all those readers share one
+        # cached parse.
+        self._events_snapshot = JsonlSnapshot(config.events_log)
+        # Turn records keep FULL tool-call args + reasoning on disk (the
+        # audit trail; the turn viewer reads the file). The RETAINED
+        # in-RAM view is slimmed as records enter the cache — pre-fix
+        # this cache held ~600 MB parsed on a busy deployment.
+        self._turns_snapshot = JsonlSnapshot(
+            config.turns_log, slim=slim_turn_record
+        )
+
+        # Recent feedback signals block — algedonic surface for the
+        # turn prompt (v0.4 §2).
+        self._feedback = FeedbackLog(
+            events_path=config.events_log,
+            turns_path=config.turns_log,
+            default_window_hours=config.feedback_window_hours,
+            default_limit_per_polarity=config.feedback_limit_per_polarity,
+            events_snapshot=self._events_snapshot,
+            turns_snapshot=self._turns_snapshot,
+            resolved_incidents_path=config.home / "resolved-incidents.jsonl",
+            identity_resolver=self._identity_resolver,
+            cross_platform_pull=config.cross_platform_pull,
+        )
+        # Plan-window rate-limit state — real RateLimitStore (replaces
+        # the deprecated _RateLimitStub). The oauth_usage_poller writes
+        # to this same JSON file from server.py's wiring; per-turn
+        # readers (usage block, self-state, upcoming) read through here.
+        self._rate_limits = RateLimitStore(
+            path=config.home / ".mimir" / "rate_limits.json",
+        )
+
+        # §12.4: S3-S4 homeostat. Constructed once so scheduler heart-
+        # beats and per-turn ``## Self-state`` render share the same
+        # instance. Wire into the scheduler immediately so heartbeats
+        # fired before the first turn are still arbitrated.
+        from .billing import build_quota_providers
+        from .budget import HomeostaticArbiter
+        from .providers import provider_for_quota
+        # Auto-discover quota providers based on routing config.
+        # Discovery is layered: ``MIMIR_MODEL_SPEC`` prefix wins
+        # (``openai:`` / ``claude-code:`` are explicit provider picks),
+        # then ``ANTHROPIC_BASE_URL`` host disambiguates ``anthropic:*``
+        # routes (Minimax compat vs canonical Anthropic).
+        anthropic_base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+        quota_providers = build_quota_providers(
+            store=self._rate_limits,
+            billing_mode=config.billing_mode,
+            model_spec=config.model_spec,
+            anthropic_base_url=anthropic_base_url,
+        )
+        active_quota_provider = provider_for_quota(
+            config.model_spec,
+            anthropic_base_url,
+        ).quota_provider_key
+        self._arbiter = HomeostaticArbiter(
+            home=config.home,
+            rate_limit_store=self._rate_limits,
+            turns_log=config.turns_log,
+            billing_mode=config.billing_mode,
+            quota_providers=quota_providers,
+            active_quota_providers=(active_quota_provider,),
+            cost_hourly_limit_usd=config.cost_hourly_limit_usd or None,
+            cost_spike_ratio=config.cost_rate_spike_ratio or None,
+            cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
+            fallback_model=config.model,
+            events_snapshot=self._events_snapshot,
+            turns_snapshot=self._turns_snapshot,
+        )
+        if scheduler is not None:
+            scheduler.set_arbiter(self._arbiter)
+
+        # Bounded set for fire-and-forget background tasks. Without
+        # retaining a reference, the asyncio task can be GC'd before
+        # the coroutine body runs. add+discard idiom from PEP 458 /
+        # asyncio docs.
+        self._bg_tasks: set[asyncio.Task] = set()
+
+        # Async-shell job registry — backs the bash_async /
+        # bash_jobs_list / bash_job_output tools. One registry per
+        # Agent (process-scoped); waiter threads spawned by
+        # ``spawn()`` live for the duration of the subprocess they
+        # wrap. Files land in ``<home>/logs/bash-jobs/<job_id>.{out,err}``.
+        # Wired into the tool surface from server.py:build_app via
+        # ``mimir.tools.set_shell_job_registry(...)``.
+        from .shell_jobs import ShellJobRegistry as _ShellJobRegistry
+        self._shell_jobs = _ShellJobRegistry(
+            jobs_dir=config.home / "logs" / "bash-jobs",
+        )
+
+        # Captured at first turn (when we know we're on the asyncio
+        # loop). The shell-job waiter threads use this to schedule
+        # the completion handler back onto the loop via
+        # ``run_coroutine_threadsafe``.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Shell-job waiter threads add these futures; their done callbacks may
+        # discard them on an event-loop thread. CPython set add/discard are
+        # atomic under the GIL, and no compound iteration is performed here.
+        self._shell_completion_futures: set[concurrent.futures.Future[Any]] = set()
+
+        # Build the deepagent singleton. Done lazily to keep import-time
+        # fast and to let tests construct Agent without a real model.
+        # Lock-guarded against concurrent first turns racing in and
+        # constructing two CompiledStateGraphs — pre-fix the second
+        # would clobber the first (harmless but wasteful since each
+        # graph is heavyweight). asyncio.Lock created lazily because
+        # __init__ may run outside a running event loop (tests).
+        self._agent: Any | None = None
+        self._cached_system_prompt: str | None = None
+        self._agent_lock: asyncio.Lock | None = None
+        self._backend: Any | None = None
+        self._agent_model: Any | None = None
+        self._agent_tools: list[Any] | None = None
+        self._agent_middleware: tuple[Any, ...] | None = None
+        self._agent_skills_middleware: Any | None = None
+        self._cached_skill_catalog_fingerprint: str | None = None
+        self._skill_fingerprint_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._skill_fingerprint_cache: tuple[tuple, str] | None = None
+        self._cached_unready_tool_owners: frozenset[str] = frozenset()
+
+        # Memory-tool dep injection — only used if saga_client is a
+        # SagaStore (post-saga cutover). Wires up the @tool's
+        # SagaStore handle so deepagents can call into recall.
+        if saga_client is not None:
+            self._try_inject_memory_client(saga_client)
+        if self._saga_store is not None:
+            from .memory_proposals import configure_approvals
+            configure_approvals(config.home, config.operator_alert_channel, self._saga_store)
+        from .pairing_approval import sync_pending as sync_pairings
+        sync_pairings(config.home, getattr(config, "operator_alert_channel", ""), self._identity_resolver)
+
+    def _try_inject_memory_client(self, saga_client: SagaClient) -> None:
+        """If saga_client is a SagaStore (or wraps one at any depth),
+        wire it into the memory_query / memory_store tools.
+
+        Production saga_client is a RecordingSagaClient wrapping
+        either _InProcessSaga (legacy) or SagaStore. Test harnesses
+        and bench middleware may add additional wrappers (capture
+        proxies, recording layers); we peel ``_inner`` until we find
+        a concrete SagaStore or run out of layers.
+        """
+        try:
+            from .saga.client import SagaStore
+        except Exception:
+            return
+        candidate: Any = saga_client
+        seen: set[int] = set()
+        # Peel ``_inner`` chains — RecordingSagaClient, _MemoryStateProxy,
+        # any test/bench wrapper that follows the convention.
+        while candidate is not None and id(candidate) not in seen:
+            seen.add(id(candidate))
+            if isinstance(candidate, SagaStore):
+                from .tools import set_memory_client
+                set_memory_client(candidate)
+                # chainlink #266: stash the concrete SagaStore so the
+                # skill-memory load injection can recall skill_learning
+                # atoms via its connection. None when no SagaStore is
+                # wired (legacy _InProcessSaga / test stubs) — injection
+                # then no-ops.
+                self._saga_store = candidate
+                return
+            candidate = getattr(candidate, "_inner", None)
+
+    # ── Conversational buffer (chat_history) append helpers ────────
+    # Restored after PR #181 (deepagents migration) — the SDK-era code
+    # called ``buffer.append`` inline in the pre/post hooks; the rewrite
+    # dropped those calls. As a result ``chat_history.jsonl`` stopped
+    # being appended to (last entry 2026-05-17T21:48) and the agent's
+    # ``## Recent activity`` block was whatever the buffer's ``replay()``
+    # loaded at last process start. Restoring inbound (here) + outbound
+    # (at every ``bridge.send`` site) puts the conversation back on
+    # disk and in the deques.
+
+    # Triggers that are internal wakes with no conversational content;
+    # logging them would pollute Recent activity with system noise
+    # the agent doesn't need to re-read. Matches the pre-#181 deny-list
+    # in ``_record_inbound``. Everything else — ``user_message``,
+    # ``poller``, ``scheduled_tick``, ``react_received``, etc. — IS
+    # logged (``user_message`` → kind=user_message, all others →
+    # kind=system_note) so the agent's view of "what just happened on
+    # this channel" stays accurate.
+    _INBOUND_SKIP_TRIGGERS: frozenset[str] = frozenset(
+        {"saga_session_end", "shell_job_complete"}
+    )
+
+    def add_hook(self, hook: TurnHook) -> None:
+        """Register an additional ``TurnHook`` to fire during the
+        turn lifecycle. Hooks run in registration order; pass-through
+        post-construction registration path for callers that want to
+        layer extra behavior on top of the default chain (e.g.
+        Muninnbot adding its own ``finalize``-stage knowledge-graph
+        sync without rebuilding the constructor's hook list).
+        """
+        self._hooks.append(hook)
+
+    @staticmethod
+    def _kind_for_trigger(trigger: str) -> str:
+        """Map an ``AgentEvent.trigger`` to a ``MessageKind``."""
+        if trigger == "user_message":
+            return "user_message"
+        # Pollers (github-activity etc.), scheduled ticks, and other
+        # synthetic events are author-less but still conversation-
+        # adjacent — agent reads them in Recent activity to understand
+        # what woke it up. Pre-#181 logged them as system_note.
+        return "system_note"
+
+    async def _append_inbound_to_buffer(
+        self,
+        event: AgentEvent,
+        ifc_labels: InformationFlowLabels,
+    ) -> None:
+        """Append an inbound event to the ``MessageBuffer`` so future
+        ``assemble_recent_activity_candidates`` calls see it. Skip rules match
+        pre-#181's ``_record_inbound``: drop empty-content events
+        and internal-wake triggers (``saga_session_end``,
+        ``shell_job_complete``); log everything else.
+
+        Idempotent per event (chainlink #376 PR 4): a mid-turn message is
+        recorded here at inject time (via the dispatcher's on_inject hook); if it
+        was never folded and re-routes as its own turn, the normal inbound call
+        sees the ``_buffer_recorded`` flag and no-ops instead of double-recording.
+        """
+        if not event.content or not event.channel_id:
+            return
+        if event.trigger in self._INBOUND_SKIP_TRIGGERS:
+            return
+        if event.extra.get("_buffer_recorded"):
+            return
+        try:
+            msg = self._buffer.make_message(
+                channel_id=event.channel_id,
+                kind=self._kind_for_trigger(event.trigger),
+                content=event.content,
+                author=event.author,
+                # Fall back to ``author`` when display is unset so the
+                # render layer never has to display a raw platform key.
+                author_display=event.author_display or event.author,
+                msg_id=event.source_id,
+                source=event.source,
+                integrity=_persisted_integrity(ifc_labels),
+            )
+            await self._buffer.append(msg)
+            event.extra["_buffer_recorded"] = True
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "inbound buffer append failed for event trigger=%r channel=%r",
+                event.trigger, event.channel_id,
+            )
+
+    async def on_message_injected(self, event: AgentEvent) -> None:
+        """Dispatcher ``on_inject`` hook (chainlink #376 PR 4): a mid-turn
+        message was just folded into a running turn. Record it in chat history
+        now, at its true arrival time, so Recent activity threads it ahead of the
+        turn's later replies. Wired in server.py via ``set_on_inject``."""
+        ifc_labels = _initialize_ifc_labels(
+            event,
+            event.attachment_names,
+            resolver=getattr(self, "_identity_resolver", None),
+            policy=self._config.plugin_manager.policy,
+        )
+        await self._append_inbound_to_buffer(event, ifc_labels)
+
+    def _current_system_prompt(self, *, emit_health_events: bool = False) -> str:
+        """Render the system prompt for the current turn.
+
+        ``create_deep_agent`` bakes ``system_prompt`` into the compiled
+        graph, so the graph must be rebuilt when the rendered prompt
+        changes. The comparison path suppresses health events; the
+        changed/first-build path re-renders with events enabled so
+        ``core_prompt_degraded`` fires once per changed prompt rather
+        than once per turn.
+        """
+        override = os.environ.get("MIMIR_SYSTEM_PROMPT_OVERRIDE")
+        if override is not None:
+            return override
+        return self._build_system_prompt(emit_health_events=emit_health_events)
+
+    def _current_skill_sources(self) -> list[str]:
+        """Return the skill source directories in deepagents shadowing order."""
+        from .skill_defs import (
+            home_builtin_skills_dir,
+            home_skills_dir,
+        )
+
+        skill_sources: list[str] = []
+        operator_dir = home_skills_dir(self._config.home)
+        builtin_dir = home_builtin_skills_dir(self._config.home)
+        # Bundled (read-only intent) listed first so operator entries
+        # shadow same-named bundled ones.
+        if builtin_dir.is_dir():
+            skill_sources.append(str(builtin_dir))
+        if operator_dir.is_dir():
+            skill_sources.append(str(operator_dir))
+        return skill_sources
+
+    async def _skill_catalog_fingerprint(self, skill_sources: list[str]) -> str:
+        """Fingerprint the discovered skill catalog inputs.
+
+        Deepagents' SkillsMiddleware receives source directories, but the
+        middleware may cache the discovered catalog inside the compiled graph.
+        Include every ``SKILL.md`` file's path and content hash in the graph
+        cache key so adding/removing/editing a skill takes effect on the next
+        turn without rebuilding model/tool objects. Unchanged metadata avoids
+        content reads; ctime catches edits that restore mtime. The recursive
+        scan is still catalogue-sized, but runs off-loop on one dedicated worker.
+        """
+        if self._skill_fingerprint_executor is None:
+            self._skill_fingerprint_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mimir-skill-fingerprint",
+            )
+
+        def scan() -> tuple:
+            signature = []
+            for source in skill_sources:
+                root = Path(source)
+                entries = []
+                exists = root.is_dir()
+                if exists:
+                    for path in sorted(root.rglob("SKILL.md")):
+                        try:
+                            stat = path.stat()
+                            metadata = (
+                                stat.st_ino, stat.st_ctime_ns,
+                                stat.st_mtime_ns, stat.st_size,
+                            )
+                        except OSError:
+                            metadata = None
+                        entries.append((path, metadata))
+                signature.append((root, exists, tuple(entries)))
+            return tuple(signature)
+
+        def fingerprint() -> str:
+            signature = scan()
+            if self._skill_fingerprint_cache is not None:
+                previous, value = self._skill_fingerprint_cache
+                if signature == previous:
+                    return value
+            digest = hashlib.sha256()
+            readable = True
+            for root, exists, entries in signature:
+                digest.update(str(root).encode("utf-8", "surrogateescape"))
+                digest.update(b"\0")
+                if not exists:
+                    digest.update(b"missing\0")
+                    continue
+                for path, metadata in entries:
+                    try:
+                        data = path.read_bytes()
+                    except OSError:
+                        readable = False
+                        continue
+                    readable = readable and metadata is not None
+                    digest.update(str(path.relative_to(root)).encode("utf-8", "surrogateescape"))
+                    digest.update(b"\0")
+                    digest.update(hashlib.sha256(data).digest())
+                    digest.update(b"\0")
+            value = digest.hexdigest()
+            # Never pair a post-edit signature with a pre-edit hash. If the
+            # tree moved during hashing, leave it uncached for the next call.
+            self._skill_fingerprint_cache = (
+                (signature, value) if readable and scan() == signature else None
+            )
+            return value
+
+        # Cache reads/writes stay on the single worker, even if an awaiting
+        # turn is cancelled while its filesystem operation is still running.
+        return await asyncio.get_running_loop().run_in_executor(
+            self._skill_fingerprint_executor, fingerprint,
+        )
+
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
+    async def _build_agent_if_needed(self) -> Any:
+        # ``create_deep_agent`` freezes ``system_prompt`` at graph
+        # construction time. Re-render it on every call and use the
+        # byte-identical prompt as the cache key: unchanged turns reuse
+        # the graph (prompt-cache prefix stays warm), while core-memory /
+        # index / operator-config changes take effect on the next turn
+        # without a process restart (chainlink #369).
+        system_prompt = await asyncio.to_thread(
+            self._current_system_prompt, emit_health_events=False,
+        )
+        skill_sources = self._current_skill_sources()
+        skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
+        unready_tool_owners = _unready_tool_owners(self._config.plugin_manager.policy)
+        if self._agent is not None and self._cached_system_prompt is None:
+            # Unit tests inject a fake graph directly to avoid constructing
+            # deepagents. Production-built graphs always set
+            # ``_cached_system_prompt`` below, so this compatibility path
+            # does not bypass prompt-change invalidation in live runs.
+            return self._agent
+        if (
+            self._agent is not None
+            and system_prompt == self._cached_system_prompt
+            and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
+            and unready_tool_owners == self._cached_unready_tool_owners
+        ):
+            return self._agent
+
+        if self._agent_lock is None:
+            self._agent_lock = asyncio.Lock()
+        async with self._agent_lock:
+            # Re-render under the lock: a contending turn may have just
+            # rebuilt the graph for the same prompt while we waited, or
+            # the prompt may have changed again on disk.
+            system_prompt = await asyncio.to_thread(
+                self._current_system_prompt, emit_health_events=False,
+            )
+            skill_sources = self._current_skill_sources()
+            skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
+            unready_tool_owners = _unready_tool_owners(self._config.plugin_manager.policy)
+            if (
+                self._agent is not None
+                and system_prompt == self._cached_system_prompt
+                and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
+                and unready_tool_owners == self._cached_unready_tool_owners
+            ):
+                return self._agent
+
+            # This is the first build or an actual prompt change. Emit
+            # health events for the final rendered prompt only on this
+            # path, not on every unchanged-turn comparison.
+            if os.environ.get("MIMIR_SYSTEM_PROMPT_OVERRIDE") is None:
+                system_prompt = await asyncio.to_thread(
+                    self._current_system_prompt, emit_health_events=True,
+                )
+                if (
+                    self._agent is not None
+                    and system_prompt == self._cached_system_prompt
+                    and skill_catalog_fingerprint
+                    == self._cached_skill_catalog_fingerprint
+                    and unready_tool_owners == self._cached_unready_tool_owners
+                ):
+                    return self._agent
+
+            from deepagents import create_deep_agent
+            from .readonly_backend import (
+                WriteGuardBackend,
+                build_file_tool_routes,
+                FileToolRouter,
+            )
+            from .access_control import worklink_retained_checkout_root
+            from .tools import all_mimir_tools
+
+            # Per-directory write-permission enforcement (Config.folders).
+            # Read tools (Glob/Grep/Read) stay unrestricted; Write/Edit/upload
+            # outside ``writable_dirs`` return a permission error instead of
+            # mutating the filesystem. ``.mimir/`` (saga db, metrics) is
+            # implicitly blocked because it's not in the folders dict.
+            #
+            # Operator-declared roots OUTSIDE the home (Config.file_tool_roots,
+            # chainlink #650) are routed to real-FS backends via a
+            # CompositeBackend; the home stays the default (guarding out-of-root
+            # absolute paths with a clear error instead of a false not-found).
+            # Refresh routes on graph builds (including retries after failed
+            # builds), not on file operations: the lease root may appear later.
+            home_backend = WriteGuardBackend(
+                root_dir=self._config.home,
+                writable_dirs=self._config.writable_dirs,
+                guard_outside_root=True,
+            )
+            roots = getattr(self._config, "file_tool_roots", ()) or ()
+            lease_root = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+            if lease_root:
+                candidate = Path(lease_root)
+                if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
+                    roots = (*roots, (str(candidate.resolve()), "rw"))
+            retained_root = worklink_retained_checkout_root()
+            if retained_root is not None:
+                # The exact retained route overrides even an operator-declared
+                # writable parent; retained effects require a live lease.
+                roots = (*roots, (str(retained_root.resolve(strict=False)), "retained"))
+            routes = build_file_tool_routes(roots) if roots else {}
+            if routes:
+                self._backend = FileToolRouter(default=home_backend, routes=routes)
+                log.info(
+                    "file tools: %d extra root(s) routed beyond the home: %s",
+                    len(routes), ", ".join(sorted(routes)),
+                )
+            else:
+                self._backend = home_backend
+
+            # Bridge ChatCodexPlus's per-response x-codex-* headers
+            # into the same RateLimitStore that OpenAIQuotaProvider
+            # reads (closes the writer-side gap from PR #248). For
+            # non-codex-plus specs the callback is unused — the
+            # standard ChatOpenAI / Anthropic clients don't expose a
+            # rate_limit_callback and the kwarg is ignored.
+            if self._agent_model is None:
+                from .billing import make_codex_plus_rate_limit_callback
+                codex_plus_callback = make_codex_plus_rate_limit_callback(
+                    self._rate_limits
+                )
+                resolved_spec = os.environ.get(
+                    "MIMIR_MODEL_SPEC", getattr(self._config, "model_spec", DEFAULT_MODEL_SPEC),
+                )
+                self._agent_model = resolve_model_from_config(
+                    self._config,
+                    rate_limit_callback=codex_plus_callback,
+                    model_spec=resolved_spec,
+                )
+                self._agent_model_spec = resolved_spec
+
+            if (
+                self._agent_tools is None
+                or unready_tool_owners != self._cached_unready_tool_owners
+            ):
+                self._agent_tools = all_mimir_tools(
+                    policy=self._config.plugin_manager.policy,
+                    unready_plugin_owners=unready_tool_owners,
+                )
+
+            # Skills surfaced via SkillsMiddleware: pass operator +
+            # bundled source paths as discovery sources. The framework
+            # scans each source for ``<name>/SKILL.md`` entries and
+            # renders a catalog into the system prompt. ``skill_sources``
+            # is recomputed each turn; its catalog fingerprint above
+            # decides whether the graph has to be rebuilt.
+
+            if self._agent_middleware is None:
+                # ``BudgetGateMiddleware`` enforces the per-turn tool-call
+                # budget at the langchain middleware layer so it catches
+                # BOTH mimir-registered tools and deepagents' built-ins
+                # (shell_exec, read_file, write_file, glob, edit_file,
+                # write_todos). Pre-fix the budget gate wrapped each
+                # ``all_mimir_tools()`` entry individually and missed the
+                # built-ins — production heartbeats hit 142 tool_calls
+                # vs a budget of 120 with zero denials firing.
+                from .tools.budget_gate import BudgetGateMiddleware
+                from langchain.agents.middleware import TodoListMiddleware
+                # chainlink #266 (slice 3): on non-poller turns the model
+                # loads a skill by read_file-ing its SKILL.md; this middleware
+                # appends that skill's recorded learnings to the result. Ordered
+                # AFTER the budget gate so a budget-denied read never triggers
+                # injection (it's order-robust regardless — it only augments
+                # successful read_file results on a <skill>/SKILL.md path).
+                from .tools.skill_memory_inject import SkillMemoryInjectionMiddleware
+                # Fetched web bodies become active model context through the
+                # built-in read_file tool. Add a provenance-bound reminder at
+                # that ingestion point, independently of access-control mode.
+                from .tools.fetched_content_inject import FetchedContentReminderMiddleware
+                # chainlink #376 (PR 1): folds queued mid-turn user messages into
+                # the running turn at each model-call boundary. Ordered LAST so
+                # the fold-in is additive and never bypasses the budget gate.
+                # Dormant until the dispatcher feeds the queue (PR 2) — a no-op
+                # (empty queue) on every turn today.
+                from .mid_turn_injection import MidTurnInjectionMiddleware
+                # chainlink #511: per-turn model-iteration ceiling. Counts
+                # before_model boundaries and asks for a final summary once at
+                # the budget — a graceful stop the tool-call budget alone can't
+                # provide for low-tool loops. First in the tuple so the count +
+                # one-shot wrap-up land before the other before_model hooks.
+                from .tools.iteration_gate import IterationGateMiddleware
+                from .tools.service_tool_surface import ServiceToolSurfaceMiddleware
+                # Replaces deepagents' default skills slot (main agent and the
+                # general-purpose subagent) so skills seeded by a deselected
+                # plugin never reach the catalog.
+                self._agent_skills_middleware = SeedFilteredSkillsMiddleware(
+                    backend=self._backend, sources=skill_sources,
+                    home=self._config.home, policy=self._config.plugin_manager.policy,
+                )
+                self._agent_middleware = (
+                    TodoListMiddleware(),
+                    IterationGateMiddleware(),
+                    ServiceToolSurfaceMiddleware(self._config.plugin_manager.policy),
+                    BudgetGateMiddleware(self._config.plugin_manager.policy),
+                    FetchedContentReminderMiddleware(self._config.home),
+                    SkillMemoryInjectionMiddleware(skill_sources),
+                    MidTurnInjectionMiddleware(),
+                )
+
+            for middleware in (*self._agent_middleware, self._agent_skills_middleware):
+                set_skill_sources = getattr(middleware, "set_skill_sources", None)
+                if callable(set_skill_sources):
+                    set_skill_sources(skill_sources)
+
+            from .subagents import build_mimir_subagents
+            from ._deepagents_subagent_auth import install_subagent_auth_context_patch
+
+            install_subagent_auth_context_patch()
+
+            self._agent = create_deep_agent(
+                model=self._agent_model,
+                tools=self._agent_tools,
+                system_prompt=system_prompt,
+                backend=self._backend,
+                middleware=(
+                    (*self._agent_middleware, self._agent_skills_middleware)
+                    if skill_sources else self._agent_middleware
+                ),
+                subagents=build_mimir_subagents(
+                    home=self._config.home, policy=self._config.plugin_manager.policy,
+                ),
+                context_schema=AuthContext,
+            )
+            self._cached_system_prompt = system_prompt
+            self._cached_skill_catalog_fingerprint = skill_catalog_fingerprint
+            self._cached_unready_tool_owners = unready_tool_owners
+            return self._agent
+
+    async def _trace_run_turn(
+        self,
+        event: AgentEvent,
+        *,
+        turn_id: str | None = None,
+        session_id: str | None = None,
+        saga_session_id: str | None = None,
+        body: Callable[..., Any],
+    ) -> TurnRecord:
+        """Bracket the complete turn, including approval replies and finalization."""
+        controller = self._trace_controller if getattr(self._config, "tracing_enabled", False) else None
+        if controller is None:
+            return await body(
+                self, event, turn_id=turn_id, session_id=session_id, saga_session_id=saga_session_id,
+            )
+        scope = controller.turn(
+            conversation_id=session_id or event.channel_id or "default",
+            agent_name=self._config.agent_id,
+            model=str(getattr(self, "_agent_model_spec", None) or getattr(self._config, "model_spec", None) or "unknown"),
+            input_content=event.content,
+        )
+        with scope as trace:
+            record = await body(
+                self, event, turn_id=turn_id, session_id=session_id, saga_session_id=saga_session_id,
+            )
+            if record.error or record.result_is_error:
+                trace.mark_error()
+            if controller.capture_content:
+                trace.finish(output_content=record.output)
+            return record
+
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
+    @_trace_turn
+    async def run_turn(
+        self,
+        event: AgentEvent,
+        *,
+        turn_id: str | None = None,
+        session_id: str | None = None,
+        saga_session_id: str | None = None,
+    ) -> TurnRecord:
+        """Run one agent turn — preserves the SDK Agent.run_turn contract."""
+        from .operator_approval import _is_authenticated_operator
+        from .memory_proposals import complete_reply, is_mp_reply, sync_pending
+        from .pairing_approval import complete_reply as complete_pairing_reply, sync_pending as sync_pairings
+        from .approval_requests import (
+            is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
+        )
+        from .commitment_proposals import handle_reply as handle_closure_reply
+        closure_notice = await handle_closure_reply(self._config.home, event, self._identity_resolver)
+        if closure_notice is not None:
+            if self._dispatcher is not None:
+                await self._dispatcher._send_approval_notice(event.channel_id, closure_notice)
+            elif self._channels is not None:
+                await self._channels.send(event.channel_id, closure_notice, final=True)
+            return TurnRecord(
+                ts=datetime.now(timezone.utc).isoformat(), turn_id=turn_id or make_turn_id(),
+                session_id=session_id or event.channel_id or "default", saga_session_id=saga_session_id,
+                trigger=event.trigger, channel_id=event.channel_id, input=event.content or "",
+                output=closure_notice, kind="commitment_proposal_approval",
+            )
+
+        async def report_early_failure(exc: Exception, ctx: Any, failed_turn_id: str) -> None:
+            if event.trigger == "poller" and not getattr(ctx, "outcome_emitted", False):
+                try:
+                    transient_reason, retry_after_s = _transient_provider_failure(exc)
+                    await log_event(
+                        "turn_failed", channel_id=event.channel_id,
+                        turn_id=failed_turn_id, trigger=event.trigger,
+                        error=f"{type(exc).__name__}: {exc}"[:240],
+                        traceback="".join(traceback.format_exception(
+                            type(exc), exc, exc.__traceback__, limit=12,
+                        ))[-4000:],
+                        phase="pre_model_loop",
+                        attempt_disposition=("transient_provider" if transient_reason else "charge"),
+                        attempt_reason=transient_reason or f"{type(exc).__name__}: {exc}"[:240],
+                        **({"retry_after_s": retry_after_s} if retry_after_s else {}),
+                        **_turn_outcome_identity(event),
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase turn_failed emit failed")
+            if not getattr(ctx, "outcome_emitted", False):
+                try:
+                    await self._notify_chat_skill_failure(
+                        event, f"{type(exc).__name__}: {exc}", ctx, phase="early_exception",
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase chat-skill failure notice failed")
+                try:
+                    await self._post_deliver_failure(
+                        event, f"{type(exc).__name__}: {exc}", ctx,
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase deliver notice failed")
+
+        explicit_session_binding = session_id is not None and saga_session_id is not None
+        def prepare_preflight_context():
+            labels = _initialize_ifc_labels(
+                event, event.attachment_names,
+                resolver=getattr(self, "_identity_resolver", None),
+                policy=self._config.plugin_manager.policy,
+            )
+            if explicit_session_binding:
+                bound = _require_auth_context(event.continuation_auth_context)
+                if not bound.enforcement_enabled:
+                    raise ValueError("bound turns require enforced authorization")
+                acp_state = (bound.ifc_state if bound.origin_trigger == "acp_session" else None)
+                if acp_state is not None:
+                    acp_state.merge(labels)
+                auth = replace(
+                    bound, ifc_labels=labels,
+                    ifc_state=acp_state or InformationFlowState(labels=labels),
+                    ingested_url_state=IngestedURLState(), saga_session_id=saga_session_id,
+                )
+                _seed_trigger_ingested_urls(event, labels, auth)
+            else:
+                auth = _create_turn_auth_context(
+                    event, getattr(self, "_identity_resolver", None),
+                    policy_version=getattr(self._config, "policy_version", None),
+                    enforce=self._config.access_control_enforced,
+                    ifc_labels=labels, audience_provider=self._audience_provider,
+                    cross_platform_pull=self._config.cross_platform_pull,
+                    server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
+                    policy=self._config.plugin_manager.policy,
+                )
+            return labels, auth
+
+        plugin_manager = self._config.plugin_manager
+        preflight_emitter = None
+        async def run_plugin_preflight() -> None:
+            nonlocal turn_id, preflight_emitter, initial_ifc_labels, initial_auth_context
+            initial_ifc_labels, initial_auth_context = prepare_preflight_context()
+            turn_id = turn_id or make_turn_id()
+            preflight_emitter = TurnEventEmitter(
+                self._turn_event_bus, turn_id=turn_id,
+                channel_id=event.channel_id, ifc_labels=initial_ifc_labels,
+                auth_context=initial_auth_context,
+            )
+            preflight_emitter.turn_started(event)
+            try:
+                await plugin_manager.turn_preflight(event, initial_auth_context)
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    notice_context = SimpleNamespace(
+                        auth_context=initial_auth_context, ifc_labels=initial_ifc_labels,
+                    )
+                    await report_early_failure(exc, notice_context, turn_id)
+                try:
+                    preflight_emitter.turn_ended(
+                        status="error", error=f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001 — emission must not mask rejection
+                    pass
+                raise
+
+        bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
+        named_reply = is_non_turn_bound_reply(event)
+        # When no request is known, providers with preflight hooks still guard
+        # turns that look like replies. Empty providers have no hook to invoke:
+        # let the authenticated approval resolver consult durable/recent state
+        # before entering ordinary turn setup.
+        if (plugin_manager.plugins and named_reply and not pending_approvals(event.channel_id)
+                and any(getattr(plugin.contributor, "turn_preflight", None) is not None
+                        for plugin in plugin_manager.plugins)):
+            await run_plugin_preflight()
+        if _is_authenticated_operator(event, self._identity_resolver, allow_web=named_reply) and (named_reply or bare_reply):
+            sync_pending(self._config.home)
+            await asyncio.to_thread(
+                sync_pairings, self._config.home,
+                getattr(self._config, "operator_alert_channel", ""), self._identity_resolver,
+            )
+            pending_entries = pending_approvals(event.channel_id)
+            if bare_reply:
+                pending_entries = tuple(entry for entry in pending_entries if entry.kind != "pair")
+            memory_reply = is_mp_reply(event) or (bare_reply and bool(pending_entries) and all(
+                entry.kind == "mp" for entry in pending_entries
+            ))
+            if named_reply or any(
+                not entry.inject_into_turn for entry in pending_entries
+            ):
+                resolution = resolve_approval(event, self._identity_resolver)
+            else:
+                resolution = None
+            if resolution is not None and ((resolution.entry is not None and not resolution.entry.inject_into_turn)
+                    or (resolution.entry is None and (named_reply or bare_reply))):
+                if resolution.entry is not None and resolution.entry.kind == "trust":
+                    from .trust_approval import complete_reply as complete_trust_reply
+                    notice = await complete_trust_reply(event, resolution, self._identity_resolver)
+                elif resolution.entry is not None and resolution.entry.kind == "pair":
+                    notice = await complete_pairing_reply(
+                        self._config.home, getattr(self._config, "operator_alert_channel", ""),
+                        event, resolution, self._identity_resolver,
+                    )
+                elif memory_reply or (resolution.entry is not None and resolution.entry.kind == "mp"):
+                    notice = await complete_reply(
+                        self._config.home, event, resolution, self._identity_resolver,
+                    )
+                else:
+                    notice = resolution.message or (
+                        f"{resolution.status} {resolution.entry.approval_id}" if resolution.entry else None
+                    )
+                if notice and self._dispatcher is not None:
+                    await self._dispatcher._send_approval_notice(event.channel_id, notice)
+                elif notice and self._channels is not None:
+                    await self._channels.send(event.channel_id, notice, final=True)
+                if preflight_emitter is not None:
+                    preflight_emitter.turn_ended(status="ok")
+                return TurnRecord(
+                    ts=datetime.now(timezone.utc).isoformat(), turn_id=turn_id or make_turn_id(),
+                    session_id=session_id or event.channel_id or "default",
+                    saga_session_id=saga_session_id, trigger=event.trigger,
+                    channel_id=event.channel_id, input=event.content or "",
+                    output=notice or "", kind=(
+                        "memory_proposal_approval" if memory_reply or (
+                            resolution.entry is not None and resolution.entry.kind == "mp"
+                        ) else "operator_approval"
+                    ),
+                )
+        if plugin_manager.plugins and preflight_emitter is None:
+            await run_plugin_preflight()
+        turn_id = turn_id or make_turn_id()
+        t_total_start = time.monotonic()
+        if not plugin_manager.plugins:
+            initial_ifc_labels, initial_auth_context = prepare_preflight_context()
+        # chainlink #583 slice 1: bracket the whole turn on the live event bus
+        # (no-op when unwired). turn_started here pairs with turn_ended in the
+        # finally so every turn — even an early-phase crash — is bracketed.
+        emitter = preflight_emitter or TurnEventEmitter(
+            self._turn_event_bus,
+            turn_id=turn_id,
+            channel_id=event.channel_id,
+            ifc_labels=initial_ifc_labels,
+            auth_context=initial_auth_context,
+        )
+        if preflight_emitter is None:
+            emitter.turn_started(event)
+        _turn_record = None
+        _turn_exc = None
+        # Arm the registry for every channel turn so its own job completions
+        # can fold. The dispatcher still opts in USER messages separately.
+        # chainlink #383: arm before any slow setup work
+        # (session touch, SAGA query, prompt/index assembly). The dispatcher
+        # already marks the channel in-flight before invoking run_turn; keeping
+        # the registry in lockstep closes the setup blind window where a
+        # follow-up user_message saw dispatcher._in_flight but inject_message()
+        # returned no_active_turn and fell into the FIFO. The model-loop finally
+        # still owns deactivate(); the setup phase runs inside run_turn's own
+        # try (chainlink #415) so its finally deactivates + requeues on any
+        # setup-phase exception or cancellation — early arming cannot leak a
+        # stale active entry.
+        injection_registered = False
+        if event.channel_id:
+            mid_turn_injection.register_inflight(
+                event.channel_id, emitter=emitter, turn_id=turn_id,
+                allow_user_messages=event.trigger == "user_message",
+            )
+            injection_registered = True
+        # chainlink #415: cleanup obligations accrue across the setup phase
+        # (typing-indicator hold, _active_turns registration, channel /
+        # interactivity contextvar tokens) — so the setup MUST run inside
+        # the same try whose finally releases them. It previously sat
+        # outside: a cancellation at the session-touch lock (hard
+        # shutdown) or an unexpected setup failure leaked the active
+        # injection-registry entry (silently dropping any already-injected
+        # messages on the next turn's overwrite), poisoned
+        # get_only_active_turn()'s len==1 heuristic for the life of the
+        # process, and left the typing-hold task running. Names are
+        # pre-bound so the finally releases exactly what was created.
+        _typing_bridge = None
+        ctx = None
+        ctx_token = None
+        cid_token = None
+        interactive_token = None
+        codex_stream_buffer_token = None
+        try:
+            codex_stream_buffer_token = set_codex_plus_stream_buffering(event.trigger)
+            # Capture the asyncio loop once so shell-job waiter threads
+            # can schedule their completion handlers back onto it via
+            # ``asyncio.run_coroutine_threadsafe``.
+            if self._loop is None:
+                try:
+                    self._loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+
+            # Session attach — same as the SDK path.
+            session_id = (
+                session_id if explicit_session_binding else event.channel_id or "default"
+            )
+            saga_session_id = saga_session_id if explicit_session_binding else None
+            session_egress_state = initial_auth_context.egress_state
+            chat_ifc_state = None
+            if not explicit_session_binding and event.trigger == "saga_session_end":
+                saga_session_id = (event.extra or {}).get("saga_session_id")
+            elif not explicit_session_binding and self._sessions is not None:
+                channel_visibility = (
+                    event.extra.get("channel_visibility", "private")
+                    if isinstance(event.extra, Mapping)
+                    else "private"
+                )
+                sess = await self._sessions.touch(
+                    event.channel_id,
+                    initial_auth_context,
+                    origin_domain=event.source,
+                    visibility=channel_visibility,
+                )
+                saga_session_id = sess.saga_session_id
+                session_egress_state = getattr(
+                    sess, "egress_state", session_egress_state,
+                )
+                self._sessions.increment_turn_count(event.channel_id)
+
+            event_ingress = None
+            if isinstance(event.extra, Mapping):
+                stamped_ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
+                if isinstance(stamped_ingress, str):
+                    event_ingress = stamped_ingress or None
+            if (not explicit_session_binding
+                    and event_ingress is None
+                    and event.source in {"discord", "slack", "web"}
+                    and _is_authenticated_operator(event, self._identity_resolver, allow_web=True)
+                    and initial_auth_context.event_ingress is None
+                    and isinstance(event.channel_id, str) and event.channel_id):
+                key = (event.channel_id, initial_auth_context.canonical_principal)
+                cache = self._chat_ingest_acknowledgements
+                now = time.monotonic()
+                for stale in [k for k, cell in cache.items()
+                              if now - cell.last_used >= cell.IDLE_SECONDS]:
+                    del cache[stale]
+                if key not in cache and len(cache) >= 256:
+                    del cache[min(cache, key=lambda k: cache[k].last_used)]
+                acknowledgement = cache.setdefault(key, IngestAcknowledgement())
+                acknowledgement.touch()
+                chat_ifc_state = InformationFlowState(ingest_acknowledgement=acknowledgement)
+            turn_interactivity = classify_turn_interactivity(
+                event.channel_id,
+                event.trigger,
+                event_ingress,
+                self._channels,
+            )
+
+            # Typing indicator: fire at turn START on interactive turns so the
+            # user sees "mimir is typing…" the moment their message lands and for
+            # the whole turn (0.3.0 removed auto-dispatch, so this is the only
+            # received-it signal until the agent calls send_message). It is
+            # released in the finally (turn END) — NOT on send_message — so it
+            # persists across multi-part replies. Bridges without the method
+            # (Bench / WebChat) are silently skipped.
+            _typing_bridge = None
+            if (
+                self._channels is not None
+                and event.channel_id
+                and _turn_is_interactive(turn_interactivity)
+            ):
+                _typing_bridge = self._channels.find(event.channel_id)
+                if _typing_bridge is not None and hasattr(
+                    _typing_bridge, "send_typing_indicator"
+                ):
+                    try:
+                        await _typing_bridge.send_typing_indicator(event.channel_id)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("typing indicator failed: %s", exc)
+
+            # Set up TurnContext so RecordingSagaClient can populate
+            # ctx.saga_calls. Without this all saga calls — pre-message
+            # query, post-message feedback — were lost from the turn
+            # record. The context is reset in the finally block.
+            from .models import TurnContext as _TurnContext
+            from ._context import set_current_turn, reset_current_turn
+            from .loop_detector import LoopDetector
+            # Create the frozen AuthContext at ingress BEFORE model execution.
+            # This carrier is immutable - authority derives ONLY from this carrier,
+            # NOT from model session_id, ContextVar fallback, or single-active-turn
+            # heuristics. LangGraph carries it through ordinary, built-in, and
+            # wrapped MCP tool requests; Claude SDK hooks fail closed while their
+            # API lacks an exact runtime carrier (chainlink #864).
+            auth_ctx = initial_auth_context
+            if event_ingress is not None:
+                auth_ctx = create_auth_context(
+                    event,
+                    getattr(self, "_identity_resolver", None),
+                    policy_version=getattr(self._config, "policy_version", None),
+                    enforce=self._config.access_control_enforced,
+                    event_ingress=event_ingress,
+                    ifc_labels=initial_ifc_labels,
+                    audience_provider=self._audience_provider,
+                    cross_platform_pull=self._config.cross_platform_pull,
+                    policy=self._config.plugin_manager.policy,
+                )
+            # Update auth_ctx with the actual interactivity classification
+            if auth_ctx is not None:
+                if chat_ifc_state is not None:
+                    chat_ifc_state.merge(initial_ifc_labels)
+                auth_ctx = replace(
+                    auth_ctx,
+                    ifc_state=chat_ifc_state or auth_ctx.ifc_state,
+                    interactivity=turn_interactivity,
+                    saga_session_id=saga_session_id,
+                    egress_state=session_egress_state,
+                    server_discovered_pr_scope_store=(
+                        self._server_discovered_pr_scope_store
+                        if event_ingress is None else None
+                    ),
+                )
+            # IFC exists before any model call or harness panel egress. A resumed
+            # event's trusted carrier is unioned with ingress-derived labels; a
+            # fresh turn cannot start with ``None`` and bypass the sink gate.
+            ctx = _TurnContext(
+                turn_id=turn_id,
+                session_id=session_id,
+                trigger=event.trigger,
+                channel_id=event.channel_id,
+                started_at=t_total_start,
+                agent_id=self._config.agent_id,
+                saga_session_id=saga_session_id,
+                # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
+                # to the TurnContext so send_message can reach it via
+                # ``_context.get_current_turn()`` without a separate
+                # parameter-passing path. Soft/hard limits + similarity
+                # threshold come from Config (mimir/config.py default 5/10/0.9).
+                # Pre-181-J the detector wasn't constructed at all; the
+                # circuit breaker was disarmed and the agent could ship
+                # near-duplicate sends indefinitely.
+                loop_detector=LoopDetector(
+                    soft_limit=self._config.send_loop_soft_limit,
+                    hard_limit=self._config.send_loop_hard_limit,
+                    similarity_threshold=self._config.send_loop_similarity,
+                ),
+                # Tool-call budget (181-N). The langchain @tool wrappers
+                # installed by ``apply_budget_gate`` in registry.py read
+                # this off the TurnContext and refuse tool calls past
+                # the cap. 0 disables (matches main's contract).
+                tool_call_budget=self._config.tool_call_budget,
+                # Per-turn model-iteration ceiling (chainlink #511). Read off
+                # the TurnContext by IterationGateMiddleware.before_model. 0
+                # disables.
+                iteration_budget=self._config.max_turn_iterations,
+                # Source of the inbound channel (e.g. "discord", "slack"),
+                # recorded on the turn context for observability. The outbound
+                # buffer-append now lives only in the send_message tool, which
+                # tags the message with ``bridge.name`` so it passes the
+                # recent_sources allowlist in recent_for_channel (chainlink #270);
+                # this field is no longer the source of that tag.
+                channel_source=event.source,
+                event_ingress=event_ingress,
+                interactivity=turn_interactivity,
+                # Runtime access-control context consumed by tool middleware.
+                author=event.author,
+                identity_resolver=getattr(self, "_identity_resolver", None),
+                access_control_enforced=self._config.access_control_enforced,
+                # Frozen authorization context (chainlink #864).
+                auth_context=auth_ctx,
+                ifc_labels=initial_ifc_labels,
+                operator_ingress_event=event if chat_ifc_state is not None else None,
+                trust_notice_sender=(
+                    self._dispatcher._send_approval_notice
+                    if self._dispatcher is not None
+                    and hasattr(self._dispatcher, "_send_approval_notice")
+                    else (lambda channel, notice: self._channels.send(channel, notice, final=True))
+                    if self._channels is not None else None
+                ),
+                trust_owner_loop=asyncio.get_running_loop(),
+            )
+            ctx.completion_chain_id = (
+                event.extra.get("completion_chain_id") or turn_id
+                if event.trigger == "shell_job_complete" else turn_id
+            )
+            # Both ordinary and synthesis turns share this setup. Register the
+            # intended workspace before validating/repairing it so the janitor
+            # cannot evict an old reused directory during setup. No prompt or
+            # tool sees this provisional path; refusal clears it before either.
+            ctx.turn_scratch_path = (
+                self._config.home.resolve() / "scratch" / "turns" / ctx.turn_id
+            )
+            ctx_token = set_current_turn(ctx)
+            ctx.turn_scratch_path = ensure_turn_scratch(self._config.home, ctx.turn_id)
+            from .turn_stores import move_ci_logs_to_turn
+            ctx.ci_log_paths = await asyncio.to_thread(
+                move_ci_logs_to_turn, self._config.home, event, ctx.turn_scratch_path,
+            )
+            ctx.turn_event_emitter = emitter
+            emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
+            # WikiBacklinksHook pre-snapshot — capture mtimes of every
+            # state/wiki/ content page BEFORE the model loop runs so the
+            # finalize step can tell if any wiki page was edited this turn.
+            # Stored on ctx (NOT on self) so concurrent turns on different
+            # channels don't share state — multi-channel-correctness
+            # invariant from the SDK build. Empty dict when the wiki dir
+            # doesn't exist; finalize early-returns in that case.
+            ctx.wiki_mtime_snapshot = await self._snapshot_wiki_mtimes_async()
+            # Populate the module-global current_channel_id as a fallback
+            # for the claude-code path. ChatClaudeCode dispatches tools
+            # via the ClaudeSDKClient subprocess; the SDK round-trips back
+            # through ``_langchain_claude_code_patches`` which calls
+            # ``tool._arun(**args, config=RunnableConfig())`` — a fresh
+            # empty config. The RunnableConfig route added in 181-B
+            # therefore can't see ``configurable["channel_id"]`` on that
+            # path, and send_message / react / fetch_channel_history would
+            # fail with "no channel_id and no current channel" when the
+            # model omits the arg. Setting _STATE here closes the gap; the
+            # helper still prefers configurable when present, so direct
+            # LangGraph tool dispatch (anthropic/openai providers) keeps
+            # the race-free route. The dispatcher serializes turns per-
+            # channel, so the cross-channel race Mimir originally flagged
+            # is constrained to the moment between set and reset here.
+            from .tools.registry import (
+                set_current_channel_id as _set_cid,
+                reset_current_channel_id as _reset_cid,
+                set_current_turn_interactive as _set_interactive,
+                reset_current_turn_interactive as _reset_interactive,
+            )
+            cid_token = _set_cid(event.channel_id)
+            # Pair the stored server-owned interactivity classification with the
+            # channel id: send_message uses it to decide whether a channel-less
+            # call may default to this turn's channel (interactive) or must be
+            # given an explicit channel (non-interactive heartbeat / poller /
+            # synthesis / upgrade turns). Keep the ContextVar for backward
+            # compatibility only; the authoritative decision lives on TurnContext.
+            interactive_token = _set_interactive(_turn_is_interactive(ctx.interactivity))
+            _turn_record = await self._run_turn_body(
+                event, ctx, ctx_token, turn_id, session_id, saga_session_id,
+                t_total_start, emitter, initial_auth_context,
+            )
+            return _turn_record
+        except asyncio.CancelledError as exc:
+            _turn_exc = exc
+            raise
+        except Exception as exc:
+            _turn_exc = exc
+            # chainlink #306 (+ #415): _run_turn_body's model-loop try/except emits
+            # turn_failed/turn_completed only AFTER the early phase (prompt
+            # build, agent construction, model resolution). A crash in that
+            # early phase would otherwise propagate here with NO terminal
+            # outcome logged — and poller-recovery (#262), which keys off
+            # turn_failed/turn_completed, would leak the in-flight item
+            # forever (never retried). Guarantee a turn_failed for poller
+            # turns whose outcome wasn't already emitted, then re-raise so
+            # the dispatcher's own error handling is unchanged. Only
+            # ``Exception`` (not CancelledError) — a cancelled turn isn't a
+            # failure to recover.
+            # chainlink #508: an early-phase crash (prompt build, agent
+            # construction, model resolution) is exactly "the agent couldn't
+            # report" — mirror the deliver: failure notice here so a poller OR
+            # scheduled-tick job with deliver: set isn't silently lost before
+            # the model loop. Gated on outcome_emitted so it never double-posts
+            # with the in-body path (which sets that flag after the loop).
+            await report_early_failure(exc, ctx, turn_id)
+            raise
+        finally:
+            # chainlink #583: close the turn bracket on the live bus. Status
+            # reflects an exception or a returned record that carries an error.
+            try:
+                _outbound_sent = (
+                    (getattr(ctx, "send_message_count", 0) or 0) > 0
+                    if ctx is not None else None
+                )
+                _injected_count = (
+                    len(getattr(_turn_record, "injected_inputs", []) or [])
+                    if _turn_record is not None else None
+                )
+                if _turn_exc is not None:
+                    emitter.turn_ended(
+                        status="error",
+                        error=f"{type(_turn_exc).__name__}: {_turn_exc}",
+                        outbound_message_sent=_outbound_sent,
+                        injected_input_count=_injected_count,
+                    )
+                elif _turn_record is not None and getattr(_turn_record, "error", None):
+                    emitter.turn_ended(
+                        status="error",
+                        error=str(_turn_record.error),
+                        outbound_message_sent=_outbound_sent,
+                        injected_input_count=_injected_count,
+                    )
+                else:
+                    emitter.turn_ended(
+                        status="ok",
+                        outbound_message_sent=_outbound_sent,
+                        injected_input_count=_injected_count,
+                    )
+            except Exception:  # noqa: BLE001 — never let emission break cleanup
+                pass
+            if injection_registered:
+                # _run_turn_body normally deactivates once the model loop starts.
+                # This covers pre-body cancellations/exceptions that bypass that
+                # finally without relying on register_inflight's next-turn overwrite.
+                leftover_injections, _folded, _deferred = mid_turn_injection.deactivate(
+                    event.channel_id
+                )
+                if leftover_injections and self._dispatcher is not None:
+                    user_leftovers = [e for e in leftover_injections if e.trigger != "shell_job_complete"]
+                    for completion in leftover_injections:
+                        if completion.trigger == "shell_job_complete":
+                            await Agent._queue_shell_followup(self, completion)
+                    requeued = self._dispatcher.requeue_front(user_leftovers)
+                    if requeued < len(user_leftovers):
+                        await self._log_injection_requeue(
+                            "mid_turn_injection_leftover", event.channel_id, turn_id,
+                            len(user_leftovers), requeued,
+                        )
+            # Release the typing indicator at turn end (held from turn start
+            # across any send_message calls). In the finally so it fires on
+            # success, error, and cancellation alike.
+            if _typing_bridge is not None and hasattr(_typing_bridge, "cancel_typing"):
+                try:
+                    await _typing_bridge.cancel_typing(event.channel_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("cancel_typing failed: %s", exc)
+            # Token guards: a setup-phase exception may land here before a
+            # given token (or its importing module) was bound — release
+            # only what was actually created.
+            if ctx_token is not None:
+                reset_current_turn(ctx_token)
+            if ctx is not None:
+                from .turn_stores import close_turn_stores, wipe_ci_logs, wipe_research_drafts, wipe_turn_stores
+                try:
+                    await asyncio.to_thread(close_turn_stores, ctx)
+                    await asyncio.to_thread(wipe_turn_stores, self._config.home, ctx.turn_id)
+                    await asyncio.to_thread(wipe_ci_logs, getattr(ctx, "ci_log_paths", ()))
+                    await asyncio.to_thread(wipe_research_drafts, self._config.home, ctx.turn_id)
+                except Exception:  # noqa: BLE001 — cleanup must not mask turn failure
+                    log.exception("turn_store_wipe_failed")
+            if interactive_token is not None:
+                _reset_interactive(interactive_token)
+            if cid_token is not None:
+                _reset_cid(cid_token)
+            if codex_stream_buffer_token is not None:
+                reset_codex_plus_stream_buffering(codex_stream_buffer_token)
+
+    async def _post_deliver_failure(
+        self, event: AgentEvent, error: str, ctx: Any = None,
+    ) -> None:
+        """chainlink #508: best-effort ``⚠️ <job> failed`` notice to a poller/
+        tick's ``deliver:`` channel. No-ops when no deliver channel is set (the
+        common case) or it resolves to nothing. Called from BOTH terminal-
+        failure paths — the in-body ``if error:`` (model-loop failures) and the
+        outer early-failure guard (crashes before the model loop) — which are
+        disjoint via ``ctx.outcome_emitted``, so a failure notifies exactly
+        once. Never raises."""
+        if ctx is not None and getattr(ctx, "deliver_failure_notice_attempted", False):
+            return
+        if ctx is not None:
+            ctx.deliver_failure_notice_attempted = True
+        deliver = resolve_deliver_channel(
+            (event.extra or {}).get("deliver"),
+            getattr(self._config, "operator_alert_channel", ""),
+        )
+        if not deliver:
+            return
+        if not self._harness_sink_allowed(ctx, deliver, "send_message"):
+            return
+        label = (
+            (event.extra or {}).get("schedule_name")
+            or (event.extra or {}).get("poller_name")
+            or event.trigger
+        )
+        await post_job_failure_notice(
+            self._channels, deliver, label=str(label), error=error[:240],
+        )
+
+    @staticmethod
+    def _chat_skill_failure_fields(invocation_payload: Any) -> dict[str, Any]:
+        """Return a bounded, non-sensitive summary of a chat-skill payload."""
+        fields: dict[str, Any] = {}
+        if not isinstance(invocation_payload, Mapping):
+            fields["chat_skill_payload_type"] = type(invocation_payload).__name__[:80]
+            return fields
+        raw_token = ""
+        raw = invocation_payload.get("raw")
+        if isinstance(raw, str):
+            raw_token = raw.lstrip().split(None, 1)[0].strip()
+        command_token = ""
+        command = invocation_payload.get("command")
+        if isinstance(command, str):
+            command_token = command.strip().split(None, 1)[0].strip()
+        label = raw_token or command_token
+        if label.startswith("/"):
+            fields["chat_skill_command"] = label[:80]
+        name = invocation_payload.get("name")
+        if isinstance(name, str) and name.strip():
+            fields["chat_skill_name"] = name.strip()[:80]
+        return fields
+
+    @staticmethod
+    def _chat_skill_failure_notice(phase: str, command: str | None) -> str:
+        label = command or "that slash command"
+        if phase == "prompt_resolution":
+            return (
+                f"⚠️ I couldn't validate {label} safely, so I didn't run it. "
+                "Please try again or ask the operator to verify the chat-skill "
+                "allowlist."
+            )
+        return (
+            f"⚠️ I couldn't complete {label} on this turn. "
+            "Please try again in a new message."
+        )
+
+    async def _notify_chat_skill_failure(
+        self,
+        event: AgentEvent,
+        error: str,
+        ctx: Any,
+        phase: str,
+    ) -> None:
+        """Best-effort notice + structured log for chat-skill runtime failures."""
+        extra = event.extra or {}
+        if CHAT_SKILL_EXTRA_KEY not in extra:
+            return
+        failure_fields = self._chat_skill_failure_fields(
+            extra.get(CHAT_SKILL_EXTRA_KEY)
+        )
+        await safe_log_event(
+            "chat_skill_runtime_failed",
+            channel_id=event.channel_id,
+            trigger=event.trigger,
+            phase=phase,
+            error=(error or "chat skill runtime failed")[:240],
+            **failure_fields,
+        )
+        if getattr(ctx, "_chat_skill_failure_notice_sent", False):
+            return
+        if self._channels is None or not event.channel_id:
+            return
+        if not self._harness_sink_allowed(ctx, event.channel_id, "send_message"):
+            return
+        try:
+            result = await self._channels.send(
+                event.channel_id,
+                self._chat_skill_failure_notice(
+                    phase,
+                    failure_fields.get("chat_skill_command"),
+                ),
+                final=True,
+            )
+        except Exception:  # noqa: BLE001 — failure notice must not cascade
+            log.exception("chat-skill failure notice failed")
+            return
+        if not getattr(result, "sent", False):
+            return
+        if ctx is not None:
+            try:
+                ctx.delivered_channel_ids.add(event.channel_id)
+                ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+                ctx._chat_skill_failure_notice_sent = True
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
+                log.debug("chat-skill failure delivery bookkeeping failed", exc_info=True)
+
+    async def _notify_iteration_hard_stop(
+        self, event: AgentEvent, budget: int, ctx: Any,
+    ) -> None:
+        """chainlink #511: tell the channel a turn was force-stopped at the
+        iteration ceiling (the model never delivered). Target = the deliver:
+        channel (#508) if set, else the triggering channel for an interactive
+        turn; nothing for a silent tick. Best-effort; never raises."""
+        target = resolve_deliver_channel(
+            (event.extra or {}).get("deliver"),
+            getattr(self._config, "operator_alert_channel", ""),
+        )
+        if not target and event.channel_id and _turn_is_interactive(
+            getattr(ctx, "interactivity", None)
+        ):
+            target = event.channel_id
+        if not target or self._channels is None:
+            return
+        if not self._harness_sink_allowed(ctx, target, "send_message"):
+            return
+        try:
+            result = await self._channels.send(
+                target,
+                f"⚠️ I hit this turn's iteration limit ({budget} model steps) "
+                f"and stopped before finishing. Re-ask if you need me to "
+                f"continue — narrowing the scope helps.",
+            )
+        except Exception:  # noqa: BLE001 — never mask the turn outcome
+            log.exception("iteration hard-stop channel notice failed")
+            return
+        # Only record delivery on a CONFIRMED send. ChannelRegistry.send returns
+        # a SendResult; a bridge soft failure returns SendResult(sent=False)
+        # WITHOUT raising — recording that as delivered would suppress the
+        # forgot-to-send guard (#423) even though nothing reached the channel
+        # (the exact accounting bug this path is meant to avoid). Mirrors the
+        # send_message tool, which also gates reply accounting on result.sent.
+        # (PR #718 review.)
+        if getattr(result, "sent", False):
+            try:
+                ctx.delivered_channel_ids.add(target)
+                ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+            except Exception:  # noqa: BLE001 — bookkeeping must not break the turn
+                log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
+
+    @staticmethod
+    def _harness_sink_allowed(
+        ctx: Any,
+        target: str | None,
+        sink_name: str,
+        *,
+        on_refusal: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Apply IFC to a harness-owned final egress boundary."""
+        auth_context = getattr(ctx, "auth_context", None)
+        ifc_labels = getattr(ctx, "ifc_labels", None)
+        return harness_sink_allowed(
+            sink_name,
+            target,
+            ifc_labels,
+            auth_context,
+            on_refusal=on_refusal,
+        )
+
+    @staticmethod
+    def _report_acp_final_text_delivery_failure(reason: str) -> None:
+        """Report a scrubbed ACP delivery refusal without risking the turn."""
+        try:
+            from .tools.client_provider import get_turn_capability_context
+            from .turn_event_redaction import scrub_detail
+
+            raw_reason = str(reason).strip()
+            safe_reason = scrub_detail(raw_reason) or "delivery_refused"
+            safe_phrases = {
+                "ACP bridge is disconnected",
+                "ACP delivery failed",
+                "invalid ACP channel",
+                "rich ACP messages are unsupported",
+                "unbound ACP channel",
+            }
+            if raw_reason not in safe_phrases:
+                # Sink reasons are stable machine tokens. Keep that token but
+                # never forward an appended provider/transport diagnostic.
+                safe_reason = safe_reason.split(maxsplit=1)[0]
+            capability = get_turn_capability_context()
+            reporter = getattr(
+                getattr(capability, "permission_broker", None),
+                "report_final_text_delivery_failure",
+                None,
+            )
+            if reporter is not None:
+                reporter(safe_reason)
+        except Exception:  # noqa: BLE001 - reporting failure must not fail the turn
+            log.debug("ACP final-text refusal reporting failed", exc_info=True)
+
+    async def _maybe_resend_nudge(
+        self,
+        agent: Any,
+        invoke_config: dict,
+        ctx: Any,
+        event: AgentEvent,
+        *,
+        turn_id: str,
+        turn_is_interactive: bool,
+        messages: list,
+        events: list,
+        output: str,
+    ) -> tuple[list, list, str]:
+        """Forgot-to-send recovery (opt-in via ``MIMIR_RESEND_NUDGE_CHANNELS``).
+
+        When an interactive turn produced final text but never DELIVERED to the
+        triggering channel, re-prompt the model ONCE to call ``send_message``.
+        The forgot-to-send guard (#423) only flags this for the next turn; this
+        recovers the reply the user is actually waiting on — aimed at tool-shy
+        models (minimax M3) that answer in final text instead of calling the tool.
+
+        Folded into the current turn: it re-enters the SAME graph thread, so it
+        inherits the original turn's context (the undelivered reply is already in
+        the message history) and triggers NO additional SAGA recall/synthesis
+        (recall is built once at turn start; synthesis is a separate idle turn).
+        Loop-safe — exactly one re-prompt; if it still doesn't deliver it logs
+        ``resend_nudge_failed`` and gives up (no recursion). Every failure path is
+        swallowed so the nudge can never fail the turn.
+        """
+        from .resend_nudge import (
+            build_nudge_text,
+            channel_prefix_enabled,
+            count_recent_no_sends,
+            nudge_enabled,
+        )
+
+        if not (turn_is_interactive and (output or "").strip()):
+            return messages, events, output
+        delivered = getattr(ctx, "delivered_channel_ids", None) or set()
+        if event.channel_id in delivered:
+            return messages, events, output
+        # Same reasoning as the auto-deliver gate: on an ACP turn auto-delivery
+        # always runs, so the nudge is redundant — and worse than redundant,
+        # since it spends an extra model call asking for a send_message the ACP
+        # tool surface does not offer.
+        if _is_acp_delivery_turn() or channel_prefix_enabled(
+            event.channel_id,
+            getattr(self._config, "auto_deliver_final_text_channels", ()),
+        ):
+            return messages, events, output
+        if not nudge_enabled(event.channel_id, self._config.resend_nudge_channels):
+            return messages, events, output
+        # The nudge can cause a model tool delivery, but it is itself a harness
+        # continuation of labeled context. Refuse before the extra model call when
+        # that eventual channel sink is incompatible.
+        if not self._harness_sink_allowed(ctx, event.channel_id, "harness_resend_nudge"):
+            return messages, events, output
+
+        # 24h recidivism tally, counted from events.jsonl the same way the
+        # algedonic block does (not a parallel counter). +1 for this turn's
+        # under-send, whose guard event hasn't been emitted yet at this point.
+        try:
+            cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            events_path = self._config.home / "logs" / "events.jsonl"
+            count = await asyncio.to_thread(
+                count_recent_no_sends, events_path, event.channel_id, cutoff_iso,
+            ) + 1
+        except Exception:  # noqa: BLE001 — counting must never fail the turn
+            log.exception("resend-nudge count failed")
+            count = 1
+        await safe_log_event(
+            "resend_nudge_issued",
+            channel_id=event.channel_id, turn_id=turn_id, no_send_count_24h=count,
+        )
+        try:
+            async for chunk in agent.astream(
+                {"messages": [HumanMessage(content=build_nudge_text(event.channel_id, count))]},
+                config=invoke_config,
+                context=ctx.auth_with_plugin_state() if isinstance(ctx, TurnContext) else ctx.auth_context,
+                stream_mode="values",
+            ):
+                messages = list(chunk.get("messages", []))
+            events, output = extract_turn_events(messages)
+        except Exception:  # noqa: BLE001 — a re-prompt failure must not fail the turn
+            log.exception("resend-nudge re-prompt failed")
+            return messages, events, output
+
+        delivered = getattr(ctx, "delivered_channel_ids", None) or set()
+        if event.channel_id not in delivered:
+            await safe_log_event(
+                "resend_nudge_failed",
+                channel_id=event.channel_id, turn_id=turn_id, no_send_count_24h=count,
+            )
+        return messages, events, output
+
+    @staticmethod
+    def _substantive_final_text(text: str | None) -> str | None:
+        """Return stripped text only when it is substantial enough to ship."""
+        stripped = (text or "").strip()
+        if len(stripped) < 20:
+            return None
+        if len(re.findall(r"[A-Za-z0-9]+", stripped)) < 3:
+            return None
+        return stripped
+
+    async def _maybe_auto_deliver_final_text(
+        self,
+        ctx: Any,
+        event: AgentEvent,
+        *,
+        turn_id: str,
+        turn_is_interactive: bool,
+        output: str,
+    ) -> None:
+        """Opt-in deterministic recovery for user_message turns.
+
+        If a tool-shy model finished with a user-addressed final reply but did
+        not call ``send_message``, deliver that captured final text directly to
+        the triggering channel. This is intentionally narrower than
+        ``turn_is_interactive``: ``shell_job_complete`` is interactive for
+        normal send defaults, but silence is often correct there.
+        """
+        from .bridges._directives import parse_directives
+        from .resend_nudge import channel_prefix_enabled
+        from .tools.registry import dispatch_send_message_directives
+
+        parsed = parse_directives(output or "")
+        clean_text = self._substantive_final_text(parsed.clean_text)
+        acp_delivery = _is_acp_delivery_turn()
+
+        def refuse(reason: str) -> None:
+            if acp_delivery and clean_text:
+                self._report_acp_final_text_delivery_failure(reason)
+
+        if clean_text is None and acp_delivery:
+            # The substantiveness floor (>= 20 chars, >= 3 words) exists to
+            # judge whether output is worth auto-shipping as *recovery* on a
+            # channel where the model could have called send_message. On an ACP
+            # turn this is the only delivery path, so the floor would silently
+            # drop exactly the answers ACP clients ask for — "Paris", "42",
+            # "yes". Any non-empty final text ships.
+            clean_text = (parsed.clean_text or "").strip() or None
+        if clean_text is None and not parsed.directives:
+            return
+        if event.trigger != "user_message" or not turn_is_interactive:
+            refuse("turn_not_deliverable")
+            return
+        delivered = getattr(ctx, "delivered_channel_ids", None) or set()
+        if event.channel_id in delivered:
+            return
+        # ACP turns are always eligible: the opt-in list exists to choose which
+        # channels get recovery when send_message was available and unused, but
+        # on ACP the tool does not exist, so gating here would drop every reply.
+        if not acp_delivery and not channel_prefix_enabled(
+            event.channel_id,
+            getattr(self._config, "auto_deliver_final_text_channels", ()),
+        ):
+            return
+        if self._channels is None or not event.channel_id:
+            refuse("channel_unavailable")
+            return
+        bridge = self._channels.find(event.channel_id)
+        if bridge is None:
+            refuse("bridge_unavailable")
+            return
+        refusal_reason: str | None = None
+
+        def capture_refusal(reason: str) -> None:
+            nonlocal refusal_reason
+            refusal_reason = reason
+
+        if not self._harness_sink_allowed(
+            ctx, event.channel_id, "harness_auto_deliver",
+            on_refusal=capture_refusal,
+        ):
+            refuse(refusal_reason or "delivery_refused")
+            return
+
+        result = None
+        if clean_text:
+            try:
+                result = await self._channels.send(event.channel_id, clean_text, final=False)
+            except Exception:  # noqa: BLE001 — auto-recovery must not fail the turn
+                log.exception("auto-deliver final text send failed")
+                refuse("delivery_failed")
+                return
+            if not getattr(result, "sent", True):
+                refusal = str(getattr(result, "error", None) or "").strip()
+                refuse(refusal or "delivery_refused")
+                try:
+                    await safe_log_event(
+                        "send_message_failed",
+                        channel_id=event.channel_id,
+                        error=str(getattr(result, "error", None) or "")[:200] or None,
+                        chunks=getattr(result, "chunks", 0),
+                        uploads=getattr(result, "uploads", 0),
+                        message_id=getattr(result, "message_id", None),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            try:
+                ctx.send_message_count = (getattr(ctx, "send_message_count", 0) or 0) + 1
+                ctx.delivered_channel_ids.add(event.channel_id)
+                emitter = getattr(ctx, "turn_event_emitter", None)
+                if emitter is not None:
+                    emitter.outbound_message(
+                        channel_id=event.channel_id,
+                        message_id=getattr(result, "message_id", None),
+                    )
+            except Exception:  # noqa: BLE001
+                log.debug("auto-deliver bookkeeping failed", exc_info=True)
+
+            norm = re.sub(r"\s+", " ", clean_text.strip()).lower()[:500]
+            content_hash = hashlib.md5(norm.encode()).hexdigest()[:16]
+            await safe_log_event(
+                "send_message_sent", channel_id=event.channel_id, content_hash=content_hash,
+            )
+            try:
+                msg = self._buffer.make_message(
+                    channel_id=event.channel_id,
+                    kind="assistant_message",
+                    content=clean_text,
+                    msg_id=getattr(result, "message_id", None),
+                    source=getattr(bridge, "name", None),
+                    integrity=_effective_persisted_integrity(ctx.ifc_labels, ctx.auth_context),
+                )
+                await self._buffer.append(msg)
+            except Exception:  # noqa: BLE001
+                log.warning("auto-deliver final text history append failed", exc_info=True)
+
+        try:
+            await dispatch_send_message_directives(
+                directives=parsed.directives,
+                bridge=bridge,
+                channel_id=event.channel_id,
+                sent_message_id=(getattr(result, "message_id", None) if result else None),
+                fallback_message_id=(
+                    event.source_id or getattr(ctx, "last_assistant_message_id", None)
+                ),
+                ctx=ctx,
+            )
+        except Exception:  # noqa: BLE001 — directive recovery is best-effort
+            log.exception("auto-deliver directive dispatch failed")
+
+        await safe_log_event(
+            "interactive_turn_auto_delivered",
+            channel_id=event.channel_id,
+            turn_id=turn_id,
+            output_chars=len(clean_text or ""),
+        )
+
+    async def _run_turn_body(
+        self,
+        event: AgentEvent,
+        ctx: Any,
+        ctx_token: Any,
+        turn_id: str,
+        session_id: str,
+        saga_session_id: str | None,
+        t_total_start: float,
+        emitter: TurnEventEmitter,
+        initial_auth_context: AuthContext,
+    ) -> TurnRecord:
+
+        # Persist the inbound event to the chat-history buffer + JSONL
+        # BEFORE any other turn work so ``assemble_recent_activity_candidates``
+        # in ``_build_turn_prompt`` sees this turn's own trigger as
+        # context. No-op for triggers that don't represent conversation
+        # (scheduled_tick / saga_session_end / shell_job_complete).
+        await self._append_inbound_to_buffer(event, ctx.ifc_labels)
+
+        # chainlink #383 facet 1: mop up same-channel user messages that
+        # queued behind an interactive user turn before the dispatcher/registry
+        # made it injectable. The dispatcher drains only the contiguous
+        # user_message prefix, so non-user queued predecessors remain an
+        # ordering boundary. Do NOT drain for non-user triggers (session
+        # synthesis, react, shell-job, etc.): folding a user's queued message
+        # into a non-conversational turn can silently swallow it with no
+        # user-facing reply. Enqueue-time injection is likewise limited by
+        # only routing user messages for user_message turns in the dispatcher.
+        if self._dispatcher is not None and event.trigger == "user_message":
+            startup_events = self._dispatcher.drain_startup_user_messages(event.channel_id)
+            if startup_events:
+                accepted = mid_turn_injection.inject_startup_messages(
+                    event.channel_id, startup_events,
+                )
+                if accepted:
+                    await log_event(
+                        "mid_turn_startup_injected",
+                        channel_id=event.channel_id,
+                        count=accepted,
+                    )
+                    for startup_event in startup_events[:accepted]:
+                        await self.on_message_injected(startup_event)
+                if accepted < len(startup_events) and self._dispatcher is not None:
+                    self._dispatcher.requeue_front(startup_events[accepted:])
+
+        # Pre-message memory inject. Builds the "Possibly relevant
+        # memories" block + collects atom_ids for the post-turn
+        # feedback credit pass. Skipped for triggers in
+        # NON_USER_QUERY_TRIGGERS (saga_session_end, scheduled_tick,
+        # poller) — these turns have no user-authored query anchor so
+        # retrieval is wasteful noise; session summaries still fire
+        # via _assemble_session_summaries for all trigger types.
+        memory_block: str | None = None
+        memory_labels = InformationFlowLabels()
+        saga_atom_ids: list[str] = []
+        saga_query_task: asyncio.Task[
+            tuple[str | None, InformationFlowLabels]
+        ] | None = None
+        if self._saga is not None and event.trigger not in NON_USER_QUERY_TRIGGERS:
+            async def query_saga() -> tuple[str | None, InformationFlowLabels]:
+                labels = InformationFlowLabels()
+                block: str | None = None
+                try:
+                    # Pass the channel's recent transcript so SagaStore's
+                    # contextual rewrite can resolve referential queries into
+                    # self-contained retrieval anchors before embedding/FTS.
+                    rewrite_context = _rewrite_context_from_buffer(
+                        self._buffer, event.channel_id,
+                    ) if event.channel_id else None
+                    payload = await self._saga.query(
+                        event.content,
+                        top_k=12,
+                        session_id=saga_session_id,
+                        min_confidence_tier=(
+                            self._config.saga_pre_message_min_tier.strip() or None
+                        ),
+                        context=rewrite_context,
+                        auth_context=initial_auth_context,
+                    )
+                    raw_block = _format_saga_payload(payload)
+                    labels = _auto_recall_source_labels(
+                        initial_auth_context, payload,
+                    )
+                    if raw_block and raw_block != "(no atoms)":
+                        block = raw_block
+                    ids = _atom_ids_from_response(payload)
+                    triple_ids = _source_atom_ids_from_triples(payload)
+                    seen: set[str] = set()
+                    # Atom ids returned as atoms are already known-real. Triple
+                    # source ids are heuristic payload references and must resolve
+                    # before they can become turn citations.
+                    for aid in ids:
+                        if aid not in seen:
+                            seen.add(aid)
+                            saga_atom_ids.append(aid)
+                    for aid in await _resolve_heuristic_atom_ids(
+                        self._saga, triple_ids, auth_context=initial_auth_context,
+                    ):
+                        if aid not in seen:
+                            seen.add(aid)
+                            saga_atom_ids.append(aid)
+                except Exception as exc:
+                    log.warning("pre-message saga.query failed: %s", exc)
+                return block, labels
+
+            saga_query_task = asyncio.create_task(query_saga())
+
+        # Per-turn prompt assembly — Recent activity, Recent feedback,
+        # Session summaries, Resource usage, Upcoming, Upcoming
+        # commitments, Self-state, etc. Synthesis turns
+        # (saga_session_end) get a dedicated template instead.
+        stable_prefix_out: list[str] = []
+        turn_prompt, recent = await self._build_turn_prompt(
+            ctx, event,
+            saga_block=memory_block,
+            initial_auth_context=initial_auth_context,
+            saga_labels=memory_labels,
+            saga_query_task=saga_query_task,
+            stable_prefix_out=stable_prefix_out,
+        )
+
+        # Protected loaders merge their authoritative provenance into the turn
+        # during assembly. Do not relabel the assembled prompt as if every source
+        # belonged to the requester channel.
+        if ctx.auth_context is not None:
+            ctx.ifc_labels = ctx.auth_context.ifc_state.merge(ctx.ifc_labels)
+            ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
+        emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
+
+        # Build / reuse the agent singleton.
+        agent = await self._build_agent_if_needed()
+        from .tracing import _active_turn, MODEL
+        active_trace = _active_turn.get()
+        if active_trace is not None and active_trace.span is not None:
+            active_trace._safe(lambda: active_trace.span.set_attribute(
+                MODEL, str(getattr(self, "_agent_model_spec", None)
+                           or getattr(self._config, "model_spec", None) or "unknown"),
+            ))
+
+        # 0.3.0: auto-dispatch removed. The model's final text is NOT shipped
+        # to the channel — the agent must call the ``send_message`` tool to
+        # reply (and may call it multiple times per turn). The unsent final
+        # text is captured as reasoning in the turn record.
+        # The stored server-owned classification feeds the forgot-to-send guard
+        # at turn end; the typing indicator is started/cancelled in run_turn.
+        turn_is_interactive = _turn_is_interactive(getattr(ctx, "interactivity", None))
+
+        timeout = self._config.turn_timeout_seconds
+        # asyncio.timeout() is available on Python 3.11+, which is the
+        # hard deployment floor for mimir. Using it directly (no hasattr
+        # guard) means a mis-deployed Python <3.11 crashes loudly with
+        # AttributeError at turn-time rather than silently skipping
+        # enforcement — a P0 safety mechanism should never degrade
+        # silently. 0 = disabled (bench/dev).
+        if timeout > 0:
+            _timeout_ctx: Any = asyncio.timeout(timeout)
+        else:
+            _timeout_ctx = contextlib.nullcontext()
+
+        error: str | None = None
+        exception_traceback: str | None = None
+        # PII-light request-content inventory attached to provider errors
+        # (e.g. CodexResponseError on "HTTP 400: Unsupported content type")
+        # so a content rejection is queryable in events.jsonl. The getattr
+        # below keeps this inert on provider versions that don't surface it.
+        turn_error_request_summary: dict[str, Any] | None = None
+        transient_reason: str | None = None
+        retry_after_s: float | None = None
+        messages: list[Any] = []
+        callback_usage: dict[str | int, dict[str, int]] = {}
+        state_usage: dict[str | int, dict[str, int]] = {}
+        output = ""
+        events_truncated = False
+        # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
+        # folded into THIS turn mid-stream, read from the registry in the finally
+        # below (before deactivate pops it) so the turn record can carry the
+        # mid-turn inputs WITH a start-relative t_ms. Empty unless a mid-turn
+        # message was actually folded. (Chat-history recording happens at inject
+        # time via the dispatcher's on_inject hook, not here — PR 4.)
+        folded_records: list[tuple[AgentEvent, float]] = []
+        # chainlink #384: (event, reason) for folded messages the agent chose to
+        # DEFER (via defer_injected_message) — re-enqueued as their own turns in
+        # the finally, and marked deferred=true in injected_inputs below.
+        deferred_records: list[tuple[AgentEvent, str]] = []
+        try:
+            async with _timeout_ctx:
+                # ``stream_mode="values"`` yields the full state snapshot
+                # after each graph step; ``state.get("messages", [])`` is
+                # the canonical message list. We drain the stream to drive the
+                # graph to completion, then derive events/output from the final
+                # message list. (Pre-0.3.0 this loop also fed each new
+                # AIMessage through a streaming auto-dispatcher that flushed
+                # plan text mid-turn; auto-dispatch is gone — the agent now
+                # delivers via the send_message tool.)
+                invoke_config = {
+                    "configurable": {
+                        "thread_id": saga_session_id or session_id,
+                        # Per-turn channel id so send_message / react /
+                        # fetch_channel_history can default to it when
+                        # the model doesn't supply ``channel_id``
+                        # explicitly. Threads through LangGraph instead
+                        # of the old process-global ``_STATE`` setter,
+                        # which raced across concurrent dispatcher turns
+                        # on different channels.
+                        "channel_id": event.channel_id,
+                    },
+                }
+                if getattr(self._config, "tracing_enabled", False) and self._trace_controller is not None:
+                    active_trace = _active_turn.get()
+                    if active_trace is not None:
+                        try:
+                            def count_callback(message: Any) -> None:
+                                values = _trace_usage(message)
+                                if values is None:
+                                    return
+                                identity = message.id or id(message)
+                                previous = callback_usage.setdefault(identity, {})
+                                for key, value in values.items():
+                                    previous[key] = previous.get(key, 0) + value
+
+                            active_trace.set_usage_observer(count_callback)
+                            invoke_config["callbacks"] = [active_trace.callback]
+                        except Exception:
+                            log.warning("Tracing callback unavailable.")
+                # chainlink #583 slice 2: request both stream modes. "values"
+                # gives the full-state snapshots the turn record is built from
+                # (block-level brackets, slice 1); "messages" gives token-level
+                # AIMessageChunks so tool-call args (the send_message reply)
+                # stream live where the backend supports it (codex-plus >=0.0.4,
+                # anthropic, openai). LangGraph yields (mode, payload) tuples
+                # when stream_mode is a list; the fallback keeps working if a
+                # backend ignores the list and yields bare snapshots.
+                async for item in agent.astream(
+                    {"messages": [_turn_human_message(
+                        turn_prompt, stable_prefix_out[0] if stable_prefix_out else "",
+                        self._agent_model,
+                    )]},
+                    config=invoke_config,
+                    context=ctx.auth_with_plugin_state(),
+                    stream_mode=["values", "messages"],
+                ):
+                    if isinstance(item, tuple) and len(item) == 2:
+                        mode, payload = item
+                    else:
+                        mode, payload = "values", item
+                    if mode == "values" and isinstance(payload, dict):
+                        messages = list(payload.get("messages", []))
+                        if active_trace is not None:
+                            for message in messages:
+                                if isinstance(message, AIMessage):
+                                    values = _trace_usage(message)
+                                    if values is not None:
+                                        state_usage[message.id or id(message)] = values
+                        # Block-level brackets (slice 1): animate mid-turn,
+                        # no-op when the bus is unwired; never raises.
+                        emitter.blocks_from_messages(messages)
+                    elif mode == "messages" and isinstance(payload, tuple) and payload:
+                        # payload is (message_chunk, metadata); stream token deltas.
+                        emitter.token_chunk(payload[0])
+                events, output = extract_turn_events(messages)
+                # Forgot-to-send recovery (opt-in, MIMIR_RESEND_NUDGE_CHANNELS):
+                # an interactive turn that produced text but never delivered gets
+                # ONE in-band re-prompt to call send_message. Folded into THIS
+                # turn/thread, so it inherits the original context and adds no
+                # SAGA recall/synthesis.
+                messages, events, output = await self._maybe_resend_nudge(
+                    agent, invoke_config, ctx, event,
+                    turn_id=turn_id,
+                    turn_is_interactive=turn_is_interactive,
+                    messages=messages, events=events, output=output,
+                )
+                if active_trace is not None:
+                    for message in messages:
+                        if isinstance(message, AIMessage):
+                            values = _trace_usage(message)
+                            if values is not None:
+                                state_usage[message.id or id(message)] = values
+        except asyncio.TimeoutError:
+            error = f"TurnTimeout: turn exceeded {timeout}s wall-clock limit"
+            log.error(
+                "turn timed out after %ss (channel=%s, turn=%s)",
+                timeout, event.channel_id, turn_id,
+            )
+            await log_event("turn_timeout", channel_id=event.channel_id, timeout_s=timeout)
+        except Exception as exc:
+            from .redaction import redact_text
+
+            if event.trigger == "poller":
+                transient_reason, retry_after_s = _transient_provider_failure(exc)
+            error = redact_text(f"{type(exc).__name__}: {exc}")[:2048]
+            exception_traceback = redact_text("".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__, limit=16)
+            ))
+            # langchain-codex-plus >= 0.0.5 attaches a request-content summary
+            # to CodexResponseError; surface it on turn_failed so a content
+            # rejection (e.g. "Unsupported content type") names itself.
+            _req_summary = getattr(exc, "request_summary", None)
+            if isinstance(_req_summary, dict):
+                turn_error_request_summary = _req_summary
+            log.error("agent.astream failed: %s", error)
+            # Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
+            # If the model call surfaced as a 429, record a pause so
+            # subsequent scheduled ticks suppress until the window
+            # resets, and emit a structured ``quota_exhausted`` event
+            # (algedonic negative). User-message turns still try to
+            # run per §4.9 — they'll get their own 429 and surface
+            # it to the operator via send_message rather than vanishing.
+            try:
+                from .quota_pause import QuotaPauseTracker, is_quota_exhaustion
+                if is_quota_exhaustion(exc):
+                    from .billing import record_codex_plus_rejection
+
+                    record_codex_plus_rejection(self._rate_limits, exc)
+                    tracker = QuotaPauseTracker(
+                        self._config.home / ".mimir" / "quota_pause.json"
+                    )
+                    # Classify: an authoritative reset → pause until then;
+                    # a header-less 429 → short escalating backoff (so a
+                    # transient burst doesn't sit out a full window).
+                    reset_at, pause_reason = tracker.record_rate_limit(exc)
+                    if tracker.last_save_ok is not False:
+                        await log_event(
+                            "quota_exhausted",
+                            channel_id=event.channel_id,
+                            turn_id=turn_id,
+                            reset_at=reset_at.isoformat(),
+                            pause_reason=pause_reason,
+                            provider=tracker.provider,
+                            exception_class=type(exc).__name__,
+                            exception_message=str(exc)[:240],
+                        )
+                        # Arm a recovery wake so the agent retries exactly
+                        # when the window should roll over, instead of idling
+                        # until the next hourly scheduled tick.
+                        sched = getattr(self, "_scheduler", None)
+                        if sched is not None and hasattr(sched, "arm_quota_recovery_wake"):
+                            try:
+                                sched.arm_quota_recovery_wake(reset_at)
+                            except Exception:  # noqa: BLE001
+                                log.exception(
+                                    "arm_quota_recovery_wake failed; next "
+                                    "scheduled tick will still recover"
+                                )
+            except Exception:  # noqa: BLE001 — defensive boundary
+                log.exception("quota_pause emit failed; continuing")
+        finally:
+            # chainlink #376: drop the in-flight registry entry (rejects a late
+            # inject as no_active_turn; a crashed turn can't leak a stale active
+            # queue). Any leftover events were accepted by inject_message AFTER
+            # the turn's final before_model boundary (e.g. a follow-up sent while
+            # the model was generating its last response) so they were never
+            # folded. They arrived BEFORE any same-channel event that queued
+            # while this turn ran, so route them to the FRONT of the channel
+            # queue (ahead of those later events) rather than appending via
+            # enqueue() — preserving within-channel arrival order (PR 2; mimir's
+            # #591 + #593 review notes).
+            # PR 3/4 + chainlink #435: atomically snapshot what this turn folded
+            # (with fold times), what it deferred, and what was accepted but never
+            # folded before popping the registry entry. A sync before_model hook can
+            # run in an executor thread; separate folded_records()/deferred_records()
+            # reads before deactivate could miss a drain that lands between those
+            # reads and the pop. deactivate() returns all three snapshots under one
+            # lock, so queue/folded/deferred cannot change between observe+finalize.
+            (
+                leftover_injections,
+                folded_records,
+                deferred_records,
+            ) = mid_turn_injection.deactivate(event.channel_id)
+            requeue_results = []
+            if leftover_injections and self._dispatcher is not None:
+                user_leftovers = [e for e in leftover_injections if e.trigger != "shell_job_complete"]
+                for completion in leftover_injections:
+                    if completion.trigger == "shell_job_complete":
+                        await Agent._queue_shell_followup(self, completion)
+                if user_leftovers:
+                    requeued = self._dispatcher.requeue_front(user_leftovers)
+                    requeue_results.append((
+                        "mid_turn_injection_leftover", len(user_leftovers), requeued,
+                    ))
+            # chainlink #384: re-enqueue deferred messages as their own fresh
+            # turns. force_new_turn=True makes Dispatcher.enqueue / startup-drain
+            # refuse to re-fold them (loop guard); deferred_from_turn_id +
+            # deferred_reason make the later delivery traceable. Front of the
+            # queue (like leftovers) preserves their mid-turn arrival order ahead
+            # of post-turn events. _buffer_recorded is preserved from the original
+            # inject-time record, so chat history isn't duplicated.
+            if deferred_records and self._dispatcher is not None:
+                deferred_events = [
+                    replace(ev, extra={
+                        **ev.extra,
+                        "force_new_turn": True,
+                        "deferred_from_turn_id": turn_id,
+                        "deferred_reason": reason,
+                    })
+                    for ev, reason in deferred_records
+                ]
+                requeued = self._dispatcher.requeue_front(deferred_events)
+                requeue_results.append(("mid_turn_deferred", len(deferred_events), requeued))
+            # Restore both batches before any telemetry await can fail or cancel.
+            for kind, count, requeued in requeue_results:
+                await self._log_injection_requeue(
+                    kind, event.channel_id, turn_id, count, requeued,
+                )
+
+        if error is not None:
+            events, events_truncated = extract_partial_tool_events(messages)
+            output = ""
+
+        # chainlink #511: if the per-turn iteration ceiling force-stopped this
+        # turn, the model never got to deliver — notify the channel rather than
+        # truncating silently. (The 90%/100% events already recorded the cap.)
+        if getattr(ctx, "iteration_hard_stopped", False):
+            await self._notify_iteration_hard_stop(
+                event, getattr(ctx, "iteration_budget", 0), ctx,
+            )
+
+        # Result fields drive both terminal events and the TurnRecord, so derive
+        # them before finalization and reuse the exact classification.
+        if active_trace is not None:
+            with active_trace._lock:
+                for identity, values in state_usage.items():
+                    for key, value in values.items():
+                        if isinstance(value, int) and value >= 0:
+                            active_trace._totals[key] += max(
+                                0, value - callback_usage.get(identity, {}).get(key, 0),
+                            )
+        result_fields = derive_result_fields(messages, context=ctx)
+        if error is not None:
+            # Partial model messages cannot certify a failed host turn as success.
+            # Preserve specific failures (notably budget exhaustion) for recovery.
+            result_fields["result_is_error"] = True
+            if result_fields["result_subtype"] in (None, "success"):
+                result_fields["result_subtype"] = "error_turn"
+        hard_refusals = list(getattr(ctx, "hard_boundary_denials", []) or [])
+        remediation_effects = list(getattr(ctx, "remediation_effects", []) or [])
+        refusal_is_exempt = bool(hard_refusals and not remediation_effects)
+        outcome_is_error = bool(error or result_fields["result_is_error"])
+        outcome_fields = {
+            "result_subtype": result_fields["result_subtype"],
+            "result_is_error": result_fields["result_is_error"],
+            "stop_reason": result_fields["stop_reason"],
+            "tool_call_count": ctx.tool_call_count,
+            # This is framework-authored from boundary middleware state, never
+            # inferred from model text or a tool error message.
+            "attempt_disposition": (
+                "exempt_hard_refusal" if refusal_is_exempt else
+                "transient_provider" if transient_reason else "charge"
+            ),
+            "attempt_reason": (
+                ", ".join(
+                    sorted({
+                        str(item.get("reason") or item.get("boundary"))
+                        for item in hard_refusals
+                        if isinstance(item, dict)
+                    })
+                )
+                if refusal_is_exempt
+                else (transient_reason or (error[:240] if error else result_fields["result_subtype"]))
+            ),
+            "hard_refusals": hard_refusals,
+            "remediation_effects": remediation_effects,
+        }
+
+        # Algedonic: surface EVERY turn failure as an event so a dropped
+        # turn — a transient model 503, a timeout, quota exhaustion, or a
+        # plain bug — is operator-visible on the ops dashboard and
+        # queryable in events.jsonl, not just a ``log.exception`` line.
+        # Fires for ALL turn kinds (poller / user_message / scheduled /
+        # heartbeat) and ALL failure types; the ``turn_timeout`` and
+        # ``quota_exhausted`` events above remain as additional context.
+        # A transient poller-review 503 used to vanish entirely here —
+        # invisible AND (cursor-advanced) un-retried. (chainlink #299)
+        if outcome_is_error:
+            await log_event(
+                "turn_failed",
+                channel_id=event.channel_id,
+                turn_id=turn_id,
+                trigger=event.trigger,
+                error=(error[:240] if error else result_fields["result_subtype"]),
+                **({"retry_after_s": retry_after_s} if transient_reason and retry_after_s else {}),
+                **outcome_fields,
+                **(
+                    {"traceback": exception_traceback[-4000:]}
+                    if exception_traceback else {}
+                ),
+                **(
+                    {"request_summary": turn_error_request_summary}
+                    if turn_error_request_summary else {}
+                ),
+                **_turn_outcome_identity(event),
+            )
+            if error:
+                await self._notify_chat_skill_failure(
+                    event, error, ctx, phase="model_loop",
+                )
+            # chainlink #508: a poller/tick turn that declared a deliver:
+            # channel couldn't surface its own result — post the mechanical
+            # failure notice there. (Mirrored in the outer early-failure guard
+            # for crashes before the model loop; disjoint via outcome_emitted.)
+            if error or any(hook(event) for hook in _selected_turn_hooks(
+                self._config.plugin_manager.policy, "failure_intervention",
+            )):
+                failure_detail = (
+                    error
+                    or str(result_fields["result_subtype"] or result_fields["stop_reason"])
+                    or "incident intervention failed"
+                )
+                await self._post_deliver_failure(event, failure_detail, ctx)
+        elif event.trigger == "poller":
+            # Success counterpart to ``turn_failed`` for poller turns
+            # (chainlink #262): records that this poller item's turn was
+            # processed without erroring, so the framework consumer can
+            # advance the per-poller watermark past it and NOT re-emit it.
+            # Poller-gated so events.jsonl doesn't grow a success event per
+            # user / scheduled / heartbeat turn; not in
+            # ``feedback._EVENT_RULES``, so it never surfaces algedonically
+            # — it's a plumbing record for the poller-recovery consumer.
+            await log_event(
+                "turn_completed",
+                channel_id=event.channel_id,
+                turn_id=turn_id,
+                trigger=event.trigger,
+                **outcome_fields,
+                **_turn_outcome_identity(event),
+            )
+        # chainlink #306: the terminal outcome for this turn has now been
+        # emitted (turn_failed on a model-loop error, turn_completed on a
+        # poller success). Mark it so run_turn's early-crash guard doesn't
+        # double-emit if a LATER step in this body raises.
+        ctx.outcome_emitted = True
+
+        # Assemble this turn's cited-atom set for the TurnRecord. NO
+        # automatic feedback (operator decision 2026-05-29): the old
+        # post-message credit pass wrote a weight-2.0 ``feedback_positive``
+        # boost on every cited atom whenever the turn merely "didn't fail"
+        # — a positive-only ratchet layered on top of the ``retrieval``
+        # access event recall already logs, crediting atoms for being in
+        # the context window rather than for being used. Activation now
+        # rises only from (a) that retrieval access event and (b)
+        # DELIBERATE agent-curated feedback: the session-boundary synthesis
+        # turn's ``saga_feedback`` votes and explicit
+        # ``saga_mark_contributions`` (both emit ``saga_feedback_sent``).
+        #
+        # We still build the cited-atom union — pre-injected retrievals +
+        # mid-turn ``saga_query`` hits + injected skill learnings (slice 6)
+        # — because that's the candidate list the synthesis turn curates
+        # over (it reaches the synthesis prompt via the TurnRecord's
+        # ``saga_atom_ids`` → turns.jsonl → ``_atom_feedback_lines``).
+        if self._saga is not None:
+            tool_atom_ids = await _resolve_heuristic_atom_ids(
+                self._saga,
+                _extract_atom_ids_from_tool_results(messages),
+                auth_context=ctx.auth_context,
+            )
+            for aid in tool_atom_ids:
+                if aid not in saga_atom_ids:
+                    saga_atom_ids.append(aid)
+            # Injected skill learnings only exist when a SagaStore is wired
+            # (augment_skill_body needs one), so they belong under the same
+            # guard — keeps the cited-atom assembly symmetric (#268).
+            for aid in ctx.injected_skill_atom_ids:
+                if aid not in saga_atom_ids:
+                    saga_atom_ids.append(aid)
+
+        # Build and write TurnRecord — matches the SDK schema.
+        # Drain observability state captured during this turn:
+        #   - permission_denials from WriteGuardBackend (every blocked
+        #     write/edit/upload during the turn).
+        #   - saga_calls from TurnContext (populated by
+        #     RecordingSagaClient on every recorded saga method).
+        permission_denials: list = []
+        if self._backend is not None and hasattr(self._backend, "drain_denials"):
+            try:
+                permission_denials = self._backend.drain_denials(turn_id=turn_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("backend.drain_denials failed: %s", exc)
+        # Gap 3 fix: emit one algedonic negative per denied write/edit/upload
+        # so the per-turn feedback block surfaces write-guard denials. The
+        # backend only records them (sync); we emit here where we're async.
+        for _denial in permission_denials:
+            await safe_log_event(
+                "tool_call_denied",
+                op=_denial.get("op"),
+                file_path=_denial.get("file_path"),
+                session_id=session_id,
+            )
+        # Gap 2 fix: if this is a synthesis turn (saga_session_end trigger)
+        # and the model didn't call saga_end_session, emit the boundary-skip
+        # signal so the next turn's algedonic block surfaces it for
+        # self-correction.
+        if (
+            event.trigger == "saga_session_end"
+            and not ctx.saga_end_session_called
+            and not any(
+                item.get("type") == "tool_result"
+                and item.get("name") == "saga_end_session"
+                and "saga_end_session ok:" in str(item.get("content", ""))
+                for item in events
+                if isinstance(item, dict)
+            )
+        ):
+            await safe_log_event(
+                "saga_synthesis_skipped_boundary",
+                session_id=saga_session_id,
+                trigger=event.trigger,
+            )
+        # Expected-tool-call check (#234/#235; #299 follow-up; per-item in
+        # #308): the event source can declare an ``expected_tool_call``
+        # marker (a poller needing the turn to call a submission tool —
+        # github-poller's review events expect ``gh pr review``). For a
+        # poller BATCH each review item carries its OWN marker; when that
+        # marker's ``bash_substrings`` is PR-specific (the PR number / url)
+        # we can tell WHICH item wasn't submitted — so a duplicate review of
+        # one PR no longer masks an unreviewed sibling (#308). A marker is
+        # "missed" when NONE of its declared submissions fired.
+        #
+        # Only checked on a SUCCEEDED turn (#308 / finding #22): a failed or
+        # timed-out turn already emits ``turn_failed``, so re-flagging the
+        # un-submitted review would be redundant noise.
+        sub_markers = [] if error else _expected_submission_markers(event.extra or {})
+        if sub_markers:
+            signal_type = sub_markers[0].get("signal_on_missing")
+            # Per-item: each marker is satisfied independently by its own
+            # submission(s). Generic (non-PR-specific) markers all match the
+            # same submissions and degrade to all-or-nothing — no false
+            # positives, just no per-item attribution.
+            missed = []
+            # Keep gh calls sequential, but off the event loop: each network
+            # subprocess can take up to 15 seconds.
+            for m in sub_markers:
+                if (
+                    _count_expected_tool_calls(events, m) == 0
+                    and not await asyncio.to_thread(_gh_review_submitted_for_marker, m)
+                ):
+                    missed.append(m)
+            if isinstance(signal_type, str) and signal_type.strip() and missed:
+                ext = event.extra or {}
+                items = ext.get("items") or []
+                event_type = ext.get("event_type") or (
+                    items[0].get("event_type")
+                    if items and isinstance(items[0], dict) else None
+                )
+                # Which items were not submitted (PR url / #number) — for
+                # PR-specific markers; None for generic markers.
+                missed_refs = [m.get("ref") for m in missed if m.get("ref")]
+                await safe_log_event(
+                    signal_type.strip(),
+                    channel_id=event.channel_id,
+                    # ``event_type`` is log_event's positional parameter, so the
+                    # originating poller event type goes under a distinct key —
+                    # else "multiple values for argument 'event_type'" (the same
+                    # collision pollers.py strips ``event_type`` to avoid).
+                    source_event_type=event_type,
+                    expected=len(sub_markers),
+                    submitted=len(sub_markers) - len(missed),
+                    missed=len(missed),
+                    missed_refs=missed_refs or None,
+                    expected_tool_names=list(sub_markers[0].get("tool_names") or []),
+                )
+        saga_calls = [
+            {
+                "call_type": c.call_type, "args": c.args, "result": c.result,
+                "latency_ms": c.latency_ms, "error": c.error, "t_ms": c.t_ms,
+            }
+            for c in ctx.saga_calls
+        ]
+        final_labels = ctx.auth_context.ifc_state.current(ctx.ifc_labels)
+        if not isinstance(final_labels, InformationFlowLabels):
+            final_labels = InformationFlowLabels()
+        max_integrity_sources = 32
+        ordered_integrity_sources = sorted(
+            final_labels.sources,
+            key=lambda source: (
+                0 if source.has_untrusted_active_ingest else (
+                    1 if source.integrity == Integrity.UNTRUSTED else 2
+                ),
+                source.domain or "",
+                source.resource_id or "",
+                source.domain_qualifier or "",
+                source.principal or "",
+                str(source.source_kind),
+                str(source.integrity_effect),
+            ),
+        )
+        integrity_source_counts: dict[str, int] = {}
+        for source in ordered_integrity_sources:
+            category = f"{source.integrity}/{source.integrity_effect}"
+            integrity_source_counts[category] = integrity_source_counts.get(category, 0) + 1
+        untrusted_active_ingest_domains = sorted({
+            source.domain
+            for source in final_labels.sources
+            if source.has_untrusted_active_ingest and isinstance(source.domain, str)
+        })[:max_integrity_sources]
+        integrity_sources = [
+            {
+                "principal": source.principal,
+                "domain": source.domain,
+                "domain_qualifier": source.domain_qualifier,
+                "resource_id": source.resource_id,
+                "source_kind": source.source_kind,
+                "integrity": source.integrity,
+                "integrity_effect": source.integrity_effect,
+            }
+            for source in ordered_integrity_sources[:max_integrity_sources]
+        ]
+        record = TurnRecord(
+            ts=_utc_now(),
+            turn_id=turn_id,
+            session_id=session_id,
+            saga_session_id=saga_session_id,
+            trigger=event.trigger,
+            channel_id=event.channel_id,
+            input=truncate_input(turn_prompt),
+            agent_id=self._config.agent_id,
+            saga_atom_ids=saga_atom_ids,
+            events=events,
+            events_partial=error is not None,
+            events_truncated=events_truncated,
+            # chainlink #376 (PR 3/4): each mid-turn message folded into this turn
+            # as ``{t_ms, text}`` — rendered the way the model saw it (author +
+            # attachments header, capped) plus a start-relative offset (same axis
+            # as event/saga t_ms) so the turn viewer can place it on the timeline
+            # at the boundary it was folded, not in a side list.
+            injected_inputs=[
+                {
+                    "t_ms": max(0, round((mono - t_total_start) * 1000, 2)),
+                    "text": truncate_input(mid_turn_injection.render_injected_message(e)),
+                    # chainlink #384: mark entries the agent deferred to their own
+                    # turn, so "why didn't turn N answer this folded message?" is
+                    # traceable from turn N's own record (pairs with the
+                    # deferred_from_turn_id on the re-delivered turn).
+                    **({"deferred": True}
+                       if e.trigger == "user_message" and e.source_id in {ev.source_id for ev, _r in deferred_records}
+                       else {}),
+                }
+                for e, mono in folded_records
+            ],
+            output=(output or "")[:2048],
+            duration_ms=int((time.monotonic() - t_total_start) * 1000),
+            error=error,
+            permission_denials=permission_denials,
+            saga_calls=saga_calls,
+            interactivity=getattr(ctx, "interactivity", None),
+            tool_call_count=ctx.tool_call_count,
+            integrity=_effective_persisted_integrity(final_labels, ctx.auth_context),
+            integrity_effect=(
+                IntegrityEffect.INFORMATIONAL
+                if not ctx.auth_context.ifc_state.has_untrusted_active_ingest(final_labels)
+                else final_labels.persisted_integrity_effect
+            ),
+            integrity_sources=integrity_sources,
+            integrity_source_counts=integrity_source_counts,
+            untrusted_active_ingest_domains=untrusted_active_ingest_domains,
+            integrity_sources_omitted=max(
+                0, len(final_labels.sources) - max_integrity_sources,
+            ),
+            **result_fields,
+        )
+        await self._turn_logger.write(record)
+        # Continuation sidecars are server-owned bookkeeping, not model writes.
+        intervention = any(hook(event) for hook in _selected_turn_hooks(
+            self._config.plugin_manager.policy, "failure_intervention",
+        ))
+        continuation_hooks = _selected_turn_hooks(
+            self._config.plugin_manager.policy, "budget_continuation",
+        )
+        if ctx.tool_call_budget_exhausted and not intervention and continuation_hooks:
+            continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
+            try:
+                try:
+                    current_worktree = Path.cwd().resolve()
+                except OSError:
+                    current_worktree = None
+                continuation_event = replace(
+                    event,
+                    ifc_labels=_propagate_ifc_labels(
+                        ctx.ifc_labels, event.channel_id, ctx.auth_context,
+                    ),
+                )
+                for continuation_hook in continuation_hooks:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            continuation_hook,
+                            home=self._config.home,
+                            event=continuation_event,
+                            ctx=ctx,
+                            record=record,
+                            repo=current_worktree,
+                            current_worktree=current_worktree,
+                            run_id=(
+                                continuation_event.extra.get("run_id")
+                                if isinstance(continuation_event.extra.get("run_id"), str)
+                                else None
+                            ),
+                        ),
+                        timeout=continuation_timeout_s,
+                    )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "worklink continuation recovery exceeded timeout (%ss) for turn %s",
+                    continuation_timeout_s,
+                    turn_id,
+                )
+                await safe_log_event(
+                    "worklink_continuation_failed",
+                    turn_id=turn_id,
+                    channel_id=event.channel_id,
+                    trigger=event.trigger,
+                    source_id=event.source_id,
+                    error=f"timed out after {continuation_timeout_s:.2f}s",
+                    timeout_s=continuation_timeout_s,
+                    tool_call_count=ctx.tool_call_count,
+                    tool_call_budget=ctx.tool_call_budget,
+                    denied_count=ctx.tool_call_budget_denied_count,
+                    denied_tools=ctx.tool_call_budget_denied_tools or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "worklink continuation recovery failed for turn %s: %s",
+                    turn_id,
+                    exc,
+                    exc_info=True,
+                )
+                await safe_log_event(
+                    "worklink_continuation_failed",
+                    turn_id=turn_id,
+                    channel_id=event.channel_id,
+                    trigger=event.trigger,
+                    source_id=event.source_id,
+                    error=str(exc)[:300],
+                    timeout_s=continuation_timeout_s,
+                    tool_call_count=ctx.tool_call_count,
+                    tool_call_budget=ctx.tool_call_budget,
+                    denied_count=ctx.tool_call_budget_denied_count,
+                    denied_tools=ctx.tool_call_budget_denied_tools or None,
+                )
+
+        # Fire the finalize stage of the turn hook chain. The default
+        # ``CommitmentExtractionHook`` runs Phase 2a commitment
+        # extraction (saga_session_end → structured commitment records),
+        # restoring the SDK-era ``CommitmentExtractionHook.finalize``
+        # behavior. Additional deployment-specific finalize hooks
+        # (wiki backlinks, custom synthesis, etc.) can be registered
+        # via the ``Agent(turn_hooks=...)`` constructor parameter or
+        # ``Agent.add_hook(...)``. Per-hook exception isolation —
+        # see ``mimir.turn_hooks.fire_hooks``.
+        # chainlink #389: bound finalize hooks. Operator-registered hooks are
+        # arbitrary code; a hang here would hold the dispatcher worker (and thus
+        # the whole channel) forever — turn_timeout_seconds only covers the model
+        # stream, not this post-loop work. The TurnRecord is already written
+        # above, so a timeout here only drops best-effort finalize work.
+        finalize_timeout = self._config.post_turn_timeout_seconds
+        if finalize_timeout <= 0:
+            finalize_timeout = 180
+        from .access_control import _turn_has_untrusted_active_ingest
+        semantic_writes_allowed = not _turn_has_untrusted_active_ingest(ctx.auth_context, ctx.ifc_labels)
+        try:
+            if semantic_writes_allowed:
+                await asyncio.wait_for(
+                    fire_hooks("finalize", self._hooks, ctx, event, record),
+                    timeout=finalize_timeout,
+                )
+        except asyncio.TimeoutError:
+            log.warning(
+                "finalize hooks exceeded post_turn_timeout (%ss) — skipped to "
+                "avoid wedging the channel",
+                finalize_timeout,
+            )
+
+        # Post-turn observability hooks (181-M). Order matters:
+        #   1. wiki_backlinks: regenerates state/wiki/{orphans,
+        #      dangling-links,backlinks-index}.md when a wiki content
+        #      page was modified this turn. Must run BEFORE index
+        #      rebuild so INDEX.md picks up the freshly-regen'd outputs.
+        #   2. index_rebuild: regen state/INDEX.md + memory/INDEX.md
+        #      via the per-Agent IndexGenerator (debounced internally).
+        #   3. git_commit: post-turn commit gated on
+        #      MIMIR_GIT_TRACKING_ENABLED — runs last so all regen'd
+        #      outputs are part of the same commit as the writes that
+        #      triggered them.
+        # Each is best-effort: failures log + return; turn record stays.
+        if semantic_writes_allowed:
+            await self._post_turn_wiki_backlinks(ctx)
+            await self._post_turn_index_rebuild()
+            await self._post_turn_git_commit(ctx)
+
+        # 0.3.0: no auto-dispatch. The agent delivers via the send_message
+        # tool only; the model's final text is captured as reasoning (it's
+        # already in the TurnRecord ``output`` + a reasoning event) and is
+        # intentionally NOT shipped to the channel or appended to the chat
+        # buffer as a sent message. (Typing is released in run_turn's finally.)
+        #
+        # Forgot-to-send guard: an interactive turn that produced final text
+        # but never DELIVERED a response means the text is stuck as reasoning
+        # and the user got nothing. Key off confirmed delivery — a successful
+        # send_message OR a successful react (a react-only acknowledgment is a
+        # valid reply, so it must NOT be flagged) — NOT the presence of a tool
+        # call, which can be refused (non-interactive / loop hard-stop / no
+        # bridge) or soft-fail and deliver nothing.
+        #
+        # chainlink #423: the check is CHANNEL-SCOPED — the delivery must
+        # reach the TRIGGERING channel. A turn whose only confirmed
+        # delivery is a cross-channel send (e.g. an ops-channel alert)
+        # left the asking user in silence, which is exactly what this
+        # signal exists to catch; the convention is "close the loop with
+        # whoever asked" (see prompts.py). ``delivered_elsewhere`` is
+        # carried on the event so feedback/reflection can distinguish
+        # totally-silent from answered-in-the-wrong-room. Emit a negative
+        # signal so the next turn's feedback panel surfaces it
+        # (feedback.classify maps it to a negative ``no_reply``).
+        await self._maybe_auto_deliver_final_text(
+            ctx, event,
+            turn_id=turn_id,
+            turn_is_interactive=turn_is_interactive,
+            output=output,
+        )
+        _delivered = getattr(ctx, "delivered_channel_ids", None) or set()
+        if (
+            turn_is_interactive
+            and (output or "").strip()
+            and event.channel_id not in _delivered
+        ):
+            await safe_log_event(
+                "interactive_turn_no_send_message",
+                channel_id=event.channel_id,
+                turn_id=turn_id,
+                trigger=event.trigger,
+                output_chars=len((output or "").strip()),
+                **(
+                    {"delivered_elsewhere": sorted(_delivered)}
+                    if _delivered else {}
+                ),
+            )
+
+        await log_event(
+            "turn_finished",
+            turn_id=turn_id,
+            channel_id=event.channel_id,
+            duration_ms=record.duration_ms,
+            error=error,
+            stop_reason=result_fields.get("stop_reason"),
+        )
+
+        # Autonomous-work triggers (cron + poller) don't anchor a
+        # conversation, so the standard ``MIMIR_SAGA_SESSION_IDLE_MINUTES``
+        # countdown would just defer the synthesis turn by 10 minutes with
+        # no recall benefit (no more turns will fire on the same session
+        # — the next cron tick / poller batch creates its own session via
+        # ``SessionManager.touch``). Force-end the session now so the
+        # synthesis turn runs immediately after the autonomous work.
+        # ``end_now`` enqueues a ``saga_session_end`` turn via the registered
+        # on-idle callback (see ``server.py:_on_session_idle``), which the
+        # per-channel dispatcher will pick up after this turn returns and
+        # the worker frees up.
+        if (
+            self._sessions is not None
+            and event.channel_id
+            and event.trigger in IMMEDIATE_SESSION_END_TRIGGERS
+        ):
+            try:
+                await self._sessions.end_now(event.channel_id)
+            except Exception:  # noqa: BLE001
+                # Synthesis enqueue failure shouldn't crash the just-
+                # completed autonomous turn — log + swallow. Note:
+                # end_now pops the session from the registry under its
+                # internal lock BEFORE calling _dispatch_idle, so an
+                # exception here means the session is already ended
+                # in-process state but the synthesis turn never got
+                # enqueued. Recovery: the next event on the channel
+                # creates a fresh session via touch() — the autonomous
+                # work's session boundary atom is lost for this tick,
+                # but the channel keeps functioning.
+                log.exception(
+                    "immediate session-end failed for trigger=%r channel_id=%r",
+                    event.trigger,
+                    event.channel_id,
+                )
+
+        if event.trigger == "scheduled_tick" and event.channel_id == "scheduler:commitments-review":
+            from .access_control import can_review_commitments
+            from .commitment_proposals import seal_review
+            from .commitments.store import run_store_io
+            if can_review_commitments(ctx.auth_context):
+                await run_store_io(seal_review, self._config.home, turn_id)
+
+        return record
+
+    # ────────────────────────────────────────────────────────────
+    # Post-turn hooks (181-M)
+    # ────────────────────────────────────────────────────────────
+    #
+    # ``_maybe_extract_commitments`` lived here pre-#213; it was
+    # migrated to ``mimir.turn_hooks.CommitmentExtractionHook`` and
+    # is now fired via the ``finalize`` stage of the turn hook chain
+    # (see the ``await fire_hooks("finalize", ...)`` call above).
+    # Other inlined finalize logic (wiki backlinks, etc.) can migrate
+    # to hooks following the same pattern in follow-up PRs.
+
+    # Generated wiki outputs — the WikiBacklinksHook regenerates these
+    # itself, so changes to them must NOT trigger another regeneration
+    # (otherwise the hook would loop on its own writes).
+    _WIKI_GENERATED_OUTPUTS = frozenset({
+        "orphans.md",
+        "dangling-links.md",
+        "backlinks-index.md",
+    })
+
+    def _snapshot_wiki_mtimes(self) -> dict[str, float]:
+        """Walk ``<home>/state/wiki``, return ``{abs_path_str: st_mtime}``
+        for every non-generated content page. Empty dict when the wiki
+        dir doesn't exist."""
+        wiki = self._config.home / "state" / "wiki"
+        snapshot: dict[str, float] = {}
+        if not wiki.is_dir():
+            return snapshot
+        for page in wiki.rglob("*.md"):
+            if page.name in self._WIKI_GENERATED_OUTPUTS:
+                continue
+            try:
+                snapshot[str(page)] = page.stat().st_mtime
+            except OSError:
+                continue
+        return snapshot
+
+    async def _snapshot_wiki_mtimes_async(self) -> dict[str, float]:
+        from .wiki_backlinks import _BACKLINKS_EXECUTOR
+
+        # Keep each complete start/end observation on the dedicated wiki pool.
+        return await asyncio.get_running_loop().run_in_executor(
+            _BACKLINKS_EXECUTOR, self._snapshot_wiki_mtimes,
+        )
+
+    async def _post_turn_wiki_backlinks(self, ctx: Any) -> None:
+        """Regenerate the wiki backlinks/orphans/dangling outputs when
+        ANY non-generated state/wiki/*.md page changed mtime relative
+        to the pre-turn snapshot. Edit-triggered (not periodic) so
+        orphan / dangling regressions surface on the turn that
+        introduced them. Direct port of ``WikiBacklinksHook.finalize``."""
+        wiki = self._config.home / "state" / "wiki"
+        if not wiki.is_dir():
+            return
+        before: dict[str, float] = getattr(ctx, "wiki_mtime_snapshot", {}) or {}
+        after = await self._snapshot_wiki_mtimes_async()
+
+        touched = False
+        for path_str, mtime in after.items():
+            if before.get(path_str) != mtime:
+                touched = True
+                break
+        if not touched:
+            for path_str in before:
+                if path_str not in after:
+                    touched = True
+                    break
+        if not touched:
+            return
+
+        from . import wiki_backlinks
+        try:
+            await wiki_backlinks.run(self._config.home)
+        except FileNotFoundError:
+            # Wiki dir disappeared between snapshot and run — benign race.
+            return
+        except Exception:  # noqa: BLE001 — never crash a turn for this
+            log.exception("wiki_backlinks regen failed; continuing")
+
+    async def _post_turn_index_rebuild(self) -> None:
+        """Mark INDEX.md dirty + flush the IndexGenerator. Debounced
+        internally so consecutive turns within the debounce window
+        share a single rebuild. Direct port of
+        ``IndexRebuildHook.finalize``."""
+        try:
+            self._indexes.mark_dirty("all")
+            await self._indexes.flush()
+        except Exception:  # noqa: BLE001
+            log.exception("INDEX rebuild flush failed; continuing")
+
+    async def _post_turn_git_commit(self, ctx: Any) -> None:
+        """Post-turn commit of memory/state changes, gated on
+        ``MIMIR_GIT_TRACKING_ENABLED``. Runs after the index rebuild
+        so auto-regenerated INDEX.md / wiki outputs are part of the
+        same commit as the writes that triggered them. Failures inside
+        ``commit_turn_changes`` are swallowed there and surfaced via
+        ``git_commit_failed`` / ``git_push_failed`` algedonic events;
+        we still wrap in try/except for defense in depth."""
+        try:
+            from . import git_tracking
+            await git_tracking.commit_turn_changes(
+                turn_id=ctx.turn_id,
+                trigger=ctx.trigger,
+                home=self._config.home,
+                enabled=self._config.git_tracking_enabled,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("git commit_turn_changes raised; continuing")
+
+    # ────────────────────────────────────────────────────────────
+    # Shell-job completion bridge
+    # ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _completion_output_observed(owner: Any, event: AgentEvent) -> bool:
+        get_job = getattr(owner._shell_jobs, "get", None)
+        job = getattr(event, "_shell_job", None)
+        if job is None and get_job is not None:
+            job = get_job(event.extra.get("job_id"))
+        check = getattr(job, "final_output_observed", None)
+        return bool(check()) if check is not None else False
+
+    async def _queue_shell_followup(self, event: AgentEvent) -> bool | None:
+        """Coalesce nearby completions before one bounded continuation turn."""
+        if Agent._completion_output_observed(self, event):
+            await log_event(
+                "shell_job_complete_suppressed", job_id=event.extra["job_id"],
+                turn_id=event.extra.get("starting_turn_id"), reason="output_observed",
+            )
+            return False
+        # Use the frozen continuation identity as well as channel: one owner's
+        # authority must never deliver another owner's output.
+        auth = event.continuation_auth_context
+        key = (event.channel_id, getattr(auth, "canonical_principal", None),
+               getattr(auth, "is_service", None), getattr(auth, "roles", None))
+        batches = self.__dict__.setdefault("_shell_completion_batches", {})
+        # Same channel/principal does not imply equal continuation authority.
+        # Keep different frozen grants in separate batches rather than run one
+        # job's result under another turn's potentially wider permissions.
+        if key in batches and batches[key][0].continuation_auth_context != auth:
+            key += (id(auth),)
+        if key in batches:
+            batches[key].append(event)
+            return None
+        batches[key] = [event]
+        window = getattr(self, "_shell_completion_batch_seconds", 30 if hasattr(self, "_config") else 0)
+
+        async def flush() -> bool | None:
+            try:
+                return await deliver()
+            except Exception as exc:  # noqa: BLE001
+                await log_event(
+                    "shell_job_complete_enqueue_failed", job_id=event.extra["job_id"],
+                    error=str(exc)[:500],
+                )
+                return False
+            finally:
+                if batches.get(key) == []:
+                    batches.pop(key, None)
+
+        async def deliver() -> bool | None:
+            if window:
+                await asyncio.sleep(window)
+            items = batches.pop(key, [])
+            if not items:
+                return None
+            counts = self.__dict__.setdefault("_shell_completion_chain_counts", {})
+            notified = self.__dict__.setdefault("_shell_completion_chain_notified", set())
+            accepted = []
+            chains = set()
+            for item in items:
+                if Agent._completion_output_observed(self, item):
+                    await log_event(
+                        "shell_job_complete_suppressed", job_id=item.extra["job_id"],
+                        turn_id=item.extra.get("starting_turn_id"), reason="output_observed",
+                    )
+                    continue
+                chain = item.extra.get("completion_chain_id") or item.extra.get("starting_turn_id") or item.extra["job_id"]
+                if counts.get(chain, 0) >= 3:
+                    await log_event(
+                        "shell_job_complete_suppressed", job_id=item.extra["job_id"],
+                        turn_id=item.extra.get("starting_turn_id"), reason="chain_cap",
+                        chain_id=chain,
+                    )
+                    if chain not in notified:
+                        notified.add(chain)
+                        channel = getattr(getattr(self, "_config", None), "operator_alert_channel", None)
+                        sender = getattr(self._dispatcher, "_send_approval_notice", None)
+                        if channel and sender is not None:
+                            await sender(channel, f"Background-job continuation limit reached for chain {chain}.")
+                    continue
+                accepted.append(item)
+                chains.add(chain)
+            if not accepted:
+                return False
+            for chain in chains:
+                counts[chain] = counts.get(chain, 0) + 1
+            followup = replace(
+                accepted[0],
+                content=(
+                    "Background jobs from an earlier turn finished. The scheduled task "
+                    "already ran; do not redo it. Act only on these job results, then "
+                    "end quietly if nothing remains to do.\n\n"
+                    + "\n\n".join(item.content for item in accepted)
+                ),
+                ifc_labels=_merge_ifc_labels(*(item.ifc_labels for item in accepted)),
+                extra={**accepted[0].extra, "completion_job_ids": [
+                    item.extra["job_id"] for item in accepted
+                ]},
+            )
+            try:
+                queued = await self._dispatcher.enqueue(followup)
+            except Exception as exc:  # noqa: BLE001
+                await log_event("shell_job_complete_enqueue_failed", job_id=followup.extra["job_id"], error=str(exc)[:500])
+                return False
+            await log_event(
+                "shell_job_complete_enqueue_ok" if queued else "shell_job_complete_enqueue_failed",
+                job_id=followup.extra["job_id"], job_ids=followup.extra["completion_job_ids"],
+            )
+            return bool(queued)
+
+        if window:
+            # Retained in _bg_tasks: the loop keeps only a weak reference to a
+            # bare task, so an unretained flush could be collected before it runs.
+            Agent._spawn_bg_task(self, flush())
+        else:
+            return await flush()
+        return None
+
+    def _handle_shell_job_complete(self, job: Any) -> None:
+        """Thread-safe bridge: a shell-job waiter thread invokes this
+        when its subprocess exits. Schedules the async handler onto
+        the captured asyncio loop so we can enqueue a
+        ``shell_job_complete`` AgentEvent without crossing thread
+        boundaries unsafely.
+
+        Loop-unavailable path: shutdown / pre-first-turn / no
+        dispatcher → log + drop. Operator eventually notices via
+        ``bash_jobs_list``. No synthetic TurnRecord at risk; only
+        the wake-up event for the spawning channel is lost.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            log.warning(
+                "shell_job_complete dropped (loop unavailable): "
+                "job_id=%s channel_id=%s",
+                getattr(job, "job_id", "?"),
+                getattr(job, "channel_id", None),
+            )
+            return
+        if self._dispatcher is None:
+            log.warning(
+                "shell_job_complete dropped (no dispatcher wired): "
+                "job_id=%s channel_id=%s",
+                getattr(job, "job_id", "?"),
+                getattr(job, "channel_id", None),
+            )
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._on_shell_job_complete(job), loop,
+            )
+            self._shell_completion_futures.add(future)
+            job_id = getattr(job, "job_id", "?")
+
+            def observe_handler(done: concurrent.futures.Future[Any]) -> None:
+                self._shell_completion_futures.discard(done)
+                try:
+                    done.result()
+                except concurrent.futures.CancelledError:
+                    log.warning(
+                        "shell-job-complete handler cancelled: job_id=%s", job_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "shell-job-complete handler failed: job_id=%s", job_id,
+                        exc_info=exc,
+                    )
+                    try:
+                        log_durable_event_sync(
+                            "shell_job_complete_handler_failed",
+                            job_id=job_id,
+                            error=f"{type(exc).__name__}: {exc}"[:500],
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "durable shell-job-complete failure event failed: "
+                            "job_id=%s",
+                            job_id,
+                        )
+
+            future.add_done_callback(observe_handler)
+        except Exception:  # noqa: BLE001
+            # Never let a daemon-thread invocation crash the registry.
+            log.exception("schedule of shell-job-complete handler failed")
+
+    async def _on_shell_job_complete(self, job: Any) -> None:
+        """Async handler: build a turn-prompt summary of the job's exit
+        state + bounded output tails and enqueue a
+        ``shell_job_complete`` AgentEvent into the dispatcher. Routes
+        back to the channel that spawned the job. No-channel jobs
+        (e.g. spawned from a bare scheduled tick) are dropped — no
+        sensible default routing target.
+        """
+        if getattr(job, "channel_id", None) is None:
+            await log_event(
+                "shell_job_complete_no_channel",
+                job_id=job.job_id,
+                exit_code=job.exit_code,
+            )
+            return
+
+        try:
+            data = self._shell_jobs.read_job_output(
+                job, tail_lines=100, stream="both",
+            )
+        except Exception:  # noqa: BLE001
+            data = {"stdout_tail": "", "stderr_tail": ""}
+
+        stdout_tail = (data.get("stdout_tail") or "").strip()
+        stderr_tail = (data.get("stderr_tail") or "").strip()
+        # Bound each stream so a runaway job doesn't blow the prompt budget.
+        max_chars = 4000
+        if len(stdout_tail) > max_chars:
+            stdout_tail = stdout_tail[-max_chars:]
+        if len(stderr_tail) > max_chars:
+            stderr_tail = stderr_tail[-max_chars:]
+
+        elapsed = round(getattr(job, "elapsed_seconds", 0.0), 1)
+        body_lines = [
+            f"Shell job {job.job_id} complete (status={job.status}, "
+            f"exit_code={job.exit_code}, elapsed={elapsed}s).",
+            f"Command: {job.command}",
+            "",
+            "--- stdout tail ---",
+            stdout_tail or "(empty)",
+            "",
+            "--- stderr tail ---",
+            stderr_tail or "(empty)",
+        ]
+        body = "\n".join(body_lines)
+
+        event = AgentEvent(
+            trigger="shell_job_complete",
+            channel_id=job.channel_id,
+            content=body,
+            source_id=f"shell_job:{job.job_id}",
+            source="system",
+            extra={
+                "job_id": job.job_id, "exit_code": job.exit_code,
+                "status": job.status, "elapsed_seconds": elapsed,
+                "starting_turn_id": getattr(job, "starting_turn_id", None),
+                "completion_chain_id": getattr(job, "completion_chain_id", None),
+            },
+            ifc_labels=_shell_completion_labels(job),
+            continuation_auth_context=getattr(job, "auth_context", None),
+        )
+        event._shell_job = job
+        if Agent._completion_output_observed(self, event):
+            await log_event(
+                "shell_job_complete_suppressed", job_id=job.job_id,
+                turn_id=getattr(job, "starting_turn_id", None), reason="output_observed",
+            )
+            return
+        folded = mid_turn_injection.inject_job_completion(
+            job.channel_id, getattr(job, "starting_turn_id", None), event,
+        )
+        if folded == "injected":
+            await log_event("shell_job_complete_folded_pending", job_id=job.job_id,
+                            turn_id=job.starting_turn_id)
+            return
+        accepted = await Agent._queue_shell_followup(self, event)
+        await log_event(
+            "shell_job_complete_routed",
+            job_id=job.job_id,
+            channel_id=job.channel_id,
+            exit_code=job.exit_code,
+            accepted=accepted,
+        )
+
+    async def _log_injection_requeue(
+        self, kind: str, channel_id: str, turn_id: str, count: int, requeued: int,
+    ) -> None:
+        """Best-effort telemetry after accepted messages have been restored."""
+        if requeued < count:
+            log.error(
+                "mid_turn_message_loss: %s on %s requeued %s/%s messages",
+                kind, channel_id, requeued, count,
+            )
+            try:
+                await log_event(
+                    "mid_turn_message_loss", channel_id=channel_id, turn_id=turn_id,
+                    requeue_kind=kind, count=count, requeued=requeued, dropped=count - requeued,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("message-loss telemetry failed")
+        try:
+            await log_event(
+                kind, channel_id=channel_id, turn_id=turn_id,
+                count=count,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("injection requeue telemetry failed")
+
+    # ────────────────────────────────────────────────────────────
+    # System prompt assembly
+    # ────────────────────────────────────────────────────────────
+
+    def _build_system_prompt(self, *, emit_health_events: bool = True) -> str:
+        """Assemble the per-turn system prompt: persona + core memory +
+        memory index + operator alert channel + skill catalog. Rebuilt
+        each turn so skill bucket assignments / outcome counters stay
+        current (chainlink #15: install-stable section comes first so
+        the prompt cache prefix extends through it).
+
+        ``emit_health_events`` lets the prompt-cache comparison path
+        inspect the rendered prompt without writing ``core_prompt_degraded``
+        on every unchanged turn; rebuilds enable it for the final prompt.
+
+        Falls back to the minimal default prompt on any failure — a
+        broken core-block read or skill-catalog crash should NEVER
+        prevent a turn from running."""
+        try:
+            from .core_blocks import check_core_blocks_health, load_core
+            from .prompts import build_system_prompt
+            core_blocks = load_core(self._config.home)
+
+            # S1-3: detect silent identity loss before it propagates.
+            # Checks that enough core blocks loaded and none are stubs.
+            # log_event_sync is used because _build_system_prompt is sync;
+            # the async counterpart (log_event) would need an awaitable caller.
+            degraded, issues = check_core_blocks_health(core_blocks)
+            if degraded and emit_health_events:
+                log.warning(
+                    "core_prompt_degraded: %s — agent will use degraded prompt",
+                    "; ".join(issues),
+                )
+                log_event_sync(
+                    "core_prompt_degraded",
+                    issues=issues,
+                    block_count=len(core_blocks),
+                )
+
+            memory_index_body = (
+                self._indexes.read_memory_index()
+                if self._indexes is not None else None
+            )
+            # Skill catalog rendering moved to deepagents' SkillsMiddleware
+            # (wired via ``create_deep_agent(skills=...)``). build_system_prompt
+            # no longer composes a skill_block — the middleware injects
+            # ``## Skills System`` into the prompt at request time.
+            from .plugins.skills import pending_skill_upgrades, skills_for_candidates, upgrade_command
+
+            manager = getattr(self._config, "plugin_manager", None)
+            candidates = (manager.policy.selected_plugin_candidates if manager is not None else ())
+            pending = pending_skill_upgrades(self._config.home, skills_for_candidates(candidates))
+            return build_system_prompt(
+                core_blocks=core_blocks,
+                memory_index_body=memory_index_body,
+                operator_alert_channel=getattr(
+                    self._config, "operator_alert_channel", "",
+                ),
+                skill_block=None,
+                plugin_upgrade_notice=("Pending: " + "; ".join(
+                    f"{skill.label} (`{upgrade_command(skill)}`)" for skill in pending
+                ) + ". Tell the operator; do not apply upgrades yourself." if pending else None),
+                home_dir=str(self._config.home),
+                writable_dirs=self._config.writable_dirs,
+                access_control_enforced=self._config.access_control_enforced,
+            )
+        except Exception as exc:
+            log.exception("_build_system_prompt failed; using minimal default")
+            if emit_health_events:
+                try:
+                    log_event_sync(
+                        "core_prompt_degraded",
+                        reason="assembly_fallback",
+                        error_type=type(exc).__name__,
+                    )
+                except Exception:
+                    log.exception("core_prompt_degraded event emission failed")
+            # Keep conventions even when the full prompt builder itself fails.
+            from .prompts import _DEFAULT_CONVENTIONS
+
+            fallback = f"{_DEFAULT_SYSTEM_PROMPT}\n\n{_DEFAULT_CONVENTIONS}"
+            if self._config.access_control_enforced:
+                return f"{fallback}\n\n{ENFORCEMENT_GUIDANCE}"
+            return fallback
+
+    # NOTE: _assemble_skill_block was removed in the skills-middleware
+    # restoration PR. The framework's SkillsMiddleware now renders the
+    # catalog at request time via wrap_model_call — see the
+    # ``create_deep_agent(skills=...)`` call in _get_or_build_agent.
+    # Per-turn skill telemetry (the "(N/M in window)" counters) stays
+    # in mimir's hands via _assemble_skill_telemetry_lines and the
+    # ``## Self-state`` block.
+
+    # ────────────────────────────────────────────────────────────
+    # Per-turn block assembly (ported from main)
+    # ────────────────────────────────────────────────────────────
+
+    def _spawn_bg_task(self, coro):
+        """Schedule a fire-and-forget coroutine on the running loop.
+
+        No-op when there is no running loop (turns invoked from a sync
+        test path) — caller's deferred event simply doesn't fire,
+        which is fine because the per-turn block readers are
+        non-essential.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _assemble_usage_block(
+        self,
+        auth_context: AuthContext,
+    ) -> tuple[PromptBlock | None, list[tuple[str, dict]]]:
+        """Aggregate over 1h / 5h / 7d, render the Resource usage prompt
+        section, return ``(block_text, deferred_events)``.
+
+        Side effects (deferred): cost_rate_alert / cost_rate_advisory
+        + rate_limit_off_pace events under cooldown. Caller flushes
+        deferred_events on the running loop because this method runs
+        inside ``asyncio.to_thread``.
+        """
+        auth_context = _require_auth_context(auth_context)
+        deferred: list[tuple[str, dict]] = []
+        if not _is_prompt_operator(auth_context):
+            return None, deferred
+        if not self._config.usage_block_enabled:
+            return None, deferred
+
+        from .stats_block import assemble_stats_block
+
+        try:
+            result = assemble_stats_block(
+                self._config,
+                self._rate_limits,
+                turns_snapshot=self._turns_snapshot,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("assemble_stats_block failed; skipping block")
+            return None, deferred
+
+        if result.alert is not None:
+            from .billing import BillingMode
+            advisory = self._config.billing_mode is BillingMode.QUOTA
+            event_kind = "cost_rate_advisory" if advisory else "cost_rate_alert"
+            if not event_recently_emitted(
+                self._config.events_log,
+                event_kind,
+                cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+                snapshot=self._events_snapshot,
+            ):
+                deferred.append(
+                    (
+                        event_kind,
+                        {
+                            "reason": result.alert.reason,
+                            "rate_now_usd_per_hour": round(
+                                result.alert.rate_now_usd_per_hour, 4,
+                            ),
+                            "threshold_usd_per_hour": round(
+                                result.alert.threshold_usd_per_hour, 4,
+                            ),
+                            "baseline_usd_per_hour": (
+                                round(result.alert.baseline_usd_per_hour, 4)
+                                if result.alert.baseline_usd_per_hour is not None
+                                else None
+                            ),
+                        },
+                    )
+                )
+
+        if result.off_pace and not event_recently_emitted(
+            self._config.events_log,
+            "rate_limit_off_pace",
+            cooldown_minutes=self._config.cost_alert_cooldown_minutes,
+            snapshot=self._events_snapshot,
+        ):
+            worst_key, worst_snap, worst_proj = result.off_pace[0]
+            deferred.append(
+                (
+                    "rate_limit_off_pace",
+                    {
+                        "rate_limit_type": worst_key,
+                        "utilization": worst_snap.utilization,
+                        "on_pace_utilization": round(
+                            worst_proj.on_pace_utilization, 4,
+                        ),
+                        "hours_until_reset": round(
+                            worst_proj.hours_until_reset, 2,
+                        ),
+                        "resets_at": worst_snap.resets_at,
+                    },
+                )
+            )
+
+        # Admitted pollers/jobs must not re-decide quota policy. Heartbeat is
+        # discretionary; keep its pace data. Alerts above remain independent
+        # of prompt visibility and retain their existing cooldowns.
+        if auth_context.trigger == "poller" or (
+            auth_context.trigger == "scheduled_tick"
+            and auth_context.channel_id != "scheduler:heartbeat"
+        ):
+            return None, deferred
+        if not result.body:
+            return None, deferred
+        return PromptBlock(
+            result.body,
+            _prompt_source_labels(
+                auth_context, domain="usage", resource="global:usage",
+                principal="service:mimir", self_authored=True,
+            ),
+        ), deferred
+
+    def _assemble_upcoming_block(self, auth_context: AuthContext) -> PromptBlock | None:
+        """v0.5+ §12.1: render the ``## Upcoming`` block."""
+        auth_context = _require_auth_context(auth_context)
+        if not _is_prompt_operator(auth_context):
+            return None
+        try:
+            from .upcoming import render_upcoming_block
+            content = render_upcoming_block(
+                scheduler=self._scheduler,
+                rate_limit_store=self._rate_limits,
+            )
+            if not content:
+                return None
+            return PromptBlock(
+                content,
+                _prompt_source_labels(
+                    auth_context, domain="schedules", resource="global:upcoming",
+                    principal="service:mimir", self_authored=True,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_upcoming_block failed; skipping")
+            return None
+
+    def _assemble_commitments_block(
+        self, channel_id: str | None, auth_context: AuthContext,
+    ) -> PromptBlock | None:
+        """Phase 3: ``## Upcoming commitments`` block — active records
+        for this channel (+ unbound). Suppressed on synthetic
+        scheduler:* / poller:* channels and when no store is wired."""
+        auth_context = _require_auth_context(auth_context)
+        if channel_id is None or self._commitments is None:
+            return None
+        from .history import SYNTHETIC_CHANNEL_PREFIXES
+        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+            return None
+        try:
+            from .commitments.render import render_commitments_block
+            records = self._commitments.list(
+                channel_id=channel_id,
+                include_unbound=_is_prompt_operator(auth_context),
+                owner_principal=(
+                    None
+                    if _is_prompt_operator(auth_context)
+                    else auth_context.canonical_principal or auth_context.principal
+                ),
+                auth_context=auth_context,
+            )
+            content = render_commitments_block(records)
+            if not content:
+                return None
+            labels = InformationFlowLabels()
+            for record in records:
+                owner = record.owner_principal or None
+                labels = _merge_ifc_labels(
+                    labels,
+                    _prompt_source_labels(
+                        auth_context,
+                        domain="commitments",
+                        resource=f"commitment:{record.id}",
+                        channel_id=record.originating_channel or record.channel_id,
+                        principal=owner,
+                        authorized_principals=_protected_owner_acl(
+                            auth_context, owner,
+                        ),
+                        self_authored=True,
+                    ),
+                )
+            return PromptBlock(content, labels)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_commitments_block failed; skipping",
+            )
+            return None
+
+    def _assemble_self_state_block(
+        self, auth_context: AuthContext, *,
+        event_loop: "asyncio.AbstractEventLoop | None" = None,
+    ) -> PromptBlock | None:
+        """v0.5+ §12.4: render the ``## Self-state`` block — homeostat
+        view + uncommitted-files line + per-turn skill telemetry.
+
+        ``event_loop`` is threaded to the arbiter so a lazy-expiry
+        ``quota_recovered`` emit isn't dropped on this worker thread (#489)."""
+        auth_context = _require_auth_context(auth_context)
+        if not _is_prompt_operator(auth_context):
+            return None
+        try:
+            arbiter_body = self._arbiter.render_self_state_block(
+                event_loop=event_loop,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_self_state_block (arbiter) failed; skipping",
+            )
+            arbiter_body = None
+        git_line = self._assemble_git_status_line()
+        skill_body = self._assemble_skill_telemetry_lines()
+        parts = [s for s in (arbiter_body, git_line, skill_body) if s]
+        if not parts:
+            return None
+        return PromptBlock(
+            "\n".join(parts),
+            _prompt_source_labels(
+                auth_context, domain="self_state", resource="global:self_state",
+                principal="service:mimir", self_authored=True,
+            ),
+        )
+
+    def _assemble_git_status_line(self) -> str | None:
+        """``- uncommitted in /mimir-home: <count> file(s) — <topN>`` line.
+        Suppressed when tracking is off, count==0, or summary errored.
+        """
+        if not self._config.git_tracking_enabled:
+            return None
+        try:
+            return health.render_git_status_line(self._config.home)
+        except Exception:  # noqa: BLE001
+            log.exception("_assemble_git_status_line failed; skipping")
+            return None
+
+    def _assemble_skill_telemetry_lines(self) -> str | None:
+        """Per-turn skill bucket telemetry lines for ``## Self-state``."""
+        try:
+            from .skill_outcomes import (
+                aggregate,
+                load_skill_success_criteria,
+                render_skill_telemetry,
+            )
+            from .skill_defs import installed_skill_names
+            seeded = visible_skill_names(
+                self._config.home, installed_skill_names(self._config.home),
+                self._config.plugin_manager.policy,
+            )
+            if not seeded:
+                return None
+            # Per-skill success_criteria refines load-kind outcomes
+            # into success vs incomplete based on whether the
+            # operator-declared completion signals fired in the turn.
+            # No-op for skills without a success_criteria block.
+            criteria = load_skill_success_criteria(self._config.home)
+            aggs = aggregate(
+                self._config.turns_log, skill_criteria=criteria,
+            )
+            return render_skill_telemetry(seeded, aggs)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "_assemble_skill_telemetry_lines failed; skipping",
+            )
+            return None
+
+    async def _assemble_session_summaries(
+        self,
+        *,
+        channel_id: str | None,
+        auth_context: AuthContext | None = None,
+    ) -> PromptBlock | None:
+        """Render the Recent session summaries block from SagaStore's
+        ``recent_session_boundaries()``."""
+        auth_context = _require_auth_context(auth_context)
+        count = self._config.recent_boundaries
+        if count <= 0:
+            return None
+        boundaries: list[dict] = []
+        if self._saga is not None:
+            try:
+                # Best-effort — SAGA client may not implement this. We
+                # don't want to crash a turn over an optional method.
+                recent_fn = getattr(
+                    self._saga, "recent_session_boundaries", None,
+                )
+                if recent_fn is not None:
+                    boundaries = await recent_fn(
+                        channel_id=channel_id,
+                        count=count,
+                        auth_context=auth_context,
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "_assemble_session_summaries: SAGA "
+                    "recent_session_boundaries failed"
+                )
+                boundaries = []
+        turn_counts: dict[str, int] = {}
+        if channel_id is not None and boundaries:
+            boundary_timestamps = [
+                str(b.get("ts") or b.get("timestamp") or "")
+                for b in boundaries
+            ]
+            turn_counts = await asyncio.to_thread(
+                count_turns_since_many,
+                self._config.turns_log,
+                channel_id=channel_id,
+                since_timestamps=boundary_timestamps,
+                snapshot_records=self._turns_snapshot.records,
+            )
+        if has_validatable_unfinished_work(boundaries):
+            boundaries = await asyncio.to_thread(
+                validate_unfinished_work, boundaries,
+            )
+        now = datetime.now(tz=timezone.utc)
+        content = render_session_summaries(
+            boundaries,
+            now=now,
+            turn_counts=turn_counts,
+            stale_age_hours=self._config.unfinished_stale_age_hours,
+            stale_turns=self._config.unfinished_stale_turns,
+        )
+        if not content:
+            return None
+        labels = InformationFlowLabels()
+        for boundary in boundaries:
+            channel = boundary.get("channel_id")
+            owner = boundary.get("owner_principal")
+            owner = owner if isinstance(owner, str) and owner else None
+            visibility = boundary.get("visibility")
+            labels = _merge_ifc_labels(
+                labels,
+                _prompt_source_labels(
+                    auth_context,
+                    domain="saga",
+                    resource=f"session:{boundary.get('session_id') or boundary.get('id') or 'unknown'}",
+                    channel_id=channel if isinstance(channel, str) else None,
+                    principal=owner,
+                    authorized_principals=_protected_owner_acl(
+                        auth_context,
+                        owner,
+                        requester_visible=visibility == "public",
+                    ),
+                    self_authored=True,
+                ),
+            )
+        return PromptBlock(content, labels)
+
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
+    async def _build_synthesis_prompt(
+        self, ctx: Any, event: AgentEvent,
+    ) -> PromptBlock:
+        """For trigger='saga_session_end' — load the synthesis template,
+        embed the session's turn window from turns.jsonl. Off-loops the
+        turns.jsonl scan via to_thread."""
+        saga_session_id = ctx.saga_session_id or (event.extra or {}).get(
+            "saga_session_id", "",
+        )
+        idle_minutes = self._config.saga_session_idle_minutes
+        turns_window = await asyncio.to_thread(
+            _filter_session_turns,
+            self._config.turns_log,
+            saga_session_id,
+            channel_id=event.channel_id or "",
+            idle_minutes=idle_minutes,
+        )
+        if not turns_window:
+            self._spawn_bg_task(
+                log_event(
+                    "saga_synthesis_empty_window",
+                    saga_session_id=saga_session_id,
+                    channel_id=event.channel_id,
+                    reason="turns.jsonl rotated past this session's records",
+                )
+            )
+        labels = InformationFlowLabels()
+        if turns_window:
+            labels = event.ifc_labels or ctx.ifc_labels
+            if not labels.sources:
+                raise ValueError("session turn history omitted provenance")
+        return PromptBlock(
+            render_saga_session_end(
+                channel_id=event.channel_id or "",
+                saga_session_id=saga_session_id,
+                idle_minutes=idle_minutes,
+                turns_window=turns_window,
+                prompts_dir=self._config.prompts_dir,
+            ),
+            labels,
+        )
+
+    def _select_recent_activity(
+        self,
+        event: AgentEvent,
+        auth_context: AuthContext,
+    ) -> tuple[list[Message], tuple[PromptBlock, ...]]:
+        candidates = self._buffer.assemble_recent_activity_candidates(
+            channel_id=event.channel_id or "",
+            author=event.author,
+            recent_per_channel=self._config.recent_per_channel,
+            recent_author_cross=self._config.recent_author_cross,
+            cross_hours=self._config.recent_cross_hours,
+            source_allowlist=self._config.recent_sources,
+        )
+        effective_principal = (
+            auth_context.canonical_principal or auth_context.principal
+        )
+        if auth_context.is_service and effective_principal:
+            effective_principal = f"service:{effective_principal}"
+        if not effective_principal:
+            return [], ()
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(
+            event.channel_id,
+        )
+
+        admitted: list[Message] = []
+        blocks: list[PromptBlock] = []
+        for message in candidates:
+            same_channel = (
+                ChannelResourceAdapter._resolve_channel(message.channel_id)
+                == resolved_triggering
+            )
+            owner_attestation = None
+            source_kind = (
+                "recent_activity_assistant"
+                if message.kind == "assistant_message" or not message.author
+                else "recent_activity_user"
+            )
+            principal = effective_principal
+            acl = frozenset({effective_principal})
+            if not same_channel and source_kind == "recent_activity_user":
+                owner_attestation = attest_owner(
+                    self._identity_resolver,
+                    message.author,
+                    message.channel_id,
+                )
+                if owner_attestation is None:
+                    continue
+                principal = owner_attestation.canonical_principal
+                acl = frozenset({principal})
+            labels = _prompt_source_labels(
+                auth_context,
+                domain="recent_activity",
+                resource=f"message:{message.msg_id}",
+                channel_id=message.channel_id,
+                principal=principal,
+                bridge=message.source,
+                authorized_principals=acl,
+                source_kind=source_kind,
+                self_authored=_recent_message_is_self_authored(message),
+                owner_attestation=owner_attestation,
+            )
+            source = labels.sources[0]
+            compatible = _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_principal,
+                triggering_principal=auth_context.principal,
+                resolved_triggering=resolved_triggering,
+                audience_provider=auth_context.audience_provider,
+                cross_platform_pull=auth_context.cross_platform_pull,
+            )
+            if not compatible:
+                # Shadow must evaluate the same carrier enforcement would build.
+                continue
+            admitted.append(message)
+            blocks.append(PromptBlock(message.content, labels))
+        return admitted, tuple(blocks)
+
+    async def _build_turn_prompt(
+        self,
+        ctx: Any,
+        event: AgentEvent,
+        saga_block: str | None,
+        initial_auth_context: AuthContext | None = None,
+        saga_labels: InformationFlowLabels | None = None,
+        saga_query_task: asyncio.Task[
+            tuple[str | None, InformationFlowLabels]
+        ] | None = None,
+        stable_prefix_out: list[str] | None = None,
+    ) -> tuple[str, list]:
+        """Assemble the per-turn user-side prompt + the recent-message
+        list. Synthesis turns get a dedicated synthesis prompt; everything
+        else builds the standard turn prompt with the algedonic /
+        session-summary / usage / upcoming / self-state blocks.
+
+        Returns ``(turn_prompt, recent)`` — recent is needed for the
+        ``turn_started`` event's ``recent_message_count``.
+        """
+        source_blocks: list[PromptBlock] = []
+
+        def use(block: PromptBlock | None) -> str | None:
+            if block is None:
+                return None
+            if not isinstance(block, PromptBlock):
+                raise TypeError("protected prompt loader omitted provenance")
+            if (
+                "private" not in block.labels.labels
+                or not block.labels.sources
+                or any(not source.is_complete for source in block.labels.sources)
+            ):
+                raise ValueError("protected prompt loader returned incomplete provenance")
+            source_blocks.append(block)
+            return block.content
+
+        if event.trigger == "saga_session_end":
+            synthesis_block = await self._build_synthesis_prompt(ctx, event)
+            if not isinstance(synthesis_block, PromptBlock):
+                raise TypeError("synthesis prompt loader omitted provenance")
+            if any(not source.is_complete for source in synthesis_block.labels.sources):
+                raise ValueError("session turn history returned incomplete provenance")
+            synthesis_prompt = synthesis_block.content
+            if synthesis_block.labels.sources:
+                source_blocks.append(synthesis_block)
+            scratch_path = getattr(ctx, "turn_scratch_path", None)
+            ctx.ifc_labels = _merge_ifc_labels(
+                ctx.ifc_labels, *(block.labels for block in source_blocks),
+            )
+            scratch_section = (
+                "## Current turn scratch\n\n"
+                f"Use `{scratch_path}/` for ordinary ephemeral files. This workspace "
+                "is private to this turn; the shared `scratch/` root and other turns' "
+                "workspaces are unreadable.\n\n"
+            ) if scratch_path is not None else ""
+            return scratch_section + synthesis_prompt, []
+
+        auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
+        pending_plugins: dict[str, list[tuple[str, PromptBlock]]] = {}
+        for provider in sorted(selected_policy_registry().prompt_providers.values(), key=lambda item: item.name):
+            try:
+                if not await asyncio.to_thread(provider.applies, auth_context, event):
+                    continue
+                content, resources = await asyncio.to_thread(
+                    _render_plugin_prompt, provider, auth_context, event, self._config.home,
+                )
+                if not content:
+                    continue
+                content, over_cap = _cap_plugin_prompt(content, provider.max_bytes)
+                if over_cap:
+                    _report_plugin_prompt("plugin_prompt_over_cap", provider.name)
+                labels = InformationFlowLabels()
+                for resource in resources or (f"plugin:{provider.owner}:{provider.name}",):
+                    labels = _merge_ifc_labels(labels, _prompt_source_labels(
+                        auth_context, domain=provider.name, resource=resource,
+                        self_authored=True,
+                    ))
+                pending_plugins.setdefault(provider.section, []).append((provider.name, PromptBlock(content, labels)))
+            except Exception as exc:  # noqa: BLE001 — one plugin cannot fail a turn
+                from .core_blocks import PromptReadRefused
+                kind = "plugin_prompt_read_refused" if isinstance(exc, PromptReadRefused) else "plugin_prompt_failed"
+                _report_plugin_prompt(kind, provider.name)
+        plugin_blocks: dict[str, tuple[tuple[str, str], ...]] = {}
+
+        def use_plugins(section: str) -> None:
+            plugin_blocks[section] = tuple(
+                (name, use(block)) for name, block in pending_plugins.get(section, ())
+            )
+        recent, recent_blocks = self._select_recent_activity(event, auth_context)
+        source_blocks.extend(recent_blocks)
+        # Channel memory injection (chainlink #187): load per-channel fact
+        # files (operator name, preferences, patterns) from
+        # ``memory/channels/<channel_id>/``. Returns None for synthetic
+        # channels (scheduler:*, poller:*) and channels with no memory files.
+        #
+        # Load before Recent feedback so the over-cap algedonic signal emitted
+        # by load_channel_memory() is visible on the same turn, not the next.
+        from .core_blocks import load_channel_memory
+        channel_memory_content = await asyncio.to_thread(
+            load_channel_memory,
+            self._config.home,
+            event.channel_id or "",
+        )
+        channel_memory_owner = auth_context.canonical_principal or auth_context.principal
+        channel_memory_block = use(
+            PromptBlock(
+                channel_memory_content,
+                _prompt_source_labels(
+                    auth_context,
+                    domain="channel_memory",
+                    resource=f"memory/channels/{event.channel_id or ''}",
+                    channel_id=event.channel_id,
+                    bridge=event.source,
+                    self_authored=True,
+                ),
+            ) if channel_memory_content and channel_memory_owner else None
+        )
+        use_plugins("channel_memory")
+        # Open change-proposal nudge (chainlink #337/#339/#344), rendered next
+        # to the feedback signals so the agent finishes/abandons an in-flight
+        # proposal. Sync git call off the loop; a prompt section must never
+        # break the turn, hence the broad guard.
+        async def load_open_proposals() -> PromptBlock | None:
+            try:
+                from .proposals import render_open_proposals_block
+                proposal_content = (
+                    await asyncio.to_thread(
+                        render_open_proposals_block, self._config.home,
+                    )
+                    if _is_prompt_operator(auth_context)
+                    else None
+                )
+                return PromptBlock(
+                    proposal_content,
+                    _prompt_source_labels(
+                        auth_context, domain="proposals", resource="global:proposals",
+                        principal="service:mimir", self_authored=True,
+                    ),
+                ) if proposal_content else None
+            except Exception:  # noqa: BLE001 — prompt assembly must not fail a turn
+                return None
+
+        from .commitments.store import run_store_io
+        from .skill_resolver import find_skill_for_channel
+        from .skill_defs import home_builtin_skills_dir, home_skills_dir
+
+        skills_dirs = (
+            home_skills_dir(self._config.home),
+            home_builtin_skills_dir(self._config.home),
+        )
+        event_loop = asyncio.get_running_loop()
+        (
+            feedback_source,
+            core_proposals_source,
+            session_summaries_source,
+            usage_result,
+            commitments_source,
+            self_state_source,
+            auto_skill_block,
+            saga_result,
+        ) = await asyncio.gather(
+            asyncio.to_thread(self._feedback.recent_prompt_block, auth_context)
+            if self._config.feedback_limit_per_polarity > 0
+            else asyncio.sleep(0, result=None),
+            load_open_proposals(),
+            self._assemble_session_summaries(
+                channel_id=(
+                    None
+                    if event.channel_id == _REFLECTION_CHANNEL_ID
+                    else event.channel_id
+                ),
+                auth_context=auth_context,
+            ),
+            asyncio.to_thread(self._assemble_usage_block, auth_context),
+            run_store_io(
+                self._assemble_commitments_block,
+                channel_id=event.channel_id,
+                auth_context=auth_context,
+            ),
+            asyncio.to_thread(
+                self._assemble_self_state_block,
+                auth_context,
+                event_loop=event_loop,
+            ),
+            asyncio.to_thread(
+                lambda: find_skill_for_channel(
+                    event.channel_id, skills_dirs,
+                    hidden=hidden_home_skill_dirs(
+                        self._config.home, self._config.plugin_manager.policy,
+                    ),
+                ),
+            ),
+            saga_query_task
+            if saga_query_task is not None
+            else asyncio.sleep(0, result=(saga_block, saga_labels)),
+        )
+
+        # Completion order must not affect prompt or provenance order.
+        feedback_block = use(feedback_source)
+        use_plugins("feedback")
+        core_proposals_block = use(core_proposals_source)
+        use_plugins("core_proposals")
+        session_summaries_block = use(session_summaries_source)
+        use_plugins("session_summaries")
+        usage_source, deferred_usage_events = usage_result
+        usage_block = use(usage_source)
+        use_plugins("usage")
+        # Flush deferred events on the running loop.
+        from .ntfy import fire_cost_runaway_alarm_if_warranted
+        for event_kind, event_kwargs in deferred_usage_events:
+            self._spawn_bg_task(log_event(event_kind, **event_kwargs))
+            # Dead-man alarm: cost-rate runaway (chainlink #66). Fires an ntfy
+            # push when the hourly rate exceeds the runaway threshold so the
+            # operator is notified even when not watching chat.
+            self._spawn_bg_task(
+                fire_cost_runaway_alarm_if_warranted(event_kind, event_kwargs)
+            )
+        upcoming_block = use(self._assemble_upcoming_block(auth_context))
+        use_plugins("upcoming")
+        commitments_block = use(commitments_source)
+        use_plugins("commitments")
+        self_state_block = use(self_state_source)
+        use_plugins("self_state")
+        saga_block, saga_labels = saga_result
+        # Auto-surface the relevant SKILL.md when this turn is on a
+        # ``poller:<name>`` channel — the agent gets the skill's
+        # content inline without needing a ``find-skills`` lookup.
+        # Closes the failure mode where the agent reaches for
+        # ``send_message`` instead of the skill-specific workflow
+        # because it never loaded the matching skill (muninn-mimir
+        # 2026-05-23: a Bluesky reply landed in Discord). Non-poller
+        # turns return None and the prompt is unaffected.
+        # Disk I/O (walk skills dirs + read pollers.json + SKILL.md)
+        # wrapped in to_thread to match the existing pattern in this
+        # function — every other file-touching call here uses
+        # asyncio.to_thread. Consistency note from PR #315 review.
+        # Cost is sub-ms at current skill counts (<20 bundled + a few
+        # operator-installed) but keeps the event loop honest if skill
+        # counts grow or a SKILL.md gets large.
+        # chainlink #783: slash-command chat skills resolve only through the
+        # injected registry + the server-owned serialized invocation stored in
+        # ``event.extra``. Presence of the extra key replaces any poller auto-
+        # skill path for this turn.
+        if CHAT_SKILL_EXTRA_KEY in (event.extra or {}):
+            auto_skill_block = None
+            invocation_payload = (event.extra or {}).get(CHAT_SKILL_EXTRA_KEY)
+            prompt_block = (
+                self._chat_skill_registry.prompt_block_for_invocation(invocation_payload)
+                if self._chat_skill_registry is not None
+                else None
+            )
+            if prompt_block is not None:
+                skill_name = "chat-skill"
+                if isinstance(invocation_payload, Mapping):
+                    raw_name = invocation_payload.get("name")
+                    if isinstance(raw_name, str) and raw_name.strip():
+                        skill_name = raw_name.strip()
+                auto_skill_block = (skill_name, prompt_block)
+            else:
+                await self._notify_chat_skill_failure(
+                    event,
+                    (
+                        "chat skill invocation could not be validated"
+                        if self._chat_skill_registry is not None
+                        else "chat skill registry unavailable"
+                    ),
+                    ctx,
+                    phase="prompt_resolution",
+                )
+        # chainlink #266: when a skill auto-loads, its accumulated
+        # learnings (gotchas/tips stored as skill_learning atoms) load
+        # with it — appended under the same Skill section. Best-effort:
+        # only when a concrete SagaStore is wired; recall errors leave the
+        # body unchanged (skill load must not fail on a memory miss).
+        skill_ifc_sources: list[dict[str, str | None]] = []
+        if auto_skill_block is not None and self._saga_store is not None:
+            from . import skill_memory
+            _skill_name, _skill_body = auto_skill_block
+            # chainlink #411: route the read through the store's own
+            # serialization (run_locked_read holds _db_lock in the
+            # worker thread) rather than handing the shared
+            # check_same_thread=False connection into a bare thread —
+            # the consolidate cron / turn writers use that connection
+            # under the store's locks, and unserialized cross-thread
+            # access is segfault-class with FTS5 (#365/#386).
+            # augment_skill_body itself swallows recall errors and
+            # returns the body unaugmented.
+            _auth_ctx = ctx.auth_context
+            _augmented, _injected_ids, skill_ifc_sources = await asyncio.to_thread(
+                self._saga_store.run_locked_read,
+                lambda _c: skill_memory.augment_skill_body(
+                    _c, _skill_name, _skill_body, auth_context=_auth_ctx
+                ),
+            )
+            auto_skill_block = (_skill_name, _augmented)
+            # slice 6: record the injected learnings as this turn's cited
+            # atoms so the session-boundary synthesis turn curates feedback
+            # on them (run_turn folds ctx.injected_skill_atom_ids into the
+            # TurnRecord's saga_atom_ids).
+            for _aid in _injected_ids:
+                if _aid not in ctx.injected_skill_atom_ids:
+                    ctx.injected_skill_atom_ids.append(_aid)
+
+        effective_principal = auth_context.canonical_principal or auth_context.principal
+        resolver = self._buffer.resolver
+        identity_principals: set[str] = set()
+        if resolver is not None:
+            for author in [event.author, *(message.author for message in recent)]:
+                if not author:
+                    continue
+                identity_lookup = getattr(resolver, "identity", None)
+                identity = identity_lookup(author) if callable(identity_lookup) else None
+                if identity is not None:
+                    canonical = identity.canonical
+                else:
+                    resolve = getattr(resolver, "resolve", None)
+                    canonical = resolve(author) if callable(resolve) else author
+                if canonical and canonical != author:
+                    identity_principals.add(canonical)
+        if identity_principals:
+            identity_labels = _prompt_source_labels(
+                auth_context, domain="identities", resource="state/identities.yaml",
+                self_authored=True,
+            )
+            for principal in identity_principals:
+                identity_labels = _merge_ifc_labels(
+                    identity_labels,
+                    _prompt_source_labels(
+                        auth_context,
+                        domain="identities",
+                        resource=f"identity:{principal}",
+                        principal=principal,
+                        authorized_principals=frozenset({effective_principal}) if effective_principal else frozenset(),
+                        self_authored=True,
+                    ),
+                )
+            source_blocks.append(PromptBlock("known identities", identity_labels))
+        if saga_block:
+            source_blocks.append(PromptBlock(
+                saga_block,
+                saga_labels if saga_labels and saga_labels.sources else _prompt_source_labels(
+                    auth_context, domain="saga", resource="query",
+                    channel_id=event.channel_id, principal=effective_principal,
+                    self_authored=True,
+                ),
+            ))
+        if auto_skill_block is not None:
+            auto_skill_labels = _prompt_source_labels(
+                auth_context, domain="skills", resource=f"skill:{auto_skill_block[0]}",
+                principal=effective_principal, self_authored=True,
+            )
+            if skill_ifc_sources:
+                auto_skill_labels = _merge_ifc_labels(
+                    auto_skill_labels,
+                    _auto_recall_source_labels(
+                        auth_context, {"_ifc_sources": skill_ifc_sources},
+                    ),
+                )
+            source_blocks.append(PromptBlock(
+                auto_skill_block[1],
+                auto_skill_labels,
+            ))
+        trusted_trigger = (
+            get_trusted_service_from_auth_context(auth_context)
+            if event.trigger in {"scheduled_tick", "poller"}
+            else None
+        )
+        # Delivery is framework authority, so derive it from the immutable
+        # server-created poller/schedule grant rather than event.extra. Registry
+        # lookup proves routability only; the exact config value is the grant.
+        deliver_channel = resolve_deliver_channel(
+            trusted_trigger.configured_delivery_channel if trusted_trigger else None,
+            getattr(self._config, "operator_alert_channel", ""),
+        )
+        if (
+            deliver_channel is not None
+            and (self._channels is None or self._channels.find(deliver_channel) is None)
+        ):
+            deliver_channel = None
+        trigger_authority = (
+            trusted_trigger if self._config.access_control_enforced else None
+        )
+        turn_prompt = build_turn_prompt(
+            event,
+            recent_messages=recent,
+            saga_block=saga_block,
+            recent_message_chars=self._config.recent_message_chars,
+            resolver=self._buffer.resolver,
+            feedback_block=feedback_block,
+            core_proposals_block=core_proposals_block,
+            session_summaries_block=session_summaries_block,
+            usage_block=usage_block,
+            upcoming_block=upcoming_block,
+            commitments_block=commitments_block,
+            self_state_block=self_state_block,
+            auto_skill_block=auto_skill_block,
+            saga_session_id=ctx.saga_session_id,
+            channel_memory_block=channel_memory_block,
+            plugin_blocks=plugin_blocks,
+            deliver_channel=deliver_channel,
+            trigger_authority_profile=(
+                trigger_authority.authority_profile if trigger_authority else None
+            ),
+            trigger_capability_tier=(
+                trigger_authority.capability_tier.value
+                if trigger_authority and trigger_authority.capability_tier
+                else None
+            ),
+            trigger_capabilities=(
+                trigger_authority.capabilities if trigger_authority else None
+            ),
+            trigger_authority_present=trigger_authority is not None,
+            trigger_shell_commands=(
+                tuple(
+                    command.executable
+                    for command in trigger_authority.declared_shell_commands
+                )
+                if trigger_authority
+                else None
+            ),
+            turn_scratch_path=(
+                str(ctx.turn_scratch_path)
+                if getattr(ctx, "turn_scratch_path", None) is not None else None
+            ),
+            stable_prefix_out=stable_prefix_out,
+        )
+        ctx.ifc_labels = _merge_ifc_labels(
+            ctx.ifc_labels, *(block.labels for block in source_blocks),
+        )
+        return turn_prompt, recent

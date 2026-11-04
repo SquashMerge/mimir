@@ -1,0 +1,1716 @@
+"""Env-based configuration. Defaults match SPEC §14.
+
+Runtime contract: ``Config.from_env`` loads ``<MIMIR_HOME>/.env`` as defaults
+before reading settings, and process environment values always win. This keeps
+fresh local homes runnable from the setup-written file while preserving
+operator-provided exports in managed deployments.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import re
+import shutil
+import stat as stat_module
+import subprocess
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+from dotenv import dotenv_values, load_dotenv
+
+from .access_control import resolve_access_control_enforcement
+from .billing import BillingMode, detect_billing_mode
+from .env import _ENV_BOOL_FALSY, _ENV_BOOL_TRUTHY, env_bool
+
+if TYPE_CHECKING:
+    from .plugins.manager import PluginManager
+
+# Single source of the shipped default. ``mimir setup`` writes this same
+# spec via ``detect_route(None)``, so a setup-created home and a home that
+# never ran setup select the same model. model_registry imports only
+# ``providers`` (stdlib-only), so this is not circular.
+from .model_registry import DEFAULT_MODEL_SPEC
+
+
+log = logging.getLogger(__name__)
+
+DEFAULT_TURN_TIMEOUT_SECONDS = 3600
+
+_SCOPE_KEYS = (
+    "ALLOWED_CHANNELS", "IGNORED_CHANNELS", "REQUIRE_MENTION",
+    "FREE_RESPONSE_CHANNELS", "ALLOW_BOTS", "ALLOWED_BOT_IDS",
+)
+_SCOPE_ENV_KEYS = frozenset(
+    f"MIMIR_{platform}_{key}"
+    for platform in ("DISCORD", "SLACK") for key in _SCOPE_KEYS
+) | {"MIMIR_CHANNEL_SCOPE_FILE"}
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name) or default
+
+
+def _env_allow_empty(name: str, default: str) -> str:
+    """Read an env value for settings where empty has explicit semantics."""
+    return os.environ.get(name, default)
+
+
+def trusted_github_bot_logins() -> frozenset[str]:
+    """Exact, case-insensitive operator-approved GitHub bot logins."""
+    return frozenset(
+        login.casefold() for entry in _env("MIMIR_GITHUB_TRUSTED_BOT_LOGINS").split(",")
+        if (login := entry.strip()) and re.fullmatch(r"[A-Za-z0-9-]{1,39}\[bot\]", login, re.I)
+    )
+
+
+def _load_home_dotenv(home: Path) -> list[str]:
+    """Load ``<home>/.env`` as runtime defaults.
+
+    Process env wins: Docker/operator exports remain authoritative. The
+    returned key list is for startup observability only and never includes
+    values, so secret-bearing homes can still log the contract without leaking.
+    """
+    env_path = home / ".env"
+    if not env_path.is_file():
+        return []
+
+    before = set(os.environ)
+    process_only = {name: os.environ.get(name) for name in ("MIMIR_PLUGINS", "MIMIR_WEB_DEFAULT_SKIN")}
+    # Preserve load_dotenv's empty-value and process-first interpolation
+    # semantics. Restore process-only selections even if loading fails.
+    try:
+        operator_only = _SCOPE_ENV_KEYS | process_only.keys()
+        for key in sorted(dotenv_values(env_path, interpolate=False).keys() & operator_only):
+            log.warning("ignoring operator-only scope key %s in %s", key, env_path)
+        load_dotenv(env_path, override=False)
+    finally:
+        for key in _SCOPE_ENV_KEYS - before:
+            os.environ.pop(key, None)
+        for name, value in process_only.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    loaded = sorted(
+        key for key in set(os.environ) - before
+        if os.environ.get(key, "") != ""
+    )
+    if loaded:
+        log.info(
+            "loaded %s env default(s) from %s: %s",
+            len(loaded),
+            env_path,
+            ", ".join(loaded),
+        )
+    return loaded
+
+
+def _protected_channel_scope_file(path: Path, home: Path) -> Path:
+    """Resolve links and reject any target writable by this process or under home."""
+    resolved = path.resolve(strict=True)
+    if resolved.is_relative_to(home.resolve()):
+        raise ValueError("scope file resolves under MIMIR_HOME")
+    if not resolved.is_file():
+        raise ValueError("scope path is not a regular file")
+    for node in (resolved, *resolved.parents):
+        if os.access(node, os.W_OK):
+            raise ValueError(f"scope file or ancestor is writable: {node}")
+    return resolved
+
+
+def _scope_ids(raw: object, platform: str, *, yaml_list: bool = False) -> frozenset[str]:
+    if yaml_list:
+        if not isinstance(raw, list):
+            raise ValueError(f"{platform} channel/author ids must be a YAML list")
+        entries = raw
+    else:
+        entries = str(raw or "").split(",")
+    result = set()
+    for entry in entries:
+        # bool is an int subclass, but neither booleans nor floats are ids.
+        if yaml_list and platform == "discord" and type(entry) is int:
+            entry = str(entry)
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(f"{platform} ids must be nonempty strings")
+        value = entry.strip()
+        prefix = f"{platform}-"
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+        if not value or value.startswith(("discord-", "slack-", "dm-")) or value == "*":
+            raise ValueError(f"invalid {platform} id")
+        result.add(prefix + value)
+    return frozenset(result)
+
+
+def _parse_channel_scope(platform: str, values: dict[str, object], *, from_file: bool):
+    from .bridges.channel_scope import ChannelScope
+
+    if from_file:
+        for key in ("allowed_channels", "ignored_channels", "free_response_channels", "allowed_bot_ids"):
+            if key in values and not isinstance(values[key], list):
+                raise ValueError(f"{platform} {key} must be a YAML list")
+
+    def ids(key: str) -> frozenset[str]:
+        raw = values.get(key)
+        if raw is None or raw == "":
+            return frozenset()
+        return _scope_ids(raw, platform, yaml_list=from_file)
+
+    allowed_raw = values.get("allowed_channels")
+    allowed = (
+        None if allowed_raw is None or allowed_raw == "*"
+        else ids("allowed_channels")
+    )
+    bot_mode = values.get("allow_bots", "none")
+    if bot_mode not in ("none", "mentions", "all"):
+        raise ValueError(f"{platform} allow_bots must be none, mentions, or all")
+    require = values.get("require_mention", False)
+    if from_file:
+        if not isinstance(require, bool):
+            raise ValueError(f"{platform} require_mention must be a boolean")
+    else:
+        require = _env_bool(f"MIMIR_{platform.upper()}_REQUIRE_MENTION", False)
+    return ChannelScope(
+        allowed=allowed, ignored=ids("ignored_channels"), require_mention=require,
+        free_response=ids("free_response_channels"), allow_bots=bot_mode,
+        allowed_bot_ids=ids("allowed_bot_ids"),
+    )
+
+
+def load_channel_scopes(home: Path) -> dict[str, object]:
+    """Read operator-only process env or a protected file, once at bridge startup.
+
+    Raises ValueError/OSError on *any* bad source; callers must not register
+    either bridge when loading fails.
+    """
+    import yaml
+
+    configured = os.environ.get("MIMIR_CHANNEL_SCOPE_FILE")
+    default_path = Path("/etc/mimir/channel-scope.yaml")
+    path = Path(configured) if configured is not None else default_path
+    use_file = configured is not None or default_path.exists()
+    if use_file:
+        conflicts = sorted(_SCOPE_ENV_KEYS.intersection(os.environ) - {"MIMIR_CHANNEL_SCOPE_FILE"})
+        if conflicts:
+            raise ValueError("scope file conflicts with " + ", ".join(conflicts))
+        resolved = _protected_channel_scope_file(path, home)
+        try:
+            document = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, UnicodeError) as exc:
+            raise ValueError("invalid scope YAML") from exc
+        if not isinstance(document, dict) or set(document) - {"discord", "slack"}:
+            raise ValueError("scope file must contain only discord and slack sections")
+        sections = {}
+        valid = {key.lower() for key in _SCOPE_KEYS}
+        for platform in ("discord", "slack"):
+            section = document.get(platform, {})
+            if not isinstance(section, dict) or set(section) - valid:
+                raise ValueError(f"invalid {platform} scope keys")
+            sections[platform] = _parse_channel_scope(platform, section, from_file=True)
+        return sections
+    return {
+        platform: _parse_channel_scope(platform, {
+            key.lower(): os.environ[f"MIMIR_{platform.upper()}_{key}"]
+            for key in _SCOPE_KEYS if f"MIMIR_{platform.upper()}_{key}" in os.environ
+        }, from_file=False)
+        for platform in ("discord", "slack")
+    }
+
+
+def model_spec_at_call_time(home: Path | None = None) -> str:
+    """Resolve the live agent model, including its home-local dotenv defaults."""
+    if home is None:
+        raw_home = _env("MIMIR_HOME")
+        home = Path(raw_home).resolve() if raw_home else None
+    if home is not None:
+        _load_home_dotenv(home)
+    return _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        # chainlink #259: match _env_bool's posture — a typo
+        # (MIMIR_WEB_PORT=808O) warns + falls back rather than crashing
+        # boot with an opaque traceback.
+        log.warning(
+            "%s=%r is not a valid integer; using default %r",
+            name, raw, default,
+        )
+        return default
+
+
+def _env_positive_decimal(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if re.fullmatch(r"[0-9]+", raw) is None or int(raw) <= 0:
+        raise ValueError(f"{name} must be a positive decimal integer")
+    return int(raw)
+
+
+# Hard ceilings on the JSONL log caps. The reflection skill filters to the
+# last 7 days, the algedonic prompt block bounds itself by hours+limit, and
+# tail-streamed reads keep prompt-assembly cost O(window) regardless of
+# total log size — so the practical limit is on-disk weight, not prompt
+# cost. At ~400 bytes/event observed, 750k events ≈ 300 MB; that's the
+# upper bound an operator should ever set without shipping logs to an
+# external store.
+#
+# Events cap is 15× the turns cap — measured ~14 events/turn on mimir as
+# of 2026-05 (turn_started/finished, event_queued bursts, saga_feedback_sent
+# per batch, async-bash start/done pairs, tool_call_denied/retry events).
+# Up from the original 5× target as tool-call density grew through 2026
+# Q2; if events.jsonl outpaces turns.jsonl on retention again, raise again.
+#
+# Defaults at 5k turns / 75k events give roughly 30+ days of retention at
+# current rates, which is the window most behavioral audits assume.
+_TURNS_CAP_DEFAULT = 5_000
+_TURNS_CAP_MAX = 50_000
+_EVENTS_PER_TURN_RATIO = 15
+_EVENTS_CAP_DEFAULT = _TURNS_CAP_DEFAULT * _EVENTS_PER_TURN_RATIO
+_EVENTS_CAP_MAX = _TURNS_CAP_MAX * _EVENTS_PER_TURN_RATIO
+
+
+# Per-directory write permissions under MIMIR_HOME. ``"rw"`` allows
+# Write/Edit/upload via deepagents' filesystem tools; ``"ro"`` blocks
+# them at the WriteGuardBackend layer (reads/grep/glob unrestricted).
+# Anything not in this dict — e.g. ``.mimir/`` (saga db, metrics) — is
+# implicitly blocked because it's not a writable root. Operators
+# override via MIMIR_FOLDERS.
+DEFAULT_FOLDERS: dict[str, str] = {
+    "state": "rw",       # Agent state files (commitments, sessions, etc.)
+    "memory": "rw",      # Long-form text journal
+    "conversation_history": "rw",  # DeepAgents summarization offload
+    "attachments": "rw", # Agent-generated artifacts
+    "scratch": "rw",     # Ephemeral working area (drafts, throwaway clones,
+                         # scratch notes). Gitignored — not tracked state. The
+                         # blessed place for working files so the agent doesn't
+                         # invent ad-hoc dirs the write-guard then blocks (#299).
+    "skills": "rw",      # Operator-supplied skill bundles (agent can refine)
+    "logs": "ro",        # System-managed event/turn logs
+    "messages": "ro",    # Channel history (read-only — never rewrite)
+    "prompts": "ro",     # Operator-managed prompt overrides
+}
+
+
+def _turns_cap() -> int:
+    return min(_env_int("MIMIR_MAX_TURNS", _TURNS_CAP_DEFAULT), _TURNS_CAP_MAX)
+
+
+def _events_cap() -> int:
+    return min(_env_int("MIMIR_MAX_EVENTS", _EVENTS_CAP_DEFAULT), _EVENTS_CAP_MAX)
+
+
+def _is_anthropic_oauth_deployment() -> bool:
+    """True when this deployment talks to Anthropic's actual OAuth-
+    backed API (or no remote endpoint at all). False when the operator
+    routes ``ANTHROPIC_BASE_URL`` at a non-Anthropic compat endpoint
+    (Minimax / Moonshot Kimi / a gateway / etc.) — in which case
+    Anthropic's ``/api/oauth/usage`` endpoint is meaningless and
+    polling it would emit ``oauth_usage_failed`` every cron tick.
+
+    Heuristic: parse ``ANTHROPIC_BASE_URL``. Unset / empty / pointing
+    at ``api.anthropic.com`` → real Anthropic. Anything else → a
+    proxy / compat endpoint where the OAuth usage poller has no
+    useful work to do."""
+    raw = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not raw:
+        return True
+    try:
+        # ``urlparse().hostname`` already lowercases the host, so no
+        # extra ``.lower()`` needed (mimir-carreira review note on PR
+        # #246).
+        host = urlparse(raw).hostname or ""
+    except (ValueError, AttributeError):
+        return True  # malformed → assume Anthropic; the SDK will error elsewhere
+    return host == "api.anthropic.com"
+
+
+def _oauth_credentials_path() -> Path | None:
+    """Resolve the OAuth credentials path. Empty string explicitly
+    disables (useful in tests / non-OAuth deployments). Unset prefers
+    ``$MIMIR_HOME/.claude/.credentials.json`` — co-located with the
+    rest of mimir's persistent state so the credentials file rides
+    whatever bind mount / volume the operator has set up for the
+    homedir. Falls back to ``$HOME/.claude/.credentials.json`` (where
+    ``claude /login`` writes by default) only if MIMIR_HOME is unset.
+
+    Returns ``None`` when ``ANTHROPIC_BASE_URL`` points at a non-
+    Anthropic compat endpoint (Minimax / Kimi / gateway). The OAuth
+    usage endpoint (``/api/oauth/usage``) is Anthropic-specific; on
+    a routed deployment it doesn't exist + would emit
+    ``oauth_usage_failed`` every cron tick. The agent's chat model
+    still works fine via the routed endpoint — only the usage poller
+    is auto-disabled. Operators can force the poller back on with
+    an explicit ``MIMIR_CLAUDE_OAUTH_CREDENTIALS=<path>`` env.
+
+    Containerized deployments without bind mounts otherwise see the
+    refresh-token rotation get blown away on every container rebuild,
+    forcing a re-login. Anchoring on MIMIR_HOME removes that footgun
+    while still letting bare-metal operators keep credentials in their
+    user home."""
+    raw = os.environ.get("MIMIR_CLAUDE_OAUTH_CREDENTIALS")
+    if raw is not None and not raw.strip():
+        # Explicitly empty → disable.
+        return None
+    if raw is not None:
+        # Explicit path wins, even on a routed deployment (operator
+        # opt-in: "I know what I'm doing, poll Anthropic anyway").
+        return Path(raw).expanduser().resolve()
+    # No explicit env override. Auto-disable on non-Anthropic
+    # deployments (Minimax / Kimi / etc.) — the poller has no useful
+    # endpoint to hit and would just spam ``oauth_usage_failed``.
+    if not _is_anthropic_oauth_deployment():
+        return None
+    mimir_home = os.environ.get("MIMIR_HOME")
+    if mimir_home:
+        return Path(mimir_home).expanduser().resolve() / ".claude" / ".credentials.json"
+    home = os.environ.get("HOME") or ""
+    if not home:
+        return None
+    return Path(home) / ".claude" / ".credentials.json"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning(
+            "%s=%r is not a valid float; using default %r",
+            name, raw, default,
+        )
+        return default
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    value = _env_float(name, default)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse an env-var value as boolean.
+
+    Truthy: ``{1, true, yes, on, y}`` (case-insensitive, whitespace-
+    trimmed).  Falsy: ``{0, false, no, off, n}``.  Empty / unset
+    returns *default*. Anything else emits ``log.warning`` and returns
+    *default* so a typo doesn't silently flip a flag.
+    """
+    return env_bool(name, default, logger=log)
+
+
+def _load_mcp_servers_from_env() -> list:
+    """Load MCP server configs from MIMIR_MCP_SERVERS_JSON / _PATH env.
+
+    Inline JSON wins over path. Returns an empty list if both unset
+    (MCP is opt-in). Import is local so config doesn't pay the mcp/
+    LangChain import cost when MCP isn't configured.
+    """
+    json_inline = os.environ.get("MIMIR_MCP_SERVERS_JSON", "").strip()
+    json_path = os.environ.get("MIMIR_MCP_SERVERS_PATH", "").strip()
+    if not json_inline and not json_path:
+        return []
+    from .mcp_client import load_mcp_server_configs
+    return load_mcp_server_configs(
+        json_inline=json_inline or None,
+        json_path=json_path or None,
+    )
+
+
+def _parse_folders(raw: str) -> dict[str, str]:
+    """Parse a ``MIMIR_FOLDERS`` env value into a name→mode dict.
+
+    Format: ``name:mode`` pairs, comma-separated. Modes other than
+    ``rw``/``ro`` are coerced to ``ro`` (fail safe). Empty/unset
+    returns ``DEFAULT_FOLDERS``.
+
+    Unsafe names — ``""``, ``"."``, ``".."``, anything containing
+    traversal segments — are rejected with a warning. Pre-fix a bogus
+    spec like ``.:rw`` would alias the root and make EVERY directory
+    writable (including ``.mimir/db.sqlite``). Malformed input as a
+    whole (no parseable pairs) also logs at warning level rather than
+    silently restoring defaults — operator typo visibility matters
+    more than backwards compat with the silent fallback.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    raw = (raw or "").strip()
+    if not raw:
+        return dict(DEFAULT_FOLDERS)
+    folders: dict[str, str] = {}
+    had_pairs = False
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        had_pairs = True
+        name, mode = pair.split(":", 1)
+        name = name.strip().strip("/")
+        mode = mode.strip().lower()
+        if not name or name in (".", ".."):
+            _log.warning(
+                "MIMIR_FOLDERS: ignoring unsafe folder name %r "
+                "(empty or root-aliasing)", pair,
+            )
+            continue
+        # Reject any pathlike with traversal — ``a/../b``, ``../x``, etc.
+        if "/" in name or "\\" in name or name.startswith("."):
+            _log.warning(
+                "MIMIR_FOLDERS: ignoring suspicious folder name %r "
+                "(path separators or leading dot)", pair,
+            )
+            continue
+        if mode not in ("rw", "ro"):
+            _log.warning(
+                "MIMIR_FOLDERS: unknown mode %r for folder %r — "
+                "coercing to 'ro' (fail safe)", mode, name,
+            )
+            mode = "ro"
+        folders[name] = mode
+    if not folders:
+        if had_pairs:
+            _log.warning(
+                "MIMIR_FOLDERS=%r produced no valid folders — "
+                "falling back to DEFAULT_FOLDERS", raw,
+            )
+        return dict(DEFAULT_FOLDERS)
+    return folders
+
+
+def configured_writable_dirs(
+    folders: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Return configured folder names whose mode is ``rw``.
+
+    Without an explicit parsed mapping, this reads only ``MIMIR_FOLDERS``. It
+    deliberately does not load the home dotenv or build ``Config`` because the
+    result is used in write authorization. Invalid values retain
+    ``_parse_folders``' fail-safe behavior and fall back to ``DEFAULT_FOLDERS``;
+    unrelated configuration failures, such as repository git probes, cannot
+    affect this decision.
+    """
+    effective = (
+        _parse_folders(os.environ.get("MIMIR_FOLDERS", ""))
+        if folders is None
+        else folders
+    )
+    return [name for name, mode in effective.items() if mode == "rw"]
+
+
+# Absolute roots OUTSIDE the home that the file tools may read/edit, declared by
+# the operator (chainlink #650). Distinct from ``folders`` (subdirs UNDER the
+# home). ``/tmp`` is always added rw when present so the agent has an ephemeral
+# scratch root without per-deployment config.
+#
+# These exact roots are footgun guardrails, not a security boundary: an operator
+# can still choose a narrower project/data directory beneath a system prefix.
+_FILE_TOOL_FORBIDDEN_ROOTS: frozenset[str] = frozenset(
+    {
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/proc",
+        "/root",
+        "/sbin",
+        "/sys",
+        "/usr",
+        "/var",
+    }
+)
+
+
+@lru_cache(maxsize=1)
+def _forbidden_root_forms() -> frozenset[str]:
+    """Return each forbidden root in both its literal and resolved form.
+
+    ``Path.resolve()`` rewrites platform aliases: on macOS ``/etc`` becomes
+    ``/private/etc`` and ``/var`` becomes ``/private/var``. Comparing a resolved
+    candidate against the literal set therefore admitted a symlink to ``/etc``
+    on Darwin -- the guardrail applied on Linux and silently did not apply on a
+    developer machine. Both sides are now compared in the same space.
+
+    Resolution is per-platform and cached for the process. A root that cannot be
+    resolved contributes only its literal form, so an unresolvable entry never
+    removes an existing rejection.
+    """
+    forms: set[str] = set()
+    for raw in _FILE_TOOL_FORBIDDEN_ROOTS:
+        forms.add(raw)
+        try:
+            forms.add(str(Path(raw).resolve()))
+        except (OSError, RuntimeError):
+            continue
+    return frozenset(forms)
+
+
+_ALWAYS_RW_FILE_TOOL_ROOTS: tuple[str, ...] = ("/tmp",)
+
+
+def _parse_file_tool_roots(
+    raw: str,
+    home: Path,
+    *,
+    always_rw: tuple[str, ...] | None = None,
+    log_effective: bool = False,
+) -> tuple[tuple[str, str], ...]:
+    """Parse ``MIMIR_FILE_TOOL_ROOTS`` into validated ``(abs_path, mode)`` pairs.
+
+    Each comma-separated entry is ``path`` (defaults to ``rw``) or ``path:ro`` /
+    ``path:rw``. These become ``CompositeBackend`` routes so the agent's file
+    tools can read/edit repos OUTSIDE the home (e.g. a source checkout it
+    develops). Roots in ``always_rw`` (default ``/tmp``) are appended ``rw`` when
+    they exist.
+
+    Rejected (logged + skipped): non-absolute; ``~`` or ``..`` (traversal);
+    common system roots; missing / non-directory; and any root that IS the home
+    or overlaps it in either direction (which would shadow the home WriteGuard).
+    Symlinks are resolved. De-duplicated by resolved path, insertion order, with
+    explicit entries taking precedence over ``always_rw``. ``always_rw``
+    defaults to ``_ALWAYS_RW_FILE_TOOL_ROOTS`` (resolved at call time so an
+    unset env still gets ``/tmp``); pass ``()`` to disable it."""
+    if always_rw is None:
+        always_rw = _ALWAYS_RW_FILE_TOOL_ROOTS
+    _log = logging.getLogger(__name__)
+    home_resolved = Path(home).resolve()
+    out: dict[str, str] = {}
+    origins: dict[str, str] = {}
+    expected = "expected /absolute/path[:ro|:rw], comma-separated"
+
+    def _reject(entry: str, reason: str) -> None:
+        _log.warning(
+            "MIMIR_FILE_TOOL_ROOTS: ignoring entry %r (%s; %s)",
+            entry,
+            reason,
+            expected,
+        )
+
+    def _consider(rawpath: str, mode: str, entry: str, origin: str) -> None:
+        rawpath = rawpath.strip()
+        if not rawpath:
+            _reject(entry, "path is empty")
+            return
+        if "~" in rawpath or ".." in Path(rawpath).parts:
+            _reject(entry, "~ and .. are not allowed")
+            return
+        p = Path(rawpath)
+        if not p.is_absolute():
+            _reject(entry, "path is not absolute")
+            return
+        if rawpath.rstrip("/") in _forbidden_root_forms():
+            _reject(entry, "path is a forbidden system root")
+            return
+        try:
+            resolved = p.resolve()
+        except (OSError, RuntimeError) as exc:
+            _reject(entry, f"path cannot be resolved: {exc}")
+            return
+        # ``Path.resolve()`` does not fail uniformly on a symlink loop: Linux
+        # raises ELOOP, macOS returns the path unchanged. ``is_dir()`` then
+        # swallows the stat error on both, so a loop was reported as "not an
+        # existing directory" on Darwin -- true of a missing path, misleading
+        # about a path that exists and cannot be followed. stat explicitly and
+        # keep the two reasons distinct: absent is not the same as unresolvable.
+        try:
+            is_dir = stat_module.S_ISDIR(os.stat(resolved).st_mode)
+        except FileNotFoundError:
+            is_dir = False
+        except (OSError, RuntimeError) as exc:
+            _reject(entry, f"path cannot be resolved: {exc}")
+            return
+        if not is_dir:
+            _reject(entry, "path is not an existing directory")
+            return
+        if str(resolved) in _forbidden_root_forms():
+            _reject(entry, "path resolves to a forbidden system root")
+            return
+        if (
+            resolved == home_resolved
+            or resolved.is_relative_to(home_resolved)
+            or home_resolved.is_relative_to(resolved)
+        ):
+            _reject(entry, f"path overlaps the agent home {home_resolved}")
+            return
+        key = str(resolved)
+        if key not in out:  # first wins; explicit entries are parsed before always_rw
+            out[key] = mode
+            origins[key] = origin
+
+    for entry in (raw or "").split(",") if raw else ():
+        entry = entry.strip()
+        if not entry:
+            _reject(entry, "entry is empty")
+            continue
+        if entry.count(":") > 1:
+            _reject(entry, "colon is only valid as the optional mode delimiter")
+            continue
+        path_part, sep, mode_part = entry.rpartition(":")
+        if sep:
+            mode = mode_part.strip().lower()
+            if mode not in ("ro", "rw"):
+                _reject(entry, f"unknown mode {mode_part!r}")
+                continue
+            _consider(path_part, mode, entry, "configured")
+        else:
+            _consider(entry, "rw", entry, "configured")
+
+    for ap in always_rw:
+        if Path(ap).is_dir():
+            _consider(ap, "rw", ap, "derived")
+
+    if log_effective:
+        _log.info(
+            "effective file root path=%r mode=rw origin=derived-home",
+            str(home_resolved),
+        )
+        for path, mode in out.items():
+            _log.info(
+                "effective file root path=%r mode=%s origin=%s",
+                path,
+                mode,
+                origins[path],
+            )
+
+    return tuple(out.items())
+
+
+#: How an operator gets coding back after it moved out of core. Emitted verbatim
+#: by the boot warnings below: agents and operators act on this string, so it
+#: must stay exact (see docs/plugins.md, "Upgrading a coding deployment").
+CULTIVATE_UPGRADE_HINT = (
+    "Coding now ships as the Cultivate plugin (the plugins/cultivate workspace "
+    "member). To keep coding: install it from this source checkout with "
+    "`uv sync --all-packages` (keep your --extra flags; a plain `uv sync` removes "
+    "it), or rebuild the image with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` "
+    "and `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build`; "
+    "then set MIMIR_PLUGINS=cultivate in the process or supervisor environment "
+    "(shell export, systemd Environment=, compose environment:/env_file) and "
+    "restart. Do NOT put MIMIR_PLUGINS in the agent home's .env: that file cannot "
+    "select plugins. See docs/plugins.md, \"Upgrading a coding deployment\"."
+)
+#: Home files that only a selected forge/coding provider consumes.
+_PROVIDER_OWNED_HOME_FILES = ("worklink.yaml", "repositories.yaml")
+#: One warning per message per process: from_env runs more than once per boot.
+_retired_coding_warned: set[str] = set()
+
+
+def _warn_once(message: str, *args: object) -> None:
+    rendered = message % args if args else message
+    if rendered in _retired_coding_warned:
+        return
+    _retired_coding_warned.add(rendered)
+    log.warning(rendered)
+
+
+def _warn_retired_coding_configuration(home: Path, provider_selected: bool) -> None:
+    """Make an upgrade that silently lost coding loud, without failing boot."""
+    raw = os.environ.get("MIMIR_CODING_ENABLED")
+    if raw is not None:
+        if provider_selected or raw.strip().lower() not in _ENV_BOOL_TRUTHY:
+            _warn_once(
+                "MIMIR_CODING_ENABLED is retired and ignored; coding is selected only "
+                "by MIMIR_PLUGINS. Remove MIMIR_CODING_ENABLED from the deployment"
+            )
+        else:
+            _warn_once(
+                "MIMIR_CODING_ENABLED=%s is retired and ignored: CODING IS DISABLED "
+                "because no coding provider is selected (MIMIR_PLUGINS=%r). %s",
+                raw, os.environ.get("MIMIR_PLUGINS", ""), CULTIVATE_UPGRADE_HINT,
+            )
+    if provider_selected:
+        return
+    for name in _PROVIDER_OWNED_HOME_FILES:
+        if (home / name).exists():
+            _warn_once(
+                "%s exists but no selected plugin owns it (MIMIR_PLUGINS=%r): it is "
+                "IGNORED and coding is disabled. %s",
+                home / name, os.environ.get("MIMIR_PLUGINS", ""), CULTIVATE_UPGRADE_HINT,
+            )
+
+
+def _configure_declared_repositories(
+    home: Path, inventory_loader: Any = None, repository_selection: Any = None,
+) -> None:
+    """Validate the repository inventory and reconcile its legacy projections."""
+    if inventory_loader is None:
+        return
+    inventory = inventory_loader(home / "repositories.yaml")
+    if not inventory.declared:
+        return
+
+    declared_roots = tuple(
+        (str(item.root), item.mode)
+        for item in (*inventory.repositories, *inventory.allowed_roots)
+    )
+    rendered_roots = ",".join(f"{path}:{mode}" for path, mode in declared_roots)
+    effective_declared = _parse_file_tool_roots(rendered_roots, home, always_rw=())
+    if effective_declared != declared_roots:
+        raise RuntimeError(
+            "declared repositories/allowed_roots contain a root that is not a valid "
+            f"file-tool root: declared={declared_roots!r}, effective={effective_declared!r}"
+        )
+
+    legacy_roots = os.environ.get("MIMIR_FILE_TOOL_ROOTS")
+    if legacy_roots:
+        effective_legacy = _parse_file_tool_roots(legacy_roots, home, always_rw=())
+        if dict(effective_legacy) != dict(declared_roots):
+            raise RuntimeError(
+                "MIMIR_FILE_TOOL_ROOTS disagrees with repositories.yaml: "
+                f"legacy={effective_legacy!r}, declared={declared_roots!r}"
+            )
+    else:
+        os.environ["MIMIR_FILE_TOOL_ROOTS"] = rendered_roots
+
+    declared_slugs = tuple(repo.slug for repo in inventory.repositories)
+    legacy_slugs = os.environ.get("GITHUB_REPOS")
+    if legacy_slugs:
+        effective_slugs = tuple(
+            part.strip().lower() for part in legacy_slugs.split(",") if part.strip()
+        )
+        if set(effective_slugs) != set(declared_slugs):
+            raise RuntimeError(
+                "GITHUB_REPOS disagrees with repositories.yaml: "
+                f"legacy={effective_slugs!r}, declared={declared_slugs!r}"
+            )
+    else:
+        os.environ["GITHUB_REPOS"] = ",".join(declared_slugs)
+
+    if repository_selection is not None:
+        repository_selection(home, inventory)
+
+    git = shutil.which("git")
+    if git is None and inventory.repositories:
+        raise RuntimeError("declared repositories cannot be validated: git is unavailable")
+    for repo in inventory.repositories:
+        found = "not a git checkout"
+        try:
+            top = subprocess.run(
+                [str(git), "-C", str(repo.root), "rev-parse", "--show-toplevel"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            origin = subprocess.run(
+                [str(git), "-C", str(repo.root), "config", "--local", "--get", "remote.origin.url"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            observed_top = Path(top.stdout.strip()).resolve() if top.returncode == 0 else None
+            if observed_top == repo.root and origin.returncode == 0:
+                found = origin.stdout.strip() or "origin is empty"
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
+        if found != repo.origin:
+            raise RuntimeError(
+                f"repository {repo.slug} did not bind: expected origin "
+                f"{repo.origin!r}, found {found!r} at {repo.root}"
+            )
+
+
+def _parse_sources(raw: str) -> frozenset[str] | None:
+    """Parse a comma-separated source allowlist for Recent activity.
+
+    - ``""`` / unset → ``frozenset()`` (allow nothing — bench-friendly default
+      when MIMIR_RECENT_SOURCES is explicitly set to empty)
+    - ``"*"`` or ``"all"`` → ``None`` (allow every source, including legacy
+      records with ``source=None``)
+    - otherwise → ``frozenset`` of comma-split tokens after strip+lower
+    """
+    raw = (raw or "").strip()
+    if raw in {"*", "all"}:
+        return None
+    if not raw:
+        return frozenset()
+    tokens = {tok.strip().lower() for tok in raw.split(",") if tok.strip()}
+    return frozenset(tokens)
+
+
+_CHAT_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _normalize_chat_skill_name(raw: str) -> str | None:
+    """Normalize one chat-skill name to its command slug.
+
+    Rules (chainlink #783): strip surrounding whitespace, tolerate one optional
+    leading slash, lowercase, and reject anything outside the normalized
+    ``lowercase-with-hyphens`` command surface.
+    """
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    if candidate.startswith("/"):
+        candidate = candidate[1:]
+    candidate = candidate.lower()
+    if not candidate or not _CHAT_SKILL_NAME_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _parse_chat_skill_allowlist(raw: str) -> tuple[str, ...]:
+    """Parse ``MIMIR_CHAT_SKILL_ALLOWLIST`` into normalized unique names.
+
+    Invalid entries are dropped silently (fail-safe, default-off posture); the
+    operator-visible behavior is simply that only valid, normalized skill names
+    survive into the allowlist.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in (raw or "").split(","):
+        name = _normalize_chat_skill_name(token)
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
+
+
+def _core_plugin_manager() -> PluginManager:
+    from .plugins.core import core_policy_registry
+    from .plugins.manager import PluginManager
+
+    return PluginManager(core_policy_registry(), ())
+
+
+@dataclass
+class Config:
+    home: Path
+    # Logical agent name — tags every TurnRecord + event record so a
+    # cross-process operator running two agents on the same
+    # infrastructure can disambiguate output by agent without grepping
+    # by MIMIR_HOME path. Default "mimir"; multi-agent deployments
+    # override via MIMIR_AGENT_ID. Has no effect on a single-agent
+    # deployment.
+    agent_id: str
+    model: str
+    # Post-cutover model spec for the deepagents path:
+    #   - ``claude-code:<model>``  → ChatClaudeCode (Max OAuth subprocess)
+    #   - ``<provider>:<model>``   → init_chat_model via langchain
+    #
+    # Common forms:
+    #   codex-plus:gpt-5.6-luna           (default; Codex subscription OAuth)
+    #   claude-code:claude-sonnet-4-6     (Max OAuth subprocess)
+    #   anthropic:claude-haiku-4-5        (direct API, paid)
+    #   openai:gpt-4.1-mini               (direct OpenAI)
+    #
+    # Non-Anthropic / non-OpenAI providers that expose an
+    # Anthropic-compat endpoint (Minimax, Moonshot Kimi) ride the
+    # ``anthropic:`` provider with ``ANTHROPIC_BASE_URL`` overridden:
+    #   ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
+    #   ANTHROPIC_API_KEY=<minimax key>
+    #   MIMIR_MODEL_SPEC=anthropic:MiniMax-M2.7
+    # Anthropic-compat is preferred over OpenAI-compat for reasoning
+    # models because the provider converts reasoning to proper
+    # ``thinking`` content blocks server-side, vs. the OAI-compat
+    # path's inline ``<think>...</think>`` tags in content.
+    #
+    # See ``mimir.agent._resolve_model``. Defaults to
+    # ``codex-plus:gpt-5.6-luna`` (Codex subscription OAuth, no API-key
+    # billing). Every provider supports ``MIMIR_ACCESS_CONTROL_ENFORCED``.
+    model_spec: str
+
+    # Per-call retry budget for non-claude-code providers (anthropic,
+    # openai, voyage, etc.). Threaded into ``init_chat_model`` via
+    # ``max_retries=...``; provider SDKs use this for transient 429 /
+    # 5xx backoff. claude-code path ignores this — the subprocess
+    # handles its own retry semantics. Default 6 (matches open-strix).
+    model_max_retries: int
+    effort: str
+    embed_model: str
+    web_port: int
+
+    # Concurrency (§4.5)
+    max_concurrent_turns: int
+    max_channel_queue: int
+    worker_idle_timeout_s: int
+    # chainlink #376: channel-id prefixes opted into mid-turn user-message
+    # injection (fold a message into the running turn instead of queuing it as
+    # the next turn). Empty (default) disables the feature; "*" enables it for
+    # all channels. Pollers / scheduled ticks are excluded regardless (only
+    # ``user_message`` events are eligible).
+    midturn_injection_channels: tuple[str, ...]
+
+    # Message buffer (§5.4)
+    history_global_max: int
+    history_per_channel_max: int
+    recent_per_channel: int
+    recent_author_cross: int
+    recent_cross_hours: int
+    # Allowlist of Message.source values that participate in the Recent
+    # activity prompt section (open-strix's exact filter — its allowlist is
+    # ``{"discord","web","stdin"}`` hard-coded in app.py:734). Empty
+    # frozenset means "allow nothing", None means "allow all sources".
+    recent_sources: frozenset[str] | None
+    # Per-message render cap for Recent activity (chars). 0 = no cap.
+    recent_message_chars: int
+
+    # SAGA session (§5.6)
+    saga_session_idle_minutes: int
+    saga_session_max_turns: int
+    saga_consolidate_cron: str
+
+    # Timezone the scheduler interprets all cron expressions in
+    # (scheduler.yaml jobs, saga-consolidate, introspection-report,
+    # commitments-due-check, every poller). APScheduler ZoneInfo
+    # string — e.g., "UTC", "America/New_York", "Europe/London".
+    # Default UTC matches the pre-PR behavior (all cron expressions
+    # treated as UTC); operators deploying in a non-UTC region set
+    # this so they can author scheduler.yaml in local wall-clock time
+    # without mentally subtracting hours twice a year for DST.
+    # Invalid values fall back to UTC with a logged warning rather
+    # than crashing the scheduler — wrong-but-offset is preferable to
+    # agent-offline. ZoneInfo handles DST automatically via the
+    # system's tzdata.
+    scheduler_tz: str
+
+    # Commitments Phase 2b — periodic due-check sweep emits
+    # commitment_due / commitment_expired / commitment_snooze_pileup
+    # algedonic events. Empty string disables the cron entirely.
+    # 5-min default is fine-grained enough that an explicit "remind
+    # me at 14:00" surfaces within 5 min of 14:00, coarse-grained
+    # enough that the sweep cost (replay + 0–N writes) is negligible.
+    commitments_due_check_cron: str
+    # Pileup threshold: when a single commitment's snooze_count
+    # reaches this, the poller fires commitment_snooze_pileup.
+    # Default 3 — "you've punted this thing 3 times already, time
+    # to commit or dismiss."
+    commitments_snooze_pileup_threshold: int
+
+    # Weekly event-introspection report (FEEDBACK-LOOPS §4.7) + heartbeat
+    # health monitor (§4.8). Empty string disables the cron. Default is
+    # Friday 14:00 UTC so the report lands before reflection (Sun 06:00)
+    # and operator review on Monday morning.
+    introspection_report_cron: str
+    introspection_report_days: int
+    introspection_report_health_threshold: float
+    introspection_report_emit_algedonic: bool
+
+    # Per-atom confidence floor (post SAGA per-atom gating) for the
+    # pre-message auto-fetch hook. Empty string (default) defers to SAGA's
+    # ``[retrieval].default_min_confidence_tier`` config (today: "low").
+    # Override with "medium"/"high" only when bench data shows weak hits
+    # are net-negative; "low" is fine post SAGA commit 29efa38 which fixed
+    # the bug where keyword-only-pathway atoms had ``_confidence_tier``
+    # unset and got dropped at any floor ≥ low.
+    saga_pre_message_min_tier: str
+
+    # send_message circuit breaker (§7.2.4)
+    send_loop_soft_limit: int
+    send_loop_hard_limit: int
+    send_loop_similarity: float
+
+    # Per-turn tool-call budget — caps panic-search loops on probe retries.
+    # 0 disables the cap entirely.
+    tool_call_budget: int
+
+    # chainlink #511: per-turn model-iteration ceiling (3-tier belt-and-
+    # suspenders alongside tool_call_budget + the homeostat). The
+    # IterationGate nudges at 75% / 90% and hard-stops (force-ends the turn +
+    # notifies the channel) at 100%. Default 200 is set ABOVE the observed
+    # ceiling of real turns (mimirbot p99≈91, max 154 over ~4.5k turns) so it
+    # only catches a genuine runaway — not Hermes' 90, which would clip ~1% of
+    # legitimate heavy turns. 0 disables the cap entirely.
+    max_turn_iterations: int
+
+    # Per-directory write permissions under ``home``. Subdir name →
+    # ``"rw"`` or ``"ro"``. ``WriteGuardBackend`` enforces this at the
+    # filesystem-tool layer (Write/Edit/upload blocked outside writable
+    # roots; reads/grep/glob unrestricted). Operator-configurable via
+    # ``MIMIR_FOLDERS`` (``name:mode`` pairs, comma-separated, e.g.
+    # ``state:rw,memory:rw,logs:ro``); falls back to ``DEFAULT_FOLDERS``
+    # when unset. Unknown modes are coerced to ``"ro"`` (fail safe).
+    folders: dict[str, str]
+
+    # MCP servers to spawn at startup. Each entry is an
+    # ``MCPServerConfig`` (name, command, args, env). Tools exposed by
+    # the servers are bridged as ``mcp_{server}_{tool}`` LangChain
+    # tools and appended to the agent's tool surface. Operator-supplied
+    # via ``MIMIR_MCP_SERVERS_JSON`` (inline JSON list) or
+    # ``MIMIR_MCP_SERVERS_PATH`` (path to a JSON file). Both forms
+    # accept the Claude-Code-style ``{"mcpServers": [...]}`` wrapper
+    # or a bare list. Empty by default — MCP is opt-in.
+    mcp_servers: list  # type: list[MCPServerConfig], avoiding the import
+
+    # SDK gateway (§14.1)
+    anthropic_api_key: str
+    anthropic_base_url: str
+    anthropic_auth_token: str
+    anthropic_model: str
+    anthropic_custom_model_option: str
+    disable_experimental_betas: str
+
+    # Prompts override
+    prompts_dir: Path | None
+
+    # Channels
+    discord_token: str
+    slack_bot_token: str
+    slack_app_token: str
+    bsky_handle: str
+    bsky_app_password: str
+    # Per-file cap on inbound chat attachments the agent downloads to disk
+    # (#494/#495). Without it the bridge size gate is disabled and any chat
+    # participant can fill the agent's disk with max-size uploads. Override
+    # via ``MIMIR_ATTACHMENTS_MAX_BYTES`` (e.g. larger for Slack's ~1GB).
+    attachments_max_bytes: int
+
+    # Identity reconciliation (FUTURE_WORK §6.1). Defaults true — operators
+    # who want strict per-platform isolation (compliance, regulated workflows)
+    # can set MIMIR_CROSS_PLATFORM_PULL=false to disable cross-platform pull
+    # without removing state/identities.yaml.
+    cross_platform_pull: bool
+
+    # IFC, tool and sink policy enforcement; independent of bridge intake.
+    access_control_enforced: bool
+    # Explicitly admit unauthorised bridge authors in shadow mode. Ignored when
+    # access control is enforced; intake is closed by default.
+    open_bridge: bool
+
+    # Operator alert channel (v0.4 §6) — channel_id the agent uses for
+    # high-priority signals to the operator that don't fit the current
+    # conversation (critical errors, urgent heartbeat findings, dispatch
+    # failures). Empty default means feature inactive — the system prompt
+    # omits the line entirely and the alert skill no-ops. Just a normal
+    # channel id; the registered bridge dispatches by prefix.
+    operator_alert_channel: str
+
+    # Server-side API key for the public injection endpoint (POST /event).
+    # When set, requests must carry a matching ``X-API-Key`` header or get
+    # 401. Empty default means no auth — fine for development on
+    # loopback (127.0.0.1, the default ``web_host``). Binding any
+    # non-loopback interface (``0.0.0.0`` or a specific external IP)
+    # requires a non-empty ``api_key``; the server refuses to start
+    # otherwise. Without auth on a network-reachable port, an attacker
+    # who can reach the port can steer the agent into the synthesis
+    # path against an arbitrary session id (and call saga_end_session
+    # etc.).
+    api_key: str
+
+    # HTTP bind address. Default ``127.0.0.1`` — loopback-only, the safe
+    # posture for a process the operator interacts with locally.
+    # ``MIMIR_WEB_HOST=0.0.0.0`` (or a specific IP) exposes the port to
+    # the network and requires ``MIMIR_API_KEY`` to be set; startup
+    # refuses the combination of a non-loopback bind + missing key.
+    # Docker / k8s deployments typically set this to ``0.0.0.0`` and
+    # also supply an API key via the orchestrator's secret store.
+    web_host: str
+
+    # Set MIMIR_ALLOW_UNAUTHENTICATED=true to suppress the startup
+    # security warning when MIMIR_API_KEY is empty. For development /
+    # localhost use only; production deployments should set MIMIR_API_KEY.
+    allow_unauthenticated: bool
+
+    # Per-turn wall-clock timeout in seconds. 0 = no timeout (bench/dev).
+    # Default 3600 (60 min) catches indefinitely hung turns while
+    # allowing legitimate long heartbeat or reflection work.
+    turn_timeout_seconds: int
+
+    # chainlink #389: ceiling for post-model-loop finalize hooks.
+    # turn_timeout_seconds only bounds the model stream; without this a hung hook
+    # would hold the dispatcher worker forever and wedge the whole channel.
+    # Nonpositive values use the 180-second default, matching continuation
+    # recovery's finite-default semantics (its separate default is 30 seconds).
+    post_turn_timeout_seconds: int
+
+    # chainlink #510: graceful-drain bound. On SIGTERM the dispatcher stops
+    # accepting new events and waits up to this many seconds for in-flight
+    # turns to finish before cancelling them and exiting — so a deploy restart
+    # finishes live turns instead of killing them, while staying deterministic
+    # (don't hang past the compose stop_grace_period, which Docker then SIGKILLs
+    # through). Keep stop_grace_period >= this. 0 = wait unbounded.
+    drain_timeout_seconds: int
+
+    # aiohttp's in-flight HTTP handler grace, including SSE streams. Keep this
+    # plus drain_timeout_seconds and cleanup margin below the supervisor grace.
+    http_shutdown_timeout_seconds: float
+
+    # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
+    # signals prompt section; per-polarity cap on rendered items. 0 for
+    # the limit disables the section entirely. Tune small if the prompt
+    # is getting noisy.
+    feedback_window_hours: int
+    feedback_limit_per_polarity: int
+
+    # Session boundary surfacing (v0.4 §3). Number of recent session
+    # boundaries to render in the prompt's "Recent session summaries"
+    # block, scoped to the current channel. 0 disables the section.
+    recent_boundaries: int
+    # Staleness markers on the Unfinished sub-bullet (chainlink #63).
+    # When a summary's age >= ``stale_age_hours`` OR turns-since-boundary
+    # on the same channel >= ``stale_turns``, the Unfinished header gets
+    # a ``[verify before quoting]`` suffix nudging the
+    # verify-before-claim rule. Either signal alone is enough to fire.
+    unfinished_stale_age_hours: int
+    unfinished_stale_turns: int
+
+    # Usage block in the turn prompt: enable/disable, plus optional
+    # dollar budgets that gate the "% of budget" annotation. The 5h /
+    # weekly windows match Anthropic's Max-plan rolling-window shape;
+    # these are *operator-set dollar ceilings*, complementary to the
+    # plan's unit budget that the SDK's RateLimitEvent stream reports
+    # (captured separately in mimir/rate_limits.py and rendered as
+    # "Plan windows" in the same prompt section). Leave blank to skip
+    # the dollar-threshold annotation.
+    usage_block_enabled: bool
+    usage_5h_limit_usd: float
+    usage_weekly_limit_usd: float
+
+    # Cost-rate alert. Two thresholds, both optional:
+    # - cost_hourly_limit_usd: absolute ceiling. 0 disables.
+    # - cost_rate_spike_ratio: multiplier of the rolling-week per-hour
+    #   baseline. Default 3.0; 0 disables. Adapts to your usual spend
+    #   so a sleeper agent that wakes up briefly doesn't false-positive.
+    # - cost_rate_spike_floor_usd: rate_now floor below which the spike
+    #   check is silenced regardless of ratio. Default $5.00/hr — a
+    #   second line of defense for "weird shape, not yet at ceiling"
+    #   that lets normal working sessions (a few dollars/hour) pass
+    #   without tripping. 0 disables (revert to baseline-only gating).
+    # cost_alert_cooldown_minutes: minimum interval between
+    #   ``cost_rate_alert`` events landing in events.jsonl. The
+    #   algedonic surfacing keeps showing the most recent alert until
+    #   it ages out of the window, so re-emitting per turn adds no
+    #   information. Default 60.
+    cost_hourly_limit_usd: float
+    cost_rate_spike_ratio: float
+    cost_rate_spike_floor_usd: float
+    cost_alert_cooldown_minutes: int
+
+    # Billing-mode-aware suppression (chainlink #13). ``quota`` mode
+    # treats plan-window on-pace projection as the binding constraint
+    # (zero marginal cost up to the cap) and demotes cost-rate spikes
+    # to advisory; ``pay-as-you-go`` keeps the existing spike_ratio
+    # path. Auto-detected by default — see ``mimir.billing.detect_billing_mode``.
+    # Override via ``MIMIR_BILLING_MODE=quota|pay-as-you-go``.
+    billing_mode: BillingMode
+
+    # OAuth usage poller (mimir/oauth_usage_poller.py): hits Anthropic's
+    # /api/oauth/usage to populate plan-window utilization% in the
+    # RateLimitStore. Requires credentials minted by ``claude /login``
+    # (which grants user:profile scope) — the headless setup-token
+    # flow's user:inference-only scope can't read this endpoint.
+    # ``oauth_credentials_path`` is the path to credentials.json;
+    # default is $HOME/.claude/.credentials.json. Empty string disables
+    # the poller. ``oauth_usage_poll_cron`` is the cron expression;
+    # leave blank to disable. ``oauth_refresh_warn_days`` is the soft
+    # heuristic threshold (days since first observed credentials) at
+    # which we emit ``oauth_refresh_token_age_warn`` so the operator
+    # knows to consider re-/login before the refresh token expires.
+    oauth_credentials_path: Path | None
+    oauth_usage_poll_cron: str
+    oauth_refresh_warn_days: int
+
+    # Codex account usage refresh. This is a scheduler named callable, not an
+    # LLM/skill poller, so quota suppression cannot prevent telemetry recovery.
+    codex_usage_poll_cron: str
+
+    # Minimax usage poller (mimir/minimax_usage_poller.py): hits
+    # ``www.minimax.io/v1/api/openplatform/coding_plan/remains`` and
+    # writes ``minimax_five_hour`` / ``minimax_seven_day`` snapshots
+    # to ``RateLimitStore``. Independent of the Anthropic OAuth poller;
+    # typical deployments use one or the other based on which gateway
+    # the agent talks to. Disabled by default (empty cron) — operator
+    # opts in by setting ``MIMIR_MINIMAX_USAGE_POLL_CRON`` (e.g.
+    # ``*/3 * * * *`` to match the Anthropic poller cadence) and
+    # providing ``MINIMAX_API_KEY``.
+    minimax_usage_poll_cron: str
+    minimax_usage_model_name: str
+
+    # Bind-mount health probe (mimir/health_probe.py): detects the
+    # VirtioFS stale-inode failure mode and self-restarts via SIGTERM
+    # to PID 1 so Docker's restart-unless-stopped policy re-mounts
+    # cleanly. ``health_probe_cron`` is the cron expression; default
+    # is every minute. Empty disables. ``health_probe_max_restarts_per_hour``
+    # is the sliding-window guard threshold — past N restarts in 60min
+    # we stop self-restarting and surface ``bind_mount_stale_persistent``
+    # for operator action.
+    health_probe_cron: str
+    health_probe_max_restarts_per_hour: int
+
+    # Liveness beat (chainlink #507): a background task rewrites
+    # ``state/liveness.json`` every ``liveness_beat_seconds`` so the
+    # out-of-process ``mimir watchdog`` dead-man's-switch can detect a
+    # dead/wedged agent and alert out-of-band (ntfy / webhook). 0 disables
+    # the beat. Default 60s (watchdog default stale threshold is 180s).
+    liveness_beat_seconds: int
+
+    # Identities populator (mimir/identities_populator.py): scrapes
+    # connected Discord guilds + Slack workspaces into
+    # ``state/identities.yaml`` so the registry stays current without
+    # operator hand-curation. ``identities_populate_cron`` is the cron
+    # expression; default empty (disabled) — operator opt-in via
+    # ``MIMIR_IDENTITIES_POPULATE_CRON`` because bridge scrapes are
+    # platform-API hits that shouldn't fire by default in environments
+    # where it'd be surprising. Recommended value: ``0 6 * * *`` (daily
+    # at 06:00 UTC). The populator is idempotent — rerun → zero deltas,
+    # operator-set fields preserved, atomic writeback.
+    identities_populate_cron: str
+
+    # Per-response rate-limit capture (default on). Enabling this turns
+    # on the SDK's include_partial_messages so StreamEvent messages
+    # carry the raw Anthropic streaming events; we filter for
+    # ``message_start`` and read its ``rate_limits`` block. Without
+    # this, mimir only sees rate-limit data when the SDK emits a
+    # transition event (allowed → allowed_warning → rejected) — fine
+    # for "scale back when warned" but the Plan windows section is
+    # empty most of the time. Cost: extra streaming chunks parsed per
+    # turn (cheap; local IPC, dict lookups). Disable to skip the
+    # streaming overhead at the cost of less-current plan-window data.
+    capture_rate_limits: bool
+
+    # Opt into Anthropic's 1M-context-window beta for Claude 4.x
+    # Opus / Sonnet (header ``context-1m-2025-08-07``). Default on:
+    # mimir's typical prompt size (300-600k tokens with full memory +
+    # session summaries + recent activity + SAGA hits) is well past
+    # the 200k bare-model cap, so without this the API silently
+    # truncates or rejects oversize prompts. Set
+    # ``MIMIR_CONTEXT_1M=false`` to disable (e.g. when running against
+    # an account / model variant that doesn't support the beta).
+    context_1m: bool
+
+    # PR 4a (MIMIR_HOME_GIT_TRACKING): post-turn git commit + debounced
+    # push for /mimir-home. PR 4b ships the allowlist gitignore +
+    # pre-commit secret-scan hook + ``git_bootstrap.bootstrap_git_repo``
+    # called from ``mimir setup`` and from ``server._on_startup``, and
+    # flips this default to True. Operators that want to opt out (e.g.
+    # standalone CI runs, transient containers) can still set
+    # ``MIMIR_GIT_TRACKING_ENABLED=false`` in the env.
+    git_tracking_enabled: bool
+    # PR 4b: optional remote-bootstrap inputs. When both are set, the
+    # bootstrap function clones the remote into an empty home (or
+    # configures origin + pulls --ff-only on an existing repo). When
+    # either is missing, the bootstrap falls back to ``git init`` +
+    # bootstrap commit (no remote, no auto-push). Token is URL-encoded
+    # into the embedded HTTPS URL — never logged in cleartext.
+    git_state_repo: str | None
+    git_state_token: str | None
+
+    # Logging — JSONL caps clamped to [1, _LOG_CAP_MAX]. Default 1000.
+    # Both files are tail-streamed at read time, so the cap is mostly
+    # about cumulative on-disk size; the trim logic uses 10% hysteresis
+    # to amortize rewrite cost.
+    max_turns_kept: int
+    max_events_kept: int
+    turns_archive_dir: Path | None
+
+    # Per-call OUTPUT token cap for non-claude-code providers, threaded into
+    # ``init_chat_model`` via ``max_tokens=...`` (see ``mimir.agent._resolve_model``).
+    # 0 (default) leaves the provider default in place. RAISE IT for
+    # thinking-via-Anthropic-compat models (Minimax / Kimi): their reasoning
+    # blocks count against the output budget, so a small default (e.g. 4096)
+    # can be consumed entirely by thinking — the turn hits ``max_tokens``
+    # mid-reasoning and returns an empty response. Declared last with a
+    # default so direct ``Config(...)`` constructions stay non-breaking.
+    model_max_tokens: int = 0
+
+    # Reasoning effort for providers that support it. Forwarded to Codex Plus
+    # (default "none" — mimir's cheap-inference baseline) and to OpenAI
+    # reasoning models; Anthropic/minimax/claude-code ignore it (they use a
+    # thinking budget, not an effort level). "" leaves each provider's default.
+    model_reasoning_effort: str = ""
+
+    # Unauthorized bridge user behavior for public/shared channels. ``ignore``
+    # only logs the denial; ``prompt-to-pair`` logs an explicit pairing prompt
+    # event without queueing a normal agent turn. DM denials always use the
+    # pending-pairing path when access control is enforced.
+    # Pairing notification/reply controls. Operator alerts are deduped by the
+    # pending-pairing first-write edge and coalesced over this window. DM
+    # auto-replies include a one-time code, are DM-only and globally rate-limited.
+    pairing_pending_max: int = 100
+    pairing_operator_digest_delay_seconds: float = 1.0
+    pairing_dm_auto_reply_enabled: bool = True
+    pairing_dm_auto_reply_interval_seconds: float = 30.0
+    pairing_dm_auto_reply_text: str = (
+        "I don't recognize you yet, so I can't reply until the operator approves you. "
+        "Your pairing code is `{code}` (valid for 1 hour). Send it to the operator; "
+        "after approval, send your message again."
+    )
+
+    # Resend-nudge recovery (forgot-to-send): channels (prefix allow-list, ``*``
+    # = all) where an interactive turn that produced text but never delivered
+    # gets ONE in-band re-prompt to call send_message. Empty default = off; the
+    # re-prompt re-enters the same turn/thread (no extra SAGA cycle). For
+    # tool-shy models (minimax M3) that answer in final text instead of calling
+    # the tool. ``MIMIR_RESEND_NUDGE_CHANNELS``.
+    resend_nudge_channels: tuple[str, ...] = ()
+    # Optional deterministic forgot-to-send recovery: channels (prefix
+    # allow-list, ``*`` = all) where a user_message turn that produced
+    # substantive final text but never delivered to the triggering channel
+    # auto-delivers that final text directly. Empty default = off.
+    # ``MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS``.
+    auto_deliver_final_text_channels: tuple[str, ...] = ()
+    # Passive live activity panel channel-prefix allowlist. Empty = off.
+    # ``MIMIR_ACTIVITY_PANEL_CHANNELS``.
+    activity_panel_channels: tuple[str, ...] = ()
+    # chainlink #783: opt-in chat slash-skill discovery/invocation. Disabled by
+    # default; the allowlist is normalized, lowercased skill slugs only.
+    chat_skills_enabled: bool = False
+    chat_skill_allowlist: tuple[str, ...] = ()
+    # Operator-declared absolute roots OUTSIDE the home the file tools may
+    # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
+    # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
+    file_tool_roots: tuple[tuple[str, str], ...] = ()
+    acp_journal_ttl_days: int = 7
+    # Per-process cap for concurrent web-chat SSE subscribers.
+    chat_stream_max_subscribers: int = 8
+    plugin_manager: PluginManager = field(default_factory=_core_plugin_manager, repr=False, compare=False)
+    tracing_enabled: bool = False
+    otlp_endpoint: str | None = None
+    otel_service_name: str = "mimir"
+    tracing_capture_content: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.plugin_manager.policy.frozen:
+            raise ValueError("Config requires a frozen plugin policy")
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        process_plugins = os.environ.get("MIMIR_PLUGINS", "")
+        raw_home = _env("MIMIR_HOME")
+        if not raw_home:
+            # `mimir run` gates on this and refuses to start; this fallback
+            # only reaches direct from_env callers (tests, one-off ops
+            # commands). Warn loudly so a misconfigured direct launch is
+            # visible rather than silently homing on the process cwd — a
+            # cwd-home is what makes the agent chase paths that don't exist.
+            log.warning(
+                "MIMIR_HOME is not set; falling back to the current directory "
+                "(%s). Set MIMIR_HOME to an explicit agent home.", Path.cwd(),
+            )
+        home = Path(raw_home or Path.cwd()).resolve()
+        _load_home_dotenv(home)
+        from .plugins.manager import load_plugins
+
+        plugin_manager = load_plugins(enable=process_plugins)
+        if "MIMIR_UNAUTHORIZED_USER_BEHAVIOR" in os.environ and not getattr(cls, "_retired_intake_warned", False):
+            log.warning("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired; use intake.unknown_senders in identities.yaml")
+            cls._retired_intake_warned = True
+        hooks = plugin_manager.policy.policy_consumer_hooks
+        _warn_retired_coding_configuration(home, provider_selected=hooks is not None)
+        _configure_declared_repositories(
+            home, hooks.repository_inventory if hooks is not None else None,
+            hooks.repository_selection if hooks is not None else None,
+        )
+        if "MIMIR_FILE_OP_ROOTS" in os.environ:
+            log.warning(
+                "MIMIR_FILE_OP_ROOTS is retired and ignored; migrate its required "
+                "roots to MIMIR_FILE_TOOL_ROOTS as /absolute/path:ro or "
+                "/absolute/path:rw entries, then remove MIMIR_FILE_OP_ROOTS from "
+                "the deployment"
+            )
+        prompts_override = _env("MIMIR_PROMPTS_DIR")
+        archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
+        model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
+        # Resolve once — used by both ``billing_mode`` (to detect QUOTA
+        # vs API_KEY billing) and ``oauth_credentials_path`` (the field
+        # itself). Computing it twice was redundant and could in theory
+        # diverge if env state shifted between the two calls.
+        oauth_credentials_path = _oauth_credentials_path()
+        chat_stream_max_subscribers_raw = os.environ.get(
+            "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS"
+        )
+        if chat_stream_max_subscribers_raw == "":
+            log.warning(
+                "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS is empty; using default %r",
+                8,
+            )
+
+        return cls(
+            plugin_manager=plugin_manager,
+            home=home,
+            agent_id=_env("MIMIR_AGENT_ID", "mimir"),
+            model=_env("MIMIR_MODEL", "claude-opus-4-7"),
+            model_spec=model_spec,
+            tracing_enabled=_env_bool("MIMIR_TRACING_ENABLED", False),
+            otlp_endpoint=_env("MIMIR_OTLP_ENDPOINT") or None,
+            otel_service_name=_env("MIMIR_OTEL_SERVICE_NAME", "mimir"),
+            tracing_capture_content=_env_bool("MIMIR_TRACING_CAPTURE_CONTENT", False),
+            model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
+            model_max_tokens=_env_int("MIMIR_MODEL_MAX_TOKENS", 0),
+            model_reasoning_effort=_env("MIMIR_MODEL_REASONING_EFFORT", ""),
+            effort=_env("MIMIR_EFFORT", "high"),
+            embed_model=_env("MIMIR_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
+            web_port=_env_int("MIMIR_WEB_PORT", 8080),
+
+            max_concurrent_turns=_env_int("MIMIR_MAX_CONCURRENT_TURNS", 10),
+            max_channel_queue=_env_int("MIMIR_MAX_CHANNEL_QUEUE", 100),
+            worker_idle_timeout_s=_env_int("MIMIR_WORKER_IDLE_TIMEOUT_S", 60),
+            midturn_injection_channels=tuple(
+                p.strip() for p in _env("MIMIR_MIDTURN_INJECTION_CHANNELS", "").split(",")
+                if p.strip()
+            ),
+
+            history_global_max=_env_int("MIMIR_HISTORY_GLOBAL_MAX", 500),
+            history_per_channel_max=_env_int("MIMIR_HISTORY_PER_CHANNEL_MAX", 250),
+            recent_per_channel=_env_int("MIMIR_RECENT_PER_CHANNEL", 10),
+            recent_author_cross=_env_int("MIMIR_RECENT_AUTHOR_CROSS", 10),
+            recent_cross_hours=_env_int("MIMIR_RECENT_CROSS_HOURS", 24),
+            recent_sources=_parse_sources(
+                    _env_allow_empty(
+                        "MIMIR_RECENT_SOURCES",
+                        "slack,discord,bluesky,web,stdin,acp",
+                    )
+            ),
+            recent_message_chars=_env_int("MIMIR_RECENT_MESSAGE_CHARS", 4096),
+
+            saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
+            saga_session_max_turns=_env_int("MIMIR_SAGA_SESSION_MAX_TURNS", 10),
+            saga_consolidate_cron=_env_allow_empty(
+                "MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * *"
+            ),
+            scheduler_tz=_env("MIMIR_SCHEDULER_TZ", "UTC"),
+            commitments_due_check_cron=_env_allow_empty(
+                "MIMIR_COMMITMENTS_DUE_CHECK_CRON", "*/5 * * * *",
+            ),
+            commitments_snooze_pileup_threshold=_env_int(
+                "MIMIR_COMMITMENTS_SNOOZE_PILEUP_THRESHOLD", 3,
+            ),
+            introspection_report_cron=_env_allow_empty(
+                "MIMIR_INTROSPECTION_REPORT_CRON", "0 14 * * 5",
+            ),
+            introspection_report_days=_env_int(
+                "MIMIR_INTROSPECTION_REPORT_DAYS", 7,
+            ),
+            introspection_report_health_threshold=_env_float(
+                "MIMIR_INTROSPECTION_HEALTH_THRESHOLD", 0.80,
+            ),
+            introspection_report_emit_algedonic=_env_bool(
+                "MIMIR_INTROSPECTION_EMIT_ALGEDONIC", True,
+            ),
+            saga_pre_message_min_tier=_env("MIMIR_SAGA_PRE_MSG_MIN_TIER", ""),
+
+            send_loop_soft_limit=_env_int("MIMIR_SEND_LOOP_SOFT_LIMIT", 5),
+            send_loop_hard_limit=_env_int("MIMIR_SEND_LOOP_HARD_LIMIT", 10),
+            send_loop_similarity=_env_float("MIMIR_SEND_LOOP_SIMILARITY", 0.9),
+            tool_call_budget=_env_int("MIMIR_TOOL_CALL_BUDGET", 200),
+            max_turn_iterations=_env_int("MIMIR_MAX_TURN_ITERATIONS", 200),
+            folders=_parse_folders(_env("MIMIR_FOLDERS", "") or ""),
+            file_tool_roots=_parse_file_tool_roots(
+                _env("MIMIR_FILE_TOOL_ROOTS", ""), home, log_effective=True
+            ),
+            mcp_servers=_load_mcp_servers_from_env(),
+
+            anthropic_api_key=_env("ANTHROPIC_API_KEY"),
+            anthropic_base_url=_env("ANTHROPIC_BASE_URL"),
+            anthropic_auth_token=_env("ANTHROPIC_AUTH_TOKEN"),
+            anthropic_model=_env("ANTHROPIC_MODEL"),
+            anthropic_custom_model_option=_env("ANTHROPIC_CUSTOM_MODEL_OPTION"),
+            disable_experimental_betas=_env("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"),
+
+            prompts_dir=Path(prompts_override).resolve() if prompts_override else None,
+
+            discord_token=_env("DISCORD_TOKEN"),
+            slack_bot_token=_env("SLACK_BOT_TOKEN"),
+            slack_app_token=_env("SLACK_APP_TOKEN"),
+            bsky_handle=_env("BSKY_HANDLE"),
+            bsky_app_password=_env("BSKY_APP_PASSWORD"),
+            attachments_max_bytes=_env_int(
+                "MIMIR_ATTACHMENTS_MAX_BYTES", 25 * 1024 * 1024,
+            ),
+
+            cross_platform_pull=_env_bool("MIMIR_CROSS_PLATFORM_PULL", True),
+            access_control_enforced=resolve_access_control_enforcement(
+                _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
+                model_spec=model_spec,
+                policy=plugin_manager.policy,
+            ),
+            open_bridge=_env_bool("MIMIR_OPEN_BRIDGE", False),
+
+            operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
+            pairing_pending_max=_env_int("MIMIR_PAIRING_PENDING_MAX", 100),
+            pairing_operator_digest_delay_seconds=_env_float(
+                "MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS", 1.0,
+            ),
+            pairing_dm_auto_reply_enabled=_env_bool(
+                "MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED", True,
+            ),
+            pairing_dm_auto_reply_interval_seconds=_env_float(
+                "MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS", 30.0,
+            ),
+            pairing_dm_auto_reply_text=_env_allow_empty(
+                "MIMIR_PAIRING_DM_AUTO_REPLY_TEXT",
+                "I don't recognize you yet, so I can't reply until the operator approves you. "
+                "Your pairing code is `{code}` (valid for 1 hour). Send it to the operator; "
+                "after approval, send your message again.",
+            ),
+            resend_nudge_channels=tuple(
+                p.strip() for p in _env("MIMIR_RESEND_NUDGE_CHANNELS", "").split(",")
+                if p.strip()
+            ),
+            auto_deliver_final_text_channels=tuple(
+                p.strip()
+                for p in _env("MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS", "").split(",")
+                if p.strip()
+            ),
+            activity_panel_channels=tuple(
+                p.strip()
+                for p in _env("MIMIR_ACTIVITY_PANEL_CHANNELS", "").split(",")
+                if p.strip()
+            ),
+            chat_skills_enabled=_env_bool("MIMIR_CHAT_SKILLS_ENABLED", False),
+            chat_skill_allowlist=_parse_chat_skill_allowlist(
+                _env("MIMIR_CHAT_SKILL_ALLOWLIST", "")
+            ),
+            api_key=_env("MIMIR_API_KEY"),
+            web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
+            chat_stream_max_subscribers=_env_int(
+                "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", 8
+            ),
+            allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),
+            turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", DEFAULT_TURN_TIMEOUT_SECONDS),
+            post_turn_timeout_seconds=_env_int("MIMIR_POST_TURN_TIMEOUT_SECONDS", 180),
+            drain_timeout_seconds=_env_int("MIMIR_DRAIN_TIMEOUT_SECONDS", 30),
+            http_shutdown_timeout_seconds=_env_positive_float(
+                "MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", 5.0,
+            ),
+
+            feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
+            feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),
+
+            recent_boundaries=_env_int("MIMIR_RECENT_BOUNDARIES", 3),
+            unfinished_stale_age_hours=_env_int("MIMIR_UNFINISHED_STALE_AGE_HOURS", 2),
+            unfinished_stale_turns=_env_int("MIMIR_UNFINISHED_STALE_TURNS", 5),
+
+            usage_block_enabled=_env_bool("MIMIR_USAGE_BLOCK", True),
+            usage_5h_limit_usd=_env_float("MIMIR_USAGE_5H_LIMIT_USD", 0.0),
+            usage_weekly_limit_usd=_env_float("MIMIR_USAGE_WEEKLY_LIMIT_USD", 0.0),
+
+            cost_hourly_limit_usd=_env_float("MIMIR_COST_HOURLY_LIMIT_USD", 0.0),
+            cost_rate_spike_ratio=_env_float("MIMIR_COST_RATE_SPIKE_RATIO", 3.0),
+            cost_rate_spike_floor_usd=_env_float(
+                "MIMIR_COST_RATE_SPIKE_FLOOR_USD", 5.00,
+            ),
+            cost_alert_cooldown_minutes=_env_int(
+                "MIMIR_COST_ALERT_COOLDOWN_MINUTES", 60,
+            ),
+
+            billing_mode=detect_billing_mode(
+                explicit=_env("MIMIR_BILLING_MODE") or None,
+                oauth_credentials_path=oauth_credentials_path,
+                # chainlink #315: a codex-plus subscription spec is itself a
+                # QUOTA signal, so a Codex-only install keeps its quota view
+                # without relying on stale Anthropic creds.
+                model_spec=model_spec,
+            ),
+
+            capture_rate_limits=_env_bool("MIMIR_CAPTURE_RATE_LIMITS", True),
+
+            context_1m=_env_bool("MIMIR_CONTEXT_1M", True),
+
+            oauth_credentials_path=oauth_credentials_path,
+            oauth_usage_poll_cron=_env_allow_empty(
+                "MIMIR_OAUTH_USAGE_POLL_CRON", "*/3 * * * *",
+            ),
+            oauth_refresh_warn_days=_env_int(
+                "MIMIR_OAUTH_REFRESH_WARN_DAYS", 25,
+            ),
+
+            codex_usage_poll_cron=_env_allow_empty(
+                "MIMIR_CODEX_USAGE_POLL_CRON", "*/3 * * * *",
+            ),
+
+            # Default to empty (disabled). Minimax deployments opt in
+            # by setting both this env + MINIMAX_API_KEY. The poller's
+            # server-side registration in server.py double-checks the
+            # API key is present before scheduling.
+            minimax_usage_poll_cron=_env(
+                "MIMIR_MINIMAX_USAGE_POLL_CRON", "",
+            ),
+            minimax_usage_model_name=_env(
+                # Minimax's coding_plan/remains endpoint keys buckets by
+                # category now ("general" for chat, "video"), not the old
+                # "MiniMax-M*" model glob (Coding Plan → Token Plan, 2026-06).
+                "MIMIR_MINIMAX_USAGE_MODEL", "general",
+            ),
+
+            health_probe_cron=_env_allow_empty(
+                "MIMIR_HEALTH_PROBE_CRON", "* * * * *",
+            ),
+            health_probe_max_restarts_per_hour=_env_int(
+                "MIMIR_HEALTH_PROBE_MAX_RESTARTS_PER_HOUR", 3,
+            ),
+            liveness_beat_seconds=_env_int("MIMIR_LIVENESS_BEAT_SECONDS", 60),
+
+            identities_populate_cron=_env(
+                "MIMIR_IDENTITIES_POPULATE_CRON", "",
+            ),
+
+            git_tracking_enabled=_env_bool("MIMIR_GIT_TRACKING_ENABLED", True),
+            git_state_repo=_env("MIMIR_STATE_REPO"),
+            git_state_token=_env("GITHUB_TOKEN"),
+
+            max_turns_kept=_turns_cap(),
+            max_events_kept=_events_cap(),
+            turns_archive_dir=Path(archive_dir).resolve() if archive_dir else None,
+            acp_journal_ttl_days=_env_positive_decimal(
+                "MIMIR_ACP_JOURNAL_TTL_DAYS", 7
+            ),
+        )
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.home / "logs"
+
+    @property
+    def turns_log(self) -> Path:
+        return self.logs_dir / "turns.jsonl"
+
+    @property
+    def events_log(self) -> Path:
+        return self.logs_dir / "events.jsonl"
+
+    @property
+    def commitments_log(self) -> Path:
+        """Append-only commitments JSONL. Lives under ``.mimir/`` (not
+        ``state/``) so the indexer doesn't walk it as searchable
+        knowledge — it's internal lifecycle state, not content."""
+        return self.home / ".mimir" / "commitments.jsonl"
+
+    @property
+    def writable_dirs(self) -> list[str]:
+        """Subdir names with ``"rw"`` mode in ``folders``. Passed to
+        ``WriteGuardBackend`` so deepagents' Write/Edit/upload tools
+        block paths outside these roots. Order preserves dict order
+        (insertion order from ``_parse_folders``)."""
+        return configured_writable_dirs(self.folders)
+
+    @property
+    def all_dirs(self) -> list[str]:
+        """Every subdir named in ``folders``, both rw and ro. Useful
+        for surfacing the agent-visible workspace layout in the system
+        prompt or for diagnostics."""
+        return list(self.folders.keys())
+
+    def sdk_env_overrides(self) -> dict[str, str]:
+        """Env vars to forward via ClaudeAgentOptions.env (§14.1)."""
+        out = {}
+        for key, val in [
+            ("ANTHROPIC_BASE_URL", self.anthropic_base_url),
+            ("ANTHROPIC_AUTH_TOKEN", self.anthropic_auth_token),
+            ("ANTHROPIC_MODEL", self.anthropic_model),
+            ("ANTHROPIC_CUSTOM_MODEL_OPTION", self.anthropic_custom_model_option),
+            ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", self.disable_experimental_betas),
+        ]:
+            if val:
+                out[key] = val
+        return out

@@ -1,0 +1,989 @@
+# Configuration reference
+
+Every configuration environment variable mimir reads, with its type, default,
+and what it does. **This is the complete list**, enforced by
+`tests/test_config_docs_complete.py`. The gate scans exact `MIMIR_*` string
+literals in core Python code, so new names must gain a reference entry. Prefixes
+and regular expressions do not match the exact-name shape and are excluded by
+construction rather than by an ignore list. A second AST scan covers non-Mimir
+environment reads and explicitly excludes variables owned by the OS or an
+external process.
+[`.env.example`](../.env.example) is a copy-paste starter that covers the common
+ones; this file is the exhaustive reference.
+
+**Not included** (owned/documented elsewhere, and on the test's allowlist):
+standard OS vars (`HOME`); environment injected by the harness into poller/tool
+subprocesses (`STATE_DIR`, `POLLER_NAME`, `ROOT_DIR`); and locators for external
+CLIs mimir shells out to, defined by those tools (`CODEX_HOME`,
+`CLAUDE_CONFIG_DIR`, `CHAINLINK_BIN`, `WORKLINK_RUN_BIN`, `OSV_SCANNER`).
+Optional-skill poller variables are listed below for convenience but live in
+their own skill subprocesses.
+
+## How configuration is loaded
+
+- **Process environment wins.** Anything exported into the process (your shell,
+  a Docker `compose.env`, a systemd unit) takes precedence.
+- **`<MIMIR_HOME>/.env` supplies defaults** for anything not already in the
+  process environment, except channel scope keys, `MIMIR_PLUGINS`, and
+  `MIMIR_WEB_DEFAULT_SKIN` (operator-only). It's loaded once at startup; the
+  process env overrides it.
+- **Unset optional flags fall back to the defaults below.**
+
+To confirm what a running agent actually resolved, read `Config.from_env()` or
+the startup banner — not the `.env` file, since the process env can override it.
+
+Almost everything here is optional. The only things a minimal deployment needs
+are an auth path (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / a gateway) and,
+for anything non-loopback, `MIMIR_WEB_HOST` + `MIMIR_API_KEY`.
+
+## Channel scope (Discord and Slack)
+
+Configure the bridge, rather than telling mimir in chat to stay in one channel:
+chat instructions are not enforced. For **only channel X**, set
+`MIMIR_DISCORD_ALLOWED_CHANNELS=<id>` (or the Slack equivalent); add
+`MIMIR_DISCORD_REQUIRE_MENTION=true` to require a direct mention there. Threads
+inherit their parent channel's policy. Scope is checked before intake, pairing,
+profile lookups, and attachment downloads. DMs bypass channel lists and mention
+requirements, retaining their existing identity/pairing gate. Group DMs are not
+treated as DMs: channel lists and mention requirements apply to them.
+
+Each of the following has a `MIMIR_DISCORD_` and a `MIMIR_SLACK_` form:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_CHANNEL_SCOPE_FILE` | path | `/etc/mimir/channel-scope.yaml` if present | Protected YAML source for both bridges. Conflicts with platform scope environment keys reject both bridges. |
+
+| Suffix | Default | Meaning |
+|---|---|---|
+| `ALLOWED_CHANNELS` | `*` | Comma-separated channel ids; unset or `*` allows all; an empty value allows none. |
+| `IGNORED_CHANNELS` | empty | Excluded channel ids; wins over allowed, mentions, and free-response. |
+| `REQUIRE_MENTION` | `false` | Require a direct bot mention in non-DM channels. Discord replies to the bot's message count too. |
+| `FREE_RESPONSE_CHANNELS` | empty | Channel ids exempt from require-mention. |
+| `ALLOW_BOTS` | `none` | `none` drops other bots, `mentions` allows directly mentioning bots, `all` allows other bots (subject to mention requirements). Unknown values reject startup. |
+| `ALLOWED_BOT_IDS` | empty | Bot author ids always admitted after channel allow/ignore checks, even without a mention. |
+
+Lists accept bare platform ids (`123`, `C0123`) or prefixed ids
+(`discord-123`, `slack-C0123`); use comma-separated values in process env.
+The order is: own-message filter; DM bypass of channel/mention rules; ignored;
+allowed; bot-author rule; require-mention unless free-response. Every rejected
+message produces one content-free `channel_scope_dropped` event with `platform`,
+`channel_id`, `parent_channel_id`, `reason`, and `author_kind`.
+
+For protected file configuration set `MIMIR_CHANNEL_SCOPE_FILE` to a YAML file,
+or place it at `/etc/mimir/channel-scope.yaml` (auto-loaded if present):
+
+```yaml
+discord:
+  allowed_channels: ["123"]
+  ignored_channels: ["456"]
+  require_mention: true
+  free_response_channels: ["789"]
+  allow_bots: none
+  allowed_bot_ids: []
+slack:
+  allowed_channels: ["C0123"]
+  ignored_channels: []
+  require_mention: false
+  free_response_channels: []
+  allow_bots: none
+  allowed_bot_ids: []
+```
+
+File lists are YAML lists. Discord ids may be quoted strings or unquoted YAML
+integers, which are normalized to strings; booleans and floats are rejected.
+Slack ids must be strings. A missing `allowed_channels` means all; an empty list
+means none. The resolved file (including symlink targets) and **every ancestor
+directory up to `/`** must be non-writable by the running process, and the file
+must not be under `MIMIR_HOME`. **File-based scope requires a non-root runtime**:
+running as root always rejects the scope file because root can write every path.
+Root deployments must instead use operator-supplied process environment scope.
+An unreadable, writable, or invalid file, or
+mixing a file with any platform scope env key, rejects the configuration and
+prevents **both** chat bridges from starting; the failure emits
+`channel_scope_config_rejected` without file contents. A configured file is the
+only scope source; otherwise process env applies, then defaults. Scope keys in
+`<MIMIR_HOME>/.env` are ignored with a key-name-only warning: the running agent
+can write that file. Scope is loaded once at bridge startup, never from chat or
+tools. On mimirbot, bake the file into the image as `root:root 0644` under
+`/etc/mimir/`, or bind-mount it read-only from the host; for simple setups use
+host-side `compose.env` process environment values.
+
+## Feature flags that ship off by default
+
+These gate real, already-built capabilities that are **disabled unless you set
+the flag**. If you're about to propose or build one of these, it likely already
+exists — turn it on here first:
+
+| Flag | What it turns on |
+|---|---|
+| `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS` | Deliver a turn's captured final text to the triggering channel even when the model never called `send_message`. Recommended for tool-shy models (e.g. Minimax M3) that write a reply but don't reliably fire the tool. `*` = all interactive channels. |
+| `MIMIR_RESEND_NUDGE_CHANNELS` | Re-prompt a turn **once**, in-band, to call `send_message` when it produced text but delivered nothing. (Superseded by auto-deliver on channels where both are set.) |
+| `MIMIR_ACTIVITY_PANEL_CHANNELS` | A passive, live-updating "working…" panel posted to the channel that accumulates the turn's steps and edits itself in place (Slack `chat.update` / Discord message edit). |
+| `MIMIR_MIDTURN_INJECTION_CHANNELS` | Fold an inbound user message into the currently-running turn instead of queuing it for the next one. |
+| `MIMIR_CHAT_SKILLS_ENABLED` | Chat slash-skill discovery + invocation from a channel. |
+| `MIMIR_FACTORY_EPICS_ENABLED` | Feature-factory epic dispatch in the chainlink-orchestrator poller (for `worklink:epic` issues). |
+
+Coding is an optional installed provider, not a feature flag: install the
+in-repo `plugins/cultivate` workspace member (`uv sync --all-packages`, or an
+image built with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
+`--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build`) and select `cultivate` in
+`MIMIR_PLUGINS`. The retired `MIMIR_CODING_ENABLED` flag has no effect and logs a
+warning at boot. See [coding prerequisites](#coding-prerequisites) and
+[upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment).
+
+Installed Python plugins use an operator-owned process-environment enable
+list. They are trusted in-process code, not a sandbox or a remote marketplace.
+Unset or empty `MIMIR_PLUGINS` disables optional plugins only; existing core tools
+remain available. Disabled providers are inspected through package metadata, not
+imported. Set a comma-separated list of manifest names or `all` to enable them.
+Invalid or duplicate disabled providers are diagnosed in the plugin listing;
+selected missing, duplicate, invalid or incompatible providers fail startup.
+Set `MIMIR_PLUGINS` in the supervisor's operator-owned process environment
+(for example, a systemd unit). With the generated Docker scaffold, export it
+in the operator's host shell for every Compose invocation: Compose interpolates
+the process value into `environment:`. Neither the mounted agent home's `.env`
+nor its `compose.env` is an authority source; both are agent-writable. In
+particular, `compose.env` cannot override the scaffold's interpolated
+`environment:` entry. The selection is captured at startup and cannot be
+changed by chat, tools or a home dotenv. `mimir plugins list [--json]` inspects installed
+metadata and the current process selection without starting the runtime; it
+reports disabled-manifest diagnostics. See [plugins](plugins.md).
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_PLUGINS` | comma-separated plugin names or `all` | `""` (off) | Operator-owned process enable list for installed `mimir.plugins` providers; does not disable core tools. |
+| `MIMIR_PLUGIN_` | per-plugin key prefix | no keys | Manifest-declared plugin config keys must start with `MIMIR_PLUGIN_<NAME>_`, where `<NAME>` is the owning plugin name uppercased with hyphens replaced by underscores. This is a namespace prefix, not a variable to set. It does not grant access to core or other plugins' keys. |
+| `MIMIR_WEB_DEFAULT_SKIN` | skin id | unset | Operator process override for the dashboard's default skin. When unset, more than one selected plugin declaring a default skin fails startup; a saved user choice or explicit skin preview takes precedence over the default. This is not a plugin-writable setting. |
+
+All channel-list flags take a comma-separated prefix allow-list (e.g.
+`discord-,slack-`); `*` means all interactive channels; empty means off.
+
+---
+
+## Model & providers
+
+### Optional OpenTelemetry tracing
+
+Install `mimir-agent[otel]` to enable OTLP HTTP trace export. Tracing is off
+unless explicitly enabled; installing the extra alone does not activate it.
+`MIMIR_OTLP_ENDPOINT` is an HTTP(S) base URL (for example,
+`https://collector.example.com`), not a URL ending in `/v1/traces`;
+Mimir appends that path. Do not put credentials in this URL. Content capture
+can include prompts, model responses, tool arguments and results; leave it off
+unless your collector and retention policy are approved for that data.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_TRACING_ENABLED` | bool | `false` | Enable optional OTLP GenAI tracing when the extra and endpoint are configured. |
+| `MIMIR_OTLP_ENDPOINT` | HTTP(S) base URL | unset | OTLP HTTP collector base URL; do not append `/v1/traces` or embed credentials. |
+| `MIMIR_OTEL_SERVICE_NAME` | str | `mimir` | Service name reported to the collector. |
+| `MIMIR_TRACING_CAPTURE_CONTENT` | bool | `false` | Include redacted prompt/response/tool content in spans; sensitive even after redaction. |
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_MODEL_SPEC` | str | `codex-plus:gpt-5.6-luna` | Active model selector, `provider:model`. `codex-plus:*` = Codex subscription OAuth; `claude-code:*` = Max-OAuth subprocess; `anthropic:*` / `openai:*` = langchain `init_chat_model`. Anthropic-compat gateways (Minimax/Kimi) use `anthropic:` + `ANTHROPIC_BASE_URL`. Each provider needs its extra installed (`pip install 'mimir-agent[codex-plus]'` for the default). |
+| `MIMIR_MODEL` | str | `claude-opus-4-7` | Legacy model-name field tagged onto records; the operative selector is `MIMIR_MODEL_SPEC`. |
+| `MIMIR_MODEL_MAX_RETRIES` | int | `6` | Per-call transient (429/5xx) retry budget for non-`claude-code` providers. The `claude-code` path ignores it. |
+| `MIMIR_MODEL_MAX_TOKENS` | int | `0` | Per-call **output** token cap for non-`claude-code` providers. `0` = provider default. Raise for thinking-via-Anthropic-compat models whose reasoning counts against output. |
+| `MIMIR_MODEL_REASONING_EFFORT` | str | `""` | Reasoning effort forwarded to supported model providers. Codex-Plus accepts `none`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; unset/`""` uses the model default. Other providers retain their provider-specific values and behavior. |
+| `MIMIR_WORKLINK_REASONING_EFFORT` | str | `""` | Optional override of `MIMIR_MODEL_REASONING_EFFORT` for Worklink OpenCode leaf builds only. Exported env wins over `<home>/.env`; unset or empty falls back to the agent effort. `none` omits `--variant`, as does an unset effort. OpenAI models accept Codex-Plus effort values; other providers use their own variant names. Feature-factory runs use their per-agent variants instead. |
+| `OPENCODE_CONFIG` | path | `$XDG_CONFIG_HOME/opencode/opencode.jsonc` or `~/.config/opencode/opencode.jsonc` | OpenCode's native operator-owned JSON/JSONC. Its `model`, `provider`, plugin, proxy, and `{env:NAME}` settings are used unchanged by both `spawn_open_code` and the Worklink backend. If `model` is absent, the live `MIMIR_MODEL_SPEC` is translated to `provider/model`; an explicit spawn `model` wins over both. |
+| `MIMIR_EFFORT` | str | `high` | Effort level recorded on the config. |
+| `MIMIR_EMBED_MODEL` | str | `BAAI/bge-small-en-v1.5` | Embedding model id. |
+| `MIMIR_CONTEXT_1M` | bool | `true` | Opt into Anthropic's 1M-context beta header for Claude 4.x. Disable for accounts/models without the beta. |
+| `MIMIR_USE_RESPONSES_API` | bool (tri-state) | auto | Force OpenAI Responses API on/off. Unset → derived from `OPENAI_BASE_URL`. |
+| `MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS` | int | `3` | Max attempts for Codex-Plus transient connection-error retries (floor 1). |
+| `MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY` | float | `0.5` | Base backoff (s) for Codex-Plus transient retries (floor 0.0). |
+| `MIMIR_CODEX_PLUS_BUFFER_NONINTERACTIVE` | bool | `true` | Buffer Codex-Plus model steps for non-interactive turns so mid-response transient drops can be retried safely. Set to `0` or `false` to disable. |
+| `MIMIR_LLM_RETRY_MAX_ATTEMPTS` | int | `3` | Max attempts in the shared provider-agnostic LLM retry layer (backoff + jitter on transient errors). |
+| `MIMIR_LLM_RETRY_BASE_DELAY` | float | `0.5` | Base backoff (s) for the shared LLM retry layer. |
+| `MIMIR_LLM_RETRY_MAX_DELAY` | float | `30.0` | Max backoff (s) cap for the shared LLM retry layer. |
+| `MIMIR_TURN_TRANSIENT_RETRY_MAX` | int | `5` | Accepted poller-turn replays for transient provider failures before charging the normal content attempt (minimum 0). |
+| `MIMIR_TURN_TRANSIENT_RETRY_BASE_S` | float | `120` | Initial poller-turn provider retry delay in seconds; doubles on subsequent retries with up to 50% jitter. |
+| `MIMIR_TURN_TRANSIENT_RETRY_MAX_S` | float | `1800` | Maximum jittered poller-turn provider delay in seconds; provider Retry-After may extend it. |
+| `MIMIR_CLAUDE_OAUTH_CREDENTIALS` | path | `$MIMIR_HOME/.claude/.credentials.json` | Anthropic OAuth credentials for the usage poller. Empty disables; auto-disabled on a non-Anthropic `ANTHROPIC_BASE_URL`. |
+| `MIMIR_BILLING_MODE` | enum | auto-detected | Override billing mode: `quota` (demotes cost-rate spikes to advisory) or `pay-as-you-go`. |
+
+## Delivery & recovery
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS` | csv-list | `""` (off) | See [feature flags](#feature-flags-that-ship-off-by-default). Prefix allow-list; `*` = all interactive channels. |
+| `MIMIR_RESEND_NUDGE_CHANNELS` | csv-list | `""` (off) | One in-band re-prompt to `send_message` when a turn produced text but delivered nothing. |
+| `MIMIR_ACTIVITY_PANEL_CHANNELS` | csv-list | `""` (off) | Enable the live activity panel on matching channels. |
+| `MIMIR_MIDTURN_INJECTION_CHANNELS` | csv-list | `""` (off) | Fold inbound `user_message` events into the running turn. Pollers / scheduled ticks excluded. |
+| `MIMIR_CHAT_SKILLS_ENABLED` | bool | `false` | Chat slash-skill discovery/invocation (chainlink #783). |
+| `MIMIR_CHAT_SKILL_ALLOWLIST` | csv-list | `""` | Skill slugs allowed as chat slash-skills (companion to the flag above). |
+
+## Concurrency, queue & timeouts
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_MAX_CONCURRENT_TURNS` | int | `10` | Dispatcher cap on concurrently-running turns. |
+| `MIMIR_MAX_CHANNEL_QUEUE` | int | `100` | Per-channel event queue bound. |
+| `MIMIR_WORKER_IDLE_TIMEOUT_S` | int | `60` | Idle seconds before a channel worker is torn down. |
+| `MIMIR_MAX_CONCURRENT_POLLERS` | int | `8` | Semaphore cap on concurrent poller subprocesses (floor 1). |
+| `MIMIR_TURN_TIMEOUT_SECONDS` | int | `3600` | Per-turn wall-clock timeout on the model stream. `0` = no timeout. |
+| `MIMIR_POST_TURN_TIMEOUT_SECONDS` | int | `180` | Ceiling for finalize hooks after the model loop. Zero or negative values use the 180-second default, not an immediate timeout or an unlimited wait. Worklink continuation recovery uses a separate ceiling of 30 seconds, reduced to this value when positive and smaller. |
+| `MIMIR_DRAIN_TIMEOUT_SECONDS` | int | `30` | Graceful-drain bound on SIGTERM for in-flight turns. `0` = unbounded. Keep HTTP shutdown timeout + drain timeout + cleanup margin below the supervisor stop grace. |
+| `MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS` | float | `5` | Finite, positive aiohttp handler shutdown bound in seconds; zero, negative and non-finite values are rejected. HTTP timeout + drain timeout + cleanup margin must be below the supervisor stop grace. |
+| `MIMIR_TOOL_CALL_BUDGET` | int | `200` | Per-turn tool-call budget; caps panic-search loops. `0` disables. |
+| `MIMIR_MAX_TURN_ITERATIONS` | int | `200` | Per-turn model-iteration ceiling; nudges at 75%/90%, hard-stops at 100%. `0` disables. |
+| `MIMIR_SEND_LOOP_SOFT_LIMIT` | int | `5` | `send_message` circuit-breaker soft limit. |
+| `MIMIR_SEND_LOOP_HARD_LIMIT` | int | `10` | `send_message` circuit-breaker hard limit. |
+| `MIMIR_SEND_LOOP_SIMILARITY` | float | `0.9` | Similarity threshold for send-loop duplicate detection. |
+| `MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS` | int | `8` | Max concurrent SSE subscribers per web-chat stream. |
+| `MIMIR_LIVE_EVENTS_MAX_STREAMS` | int | `8` | Max concurrent live-events dashboard streams. |
+
+## History & recent-activity context
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_HISTORY_GLOBAL_MAX` | int | `500` | Global in-memory message-buffer cap. |
+| `MIMIR_HISTORY_PER_CHANNEL_MAX` | int | `250` | Per-channel message-buffer cap. |
+| `MIMIR_RECENT_PER_CHANNEL` | int | `10` | Recent-activity messages rendered from the active channel. |
+| `MIMIR_RECENT_AUTHOR_CROSS` | int | `10` | Cross-channel recent messages anchored to the initiating user. |
+| `MIMIR_RECENT_CROSS_HOURS` | int | `24` | Lookback window (hours) for cross-channel recent activity. |
+| `MIMIR_RECENT_SOURCES` | csv-list | `slack,discord,bluesky,web,stdin,acp` | Allowlist of `Message.source` values in Recent activity. `*`/`all` = allow all; `""` = none. |
+| `MIMIR_ACP_JOURNAL_TTL_DAYS` | positive int | `7` | Days to retain replayable ACP session journals before expiry. |
+| `MIMIR_ACP_ENABLED` | bool | enabled on POSIX with verifiable peer credentials | Start the owner-only Unix ACP daemon with `mimir run`. An explicit false value (`0`, `false`, `no`, `off`, or `n`, case-insensitive) prevents all ACP daemon construction; explicit enable fails on unsupported platforms. |
+| `MIMIR_RECENT_MESSAGE_CHARS` | int | `4096` | Per-message render cap (chars) in Recent activity. `0` = no cap. |
+| `MIMIR_RECENT_BOUNDARIES` | int | `3` | Recent session boundaries rendered under "Recent session summaries". `0` disables. |
+| `MIMIR_UNFINISHED_STALE_AGE_HOURS` | int | `2` | Age (h) at which an Unfinished summary gets the `[verify before quoting]` suffix. |
+| `MIMIR_UNFINISHED_STALE_TURNS` | int | `5` | Turns-since-boundary at which the staleness suffix fires. |
+| `MIMIR_FEEDBACK_WINDOW_HOURS` | int | `24` | Window for the Recent-feedback prompt section. |
+| `MIMIR_FEEDBACK_LIMIT` | int | `5` | Per-polarity cap on rendered feedback items. `0` disables the section. |
+| `MIMIR_MAX_TURNS` | int | `5000` (clamp ≤ `50000`) | On-disk cap for `turns.jsonl`. |
+| `MIMIR_MAX_EVENTS` | int | `75000` (clamp ≤ `750000`) | On-disk cap for `events.jsonl`. |
+| `MIMIR_TURNS_ARCHIVE_DIR` | path | unset | If set, directory where trimmed turn records are archived. |
+
+## SAGA / memory
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_SAGA_SESSION_IDLE_MINUTES` | int | `10` | Idle minutes before a SAGA session boundary. |
+| `MIMIR_SAGA_SESSION_MAX_TURNS` | int | `10` | Max turns per SAGA session before a boundary. |
+| `MIMIR_SAGA_CONSOLIDATE_CRON` | cron | `0 4 * * *` | SAGA consolidation cron. |
+| `MIMIR_SAGA_PRE_MSG_MIN_TIER` | str | `""` | Confidence floor for the pre-message auto-fetch hook. `""` defers to SAGA config; override `low`/`medium`/`high`. |
+| `MIMIR_SAGA_SQL_ENABLED` | bool (`1`) | off | Enable the `/api/saga/sql` read-only SQL console (`=1` only). |
+| `MIMIR_SAGA_SQL_TIMEOUT_S` | float | `5.0` | Wall-clock budget per SQL-console statement. |
+| `MIMIR_SAGA_SQL_MAX_VALUE_BYTES` | int | `10000000` | Caps any single string/blob via `SQLITE_LIMIT_LENGTH`. |
+| `SAGA_ENDPOINT` | str | unset | Only if running SAGA as a separate HTTP server (default is in-process). |
+| `SAGA_API_KEY` | str | unset | Key for the SAGA HTTP server. |
+| `SAGA_CONFIG` | path | unset | Explicit path to `saga.toml` (highest-priority in the config search order). Set automatically to `<MIMIR_HOME>/saga.toml` when present. |
+| `SAGA_DATA_DIR` | path | unset | Data directory searched for `saga.toml` (`$SAGA_DATA_DIR/saga.toml`). |
+| `SAGA_QUIET_CONFIG` | bool (`1`) | off | Suppress the "no `saga.toml` found, using defaults" startup log. |
+| `SAGA_PERSISTENT_CLAUDE_POOL_SIZE` | int (≥1) | SAGA default | Size of SAGA's persistent Claude-Code client pool (only relevant when SAGA's LLM `provider = "claude_code"`). |
+| `SAGA_PERSISTENT_CLAUDE_RECYCLE` | int (≥1) | SAGA default | Recycle a pooled SAGA Claude-Code client after this many calls. |
+| `FASTEMBED_CACHE_PATH` | path | unset | Explicit directory for Saga's local ONNX/fastembed model cache. Takes precedence over `XDG_CACHE_HOME`; created on first model load. |
+| `XDG_CACHE_HOME` | path | unset | When no `FASTEMBED_CACHE_PATH` is set, Saga caches the local model under `$XDG_CACHE_HOME/fastembed` (otherwise `~/.cache/fastembed`). Unwritable cache directories fall back to the temporary fastembed cache with a warning. |
+
+> SAGA's substantive dials (retrieval, consolidation, embeddings, LLM provider)
+> live in `<MIMIR_HOME>/saga.toml`. These variables locate that file, set the
+> local model cache path, and tune the (opt-in) persistent Claude-Code pool.
+
+## Web server & auth
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_WEB_PORT` | int | `8080` | HTTP listen port. |
+| `MIMIR_WEB_HOST` | str | `127.0.0.1` | HTTP bind address. **Non-loopback (`0.0.0.0`/IP) requires `MIMIR_API_KEY`** or startup refuses. |
+| `MIMIR_API_KEY` | str | `""` | Server-side key for `/api/*`; requests need a matching `X-API-Key` or 401. Empty = no auth (loopback only). Auto-generated by `mimir setup`. |
+| `MIMIR_ALLOW_UNAUTHENTICATED` | bool | `false` | Suppress the empty-`MIMIR_API_KEY` startup warning (dev/localhost only). |
+| `MIMIR_ATTACHMENTS_MAX_BYTES` | int | `26214400` (25 MiB) | Per-file cap on inbound chat attachments downloaded to disk. |
+
+The browser session cookie is `Secure` only over HTTPS. Plain-HTTP remote access works, but sends the key unencrypted; use HTTPS or a tunnel when possible.
+
+## Cost & usage limits
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_USAGE_BLOCK` | bool | `true` | Enable the Usage block in the turn prompt. |
+| `MIMIR_USAGE_5H_LIMIT_USD` | float | `0.0` | 5h-window dollar ceiling for the "% of budget" annotation. `0` = skip. |
+| `MIMIR_USAGE_WEEKLY_LIMIT_USD` | float | `0.0` | Weekly dollar ceiling for the annotation. `0` = skip. |
+| `MIMIR_COST_HOURLY_LIMIT_USD` | float | `0.0` | Absolute hourly cost ceiling for cost-rate alerts. `0` disables. |
+| `MIMIR_COST_RATE_SPIKE_RATIO` | float | `3.0` | Multiplier of the rolling-week per-hour baseline that trips a spike alert. `0` disables. |
+| `MIMIR_COST_RATE_SPIKE_FLOOR_USD` | float | `5.00` | `rate_now` floor below which the spike check is silenced. `0` disables. |
+| `MIMIR_COST_ALERT_COOLDOWN_MINUTES` | int | `60` | Minimum interval between `cost_rate_alert` events. |
+| `MIMIR_CAPTURE_RATE_LIMITS` | bool | `true` | Read per-response `rate_limits` (SDK partial messages) for the Plan-windows section. |
+
+## Scheduler, pollers, usage/quota & health
+
+### `scheduler.yaml` operator chat shell declarations
+
+The legacy top-level job list remains valid. To opt into bounded commands in a
+tainted **admin operator chat** turn, use a mapping with `jobs:` (the original
+list) and a separate `operator_shell_commands:` list:
+
+```yaml
+operator_shell_commands:
+  - exec: gog
+    path: /usr/local/bin/gog
+    subcommands: [[calendar, events], [gmail, search]]
+    options: [--from, --to, --limit]
+    pass_env: [GOG_CONFIG_DIR]
+jobs:
+  - name: morning-briefing
+    cron: "0 8 * * *"
+    prompt: Prepare the morning brief.
+```
+
+Use only read-only verbs: **never declare** `gog gmail send`, `acli jira workitem
+create/transition`, or another mutating command. This is an explicit chat grant,
+not the union of jobs' `shell_commands`. Entries require a pinned, non-agent-writable
+executable, nonempty subcommand prefixes, and an option allowlist. `external_send`,
+`payload_args`, interpreter/script entries, and `gh` (including paths or symlinks
+resolving to `gh`) are rejected. Any subcommand token with basename `gh` is
+also rejected, including behind exec wrappers such as `nice` or `timeout`.
+All these basename comparisons are case-insensitive (`gh`, `GH`, and `Gh`).
+At execution the same refusal covers every argv element, before environment
+construction or identity handling, and names the offending argument. This
+fail-closed rule also refuses literal search arguments such as
+`chainlink issue search gh`. GitHub access from operator chat after untrusted
+ingest goes through a fresh untainted turn or the forge tools. A malformed grant
+rejects the document at load. The agent cannot write `scheduler.yaml` with file
+tools, even on an untainted admin turn. Scheduled turns continue to use their
+own job declarations. The executable runs as server-bound argv, in a server-
+selected `<MIMIR_HOME>` cwd (ignoring model cwd), with only its `pass_env` and the scrubbed `MIMIR_SHELL_PASS_ENV`
+baseline; it never receives the whole process environment. `GH_*` overrides
+remain rejected by the declaration parser.
+
+Each subcommand prefix admits **every deeper verb**. Declare full read-only leaf
+paths such as `[jira, workitem, search]`, never `[jira, workitem]`. This grant
+intentionally includes authenticated admin ACP `user_message` turns as well as
+bridge chat; interactive completion/continuation events do not inherit it.
+
+An injected read query can still bring sensitive data into the turn. Command
+output remains untrusted active ingest; outbound sinks retain their taint checks.
+`operator_declared_shell_exec` audits the executable, subcommand, option **names**,
+outcome, and taint source domains without logging option values.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_SCHEDULER_TZ` | str | `UTC` | IANA timezone all cron expressions are interpreted in. Invalid → UTC + warning. |
+| `MIMIR_COMMITMENTS_DUE_CHECK_CRON` | cron | `*/5 * * * *` | Commitments due-check sweep. Empty disables. |
+| `MIMIR_COMMITMENTS_SNOOZE_PILEUP_THRESHOLD` | int | `3` | `snooze_count` at which `commitment_snooze_pileup` fires. |
+| `MIMIR_INTROSPECTION_REPORT_CRON` | cron | `0 14 * * 5` | Weekly event-introspection report. Empty disables. |
+| `MIMIR_INTROSPECTION_REPORT_DAYS` | int | `7` | Lookback days for the report. |
+| `MIMIR_INTROSPECTION_HEALTH_THRESHOLD` | float | `0.80` | Health-score threshold in the report. |
+| `MIMIR_INTROSPECTION_EMIT_ALGEDONIC` | bool | `true` | Whether the report emits algedonic events. |
+| `MIMIR_OAUTH_USAGE_POLL_CRON` | cron | `*/3 * * * *` | Anthropic OAuth usage poller. Empty disables. |
+| `MIMIR_CODEX_USAGE_POLL_CRON` | cron | `*/3 * * * *` | Non-generative Codex account quota refresh. Empty disables. |
+| `MIMIR_OAUTH_REFRESH_WARN_DAYS` | int | `25` | Credential age (days) at which `oauth_refresh_token_age_warn` fires. |
+| `MIMIR_MINIMAX_USAGE_POLL_CRON` | cron | `""` (off) | Minimax usage poller. Opt in with a cron + `MINIMAX_API_KEY`. |
+| `MIMIR_MINIMAX_USAGE_MODEL` | str | `general` | Minimax `coding_plan/remains` bucket (`general` chat, `video`). |
+| `MIMIR_HEALTH_PROBE_CRON` | cron | `* * * * *` | Bind-mount stale-inode health probe. Empty disables. |
+| `MIMIR_HEALTH_PROBE_MAX_RESTARTS_PER_HOUR` | int | `3` | Guard: past N self-restarts/60min, stop and surface `bind_mount_stale_persistent`. |
+| `MIMIR_LIVENESS_BEAT_SECONDS` | int | `60` | Interval to rewrite `state/liveness.json` for the watchdog. `0` disables. |
+| `MIMIR_LOOP_STALL_ALERT_SECONDS` | float | `300` | Daemon-thread threshold for a direct ntfy/webhook alert. `0` disables. |
+| `MIMIR_LOOP_STALL_SELF_TERMINATE` | bool | `false` | After alerting, signal PID 1 so the supervisor can restart the agent. |
+| `MIMIR_IDENTITIES_POPULATE_CRON` | cron | `""` (off) | Identities populator (scrapes Discord/Slack into `state/identities.yaml`). Recommended `0 6 * * *`. |
+| `MIMIR_QUOTA_RECHECK_SECONDS` | int | `180` (floor `30`) | Shared quota-pause recheck job cadence; Codex applies its own 15-minute throttle (see below). |
+| `MIMIR_QUOTA_5H_BACKDERIVE_FACTOR` | float | `10.0` | Back-derive factor for the 5h quota-dollar estimator. |
+| `MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD` | int | `5` | Confirmations required before acting on a 7d quota anomaly. |
+| `MIMIR_WATCHDOG_WEBHOOK_URL` | str | unset | Out-of-band webhook the watchdog POSTs `{"text": ...}` to on liveness down/recovered. |
+| `NTFY_TOPIC` | str | unset | ntfy.sh topic for watchdog alerts (alternative sink). |
+| `MIMIR_POLLER_ENV_ALLOWLIST` | csv-list | `""` | Extra env-var names (beyond the builtin allowlist) forwarded into poller subprocess environments. |
+
+### Codex quota-pause recovery
+
+`MIMIR_QUOTA_RECHECK_SECONDS` remains the shared recheck-job interval (default
+180 seconds, floor 30); Anthropic and other providers keep their existing
+recovery behavior. The Codex path adds a separate 15-minute throttle and limits
+canaries to 4 per hour. It runs only while a Codex quota pause is active.
+
+Each Codex recheck refreshes `/wham/usage`. Only an explicit server verdict
+`allowed=true` with `limit_reached` not true permits a minimal `ping` generation
+canary; a usage read alone cannot clear the pause. When `MIMIR_MODEL_SPEC` is
+`codex-plus:<model>`, that configured model is used. Otherwise (for example, an
+Anthropic agent whose Saga or Worklinks use Codex), the first model in the live
+`/codex/models` listing is selected using the chat adapter's configured client
+version. The canary never hardcodes a model and omits reasoning effort.
+
+Canary success clears generation-sourced rejection snapshots and the matching
+pause. `quota_pause_recheck` records `success`, `still_limited`, or `error` for
+canary outcomes; error diagnostics contain only exception type/classification,
+not exception text. Usage-denied rechecks record `still_limited` with
+`stage=usage`. Clearing the pause emits `quota_pause_cleared` with
+`reason=recheck_succeeded` and schedules recovery through the normal arbiter.
+Failed canaries leave the pause intact; the recorded reset remains the fallback.
+
+## Git, state, update & files
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_HOME` | path | cwd (with warning) | Agent home. `<home>/.env` is loaded as runtime defaults (process env wins). |
+| `MIMIR_AGENT_ID` | str | `mimir` | Logical agent name tagged on every turn/event (multi-agent disambiguation). |
+| `MIMIR_GIT_TRACKING_ENABLED` | bool | `true` | Post-turn git commit + debounced push of the home. Disable for CI/transient containers. |
+| `MIMIR_STATE_REPO` | str | unset | Remote repo URL for home git bootstrap. Paired with `GITHUB_TOKEN`. |
+| `MIMIR_SOURCE_REPO` | path | unset | Repository branches are pushed from, where the pre-push staleness hook is installed. Distinct from `MIMIR_SOURCE_DIR`; skipped if not a dir. |
+| `MIMIR_REACT_APP_DIST` | path | packaged `mimir/react_app/dist` | Live Vite build output to serve instead of the frontend packaged beside `web_ui.py`. |
+| `MIMIR_PYPI_PACKAGE_NAME` | str | `mimir-agent` | Distribution name for update-on-start + daily version check (forks/pre-release). |
+| `MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN` | bool | `false` | Auto-submit a conflict-free defaults-upgrade proposal PR immediately. |
+| `MIMIR_PROMPTS_DIR` | path | unset | Operator prompt-override directory. |
+| `MIMIR_SYSTEM_PROMPT_OVERRIDE` | str | unset | Full system-prompt override (replaces the rendered prompt entirely). |
+| `MIMIR_FOLDERS` | csv `name:mode` | built-in | Per-subdir write permissions under home (`state:rw,logs:ro,...`). Unknown modes → `ro`; unsafe names rejected. |
+| `MIMIR_FILE_OP_ROOTS` | retired tripwire | unset | Retired and ignored. If still present, startup warns to migrate every required root to `MIMIR_FILE_TOOL_ROOTS` and remove the old deployment setting; it grants no access. |
+| `MIMIR_FILE_TOOL_ROOTS` | csv `/absolute/path[:ro\|:rw]` | `""` | Legacy projection of `repositories.yaml` repository and allowed roots. When the YAML inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without that inventory, it retains the legacy behavior. `/tmp` is always derived as `rw`. See [file-tool access](../README.md#file-tool-access-outside-the-home). |
+| `MIMIR_PR_CHECKOUT_LEASE_ROOT` | absolute path | unset | Existing, non-symlink directory writable by the runtime user, on the same filesystem as the repository root for hardlinks. Not created automatically. GitHub activity receives write authority only for its active lease path, not this root generally or the live source checkout. |
+| `MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON` | cron | `*/15 * * * *` | Expired PR checkout lease reclamation cadence. Each lease's recorded `expires_at` determines eligibility; an empty value disables the scheduled sweep. |
+| `MIMIR_FETCH_URL_DISABLED` | bool | off | Truthy disables the `fetch_url` tool on non-`claude-code` providers. |
+| `MIMIR_OUTBOUND_PII_JEV` | bool | off | Opts locally clean outbound text into TypeSafe Jev PII classification when `JEV_KEY` is also set. |
+| `JEV_KEY` | string | `""` | TypeSafe API bearer key used only when `MIMIR_OUTBOUND_PII_JEV` is enabled. |
+| `MIMIR_FETCH_PDF_MAX_PAGES` | positive int | `100` | Maximum pages extracted from a fetched `application/pdf`; invalid or non-positive values use the default. |
+| `MIMIR_FETCH_PDF_MAX_TEXT_BYTES` | positive int | `1000000` | Maximum UTF-8 bytes written to a fetched PDF's text sibling; invalid or non-positive values use the default. |
+| `MIMIR_MCP_SERVERS_JSON` | json | `""` | Inline MCP server config list (wins over `_PATH`). MCP is opt-in. |
+| `MIMIR_MCP_SERVERS_PATH` | path | `""` | Path to a JSON MCP server config file. |
+
+## Access control & authz
+
+See the [authorization reference](authorization.md) for the requester-resource
+model, trusted-service matrix, resource and IFC layers, extension obligations,
+and the shadow-first enablement runbook. Human roles are canonical-level policy
+in `<MIMIR_HOME>/state/identities.yaml`: `user` admits normal inbound use and
+`admin` admits admin-required operations. Generic `/event` API credentials
+authenticate transport only; they do not create a named requester.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce tool, sink and IFC policy; also keeps the bridge author gate closed even if `MIMIR_OPEN_BRIDGE=true`. Compatible with the default `MIMIR_MODEL_SPEC`. Claude Code subprocess hooks receive the exact per-invocation authorization context through a server-owned carrier, so `claude-code:*` is also enforcement-compatible. |
+| `MIMIR_OPEN_BRIDGE` | bool | `false` | Explicit opt-out of the default `identities.yaml` author gate for external `user_message` and generic HTTP `/event` intake when access control enforcement is off. Unknown, missing and non-allowlisted authors are otherwise refused before queueing; trusted internal sources and other triggers keep their existing behavior. Does not change tool, sink or IFC enforcement. |
+| `MIMIR_OUTBOUND_PRIVACY_ENFORCE` | bool | `false` | Refuse external-sink writes containing an exact operator term from `<MIMIR_HOME>/private-terms.txt`. When false, private-term matches are shadow-logged and proceed. Credential matches are always refused independently of this flag and `MIMIR_ACCESS_CONTROL_ENFORCED`. |
+| `MIMIR_EGRESS_APPROVED_URLS` | URL or JSON array | `""` | URLs approved for application network egress. A URL without a wildcard is exact. Use an explicit trailing `/*` to approve a path prefix such as `https://arxiv.org/abs/*`; scheme and host are matched exactly and path prefixes match only at the `/` segment boundary. Exact/session-approved `fetch_url` destinations remain available after untrusted active ingest, while scope-only destinations are turn-taint gated because their path and query suffixes are model-selected. Configure multiple entries as a JSON array, for example `["https://hooks.example/a", "https://arxiv.org/abs/*"]`; comma-separated URL lists are not supported. |
+| `MIMIR_HEARTBEAT_APPROVED_URLS` | URL or JSON array | `""` | URLs the heartbeat service may fetch, using the same exact URL and explicit trailing `/*` scope forms as `MIMIR_EGRESS_APPROVED_URLS`. Configure multiple entries as a JSON array; comma-separated URL lists are not supported. |
+| `MIMIR_PROJECT_TEST_COMMAND` | JSON object | unset | Operator-owned project test invocation for trusted-service turns: `{"argv":["/absolute/root-owned/test-runner","fixed","arguments"],"cwd":"/configured/project/root"}`. The executable must be an absolute, executable, non-symlink file outside service-writable roots; `cwd` must be within `MIMIR_FILE_TOOL_ROOTS`. The model may append only bounded relative test paths/selectors, never options or a different command. Interpreter commands are rejected. Unset preserves the ordinary shell-profile refusals. |
+| `MIMIR_SHELL_PASS_ENV` | comma-separated exact env names | `""` | Grant named process variables to interactive `shell_exec` and `bash_async` children. No globs; only present names are passed and logged (names only) as `interactive_shell_env_passthrough`. By default these shells receive HOME, LANG, TZ, LC_*, TERM, TMPDIR, USER, LOGNAME, MIMIR_HOME and a pinned PATH; credentials are excluded. Use declared service commands or forge tools for sanctioned authenticated flows. The literal secret-store/procfs operand screen is best effort: globs (`.e*v`), braces (`{.env,x}`), variable indirection (`f=.env; cat $f`) and interpreter code (`python -c "open('.env')"`) can bypass it. The environment scrub plus non-dumpable Linux mimir CLI processes (including server, watchdog and Worklink) are the real controls for their ambient credentials, not filesystem isolation. Non-dumpable processes disable same-uid procfs inspection and core dumps; the server reapplies this after pending-update exec. Non-mimir same-uid processes with inherited secrets (such as codex-auth-sync and dev vite/esbuild watchers) remain readable; minimize their environments or isolate identities. Root/CAP_SYS_PTRACE bypasses the procfs protection. |
+| `GOG_HOME` | path | unset | Optional gogcli secret-store root. Interactive shell operands under this root are refused; the variable is not passed into the shell unless explicitly named in `MIMIR_SHELL_PASS_ENV`. |
+| `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |
+| `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts, including pairing digests. With enforced Discord/Slack intake, an empty channel warns at startup; review pending users at `/app/admin/users` or with `mimir identities list`. |
+| `MIMIR_PAIRING_PENDING_MAX` | int | `100` | Max pending pairing requests retained. |
+| `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | float | `1.0` | Coalesce window for operator pairing-notification digests. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | bool | `true` | Send a one-time pairing code to unpaired DM users. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | float | `30.0` | Global rate limit between DM auto-replies. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | str | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is {code} (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM reply template; `{code}` is replaced, or a code line is appended if absent. |
+
+## Spawn (subagent) controls
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_SPAWN_MAX_CONCURRENT` | int | `3` (floor 1) | Max concurrent spawned CLI subprocesses. |
+| `MIMIR_SPAWN_MAX_PER_HOUR` | int | `20` (floor 1) | Sliding-window per-hour spawn cap. |
+| `MIMIR_SPAWN_MAX_DEPTH` | int | `2` (floor 1) | Recursion-depth cap on nested spawns (fork-bomb guard). |
+| `MIMIR_OPENCODE_SPAWN_ARGS` | str (shell) | `""` | Extra flags appended to `opencode run` (e.g. `--format json`); shlex-split. |
+
+> `MIMIR_SPAWN_DEPTH` is set by the harness on child subprocesses to track
+> recursion depth — it is not an operator setting.
+
+## Worklink / chainlink / factory
+
+Worklink reads deployment settings from `<MIMIR_HOME>/worklink.yaml`. The test
+gate and OpenCode executor shell policy must agree. When
+`backends.opencode.bash_allowlist` is omitted, Worklink conservatively derives
+the effective default as `git *` plus only the approved build runner named by
+`defaults.test_command`. The built-in Python-oriented configuration is therefore
+`test_command: "uv run pytest -q"` with `bash_allowlist: ["git *", "uv *"]`.
+Supported derived runners are `uv`, `npm`, `pnpm`, `yarn`, `bun`, `mvn`, Maven
+Wrapper, `gradle`, Gradle Wrapper, `cargo`, and `go`. General launchers such as
+`bash`, `sh`, `env`, `make`, and language interpreters are not derived.
+
+An operator-set allowlist replaces the derived default and must admit the
+configured test command. Empty lists deny all executor shell commands and thus
+fail configuration reconciliation for a non-empty test command. The catch-all
+`"*"` is always rejected. Startup logs the effective list; a refused command
+reports `backends.opencode.bash_allowlist` and those effective patterns.
+
+Node deployment:
+
+```yaml
+defaults:
+  test_command: "npm test"
+backends:
+  opencode:
+    bash_allowlist: ["git *", "npm *"]
+```
+
+Java deployment using Gradle Wrapper:
+
+```yaml
+defaults:
+  test_command: "./gradlew test"
+backends:
+  opencode:
+    bash_allowlist: ["git *", "./gradlew *"]
+```
+
+Both examples use explicit lists for auditability; omitting `bash_allowlist`
+derives the same two patterns. The setting is operator configuration only:
+repository files and model-generated values never add permission entries.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `GITHUB_REPOS` | csv `owner/repository` | unset | Legacy projection of `repositories.yaml` `repositories[].slug`. When the repository inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without the inventory, it retains the legacy repository allowlist behavior. |
+| `MIMIR_WORKLINK_REPO` | str | unset | Dedicated base repository Worklink branches from (back-compat alias of `WORKLINK_REPO`, which wins). Never inferred from cwd or the Mimir installation. |
+| `MIMIR_WORKLINK_AGENT_ID` | str | process-generated | Internal process-scoped owner inherited by detached Worklink controllers; the server sets this automatically. |
+| `MIMIR_WORKLINK_GATE` | `1` | unset | Internal marker exported by the enabled Worklink leaf executor. It identifies commands running in the build-gate sandbox; operators and repository configuration must not set it. |
+| `PYTEST_ADDOPTS` | pytest arguments | unset | Existing pytest options are preserved by the Worklink gate alongside its fresh JUnit/cache reporting options. Failed-node reruns override selection and use `-n 0`, retaining execution settings such as warning policies. |
+| `MIMIR_WORKLINK_REAPER_CRON` | cron | `*/30 * * * *` on homes with `worklink.yaml` | Cultivate's scheduled stale-claim reaper also reconciles merged Worklink leaves. The runtime default applies to fresh setups and upgrades without changing `compose.env` or operator values; an explicitly empty value disables the job. Homes without `worklink.yaml` register no reaper job. |
+| `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |
+| `MIMIR_MALLOC_TRIM_CRON` | cron | `*/5 * * * *` (on) | `mimir run` trims freed glibc heap every five minutes on Linux; empty disables. No job is registered on other platforms or with jemalloc/tcmalloc in `LD_PRELOAD`. Changes require a restart; only RSS drops of at least 16 MB emit `malloc_trim`. |
+| `MIMIR_SCRATCH_TTL_DAYS` | int | `1` | Age (newest contained mtime, days) before a scratch entry is swept; the recency check keeps in-use checkouts. `<= 0` disables the janitor. |
+| `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
+| `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
+| `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
+| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.12.1 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
+| `MIMIR_FACTORY_MAX_CONCURRENT` | positive int | `1` | Factory-only concurrent Chainlink claim cap. The ordinary leaf cap remains `defaults.max_concurrent` with default `2`. |
+| `MIMIR_FACTORY_MAX_RETRIES` | ASCII decimal integer | `5` | Factory `/feature` retry budget. Accepts exactly ASCII `[0-9]+` valued from `1` through `9007199254740991`; absent or invalid values fall back to `5`. |
+| `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
+| `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Diagnostic threshold for stale factory lock observations. It never authorizes dispatch, lock stealing, cancellation, or deletion. |
+| `MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S` | float | `300` (5m) | How long the controller waits for the factory to publish its first status before failing the attempt. The window must cover OpenCode's boot, config and plugin loading, one model round trip, and `factory init`; the former hardcoded `120` killed runs that were still starting. Raising it only slows detection of a factory that never starts, since a started run is bounded by `MIMIR_FACTORY_RUN_TIMEOUT_S`. Absent is silent; a non-numeric or non-positive value is announced and the default used. |
+| `MIMIR_WORK_ITEM_JSON` | JSON object | unset | Internal factory-dispatch payload set by Worklink for a claimed Chainlink epic. The repository resolver emits it unchanged and skips GitHub issue lookup; operators should not set it for direct local runs. |
+| `MIMIR_SOURCE_DIR` | path | unset | Editable controller source checkout, used by pollers and by Worklink's base-overlap refusal. Leave unset for a PyPI install with no source checkout. |
+| `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
+| `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
+
+The factory launch ends with `--command feature " --autonomous --max-retries 5
+<issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
+`[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
+invalid values. feature-factory 0.7.5 stages the workflow inside the run
+directory; exact token `--auto` is never passed. Worklink's base selects the
+checkout start point and PR target; it is not factory `--base`, which is never
+passed.
+
+Before first factory dispatch only, after checkout creation and before process
+launch, Worklink reads the effective checkout `git config --get user.name` and
+`git config --get user.email`. Both must be nonblank. The child receives
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
+`GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
+
+Worklink reads the nonblank `publishing_identity` from
+`MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise from
+the trusted controller checkout's `.factory.json`. A set but blank or non-string
+override fails instead of falling back. For GitHub publication Worklink
+verifies the credential this process is already bound to, `GITHUB_TOKEN`, rather
+than selecting among candidates: `GH_TOKEN` is a child-only alias for `gh`, and
+verifying a second credential in a process that already verified one is refused
+by the forge identity memo before `/user` is ever reached. That token's owner is
+compared against the selected identity before dispatch, then both child aliases
+are normalized to it. `GH_TOKEN` and `GITHUB_TOKEN` set to different values fail
+dispatch as an operator ambiguity rather than one being preferred, and a missing
+`GITHUB_TOKEN` fails naming that variable - in both cases without disclosing
+values.
+
+`MIMIR_FACTORY_PUBLISHING_IDENTITY` and `FACTORY_PUBLISHING_IDENTITY` are two
+different variables with two different consumers, and a mimirbot-shaped deployment
+needs both. The first is read by the CONTROLLER for its pre-dispatch verification.
+  The second is inherited by the FACTORY CHILD (feature-factory 0.8.0+) and is what
+the driver compares against `gh api /user`. Setting only the controller variable
+lets the pre-flight pass and the run then park at Gate 1 naming the file's
+identity, which reads as a misconfiguration rather than a variable the child never
+received.
+
+## Worklink YAML
+
+Worklink reads `<MIMIR_HOME>/worklink.yaml`. This is separate from `.env`: YAML
+selects Worklink execution behavior and backends, while the environment table
+above configures the Mimir process. Omitted keys use the defaults below.
+
+| Top-level key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `defaults` | mapping | `{}` | Holds routing, execution, autonomy, and compatibility defaults described below. | `defaults: {backend: opencode}` |
+| `repository` | `owner/repository` | unset | Names Worklink's target from the neutral `repositories.yaml` inventory. | `repository: owner/service` |
+| `routes` | list[mapping] | `[]` | Selects tool/compute backends using first-match-wins rules. | `routes: [{label: worklink:epic, backend: feature_factory}]` |
+| `backends` | mapping | `{}` | Configures the shipping tool-backend adapters. | `backends: {opencode: {bin: opencode}}` |
+| `compute_backends` | mapping | `{}` | Configures compute substrates; the sole shipping substrate accepts an empty block only. | `compute_backends: {local_subprocess: {}}` |
+| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.19.4", smoke: "opencode --version"}]` |
+
+### Repository Inventory
+
+The neutral repository and file-root inventory lives in
+`<MIMIR_HOME>/repositories.yaml`, separate from Worklink's execution settings:
+
+```yaml
+repositories:
+  - slug: owner/service
+    root: /workspace/service
+    mode: rw
+    origin: https://github.com/owner/service.git
+    base_branch: trunk
+    test_command: npm test
+allowed_roots:
+  - root: /benchmark
+    mode: rw
+  - root: /mimir-results
+    mode: ro
+```
+
+Worklink names its target in its own file:
+
+```yaml
+# worklink.yaml
+repository: owner/service
+```
+
+Declaring either inventory key enables the new source. Startup derives omitted
+`GITHUB_REPOS`, `MIMIR_FILE_TOOL_ROOTS`, and, when Worklink names a target,
+`WORKLINK_REPO` values; if a legacy value is still present, its effective value
+must agree exactly or startup fails with both values. This permits
+one-variable-at-a-time migration without widening file scope.
+
+Every repository root must exist, be the checkout top level, and have a local
+`remote.origin.url` exactly equal to `origin`. Duplicate slugs or roots and
+an overlap between repository and allowed roots are fatal. A Worklink target
+that is absent from the neutral inventory is also fatal. Run
+`MIMIR_HOME=/path/to/home mimir run` after editing either file; the preflight
+runs before application construction or socket binding and names the repository,
+expected origin, and observed origin on failure.
+
+#### Repository Test Suites
+
+Each repository can declare `test_suites` (default `[]`) in
+`repositories.yaml`. Each entry uses the `RepositoryTestSuite` fields:
+
+| Field | Type | Default | Effect |
+|---|---|---|---|
+| `name` | str | required | Unique suite name matching `[A-Za-z0-9][A-Za-z0-9_.-]*`. The name `default` is reserved when the repository has a non-null `test_command`. |
+| `command` | str | required | Non-empty, operator-configured test command, POSIX-split into fixed arguments. |
+| `default` | bool | `false` | Select this suite when neither a suite name nor selectors are supplied. At most one suite may set `default: true`. |
+| `selector_prefixes` | list[str] | `[]` | Non-empty literal prefixes used to route selector paths to this suite. |
+| `selector_suffixes` | list[str] | `[]` | Non-empty literal suffixes used to route selector paths to this suite. |
+
+For Mimir, a two-suite inventory entry looks like this (adjust the root to the
+registered checkout):
+
+```yaml
+repositories:
+  - slug: SquashMerge/mimir
+    root: /workspace/mimir
+    mode: rw
+    origin: https://github.com/SquashMerge/mimir.git
+    base_branch: main
+    test_suites:
+      - name: python
+        command: uv run --extra dev --extra bench pytest -q
+        default: true
+        selector_prefixes: [tests/]
+        selector_suffixes: [.py]
+      - name: frontend
+        command: npm run test:ci
+        selector_prefixes: [frontend/]
+        selector_suffixes: [.test.ts, .test.tsx]
+```
+
+`repo_test` resolves the command and suite as follows:
+
+- Without suites, legacy behavior is unchanged: the repository `test_command`
+  wins, otherwise `defaults.test_command` supplies the deployment fallback. This
+  command is exposed as the default suite named `default`.
+- With suites, a declared `default: true` wins. If none is declared but the
+  repository has a `test_command`, that command is synthesized as a default suite
+  named `default`. Deployment configuration does not supply a default when suites
+  are declared.
+- An explicit `suite` selects by name. Otherwise, when selectors are supplied,
+  every selector's path must match a prefix **or** suffix of the same single
+  suite. Matching uses the path before any pytest `::` node suffix, not globs.
+- With neither an explicit suite nor selectors, the default suite is selected.
+  If there is no default, the request is refused. Unknown suite names, ambiguous
+  or unmatched selectors, and mixed selectors that cannot route to one suite are
+  also refused with `test_suite_selection_refused`, which lists available suites.
+
+Selection does not relax selector validation: frontend selectors must be bounded
+relative `.ts` or `.tsx` file paths, with no pytest-style `::` node selectors.
+For example, `frontend/src/example.test.tsx` routes to `frontend` in the sample;
+it cannot be combined with `tests/test_example.py` in an automatically routed run.
+
+The runner POSIX-splits the selected command and launches it without a shell.
+For declared suites using `npm run` scripts, it inserts `--` before appended
+selectors when needed, producing e.g.
+`npm run test:ci -- frontend/src/example.test.tsx`. Mimir's root `package.json`
+defines `test:ci` as `npm ci && vitest run`: npm interprets that script, not the
+runner's command parser. The script runs only in the disposable snapshot under
+the existing containment policy, with a fresh `HOME` per execution and no shared
+npm cache. Suite configuration does not grant live-checkout execution or widen
+containment permissions.
+
+Results include the selected suite, resolved command, and whether the command
+came from `repository` or `deployment` configuration. Only a run of the default
+suite **without selectors** records the existing full-test evidence. In the
+sample, running the frontend suite, even without selectors, does not satisfy or
+bypass that gate; the default Python suite remains required.
+
+### Defaults
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `defaults.backend` | backend name | `opencode` | Selects the tool backend when no route or category override matches. | `backend: opencode` |
+| `defaults.timeout_s` | int | `1800` | Maximum seconds allowed for the backend/compute run. | `timeout_s: 3600` |
+| `defaults.priority` | str | `normal` | Priority supplied to the autonomous arbiter. | `priority: low` |
+| `defaults.test_command` | command string | `uv run pytest -q` | Command Worklink uses for observed test evidence. Granting the typed `repo_test` capability lets a remediation turn run this same configured command, shell-free, in its authorized PR checkout lease. | `test_command: "/usr/bin/npm test"` |
+| `defaults.gate_rerun_max_failures` | nonnegative int | `10` | Maximum failed pytest node IDs eligible for one serial rerun per gate observation; `0` disables reruns. Above the bound, unsupported commands, collection errors, or incomplete rerun reports retain the failed gate. A complete rerun separates `flaky_tests` from persistent `failed_tests` and emits `worklink_gate_flaky_tests`. Both pre-commit and post-commit gate observations retain their evidence. | `gate_rerun_max_failures: 10` |
+| `defaults.backend_by_category` | mapping | `{}` | Selects a backend by tool category after no route matches. | `backend_by_category: {coding-cli: opencode}` |
+| `defaults.category_defaults` | mapping | `{}` | Compatibility alias for `backend_by_category`; ignored when that key is non-empty. | `category_defaults: {coding-cli: opencode}` |
+| `defaults.compute_backend` | compute name | `local_subprocess` | Selects where the tool backend runs. The shipping value is unsandboxed. | `compute_backend: local_subprocess` |
+| `defaults.compute` | compute name | `local_subprocess` | Compatibility alias for `compute_backend`; ignored when that key is present. | `compute: local-subprocess` |
+| `defaults.base_branch` | str | `main` | Branch attempt checkouts are based on and leaf PRs target. | `base_branch: release/0.7` |
+| `defaults.base_fetch` | bool | `true` | Refreshes `origin/<base_branch>` before creating an attempt checkout without moving the source checkout. | `base_fetch: false` |
+| `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
+| `defaults.reaper_ttl_s` | positive int | `86400` | Lost-heartbeat recovery grace in seconds. Minimum `2 * timeout_s` (3600 for a 1800-second leaf); lower values warn and are raised at load. Backend waiting and finalization, including gate reruns, heartbeat throughout; this is not a total-runtime bound or atomic publication fence. Factory claims are excluded from the leaf reaper. | `reaper_ttl_s: 86400` |
+| `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
+| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.12.1 runtime consumes it. | `epic_branch_prefix: "epic/"` |
+| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.12.1 runtime consumes it. | `max_review_retries: 3` |
+| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.12.1 runtime consumes it. | `max_claim_attempts: 5` |
+| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.12.1 runtime consumes it. | `reviewer_backend: opencode` |
+| `defaults.tiered_review` | mapping | framework defaults | Compatibility-only parsed review classifier; its child keys are described below. | `tiered_review: {multi_vote_reviewer_count: 5}` |
+
+`defaults.trusted_test_retries` is **retired**, not an operator setting in
+0.12.1. It belonged to the removed distributed trusted-test runner. A value in
+YAML has no effect and must not be used as a retry guarantee; for example,
+remove `trusted_test_retries: 1` from an older deployment file.
+
+The remediation parser for `defaults.test_command` uses POSIX argument splitting
+and a fixed system `PATH`; it does not run a shell. Use an executable available
+there or an absolute path. Pipelines, redirects, glob expansion, `&&`, and
+environment assignments are not interpreted. A leading `env -u NAME` (or
+`env --unset NAME`) is supported, but `env NAME=value` is not. Thus this is a
+valid non-Python configuration:
+
+```yaml
+defaults:
+  test_command: "env -u NODE_OPTIONS /usr/bin/npm test -- --runInBand"
+```
+
+### Tiered review compatibility fields
+
+These keys are parsed for old deployment files but are currently inert. If a
+list is supplied, it replaces rather than extends the framework default.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `defaults.tiered_review.high_risk_scope_patterns` | list[str] | migration/schema, auth/credential, generated/lockfile, workflow/Docker/Terraform globs | Retains the old high-risk path patterns for config compatibility; no current reviewer consumes them. | `high_risk_scope_patterns: ["src/auth/**"]` |
+| `defaults.tiered_review.high_risk_labels` | list[str] | `risk:high`, `security`, `auth`, `migration`, `prod-data`, `generated-code`, `hotspot` | Retains the old high-risk labels for config compatibility; no current reviewer consumes them. | `high_risk_labels: ["security"]` |
+| `defaults.tiered_review.multi_vote_reviewer_count` | positive int | `3` | Retains the old reviewer count for config compatibility; no current reviewer consumes it. | `multi_vote_reviewer_count: 5` |
+
+### Routes
+
+`routes` defaults to `[]`; entries are evaluated in order and the first match
+wins. Each route needs `backend` and at least one selector to be useful.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `routes[].backend` | backend name | required | Tool backend selected by this route. | `backend: feature_factory` |
+| `routes[].label` | str | unset | Matches when the issue has this label. | `label: worklink:epic` |
+| `routes[].repo` | str | unset | Matches this `owner/repo`. | `repo: acme/service` |
+| `routes[].tool_category` | str | unset | Matches the requested backend tool category. | `tool_category: coding-cli` |
+| `routes[].compute_backend` | compute name | `defaults.compute_backend` | Overrides the compute backend for this route. | `compute_backend: local_subprocess` |
+
+Example:
+
+```yaml
+routes:
+  - label: worklink:epic
+    backend: feature_factory
+    compute_backend: local_subprocess
+```
+
+### Backend blocks
+
+`backends` defaults to `{}`. Only `opencode` and `feature_factory` ship in
+0.12.1. An unknown referenced backend fails configuration loading; stale settings
+for an unreferenced backend are warned and dropped.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `backends.opencode.bin` | str | `opencode` | Executable used for `opencode run`. | `bin: /usr/local/bin/opencode` |
+| `backends.opencode.args` | list[str] | `[]` | Adds arguments not owned by Worklink. `-m`/`--model`, `--dir`, and `--` are rejected because Worklink supplies them. | `args: ["--format", "json"]` |
+| `backends.opencode.test_env` | mapping[str, str] | `{}` | Exports test settings into the executor in both coding modes. Only `PYTEST_ADDOPTS` is allowed; values must be plain text with no newlines or control characters. | `test_env: {PYTEST_ADDOPTS: "-n 6"}` |
+| `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
+| `backends.feature_factory.entrypoint` | absolute path | `MIMIR_FACTORY_ENTRYPOINT` or the fixed image path | Exact `feature-factory/bin/factory.js` used by every `node` control command and retained recovery record. | `entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` |
+
+The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.12.1` and `opencode-feature-factory@0.12.1` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
+
+For example, to bound pytest runs launched by the model (including through bash):
+
+```yaml
+backends:
+  opencode:
+    test_env:
+      PYTEST_ADDOPTS: "-n 6"
+```
+
+Pytest precedence is **pyproject addopts < PYTEST_ADDOPTS < command line**.
+The gate still runs `defaults.test_command` unchanged, so an explicit `-n` on
+that command wins. An executor command can likewise override this default; this
+setting is not a hard resource limit. Values are exported literally, without
+shell expansion or host environment lookup. Secret and model-selection variable
+names are not accepted. The selected `test_env` keys and values are recorded in
+run state, evidence JSON, and the `WORKLINK_EVIDENCE` comment, including recovered
+runs; do not put secrets in test options.
+
+`compute_backends` defaults to `{}`. The sole shipping block is
+`compute_backends.local_subprocess` (hyphenated `local-subprocess` is normalized
+to the same name), it defaults to `{}`, and it accepts no child settings.
+Example: `compute_backends: {local_subprocess: {}}`.
+
+### Tool pins
+
+`tool_pins` defaults to `[]`. It is operator inventory for drift/bump tooling,
+not an installer. Every item needs `name`, `category`, `pin`, and `smoke`; the
+remaining fields are optional and default to unset.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `tool_pins[].name` | str | required | Stable local tool name. | `name: opencode` |
+| `tool_pins[].category` | str | required | Tool class used in maintenance output. | `category: coding-cli` |
+| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "1.19.4"` |
+| `tool_pins[].smoke` | str | required | Command recorded as bump evidence; issue rendering does not execute it. | `smoke: "opencode --version"` |
+| `tool_pins[].source` | str | unset | Upstream lookup strategy. | `source: npm` |
+| `tool_pins[].package` | str | unset | Upstream package identifier. | `package: opencode-ai` |
+| `tool_pins[].repo` | str | unset | Upstream repository identifier. | `repo: anomalyco/opencode` |
+| `tool_pins[].install` | str | unset | Human-readable install surface. | `install: scaffold Dockerfile` |
+| `tool_pins[].risk` | str | unset | Human-readable upgrade risk. | `risk: high` |
+
+## Optional-skill pollers (gmail / social / github)
+
+These settings apply to opt-in poller skills and only matter once the
+corresponding skill is installed. `MIMIR_SOCIAL_OUTBOX_APPROVERS` is also read
+by the core proposals helper that verifies social-outbox merge approval.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_GMAIL_QUERY` | str | `in:inbox newer_than:1d` | Gmail poller search query. |
+| `MIMIR_GMAIL_MAX_FETCH` | int | `50` (clamp 1–200) | Max messages per gmail poll. |
+| `MIMIR_SOCIAL_PLATFORMS` | csv-list | `bsky,x` | Platforms the social-cli pollers sync. |
+| `MIMIR_SOCIAL_LIMIT` | int | `50` (clamp 1–200) | Per-sync item limit for the mentions poller. |
+| `MIMIR_SOCIAL_FEED_LIMIT` | int | `50` (clamp 1–200) | Per-sync item limit for the feed poller. |
+| `MIMIR_SOCIAL_USERS_DIR` | path | unset | Directory of tracked social users. |
+| `MIMIR_SOCIAL_OUTBOX_APPROVERS` | csv-list | unset (withhold all) | Comma-separated list of GitHub logins allowed to approve social-outbox dispatch by merging the rolling outbox PR; entries are trimmed and compared case-insensitively. Unset or empty (including whitespace/comma-only) withholds every dispatch with `no_approvers_configured`; any malformed login entry withholds with `invalid_approvers_configured`; a merger outside the list is withheld with `merger_not_approved`. Both social-cli pollers forward this setting via `pass_env`. Accepted risk: an agent holding an allowlisted operator's token could self-merge; the allowlist authorizes the forge actor, not an independent human. A separate agent GitHub identity is needed to close that risk. |
+| `MIMIR_GITHUB_PRELOAD_REVIEW_SKILL` | bool | off | Preload the review-skill body into review-needed prompts. |
+| `MIMIR_GITHUB_REVIEW_SKILL_PATH` | path | `""` | Path to the review-skill file preloaded when the above is on. |
+| `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. Also the identity `GITHUB_TOKEN` must belong to before an authorized service-shell `gh` command runs; when unset, those `gh` commands are refused. |
+| `MIMIR_GITHUB_TRUSTED_BOT_LOGINS` | csv exact logins | `""` (none) | Operator action: explicitly trust PR authors that are GitHub bots/apps, e.g. `dependabot[bot]`, on both forge reads and github-poller event payloads. The github-poller forwards this setting via `pass_env`. Case-insensitive exact match only; other bots remain untrusted. Set only for bot identities whose repository output you intend to attest. |
+| `MIMIR_GITHUB_REPOS` | str | unset | Non-secret repository selector available to pollers that explicitly forward it; the bundled GitHub poller uses `GITHUB_REPOS`. |
+
+## Bridges (credentials)
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `DISCORD_TOKEN` | str | unset | Discord bot token (intents enabled in the developer portal). |
+| `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | str | unset | Slack socket-mode app (both required). |
+| `BSKY_HANDLE` / `BSKY_APP_PASSWORD` | str | unset | Bluesky handle + app password (not the main password). |
+
+## Auth (LLM)
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `ANTHROPIC_API_KEY` | str | unset | Pay-per-token Anthropic key. |
+| `ANTHROPIC_AUTH_TOKEN` | str | unset | Anthropic Max-plan OAuth token (`claude setup-token`) or a gateway token. |
+| `ANTHROPIC_BASE_URL` | str | unset | Gateway / Anthropic-compat base URL (LiteLLM, OpenRouter, Minimax, Kimi). |
+| `ANTHROPIC_MODEL` | str | unset | Reader model override. |
+| `ANTHROPIC_CUSTOM_MODEL_OPTION` | str | unset | Extra model option passed through to the gateway. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | str | unset | OAuth token for the Claude Code subprocess path (alternative to a `claude login` credentials file). |
+| `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` | str | unset | Passed through to the Claude Code CLI to disable its experimental beta headers. |
+| `OPENAI_API_KEY` | str | unset | Used for SAGA embeddings + consolidation; without it SAGA falls back to local fastembed. |
+| `GH_TOKEN` / `GITHUB_TOKEN` | str | unset | GitHub credentials. `GITHUB_TOKEN` is the process credential: it supports home git push and GitHub-backed tools/pollers, is paired with `MIMIR_STATE_REPO`, and is the credential factory dispatch verifies against `.factory.json` `publishing_identity`. `GH_TOKEN` is a child-only alias for `gh` and is never preferred over it; both set to different values fails dispatch as an ambiguity, and a missing `GITHUB_TOKEN` fails naming that variable. Worklink sets both child aliases to the verified value. |
+| `MIMIR_FACTORY_PUBLISHING_IDENTITY` | str | unset | Overrides `.factory.json` `publishing_identity` for factory publication. If set, it must be nonblank; invalid values fail closed rather than falling back. The selected identity is still verified against the `GITHUB_TOKEN` owner before dispatch. |
+| `FACTORY_PUBLISHING_IDENTITY` | str | unset | Passed THROUGH to the factory child (feature-factory 0.8.0+), where it supplies the declared identity the driver compares against `gh api /user`. Set per deployment: `jasoncarreira` for a maintainer's local run, `mimir-carreira` inside mimirbot. An empty explicit value is treated as absent, so an inherited nonempty environment value remains effective. Must never be derived from `gh`, the token, or any command result: an expectation read from the credential being checked always matches. Allow-listed in `_control_environment()`; without that entry the deployment can export it and the driver never sees it. |
+| `MINIMAX_API_KEY` | str | unset | Enables the Minimax usage poller (with `MIMIR_MINIMAX_USAGE_POLL_CRON`). |
+
+## Tool & skill integration keys
+
+Optional keys that enable specific tools/skills; unset = the tool/skill is off.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `TAVILY_API_KEY` | str | unset | Enables the `web_search` tool (Tavily). Unset = `web_search` disabled. |
+| `TAVILY_SEARCH_URL` | str | `https://api.tavily.com/search` | Override the Tavily search endpoint (SSRF-checked). |
+| `OPENWEATHER_API_KEY` | str | unset | API key for the bundled `weather` skill. |
+
+---
+
+## Build- & scaffold-time variables
+
+These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
+`compose.env`). Build arguments do not enable a provider at runtime.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_GIT_URL` | str | `https://github.com/SquashMerge/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
+| `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
+| `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
+| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Root Dockerfile build arg: `1` installs pinned OpenCode and bootstraps its config. Selected Cultivate scaffold images use the same build argument and pass it to runtime bootstrap; this is not the runtime plugin selection (`MIMIR_PLUGINS`). |
+| `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
+| `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
+
+### Coding prerequisites
+
+Coding stays disabled by default. Install Cultivate from the in-repo
+`plugins/cultivate` workspace member at the same commit as core
+(`uv sync --all-packages`; it is not published to an index) and set
+`MIMIR_PLUGINS=cultivate` in the supervisor process environment; an unselected
+or absent provider supplies no coding tools. For image builds, select Cultivate
+at build time with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
+`--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` as described in
+[plugins](plugins.md#docker-image-assembly-and-services).
+`MIMIR_ENABLE_OPENCODE` is a build argument for the pinned CLI/bootstrap, not
+a runtime coding switch. Compose reads its project `.env` for build argument
+interpolation, not `compose.env`; place runtime `MIMIR_PLUGINS` in the process
+environment. Regenerate scaffolds and rebuild images after changing installed
+plugins. `--opencode` only optionally bakes the home's config into the image.
+
+Before an operator chooses to enable coding, provision all prerequisites:
+
+- Install the pinned OpenCode CLI from
+  `mimir_cultivate.worklink.tool_pins` on the runtime `PATH`. Regenerate older
+  scaffolds and **rebuild the image** after selecting Cultivate for the image
+  (`docker compose build`, then `docker compose up -d`). A restart
+  alone cannot install the CLI. Hand-maintained images must supply the same
+  prerequisites themselves; a runtime/build mismatch with a missing CLI is
+  caught at startup rather than exposing broken tools.
+- Provide the executable pinned Git path `/usr/bin/git` (the pin is the path,
+  not a Git release version).
+- Provision `MIMIR_PR_CHECKOUT_LEASE_ROOT` as an absolute, existing, non-symlink
+  directory in the runtime container or host namespace. Set ownership and
+  permissions for the actual runtime UID/GID, including mount permissions:
+  that user must be able to create and write files there. Startup probes this
+  as the runtime user; it does not create the root or repair ownership.
+- Place the lease root on the **same filesystem as the repository root** because
+  checkout leases use hardlinks. Separate Docker volumes can break that contract
+  even when their paths look adjacent. Startup's write probe does not verify
+  cross-root hardlink support.
+- Configure the target repository and its local root in `repositories.yaml`
+  (or the legacy `GITHUB_REPOS` / `MIMIR_FILE_TOOL_ROOTS` projections), plus
+  `MIMIR_GITHUB_SELF_LOGIN` matching the authenticated GitHub account and usable
+  GitHub credentials. Identity verification retains its intentional degraded
+  behavior: an unverified identity hides coding registration, but does not
+  excuse missing local coding prerequisites.
+
+Startup reports all missing local prerequisites in one error, including CLI,
+pinned Git, and lease-root configuration/writability. Satisfy the entire list
+before retrying. Provisioning a lease root grants no general agent write
+authority over it or the live source checkout.
+
+With coding enabled, trusted heartbeat turns can use the typed Git tools for
+checkout, conflict resolution, merge/rebase, revert, commit, and push. Raw shell
+policy is unchanged. Authority comes from a fresh GitHub snapshot of an open PR
+in a configured repository, authored by `MIMIR_GITHUB_SELF_LOGIN`; model tool
+arguments only select a candidate, never its author, refs, SHA, or permissions.
+The server pins those fields and refuses incompatible cached scopes or changed
+heads with named reasons. Rebased publication uses an exact-head force-with-lease,
+not unrestricted force, with the existing protected-ref restrictions intact.
+
+When coding is enabled, the validated lease root is also derived into file-tool
+read scope automatically. Do **not** duplicate it in `MIMIR_FILE_TOOL_ROOTS`.
+Existing active-lease authorization and protected-file checks still apply; this
+does not add a general writable root. The startup `filesystem_read_scope` event
+records the derived lease root and effective non-admin read roots for auditing.
+
+The following code-visible names are explicitly **internal, not operator
+environment variables**:
+
+| Name | Classification |
+|---|---|
+| `MIMIR_HOME_GIT_TRACKING` | Historical internal design-document/implementation label; runtime configuration is `MIMIR_GIT_TRACKING_ENABLED`. |
+| `MIMIR_COMPATIBILITY` | Optional model-adapter module attribute inspected with `getattr`; it is not read from the environment. |
+| `MIMIR_CONFIG` | Reserved future alias mentioned by the internal SAGA loader; it is not implemented. Use `SAGA_CONFIG`. |
+| `MIMIR_SPAWN_DEPTH` | Harness-owned recursion-depth marker set on child processes; it is not an operator setting. |
+
+> `MIMIR_GIT_USER_NAME` / `MIMIR_GIT_USER_EMAIL` appear in scaffold comments as
+> committer-identity overrides, but are **not currently wired to an env read** —
+> the home-commit identity uses the built-in `mimir` / `noreply@mimir-agent.local`
+> default. Track before relying on them.

@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import ast
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("acp_dependency_closure", ROOT / ".github" / "acp_dependency_closure.py")
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def test_proxy_relay_and_client_closures_are_finite_and_runtime_blind() -> None:
+    module.assert_policy(module.module_paths(ROOT / "mimir"))
+
+
+def test_hands_contract_is_stdlib_only_and_in_client_closure() -> None:
+    paths = module.module_paths(ROOT / "mimir")
+    reached, analyses = module.closure(paths, module.ROOTS["client"])
+
+    assert "mimir.acp.hands_contract" in reached
+    analysis = analyses["mimir.acp.hands_contract"]
+    assert module._first_party_imports(analysis, set(paths)) == set()
+    assert analysis.external_imports <= module.sys.stdlib_module_names
+
+
+def test_hosted_hands_closure_is_stdlib_only_and_runtime_blind() -> None:
+    paths = module.module_paths(ROOT / "mimir")
+    reached, analyses = module.closure(paths, {"mimir.acp.hosted"})
+
+    assert reached == {
+        "mimir.acp.hosted",
+        "mimir.acp.hands_contract",
+        "mimir.acp.python_kernel",
+        "mimir.acp.confinement",
+        "mimir.acp.execution_scope",
+        "mimir.acp.audit",
+        "mimir.client_file_resources",
+    }
+    for analysis in analyses.values():
+        assert analysis.external_imports <= module.sys.stdlib_module_names
+
+
+@pytest.mark.parametrize("source", [
+    "from mimir.runtime import create_core_services\ncreate_core_services()\n",
+    "import mimir.runtime as r\nbuild = r.create_agent_runtime\nbuild()\n",
+    "from mimir import runtime as r\nctor = r.AgentRuntimeBundle\nctor()\n",
+    "from mimir.runtime import AgentRuntimeBundle as B\ncloser = B.aclose\ncloser(value)\n",
+    "async def stop(value):\n    await value.aclose()\n",
+])
+def test_forbidden_constructor_and_closer_aliases_are_detected(tmp_path: Path, source: str) -> None:
+    paths = module.module_paths(ROOT / "mimir")
+    paths = dict(paths)
+    path = tmp_path / "proxy.py"
+    path.write_text("from . import profiles, credentials, transport\n" + source)
+    paths["mimir.acp.proxy"] = path
+    with pytest.raises(AssertionError, match="forbidden"):
+        module.assert_policy(paths)
+
+
+def test_transitive_sink_is_detected(tmp_path: Path) -> None:
+    paths = module.module_paths(ROOT / "mimir")
+    paths = dict(paths)
+    proxy = tmp_path / "proxy.py"
+    helper = tmp_path / "profiles.py"
+    proxy.write_text("from . import profiles, credentials, transport\n")
+    helper.write_text("from mimir.runtime import create_core_services as build\nbuild()\n")
+    paths["mimir.acp.proxy"] = proxy
+    paths["mimir.acp.profiles"] = helper
+    with pytest.raises(AssertionError, match="forbidden"):
+        module.assert_policy(paths)
+
+
+@pytest.mark.parametrize(("member", "source"), [
+    ("mimir.acp.proxy", "import requests\nfrom . import profiles, credentials, transport, hosted, diagnostics, execution_scope\n"),
+    ("mimir.acp.relay", "from cryptography import x509\nfrom . import transport\n"),
+    ("mimir.acp.credentials", "import keyring\nimport requests\n"),
+])
+def test_per_member_third_party_allowlist_rejects_mutations(tmp_path: Path, member: str, source: str) -> None:
+    paths = dict(module.module_paths(ROOT / "mimir"))
+    path = tmp_path / f"{member.rsplit('.', 1)[-1]}.py"
+    path.write_text(source)
+    paths[member] = path
+    with pytest.raises(AssertionError, match="third-party"):
+        module.assert_policy(paths)
+
+
+def test_entrypoint_acp_branch_has_only_the_client_dispatch() -> None:
+    tree = ast.parse((ROOT / "mimir" / "entrypoint.py").read_text())
+    branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    imports = [node.module for statement in branch.body for node in ast.walk(statement) if isinstance(node, ast.ImportFrom)]
+    assert imports == ["mimir.acp.bootstrap"]
+    assert any(isinstance(node, ast.Return) for statement in branch.body for node in ast.walk(statement))
+
+
+def test_daemon_consumes_runtime_without_constructing_or_closing_it() -> None:
+    source = (ROOT / "mimir" / "acp" / "daemon.py").read_text()
+    assert "create_core_services" not in source
+    assert "create_agent_runtime" not in source
+    assert ".aclose(" not in source
+
+
+def test_composition_is_globally_absent() -> None:
+    assert not (ROOT / "mimir" / "acp" / "composition.py").exists()

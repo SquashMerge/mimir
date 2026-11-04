@@ -1,0 +1,2286 @@
+from __future__ import annotations
+
+import errno
+import json
+import subprocess
+import tarfile
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("PR checkout leases require installed Cultivate", allow_module_level=True)
+
+from mimir.access_control import (
+    CapabilityTier,
+    ToolRegistry,
+    build_trigger_service_principal,
+)
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    TurnInteractivity,
+)
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRActionScope, RepoReviewState, ServerDiscoveredPRStates,
+)
+from mimir_cultivate.repository import (
+    PRCheckoutLease,
+    _foreign_candidate_head,
+    _retained_candidate_head,
+    _preserve_checkout_head,
+    _preserve_dirty_worktree,
+    _recover_retained_checkout,
+    active_pr_checkout_lease_for_path,
+    acquire_pr_checkout_lease,
+    cleanup_pr_checkout_lease,
+    create_pr_checkout_lease,
+    reclaim_expired_pr_checkout_leases,
+    recover_pr_checkout_lease,
+)
+from mimir._context import reset_current_turn, set_current_turn
+from mimir.readonly_backend import WriteGuardBackend
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        [
+            "git", "-C", str(cwd),
+            "-c", "user.name=test", "-c", "user.email=test@example.com",
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _repo_and_scope(tmp_path: Path) -> tuple[Path, RepoPRActionScope]:
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "source"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "checkout", "-q", "-b", "main")
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    _git(repo, "checkout", "-q", "-b", "worklink/7")
+    (repo / "file.txt").write_text("pull request\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "pr")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+    return repo, RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root=str(repo.resolve()),
+        canonical_origin=str(origin),
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=7,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/worklink/7",
+        observed_head_sha=head_sha,
+        base_ref="main",
+        observed_base_sha=base_sha,
+    )
+
+
+def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    state = RepoReviewState(scope)
+
+    lease = create_pr_checkout_lease(
+        scope, owner="mimir-bot", lease_root=lease_root, review_state=state,
+    )
+
+    assert lease.path.parent == lease_root.resolve()
+    assert lease.path != repo
+    assert lease.destination_ref == scope.destination_ref
+    assert lease.scope_base_sha == scope.observed_base_sha
+    assert lease.base_sha == scope.observed_base_sha
+    assert _git(lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert state.root == str(lease.path)
+    assert state.checkout_lease is lease
+    recovered = recover_pr_checkout_lease(
+        lease.path, scope, owner="mimir-bot", lease_root=lease_root, review_state=state,
+    )
+    assert recovered.recovered is True
+    assert recovered.scope_id == scope.scope_id
+
+    assert cleanup_pr_checkout_lease(recovered, review_state=state) is True
+    assert cleanup_pr_checkout_lease(recovered, review_state=state) is False
+    assert state.checkout_lease is None
+
+
+@pytest.mark.parametrize("reuse", ["acquire", "recover"])
+def test_unexpired_lease_renews_on_new_turn_with_injected_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reuse: str,
+) -> None:
+    from mimir_cultivate import repository as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    ttl = timedelta(hours=2)
+    start = datetime.now(UTC)
+
+    class Clock(datetime):
+        current = start
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz) if tz else cls.current.replace(tzinfo=None)
+
+    monkeypatch.setattr(leases, "datetime", Clock)
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, ttl=ttl)
+    assert first.expires_at == start + ttl
+    Clock.current = start + timedelta(minutes=90)
+    state = RepoReviewState(scope)
+    if reuse == "acquire":
+        renewed, _ = acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=root, ttl=ttl, review_state=state,
+        )
+    else:
+        renewed = recover_pr_checkout_lease(
+            first.path, scope, owner=scope.principal, lease_root=root,
+            ttl=ttl, review_state=state,
+        )
+    assert renewed.expires_at >= Clock.current + ttl
+    assert state.checkout_lease is renewed
+    metadata = json.loads((first.path / ".git" / "mimir-pr-checkout-lease.json").read_text())
+    assert datetime.fromisoformat(metadata["expires_at"]) == renewed.expires_at
+    Clock.current = renewed.expires_at - timedelta(seconds=1)
+    assert renewed.is_active
+    Clock.current = renewed.expires_at
+    assert not renewed.is_active
+
+
+def test_unused_lease_expires_without_renewal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir_cultivate import repository as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    start = datetime.now(UTC)
+
+    class Clock(datetime):
+        current = start
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz) if tz else cls.current.replace(tzinfo=None)
+
+    monkeypatch.setattr(leases, "datetime", Clock)
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    assert lease.expires_at == start + timedelta(hours=2)
+    Clock.current = lease.expires_at
+    assert not lease.is_active
+    with pytest.raises(RuntimeError, match="expired"):
+        recover_pr_checkout_lease(lease.path, scope, owner=scope.principal, lease_root=root)
+
+
+def test_second_attempt_resumes_unpushed_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (first.path / "fix.txt").write_text("retained fix\n", encoding="utf-8")
+    _git(first.path, "add", "fix.txt")
+    _git(first.path, "commit", "-q", "-m", "retained fix")
+    fix_head = _git(first.path, "rev-parse", "HEAD")
+    state = RepoReviewState(scope)
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+    )
+
+    assert resumed.path == first.path
+    assert resumed.recovered is True
+    assert candidates == (fix_head,)
+    assert state.checkout_lease is resumed
+    assert state.git_expected_head == fix_head
+    assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+    assert events[-1] == (
+        "pr_checkout_lease_acquired",
+        {
+            "repository": scope.canonical_repo,
+            "pull_request": scope.pr_number,
+            "scope_id": scope.scope_id,
+            "head_sha": _git(resumed.path, "rev-parse", "HEAD"),
+            "path": str(resumed.path),
+            "owner": scope.principal,
+            "acquisition": "resume",
+        },
+    )
+
+
+@pytest.mark.parametrize("work_kind", ["uncommitted", "committed"])
+def test_later_turn_reuses_same_pr_fast_forward_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    work_kind: str,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier_scope = replace(scope, event_type="pr_review_requested")
+    earlier = create_pr_checkout_lease(
+        earlier_scope, owner=earlier_scope.principal, lease_root=lease_root,
+    )
+    (earlier.path / "fix.txt").write_text("same PR fix\n", encoding="utf-8")
+    if work_kind == "committed":
+        _git(earlier.path, "add", "fix.txt")
+        _git(earlier.path, "commit", "-q", "-m", "same PR fix")
+    candidate_head = _git(earlier.path, "rev-parse", "HEAD")
+    state = RepoReviewState(scope)
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+    )
+
+    assert resumed.path == earlier.path
+    assert resumed.scope_id == scope.scope_id
+    assert resumed.recovered is True
+    assert candidates == ((candidate_head,) if work_kind == "committed" else ())
+    assert state.checkout_lease is resumed
+    assert state.git_expected_head == candidate_head
+    assert (resumed.path / "fix.txt").read_text(encoding="utf-8") == "same PR fix\n"
+
+
+def test_later_turn_refuses_same_pr_candidate_from_another_source_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier = create_pr_checkout_lease(
+        replace(scope, event_type="pr_review_requested"),
+        owner=scope.principal, lease_root=lease_root,
+    )
+    other_source = tmp_path / "other-source"
+    other_source.mkdir()
+    metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["source_root"] = str(other_source)
+    metadata_path.write_text(json.dumps(metadata))
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope"):
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert earlier.path.is_dir()
+    assert metadata_path.read_bytes() == original_metadata
+
+
+@pytest.mark.parametrize(
+    "field", ["canonical_repo", "canonical_origin", "source_root", "owner", "pr_number", "destination_ref"],
+)
+def test_foreign_candidate_identity_boundary(tmp_path: Path, field: str) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    other_source = tmp_path / "other-source"
+    other_source.mkdir()
+    values = {
+        "canonical_repo": "other/repo",
+        "canonical_origin": "https://example.com/other.git",
+        "source_root": other_source,
+        "owner": "other-bot",
+        "pr_number": scope.pr_number + 1,
+        "destination_ref": "refs/heads/other",
+    }
+    mismatched = replace(lease, **{field: values[field]})
+
+    def runner(args):
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    assert _foreign_candidate_head(
+        mismatched, scope, owner=scope.principal, runner=runner,
+    ) == (scope.observed_head_sha, False)
+
+
+@pytest.mark.parametrize("path", ["foreign", "exact"])
+@pytest.mark.parametrize("field", ["origin", "branch"])
+def test_recovery_runtime_identity(tmp_path: Path, path: str, field: str) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+
+    def runner(args):
+        if field == "origin" and "remote.origin.url" in args:
+            return subprocess.CompletedProcess(args, 0, "https://example.com/other.git", "")
+        if field == "branch" and "symbolic-ref" in args:
+            return subprocess.CompletedProcess(args, 0, "other", "")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    if path == "foreign":
+        assert _foreign_candidate_head(
+            lease, scope, owner=scope.principal, runner=runner,
+        ) == (scope.observed_head_sha, False)
+    else:
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            recover_pr_checkout_lease(
+                lease.path, scope, owner=scope.principal, lease_root=root, runner=runner,
+            )
+
+
+@pytest.mark.parametrize("entry", ["acquire", "recover", "retained"])
+def test_exact_recovery_metadata_boundary(tmp_path: Path, entry: str) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    metadata_path = lease.path / ".git/mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["owner"] = "other-bot"
+    metadata_path.write_text(json.dumps(metadata))
+    original_metadata = metadata_path.read_bytes()
+    with pytest.raises(RuntimeError, match="scope mismatch"):
+        if entry == "acquire":
+            acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+        elif entry == "retained":
+            _retained_candidate_head(
+                lease.path, scope, owner=scope.principal, root=root,
+                runner=lambda args: subprocess.run(args, capture_output=True, text=True, check=False),
+            )
+        else:
+            recover_pr_checkout_lease(lease.path, scope, owner=scope.principal, lease_root=root)
+    assert metadata_path.read_bytes() == original_metadata
+
+
+@pytest.mark.parametrize(
+    "control", [None, "equivalent", "edited_patch", "forge_stale", "remote_stale", "origin", "branch", "destination"],
+)
+def test_later_turn_reuses_rebased_candidate_with_added_fix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: str | None,
+) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier_scope = replace(scope, event_type="pr_review_requested")
+    earlier = create_pr_checkout_lease(
+        earlier_scope, owner=earlier_scope.principal, lease_root=lease_root,
+    )
+    _git(repo, "checkout", "-q", "main")
+    (repo / "base-update.txt").write_text("new base\n", encoding="utf-8")
+    _git(repo, "add", "base-update.txt")
+    _git(repo, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    _git(earlier.path, "fetch", "-q", "origin", "main")
+    _git(earlier.path, "rebase", "origin/main")
+    if control == "edited_patch":
+        (earlier.path / "file.txt").write_text("corrected PR patch\n", encoding="utf-8")
+        _git(earlier.path, "commit", "--amend", "-qam", "correct published patch")
+    if control != "equivalent":
+        (earlier.path / "fix.txt").write_text("additional fix\n", encoding="utf-8")
+        _git(earlier.path, "add", "fix.txt")
+        _git(earlier.path, "commit", "-q", "-m", "additional fix after rebase")
+    rebased_head = _git(earlier.path, "rev-parse", "HEAD")
+    current_scope = replace(
+        scope, observed_base_sha=advanced_base,
+    )
+    assert current_scope.scope_id != earlier_scope.scope_id
+    assert subprocess.run(
+        ["git", "-C", str(earlier.path), "merge-base", "--is-ancestor",
+         scope.observed_head_sha, rebased_head],
+        capture_output=True, check=False,
+    ).returncode == 1
+    if control == "forge_stale":
+        current_scope = replace(current_scope, observed_head_sha="f" * 40)
+    elif control == "remote_stale":
+        _git(repo, "checkout", "-q", "worklink/7")
+        _advance_pr_head(repo, scope)
+    elif control == "origin":
+        _git(earlier.path, "remote", "set-url", "origin", "https://example.com/other.git")
+    elif control == "branch":
+        _git(earlier.path, "branch", "-m", "other")
+    elif control == "destination":
+        metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["destination_ref"] = "refs/heads/other"
+        metadata_path.write_text(json.dumps(metadata))
+    metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+    state = RepoReviewState(current_scope)
+
+    if control not in {None, "equivalent", "edited_patch"}:
+        with pytest.raises(RuntimeError, match="include another scope|PR head advanced"):
+            acquire_pr_checkout_lease(
+                current_scope, owner=current_scope.principal, lease_root=lease_root,
+                review_state=state,
+            )
+        assert metadata_path.read_bytes() == original_metadata
+        assert _git(earlier.path, "rev-parse", "HEAD") == rebased_head
+        assert state.checkout_lease is None
+        return
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        current_scope, owner=current_scope.principal, lease_root=lease_root,
+        review_state=state,
+    )
+
+    assert resumed.path == earlier.path
+    assert resumed.scope_id == current_scope.scope_id
+    assert candidates == (rebased_head,)
+    assert resumed.head_sha == current_scope.observed_head_sha
+    assert state.checkout_lease is resumed
+    assert state.git_expected_head == rebased_head
+    assert _git(resumed.path, "rev-parse", "HEAD") == rebased_head
+    if control != "equivalent":
+        assert (resumed.path / "fix.txt").read_text() == "additional fix\n"
+    assert _git(resumed.path, "rev-parse", "refs/mimir/pr-checkout-lease/published") == scope.observed_head_sha
+
+
+@pytest.mark.parametrize("same_scope", [False, True])
+@pytest.mark.parametrize("control", [None, "remote_stale", "origin", "branch", "metadata"])
+def test_turn_recovers_genuinely_divergent_same_pr_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    same_scope: bool,
+    control: str | None,
+) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    earlier_scope = scope if same_scope else replace(scope, event_type="pr_review_requested")
+    earlier = create_pr_checkout_lease(
+        earlier_scope, owner=earlier_scope.principal, lease_root=lease_root,
+    )
+    _git(earlier.path, "reset", "--hard", "refs/remotes/origin/main")
+    head = _git(earlier.path, "rev-parse", "HEAD")
+    metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+    if control == "remote_stale":
+        _advance_pr_head(repo, scope)
+    elif control == "origin":
+        _git(earlier.path, "remote", "set-url", "origin", "https://example.com/other.git")
+    elif control == "branch":
+        _git(earlier.path, "branch", "-m", "other")
+    elif control == "metadata":
+        metadata = json.loads(metadata_path.read_text())
+        metadata["canonical_origin"] = "https://example.com/other.git"
+        metadata_path.write_text(json.dumps(metadata))
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    state = RepoReviewState(scope)
+    if control:
+        with pytest.raises(RuntimeError, match="mismatch|include another scope|PR head advanced"):
+            acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+            )
+        assert metadata_path.read_bytes() == original_metadata
+        assert state.checkout_lease is None
+    else:
+        resumed, candidates = acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+        )
+        assert resumed.path == earlier.path
+        assert resumed.recovered
+        assert candidates == (head,)
+        assert state.git_expected_head == head
+        assert state.checkout_lease is resumed
+    assert _git(earlier.path, "rev-parse", "HEAD") == head
+
+
+def test_fresh_acquisition_records_actual_checkout_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    lease, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert events == [(
+        "pr_checkout_lease_acquired",
+        {
+            "repository": scope.canonical_repo,
+            "pull_request": scope.pr_number,
+            "scope_id": scope.scope_id,
+            "head_sha": _git(lease.path, "rev-parse", "HEAD"),
+            "path": str(lease.path),
+            "owner": scope.principal,
+            "acquisition": "fresh",
+        },
+    )]
+
+
+def test_acquisition_succeeds_when_event_logger_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+
+    def raise_from_logger(_kind: str, **_fields: object) -> None:
+        raise RuntimeError("event log unavailable")
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", raise_from_logger)
+
+    lease, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert lease.path.is_dir()
+    assert _git(lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
+
+
+def test_expired_lease_with_unpushed_work_is_named_and_renewed(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (first.path / "fix.txt").write_text("expired retained fix\n", encoding="utf-8")
+    _git(first.path, "add", "fix.txt")
+    _git(first.path, "commit", "-q", "-m", "expired retained fix")
+    fix_head = _git(first.path, "rev-parse", "HEAD")
+    metadata_path = first.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["expires_at"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+
+    assert resumed.path == first.path
+    assert resumed.is_active
+    assert candidates == (fix_head,)
+    renewed = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert datetime.fromisoformat(renewed["expires_at"]) > datetime.now(UTC)
+
+
+def _expire_lease(lease: PRCheckoutLease) -> datetime:
+    expired_at = datetime.now(UTC) - timedelta(minutes=5)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["expires_at"] = expired_at.isoformat()
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+    return expired_at
+
+
+def test_reaper_reclaims_expired_published_lease(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=5),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert len(results) == 1
+    assert results[0].reclaimed is True
+    assert not lease.path.exists()
+    reclaimed = next(fields for kind, fields in events if kind == "pr_checkout_lease_reclaimed")
+    assert reclaimed["lease"] == lease.path.name
+    assert reclaimed["expired_by_s"] == 300.0
+    assert reclaimed["size_bytes"] > 0
+    assert reclaimed["publication_proof_present"] is True
+    assert events[-1] == (
+        "pr_checkout_lease_reaper_sweep",
+        {"expired_count": 1, "reclaimed_count": 1, "retained_count": 0},
+    )
+
+
+@pytest.mark.parametrize("error_number", [
+    pytest.param(39, id="linux-enotempty"),
+    pytest.param(66, id="darwin-enotempty"),
+])
+def test_reaper_delete_failure_leaves_only_tombstone_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int,
+) -> None:
+    from mimir_cultivate import repository as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+    real_delete = leases.rmtree_missing_ok
+    # ENOTEMPTY is 39 on Linux and 66 on Darwin. Exercise both renderings
+    # on every host without weakening the exact event-payload assertion.
+    delete_error = OSError(error_number, "Directory not empty")
+
+    def fail_delete(path: Path) -> None:
+        assert not lease.path.exists(), "deletion must happen after the rename"
+        assert path.name.startswith(".reclaiming-")
+        raise delete_error
+
+    monkeypatch.setattr(leases, "rmtree_missing_ok", fail_delete)
+    result = reclaim_expired_pr_checkout_leases(
+        root, event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+    assert len(result) == 1 and not result[0].reclaimed
+    assert not lease.path.exists()
+    tombstones = list(root.glob(".reclaiming-*"))
+    assert len(tombstones) == 1 and tombstones[0].is_dir()
+    assert any(kind == "pr_checkout_lease_reclaim_failed" and fields == {
+        "lease": lease.path.name, "recovery_id": lease.recovery_id,
+        "step": "delete", "error": str(delete_error),
+    } for kind, fields in events)
+
+    monkeypatch.setattr(leases, "rmtree_missing_ok", real_delete)
+    assert reclaim_expired_pr_checkout_leases(root, event_logger=lambda *_a, **_k: None) == []
+    assert not tombstones[0].exists()
+
+
+def test_reaper_failure_on_first_lease_does_not_block_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate import repository as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    second = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    for lease in (first, second):
+        _expire_lease(lease)
+    sorted_leases = sorted((first, second), key=lambda lease: lease.path)
+    real_delete = leases.rmtree_missing_ok
+
+    def fail_first(path: Path) -> None:
+        if sorted_leases[0].path.name in path.name:
+            raise OSError(errno.ENOTEMPTY, "Directory not empty")
+        real_delete(path)
+
+    monkeypatch.setattr(leases, "rmtree_missing_ok", fail_first)
+    results = reclaim_expired_pr_checkout_leases(root, event_logger=lambda *_a, **_k: None)
+    assert [result.reclaimed for result in results] == [False, True]
+    assert not sorted_leases[0].path.exists()
+    assert not sorted_leases[1].path.exists()
+
+
+def test_reaper_rechecks_live_paths_immediately_before_rename(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    _expire_lease(lease)
+    calls = 0
+
+    def active() -> set[Path]:
+        nonlocal calls
+        calls += 1
+        return {lease.path} if calls > 1 else set()
+
+    assert reclaim_expired_pr_checkout_leases(
+        root, active_paths=active, event_logger=lambda *_a, **_k: None,
+    ) == []
+    assert calls >= 2
+    assert lease.path.is_dir()
+    assert not list(root.glob(".reclaiming-*"))
+
+
+@pytest.mark.parametrize("broken", ["marker", "missing_objects"])
+def test_broken_lease_is_never_recovered_and_fresh_checkout_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken: str,
+) -> None:
+    from mimir_cultivate import repository as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    old = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    if broken == "marker":
+        (old.path / leases._RECLAMATION_METADATA).write_text('{"classification":"unreclaimable"}')
+    else:
+        import shutil
+
+        shutil.rmtree(old.path / ".git/objects")
+        assert subprocess.run(
+            ["git", "-C", str(old.path), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+        ).returncode != 0
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    with pytest.raises(RuntimeError):
+        recover_pr_checkout_lease(old.path, scope, owner=scope.principal, lease_root=root)
+
+    state = RepoReviewState(scope)
+    fresh, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=root, review_state=state,
+    )
+    assert candidates == ()
+    assert fresh.path != old.path and old.path.is_dir()
+    assert state.checkout_lease is fresh
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert any(kind == "pr_checkout_lease_retained" and fields["candidates"] == [
+        {"commit": "<unverifiable>", "path": str(old.path)},
+    ] for kind, fields in events)
+
+
+def test_marked_unpublished_head_is_preserved_and_alerted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate.repository import _RECLAMATION_METADATA
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    old = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    (old.path / "fix.txt").write_text("unpublished\n")
+    _git(old.path, "add", "fix.txt")
+    _git(old.path, "commit", "-qm", "local fix")
+    head = _git(old.path, "rev-parse", "HEAD")
+    (old.path / _RECLAMATION_METADATA).write_text('{"classification":"unreclaimable"}')
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    assert active_pr_checkout_lease_for_path(old.path / "fix.txt") is None
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    fresh, _ = acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    assert fresh.path != old.path
+    assert _git(old.path, "rev-parse", "HEAD") == head
+    assert any(kind == "pr_checkout_lease_retained" for kind, _ in events)
+
+
+def test_repo_checkout_after_half_reclaimed_lease_uses_fresh_git_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.models import InformationFlowState
+    from mimir_cultivate.repository import repo_checkout
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    old = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    import shutil
+
+    shutil.rmtree(old.path / ".git/objects")
+    state = RepoReviewState(scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    monkeypatch.setattr(
+        "mimir_cultivate.forge.remediation_checkout_preflight",
+        lambda *_args: (state, None),
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.forge._client",
+        lambda *_args: SimpleNamespace(author_is_trusted=None),
+    )
+    monkeypatch.setattr("mimir_cultivate.repository._publish_attested_lease_result", lambda *_args: None)
+
+    result = repo_checkout.func(
+        repository=scope.canonical_repo, pull_request=scope.pr_number,
+        runtime=SimpleNamespace(context=SimpleNamespace(ifc_state=InformationFlowState())),
+    )
+    assert result["status"] == "checked_out"
+    assert result["path"] != str(old.path)
+    assert _git(Path(result["path"]), "rev-parse", "HEAD") == scope.observed_head_sha
+    assert old.path.is_dir()
+
+
+def test_reaper_preserves_and_reclaims_expired_unpublished_work(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("unpublished fix\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "unpublished fix")
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=5),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert len(results) == 1
+    assert results[0].reclaimed is True
+    assert results[0].error is None
+    assert results[0].canonical_origin_contains_head is False
+    assert not lease.path.exists()
+    bundle = results[0].recovery_bundle
+    assert bundle is not None and bundle.is_file()
+    assert fix_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    reclaimed = next(fields for kind, fields in events if kind == "pr_checkout_lease_reclaimed")
+    assert reclaimed["lease"] == lease.path.name
+    assert reclaimed["publication_proof_present"] is True
+    assert reclaimed["recovery_bundle"] == str(bundle)
+
+
+def test_reaper_preserves_expired_lease_without_publication_proof(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("only local copy\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "only local copy")
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "update-ref", "-d", "refs/mimir/pr-checkout-lease/published")
+    expired_at = _expire_lease(lease)
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root, now=expired_at + timedelta(minutes=5), event_logger=lambda *_a, **_k: None,
+    )
+
+    assert len(results) == 1
+    assert results[0].reclaimed is True
+    assert results[0].publication_proof_present is False
+    assert results[0].canonical_origin_contains_head is False
+    assert not lease.path.exists()
+    bundle = results[0].recovery_bundle
+    assert bundle is not None
+    assert fix_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+
+
+def test_reaper_skips_unexpired_lease_without_publication_proof(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    _git(lease.path, "update-ref", "-d", "refs/mimir/pr-checkout-lease/published")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=datetime.now(UTC),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert results == []
+    assert lease.path.is_dir()
+    assert not (lease_root / ".recovery").exists()
+    assert not (
+        lease.path / ".git" / "mimir-pr-checkout-lease-reclamation.json"
+    ).exists()
+    assert events == [(
+        "pr_checkout_lease_reaper_sweep",
+        {"expired_count": 0, "reclaimed_count": 0, "retained_count": 0},
+    )]
+
+
+def test_reaper_marks_preservation_failure_once(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("only local copy\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "only local copy")
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args):
+        if "bundle" in args and "create" in args:
+            return subprocess.CompletedProcess(args, 1, "", "disk full\n")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    first = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=5),
+        runner=runner,
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+    second = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=15),
+        runner=runner,
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert len(first) == 1 and first[0].reclaimed is False
+    assert "recovery failed" in (first[0].error or "")
+    assert "disk full" in (first[0].error or "")
+    assert second == []
+    assert lease.path.is_dir()
+    marker = lease.path / ".git" / "mimir-pr-checkout-lease-reclamation.json"
+    assert json.loads(marker.read_text(encoding="utf-8"))["classification"] == "unreclaimable"
+    assert [kind for kind, _fields in events].count("pr_checkout_lease_unreclaimable") == 1
+
+
+def test_reaper_never_reclaims_expired_lease_attached_to_live_turn(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        active_paths={lease.path},
+        now=expired_at + timedelta(hours=3),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert results == []
+    assert lease.path.is_dir()
+    assert events == [(
+        "pr_checkout_lease_reaper_sweep",
+        {"expired_count": 0, "reclaimed_count": 0, "retained_count": 0},
+    )]
+
+
+def test_expired_lease_refuses_resume_after_pr_head_moves(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("stale fix\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "stale fix")
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expired_at = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    metadata["expires_at"] = expired_at
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+    (repo / "new-head.txt").write_text("new head\n", encoding="utf-8")
+    _git(repo, "add", "new-head.txt")
+    _git(repo, "commit", "-q", "-m", "move PR head")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+
+    with pytest.raises(RuntimeError, match="PR head advanced"):
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    retained = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert retained["expires_at"] == expired_at
+    assert lease.path.is_dir()
+
+
+def test_acquire_refuses_scope_without_current_checkout_authority(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    unauthorized = replace(
+        scope,
+        allowed_operations=scope.allowed_operations - {RepoPRAction.CHECKOUT.value},
+    )
+
+    with pytest.raises(RuntimeError, match="does not grant PR checkout"):
+        acquire_pr_checkout_lease(
+            unauthorized, owner=unauthorized.principal, lease_root=lease_root,
+        )
+
+
+def test_acquire_refuses_scope_mismatch_in_matching_lease_slot(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["scope_id"] = "f" * 64
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="scope mismatch"):
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+
+
+def test_acquire_reports_all_divergent_unpublished_candidates(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    candidates = []
+    for name in ("first", "second"):
+        lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+        (lease.path / f"{name}.txt").write_text(f"{name} fix\n", encoding="utf-8")
+        _git(lease.path, "add", f"{name}.txt")
+        _git(lease.path, "commit", "-q", "-m", f"{name} fix")
+        candidates.append(_git(lease.path, "rev-parse", "HEAD"))
+
+    with pytest.raises(RuntimeError, match="refusing implicit selection") as refusal:
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert all(candidate in str(refusal.value) for candidate in candidates)
+
+
+def test_acquire_refuses_and_reports_foreign_scope_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    current = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+    foreign_scope = replace(scope, event_type="pr_review_requested")
+    assert foreign_scope.scope_id != scope.scope_id
+    foreign = create_pr_checkout_lease(
+        foreign_scope, owner=foreign_scope.principal, lease_root=lease_root,
+    )
+    assert not foreign.path.name.startswith(scope.scope_id[:16])
+
+    candidates = []
+    for lease, name in ((current, "current"),):
+        (lease.path / f"{name}.txt").write_text(f"{name} fix\n", encoding="utf-8")
+        _git(lease.path, "add", f"{name}.txt")
+        _git(lease.path, "commit", "-q", "-m", f"{name} fix")
+        candidates.append(_git(lease.path, "rev-parse", "HEAD"))
+    _git(foreign.path, "checkout", "-q", "--orphan", "foreign-history")
+    _git(foreign.path, "rm", "-q", "-rf", ".")
+    (foreign.path / "foreign.txt").write_text("foreign fix\n", encoding="utf-8")
+    _git(foreign.path, "add", "foreign.txt")
+    _git(foreign.path, "commit", "-q", "-m", "foreign fix")
+    candidates.append(_git(foreign.path, "rev-parse", "HEAD"))
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope") as refusal:
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert all(candidate in str(refusal.value) for candidate in candidates)
+    assert events == [
+        (
+            "pr_checkout_lease_scope_conflict",
+            {
+                "repository": scope.canonical_repo,
+                "pull_request": scope.pr_number,
+                "scope_id": scope.scope_id,
+                "candidates": [
+                    {"commit": candidates[0], "path": str(current.path)},
+                    {"commit": candidates[1], "path": str(foreign.path)},
+                ],
+            },
+        ),
+    ]
+
+
+def _advance_pr_head(repo: Path, scope: RepoPRActionScope) -> RepoPRActionScope:
+    (repo / "next-head.txt").write_text("next head\n", encoding="utf-8")
+    _git(repo, "add", "next-head.txt")
+    _git(repo, "commit", "-q", "-m", "advance PR head")
+    head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+    return replace(scope, observed_head_sha=head, provenance="server_discovered")
+
+
+def _rebased_superseded_lease(
+    tmp_path: Path,
+    *,
+    dangling_source_commit: bool = False,
+) -> tuple[Path, PRCheckoutLease, RepoPRActionScope, str | None]:
+    repo, old_scope = _repo_and_scope(tmp_path)
+    dangling = None
+    if dangling_source_commit:
+        _git(repo, "checkout", "-q", "-b", "discarded", "main")
+        (repo / "discarded.txt").write_text("source-only object\n", encoding="utf-8")
+        _git(repo, "add", "discarded.txt")
+        _git(repo, "commit", "-q", "-m", "discarded source commit")
+        dangling = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "worklink/7")
+        _git(repo, "branch", "-D", "discarded")
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    (lease.path / "authored.txt").write_text("published fix\n", encoding="utf-8")
+    _git(lease.path, "add", "authored.txt")
+    _git(lease.path, "commit", "-q", "-m", "published fix")
+    published = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "update-ref", "refs/mimir/pr-checkout-lease/published", published)
+    _git(lease.path, "push", "-q", "origin", f"HEAD:{old_scope.destination_ref}")
+
+    _git(repo, "checkout", "-q", "main")
+    (repo / ".gitattributes").write_text("*.bin -diff\n", encoding="utf-8")
+    (repo / "base.bin").write_bytes(b"\x00\xffbase branch\n")
+    _git(repo, "add", ".gitattributes", "base.bin")
+    _git(repo, "commit", "-q", "-m", "advance base with binary content")
+    advanced_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    _git(lease.path, "fetch", "-q", "origin", "main")
+    _git(lease.path, "rebase", "origin/main")
+    assert _git(lease.path, "rev-parse", "HEAD") != published
+    assert _git(lease.path, "rev-parse", "HEAD:base.bin") == _git(
+        lease.path, "rev-parse", "origin/main:base.bin",
+    )
+    fresh_scope = replace(
+        old_scope,
+        observed_head_sha=published,
+        observed_base_sha=advanced_base,
+        provenance="server_discovered",
+    )
+    return lease_root, lease, fresh_scope, dangling
+
+
+def test_acquire_releases_clean_superseded_scope_and_records_observed_heads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, old_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    old_lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    fresh_scope = _advance_pr_head(repo, old_scope)
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+    assert [path for path in lease_root.iterdir() if path.is_dir()] == [fresh_lease.path]
+    assert events == [(
+        "pr_checkout_lease_superseded",
+        {
+            "repository": fresh_scope.canonical_repo,
+            "pull_request": fresh_scope.pr_number,
+            "scope_id": old_scope.scope_id,
+            "superseded_head": old_scope.observed_head_sha,
+            "observed_head": fresh_scope.observed_head_sha,
+            "path": str(old_lease.path),
+        },
+    ), (
+        "pr_checkout_lease_acquired",
+        {
+            "repository": fresh_scope.canonical_repo,
+            "pull_request": fresh_scope.pr_number,
+            "scope_id": fresh_scope.scope_id,
+            "head_sha": _git(fresh_lease.path, "rev-parse", "HEAD"),
+            "path": str(fresh_lease.path),
+            "owner": fresh_scope.principal,
+            "acquisition": "fresh",
+        },
+    )]
+
+
+@pytest.mark.parametrize("unpublished", [False, True])
+def test_acquire_reuses_published_head_after_stale_metadata_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unpublished: bool,
+) -> None:
+    _repo, old_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    old_lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    (old_lease.path / "published.txt").write_text("published\n", encoding="utf-8")
+    _git(old_lease.path, "add", "published.txt")
+    _git(old_lease.path, "commit", "-q", "-m", "published commit")
+    published = _git(old_lease.path, "rev-parse", "HEAD")
+    _git(old_lease.path, "push", "-q", "origin", f"HEAD:{old_scope.destination_ref}")
+    _git(old_lease.path, "update-ref", "refs/mimir/pr-checkout-lease/published", published)
+    if unpublished:
+        (old_lease.path / "unpublished.txt").write_text("unpublished B\n", encoding="utf-8")
+        _git(old_lease.path, "add", "unpublished.txt")
+        _git(old_lease.path, "commit", "-q", "-m", "unpublished B")
+    retained_head = _git(old_lease.path, "rev-parse", "HEAD")
+    fresh_scope = replace(
+        old_scope, observed_head_sha=published, provenance="server_discovered",
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    def runner(args):
+        assert "clone" not in args
+        assert "bundle" not in args
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    state = RepoReviewState(fresh_scope)
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+        review_state=state, runner=runner,
+    )
+
+    assert candidates == ((retained_head,) if unpublished else ())
+    assert fresh_lease.path == old_lease.path
+    assert fresh_lease.head_sha == published
+    assert fresh_lease.scope_id == fresh_scope.scope_id
+    assert state.git_expected_head == retained_head
+    metadata = json.loads((fresh_lease.path / ".git/mimir-pr-checkout-lease.json").read_text())
+    assert metadata["head_sha"] == published
+    assert metadata["scope_id"] == fresh_scope.scope_id
+    assert _git(fresh_lease.path, "rev-parse", "HEAD") == retained_head
+    assert not (lease_root / ".recovery").exists()
+
+
+@pytest.mark.parametrize("failure", [None, "fetch", "moved", "ancestry"])
+def test_acquire_fetches_missing_live_head_before_ancestry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    fresh_scope = _advance_pr_head(repo, scope)
+    live_head = fresh_scope.observed_head_sha
+    assert subprocess.run(
+        ["git", "-C", str(lease.path), "cat-file", "-e", live_head],
+        capture_output=True, check=False,
+    ).returncode != 0
+    metadata_path = lease.path / ".git/mimir-pr-checkout-lease.json"
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head", lambda _scope: live_head,
+    )
+    fetched = False
+    checked_ancestry = False
+
+    def runner(args):
+        nonlocal fetched, checked_ancestry
+        if str(lease.path) in args:
+            if "fetch" in args:
+                fetched = True
+                if failure == "fetch":
+                    return subprocess.CompletedProcess(args, 1, "", "fetch unavailable")
+            if "FETCH_HEAD^{commit}" in args and failure == "moved":
+                return subprocess.CompletedProcess(args, 0, "f" * 40, "")
+            if "--is-ancestor" in args and live_head in args:
+                assert fetched
+                checked_ancestry = True
+                if failure == "ancestry":
+                    return subprocess.CompletedProcess(args, 128, "", "ancestry unavailable")
+        if failure:
+            assert "clone" not in args
+            assert "bundle" not in args
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    if failure:
+        with pytest.raises(RuntimeError, match="unavailable|PR head advanced"):
+            acquire_pr_checkout_lease(
+                fresh_scope, owner=scope.principal, lease_root=lease_root, runner=runner,
+            )
+        assert lease.path.is_dir()
+        assert metadata_path.read_bytes() == original_metadata
+        assert not (lease_root / ".recovery").exists()
+    else:
+        fresh, candidates = acquire_pr_checkout_lease(
+            fresh_scope, owner=scope.principal, lease_root=lease_root, runner=runner,
+        )
+        assert checked_ancestry
+        assert fresh.path != lease.path
+        assert not lease.path.exists()
+        assert candidates == ()
+    assert fetched
+
+
+def test_acquire_releases_rebased_published_work_by_blob_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root, old_lease, fresh_scope, dangling = _rebased_superseded_lease(
+        tmp_path, dangling_source_commit=True,
+    )
+    assert dangling is not None
+    source_object = old_lease.source_root / ".git" / "objects" / dangling[:2] / dangling[2:]
+    lease_object = old_lease.path / ".git" / "objects" / dangling[:2] / dangling[2:]
+    assert source_object.stat().st_ino == lease_object.stat().st_ino
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+
+
+def test_acquire_bundles_unpublished_superseded_work_and_releases_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root, old_lease, fresh_scope, _dangling = _rebased_superseded_lease(tmp_path)
+    (old_lease.path / "unpublished.bin").write_bytes(b"\x00unpublished\xff")
+    _git(old_lease.path, "add", "unpublished.bin")
+    _git(old_lease.path, "commit", "-q", "-m", "unpublished binary")
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    unpublished = _git(old_lease.path, "rev-parse", "HEAD")
+
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    assert bundle.name == f"{old_lease.path.name}-{old_lease.recovery_id}.bundle"
+    assert unpublished in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+    assert candidates == ()
+
+
+def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root, old_lease, fresh_scope, _dangling = _rebased_superseded_lease(tmp_path)
+    branch = fresh_scope.head_ref
+    _git(old_lease.path, "checkout", "-q", "--orphan", "unrelated-base")
+    _git(old_lease.path, "rm", "-q", "-rf", ".")
+    (old_lease.path / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    _git(old_lease.path, "add", "unrelated.txt")
+    _git(old_lease.path, "commit", "-q", "-m", "unrelated base")
+    unrelated = _git(old_lease.path, "rev-parse", "HEAD")
+    _git(old_lease.path, "checkout", "-q", branch)
+    _git(old_lease.path, "update-ref", "refs/remotes/origin/main", unrelated)
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="no verifiable tracked base"):
+        acquire_pr_checkout_lease(
+            fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+        )
+
+    assert old_lease.path.is_dir()
+
+
+def test_acquire_refuses_second_live_scope_for_same_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first_scope = replace(scope, event_type="pr_review_requested")
+    first = create_pr_checkout_lease(
+        first_scope, owner=first_scope.principal, lease_root=lease_root,
+    )
+    metadata_path = first.path / ".git" / "mimir-pr-checkout-lease.json"
+    original_metadata = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
+        lambda: {first.path},
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope"):
+        acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root,
+        )
+
+    assert first.path.is_dir()
+    assert metadata_path.read_bytes() == original_metadata
+    assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+
+
+def test_acquire_reuses_ended_scope_for_same_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first_scope = replace(scope, event_type="pr_review_requested")
+    first = create_pr_checkout_lease(
+        first_scope, owner=first_scope.principal, lease_root=lease_root,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
+        lambda: set(),
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+
+    assert resumed.path == first.path
+    assert candidates == ()
+    assert resumed.scope_id == scope.scope_id
+    assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+
+
+@pytest.mark.parametrize("failure", ["network failure", "unknown pull request", "ambiguous response"])
+def test_acquire_keeps_foreign_lease_when_live_head_cannot_be_observed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first_scope = replace(scope, event_type="pr_review_requested")
+    first = create_pr_checkout_lease(
+        first_scope, owner=first_scope.principal, lease_root=lease_root,
+    )
+
+    class UnobservableForge:
+        def get_pull_request_snapshot(self, _repository: str, _number: int):
+            if failure == "ambiguous response":
+                return SimpleNamespace(
+                    state="open",
+                    number=scope.pr_number + 1,
+                    head_ref=scope.head_ref,
+                    head_sha=scope.observed_head_sha,
+                )
+            raise RuntimeError(failure)
+
+    monkeypatch.setattr(
+        "mimir_cultivate.forge._client_for_repository",
+        lambda _repository: UnobservableForge(),
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope"):
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert first.path.is_dir()
+
+
+def test_acquire_does_not_trust_new_scope_sha_to_release_matching_live_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, old_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    old_lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    caller_scope = replace(old_scope, observed_head_sha="f" * 40)
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: old_scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope"):
+        acquire_pr_checkout_lease(
+            caller_scope, owner=caller_scope.principal, lease_root=lease_root,
+        )
+
+    assert old_lease.path.is_dir()
+
+
+@pytest.mark.parametrize("dirty_kind", ["tracked", "untracked"])
+def test_acquire_archives_dirty_superseded_lease_before_releasing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dirty_kind: str,
+) -> None:
+    repo, old_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    old_lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    retained = old_lease.path / ("file.txt" if dirty_kind == "tracked" else "retained.txt")
+    retained.write_text("unfinished fix\n", encoding="utf-8")
+    fresh_scope = _advance_pr_head(repo, old_scope)
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    archive = bundle.with_suffix(".worktree.tar.gz")
+    with tarfile.open(archive, "r:gz") as recovered:
+        restored = recovered.extractfile(
+            f"worktree/{'file.txt' if dirty_kind == 'tracked' else 'retained.txt'}"
+        )
+        assert restored is not None
+        assert restored.read() == b"unfinished fix\n"
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+    assert candidates == ()
+    assert events[0] == (
+        "pr_checkout_lease_retained",
+        {
+            "repository": fresh_scope.canonical_repo,
+            "pull_request": fresh_scope.pr_number,
+            "scope_id": fresh_scope.scope_id,
+            "candidates": [{
+                "commit": old_scope.observed_head_sha,
+                "path": str(old_lease.path),
+            }],
+        },
+    )
+
+
+def test_dirty_worktree_recovery_reuses_existing_archive_on_retry(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    retained = lease.path / "retained.txt"
+    retained.write_text("unfinished fix\n", encoding="utf-8")
+    head = _git(lease.path, "rev-parse", "HEAD")
+
+    def runner(args):
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    bundle = _preserve_checkout_head(lease, head, runner)
+    archive = _preserve_dirty_worktree(lease, bundle)
+
+    assert _preserve_dirty_worktree(lease, bundle) == archive
+    assert _recover_retained_checkout(
+        lease, head=head, dirty=True, runner=runner,
+    ) == bundle
+    with tarfile.open(archive, "r:gz") as recovered:
+        restored = recovered.extractfile("worktree/retained.txt")
+        assert restored is not None
+        assert restored.read() == b"unfinished fix\n"
+
+
+def test_acquire_leaves_superseded_lease_when_recovery_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, old_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    old_lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    (old_lease.path / "fix.txt").write_text("unpublished\n", encoding="utf-8")
+    _git(old_lease.path, "add", "fix.txt")
+    _git(old_lease.path, "commit", "-q", "-m", "unpublished")
+    head = _git(old_lease.path, "rev-parse", "HEAD")
+    fresh_scope = _advance_pr_head(repo, old_scope)
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    def runner(args):
+        if "bundle" in args and "create" in args:
+            return subprocess.CompletedProcess(args, 1, "", "disk full\n")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    with pytest.raises(RuntimeError) as failure:
+        acquire_pr_checkout_lease(
+            fresh_scope,
+            owner=fresh_scope.principal,
+            lease_root=lease_root,
+            runner=runner,
+        )
+
+    message = str(failure.value)
+    assert str(old_lease.path) in message
+    assert head in message
+    assert "Operator must preserve the checkout and recover or publish" in message
+    assert old_lease.path.is_dir()
+    assert old_lease.revoked is False
+    assert not list((lease_root / ".recovery").glob("*.bundle"))
+
+
+def test_pr_checkout_lease_cleanup_bundles_unpublished_commit_on_lease_branch(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("authorized fix\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "fix")
+
+    assert _git(lease.path, "rev-parse", "HEAD") != lease.head_sha
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
+    assert cleanup_pr_checkout_lease(lease) is True
+
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    assert fix_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    assert not lease.path.exists()
+
+
+def test_pr_checkout_lease_cleanup_rechecks_remote_without_publication_proof(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "update-ref", "-d", "refs/mimir/pr-checkout-lease/published")
+    _git(lease.path, "reset", "--hard", lease.base_sha)
+    _git(lease.path, "push", "--force", "origin", f"HEAD:{scope.destination_ref}")
+    _git(lease.path, "fetch", "origin", scope.destination_ref)
+
+    assert cleanup_pr_checkout_lease(lease) is True
+
+    assert not lease.path.exists()
+    assert not (lease_root / ".recovery").exists()
+
+
+def test_pr_checkout_lease_cleanup_refuses_mismatched_origin(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "remote", "set-url", "origin", "https://example.com/other.git")
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(lease)
+
+    assert str(refusal.value) == (
+        "PR checkout lease cleanup origin mismatch: "
+        f"expected {scope.canonical_origin!r}; actual 'https://example.com/other.git'"
+    )
+    assert lease.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_accepts_metadata_before_additive_field(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["version"] = 1
+    del metadata["scope_base_sha"]
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert cleanup_pr_checkout_lease(lease) is True
+
+
+def test_pr_checkout_lease_cleanup_refuses_directory_from_another_lease(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    other = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(replace(lease, path=other.path))
+
+    message = str(refusal.value)
+    assert "PR checkout lease cleanup metadata" in message
+    assert "mismatch: expected" in message
+    assert "; actual " in message
+    assert lease.path.is_dir()
+    assert other.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_refuses_wrong_branch(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "branch", "other", lease.head_sha)
+    _git(lease.path, "checkout", "-q", "other")
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(lease)
+
+    assert str(refusal.value) == (
+        "PR checkout lease cleanup branch mismatch: "
+        f"expected {scope.head_ref!r}; actual 'other'"
+    )
+    assert lease.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_bundles_unrelated_head_on_expected_branch(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "checkout", "-q", "--orphan", "unrelated")
+    _git(lease.path, "rm", "-q", "-rf", ".")
+    (lease.path / "replacement.txt").write_text("unrelated\n", encoding="utf-8")
+    _git(lease.path, "add", "replacement.txt")
+    _git(lease.path, "commit", "-q", "-m", "unrelated history")
+    unrelated_head = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "branch", "-M", scope.head_ref)
+
+    assert cleanup_pr_checkout_lease(lease) is True
+
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    assert unrelated_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    assert not lease.path.exists()
+
+
+def test_pr_checkout_lease_cleanup_refuses_missing_required_identity_field(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del metadata["recovery_id"]
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(lease)
+
+    assert str(refusal.value) == (
+        "PR checkout lease cleanup metadata recovery_id mismatch: "
+        f"expected {lease.recovery_id!r}; actual <missing>"
+    )
+    assert lease.path.is_dir()
+
+
+def test_pr_checkout_lease_fails_closed_on_moved_head(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    (repo / "head-moved.txt").write_text("new head\n", encoding="utf-8")
+    _git(repo, "add", "head-moved.txt")
+    _git(repo, "commit", "-q", "-m", "move head")
+    moved_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_pr_checkout_lease(
+            scope,
+            owner="mimir-bot",
+            lease_root=lease_root,
+        )
+
+    assert "PR head advanced" in str(refusal.value)
+    assert scope.observed_head_sha in str(refusal.value)
+    assert moved_head in str(refusal.value)
+    assert list(lease_root.iterdir()) == []
+
+
+def test_pr_checkout_lease_accepts_base_advanced_by_unrelated_merge(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _git(repo, "checkout", "-q", "main")
+    (repo / "before-scope.txt").write_text("earlier merged work\n", encoding="utf-8")
+    _git(repo, "add", "before-scope.txt")
+    _git(repo, "commit", "-q", "-m", "advance before scope is minted")
+    scoped_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, observed_base_sha=scoped_base)
+    (repo / "unrelated.txt").write_text("merged work\n", encoding="utf-8")
+    _git(repo, "add", "unrelated.txt")
+    _git(repo, "commit", "-q", "-m", "unrelated merge")
+    advanced_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    assert lease.scope_base_sha == scope.observed_base_sha
+    assert lease.base_sha == advanced_base
+    assert _git(lease.path, "merge-base", lease.head_sha, lease.base_sha) != scope.observed_base_sha
+    assert _git(lease.path, "merge-base", "--is-ancestor", lease.scope_base_sha, lease.base_sha) == ""
+
+
+def test_pr_checkout_lease_refuses_rewritten_base_with_both_identities(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _git(repo, "checkout", "-q", "--orphan", "rewritten-main")
+    _git(repo, "rm", "-q", "-rf", ".")
+    (repo / "replacement.txt").write_text("replacement history\n", encoding="utf-8")
+    _git(repo, "add", "replacement.txt")
+    _git(repo, "commit", "-q", "-m", "replace main history")
+    rewritten_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "--force", "origin", "HEAD:main")
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    message = str(refusal.value)
+    assert "PR base history rewritten" in message
+    assert (
+        f"scoped base {scope.observed_base_sha} is unreachable from fetched base {rewritten_base}"
+        in message
+    )
+    assert list(lease_root.iterdir()) == []
+
+
+def test_pr_checkout_lease_does_not_report_git_failure_as_base_rewrite(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+
+    def runner(args):
+        if list(args[-4:-2]) == ["merge-base", "--is-ancestor"]:
+            return subprocess.CompletedProcess(args, 128, "", "ancestry inspection failed\n")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_pr_checkout_lease(
+            scope, owner="mimir-bot", lease_root=lease_root, runner=runner,
+        )
+
+    assert str(refusal.value) == "ancestry inspection failed"
+    assert "history rewritten" not in str(refusal.value)
+    assert list(lease_root.iterdir()) == []
+
+
+def test_pr_checkout_lease_refuses_base_that_already_contains_head(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _git(repo, "push", "-q", "origin", f"{scope.observed_head_sha}:main")
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    message = str(refusal.value)
+    assert "PR base already contains the authorized head" in message
+    assert f"fetched base {scope.observed_head_sha}" in message
+    assert f"authorized head {scope.observed_head_sha} is stale as an open PR" in message
+    assert list(lease_root.iterdir()) == []
+
+
+def test_pr_checkout_recovery_refuses_scope_mismatch_and_symlink(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    with pytest.raises(RuntimeError, match="scope mismatch"):
+        recover_pr_checkout_lease(
+            lease.path,
+            replace(scope, canonical_repo="other/repo"),
+            owner="mimir-bot",
+            lease_root=lease_root,
+        )
+    alias = lease_root / "alias"
+    alias.symlink_to(lease.path, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="escapes"):
+        recover_pr_checkout_lease(alias, scope, owner="mimir-bot", lease_root=lease_root)
+
+
+def test_review_state_refuses_mismatched_or_inactive_checkout_lease(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    refused = (
+        replace(lease, scope_id="other-scope"),
+        replace(lease, owner="other-owner"),
+        replace(lease, revoked=True),
+    )
+    for candidate in refused:
+        state = RepoReviewState(scope)
+        with pytest.raises(ValueError, match="does not match review scope"):
+            state.attach_checkout_lease(candidate)
+        assert state.checkout_lease is None
+        assert state.checked_out is False
+
+
+@pytest.fixture
+def selected_tracked_file_policy():
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.mark.usefixtures("selected_tracked_file_policy")
+@pytest.mark.asyncio
+async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, initial_scope = _repo_and_scope(tmp_path)
+    credential = "-----BEGIN " + "OPENSSH PRIVATE KEY-----"
+    published = repo / "tests" / "test_access_control.py"
+    published.parent.mkdir()
+    published.write_text(credential + "\n" + "fixture padding\n" * 5020, encoding="utf-8")
+    tracked_protected_source = repo / ".env"
+    tracked_protected_source.write_text("TOKEN=placeholder\n", encoding="utf-8")
+    _git(repo, "add", "tests/test_access_control.py", ".env")
+    _git(repo, "commit", "-q", "-m", "add authorization tests")
+    head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+    scope = replace(initial_scope, observed_head_sha=head)
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    state = RepoReviewState(scope)
+    lease = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+    )
+    other_lease = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+    tracked = lease.path / "tests" / "test_access_control.py"
+    tracked_protected = lease.path / ".env"
+    other_tracked = other_lease.path / "tests" / "test_access_control.py"
+    assert credential in tracked.read_text(encoding="utf-8")
+
+    untracked = lease.path / "notes.txt"
+    untracked.write_text(
+        credential + "\nnot published\n", encoding="utf-8",
+    )
+    untracked_env = lease.path / "scratch" / ".env"
+    untracked_env.parent.mkdir()
+    untracked_env.write_text("TOKEN=ghp_" + "a" * 30 + "\n", encoding="utf-8")
+    escape = lease.path / "escaped-tests.py"
+    escape.symlink_to(repo / "tests" / "test_access_control.py")
+
+    read_roots = (str(lease.path), str(other_lease.path), str(repo))
+    auth = AuthContext(
+        principal="service:poller:github-activity",
+        canonical_principal="poller:github-activity",
+        roles=("service",),
+        event_ingress=None,
+        trigger="poller",
+        channel_id="poller:github-activity",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        service_authority=SimpleNamespace(filesystem_read_roots=read_roots),
+        enforcement_enabled=True,
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    events = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    token = set_current_turn(SimpleNamespace(turn_id="tracked-pr-read", auth_context=auth))
+    try:
+        lease_backend = WriteGuardBackend(lease.path, [])
+        sync_result = lease_backend.read(str(tracked))
+        async_result = await lease_backend.aread(str(tracked), offset=5000, limit=20)
+        grep_result = lease_backend.grep("BEGIN OPENSSH", str(tracked))
+        glob_result = lease_backend.glob("test_access_control.py", str(tracked.parent))
+        untracked_result = lease_backend.read(str(untracked))
+        untracked_grep = lease_backend.grep("BEGIN OPENSSH", str(untracked))
+        tracked_protected_result = lease_backend.read(str(tracked_protected))
+        env_result = lease_backend.read(str(untracked_env))
+        escape_result = lease_backend.read(str(escape))
+        other_result = WriteGuardBackend(other_lease.path, []).read(str(other_tracked))
+        live_result = WriteGuardBackend(repo, []).read(str(published))
+    finally:
+        reset_current_turn(token)
+
+    assert sync_result.error is None
+    assert credential in sync_result.file_data["content"]
+    assert async_result.error is None
+    assert any(match["path"].endswith("tests/test_access_control.py") for match in grep_result.matches)
+    assert any(match["path"].endswith("tests/test_access_control.py") for match in glob_result.matches)
+    assert untracked_grep.matches == []
+    result_refusal = (
+        "Read denied: protected_read_result. For published PR content, "
+        "use pr_files or pr_diff."
+    )
+    name_refusal = (
+        "Read denied: protected_name_match. "
+        "Use a non-secret source or an authorized secret interface."
+    )
+    assert untracked_result.error == result_refusal
+    assert tracked_protected_result.error == name_refusal
+    assert env_result.error == name_refusal
+    assert escape_result.error is not None
+    assert other_result.error == result_refusal
+    assert live_result.error == result_refusal
+    denied_targets = {
+        fields["target"]
+        for kind, fields in events
+        if kind == "hard_boundary_denied"
+        and fields["reason"] in {"protected_name_match", "protected_read_result"}
+    }
+    assert str(untracked) in denied_targets
+    assert str(tracked_protected) in denied_targets
+    assert str(untracked_env) in denied_targets
+    assert str(other_tracked) in denied_targets
+    assert str(published) in denied_targets
+
+    for denied_auth in (
+        replace(auth, is_service=False),
+        replace(auth, repo_review_state=None, repo_pr_action_scope=None),
+        replace(auth, repo_pr_action_scope=initial_scope),
+    ):
+        token = set_current_turn(SimpleNamespace(turn_id="unauthorized-pr-read", auth_context=denied_auth))
+        try:
+            denied = WriteGuardBackend(lease.path, []).read(str(tracked))
+        finally:
+            reset_current_turn(token)
+        assert denied.error == result_refusal
+
+    lease.revoke()
+    token = set_current_turn(SimpleNamespace(turn_id="revoked-pr-read", auth_context=auth))
+    try:
+        revoked = WriteGuardBackend(lease.path, []).read(str(tracked))
+    finally:
+        reset_current_turn(token)
+    assert revoked.error == result_refusal
+
+
+@pytest.mark.usefixtures("selected_tracked_file_policy")
+@pytest.mark.parametrize(
+    "case",
+    ["own", "no_active_lease", "different_pr", "outside", "untracked", "same_pr_other_state"],
+)
+def test_discovered_pr_protected_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    from mimir.access_control import (
+        _target_within_active_pr_checkout_lease,
+        resolve_repository_review_state,
+    )
+    from mimir.read_policy import (
+        file_contains_secret, non_admin_read_filter_enabled, protected_read_denial_reason,
+    )
+    from mimir_cultivate.repository import RepoGitTools
+
+    repo, initial_scope = _repo_and_scope(tmp_path)
+    credential = "ghp_" + "Synthetic9" * 4
+    (repo / "fixture.txt").write_text(credential + "\n", encoding="utf-8")
+    _git(repo, "add", "fixture.txt")
+    _git(repo, "commit", "-qm", "credential-shaped fixture")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+    scope = replace(
+        initial_scope, observed_head_sha=_git(repo, "rev-parse", "HEAD"),
+        provenance="server_discovered",
+    )
+    root = tmp_path / "leases"
+    root.mkdir()
+    state = RepoReviewState(scope)
+    lease = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=root, review_state=state,
+    )
+    discovered = ServerDiscoveredPRStates()
+    discovered.remember(state)
+    target = lease.path / "fixture.txt"
+    fallback = None
+    if case == "no_active_lease":
+        lease.revoke()
+    elif case == "different_pr":
+        other_scope = replace(scope, pr_number=8)
+        other_lease = create_pr_checkout_lease(
+            other_scope, owner=scope.principal, lease_root=root,
+        )
+        target = other_lease.path / "fixture.txt"
+    elif case == "outside":
+        target = repo / "fixture.txt"
+        fallback = state
+    elif case == "untracked":
+        target = lease.path / "untracked.txt"
+        target.write_text(credential + "\n", encoding="utf-8")
+    elif case == "same_pr_other_state":
+        # The same repo/PR key is not proof of ownership of this state object.
+        discovered = ServerDiscoveredPRStates()
+        discovered.remember(RepoReviewState(scope))
+        fallback = state
+
+    auth = replace(
+        _service_auth(SimpleNamespace(filesystem_read_roots=(str(tmp_path),))),
+        server_discovered_pr_states=discovered, repo_review_state=fallback,
+    )
+    assert auth.is_service and auth.roles == ()
+    assert auth.repo_pr_scope_registry is None
+    assert auth.repo_pr_action_scope is None
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    assert protected_read_denial_reason(target) is None
+    assert file_contains_secret(target)
+    resolved, refusal = resolve_repository_review_state(auth, path=str(target))
+    if case in {"no_active_lease", "different_pr"}:
+        assert resolved is None
+    else:
+        assert resolved is state and refusal is None
+        assert (discovered.resolve(state.repo, state.pr_number) is state) == (
+            case != "same_pr_other_state"
+        )
+        assert _target_within_active_pr_checkout_lease(str(target), state) == (case != "outside")
+        if case != "outside":
+            assert RepoGitTools(state).is_tracked_file(target) == (case != "untracked")
+
+    token = set_current_turn(SimpleNamespace(turn_id="discovered-pr-read", auth_context=auth))
+    try:
+        assert non_admin_read_filter_enabled()
+        result = WriteGuardBackend(target.parent, []).read(str(target))
+    finally:
+        reset_current_turn(token)
+    if case == "own":
+        assert result.error is None
+        assert credential in result.file_data["content"]
+    else:
+        assert result.error == (
+            "Read denied: protected_read_result. For published PR content, "
+            "use pr_files or pr_diff."
+        )
+
+
+def _service_auth(service) -> AuthContext:
+    labels = InformationFlowLabels()
+    return AuthContext(
+        principal="service:poller:github-activity",
+        canonical_principal="poller:github-activity",
+        roles=(),
+        event_ingress=None,
+        trigger="poller",
+        channel_id="poller:github-activity",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        service_authority=service,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+    )
+
+
+@pytest.mark.usefixtures("selected_tracked_file_policy")
+def test_github_activity_write_grant_is_exactly_active_lease_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source = tmp_path / "source"
+    lease_root = tmp_path / "leases"
+    lease_path = lease_root / "scope-lease"
+    sibling = lease_root / "other-lease"
+    for path in (home, source, lease_path, sibling):
+        path.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{source}:rw")
+    scope = RepoPRActionScope(
+        provenance="poller_payload", canonical_repo="o/r",
+        canonical_root=str(source.resolve()), canonical_origin="https://github.com/o/r.git",
+        principal="mimir-bot", event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=7, head_repo="o/r", head_remote="origin",
+        destination_ref="refs/heads/worklink/7", observed_head_sha="a" * 40,
+        base_ref="main", observed_base_sha="b" * 40,
+    )
+    now = datetime.now(UTC)
+    lease = PRCheckoutLease(
+        canonical_repo="o/r", canonical_origin=scope.canonical_origin,
+        source_root=source.resolve(), scope_base_sha="b" * 40,
+        base_sha="b" * 40, head_sha="a" * 40,
+        destination_ref=scope.destination_ref, owner="mimir-bot", scope_id=scope.scope_id,
+        path=lease_path, lease_root=lease_root, created_at=now,
+        expires_at=now + timedelta(hours=1), recovery_id="recovery",
+    )
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("write_file", "edit_file"),
+        creation_path="test",
+    )
+    auth = replace(_service_auth(service), repo_review_state=state)
+    registry = ToolRegistry()
+
+    def allowed(path: Path) -> bool:
+        return registry.authorize_tool(
+            "write_file", auth, enforce=True, target_channel=str(path),
+        ).allowed
+
+    assert allowed(lease_path / "change.py") is True
+    assert allowed(source / "change.py") is False
+    assert allowed(sibling / "change.py") is False
+    lease.revoke()
+    assert allowed(lease_path / "change.py") is False

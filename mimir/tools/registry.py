@@ -1,0 +1,2576 @@
+"""All remaining tool ports — completes migration coverage.
+
+Translates mimir's registry-backed tools to LangChain @tool. Patterns are identical to
+extra_tools.py — same translation rule applies (decorator + type
+hints + docstring → schema).
+
+Tools ported:
+  channeltools.py:    send_message, react, fetch_channel_history
+  scheduletools.py:   list_schedules, add_schedule, remove_schedule,
+                       set_poller_overrides, reload_pollers
+  committools.py:     commitment_complete, commitment_snooze,
+                       commitment_dismiss, commitment_list
+
+Plus combined with extra_tools.py, memory_tool.py, store_tool.py, and the
+other split-out tool modules, this is mimir's agent-facing surface.
+
+Each tool's dependencies (channel registry, scheduler, commitments
+store, spawn config) are injected via module-state setters parallel
+to memory_tool.py's set_memory_client pattern.
+"""
+from __future__ import annotations
+
+import contextvars
+import hashlib
+import json
+import asyncio
+import logging
+import os
+import re
+import shlex
+import subprocess
+import tempfile
+import time
+from collections import deque
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from functools import partial
+from pathlib import Path
+from typing import Annotated, Any, Optional
+
+log = logging.getLogger(__name__)
+
+from langchain_core.runnables import RunnableConfig
+from langchain.tools import ToolRuntime
+from .refusals import ToolPolicyRefusal
+
+from ..bridges._directives import (
+    Directive,
+    parse_directives,
+    ReactDirective,
+    resolve_react_target,
+)
+from ..billing import PRIORITY_LEVELS
+from ..env import env_int_floor1 as _env_int_floor1
+from ..poller_budget import aggregate_poller_turn_usage
+from ..pollers import (
+    PollerOverridesValidationError,
+    validate_poller_overrides_text,
+)
+from ..models import AuthContext, Integrity, IntegrityEffect, TurnInteractivity
+from ..scheduler import SchedulerJob
+from ..plugins.core import scoped_policy_call, selected_policy_registry
+
+# Per-task ContextVar for channel_id — isolated across concurrent asyncio
+# Tasks so concurrent turns on different channels don't race (S2-1 fix).
+_current_channel_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mimir_current_channel_id", default=None
+)
+
+# Legacy per-task ContextVar for turn interactivity. Kept as a compatibility
+# setter for older call sites/tests, but send_message's no-reply sentinel guard
+# no longer trusts it authoritatively; allow decisions resolve
+# TurnContext.interactivity from the current / uniquely-active turn and fail
+# closed when that authoritative context is missing.
+_current_turn_interactive_var: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "mimir_current_turn_interactive", default=None
+)
+
+SEND_MESSAGE_SKIPLIST_TRIGGERS: frozenset[str] = frozenset(
+    {
+        "poller",
+        "scheduled_tick",
+        # Shell wake-ups use interactive send defaults, but often correctly end silent.
+        "shell_job_complete",
+        # Session synthesis is internal housekeeping, not a direct user reply.
+        "saga_session_end",
+        # Upgrade maintenance is framework-originated with no awaiting user.
+        "upgrade",
+    }
+)
+
+# Tunable list of phrases that indicate the model is narrating a
+# non-delivery decision instead of ending an autonomous turn silently.
+# Keep this list conservative: a false positive drops a real poller /
+# scheduled escalation, so ambiguous words like ``skip`` / ``filtered`` /
+# ``no action`` deliberately stay out of the matcher.
+SEND_MESSAGE_SKIPLIST_PHRASES: tuple[str, ...] = (
+    "end silent",
+    "end silently",
+    "end-silent",
+    "skip bucket",
+    "batch complete",
+    "routed to skip",
+)
+SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS = 8
+# #1892: observed tail narration ran to ~200 words; real briefs were 363–721 words.
+SEND_MESSAGE_SKIPLIST_SUBSTANTIVE_MIN_WORDS = 200
+
+
+def _compile_skiplist_phrase_pattern(phrase: str) -> re.Pattern[str]:
+    escaped = r"\s+".join(re.escape(part) for part in phrase.split())
+    return re.compile(
+        rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+
+
+_SEND_MESSAGE_SKIPLIST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (phrase, _compile_skiplist_phrase_pattern(phrase))
+    for phrase in SEND_MESSAGE_SKIPLIST_PHRASES
+)
+_SEND_MESSAGE_SKIPLIST_LEADING_MARKER_PATTERN = re.compile(
+    r"^\s*\[\s*skip(ped)?\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", text))
+
+
+async def dispatch_send_message_directives(
+    *,
+    directives: tuple[Directive, ...],
+    bridge: Any,
+    channel_id: str,
+    sent_message_id: str | None,
+    fallback_message_id: str | None = None,
+    ctx: Any | None = None,
+    detector: Any | None = None,
+) -> bool:
+    """Dispatch parsed ``send_message``-style directives.
+
+    Returns True when a directive produced a confirmed delivery. Failures are
+    logged and swallowed so callers can keep directive dispatch best-effort.
+    """
+    from ..event_logger import safe_log_event
+
+    delivered_by_directive = False
+    for directive in directives:
+        if isinstance(directive, ReactDirective):
+            # chainlink #394: resolve the target via the shared helper and
+            # skip on None rather than calling bridge.react(cid, None, emoji).
+            # The just-sent message is the natural target; directives-only
+            # sends may fall back to the triggering / recent message id.
+            target = resolve_react_target(
+                directive.message_id,
+                sent_message_id,
+                fallback_message_id,
+            )
+            if target is None:
+                log.debug(
+                    "send_message react directive skipped: no target message "
+                    "for emoji %r", directive.emoji,
+                )
+                continue
+            ok: object = False
+            try:
+                ok = await bridge.react(channel_id, target, directive.emoji)
+            except Exception as exc:  # noqa: BLE001 — non-fatal; don't abort the send
+                await safe_log_event(
+                    "send_message_directive_failed",
+                    channel_id=channel_id,
+                    directive="react",
+                    emoji=directive.emoji,
+                    message_id=target,
+                    error=f"{type(exc).__name__}: {exc}"[:200],
+                )
+            else:
+                if ok is False:
+                    await safe_log_event(
+                        "send_message_directive_failed",
+                        channel_id=channel_id,
+                        directive="react",
+                        emoji=directive.emoji,
+                        message_id=target,
+                        error="bridge declined",
+                    )
+            # Confirmed-delivery gate mirrors the react tool: only a
+            # non-False return counts toward the turn's reply accounting.
+            if ok is not False:
+                delivered_by_directive = True
+                if ctx is not None:
+                    try:
+                        ctx.react_count += 1
+                        ctx.delivered_channel_ids.add(channel_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if detector is not None:
+                    detector.clear_undelivered_attempts()
+        # SendFileDirective: not yet implemented via this path
+    return delivered_by_directive
+
+
+@dataclass(frozen=True)
+class _SkiplistMatch:
+    phrase: str
+    stripped_text: str | None = None  # None means reject, as before.
+
+
+def _strip_skiplist_tail(text: str, phrase_start: int) -> str:
+    # Remove the sentence containing the trailing phrase, retaining everything
+    # before the nearest line or sentence boundary.
+    last_newline = text.rfind("\n", 0, phrase_start) + 1
+    sentence_ends = list(re.finditer(r"[.!?](?=\s)", text[:phrase_start]))
+    last_sentence_end = sentence_ends[-1].end() if sentence_ends else 0
+    return text[:max(last_newline, last_sentence_end)].rstrip()
+
+
+def _matched_send_message_skiplist_phrase(text: str) -> _SkiplistMatch | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    marker_match = _SEND_MESSAGE_SKIPLIST_LEADING_MARKER_PATTERN.match(stripped)
+    if marker_match is not None:
+        return _SkiplistMatch("[skipped]" if marker_match.group(1) else "[skip]")
+
+    # A substantive escalation may mention a stop phrase in passing. Reject
+    # short messages with a phrase anywhere and narration-sized trailing phrases.
+    text_word_count = _word_count(stripped)
+    for phrase, pattern in _SEND_MESSAGE_SKIPLIST_PATTERNS:
+        for match in pattern.finditer(stripped):
+            trailing = stripped[match.end() :].strip()
+            phrase_is_tail = not trailing or not re.search(r"[A-Za-z0-9]", trailing)
+            if text_word_count <= SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS:
+                return _SkiplistMatch(phrase)
+            if phrase_is_tail:
+                if text_word_count <= SEND_MESSAGE_SKIPLIST_SUBSTANTIVE_MIN_WORDS:
+                    return _SkiplistMatch(phrase)
+                remaining = _strip_skiplist_tail(stripped, match.start())
+                # A long run of stop-phrase lines is still narration: remove
+                # each trailing stop phrase before testing for real content.
+                while remaining:
+                    tail_match = next(
+                        (
+                            m for _, p in _SEND_MESSAGE_SKIPLIST_PATTERNS
+                            for m in p.finditer(remaining)
+                            if not re.search(r"[A-Za-z0-9]", remaining[m.end() :])
+                        ),
+                        None,
+                    )
+                    if tail_match is None:
+                        break
+                    remaining = _strip_skiplist_tail(remaining, tail_match.start())
+                if not re.search(r"[A-Za-z0-9]", remaining):
+                    return _SkiplistMatch(phrase)
+                return _SkiplistMatch(phrase, remaining)
+    return None
+
+
+def _send_message_skiplist_guard_armed(trigger: str) -> bool:
+    if trigger in SEND_MESSAGE_SKIPLIST_TRIGGERS:
+        return True
+
+    namespace, separator, name = trigger.partition(":")
+    return bool(
+        separator
+        and name
+        and namespace.endswith("-poller")
+        and namespace != "-poller"
+    )
+
+
+def _channel_from_config_or_state(
+    channel_id: str | None, config: RunnableConfig | None
+) -> str:
+    """Resolve the effective channel_id for a tool call.
+
+    Precedence (highest first):
+      1. Explicit ``channel_id`` argument from the model
+      2. LangGraph ``configurable["channel_id"]`` (set by run_turn)
+      3. The per-task ``_current_channel_id_var`` ContextVar (set by the
+         dispatcher via ``set_current_channel_id``; isolated across concurrent
+         turns — the S2-1 fix replaced the old process-global ``_STATE`` write).
+
+    Returns ``""`` if no source supplies a channel.
+    """
+    cid = (channel_id or "").strip()
+    if cid:
+        return cid
+    if config is not None:
+        configurable = config.get("configurable") or {}
+        from_config = (configurable.get("channel_id") or "").strip()
+        if from_config:
+            return from_config
+    return (_current_channel_id_var.get() or "").strip()
+
+from langchain_core.tools import InjectedToolArg, ToolException, tool
+
+
+_NON_DELIVERABLE_CHANNEL_PREFIXES = ("poller:", "scheduler:")
+_NON_DELIVERABLE_CHANNEL_LITERALS = {"system"}
+_NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS = {
+    "no_reply",
+    "no-reply",
+    "noreply",
+    "none",
+}
+
+
+async def _reject_trigger_pseudo_channel(tool_name: str, channel_id: str) -> str:
+    from ..access_control import (
+        ToolRegistry,
+        get_trusted_service_from_auth_context,
+        service_can_invoke_operation,
+    )
+    from ..event_logger import safe_log_event
+    from ..models import InformationFlowState
+
+    await safe_log_event(
+        f"{tool_name}_blocked", tool=tool_name, channel_id=channel_id,
+        reason="trigger_pseudo_channel",
+    )
+    alternative = "none available on this turn"
+    ctx = _resolve_authoritative_turn_context_for_send_message_guard()
+    auth = getattr(ctx, "auth_context", None)
+    service = get_trusted_service_from_auth_context(auth)
+    from ..channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
+
+    operator_channel = resolve_deliver_channel(
+        OPERATOR_CHANNEL_SENTINEL, os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+    )
+    if operator_channel and service is not None and isinstance(auth, AuthContext):
+        options = []
+        for operation, hint in (
+            ("send_message", f"send_message(channel_id={operator_channel!r}, text=...)"),
+            ("operator_alert", "operator_alert(text=...)"),
+        ):
+            if not service_can_invoke_operation(service, operation):
+                continue
+            labels = auth.ifc_state.current(auth.ifc_labels)
+            # Probe each option separately; never spend a live one-shot approval.
+            probe = replace(
+                auth, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            )
+            if ToolRegistry().authorize_tool(
+                operation, probe, enforce=True,
+                target_channel=operator_channel, ifc_labels=labels,
+            ).allowed:
+                options.append(hint)
+        if options:
+            alternative = " or ".join(options)
+    if alternative == "none available on this turn" and isinstance(auth, AuthContext):
+        destination = (
+            service.configured_delivery_channel if service else auth.channel_id
+        )
+        channels = _STATE["channel_registry"]
+        if (
+            destination
+            and not _is_non_deliverable_channel(destination)
+            and not _is_non_interactive_no_reply_channel(destination)
+            and _acp_channel_is_owned_by_active_turn(destination)
+            and channels is not None
+            and channels.find(destination) is not None
+        ):
+            labels = auth.ifc_state.current(auth.ifc_labels)
+            # A hint must not consume a live one-shot sink approval.
+            probe = replace(
+                auth, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+            )
+            if ToolRegistry().authorize_tool(
+                "send_message", probe, enforce=True,
+                target_channel=destination, ifc_labels=labels,
+            ).allowed:
+                alternative = f"the real bridge channel via send_message(channel_id={destination!r}, text=...)"
+    return (
+        f"{tool_name} rejected: {channel_id!r} is a non-conversational trigger "
+        "channel, not a deliverable channel. A silent turn is the correct way "
+        "to decline: end the turn without calling send_message or react. "
+        f"Deliverable alternative: {alternative}."
+        + (" No operator channel is configured (MIMIR_OPERATOR_ALERT_CHANNEL is unset)."
+           if not operator_channel else "")
+    )
+
+
+async def _reject_send_message(channel_id: str | None, reason: str) -> None:
+    from ..event_logger import safe_log_event
+
+    await safe_log_event(
+        "send_message_blocked",
+        tool="send_message",
+        channel_id=channel_id,
+        reason=reason,
+    )
+    if reason == "empty_message":
+        raise ToolException(
+            "send_message rejected: empty message. The message text is empty "
+            "or whitespace-only; end the turn or send non-empty text."
+        )
+    if reason == "non_interactive_no_reply_channel":
+        raise ToolException(
+            "send_message rejected: this non-interactive turn was given a "
+            "pseudo-channel that means no reply. Declining to reply means NOT "
+            f"calling send_message. For a genuine non-interactive send, provide "
+            "a real deliverable channel_id such as the operator alert channel; "
+            f"got {channel_id!r}."
+        )
+    raise ToolException(
+        "send_message rejected: not a deliverable channel. Provide a real "
+        "bridge channel_id such as discord-<id>, dm-discord-<id>, or web-*; "
+        f"got {channel_id!r}."
+    )
+
+
+def _is_non_deliverable_channel(channel_id: str) -> bool:
+    lowered = channel_id.lower()
+    return (
+        lowered in _NON_DELIVERABLE_CHANNEL_LITERALS
+        or lowered.startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES)
+    )
+
+
+def _acp_channel_is_owned_by_active_turn(channel_id: str) -> bool:
+    if not channel_id.lower().startswith("acp:"):
+        return True
+    ctx = _resolve_authoritative_turn_context_for_send_message_guard()
+    return ctx is not None and getattr(ctx, "channel_id", None) == channel_id
+
+
+def _is_non_interactive_no_reply_channel(channel_id: str) -> bool:
+    return channel_id.strip().lower() in _NON_INTERACTIVE_NO_REPLY_CHANNEL_LITERALS
+
+
+def _resolve_authoritative_turn_context_for_send_message_guard() -> Any | None:
+    """Resolve the authoritative turn context for the no-reply sentinel guard.
+
+    Prefer the current TurnContext when present. If the ContextVar was lost on a
+    forked SDK/MCP task, fall back only to the exact single-active-turn helper.
+    Ambiguous multi-active cases fail closed upstream.
+    """
+    from .._context import get_current_turn, get_only_active_turn
+
+    ctx = get_current_turn()
+    if ctx is not None:
+        return ctx
+    return get_only_active_turn()
+
+
+def _active_turn_is_non_interactive_for_send_message_guard() -> bool:
+    """Return whether a no-reply pseudo-channel must be rejected.
+
+    Only an authoritative carried ``TurnContext.interactivity`` classification
+    of ``INTERACTIVE`` preserves the historical no-reply lookup behavior.
+    Resolve the current turn first; if ContextVar state was lost on an SDK/MCP
+    fork, fall back only to the unique active turn. Missing, ambiguous, or
+    unclassified turns all fail closed. Real channel_ids are unaffected because
+    this helper is consulted only after the sentinel match.
+    """
+    ctx = _resolve_authoritative_turn_context_for_send_message_guard()
+    if ctx is None:
+        return True
+    return getattr(ctx, "interactivity", None) != TurnInteractivity.INTERACTIVE
+
+
+# ────────────────────────────────────────────────────────────────────
+# Module-state dependency injection (parallel to memory_tool.py)
+# ────────────────────────────────────────────────────────────────────
+
+_STATE: dict[str, Any] = {
+    "channel_registry": None,
+    "identity_resolver": None,
+    "dispatcher": None,
+    "scheduler": None,
+    "commitments_store": None,
+    "spawn_config": None,
+    # Slice-3 Worklink autonomy (#444): the HomeostaticArbiter so the in-turn
+    # ``worklink_run`` tool can shed autonomous dispatch under TIGHT. Injected by
+    # server.py from ``agent._arbiter``; the operator CLI path never sets it, so
+    # ``mimir worklink run`` is uncapped/un-gated by design.
+    "arbiter": None,
+    # chainlink #392: the old "current_channel_id" key was dead — the per-turn
+    # channel lives in the _current_channel_id_var ContextVar (set via
+    # set_current_channel_id). Removed so nothing reads a never-written key.
+}
+
+
+def set_channel_registry(registry: Any) -> None:
+    _STATE["channel_registry"] = registry
+
+
+def set_identity_resolver(resolver: Any) -> None:
+    """Inject the IdentityResolver so ``list_channels`` can surface
+    operator-curated channels + captured DM channels. Set by server.py."""
+    _STATE["identity_resolver"] = resolver
+    from ..access_control import ChannelResourceAdapter
+    ChannelResourceAdapter.set_identity_resolver(resolver)
+
+
+def set_dispatcher(dispatcher: Any) -> None:
+    _STATE["dispatcher"] = dispatcher
+
+
+def set_scheduler(scheduler: Any) -> None:
+    _STATE["scheduler"] = scheduler
+
+
+def set_commitments_store(store: Any) -> None:
+    _STATE["commitments_store"] = store
+
+
+def set_spawn_config(config: Any) -> None:
+    _STATE["spawn_config"] = config
+
+
+def set_arbiter(arbiter: Any) -> None:
+    """Inject the HomeostaticArbiter so ``worklink_run`` can gate autonomous
+    dispatch (#444). Set by server.py from the agent's arbiter."""
+    _STATE["arbiter"] = arbiter
+
+
+def set_current_channel_id(channel_id: str | None) -> contextvars.Token:
+    """Set the per-task channel_id. Returns a Token; call
+    reset_current_channel_id(token) in a finally block to restore.
+
+    ContextVar is isolated per asyncio.Task — concurrent turns on
+    different channels don't race. Replaces the old process-global
+    _STATE["current_channel_id"] write (S2-1 fix).
+    """
+    return _current_channel_id_var.set(channel_id)
+
+
+def reset_current_channel_id(token: contextvars.Token) -> None:
+    """Restore the prior channel_id using the Token from set_current_channel_id."""
+    _current_channel_id_var.reset(token)
+
+
+def set_current_turn_interactive(interactive: bool) -> contextvars.Token:
+    """Compatibility setter for the legacy per-task interactivity ContextVar.
+
+    Kept so older call sites/tests can continue to stamp/reset the value, but
+    send_message's no-reply sentinel guard now resolves authoritative carried
+    ``TurnContext.interactivity`` instead of consulting this ContextVar.
+    """
+    return _current_turn_interactive_var.set(interactive)
+
+
+def reset_current_turn_interactive(token: contextvars.Token) -> None:
+    """Restore the prior interactivity flag using the Token from
+    set_current_turn_interactive."""
+    _current_turn_interactive_var.reset(token)
+
+
+# ────────────────────────────────────────────────────────────────────
+# Channel tools (mimir/channeltools.py)
+# ────────────────────────────────────────────────────────────────────
+
+@tool
+def approve_declassification(
+    sink_category: str,
+    destination: str,
+    reason: str,
+) -> str:
+    """Authorize one audited egress to an exact destination for this private turn.
+
+    This admin-only action is executed by the authorization middleware against
+    the live turn carrier. Direct invocation cannot grant authority.
+    """
+    return "approve_declassification failed: missing live authorization middleware"
+
+
+def _render_approval_metadata(value: object) -> str:
+    """Render one approval-prompt value without allowing line injection."""
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _render_approval_source(source: Any, *, include_resource_id: bool) -> str:
+    render = _render_approval_metadata
+    values = [
+        f"principal={render(source.principal or '(unknown)')}",
+        f"domain={render(source.domain or '(unknown)')}",
+        f"domain_qualifier={render(source.domain_qualifier)}",
+    ]
+    if include_resource_id:
+        values.append(f"resource_id={render(source.resource_id or '(unknown)')}")
+    values.extend((
+        f"bridge_instance={render(source.bridge_instance or '(unknown)')}",
+        f"sensitivity={render(source.sensitivity)}",
+        f"authorized_principals={render(sorted(source.authorized_principals))}",
+        f"source_kind={render(source.source_kind)}",
+        f"integrity={render(source.integrity)}",
+        f"integrity_effect={render(source.integrity_effect)}",
+    ))
+    return "; ".join(values)
+
+
+def _approval_source_group_key(source: Any) -> tuple[Any, ...]:
+    return (
+        source.principal,
+        source.domain,
+        source.domain_qualifier,
+        source.bridge_instance,
+        source.sensitivity,
+        tuple(sorted(source.authorized_principals)),
+        source.source_kind,
+        source.integrity,
+        source.integrity_effect,
+    )
+
+
+def _render_active_ingest_source_group(group: list[Any]) -> list[str]:
+    if len(group) <= 3:
+        return [
+            f"- {_render_approval_source(source, include_resource_id=True)}"
+            for source in group
+        ]
+
+    render = _render_approval_metadata
+    source = group[0]
+    values = [
+        f"count={render(len(group))}",
+        _render_approval_source(source, include_resource_id=False),
+    ]
+    resource_ids = [source.resource_id or "(unknown)" for source in group]
+    if source.domain == "filesystem" and source.domain_qualifier is None:
+        try:
+            common_prefix = os.path.commonpath(resource_ids)
+        except ValueError:
+            common_prefix = ""
+        if common_prefix:
+            values.append(f"common_path_prefix={render(common_prefix)}")
+    values.append(f"example_resource_ids={render(resource_ids[:3])}")
+    return [f"- {'; '.join(values)}"]
+
+
+def _render_approval_source_summary(
+    sources: tuple[Any, ...], *, displayed_source: Any = None,
+) -> str:
+    """Filter operator presentation only; retain the complete carrier for audit."""
+    shown: list[str] = []
+    active_groups: dict[tuple[Any, ...], list[Any]] = {}
+    active_count = 0
+    omitted_count = 0
+    for source in sources:
+        if source.has_untrusted_active_ingest:
+            active_count += 1
+            if source != displayed_source:
+                key = _approval_source_group_key(source)
+                active_groups.setdefault(key, []).append(source)
+        elif source != displayed_source:
+            omitted_count += 1
+
+    for group in active_groups.values():
+        shown.extend(_render_active_ingest_source_group(group))
+
+    if not active_count:
+        shown.append("- No active untrusted ingest was present.")
+    elif not shown:
+        shown.append("- All active untrusted ingest is shown above.")
+    if omitted_count:
+        shown.append(
+            f"- {omitted_count} other sources omitted: not active untrusted ingest; "
+            "cannot block this flow."
+        )
+    return "\n".join(shown)
+
+
+@tool
+async def request_operator_approval(
+    tool_name: str,
+    target: str,
+    reason: str,
+    sink_category: str | None = None,
+) -> str:
+    """Ask the authenticated operator to approve an exact request.
+
+    A validated ``sink_category`` requests a turn-local category capability.
+    Consent is recorded only from a later authenticated inbound operator
+    message; this tool cannot create a grant.
+    """
+    if sink_category == "shell_process":
+        return (
+            "request_operator_approval refused: no approval admits shell on a tainted turn. "
+            "Use a single bounded pinned-family command without shell metacharacters, "
+            "or send an operator message for a fresh user turn."
+        )
+
+    from .._context import get_current_turn
+    from ..operator_approval import cancel_request, create_request
+
+    ctx = get_current_turn()
+    auth = getattr(ctx, "auth_context", None) if ctx is not None else None
+    dispatcher = _STATE["dispatcher"]
+    channels = _STATE["channel_registry"]
+    if (
+        ctx is None
+        or auth is None
+        or auth.trigger != "user_message"
+        or auth.interactivity != TurnInteractivity.INTERACTIVE
+        or auth.is_service
+    ):
+        return "request_operator_approval refused: no interactive operator turn"
+    channel_id = (auth.channel_id or "").strip()
+    operator_channel = (
+        getattr(getattr(dispatcher, "_config", None), "operator_alert_channel", "") or ""
+    ).strip()
+    if not channel_id or channel_id != operator_channel:
+        return "request_operator_approval refused: operator alert channel is not the active turn"
+    if dispatcher is None or not dispatcher._injection_enabled(channel_id):
+        return "request_operator_approval refused: mid-turn injection is disabled"
+    if channels is None or channels.find(channel_id) is None:
+        return "request_operator_approval refused: operator is unreachable"
+
+    normalized_tool = " ".join((tool_name or "").split())[:128]
+    normalized_target = " ".join((target or "").split())[:1024]
+    normalized_reason = " ".join((reason or "").split())[:500]
+    if not normalized_tool or not normalized_target:
+        return "request_operator_approval refused: tool_name and target are required"
+    if sink_category is None:
+        return "request_operator_approval refused: sink_category is required"
+
+    category = None
+    parsed_category = None
+    request_carrier = None
+    request_ordinal = None
+    if sink_category is not None:
+        from ..access_control import SinkCategory
+
+        eligible = frozenset({
+            SinkCategory.SAME_CHANNEL,
+            SinkCategory.CROSS_CHANNEL,
+            SinkCategory.PUBLIC,
+            SinkCategory.SPAWN,
+            SinkCategory.NOTIFICATION,
+            SinkCategory.FILE,
+            SinkCategory.DIRECT_MESSAGE,
+            SinkCategory.SAGA,
+            SinkCategory.SCHEDULER,
+            SinkCategory.PROPOSAL,
+            SinkCategory.FORGE,
+        })
+        ineligible = frozenset({
+            SinkCategory.SHELL_PROCESS,
+            SinkCategory.NETWORK,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.EXTERNAL_MCP,
+            SinkCategory.UNKNOWN,
+            SinkCategory.HARNESS_DISPLAY,
+        })
+        assert eligible | ineligible == frozenset(SinkCategory)
+        try:
+            parsed_category = SinkCategory(sink_category)
+        except ValueError:
+            return "request_operator_approval refused: invalid sink_category"
+        if parsed_category not in eligible:
+            return "request_operator_approval refused: ineligible sink_category"
+        category = parsed_category.value
+        request_carrier, request_ordinal = auth.ifc_state.source_snapshot(auth.ifc_labels)
+        if request_carrier is None:
+            return "request_operator_approval refused: no live information-flow state"
+
+    requesting_principal = auth.canonical_principal or auth.principal
+    request, status = create_request(
+        channel_id=channel_id,
+        tool_name=normalized_tool,
+        target=normalized_target,
+        requesting_principal=requesting_principal,
+        turn_id=ctx.turn_id if category is not None else None,
+        sink_category=category,
+        request_carrier=request_carrier,
+        ifc_state=auth.ifc_state if category is not None else None,
+        request_source_arrival_ordinal=request_ordinal,
+    )
+    if request is None:
+        return f"request_operator_approval refused: {status}"
+    render = _render_approval_metadata
+    if category is None:
+        request_details = (
+            f"Tool: {render(normalized_tool)}\n"
+            f"Target: {render(normalized_target)}\n"
+        )
+    else:
+        from ..access_control import _ifc_blocking_source
+
+        blocking_source = None
+        blocking_scope = "unknown"
+        try:
+            blocking_source, blocking_scope = _ifc_blocking_source(
+                request_carrier,
+                auth,
+                parsed_category,
+            )
+        except Exception as exc:
+            blocking_scope = "classification_failed"
+            log.warning("IFC approval source classification failed: %s", exc)
+
+        if blocking_scope == "causing_source" and blocking_source is not None:
+            blocking_details = (
+                "Blocking source (cause):\n"
+                f"- {_render_approval_source(blocking_source, include_resource_id=True)}\n"
+            )
+        elif blocking_scope == "representative_source" and blocking_source is not None:
+            blocking_details = (
+                "Blocking source (representative, not confirmed as the cause):\n"
+                f"- {_render_approval_source(blocking_source, include_resource_id=True)}\n"
+            )
+        elif blocking_scope == "no_sources":
+            blocking_details = "Blocking source: no sources were available to classify.\n"
+        elif blocking_scope == "classification_failed":
+            blocking_details = "Blocking source: classification failed; the cause is unknown.\n"
+        else:
+            blocking_details = "Blocking source: unknown; no source could be classified.\n"
+
+        rendered_sources = _render_approval_source_summary(
+            request_carrier.sources,
+            displayed_source=(
+                blocking_source
+                if blocking_scope in {"causing_source", "representative_source"}
+                else None
+            ),
+        )
+        request_details = (
+            f"Sink category: {render(category)}\n"
+            f"Turn: {render(ctx.turn_id)}\n"
+            f"Requesting principal: {render(requesting_principal)}\n"
+            "Approval scope: approving authorizes every tool and every destination "
+            "in this sink category for the remainder of this turn.\n"
+            f"Requested tool (non-binding context only): {render(normalized_tool)}\n"
+            f"Requested target (non-binding context only): {render(normalized_target)}\n"
+        )
+    alert = (
+        f"Operator approval requested ({request.request_id})\n"
+        f"{request_details}"
+        f"Reason: {render(normalized_reason or '(none provided)')}\n"
+        f"Reply `approve {request.request_id}` or `decline {request.request_id}` "
+        "in this channel. The request expires in 5 minutes."
+    )
+    if category is not None:
+        alert += f"\n{blocking_details}Source summary:\n{rendered_sources}"
+    try:
+        result = await channels.send(channel_id, alert, final=False)
+    except Exception:
+        cancel_request(request.request_id)
+        return "request_operator_approval refused: operator is unreachable"
+    if not getattr(result, "sent", True):
+        cancel_request(request.request_id)
+        return "request_operator_approval refused: operator is unreachable"
+    from ..approval_requests import set_prompt_message_id
+
+    set_prompt_message_id(
+        request.request_id,
+        getattr(result, "first_message_id", None) or getattr(result, "message_id", None),
+    )
+    if category is not None:
+        return "Operator approval is pending for the sink category."
+    return "Operator approval is pending for the exact tool and target."
+
+
+@tool
+async def send_message(
+    text: str,
+    channel_id: str,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """Emit a message to a channel.
+
+    Requires an explicit deliverable bridge channel_id. Subject to a
+    per-turn loop-detection circuit breaker — repeated near-duplicates
+    first warn, then refuse.
+    Autonomous skip-list narration is rejected; substantive messages over 200
+    words with a trailing stop phrase are delivered after that tail is stripped.
+
+    Args:
+        text: The message body to send.
+        channel_id: Target deliverable bridge channel ID.
+    """
+    if not text or not text.strip():
+        await _reject_send_message(channel_id, "empty_message")
+    stripped_channel_id = (channel_id or "").strip()
+    explicit_channel = bool(stripped_channel_id)
+    if not explicit_channel:
+        await _reject_send_message(channel_id, "not_deliverable_channel")
+    if _is_non_interactive_no_reply_channel(stripped_channel_id):
+        if _active_turn_is_non_interactive_for_send_message_guard():
+            await _reject_send_message(channel_id, "non_interactive_no_reply_channel")
+    if stripped_channel_id.lower().startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES):
+        raise ToolException(await _reject_trigger_pseudo_channel("send_message", stripped_channel_id))
+    if _is_non_deliverable_channel(stripped_channel_id):
+        await _reject_send_message(channel_id, "not_deliverable_channel")
+    if not _acp_channel_is_owned_by_active_turn(stripped_channel_id):
+        await _reject_send_message(channel_id, "not_deliverable_channel")
+    channels = _STATE["channel_registry"]
+    if channels is None:
+        return "send_message failed: no channel registry configured"
+    cid = _channel_from_config_or_state(channel_id, config)
+    if not cid:
+        return "send_message failed: no channel_id and no current channel"
+
+    # Loop-detection circuit breaker (SPEC §7.2.4). The per-turn
+    # LoopDetector lives on the active TurnContext; agent.run_turn
+    # attaches it at the start of every turn. Pre-181-J this hook
+    # was missing — repeated near-duplicate sends would ship
+    # indefinitely. Now: HARD_STOP refuses the send with a recovery
+    # hint; SOFT_WARN allows but logs a one-time per-turn warning
+    # event so operator dashboards can flag the near-loop.
+    from .._context import get_current_turn
+    from ..event_logger import log_event as _log_event
+    from ..loop_detector import BreakerVerdict
+
+    detector = None
+    detector_state = None
+    decision = None
+    undelivered_decision = None
+    ctx = get_current_turn()
+    trigger = (getattr(ctx, "trigger", "") if ctx is not None else "").strip()
+    skiplist_match = (
+        _matched_send_message_skiplist_phrase(text)
+        if _send_message_skiplist_guard_armed(trigger)
+        else None
+    )
+    if skiplist_match is not None and skiplist_match.stripped_text is None:
+        try:
+            await _log_event(
+                "send_message_blocked_skiplist",
+                channel_id=cid,
+                trigger=trigger,
+                matched_phrase=skiplist_match.phrase,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise ToolException(
+            "send_message rejected: this autonomous turn found only "
+            "skip-bucket / no-action narration. The correct action is to end "
+            "the turn with no message."
+        )
+    if skiplist_match is not None:
+        stripped_text = skiplist_match.stripped_text
+        assert stripped_text is not None
+        await _log_event(
+            "send_message_skiplist_tail_stripped",
+            channel_id=cid,
+            trigger=trigger,
+            matched_phrase=skiplist_match.phrase,
+            removed_chars=len(text) - len(stripped_text),
+        )
+        text = stripped_text
+    if ctx is not None:
+        detector = getattr(ctx, "loop_detector", None)
+
+    bridge = channels.find(cid)
+    if bridge is None:
+        return f"send_message failed: no bridge for channel {cid!r}"
+
+    if detector is not None:
+        undelivered_decision = detector.check_undelivered_backstop(text)
+        if undelivered_decision is not None:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=undelivered_decision.streak,
+                similarity=round(undelivered_decision.similarity, 4),
+                undelivered=True,
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate "
+                "undelivered-send loop. This send is refused before another "
+                "delivery attempt. Reflect on the delivery failure before "
+                "trying again."
+            )
+        detector_state = detector.snapshot()
+        decision = detector.check(text)
+        if decision.verdict == BreakerVerdict.HARD_STOP:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=decision.streak,
+                similarity=round(decision.similarity, 4),
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate loop. "
+                "This send is refused. Reflect on what's wrong with the "
+                "approach before sending again — try a completely "
+                "different tactic or finish the turn."
+            )
+
+    # Strip <actions>...</actions> directive blocks from the outbound
+    # text and dispatch parsed directives (react, send-file) after send.
+    parsed = parse_directives(text)
+    clean_text = parsed.clean_text
+
+    result = None
+    delivered_by_text = False
+    delivered_by_directive = False
+    if clean_text:
+        try:
+            # final=False keeps the typing indicator held — it is released
+            # once, at turn end (run_turn's finally), so it persists across
+            # multiple send_message calls in a turn. final=True (the default)
+            # would cancel typing on the FIRST send (see DiscordBridge.send).
+            result = await bridge.send(cid, clean_text, final=False)
+        except Exception as exc:
+            if detector is not None and detector_state is not None:
+                detector.restore(detector_state)
+                undelivered_decision = detector.record_undelivered_attempt(text)
+                if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+                    await _log_event(
+                        "send_message_loop_hard_stop",
+                        channel_id=cid,
+                        streak=undelivered_decision.streak,
+                        similarity=round(undelivered_decision.similarity, 4),
+                        undelivered=True,
+                    )
+                    return (
+                        "send_message hard stop: repeated near-duplicate "
+                        "undelivered-send loop. This send failed before "
+                        "delivery and further identical retries are refused. "
+                        "Reflect on the delivery failure before trying again."
+                    )
+            return f"send_message failed: {exc}"
+
+        # Soft delivery failure: bridges return SendResult(sent=False, error=…)
+        # for recoverable failures (disconnected client, bad channel) instead
+        # of raising. With auto-dispatch gone this is the sole reply path, so a
+        # soft failure must NOT look delivered — don't log send_message_sent,
+        # don't append to history, and surface the failure to the model.
+        if not getattr(result, "sent", True):
+            chunks = getattr(result, "chunks", 0)
+            uploads = getattr(result, "uploads", 0)
+            partial = bool(chunks or uploads)
+            if detector is not None and detector_state is not None:
+                detector.restore(detector_state)
+                undelivered_decision = detector.record_undelivered_attempt(text)
+                if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+                    await _log_event(
+                        "send_message_loop_hard_stop",
+                        channel_id=cid,
+                        streak=undelivered_decision.streak,
+                        similarity=round(undelivered_decision.similarity, 4),
+                        undelivered=True,
+                    )
+                    return (
+                        "send_message hard stop: repeated near-duplicate "
+                        "undelivered-send loop. Delivery did not complete "
+                        "and further identical retries are refused. "
+                        "Reflect on the delivery failure before trying again."
+                    )
+            _err = getattr(result, "error", None)
+            try:
+                await _log_event(
+                    "send_message_failed",
+                    channel_id=cid,
+                    error=(str(_err)[:200] if _err else None),
+                    chunks=chunks,
+                    uploads=uploads,
+                    message_id=getattr(result, "message_id", None),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            if partial:
+                return (
+                    f"send_message failed: incomplete delivery (channel={cid}; "
+                    f"{chunks} chunk(s), {uploads} upload(s) delivered; "
+                    f"message_id={getattr(result, 'message_id', None)}; {_err}). "
+                    "Warning: retrying the whole message may duplicate what already landed."
+                )
+            return (
+                "send_message failed: bridge reported the message was not "
+                f"delivered (channel={cid}" + (f"; {_err}" if _err else "") + ")"
+            )
+
+        delivered_by_text = True
+
+        # Successful delivery — record it on the turn context so the
+        # forgot-to-send guard knows a reply actually went out. An
+        # attempted-but-refused / soft-failed send must NOT suppress the
+        # no-reply signal, so only a confirmed send increments this.
+        if ctx is not None:
+            try:
+                ctx.send_message_count += 1
+                ctx.delivered_channel_ids.add(cid)
+                emitter = getattr(ctx, "turn_event_emitter", None)
+                if emitter is not None:
+                    emitter.outbound_message(
+                        channel_id=cid,
+                        message_id=getattr(result, "message_id", None),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        if detector is not None:
+            detector.clear_undelivered_attempts()
+
+        # S2-2: log a send_message_sent event with a normalized content hash
+        # so FeedbackLog._detect_cross_turn_send_loops can detect 24h floods
+        # (same message to same channel across multiple turns / heartbeats).
+        # Normalize: lowercase + collapse whitespace; truncate at 500 chars
+        # before hashing so two slightly-trimmed variants of a long message
+        # compare as equal.
+        _norm = re.sub(r"\s+", " ", clean_text.strip()).lower()[:500]
+        _content_hash = hashlib.md5(_norm.encode()).hexdigest()[:16]
+        try:
+            await _log_event("send_message_sent", channel_id=cid, content_hash=_content_hash)
+        except Exception:
+            pass  # best-effort; don't fail the send if event logging hiccups
+
+        # Append outbound to chat-history buffer so the agent's next
+        # turn sees its own reply in Recent activity. Dropped in PR
+        # #181's deepagents migration; restoring here closes the
+        # regression for the send_message-tool path (the most common
+        # outbound path in production). No-op when no buffer is
+        # registered (test paths that bypass ``server.serve``).
+        #
+        # Use ``bridge.name`` (e.g. "discord", "slack") as the source
+        # so this message passes the recent_sources allowlist filter
+        # in recent_for_channel. Without a source the message is
+        # silently excluded from ## Recent activity regardless of
+        # channel — the allowlist treats None the same as an
+        # unrecognised source. This matters especially for cross-
+        # channel sends from poller / heartbeat turns: a poller turn
+        # sending to discord needs source="discord" so the operator
+        # sees mimir's own messages interleaved with their own in
+        # the next discord turn's prompt. (chainlink #270)
+        from ..history import get_global_buffer
+        _buf = get_global_buffer()
+        if _buf is not None and result is not None:
+            try:
+                msg = _buf.make_message(
+                    channel_id=cid,
+                    kind="assistant_message",
+                    content=clean_text,
+                    msg_id=getattr(result, "message_id", None),
+                    source=bridge.name,
+                    integrity=(
+                        "trusted"
+                        if ctx is not None
+                        and ctx.ifc_labels.sources
+                        and all(
+                            source.integrity == "trusted"
+                            for source in ctx.ifc_labels.sources
+                        )
+                        else "untrusted"
+                    ),
+                )
+                await _buf.append(msg)
+            except Exception:  # noqa: BLE001
+                # Best-effort — don't fail the tool call if the
+                # buffer hiccups. Log a warning rather than swallowing
+                # silently so disk-full / permission-denied issues
+                # are visible in events.jsonl downstream.
+                log.warning(
+                    "send_message: chat_history append failed", exc_info=True,
+                )
+
+    delivered_by_directive = await dispatch_send_message_directives(
+        directives=parsed.directives,
+        bridge=bridge,
+        channel_id=cid,
+        sent_message_id=(getattr(result, "message_id", None) if result else None),
+        fallback_message_id=_resolve_recent_message_id(cid),
+        ctx=ctx,
+        detector=detector,
+    )
+
+    if (
+        detector is not None
+        and detector_state is not None
+        and not delivered_by_text
+        and not delivered_by_directive
+    ):
+        detector.restore(detector_state)
+        undelivered_decision = detector.record_undelivered_attempt(text)
+        if undelivered_decision.verdict == BreakerVerdict.HARD_STOP:
+            await _log_event(
+                "send_message_loop_hard_stop",
+                channel_id=cid,
+                streak=undelivered_decision.streak,
+                similarity=round(undelivered_decision.similarity, 4),
+                undelivered=True,
+            )
+            return (
+                "send_message hard stop: repeated near-duplicate "
+                "undelivered-send loop. This send failed before delivery and "
+                "further identical retries are refused. Reflect on the "
+                "delivery failure before trying again."
+            )
+    elif (
+        detector is not None
+        and decision is not None
+        and decision.verdict == BreakerVerdict.SOFT_WARN
+        and detector.mark_warning_emitted()
+    ):
+        await _log_event(
+            "send_message_loop_warning",
+            channel_id=cid,
+            streak=decision.streak,
+            similarity=round(decision.similarity, 4),
+        )
+
+    if not delivered_by_text and not delivered_by_directive:
+        return f"send_message failed: no text or directive was delivered (channel={cid})"
+
+    # chainlink #259: surface the bare message_id, not the SendResult repr,
+    # so downstream parses/greps (e.g. a later react(message_id=...)) work.
+    _mid = getattr(result, "message_id", None) if result else None
+    return f"send_message ok: channel={cid} message_id={_mid}"
+
+
+send_message.handle_tool_error = True
+
+
+def _resolve_recent_message_id(channel_id: str) -> Optional[str]:
+    """Most recent buffered message on ``channel_id`` that carries an id.
+
+    Backs ``react``'s default target. Returns None when no buffer is
+    registered (test paths that bypass ``server.serve``) or the channel
+    has no id-bearing message in the recent window. ``recent_for_channel``
+    is exact-channel scoped; walk newest-first for the first message with a
+    usable id.
+    """
+    from ..history import get_global_buffer
+    buf = get_global_buffer()
+    if buf is None:
+        return None
+    recent = buf.recent_for_channel(channel_id, limit=50)
+    for msg in reversed(recent):
+        if msg.channel_id == channel_id and msg.msg_id:
+            return msg.msg_id
+    return None
+
+
+@tool
+async def react(
+    emoji: str,
+    message_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """React to a message with an emoji.
+
+    When ``message_id`` is omitted, defaults to the most recent message
+    on the channel that carries an id — usually the message being
+    acknowledged — resolved from the shared history buffer. Bridges that
+    don't support native reactions (e.g. Bluesky) log a no-op.
+
+    Args:
+        emoji: Reaction emoji (e.g. "👍").
+        message_id: Specific message to react to. Defaults to the most
+            recent id-bearing message on the channel.
+        channel_id: Channel scope. Defaults to current turn's.
+    """
+    cid = _channel_from_config_or_state(channel_id, config)
+    if cid.lower().startswith(_NON_DELIVERABLE_CHANNEL_PREFIXES):
+        return await _reject_trigger_pseudo_channel("react", cid)
+    channels = _STATE["channel_registry"]
+    if channels is None:
+        return "react failed: no channel registry configured"
+    if not cid:
+        return "react failed: no channel_id and no current channel"
+    bridge = channels.find(cid)
+    if bridge is None:
+        return f"react failed: no bridge for channel {cid!r}"
+    # chainlink #259 item 11: the str-typed bridge.react raises / no-ops
+    # on a None message_id, and the documented "most recent" default was
+    # never actually implemented (None was forwarded verbatim). Resolve
+    # it here from the shared history buffer instead.
+    if message_id is None:
+        message_id = _resolve_recent_message_id(cid)
+        if message_id is None:
+            return (
+                f"react failed: no message_id given and no recent "
+                f"id-bearing message on channel {cid} to default to — "
+                f"pass message_id explicitly"
+            )
+    try:
+        ok = await bridge.react(cid, message_id, emoji)
+    except Exception as exc:
+        return f"react failed: {exc}"
+    # Bridges signal a declined reaction (bad id, missing scope, …) with
+    # a False return rather than an exception. Don't report "ok" on it.
+    if ok is False:
+        return (
+            f"react failed: bridge declined "
+            f"(channel={cid}, message_id={message_id}, emoji={emoji})"
+        )
+    # A successful react is a valid interactive response (an acknowledgment) —
+    # record it on the turn so the forgot-to-send guard doesn't flag a
+    # react-only reply as "no reply" (0.3.2).
+    from .._context import get_current_turn
+    _ctx = get_current_turn()
+    if _ctx is not None:
+        try:
+            _ctx.react_count += 1
+            _ctx.delivered_channel_ids.add(cid)
+        except Exception:  # noqa: BLE001
+            pass
+    return f"react ok: channel={cid} emoji={emoji} message_id={message_id}"
+
+
+@tool
+async def fetch_channel_history(
+    channel_id: Optional[str] = None,
+    limit: int = 20,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """Fetch recent messages from a channel.
+
+    Args:
+        channel_id: Channel to read. Defaults to current turn's.
+        limit: Max messages to return (1-100, default 20).
+    """
+    channels = _STATE["channel_registry"]
+    if channels is None:
+        return "fetch_channel_history failed: no channel registry"
+    cid = _channel_from_config_or_state(channel_id, config)
+    if not cid:
+        return "fetch_channel_history failed: no channel_id and no current"
+    try:
+        k = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        k = 20
+    bridge = channels.find(cid)
+    if bridge is None or not hasattr(bridge, "fetch_history"):
+        return f"fetch_channel_history failed: bridge {cid!r} doesn't support history"
+    try:
+        history = await bridge.fetch_history(cid, limit=k)
+    except Exception as exc:
+        return f"fetch_channel_history failed: {exc}"
+    return json.dumps(history, indent=2, ensure_ascii=False, default=str)
+
+
+@tool
+async def list_channels(platform: Optional[str] = None) -> str:
+    """List the channels you know about — use this to find where to send,
+    especially to DM a person by name. Read-only.
+
+    Args:
+        platform: Optional bridge filter — e.g. ``"slack"`` or ``"discord"``.
+            When set, returns only that bridge's channels/DMs/prefixes
+            (matching ids ``<platform>-…`` and ``dm-<platform>-…``). Omit
+            for everything.
+
+    Returns JSON with:
+      - ``channels``: operator-curated channels (channel_id, display_name, kind, notes).
+      - ``dms``: per-person DM channels (person, display_name, platform, channel_id),
+        auto-captured the first time each person messaged you on a bridge.
+      - ``live_prefixes``: the channel-id prefixes the connected bridges serve
+        (e.g. ``discord-`` / ``dm-slack-``). A ``channel_id`` must carry one of
+        these or ``send_message`` raises UnknownChannelError.
+
+    To DM a person, send to their ``dms[].channel_id`` (a prefix-qualified id
+    like ``dm-slack-D…``) — never their user id.
+    """
+    resolver = _STATE["identity_resolver"]
+    channels = _STATE["channel_registry"]
+    plat = (platform or "").strip().lower() or None
+
+    def _belongs(channel_id: str) -> bool:
+        if plat is None:
+            return True
+        return channel_id.startswith(f"{plat}-") or channel_id.startswith(f"dm-{plat}-")
+
+    out: dict[str, Any] = {"channels": [], "dms": [], "live_prefixes": []}
+    if plat is not None:
+        out["platform"] = plat
+    if resolver is not None:
+        for ch in resolver.all_channels():
+            if not _belongs(ch.canonical):
+                continue
+            out["channels"].append(
+                {
+                    "channel_id": ch.canonical,
+                    "display_name": ch.display_name,
+                    "kind": ch.kind,
+                    "notes": ch.notes,
+                }
+            )
+        for ident in resolver.all_identities():
+            for dm_platform, cid in (ident.dm_channels or {}).items():
+                if plat is not None and dm_platform.strip().lower() != plat:
+                    continue
+                out["dms"].append(
+                    {
+                        "person": ident.canonical,
+                        "display_name": ident.display_name,
+                        "platform": dm_platform,
+                        "channel_id": cid,
+                    }
+                )
+    if channels is not None and hasattr(channels, "prefixes"):
+        out["live_prefixes"] = [p for p in channels.prefixes() if _belongs(p)]
+    from .._context import get_current_turn
+    from ..access_control import protected_result_source, publish_protected_result
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    resource_ids = [
+        str(item["channel_id"])
+        for collection in (out["channels"], out["dms"])
+        for item in collection
+        if item.get("channel_id")
+    ] + [f"prefix:{prefix}" for prefix in out["live_prefixes"]]
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal="mimir:channel-registry",
+            domain="channel_metadata",
+            resource_id=resource_id,
+            bridge_instance="mimir",
+        )
+        for resource_id in resource_ids
+    ))
+    return json.dumps(out, indent=2, ensure_ascii=False, default=str)
+
+
+@tool
+def defer_injected_message(
+    message_id: str,
+    reason: str,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """Defer a mid-turn-injected user message to its own later turn (chainlink #384).
+
+    Mid-turn injection folds a user's follow-up into the turn you're already
+    working on. Usually that's right — clarifications, corrections, "also do X",
+    cancels, or priority changes should fold. But sometimes an injected message
+    is a TRUE topic switch or substantial unrelated new work — common in a
+    multi-person channel where several people ask independent things while you're
+    mid-turn. Folding those into the current answer makes a worse, mixed response
+    and blurs audit / commitment boundaries.
+
+    Call this to hand such a message its OWN response boundary: it's re-queued as
+    a fresh turn right after this one, with its original author/content preserved,
+    and will not be folded again.
+
+    CONTRACT (not runtime-enforced): if you defer a message, do NOT also answer it
+    substantively in your current final response — it's already in your context,
+    but answering it defeats the purpose. A brief "I'll take your other question
+    as its own turn" is fine.
+
+    Use for: a true topic switch, substantial unrelated work, a message that needs
+    its own auditable response/tool-use boundary, or an explicit "separate
+    question" / "new thread".
+    Do NOT use for: clarifications, corrections, "also..." additions, cancels, or
+    priority changes to what you're already doing — those should fold.
+
+    Args:
+        message_id: The msg_id from the injected message's header
+            "[mid-turn message from <author>, msg_id: <id>]".
+        reason: Short why (e.g. "topic switch", "unrelated new work").
+    """
+    from .._context import get_current_turn
+    from ..access_control import saga_mutation_taint_refusal
+
+    turn = get_current_turn()
+    refusal = saga_mutation_taint_refusal(
+        getattr(turn, "auth_context", None),
+        getattr(turn, "ifc_labels", None),
+    )
+    if refusal is not None:
+        return f"defer_injected_message failed: {refusal}"
+    cid = _channel_from_config_or_state(None, config)
+    if not cid:
+        return "defer_injected_message failed: no current channel context"
+    mid = (message_id or "").strip()
+    if not mid:
+        return "defer_injected_message failed: message_id is required"
+    from .. import mid_turn_injection
+    result = mid_turn_injection.defer_message(cid, mid, (reason or "").strip())
+    if result == "deferred":
+        return (
+            f"Deferred message {mid} to its own next turn. Do NOT answer it "
+            "substantively in this response."
+        )
+    if result == "already_deferred":
+        return f"Message {mid} is already deferred for this turn (no-op)."
+    if result == "not_found":
+        return (
+            f"defer_injected_message failed: no injected message with msg_id {mid} "
+            "in the current turn. Only messages folded into THIS turn can be deferred."
+        )
+    return (
+        "defer_injected_message failed: no active injectable turn — nothing to defer."
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Scheduler tools (mimir/scheduletools.py)
+# ────────────────────────────────────────────────────────────────────
+
+@tool
+async def list_schedules() -> str:
+    """List all scheduled work: yaml-config jobs AND skill pollers.
+
+    Each entry has a ``type`` (``"job"`` or ``"poller"``) so the two
+    registries are distinguishable. Jobs carry name, cron, ``priority``,
+    channel, and prompt-source (one of ``prompt`` / ``prompt_file`` /
+    ``callable``); pollers carry name, cron, ``priority``. ``priority``
+    (low|normal|high) is the arbiter's suppression band. Runtime fields
+    (``last_run`` / ``next_fire``) live on apscheduler ``Job`` objects rather
+    than the config view and are still not joined here.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "list_schedules failed: no scheduler configured"
+    try:
+        jobs = await scheduler.list_jobs()
+    except Exception as exc:
+        return f"list_schedules failed: {exc}"
+    out: list[dict[str, Any]] = []
+    for j in jobs:
+        entry: dict[str, Any] = {
+            # ``type`` distinguishes yaml-config scheduler jobs from skill
+            # pollers (appended below) — they're separate registries and used to
+            # be invisible here (chainlink #522).
+            "type": "job",
+            "name": j.name,
+            "cron": j.cron,
+            # Priority-banded arbiter suppression (low|normal|high). Surfaced so
+            # an operator can see/verify what a job is set to (chainlink #523).
+            "priority": getattr(j, "priority", "normal"),
+            "channel_id": j.channel_id,
+        }
+        # Surface whichever prompt-source field is populated (mutually
+        # exclusive per SchedulerJob's contract). Inline prompts are
+        # truncated to keep this tool's output skim-friendly.
+        if getattr(j, "prompt_file", None):
+            entry["prompt_file"] = j.prompt_file
+        elif getattr(j, "callable_name", None):
+            entry["callable"] = j.callable_name
+        elif j.prompt:
+            entry["prompt"] = (
+                j.prompt if len(j.prompt) <= 200 else j.prompt[:200] + "..."
+            )
+        # ``time_of_day`` is an alternative to ``cron`` — surface it
+        # when the operator picked that style instead.
+        time_of_day = getattr(j, "time_of_day", None)
+        if time_of_day:
+            entry["time_of_day"] = time_of_day
+        out.append(entry)
+    # Skill pollers (chainlink #522): a separate registry from the yaml jobs.
+    # Surface them in the same view so the schedule isn't misleadingly empty.
+    poller_usage = {}
+    scheduler_home = getattr(scheduler, "_home", None)
+    if scheduler_home is not None:
+        try:
+            poller_usage = await asyncio.to_thread(
+                partial(
+                    aggregate_poller_turn_usage,
+                    Path(scheduler_home) / "logs" / "turns.jsonl",
+                    events_path=Path(scheduler_home) / "logs" / "events.jsonl",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive; listing must not fail
+            log.warning("list_schedules poller usage aggregation failed: %s", exc)
+            poller_usage = {}
+
+    poller_details = getattr(scheduler, "registered_poller_details", None)
+    if callable(poller_details):
+        for p in poller_details():
+            name = p.get("name")
+            entry = {
+                "type": "poller",
+                "name": name,
+                "cron": p.get("cron"),
+                "priority": p.get("priority"),
+            }
+            if name in poller_usage:
+                entry["usage"] = poller_usage[name].to_dict()
+            if p.get("budget") is not None:
+                entry["budget"] = p.get("budget")
+            out.append(entry)
+    # Empty only when there is NO scheduled work of either kind — checked after
+    # pollers are appended so a poller-only deployment isn't reported as empty
+    # (the #522 visibility gap; mimir-carreira review on PR #728).
+    if not out:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
+        return "(no scheduled jobs)"
+    from .._context import get_current_turn
+    from ..access_control import protected_result_source, publish_protected_result
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    # Schedule definitions and poller metadata are trusted by construction:
+    # tainted turns cannot write the live instruction surfaces they come from.
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal="mimir:scheduler",
+            domain="schedule_metadata",
+            resource_id=f"{entry.get('type', 'job')}:{entry.get('name')}",
+            bridge_instance="mimir",
+        )
+        for entry in out
+        if entry.get("name")
+    ))
+    return json.dumps(out, indent=2, ensure_ascii=False, default=str)
+
+
+@tool
+async def add_schedule(
+    name: str,
+    cron: str,
+    prompt: str = "",
+    channel_id: Optional[str] = None,
+    priority: Optional[str] = None,
+    prompt_file: Optional[str] = None,
+    replace: bool = False,
+) -> str:
+    """Add a scheduled tick. An existing name is refused unless replace=true.
+
+    Replacing overwrites the ENTIRE job entry. For partial changes use
+    set_schedule_cron or set_schedule_priority instead.
+
+    Provide exactly one of ``prompt`` or ``prompt_file``. Prefer ``prompt_file``
+    for anything beyond a one-liner — it's the canonical shape used by the
+    bundled ``scheduler_template.yaml`` (e.g. the memory-hygiene tick), so the
+    prompt body can grow without bloating ``scheduler.yaml``.
+
+    Args:
+        name: Unique job identifier.
+        cron: 5-field cron expression (e.g. ``"0 9 * * *"`` for 9am daily).
+        prompt: Inline prompt to fire on the cron tick. Mutually exclusive with
+            ``prompt_file``.
+        channel_id: Channel to dispatch the tick on. Defaults to
+            ``scheduler:<name>`` synthetic.
+        priority: Arbiter suppression band — ``low``, ``normal`` (default), or
+            ``high``. Higher priority rides through more resource pressure before
+            the arbiter sheds the tick (``high`` is shed only at the most extreme
+            severity). To change an existing job's priority without rewriting its
+            prompt, use ``set_schedule_priority``.
+        prompt_file: Basename of a prompt file under ``<home>/prompts/`` (e.g.
+            ``"memory-hygiene.md"``) to fire on the tick. Mutually exclusive
+            with ``prompt``; persisted as ``prompt_file:`` in scheduler.yaml.
+        replace: Explicitly replace an existing entry and report its old values.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "add_schedule failed: no scheduler configured"
+    inline = (prompt or "").strip()
+    pfile = (prompt_file or "").strip()
+    if bool(inline) == bool(pfile):
+        return (
+            "add_schedule failed: provide exactly one of prompt / prompt_file "
+            "(got "
+            + ("both" if inline else "neither")
+            + ")"
+        )
+    resolved_priority = "normal"
+    if priority is not None:
+        resolved_priority = priority.strip().lower()
+        if resolved_priority not in PRIORITY_LEVELS:
+            return (
+                f"add_schedule failed: invalid priority {priority!r} "
+                f"(expected one of {sorted(PRIORITY_LEVELS)})"
+            )
+    if pfile:
+        # Validate prompt_file with the SAME resolver the scheduler uses at fire
+        # time (_resolve_prompt_file), so a value can't pass here but get rejected
+        # when it fires — which would fall back to the empty inline prompt, i.e.
+        # the "silently empty tick" this check exists to prevent. The resolver
+        # rejects path traversal, absolute-path escapes, and symlinks; require a
+        # real regular file on top. Best-effort: skip when the home isn't known.
+        home = getattr(scheduler, "_home", None)
+        if home is not None:
+            from ..scheduler import _resolve_prompt_file
+            resolved = _resolve_prompt_file(Path(home), pfile)
+            if resolved is None or not resolved.is_file():
+                return (
+                    f"add_schedule failed: prompt_file {pfile!r} must be a regular "
+                    f"file under {Path(home) / 'prompts'} (basename only — no "
+                    f"'..', absolute paths, or symlinks; create the file first)"
+                )
+    try:
+        previous = next((j for j in await scheduler.list_jobs() if j.name == name), None)
+        if pfile:
+            job = SchedulerJob(
+                name=name, cron=cron, prompt_file=pfile, channel_id=channel_id,
+                priority=resolved_priority,
+            )
+        else:
+            job = SchedulerJob(
+                name=name, cron=cron, prompt=inline, channel_id=channel_id,
+                priority=resolved_priority,
+            )
+        job = await scheduler.add_job(job, replace_existing=replace)
+    except Exception as exc:
+        return f"add_schedule failed: {exc}"
+    source = f"prompt_file={job.prompt_file}" if job.prompt_file else "prompt=inline"
+    return (
+        f"add_schedule ok: name={job.name} cron={job.cron} "
+        f"priority={job.priority} {source}"
+        + (f"; replaced previous values: {previous.to_yaml_entry()!r}" if previous else "")
+    )
+
+
+@tool
+async def set_schedule_cron(name: str, cron: str) -> str:
+    """Change only an existing job's cron; preserve prompt, priority, channel and other fields.
+
+    For callable jobs, cron='' explicitly disables the default cron.
+    A prompt job must have a nonempty five-field cron expression.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_schedule_cron failed: no scheduler configured"
+    try:
+        match = next((j for j in await scheduler.list_jobs() if j.name == name), None)
+        if match is None:
+            return f"set_schedule_cron failed: no job named {name!r}"
+        if match.time_of_day:
+            return (
+                "set_schedule_cron failed: this job uses time_of_day; "
+                "changing it to cron requires an explicit add_schedule replace=true"
+            )
+        if not isinstance(cron, str) or (not cron.strip() and not match.callable_name):
+            return "set_schedule_cron failed: cron must be nonempty for a prompt job"
+        await scheduler.add_job(replace(match, cron=cron.strip()))
+    except Exception as exc:
+        return f"set_schedule_cron failed: {exc}"
+    return f"set_schedule_cron ok: name={name} cron={cron.strip()!r}; other fields preserved"
+
+
+@tool
+async def set_schedule_priority(name: str, priority: str) -> str:
+    """Set the arbiter priority of an existing scheduled job.
+
+    ``priority`` is ``low``, ``normal``, or ``high`` — higher rides through more
+    resource pressure before the arbiter sheds the tick. Only the priority is
+    changed; the job's prompt / prompt_file / cron / channel are preserved (so
+    this is the safe way to bump a ``prompt_file`` job like a daily briefing).
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_schedule_priority failed: no scheduler configured"
+    norm = priority.strip().lower() if isinstance(priority, str) else ""
+    if norm not in PRIORITY_LEVELS:
+        return (
+            f"set_schedule_priority failed: invalid priority {priority!r} "
+            f"(expected one of {sorted(PRIORITY_LEVELS)})"
+        )
+    try:
+        jobs = await scheduler.list_jobs()
+        match = next((j for j in jobs if j.name == name), None)
+        if match is None:
+            return f"set_schedule_priority failed: no job named {name!r}"
+        if getattr(match, "callable_name", None):
+            # Callable entries bypass the arbiter gate entirely, so priority is a
+            # no-op for them (and isn't even persisted). Refuse rather than
+            # silently appearing to set it.
+            return (
+                f"set_schedule_priority: {name!r} is a callable job; priority "
+                f"does not apply (callables bypass the arbiter gate)"
+            )
+        await scheduler.add_job(replace(match, priority=norm))
+    except Exception as exc:
+        return f"set_schedule_priority failed: {exc}"
+    return f"set_schedule_priority ok: name={name} priority={norm}"
+
+
+@tool
+async def remove_schedule(name: str) -> str:
+    """Remove a scheduled entry by name. Removing a callable's cron='' disable entry re-enables its default cron."""
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "remove_schedule failed: no scheduler configured"
+    try:
+        previous = next((j for j in await scheduler.list_jobs() if j.name == name), None)
+        removed = await scheduler.remove_job(name)
+    except Exception as exc:
+        return f"remove_schedule failed: {exc}"
+    if not removed:
+        return f"remove_schedule: no job named {name!r}"
+    kind = "callable" if previous and previous.callable_name else "scheduled tick"
+    warning = (
+        "; warning: removed callable disable entry (cron=''); its default cron is re-enabled"
+        if previous and previous.callable_name and not previous.cron else ""
+    )
+    return f"remove_schedule ok: name={name} type={kind}{warning}"
+
+
+def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    tmp = Path(tmp_str)
+    try:
+        os.fchmod(fd, mode)
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+@tool
+async def set_poller_overrides(poller_name: str, overrides: dict[str, Any], replace: bool = False) -> str:
+    """Merge one poller's operator overrides; null deletes an individual key.
+
+    Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
+    ``overrides`` may contain only poller override keys such as ``cron``,
+    ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Environment
+    names are restricted to non-secret poller tuning variables. Passing an empty
+    dict changes nothing; replace=true replaces the entire entry (an empty dict
+    then removes it). Call ``reload_pollers`` after a
+    successful write to apply the new values to the running scheduler.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_poller_overrides failed: no scheduler configured"
+    home = getattr(scheduler, "_home", None)
+    if home is None:
+        return "set_poller_overrides failed: scheduler has no home configured"
+    name = (poller_name or "").strip()
+    if not name:
+        return "set_poller_overrides failed: poller_name is required"
+    if not isinstance(overrides, dict):
+        return "set_poller_overrides failed: overrides must be a dict"
+
+    path = Path(home) / "pollers-overrides.yaml"
+    try:
+        current_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        validate_poller_overrides_text(current_text, path=path)
+        import yaml
+        current = yaml.safe_load(current_text) or {}
+        proposed = dict(current)
+        before = dict(current.get(name, {}))
+        updated = {} if replace else dict(before)
+        for key, value in overrides.items():
+            if value is None:
+                updated.pop(key, None)
+            else:
+                updated[key] = value
+        if updated:
+            proposed[name] = updated
+        else:
+            proposed.pop(name, None)
+
+        body = yaml.safe_dump(
+            proposed,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=True,
+        )
+        validate_poller_overrides_text(body, path=path)
+        # Unlike file-tool content, this scheduler config is never returned as a
+        # trusted filesystem result. Its mutation is audited as the dedicated
+        # set_poller_overrides scheduler sink, so file-read integrity metadata
+        # would not be consumed and is intentionally not recorded here.
+        _atomic_write_text(path, body)
+    except PollerOverridesValidationError as exc:
+        return f"set_poller_overrides failed: {exc}"
+    except Exception as exc:
+        return f"set_poller_overrides failed: {exc}"
+    action = "replaced" if replace else "merged"
+    set_keys = sorted(key for key, value in overrides.items() if value is not None)
+    deleted = sorted(set(before) - set(updated))
+    preserved = sorted(key for key in before if key in updated and key not in set_keys)
+    return (
+        f"set_poller_overrides ok: {action} {name} in {path.name}; "
+        f"set={set_keys}, deleted={deleted}, preserved={preserved}; "
+        "call reload_pollers to apply"
+    )
+
+
+@tool
+async def reload_pollers() -> str:
+    """Re-read pollers.yaml and re-register all pollers.
+
+    Use after editing the file to apply changes without restarting
+    the agent. Returns counts of registered / replaced / removed.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "reload_pollers failed: no scheduler configured"
+    try:
+        stats = await scheduler.reload_pollers()
+    except Exception as exc:
+        return f"reload_pollers failed: {exc}"
+    return (
+        f"reload_pollers ok: total={stats.get('total', 0)} "
+        f"(fresh={stats.get('registered', 0)})"
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Commitments tools (mimir/committools.py)
+# ────────────────────────────────────────────────────────────────────
+
+
+def _commitment_actor(
+    runtime: ToolRuntime[AuthContext] | None,
+) -> tuple[str, bool, bool] | None:
+    """Resolve commitment authority from the exact tool runtime carrier.
+
+    Returns ``(principal, is_admin, is_service)``.  There is deliberately no
+    ContextVar or model-argument fallback: a missing/malformed carrier must not
+    turn into the store's legacy ``actor_principal=None`` compatibility path.
+    """
+    if runtime is None or not isinstance(runtime.context, AuthContext):
+        return None
+    context = runtime.context
+    from ..access_control import get_trusted_service_from_auth_context
+
+    service = get_trusted_service_from_auth_context(context)
+    if service is not None:
+        return f"service:{service.canonical}", False, True
+    principal = context.canonical_principal
+    if principal is None:
+        return None
+    return principal, "admin" in context.roles, context.is_service
+
+
+def _commitment_taint_refusal(
+    runtime: ToolRuntime[AuthContext] | None, operation: str,
+) -> str | None:
+    from ..access_control import saga_mutation_taint_refusal
+
+    context = runtime.context if runtime is not None else None
+    if not isinstance(context, AuthContext):
+        return "authorization context unavailable"
+    refusal = saga_mutation_taint_refusal(context)
+    if refusal is not None:
+        return refusal
+    return None
+
+
+@tool
+async def commitment_propose_closure(
+    commitment_id: str, action: str, evidence: str,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Queue an inert closure for operator approval; never closes a commitment.
+
+    Args:
+        commitment_id: Non-terminal, non-CARE commitment to propose closing.
+        action: complete or dismiss (dismissals require individual approval).
+        evidence: Concrete evidence excerpt; redacted and bounded to 1000 characters.
+    """
+    from .. import access_control
+    from .._context import get_current_turn
+    from ..commitment_proposals import queue_closure
+    from ..commitments.store import run_store_io
+    from ..memory_proposals import ProposalRefusal
+
+    auth = runtime.context if runtime is not None else None
+    turn = get_current_turn()
+    if (not isinstance(auth, AuthContext) or turn is None
+            or turn.auth_context is not auth or not turn.turn_id
+            or not access_control.can_review_commitments(auth)):
+        raise ToolPolicyRefusal("commitment_propose_closure refused: scheduled review authority required")
+    store = _STATE["commitments_store"]
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if store is None or not home:
+        raise ToolPolicyRefusal("commitment_propose_closure refused: store unavailable")
+    records = await store.current_state_async()
+    record = records.get(commitment_id)
+    if record is None:
+        raise ToolPolicyRefusal("commitment_propose_closure refused: unknown commitment")
+    try:
+        pid = await run_store_io(
+            queue_closure, Path(home), record=record, action=action, evidence=evidence,
+            proposed_by=auth.canonical_principal, turn_id=turn.turn_id,
+        )
+    except (ProposalRefusal, OSError, ValueError) as exc:
+        raise ToolPolicyRefusal(f"commitment_propose_closure refused: {exc}") from exc
+    return f"Queued {pid}; nothing closed. Server digest will request operator approval."
+
+
+@tool
+async def commitment_complete(
+    commitment_id: str,
+    message_id: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Mark a tracked commitment as completed.
+
+    Args:
+        commitment_id: The commitment to close out.
+        message_id: Optional message ID that triggered the completion (for audit).
+    """
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_complete failed: no commitments store"
+    refusal = _commitment_taint_refusal(runtime, "commitment_complete")
+    if refusal is not None:
+        raise ToolPolicyRefusal(f"commitment_complete failed: {refusal}")
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_complete failed: authorization context unavailable"
+    actor_principal, actor_is_admin, _ = actor
+    try:
+        result = await store.complete(
+            commitment_id,
+            message_id=message_id,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+    except Exception as exc:
+        return f"commitment_complete failed: {exc}"
+    if not result:
+        return f"commitment_complete failed: {commitment_id} not found or already terminal"
+    return f"commitment_complete ok: id={commitment_id}"
+
+
+@tool
+async def commitment_snooze(
+    commitment_id: str,
+    until_iso: str,
+    reason: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Snooze a commitment until a future ISO datetime.
+
+    Args:
+        commitment_id: The commitment to snooze.
+        until_iso: ISO-8601 datetime when the commitment reactivates (e.g. "2026-05-20T10:00:00Z").
+        reason: Optional snooze reason recorded in the log.
+    """
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_snooze failed: no commitments store"
+    refusal = _commitment_taint_refusal(runtime, "commitment_snooze")
+    if refusal is not None:
+        raise ToolPolicyRefusal(f"commitment_snooze failed: {refusal}")
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_snooze failed: authorization context unavailable"
+    actor_principal, actor_is_admin, _ = actor
+    try:
+        dt = datetime.fromisoformat(until_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # Naive ISO (no Z/offset — the tool's arg spec doesn't forbid it)
+            # is UTC, matching the commitments CLI _parse_iso + the extractor.
+            # Without this, dt.timestamp() reads the SERVER's local tz and the
+            # snooze lands hours off on a non-UTC host (#503).
+            dt = dt.replace(tzinfo=timezone.utc)
+        until_unix = dt.timestamp()
+        result = await store.snooze(
+            commitment_id,
+            until_unix=until_unix,
+            reason=reason,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+    except Exception as exc:
+        return f"commitment_snooze failed: {exc}"
+    if not result:
+        return f"commitment_snooze failed: {commitment_id} not found or already terminal"
+    return f"commitment_snooze ok: id={commitment_id} until={until_iso}"
+
+
+@tool
+async def commitment_dismiss(
+    commitment_id: str,
+    reason: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Dismiss a commitment without completing it.
+
+    Args:
+        commitment_id: The commitment to dismiss.
+        reason: Optional dismissal reason recorded in the log.
+    """
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_dismiss failed: no commitments store"
+    refusal = _commitment_taint_refusal(runtime, "commitment_dismiss")
+    if refusal is not None:
+        raise ToolPolicyRefusal(f"commitment_dismiss failed: {refusal}")
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_dismiss failed: authorization context unavailable"
+    actor_principal, actor_is_admin, _ = actor
+    try:
+        result = await store.dismiss(
+            commitment_id,
+            reason=reason,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+    except Exception as exc:
+        return f"commitment_dismiss failed: {exc}"
+    if not result:
+        return f"commitment_dismiss failed: {commitment_id} not found or already terminal"
+    return f"commitment_dismiss ok: id={commitment_id}"
+
+
+from ..commitments.models import CommitmentStatus as _CommitmentStatus
+
+# Non-terminal statuses worth surfacing to ``commitment_list``. Sourced
+# from the ``CommitmentStatus`` enum so a future rename can't silently
+# drift this set out of sync with the real state machine.
+_ACTIVE_STATUSES = frozenset({
+    _CommitmentStatus.PENDING.value,
+    _CommitmentStatus.DELIVERED.value,
+    _CommitmentStatus.SNOOZED.value,
+})
+
+
+@tool
+async def commitment_list(
+    due_within_days: int = 7,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """List active (non-terminal) commitments, optionally filtered by due window.
+
+    Args:
+        due_within_days: Only include commitments whose due window ends within
+            this many days from now. Pass 0 to list all active commitments
+            regardless of due date (default 7 days).
+    """
+    import time as _time
+    store = _STATE["commitments_store"]
+    if store is None:
+        return "commitment_list failed: no commitments store"
+    actor = _commitment_actor(runtime)
+    if actor is None:
+        return "commitment_list failed: authorization context unavailable"
+    actor_principal, actor_is_admin, actor_is_service = actor
+    try:
+        # This grant is read-only and exact-job-bound, not actor_is_admin.
+        from ..access_control import can_review_commitments
+        review_read = can_review_commitments(runtime.context)
+        # Filter in the store before any record text enters the tool result.
+        all_items = store.list(
+            **({"auth_context": runtime.context} if review_read else {}),
+            actor_principal=actor_principal,
+            # Services need store policy evaluation rather than a caller-side
+            # owner filter so service-visibility opt-in is checked centrally.
+            # The store still enforces exact ownership for every rendered row.
+            owner_principal=None if actor_is_admin or actor_is_service else actor_principal,
+            include_service=actor_is_admin or actor_is_service,
+            actor_is_admin=actor_is_admin,
+        )
+    except Exception as exc:
+        return f"commitment_list failed: {exc}"
+    now = _time.time()
+    cutoff = now + due_within_days * 86400 if due_within_days > 0 else None
+    items = [
+        c for c in all_items
+        if c.status in _ACTIVE_STATUSES
+        and (
+            cutoff is None
+            or c.due_window_end_unix is None  # unbound — always include
+            or c.due_window_end_unix <= cutoff
+        )
+    ]
+    if not items:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
+        label = "all active" if due_within_days == 0 else f"due within {due_within_days} days"
+        return f"(no active commitments — {label})"
+    from ..access_control import protected_result_source, publish_protected_result
+
+    auth_context = runtime.context if runtime is not None else None
+    # ``actor_principal`` is the authority the store used to admit every row.
+    # Legacy/admin-visible records may not carry an owner, so provenance must
+    # retain the authenticated reader rather than emitting an incomplete label.
+    publish_protected_result(tuple(
+        protected_result_source(
+            auth_context,
+            principal=getattr(c, "owner_principal", None) or actor_principal,
+            domain="commitments",
+            resource_id=f"commitment:{c.id}",
+            bridge_instance="mimir",
+            sensitivity="private",
+        )
+        for c in items
+    ))
+    return json.dumps(
+        [
+            {
+                "id": c.id,
+                "text": c.text,
+                "status": c.status,
+                "sensitivity": c.sensitivity,
+                "source_turn_id": c.source_turn_id,
+                "saga_session_id": c.saga_session_id,
+                "channel_id": c.channel_id,
+                "due_window_hint": c.due_window_hint,
+                "due_window_end_unix": c.due_window_end_unix,
+            }
+            for c in items
+        ],
+        indent=2, ensure_ascii=False, default=str,
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Spawn (mimir/spawn.py)
+# ────────────────────────────────────────────────────────────────────
+
+
+# Spawned coding CLIs share concurrency, rate, and recursion-depth caps.
+# The defaults below are conservative and operator-overridable.
+_SPAWN_MAX_CONCURRENT_DEFAULT = 3
+_SPAWN_MAX_PER_HOUR_DEFAULT = 20
+_SPAWN_MAX_DEPTH_DEFAULT = 2
+
+# Env var a child coding subprocess sees so a nested spawn increments
+# before checking against the depth cap.
+_SPAWN_DEPTH_ENV = "MIMIR_SPAWN_DEPTH"
+
+
+def _spawn_current_depth() -> int:
+    return _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(_SPAWN_DEPTH_ENV) else 0
+
+# Minimal-env allowlist for spawned CLI subprocesses (#494). The child
+# runs an independently-prompted agent with shell + web; handing it the
+# parent's full ``os.environ`` would expose every unrelated secret
+# (Discord/Slack tokens, DB URLs, TAVILY/GitHub keys) to a second model
+# that can read its own env and exfiltrate. So we build the child env
+# from an allowlist: infrastructure vars the CLI needs to find binaries,
+# config, and a home, plus only the provider credentials that specific
+# CLI uses. New secrets added to the parent env are excluded by default.
+# Prefixes for benign locale/desktop vars passed through wholesale.
+@dataclass
+class _SpawnGuard:
+    """Process-wide state for spawn caps. Lazy-initialized on first
+    spawn so module import doesn't depend on an asyncio loop being
+    running."""
+
+    sem: asyncio.Semaphore | None = None
+    recent: deque[float] = field(default_factory=deque)
+    rate_lock: asyncio.Lock | None = None
+    max_concurrent: int = _SPAWN_MAX_CONCURRENT_DEFAULT
+    max_per_hour: int = _SPAWN_MAX_PER_HOUR_DEFAULT
+    max_depth: int = _SPAWN_MAX_DEPTH_DEFAULT
+
+
+_SPAWN_GUARD = _SpawnGuard()
+
+
+def _spawn_guard_init() -> _SpawnGuard:
+    """Refresh caps, applying concurrency changes only when fully idle.
+
+    Holders and queued acquires retain the old effective cap, even when
+    the requested cap is lower. No running spawn is preempted. The next
+    invocation with no holders or waiters applies the latest env value;
+    until then ``max_concurrent`` reports the old, enforced limit.
+    """
+    g = _SPAWN_GUARD
+    new_max_concurrent = _env_int_floor1(
+        "MIMIR_SPAWN_MAX_CONCURRENT", _SPAWN_MAX_CONCURRENT_DEFAULT,
+    )
+    g.max_per_hour = _env_int_floor1(
+        "MIMIR_SPAWN_MAX_PER_HOUR", _SPAWN_MAX_PER_HOUR_DEFAULT,
+    )
+    g.max_depth = _env_int_floor1(
+        "MIMIR_SPAWN_MAX_DEPTH", _SPAWN_MAX_DEPTH_DEFAULT,
+    )
+    # locked() alone misses partially occupied semaphores. Inspect both
+    # available permits and the waiter queue, including notified waiters
+    # that have not resumed yet. There is no await across this idle check.
+    if g.sem is None or (
+        g.max_concurrent != new_max_concurrent
+        and g.sem._value == g.max_concurrent
+        and not g.sem._waiters
+    ):
+        g.sem = asyncio.Semaphore(new_max_concurrent)
+        g.max_concurrent = new_max_concurrent
+    if g.rate_lock is None:
+        g.rate_lock = asyncio.Lock()
+    return g
+
+
+def _spawn_reset_for_tests() -> None:
+    """Drop the existing semaphore + lock + rate window so a fresh
+    test gets clean state. Called only from tests."""
+    _SPAWN_GUARD.sem = None
+    _SPAWN_GUARD.rate_lock = None
+    _SPAWN_GUARD.recent.clear()
+
+
+async def _spawn_acquire_rate_slot(
+    guard: _SpawnGuard, tool_name: str,
+) -> tuple[float | None, str | None]:
+    """Check + reserve a per-hour spawn slot.
+
+    Returns ``(token, None)`` if a slot was reserved, where ``token`` is
+    the exact timestamp appended to the sliding window, or
+    ``(None, error)`` if the cap is exhausted. The token lets abort
+    paths remove their own reservation rather than blindly popping the
+    newest entry, which can belong to a concurrent spawn.
+
+    The window is a sliding 3600-second wall-clock window over
+    ``time.monotonic()`` timestamps. The check + append are inside
+    the rate_lock so two concurrent spawns can't both squeeze under
+    the cap on the same tick.
+    """
+    assert guard.rate_lock is not None  # initialized by _spawn_guard_init
+    async with guard.rate_lock:
+        now = time.monotonic()
+        cutoff = now - 3600
+        while guard.recent and guard.recent[0] < cutoff:
+            guard.recent.popleft()
+        if len(guard.recent) >= guard.max_per_hour:
+            oldest_age = int(now - guard.recent[0])
+            return (
+                None,
+                f"{tool_name} refused: per-hour cap "
+                f"({guard.max_per_hour}/h) reached — oldest entry "
+                f"{oldest_age}s ago. Raise MIMIR_SPAWN_MAX_PER_HOUR "
+                f"or wait for the window to roll forward.",
+            )
+        guard.recent.append(now)
+    return now, None
+
+
+async def _spawn_release_rate_slot(guard: _SpawnGuard, token: float | None) -> None:
+    """Release this spawn's reserved rate slot on abort.
+
+    The rate window is shared by concurrent spawn calls, so abort cleanup
+    must remove the exact token returned by ``_spawn_acquire_rate_slot``
+    under the same lock. A blind ``pop()`` can remove a later concurrent
+    spawn's reservation instead.
+    """
+    if token is None:
+        return
+    assert guard.rate_lock is not None
+    async with guard.rate_lock:
+        try:
+            guard.recent.remove(token)
+        except ValueError:
+            # The token may already have aged out during an unusually long
+            # wait; either way, there is no live reservation to release.
+            pass
+
+
+# ────────────────────────────────────────────────────────────────────
+# Pending mimir-package update (mimir/update_on_start.py)
+# ────────────────────────────────────────────────────────────────────
+
+
+@tool
+async def request_mimir_update(
+    target_version: Optional[str] = None,
+    include_prereleases: bool = False,
+) -> str:
+    """Request an authenticated operator approval for a mimir update.
+
+    The tool registers a standalone request that survives the requesting turn.
+    Only an authenticated operator
+    ``approve upd-xxxx`` reply on the operator alert channel writes the flag.
+
+    Suggested conversation before requesting approval:
+      1. A ``mimir_update_available`` event has fired (visible in the
+         per-turn feedback block).
+      2. You raised the available update with the operator in this
+         conversation.
+      3. Ask the operator to reply with the typed request ID; informal
+         acknowledgments do not approve or create a flag.
+
+    What happens after this tool succeeds:
+      - After approval, a flag is written to ``<MIMIR_HOME>/.mimir/pending-update.flag``.
+      - On the NEXT process restart (operator runs ``docker compose
+        restart`` or the equivalent), the startup pre-flight in
+        ``server.main`` runs ``pip install --upgrade``, deletes the
+        flag, and re-execs onto the new code. ``mimir_update_applied``
+        (positive) or ``mimir_update_failed`` (negative) lands in
+        the algedonic block on the first turn after restart.
+      - The running agent (this process) keeps running on the OLD
+        version until the operator restarts.
+
+    Args:
+        target_version: Pin to a specific version (e.g. ``"0.2.0"``).
+            Default empty → pip resolves the latest matching the
+            ``include_prereleases`` setting at install time. Pinning
+            is what you want when the operator explicitly reviewed a
+            specific release; leaving it empty is appropriate when
+            they said "update to whatever's latest."
+        include_prereleases: True → pip ``--pre`` flag passed at
+            install time (alpha / beta / rc accepted). Default False.
+
+    Returns: the request ID and instructions for the operator.
+    """
+    from packaging.version import InvalidVersion, Version
+    from .. import __version__, approval_requests
+    from ..update_on_start import (
+        cultivate_source_install, cultivate_source_refusal, parse_target_version, write_flag,
+    )
+
+    home_env = os.environ.get("MIMIR_HOME")
+    if not home_env:
+        return (
+            "request_mimir_update failed: MIMIR_HOME env not set — "
+            "can't resolve the flag location. (This shouldn't happen "
+            "in a normal deployment; surface to the operator.)"
+        )
+    cleaned_target = (target_version or "").strip()
+    try:
+        target = parse_target_version(cleaned_target)
+    except InvalidVersion:
+        return f"request_mimir_update refused: invalid PEP 440 target version {cleaned_target!r}"
+    if target is not None and target < Version(__version__):
+        return f"request_mimir_update refused: {cleaned_target} is older than running version {__version__}"
+    source = cultivate_source_install()
+    if source is not None:
+        # Startup would refuse this install anyway; don't ask the operator to
+        # approve an update that cannot apply.
+        return f"request_mimir_update refused: {cultivate_source_refusal(source)}. Tell the operator."
+    dispatcher = _STATE.get("dispatcher")
+    channel = (getattr(getattr(dispatcher, "_config", None), "operator_alert_channel", "") or "").strip()
+    if not channel:
+        return "request_mimir_update refused: no operator alert channel configured"
+
+    def resolve(decision, edit, event, identity_resolver, now, approval_event, reply_source):
+        if decision == "decline":
+            return "declined"
+        # The registry authenticates the operator before calling this resolver.
+        canonical = identity_resolver.resolve(event.author)
+        write_flag(
+            Path(home_env), target_version=cleaned_target,
+            include_prereleases=bool(include_prereleases),
+            approval_id=entry.approval_id, approved_by=canonical,
+        )
+        return "granted"
+
+    entry = approval_requests.register(
+        kind="upd", channel_id=channel,
+        description=f"mimir update to {cleaned_target or 'latest'}",
+        expires_at=time.monotonic() + 3600, resolver=resolve, inject_into_turn=False,
+    )
+
+    pin_desc = f"pinned to {cleaned_target}" if cleaned_target else "latest at install time"
+    pre_desc = " (pre-releases allowed)" if include_prereleases else ""
+    return (
+        f"Update approval requested: {entry.approval_id}. No flag written.\n"
+        f"Target: {pin_desc}{pre_desc}.\n"
+        f"Operator: reply `approve {entry.approval_id}` (or `decline {entry.approval_id}`) "
+        f"on {channel} within one hour. After approval and next restart, mimir will run pip install --upgrade and "
+        f"re-exec onto the new code. The running process keeps the "
+        f"OLD version until the operator restarts.\n"
+        f"Operator: run `docker compose restart` (or the equivalent "
+        f"for your deployment) when ready."
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Convenience: assemble all tools for the deepagent factory
+# ────────────────────────────────────────────────────────────────────
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def all_mimir_tools(
+    model_spec: str | None = None,
+    *,
+    require_provider_available: bool = True,
+    policy: "PolicyRegistry | None" = None,
+    materialize_plugins: bool = True,
+    unready_plugin_owners: frozenset[str] = frozenset(),
+) -> list:
+    """Return the full mimir tool surface for create_deep_agent.
+
+    Materializes registered core factories for the selected surfaces and
+    appends dynamically connected MCP tools. Dependency setters are wired
+    by mimir/server.py:build_app.
+
+    ``model_spec`` lets startup authorization inspect the same provider-gated
+    surface before the agent is constructed. Runtime callers may omit it and
+    use ``MIMIR_MODEL_SPEC`` as before.
+
+    Selected-owner assembly validates local prerequisites before identity
+    degradation can hide registration. Declarative inventory checks may pass
+    ``require_provider_available=False`` without probing ambient CLI availability.
+
+    Web tools (Tavily ``web_search`` + ``fetch_url``) are appended
+    only when the active LLM provider is not ``claude_code`` — Claude
+    Code subprocesses ship native WebSearch/WebFetch and stacking
+    Tavily on top would duplicate the surface. See
+    ``mimir.tools.web.web_tools_enabled`` for the gating predicate.
+    """
+    from ..plugins.core import core_runtime_names
+    from .web import web_tools_enabled
+    registry = policy if policy is not None else selected_policy_registry()
+    if not registry.frozen:
+        raise ValueError("tool assembly requires a frozen policy")
+    unavailable_owners = set(unready_plugin_owners)
+
+    def materialize(surface: str) -> list:
+        return [declared.factory() for name in core_runtime_names(surface)
+                if (declared := registry.tools.get(name)) is not None
+                and declared.owner not in unavailable_owners
+                and (materialize_plugins or declared.owner == "core")]
+
+    tools = materialize("default")
+    web_search_on, fetch_url_on = web_tools_enabled(model_spec)
+    if web_search_on or fetch_url_on:
+        if web_search_on:
+            tools.extend(materialize("web_search"))
+        if fetch_url_on:
+            tools.extend(materialize("fetch_url"))
+    selected_owner = getattr(registry.policy_consumer_hooks, "owner", None)
+    if selected_owner is not None:
+        if require_provider_available:
+            missing = []
+            for (owner, stage), hook in registry.turn_hooks.items():
+                if owner == selected_owner and stage == "startup_prerequisites" and owner not in unavailable_owners:
+                    missing.extend(hook())
+            git = Path("/usr/bin/git")
+            if not git.is_file() or not os.access(git, os.X_OK):
+                missing.append(
+                    "the pinned Git binary "
+                    "/usr/bin/git is unavailable"
+                )
+            lease_root_value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+            lease_root = Path(lease_root_value) if lease_root_value else None
+            if lease_root is None or not lease_root.is_absolute():
+                missing.append(
+                    "MIMIR_PR_CHECKOUT_LEASE_ROOT is not configured as an absolute path"
+                )
+            else:
+                try:
+                    if not lease_root.is_dir() or lease_root.is_symlink():
+                        raise OSError("must be an existing directory, not a symlink")
+                    # Probe as the runtime user, including read-only mounts and ACLs.
+                    with tempfile.TemporaryFile(dir=lease_root) as probe:
+                        probe.write(b"coding startup probe")
+                        probe.flush()
+                except OSError as exc:
+                    missing.append(
+                        "MIMIR_PR_CHECKOUT_LEASE_ROOT: configured PR checkout "
+                        f"lease root is unavailable or not writable ({exc})"
+                    )
+            if missing:
+                raise RuntimeError(
+                    "selected coding plugin prerequisites are missing:\n- "
+                    + "\n- ".join(missing)
+                )
+    for (owner, stage), hook in registry.turn_hooks.items():
+        if owner != "core" and stage == "tool_readiness" and hook() is False:
+            unavailable_owners.add(owner)
+    existing = {tool.name for tool in tools}
+    for declared in registry.tools.values() if materialize_plugins else ():
+        if (declared.owner == "core" or declared.factory is None
+                or declared.owner in unavailable_owners or declared.name in existing):
+            continue
+        tool = declared.factory()
+        if getattr(tool, "name", None) != declared.name:
+            raise ValueError(
+                f"plugin {declared.owner}: factory for {declared.name} returned "
+                f"{getattr(tool, 'name', None)!r}"
+            )
+        tools.append(tool)
+        existing.add(tool.name)
+    # MCP-bridged tools (populated by server.py:_on_startup after the
+    # MCP servers come up; empty when MCP is unconfigured).
+    from .mcp import get_mcp_tools
+    tools.extend(get_mcp_tools())
+    # Per-turn tool-call budget gating moved to ``BudgetGateMiddleware``
+    # (mimir/tools/budget_gate.py) and wired via ``create_deep_agent
+    # (middleware=...)`` in agent.py. The middleware intercepts every
+    # tool call — registered AND deepagents built-ins — so the
+    # previous per-tool wrapping pattern (apply_budget_gate) was
+    # removed to avoid double-counting.
+    return tools

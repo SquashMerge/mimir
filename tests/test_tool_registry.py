@@ -1,0 +1,2059 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+import sys
+from dataclasses import FrozenInstanceError, replace
+from types import MappingProxyType, SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from langgraph.prebuilt import ToolNode
+from langgraph.runtime import Runtime
+
+from mimir.access_control import (
+    ChannelResourceAdapter,
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    OperationCatalog,
+    OperationDecision,
+    ResourceScope,
+    ServicePrincipal,
+    ToolRegistry,
+    create_auth_context,
+    get_operation_catalog,
+    get_service_principal,
+)
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
+from mimir.tools import budget_gate
+from mimir.tools.extra import shell_exec
+from mimir.tools.shell_async import bash_async
+
+
+_OLD_ADMIN_TOOLS = {
+    "add_schedule",
+    "set_schedule_priority",
+    "remove_schedule",
+    "reload_pollers",
+    "open_proposal",
+    "submit_proposal",
+    "abandon_proposal",
+    "request_mimir_update",
+    "worklink_run",
+    "shell_exec",
+    "bash_async",
+    "spawn_open_code",
+    "task",
+    "saga_forget",
+    "write_file",
+    "edit_file",
+}
+
+_NEWLY_CATALOGED_TOOLS = {
+    "memory_store": OperationDecision.ADMIN_REQUIRED,
+    "memory_query": OperationDecision.OPEN,
+    "memory_get": OperationDecision.OPEN,
+    "web_search": OperationDecision.OPEN,
+    "fetch_url": OperationDecision.OPEN,
+    "saga_feedback": OperationDecision.ADMIN_REQUIRED,
+    "saga_mark_contributions": OperationDecision.ADMIN_REQUIRED,
+    "saga_end_session": OperationDecision.ADMIN_REQUIRED,
+    "saga_record_skill_learning": OperationDecision.ADMIN_REQUIRED,
+    "bash_jobs_list": OperationDecision.ADMIN_REQUIRED,
+    "bash_job_output": OperationDecision.ADMIN_REQUIRED,
+    "write_todos": OperationDecision.OPEN,
+    "defer_injected_message": OperationDecision.OPEN,
+    "commitment_complete": OperationDecision.OPEN,
+    "commitment_snooze": OperationDecision.OPEN,
+    "commitment_dismiss": OperationDecision.OPEN,
+}
+
+
+def _auth_context(
+    *,
+    trigger: str = "user_message",
+    roles: tuple[str, ...] = ("user",),
+    enforce: bool = False,
+    event_ingress: str | None = None,
+) -> AuthContext:
+    return AuthContext(
+        principal=None,
+        canonical_principal=None,
+        roles=roles,
+        event_ingress=event_ingress,
+        trigger=trigger,
+        channel_id="scheduler:test",
+        interactivity=None,
+        enforcement_enabled=enforce,
+    )
+
+
+def _service_labels(event) -> InformationFlowLabels:
+    principal = f"service:{event.service_principal}" if event.service_principal else None
+    return InformationFlowLabels(
+        labels=frozenset({"internal"}),
+        source_channels=frozenset({event.channel_id}) if event.channel_id else frozenset(),
+        sources=frozenset({SourceLabel(
+            principal=principal,
+            domain="channel",
+            resource_id=event.channel_id,
+            bridge_instance=event.source,
+            sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            integrity="trusted",
+        )}),
+    )
+
+
+def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    assert "spawn_open_code" not in {tool.name for tool in all_mimir_tools()}
+
+
+def test_core_runtime_surface_materializes_registered_factories() -> None:
+    from mimir.plugins.core import core_policy_registry, core_runtime_names
+    from mimir.tools import all_mimir_tools
+    from mimir.tools.web import web_tools_enabled
+
+    registry = core_policy_registry()
+    tools = all_mimir_tools(model_spec="openai:test")
+    assert "send_message" in {tool.name for tool in tools}
+    web_search_on, fetch_url_on = web_tools_enabled("openai:test")
+    expected = (*core_runtime_names("default"),)
+    if web_search_on:
+        expected += core_runtime_names("web_search")
+    if fetch_url_on:
+        expected += core_runtime_names("fetch_url")
+    assert tuple(tool.name for tool in tools) == expected
+    assert all(tool is registry.tools[tool.name].factory() for tool in tools)
+
+
+def test_subagent_budget_gates_share_frozen_parent_policy() -> None:
+    from mimir.plugins.core import core_policy_registry
+    from mimir.subagents import build_mimir_subagents
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    policy = core_policy_registry()
+    parent = BudgetGateMiddleware(policy)
+    children = build_mimir_subagents(policy=policy)
+    assert parent._policy is policy
+    assert len(children) == 2
+    for child in children:
+        gates = [item for item in child["middleware"] if isinstance(item, BudgetGateMiddleware)]
+        assert len(gates) == 1
+        assert gates[0]._policy is policy
+
+
+@pytest.mark.parametrize("selection", [None, "cultivate"])
+def test_default_surface_does_not_import_coding_modules(selection: str | None) -> None:
+    """An unselected, installed provider stays out of the process tool surface.
+
+    The retired core modules no longer exist, so their absence alone proves
+    nothing. The child builds the surface the way the process does, from its own
+    ``MIMIR_PLUGINS`` (never this suite's), and the selected case is the control
+    showing the probe sees provider tools and imports when they are present.
+    """
+    pytest.importorskip(
+        "mimir_cultivate", reason="the provider must be installed for its absence to mean anything",
+    )
+    from tests.test_plugin_policy_parity import CODING_TOOLS, PLUGIN_ONLY_TOOLS
+
+    script = """\
+import importlib.util
+import os
+import sys
+from mimir.plugins.manager import load_plugins
+from mimir.tools.registry import all_mimir_tools
+assert importlib.util.find_spec('mimir_cultivate') is not None
+policy = load_plugins(enable=os.environ.get('MIMIR_PLUGINS', '')).policy
+names = {tool.name for tool in all_mimir_tools(
+    model_spec='openai:test', policy=policy, require_provider_available=False,
+)}
+assert 'send_message' in names, sorted(names)
+exposed = sorted(names & set(sys.argv[1:]))
+loaded = sorted(name for name in sys.modules
+                if name == 'mimir_cultivate' or name.startswith('mimir_cultivate.'))
+if os.environ.get('MIMIR_PLUGINS'):
+    assert {'worklink_run', 'pr_list', 'tracker_file_work'} <= set(exposed), exposed
+    assert 'mimir_cultivate' in loaded, loaded
+else:
+    assert not exposed, exposed
+    assert not loaded, loaded
+"""
+    env = dict(os.environ)
+    env.pop("MIMIR_PLUGINS", None)
+    if selection is not None:
+        env["MIMIR_PLUGINS"] = selection
+    result = subprocess.run(
+        [sys.executable, "-c", script, *sorted(CODING_TOOLS | PLUGIN_ONLY_TOOLS)],
+        env=env, capture_output=True, text=True, check=False, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _selected_cultivate_policy():
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+
+    return load_plugins(enable="cultivate").policy
+
+
+def test_explicitly_selected_missing_provider_is_refused(monkeypatch) -> None:
+    from mimir.plugins import discovery
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setattr(discovery.metadata, "entry_points", lambda **_kwargs: ())
+    with pytest.raises(discovery.PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+        load_plugins(enable="cultivate")
+
+
+def test_coding_tool_is_registered_only_when_enabled_and_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
+
+    names = {tool.name for tool in all_mimir_tools(policy=selected)}
+    assert "spawn_open_code" in names
+    from mimir_cultivate.opencode import spawn_open_code
+    assert next(tool for tool in all_mimir_tools(
+        policy=selected,
+    ) if tool.name == "spawn_open_code") is spawn_open_code
+
+
+def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir.tools import all_mimir_tools
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge as forge_tools
+
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
+    with policy_scope(selected):
+        names = {
+            tool.name
+            for tool in all_mimir_tools(
+                require_provider_available=False, policy=selected,
+            )
+        }
+
+    assert "spawn_open_code" not in names
+    assert "repo_test" not in names
+    assert "pr_metadata" not in names
+    assert forge_tools.initialize_github_forge_identity() is False
+    assert forge_tools.github_identity_is_degraded() is True
+
+
+def test_enabled_coding_without_opencode_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="opencode CLI.*not installed"):
+        all_mimir_tools(policy=selected)
+
+
+def test_enabled_coding_without_checkout_config_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
+    monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
+
+    with pytest.raises(RuntimeError, match="MIMIR_PR_CHECKOUT_LEASE_ROOT"):
+        all_mimir_tools(policy=selected)
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+@pytest.mark.parametrize("root_kind", ["unset", "relative", "missing", "file", "symlink", "unwritable"])
+def test_coding_startup_aggregates_missing_prerequisites(
+    monkeypatch, tmp_path, degraded, root_kind,
+) -> None:
+    from mimir.tools import all_mimir_tools
+    from mimir.tools import registry
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
+    real_access = registry.os.access
+    monkeypatch.setattr(
+        registry.os, "access",
+        lambda path, mode: False if str(path) == "/usr/bin/git" else real_access(path, mode),
+    )
+    root = tmp_path / "leases"
+    if root_kind == "file":
+        root.write_text("not a directory")
+    elif root_kind == "symlink":
+        root.symlink_to(tmp_path, target_is_directory=True)
+    elif root_kind == "unwritable":
+        root.mkdir()
+        # Deterministic even when tests run as root; model a runtime mount denial.
+        def denied(*, dir):
+            assert dir == root
+            raise PermissionError("runtime user cannot write")
+        monkeypatch.setattr(registry.tempfile, "TemporaryFile", denied)
+    monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
+    if root_kind != "unset":
+        monkeypatch.setenv(
+            "MIMIR_PR_CHECKOUT_LEASE_ROOT",
+            "relative/leases" if root_kind == "relative" else str(root),
+        )
+
+    with pytest.raises(RuntimeError) as error:
+        all_mimir_tools(policy=selected)
+    message = str(error.value)
+    assert "opencode CLI" in message
+    assert "pinned Git binary /usr/bin/git" in message
+    assert "MIMIR_PR_CHECKOUT_LEASE_ROOT" in message
+    assert message.count("\n- ") == 3
+    if root_kind == "missing":
+        assert not root.exists()
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, degraded):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.tools import all_mimir_tools
+    from mimir.tools import registry
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
+    monkeypatch.setattr(registry.os, "access", lambda path, mode: True)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
+    with policy_scope(selected):
+        names = {tool.name for tool in all_mimir_tools(policy=selected)}
+    assert ("spawn_open_code" in names) is not degraded
+    assert ("repo_test" in names) is not degraded
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_coding_startup_rejects_existing_relative_lease_root(monkeypatch, tmp_path):
+    from mimir.tools import all_mimir_tools
+
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "leases").mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", "leases")
+    with pytest.raises(RuntimeError, match="not configured as an absolute path"):
+        all_mimir_tools(policy=selected)
+
+
+def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_path):
+    from pathlib import Path
+    from mimir.tools import all_mimir_tools, registry
+
+    git_directory = tmp_path / "git"
+    git_directory.mkdir()
+    monkeypatch.setattr(
+        registry, "Path",
+        lambda value: git_directory if value == "/usr/bin/git" else Path(value),
+    )
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
+    with pytest.raises(RuntimeError, match="pinned Git binary /usr/bin/git"):
+        all_mimir_tools(policy=selected)
+
+
+def test_declarative_coding_inventory_does_not_probe_cli_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = _selected_cultivate_policy()
+
+    def unexpected_probe() -> bool:
+        raise AssertionError("declarative inventory must not probe PATH")
+
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", unexpected_probe)
+
+    names = {
+        tool.name
+        for tool in all_mimir_tools(
+            require_provider_available=False,
+            policy=selected,
+        )
+    }
+    assert "spawn_open_code" in names
+
+
+def test_core_only_policy_exposes_no_typed_repo_pr_tools() -> None:
+    from mimir.access_control import _TYPED_REPO_PR_TOOL_ACTIONS
+    from mimir.plugins.core import core_policy_registry
+
+    assert not _TYPED_REPO_PR_TOOL_ACTIONS
+    assert not {name for name, tool in core_policy_registry().tools.items()
+                if tool.resource_scope == "repo_pr"}
+
+
+def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir.access_control import (
+        SinkCategory,
+        ToolFlowDirection,
+        _TYPED_REPO_PR_TOOL_ACTIONS,
+    )
+    from mimir.tools import all_mimir_tools
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
+
+    default_names = {
+        tool.name for tool in all_mimir_tools(require_provider_available=False)
+    }
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        enabled_names = {
+            tool.name for tool in all_mimir_tools(
+                require_provider_available=False, policy=selected,
+            )
+        }
+    typed_names = {name for name, tool in selected.tools.items()
+                   if tool.resource_scope == "repo_pr"}
+
+    assert typed_names
+    assert not _TYPED_REPO_PR_TOOL_ACTIONS
+    assert typed_names.isdisjoint(default_names)
+    assert typed_names <= enabled_names
+    for name in typed_names:
+        assert selected.tools[name].typed_action is not None
+        direction = ToolFlowDirection(selected.tools[name].flow)
+        assert direction is not ToolFlowDirection.UNKNOWN
+        if direction in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
+            assert selected.tools[name].descriptor.sink_category is not SinkCategory.UNKNOWN
+
+
+def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
+    from mimir.access_control import (
+        ToolFlowDirection,
+        _TYPED_REPO_PR_TOOL_ACTIONS,
+        get_tool_flow_direction,
+    )
+    from mimir.tool_descriptors import TOOL_DESCRIPTORS
+
+    sinks = {
+        name for name in _TYPED_REPO_PR_TOOL_ACTIONS
+        if get_tool_flow_direction(name) in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        }
+    }
+    assert all(TOOL_DESCRIPTORS[name].sink_destination is not None for name in sinks)
+
+
+def test_typed_repo_pr_schemas_only_name_exact_registry_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+    selected = _selected_cultivate_policy()
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    tools = {
+        tool.name: tool
+        for tool in all_mimir_tools(
+            require_provider_available=False, policy=selected,
+        )
+    }
+    typed_names = {
+        name for name, declared in selected.tools.items()
+        if declared.resource_scope == "repo_pr" and declared.factory is not None
+    }
+    assert typed_names
+    forbidden = {"repo", "pr", "pr_number", "url", "host"}
+    for name in typed_names:
+        properties = tools[name].tool_call_schema.model_json_schema()["properties"]
+        assert forbidden.isdisjoint(properties), (name, properties)
+        assert {"repository", "pull_request"} <= set(properties), (name, properties)
+
+
+def test_repo_test_schema_exposes_no_execution_authority() -> None:
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("repo_test schema belongs to installed Cultivate")
+    selected = load_plugins(enable="cultivate").policy
+    assert selected.tools["repo_test"].owner == "cultivate"
+    schema = selected.tools["repo_test"].factory().tool_call_schema.model_json_schema()
+    properties = schema["properties"]
+    assert set(properties) == {"repository", "pull_request", "selectors", "suite", "include_output"}
+    assert properties["include_output"]["default"] is False
+    assert properties["suite"]["default"] is None
+    assert properties["suite"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert "suite" not in schema["required"]
+
+
+def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
+    from mimir.server import build_app
+
+    config = SimpleNamespace()
+    with (
+        patch(
+            "mimir.tools.all_mimir_tools",
+            side_effect=RuntimeError("opencode unavailable"),
+        ) as assemble,
+        pytest.raises(RuntimeError, match="opencode unavailable"),
+    ):
+        build_app(config)
+
+    assemble.assert_called_once_with()
+
+
+@pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
+def test_direct_argv_is_hidden_from_model_tool_schema(shell_tool) -> None:
+    properties = shell_tool.tool_call_schema.model_json_schema()["properties"]
+
+    assert "mimir_direct_argv" not in properties
+    assert "cwd" in properties
+
+
+@pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
+def test_shell_tool_description_states_both_execution_contracts(shell_tool) -> None:
+    description = shell_tool.description
+
+    assert "User/admin" in description
+    assert "bash -lc" in description
+    assert "trusted-service" in description
+    assert "one argv" in description
+    assert "no shell syntax" in description
+
+
+def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
+    catalog = OperationCatalog()
+    resource_scoped = {"write_file", "edit_file"}
+    moved = {"worklink_run", "spawn_open_code"}
+
+    assert _OLD_ADMIN_TOOLS - resource_scoped - moved <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert resource_scoped <= catalog._RESOURCE_SCOPED_OPERATIONS
+    assert moved.isdisjoint(catalog._ADMIN_REQUIRED_OPERATIONS | catalog._RESOURCE_SCOPED_OPERATIONS)
+    assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
+    assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
+
+
+def test_open_catalog_excludes_protected_global_metadata() -> None:
+    catalog = OperationCatalog()
+
+    assert not (
+        catalog._OPEN_OPERATIONS & catalog._PROTECTED_METADATA_OPERATIONS
+    )
+    assert catalog._PROTECTED_METADATA_OPERATIONS <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert {
+        catalog.get_decision("bash_jobs_list"),
+        catalog.get_decision("bash_job_output"),
+    } == {OperationDecision.ADMIN_REQUIRED}
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    _NEWLY_CATALOGED_TOOLS.items(),
+)
+def test_routine_tools_have_explicit_catalog_decisions(
+    operation: str,
+    expected: OperationDecision,
+) -> None:
+    assert OperationCatalog().get_decision(operation) == expected
+
+
+@pytest.mark.parametrize("tool_name", ["web_search", "fetch_url"])
+@pytest.mark.parametrize("roles", [("user",), ("user", "admin")])
+def test_web_tools_are_open_but_remain_network_sinks_when_enforced(
+    tool_name: str,
+    roles: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import SinkCategory, get_sink_category
+
+    target = "https://external.example"
+    if tool_name == "web_search":
+        monkeypatch.setenv("TAVILY_SEARCH_URL", target)
+    else:
+        monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", target)
+    result = ToolRegistry().authorize_tool(
+        tool_name,
+        _auth_context(roles=roles, enforce=True),
+        enforce=True,
+        target_channel=target,
+        ifc_labels=InformationFlowLabels(),
+    )
+
+    assert result.allowed is True
+    assert result.decision == OperationDecision.OPEN
+    assert get_sink_category(tool_name) == SinkCategory.NETWORK
+
+
+def test_web_search_ifc_target_is_the_configured_search_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.budget_gate import _extract_sink_target
+
+    monkeypatch.setenv("TAVILY_SEARCH_URL", "https://search.example/api")
+    request = SimpleNamespace(tool_call={"name": "web_search", "args": {"query": "mimir"}})
+
+    assert _extract_sink_target(request) == "https://search.example/api"
+
+
+@pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
+def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> None:
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    catalog = OperationCatalog()
+    if operation == "task":
+        assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+        return
+    pytest.importorskip("mimir_cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+
+
+def test_spawn_open_code_declares_spawn_sink_destination() -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir.tool_descriptors import TOOL_DESCRIPTORS
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert TOOL_DESCRIPTORS["spawn_open_code"].sink_destination == "spawn_process"
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [("spawn_open_code", False), ("task", True)],
+)
+def test_scheduler_service_principal_can_invoke_factory_operations(
+    operation: str,
+    expected: bool,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    auth = create_auth_context(
+        event, enforce=True, ifc_labels=_service_labels(event),
+    )
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    decision = ToolRegistry().authorize_tool(
+        operation,
+        auth,
+        enforce=True,
+        target_channel=str(tmp_path) if operation == "spawn_open_code" else None,
+    )
+
+    assert decision.allowed is expected
+    assert decision.decision == OperationDecision.ADMIN_REQUIRED
+    assert decision.reason == (None if expected else "unknown_sink_category")
+    if expected:
+        assert decision.service_principal is get_service_principal("scheduled_tick")
+    else:
+        assert decision.service_principal is None
+
+
+def test_unknown_operation_fails_closed_only_when_enforced() -> None:
+    registry = ToolRegistry()
+
+    legacy = registry.authorize_tool("new_unclassified_tool", enforce=False)
+    enforced = registry.authorize_tool("new_unclassified_tool", enforce=True)
+
+    assert legacy.allowed is True
+    assert legacy.is_shadow_decision is True
+    assert enforced.allowed is False
+    assert enforced.reason == "unknown_operation"
+
+
+@pytest.mark.asyncio
+async def test_shadow_decision_is_emitted_on_live_authorization_path() -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    with patch("mimir.event_logger.log_event", new=capture):
+        decision = registry.authorize_tool("new_unclassified_tool", enforce=False)
+        await asyncio.sleep(0)
+
+    assert decision.allowed is True
+    assert captured == [
+        (
+            "shadow_tool_decision",
+            {
+                **decision.as_log_fields(),
+                "would_block": True,
+                "target": None,
+                "requested_target": None,
+                "trigger": None,
+            },
+        )
+    ]
+
+
+def test_resource_scoped_operation_is_gated_by_live_path() -> None:
+    catalog = budget_gate.get_tool_registry()
+    operation_catalog = __import__(
+        "mimir.access_control", fromlist=["get_operation_catalog"]
+    ).get_operation_catalog()
+    operation_catalog.register_operation(
+        "scoped_test_tool",
+        OperationDecision.RESOURCE_SCOPED,
+        [ResourceScope(domain="channel")],
+    )
+
+    try:
+        assert budget_gate._is_admin_sensitive_tool(
+            "scoped_test_tool", _auth_context(enforce=True)
+        )
+    finally:
+        operation_catalog._custom_decisions.pop("scoped_test_tool", None)
+        operation_catalog._resource_scoped_operations.pop("scoped_test_tool", None)
+        catalog.disable_shadow_logging()
+
+
+@pytest.mark.parametrize("operation", [
+    "memory_store", "shell_exec", "send_message", "react", "fetch_channel_history",
+    "custom_hook_operation",
+])
+def test_register_operation_refuses_protected_downgrade(operation: str) -> None:
+    catalog = OperationCatalog()
+    catalog.register_adapter_hook(ChannelResourceAdapter.get_decision)
+    catalog.register_adapter_hook(
+        lambda name, context: OperationDecision.RESOURCE_SCOPED
+        if name == "custom_hook_operation" else None
+    )
+    original_decision = catalog.get_decision(operation)
+
+    with pytest.raises(ValueError, match="cannot downgrade protected operation"):
+        catalog.register_operation(operation, OperationDecision.OPEN)
+
+    assert catalog.get_decision(operation) == original_decision
+
+
+def test_runtime_inventory_replaced_from_final_model_surface() -> None:
+    registry = ToolRegistry()
+    registry.register_tool("stale")
+    tools = [
+        SimpleNamespace(name="native_tool", description="native"),
+        SimpleNamespace(name="write_file", description="built-in"),
+    ]
+
+    registry.register_runtime_tools(tools)
+
+    assert registry.list_tools() == ["native_tool", "write_file"]
+    assert registry.get_tool("native_tool") == {
+        "name": "native_tool",
+        "description": "native",
+        "category": "runtime",
+        "is_native": False,
+        "is_builtin": False,
+        "is_dynamic": False,
+        "is_external": False,
+    }
+
+
+def test_budget_middleware_publishes_final_runtime_inventory_per_model_call() -> None:
+    registry = budget_gate.get_tool_registry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name="existing_tool", description="existing")]
+    )
+    middleware = budget_gate.BudgetGateMiddleware()
+    request = SimpleNamespace(
+        tools=[SimpleNamespace(name="narrow_surface_tool", description="narrow")]
+    )
+
+    result = middleware.wrap_model_call(request, lambda value: value)
+
+    assert result is request
+    assert registry.list_tools() == ["narrow_surface_tool"]
+    assert registry.get_tool("narrow_surface_tool")["description"] == "narrow"
+
+
+@pytest.mark.asyncio
+async def test_budget_middleware_publishes_inventory_on_async_model_path() -> None:
+    registry = budget_gate.get_tool_registry()
+    middleware = budget_gate.BudgetGateMiddleware()
+    request = SimpleNamespace(
+        tools=[SimpleNamespace(name="async_surface_tool", description="async")]
+    )
+
+    async def handler(value: object) -> object:
+        return value
+
+    result = await middleware.awrap_model_call(request, handler)
+
+    assert result is request
+    assert registry.list_tools() == ["async_surface_tool"]
+
+
+@pytest.mark.asyncio
+async def test_final_model_bound_tool_surface_is_fully_cataloged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepagents import HarnessProfile, create_deep_agent
+    from deepagents.backends import StateBackend
+    import deepagents.graph as deepagents_graph
+    from langchain.agents.middleware import TodoListMiddleware
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.subagents import build_mimir_subagents
+    from mimir.tools.registry import all_mimir_tools
+
+    bound_tools: list[list[object]] = []
+
+    class _InventoryModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            bound_tools.append(list(tools))
+            return self
+
+    monkeypatch.setattr(
+        deepagents_graph,
+        "_harness_profile_for_model",
+        lambda *_args: HarnessProfile(extra_middleware=(TodoListMiddleware(),)),
+    )
+    install_deepagents_grep_context_tool()
+    model = _InventoryModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "write_todos",
+            "args": {"todos": [{"content": "Verify inventory", "status": "in_progress"}]},
+            "id": "tc-main-todo",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="done"),
+    ]))
+    agent = create_deep_agent(
+        model=model,
+        tools=all_mimir_tools(model_spec="openai:test"),
+        system_prompt="inventory test",
+        backend=StateBackend(),
+        middleware=[TodoListMiddleware(), budget_gate.BudgetGateMiddleware()],
+        subagents=build_mimir_subagents(),
+    )
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content="finish")]})
+
+    main_tools = next(
+        tools for tools in bound_tools
+        if sum(tool.name == "task" for tool in tools) == 1
+    )
+    main_names = [tool.name for tool in main_tools]
+    filesystem_names = {"ls", "read_file", "write_file", "edit_file", "replace_file", "glob", "grep"}
+    assert set(main_names) & filesystem_names == filesystem_names
+    assert main_names.count("task") == 1
+    assert main_names.count("write_todos") == 1
+    assert "delete" not in main_names
+    assert "execute" not in main_names
+    write_file = next(tool for tool in main_tools if tool.name == "write_file")
+    assert write_file.description == (
+        "Creates a new file and writes the supplied content. It never overwrites an "
+        "existing path; when the target exists, use `edit_file` for a targeted change "
+        "or `replace_file` for its full content. Parent "
+        "directories are created as needed."
+    )
+    assert result["todos"] == [{"content": "Verify inventory", "status": "in_progress"}]
+    runtime_tools = budget_gate.get_tool_registry().list_tools()
+    assert runtime_tools
+    unknown = sorted(
+        name for name in runtime_tools
+        if get_operation_catalog().get_decision(name) is OperationDecision.UNKNOWN
+    )
+    assert unknown == []
+
+
+def test_explicit_service_principals_are_separate_and_frozen() -> None:
+    scheduler = get_service_principal("scheduled_tick")
+    poller = get_service_principal("poller")
+    synthesis = get_service_principal("saga_session_end")
+    system = get_service_principal("upgrade")
+
+    assert scheduler is not None and scheduler.canonical == "scheduler"
+    assert poller is None  # pollers exist only as per-instance carried grants
+    assert synthesis is not None and synthesis.canonical == "synthesis"
+    assert system is not None and system.canonical == "system"
+    assert len({scheduler.canonical, synthesis.canonical, system.canonical}) == 3
+    with pytest.raises(FrozenInstanceError):
+        scheduler.trigger = "forged"
+
+
+@pytest.mark.parametrize(
+    ("trigger", "allowed_operation", "denied_operation", "ifc_allows"),
+    [
+        ("scheduled_tick", "shell_exec", "request_mimir_update", True),
+        ("scheduled_tick", "read_file", "request_mimir_update", True),
+        ("upgrade", "submit_proposal", "spawn_open_code", True),
+        ("upgrade", "read_file", "spawn_open_code", True),
+        ("saga_session_end", "saga_end_session", "spawn_open_code", True),
+        ("saga_session_end", "saga_feedback", "spawn_open_code", True),
+        ("saga_session_end", "mimir_get_turn", "spawn_open_code", True),
+        ("saga_session_end", "memory_get", "spawn_open_code", True),
+    ],
+)
+def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
+    trigger: str,
+    allowed_operation: str,
+    denied_operation: str,
+    ifc_allows: bool,
+    maintenance_git_home,
+) -> None:
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    registry = ToolRegistry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+
+    service_principals = {
+        "scheduled_tick": "scheduler",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }
+
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=f"{trigger}:test",
+        service_principal=service_principals.get(trigger),
+    )
+    labels = _service_labels(event)
+    ctx = create_auth_context(event, enforce=True, ifc_labels=labels)
+    read_arguments = None
+    if trigger == "upgrade" and allowed_operation == "read_file":
+        note = (
+            maintenance_git_home / "scratch" / "proposals"
+            / "upgrade" / "upgrade_defaults" / "notes.md"
+        )
+        note.parent.mkdir(parents=True)
+        note.write_text("proposal notes\n", encoding="utf-8")
+        read_arguments = {"file_path": str(note)}
+
+    admitted = registry.authorize_tool(
+        allowed_operation,
+        ctx,
+        enforce=True,
+        arguments=read_arguments,
+        target_channel=(
+            f"git -C {maintenance_git_home} status"
+            if allowed_operation == "shell_exec"
+            else f"{trigger}:target"
+        ),
+    )
+    denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
+
+    assert admitted.allowed is ifc_allows
+    assert admitted.is_shadow_decision is False
+    if ifc_allows:
+        assert admitted.service_principal is get_service_principal(trigger)
+    else:
+        blocked_category = "spawn" if allowed_operation == "worklink_run" else "file"
+        assert admitted.reason == f"ifc_label_blocked:{blocked_category}"
+    assert denied.allowed is False
+    if trigger == "saga_session_end":
+        assert denied.reason == "session_boundary_capability_denied"
+    elif denied_operation == "spawn_open_code":
+        assert denied.reason == "unknown_sink_category"
+        assert denied.service_principal is None
+    else:
+        assert denied.reason == "admin_required"
+        assert denied.service_principal is get_service_principal(trigger)
+
+
+def test_service_authorization_is_stable_under_inventory_mutation_and_surface_width(
+    maintenance_git_home,
+) -> None:
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    registry = ToolRegistry()
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    scheduler = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
+
+    before = registry.authorize_tool(
+        "shell_exec",
+        scheduler,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
+    )
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+    with_full_surface = registry.authorize_tool(
+        "shell_exec",
+        scheduler,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
+    )
+    denied_with_full_surface = registry.authorize_tool(
+        "request_mimir_update", scheduler, enforce=True
+    )
+    registry.clear()
+    registry.register_runtime_tools([SimpleNamespace(name="send_message")])
+    with_narrow_surface = registry.authorize_tool(
+        "shell_exec",
+        scheduler,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
+    )
+    denied_with_narrow_surface = registry.authorize_tool(
+        "request_mimir_update", scheduler, enforce=True
+    )
+
+    assert before.allowed is True
+    assert with_full_surface.allowed is True
+    assert with_narrow_surface.allowed is True
+    assert denied_with_full_surface.allowed is False
+    assert denied_with_narrow_surface.allowed is False
+
+
+def test_unknown_and_http_triggers_cannot_inherit_service_capabilities() -> None:
+    registry = ToolRegistry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+
+    unknown_trigger = registry.authorize_tool(
+        "shell_exec", _auth_context(trigger="unknown_synthetic", enforce=True), enforce=True
+    )
+    forged_http_trigger = registry.authorize_tool(
+        "shell_exec",
+        _auth_context(trigger="scheduled_tick", enforce=True, event_ingress="http-api"),
+        enforce=True,
+    )
+
+    assert unknown_trigger.allowed is False
+    assert unknown_trigger.service_principal is None
+    assert forged_http_trigger.allowed is False
+    assert forged_http_trigger.service_principal is None
+
+
+def test_service_principal_capability_helpers_are_exact() -> None:
+    principal = ServicePrincipal(
+        canonical="test",
+        trigger="test",
+        capabilities=("one",),
+        readable_domains=("domain",),
+        sink_destinations=("sink",),
+    )
+
+    assert principal.has_capability("one")
+    assert not principal.has_capability("two")
+    assert principal.can_read_domain("domain")
+    assert not principal.can_read_domain("other")
+    assert principal.can_write_sink("sink")
+    assert not principal.can_write_sink("other")
+
+
+def test_capability_matrix_preflight_check_passes_with_complete_matrix() -> None:
+    from mimir.access_control import check_capability_matrix_complete
+
+    is_complete, errors = check_capability_matrix_complete(fail_closed=True)
+    assert is_complete is True
+    assert errors == []
+
+
+@pytest.mark.parametrize("capability", ["shell_exec", "bash_async"])
+def test_shell_job_start_capabilities_declare_inspection_companions(
+    capability: str,
+) -> None:
+    from mimir.access_control import _CAPABILITY_COMPANIONS
+
+    assert _CAPABILITY_COMPANIONS[capability] == frozenset(
+        {"bash_jobs_list", "bash_job_output"}
+    )
+
+
+def test_capability_matrix_rejects_removed_declared_companion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick":
+        replace(
+            scheduler,
+            capabilities=tuple(
+                capability
+                for capability in scheduler.capabilities
+                if capability != "bash_job_output"
+            ),
+        )},
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "capabilities without companions: bash_job_output" in error
+        for error in errors
+    )
+
+
+def test_capability_matrix_preflight_fails_with_incomplete_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import (
+        ServicePrincipal,
+        _TRUSTED_SERVICE_PRINCIPALS,
+        check_capability_matrix_complete,
+    )
+
+    import mimir.access_control as access_control
+
+    captured: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
+            canonical="scheduler",
+            trigger="scheduled_tick",
+            capabilities=(),
+            readable_domains=(),
+            sink_destinations=(),
+        )},
+    )
+
+    is_complete, errors = check_capability_matrix_complete(fail_closed=True)
+    assert is_complete is False
+    assert len(errors) > 0
+    assert any("no capabilities" in e for e in errors)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    assert hard["tool"] == "startup"
+    assert hard["boundary"] == "capability_matrix_preflight"
+    assert hard["reason"] == "capability_matrix_incomplete"
+    assert any("no capabilities" in error for error in hard["target"])
+
+
+def test_capability_matrix_rejects_saga_mutation_without_sink_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    original = access_control.get_tool_descriptor
+    monkeypatch.setattr(
+        access_control,
+        "get_tool_descriptor",
+        lambda name: replace(original(name), sink_destination=None)
+        if name == "memory_store"
+        else original(name),
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' has no sink destination mapping" in errors
+
+
+def test_capability_matrix_rejects_declared_sink_without_ifc_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    original = access_control.get_tool_descriptor
+    monkeypatch.setattr(
+        access_control,
+        "get_tool_descriptor",
+        lambda name: replace(original(name), sink_category=None)
+        if name == "memory_store"
+        else original(name),
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "Sink operation 'memory_store' has no IFC sink category mapping" in errors
+
+
+def test_capability_matrix_rejects_open_saga_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setattr(
+        access_control.OperationCatalog,
+        "_OPEN_OPERATIONS",
+        access_control.OperationCatalog._OPEN_OPERATIONS | {"memory_store"},
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' must not be cataloged OPEN" in errors
+
+
+def test_capability_matrix_rejects_custom_saga_mutation_downgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setitem(
+        access_control._global_operation_catalog._custom_decisions,
+        "memory_store",
+        OperationDecision.OPEN,
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert "SAGA mutation 'memory_store' must not be cataloged OPEN" in errors
+
+
+def test_capability_matrix_rejects_service_sink_without_executable_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from dataclasses import replace
+
+    scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick":
+        replace(
+            scheduler,
+            sink_policies=tuple(
+                policy
+                for policy in scheduler.sink_policies
+                if policy.operation != "shell_exec"
+            ),
+        )},
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "shell_exec' has no executable destination policy" in error
+        for error in errors
+    )
+
+
+def test_capability_matrix_rejects_unbacked_sink_category_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from dataclasses import replace
+
+    synthesis = access_control._TRUSTED_SERVICE_PRINCIPALS["saga_session_end"]
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "saga_session_end":
+        replace(
+            synthesis,
+            sink_destinations=synthesis.sink_destinations + ("notification",),
+        )},
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "sink destination 'notification' has no executable destination policy" in error
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize("fail_closed", [True, False])
+def test_capability_matrix_reports_seeded_errors_for_both_modes(
+    fail_closed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from mimir.access_control import (
+        ServicePrincipal,
+        _TRUSTED_SERVICE_PRINCIPALS,
+        check_capability_matrix_complete,
+    )
+
+    scheduler = _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(access_control, "_TRUSTED_SERVICE_PRINCIPALS", {
+        **_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
+            canonical=scheduler.canonical,
+            trigger=scheduler.trigger,
+            capabilities=(),
+            readable_domains=scheduler.readable_domains,
+            sink_destinations=scheduler.sink_destinations,
+            creation_path=scheduler.creation_path,
+        ),
+    })
+
+    is_complete, errors = check_capability_matrix_complete(fail_closed=fail_closed)
+
+    assert is_complete is False
+    assert any("no capabilities" in error for error in errors)
+
+
+@pytest.mark.asyncio
+async def test_sink_gate_denial_emits_shadow_decision_when_not_enforced() -> None:
+    from mimir.access_control import AccessTier, SinkGate, ToolAuthorization
+
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+    sink_denial = ToolAuthorization(
+        tool_name="write_file",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason="ifc_label_blocked:file",
+        required_tier=AccessTier.ADMIN,
+        enforcement_enabled=False,
+        is_shadow_decision=True,
+        would_block=True,
+    )
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    with (
+        patch.object(SinkGate, "check_sink_flow", return_value=sink_denial),
+        patch("mimir.event_logger.log_event", new=capture),
+    ):
+        decision = registry.authorize_tool(
+            "write_file",
+            enforce=False,
+            target_channel="/tmp/example",
+            ifc_labels=object(),
+        )
+        await asyncio.sleep(0)
+
+    assert decision.allowed is True
+    assert any(
+        kind == "shadow_tool_decision"
+        and fields["reason"] == "ifc_label_blocked:file"
+        for kind, fields in captured
+    )
+
+
+def test_enforcement_enablement_fails_closed_with_incomplete_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+    from mimir.access_control import (
+        CapabilityMatrixError,
+        ServicePrincipal,
+        _TRUSTED_SERVICE_PRINCIPALS,
+        resolve_access_control_enforcement,
+    )
+
+    scheduler = _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(access_control, "_TRUSTED_SERVICE_PRINCIPALS", {
+        **_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
+            canonical=scheduler.canonical,
+            trigger=scheduler.trigger,
+            capabilities=scheduler.capabilities,
+            readable_domains=tuple(
+                domain for domain in scheduler.readable_domains
+                if domain != "filesystem"
+            ),
+            sink_destinations=scheduler.sink_destinations,
+            creation_path=scheduler.creation_path,
+        ),
+    })
+
+    with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
+        resolve_access_control_enforcement(True)
+    assert resolve_access_control_enforcement(False) is False
+
+
+def test_enforcement_enablement_rejects_uncataloged_model_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import (
+        CapabilityMatrixError,
+        resolve_access_control_enforcement,
+    )
+
+    monkeypatch.setattr(
+        "mimir.tools.registry.all_mimir_tools",
+        lambda model_spec=None, **kwargs: [
+            SimpleNamespace(name="deliberately_uncataloged")
+        ],
+    )
+
+    with pytest.raises(
+        CapabilityMatrixError,
+        match="UNKNOWN model-bound tools: deliberately_uncataloged",
+    ):
+        resolve_access_control_enforcement(True, model_spec="openai:test")
+
+
+def test_enforcement_enablement_rejects_cataloged_tool_without_flow_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    name = "deliberately_uncataloged_flow_mutation"
+    monkeypatch.setitem(
+        access_control._global_operation_catalog._custom_decisions,
+        name,
+        OperationDecision.ADMIN_REQUIRED,
+    )
+    monkeypatch.setattr(
+        "mimir.tools.registry.all_mimir_tools",
+        lambda model_spec=None, **kwargs: [SimpleNamespace(name=name)],
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match=f"without explicit IFC flow metadata: {name}",
+    ):
+        access_control.resolve_access_control_enforcement(
+            True, model_spec="openai:test"
+        )
+
+
+def test_enforcement_enablement_rejects_read_backend_flow_misclassification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setattr(
+        access_control, "_TOOL_FLOW_MAP",
+        MappingProxyType({
+            **access_control._TOOL_FLOW_MAP,
+            "read_file": access_control.ToolFlowDirection.SINK,
+        }),
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match="read-backend tools must be IFC SOURCE/BOTH: read_file",
+    ):
+        access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args", "expected"),
+    [
+        ("remove_schedule", {"name": "daily"}, "scheduler:job:daily"),
+        ("reload_pollers", {}, "scheduler:pollers"),
+        ("commitment_snooze", {"commitment_id": "c-1"}, "commitment:c-1"),
+        ("rebuild_index", {"scope": "MEMORY"}, "index:memory"),
+    ],
+)
+def test_mutation_sink_destinations_are_normalized(
+    tool_name: str,
+    args: dict[str, object],
+    expected: str,
+) -> None:
+    from mimir.tools.budget_gate import _extract_sink_target
+
+    request = SimpleNamespace(tool_call={"name": tool_name, "args": args})
+    assert _extract_sink_target(request) == expected
+
+
+@pytest.mark.parametrize(
+    "model_spec",
+    ["claude-code:claude-sonnet-4-6", "claude_code:claude-sonnet-4-6"],
+)
+def test_enforcement_enablement_accepts_claude_code_provider(
+    model_spec: str,
+) -> None:
+    from mimir.access_control import resolve_access_control_enforcement
+
+    assert resolve_access_control_enforcement(True, model_spec=model_spec) is True
+
+
+def test_capability_matrix_report_generates_complete_report() -> None:
+    from mimir.access_control import get_capability_matrix_report
+
+    report = get_capability_matrix_report()
+
+    assert "scheduled_tick" in report
+    assert "poller" not in report
+    assert "saga_session_end" in report
+    assert "upgrade" in report
+
+    for trigger, principal in report.items():
+        assert "canonical" in principal
+        assert "capabilities" in principal
+        assert "readable_domains" in principal
+        assert "sink_destinations" in principal
+        assert "creation_path" in principal
+        assert len(principal["capabilities"]) > 0
+
+
+def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
+    """Verify scheduler principal has all capabilities needed for heartbeat workflow.
+
+    Based on heartbeat.md production prompt:
+    - Reads memory/core files (read_file, ls, glob)
+    - Checks drift by reading files
+    - Reads backlog files
+    - Uses shell for jq analysis (shell_exec, bash_async)
+    - Inspects async shell job status/output
+    - Writes/edits files (write_file, edit_file)
+    """
+    scheduler = get_service_principal("scheduled_tick")
+    assert scheduler is not None
+
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
+    write_ops = {"write_file", "edit_file"}
+    shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
+    spawn_ops = {"task"}
+    schedule_ops = {"list_schedules"}
+    proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
+    saga_ops = {"saga_forget"}
+
+    all_expected = read_ops | write_ops | shell_ops | spawn_ops | schedule_ops | proposal_ops | saga_ops
+    for cap in all_expected:
+        assert scheduler.has_capability(cap), f"scheduler missing {cap}"
+
+    forbidden = {"request_mimir_update", "remove_schedule", "reload_pollers",
+                 "spawn_open_code", "worklink_run"}
+    for cap in forbidden:
+        assert not scheduler.has_capability(cap), f"scheduler should NOT have {cap}"
+
+
+def test_poller_principal_has_required_capabilities() -> None:
+    """There is no class-wide poller grant to inherit or widen."""
+    assert get_service_principal("poller") is None
+
+
+def test_synthesis_principal_has_required_capabilities_for_session_end() -> None:
+    """Synthesis has exactly the trusted-turn curation capabilities."""
+    synthesis = get_service_principal("saga_session_end")
+    assert synthesis is not None
+    assert set(synthesis.capabilities) == {
+        "memory_get", "mimir_get_turn", "saga_feedback", "saga_end_session", "write_file",
+    }
+    assert synthesis.can_write_sink("filesystem")
+    assert not synthesis.can_write_sink("shell_process")
+    assert not synthesis.can_write_sink("network")
+    assert synthesis.sink_policy_for("shell_exec") is None
+    assert synthesis.sink_policy_for("fetch_url") is None
+
+
+@pytest.mark.parametrize("enforce", [False, True], ids=["shadow", "enforced"])
+@pytest.mark.parametrize("operation", [
+    "get_turn", "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
+    "agrep", "file_search", "edit_file", "memory_store", "memory_query",
+    "saga_mark_contributions", "saga_record_skill_learning", "rebuild_index",
+    "shell_exec", "bash_async", "bash_jobs_list", "bash_job_output",
+    "fetch_url", "web_search", "pr_metadata", "pr_checks", "pr_reviews",
+    "spawn_open_code", "task", "add_schedule", "remove_schedule", "send_message",
+    "write_todos", "new_unclassified_tool",
+])
+def test_synthesis_denies_non_capabilities_even_in_shadow(operation, enforce):
+    event = AgentEvent(
+        trigger="saga_session_end", channel_id="synthesis:test",
+        service_principal="synthesis",
+    )
+    context = create_auth_context(event, enforce=enforce, ifc_labels=_service_labels(event))
+    result = ToolRegistry().authorize_tool(operation, context, enforce=enforce)
+
+    assert result.allowed is False
+    assert result.reason == "session_boundary_capability_denied"
+    assert result.decision == OperationDecision.ADMIN_REQUIRED
+    assert result.enforcement_enabled is True
+    assert result.would_block is True
+    assert result.is_shadow_decision is False
+
+
+def test_system_principal_has_required_capabilities_for_upgrade() -> None:
+    """Verify system principal has all capabilities needed for upgrade workflow.
+
+    Based on upgrade.md production prompt:
+    - Reads changed files (read_file, ls, glob)
+    - Uses shell for git commands (shell_exec, bash_async)
+    - Writes/edits files (write_file, edit_file)
+    - Submits proposals (submit_proposal)
+    - Sends operator notifications (send_message)
+    - Manages schedules (add_schedule, set_schedule_priority)
+    - Lists schedules before and after migration changes (list_schedules)
+    """
+    system = get_service_principal("upgrade")
+    assert system is not None
+
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
+    write_ops = {"write_file", "edit_file"}
+    shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
+    proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
+    schedule_ops = {"add_schedule", "set_schedule_priority", "list_schedules"}
+    message_ops = {"send_message"}
+
+    all_expected = read_ops | write_ops | shell_ops | proposal_ops | schedule_ops | message_ops
+    for cap in all_expected:
+        assert system.has_capability(cap), f"system missing {cap}"
+
+    forbidden = {"spawn_open_code", "worklink_run", "saga_forget"}
+    for cap in forbidden:
+        assert not system.has_capability(cap), f"system should NOT have {cap}"
+
+
+def test_adjacent_unauthorized_operations_deny_for_each_principal(
+    maintenance_git_home,
+) -> None:
+    """Verify that unauthorized operations are denied for each service principal.
+
+    Tests boundary: each principal should only be able to use its defined
+    capabilities, and adjacent unauthorized operations should be denied.
+    """
+    registry = ToolRegistry()
+
+    test_cases = [
+        ("scheduled_tick", "shell_exec", True),
+        ("scheduled_tick", "task", True),
+        ("scheduled_tick", "list_schedules", True),
+        ("scheduled_tick", "remove_schedule", False),
+        ("scheduled_tick", "reload_pollers", False),
+        ("saga_session_end", "saga_end_session", True),
+        ("saga_session_end", "shell_exec", False),
+        ("saga_session_end", "spawn_open_code", False),
+        ("saga_session_end", "add_schedule", False),
+        ("upgrade", "submit_proposal", True),
+        ("upgrade", "spawn_open_code", False),
+        ("upgrade", "worklink_run", False),
+    ]
+
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    service_principals = {
+        "scheduled_tick": "scheduler",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }
+
+    for trigger, operation, should_allow in test_cases:
+        event = AgentEvent(
+            trigger=trigger,
+            channel_id=f"{trigger}:test",
+            service_principal=service_principals.get(trigger),
+            source=trigger,
+        )
+        ctx = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
+        result = registry.authorize_tool(
+            operation,
+            ctx,
+            enforce=True,
+            target_channel=(
+                    (
+                        "chainlink issue show 1"
+                        if trigger == "saga_session_end"
+                        else f"git -C {maintenance_git_home} status"
+                    )
+                    if operation == "shell_exec"
+                else None
+            ),
+        )
+
+        if should_allow:
+            assert result.allowed is True, f"{trigger} should allow {operation}"
+        else:
+            assert result.allowed is False, f"{trigger} should deny {operation}"
+            assert result.reason in (
+                "admin_required",
+                "unknown_operation",
+                "service_capability_denied",
+                "session_boundary_capability_denied",
+                "ifc_label_blocked:spawn",
+                "unknown_sink_category",
+            ), f"{trigger} {operation} denied for wrong reason: {result.reason}"
+
+
+@pytest.mark.parametrize(
+    ("trigger", "operation", "target"),
+    [
+        ("scheduled_tick", "bash_jobs_list", None),
+        ("scheduled_tick", "bash_job_output", None),
+        ("saga_session_end", "bash_jobs_list", None),
+        ("saga_session_end", "bash_job_output", None),
+        ("upgrade", "bash_jobs_list", None),
+        ("upgrade", "bash_job_output", None),
+    ],
+)
+def test_service_shell_companions_follow_principal_authority_when_enforced(
+    trigger: str,
+    operation: str,
+    target: str | None,
+) -> None:
+    service_principals = {
+        "scheduled_tick": "scheduler",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=f"{trigger}:test",
+        service_principal=service_principals[trigger],
+        source=trigger,
+    )
+    context = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
+
+    result = ToolRegistry().authorize_tool(
+        operation, context, enforce=True, target_channel=target,
+    )
+
+    assert result.allowed is (trigger != "saga_session_end")
+    if trigger == "saga_session_end":
+        assert result.reason == "session_boundary_capability_denied"
+
+
+def test_service_authorization_requires_two_factor_validation(
+    maintenance_git_home,
+) -> None:
+    """Verify that service authorization requires both is_service=True AND canonical_principal match.
+
+    This tests the fix for the security issue where authorize_tool granted service
+    capabilities based only on trigger matching, without validating the full two-factor
+    proof (is_service + canonical_principal match).
+    """
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    registry = ToolRegistry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+
+    event_correct = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    ctx_correct = create_auth_context(event_correct, enforce=True, ifc_labels=_service_labels(event_correct))
+    result_correct = registry.authorize_tool(
+        "shell_exec",
+        ctx_correct,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
+    )
+    assert result_correct.allowed is True, "Correctly-stamped service should get capabilities"
+    assert result_correct.service_principal is not None
+    assert result_correct.service_principal.canonical == "scheduler"
+
+    event_wrong_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="wrong_principal",
+    )
+    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True, ifc_labels=_service_labels(event_wrong_principal))
+    result_wrong_principal = registry.authorize_tool("shell_exec", ctx_wrong_principal, enforce=True)
+    assert result_wrong_principal.allowed is False, "Mismatched service_principal should be denied"
+    assert result_wrong_principal.reason == "admin_required"
+
+    event_no_service_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+    )
+    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True, ifc_labels=_service_labels(event_no_service_principal))
+    result_no_service_principal = registry.authorize_tool("shell_exec", ctx_no_service_principal, enforce=True)
+    assert result_no_service_principal.allowed is False, "Missing service_principal should be denied"
+    assert result_no_service_principal.reason == "admin_required"
+
+    event_http_ingress = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
+    )
+    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True, ifc_labels=_service_labels(event_http_ingress))
+    result_http_ingress = registry.authorize_tool("shell_exec", ctx_http_ingress, enforce=True)
+    assert result_http_ingress.allowed is False, "HTTP ingress should be denied even with correct service_principal"
+    assert result_http_ingress.reason == "admin_required"
+
+
+def test_service_authorization_shadow_mode_emits_non_blocking_audit() -> None:
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    registry = ToolRegistry()
+    registry.register_runtime_tools(
+        [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
+    )
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    ctx = create_auth_context(event, enforce=False, ifc_labels=_service_labels(event))
+    result = registry.authorize_tool("shell_exec", ctx, enforce=False)
+    assert result.allowed is True
+    assert result.is_shadow_decision is True
+    assert result.reason is None
+
+
+def test_commitment_actor_requires_two_factor_validation() -> None:
+    """Verify that _commitment_actor requires two-factor validation for service authority.
+
+    This tests the fix for the security issue where _commitment_actor granted service
+    authority based only on trigger matching, without validating the full two-factor
+    proof (is_service + canonical_principal match).
+    """
+    from mimir.tools.registry import _commitment_actor
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+
+    class MockRuntime:
+        def __init__(self, context):
+            self.context = context
+
+    event_correct = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    ctx_correct = create_auth_context(event_correct, enforce=True, ifc_labels=_service_labels(event_correct))
+    runtime_correct = MockRuntime(ctx_correct)
+    actor_correct = _commitment_actor(runtime_correct)
+    assert actor_correct is not None
+    assert actor_correct[0] == "service:scheduler"
+    assert actor_correct[2] is True
+
+    event_wrong_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="wrong_principal",
+    )
+    ctx_wrong_principal = create_auth_context(event_wrong_principal, enforce=True, ifc_labels=_service_labels(event_wrong_principal))
+    runtime_wrong_principal = MockRuntime(ctx_wrong_principal)
+    actor_wrong_principal = _commitment_actor(runtime_wrong_principal)
+    assert actor_wrong_principal is None or actor_wrong_principal[0] != "service:scheduler"
+
+    event_no_service_principal = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+    )
+    ctx_no_service_principal = create_auth_context(event_no_service_principal, enforce=True, ifc_labels=_service_labels(event_no_service_principal))
+    runtime_no_service_principal = MockRuntime(ctx_no_service_principal)
+    actor_no_service_principal = _commitment_actor(runtime_no_service_principal)
+    assert actor_no_service_principal is None or actor_no_service_principal[0] != "service:scheduler"
+
+    event_http_ingress = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http-api"},
+    )
+    ctx_http_ingress = create_auth_context(event_http_ingress, enforce=True, ifc_labels=_service_labels(event_http_ingress))
+    runtime_http_ingress = MockRuntime(ctx_http_ingress)
+    actor_http_ingress = _commitment_actor(runtime_http_ingress)
+    assert actor_http_ingress is None or actor_http_ingress[0] != "service:scheduler"
+
+
+@pytest.mark.asyncio
+async def test_injected_runtime_delivered_despite_ifc_labels_regression():
+    """Regression for #971: tool input-parsing must not crash on a bound runtime
+    carrying populated IFC labels — AND must still deliver the injected args.
+
+    langchain's `_parse_input` calls ``model_dump()`` on the parsed args (which
+    include the injected ``ToolRuntime[AuthContext]``) purely to compute the field
+    set; the delivered values come from ``getattr`` on the validated model. The
+    default AuthContext serializer recursed into ``ifc_labels`` (whose
+    ``sources: frozenset[SourceLabel]`` python-serializes to a set of dicts ->
+    ``TypeError: unhashable type: 'dict'``) and ``ifc_state``'s threading.Lock,
+    panicking the whole turn. AuthContext now serializes opaquely — the crash is
+    gone and the injected ``runtime`` (and the server-authorized
+    ``mimir_direct_argv``) still reach the function. Excluding the fields instead
+    would DROP them (these tools use postponed annotations, so langchain's
+    ``_injected_args_keys`` is empty and never reinserts them).
+    """
+    from langchain.tools import ToolRuntime
+
+    from mimir.models import TurnInteractivity
+    from mimir.tools.memory import memory_get
+
+    src = SourceLabel(
+        principal="service:github", domain="channel",
+        resource_id="poller:github-activity", bridge_instance=None,
+        sensitivity="internal",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"internal"}), source_channels=frozenset({"c"}),
+        sources=frozenset({src}),  # non-empty -> the crashing case
+    )
+    ctx = AuthContext(
+        principal="service:github", canonical_principal="service:github",
+        roles=("github",), event_ingress=None, trigger="poller",
+        channel_id="poller:github-activity",
+        interactivity=TurnInteractivity.INTERACTIVE, ifc_labels=labels,
+    )
+    runtime = ToolRuntime(
+        state={}, context=ctx, config={}, stream_writer=lambda _: None,
+        tool_call_id="tc-971", store=None,
+    )
+
+    # The exact path that crashed (`_parse_input`, which model_dump()s the args
+    # whose `runtime` field is typed ToolRuntime[AuthContext]) succeeds AND
+    # delivers the real runtime object to the tool's parsed kwargs.
+    parsed = memory_get._parse_input({"atom_ids": ["a1"], "runtime": runtime}, "tc-971")
+    assert parsed["runtime"] is runtime
+    assert parsed["runtime"].context is ctx
+
+    # The server-authorized direct argv injected by BudgetGateMiddleware must
+    # survive parsing (else trusted-service shell falls back to `bash -lc`).
+    parsed_shell = bash_async._parse_input(
+        {"command": "orig", "mimir_direct_argv": ["git", "status"], "runtime": runtime},
+        "tc-971",
+    )
+    assert parsed_shell["mimir_direct_argv"] == ["git", "status"]
+    assert parsed_shell["runtime"] is runtime
+
+
+def test_typed_plugin_slot_survives_tool_runtime_model_dump_and_injection() -> None:
+    from dataclasses import dataclass
+
+    from langchain.tools import ToolRuntime
+
+    from mimir.access_control import create_auth_context
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir.tools.memory import memory_get
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    source = SourceLabel(
+        principal="alice", domain="channel", resource_id="channel", bridge_instance="test",
+        sensitivity="internal",
+    )
+    labels = InformationFlowLabels().with_source(source)
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="alice"),
+        policy=policy, ifc_labels=labels,
+    ).with_plugin_state(registrar, State("private"))
+    runtime = ToolRuntime(
+        state={}, context=auth, config={}, stream_writer=lambda _: None,
+        tool_call_id="slot-runtime", store=None,
+    )
+    fields = memory_get.args_schema.model_validate({"atom_ids": ["a1"], "runtime": runtime})
+    assert isinstance(fields.model_dump(), dict)
+    parsed = memory_get._parse_input({"atom_ids": ["a1"], "runtime": runtime}, "slot-runtime")
+    assert parsed["runtime"] is runtime
+    assert parsed["runtime"].context is auth
+    assert parsed["runtime"].context.plugin_state("example") == State("private")
+    assert auth.ifc_labels.sources == (source,)
+
+
+def test_hands_sink_flow_and_ifc_inventory_is_exact() -> None:
+    from mimir import access_control
+
+    assert {
+        name: (
+            access_control.get_sink_category(name),
+            access_control.get_tool_flow_direction(name),
+            access_control.get_operation_catalog().get_decision(name),
+            access_control._OPERATION_READABLE_DOMAIN.get(name),
+            (
+                access_control.TOOL_DESCRIPTORS[name].sink_destination
+                if name in access_control.TOOL_DESCRIPTORS
+                else None
+            ),
+            access_control._PROTECTED_RESULT_DOMAINS.get(name),
+        )
+        for name in ("hands_read", "hands_edit", "hands_shell", "hands_python")
+    } == {
+        "hands_read": (
+            access_control.SinkCategory.UNKNOWN,
+            access_control.ToolFlowDirection.SOURCE,
+            access_control.OperationDecision.RESOURCE_SCOPED,
+            "client_provider",
+            None,
+            "client_provider",
+        ),
+        "hands_edit": (
+            access_control.SinkCategory.EXTERNAL_MCP,
+            access_control.ToolFlowDirection.BOTH,
+            access_control.OperationDecision.ADMIN_REQUIRED,
+            None,
+            "client_provider",
+            "client_provider",
+        ),
+        "hands_shell": (
+            access_control.SinkCategory.SHELL_PROCESS,
+            access_control.ToolFlowDirection.BOTH,
+            access_control.OperationDecision.ADMIN_REQUIRED,
+            None,
+            "shell_process",
+            "client_provider",
+        ),
+        "hands_python": (
+            access_control.SinkCategory.SHELL_PROCESS,
+            access_control.ToolFlowDirection.BOTH,
+            access_control.OperationDecision.ADMIN_REQUIRED,
+            "client_provider",
+            "shell_process",
+            "client_provider",
+        ),
+    }
+def test_runtime_worklink_cli_hints_require_operator():
+    """Tool descriptions and refusal literals must not teach a guard bypass."""
+    import ast
+    import re
+    from pathlib import Path
+
+    import mimir
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.registration import worklink_run
+
+    root = Path(mimir.__file__).parent
+    hints = []
+    for module in root.rglob("*.py"):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value
+                if re.search(r"mimir worklink (?:run|resume)", text):
+                    hints.append((module.relative_to(root), text))
+                    assert not re.search(r"(?:use|run|try).*mimir worklink (?:run|resume).*force", text, re.I), module
+                    assert not re.search(r"force.*mimir worklink (?:run|resume)", text, re.I), module
+    assert hints  # Scan must continue to cover actual runtime literals.
+    from mimir_cultivate import registration
+
+    assert "ask the operator to run `mimir worklink run`" in Path(registration.__file__).read_text()
+    assert "Use ``mimir worklink run`` to force" not in worklink_run.description

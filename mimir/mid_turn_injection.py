@@ -1,0 +1,563 @@
+"""Mid-turn user message injection — registry + middleware (issue #376).
+
+PR 1 of the rollout in ``docs/internal/MID_TURN_MESSAGE_INJECTION.md``: the
+per-turn injection registry and the ``before_model`` middleware that folds queued
+user messages into the running turn at the next model-call boundary.
+
+**Dormant until PR 2.** Nothing feeds the queue yet — the dispatcher's
+in-flight routing (which calls :func:`inject_message`) is a later slice. So
+``before_model`` is a no-op (empty queue) on every turn, and wiring the
+middleware into the stack changes no behavior. ``run_turn`` registers an
+in-flight entry per turn and drops it in a ``finally`` so a late inject after
+the turn ends is rejected (``no_active_turn``).
+
+Keying is by ``channel_id`` (the dispatcher serializes per channel, so at most
+one turn per channel is in flight). The middleware reads the current
+``channel_id`` via ``langgraph.config.get_config()`` — NOT off the ``runtime``
+argument, which does not carry the ``RunnableConfig`` (see the spec).
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import HumanMessage
+from langgraph.config import get_config
+
+from .prompt_safety import prefix_prompt_body, sanitize_prompt_field
+
+if TYPE_CHECKING:
+    from .models import AgentEvent, AuthContext
+
+log = logging.getLogger(__name__)
+
+_APPROVAL_FAILURE_EXTRA_KEY = "operator_approval_failure"
+
+
+@dataclass
+class _Inflight:
+    """One in-flight turn's pending-injection queue + liveness flag.
+
+    The queue holds whole ``AgentEvent``s (not just text) so a leftover — a
+    message accepted after the turn's final ``before_model`` boundary — can be
+    re-enqueued faithfully as its own next turn (PR 2), preserving author / ids /
+    trigger. The middleware folds ``event.content`` at the boundary.
+
+    ``folded`` accumulates the events actually drained into the turn so
+    ``run_turn`` can record them durably (``TurnRecord.injected_inputs``,
+    synthesis summary, turn viewer). Each entry is ``(event, fold_monotonic)``
+    where ``fold_monotonic`` is ``time.monotonic()`` at the boundary that folded
+    it — the SAME clock as ``TurnContext.started_at`` (PR 4), so ``run_turn`` can
+    compute a ``t_ms`` offset that lines the message up on the turn-viewer
+    timeline next to the events/tool-calls it interleaved with. ``queue``
+    (pending) and ``folded`` (consumed) are disjoint: ``_drain`` moves events
+    from one to the other.
+
+    ``deferred`` maps the ``source_id`` of a folded message to the reason the
+    agent punted it (chainlink #384 — the ``defer_injected_message`` tool). At
+    turn end ``run_turn`` re-enqueues those events as their own fresh turns and
+    marks the originating turn's ``injected_inputs`` entries ``deferred``.
+    """
+
+    queue: list["AgentEvent"] = field(default_factory=list)
+    folded: list[tuple["AgentEvent", float]] = field(default_factory=list)
+    deferred: dict[str, str] = field(default_factory=dict)
+    emitter: Any | None = None
+    auth_context: "AuthContext | None" = None
+    authenticated_grants: dict[int, Any] = field(default_factory=dict)
+    active: bool = True
+    turn_id: str | None = None
+    allow_user_messages: bool = True
+
+
+# channel_id -> in-flight state. The current LangChain/LangGraph async path
+# calls our sync ``before_model`` directly on the event loop, not in a worker.
+# Keep ``_LOCK`` as defensive protection for synchronous/threaded callers;
+# critical sections must stay short and must not perform blocking I/O.
+_REGISTRY: dict[str, _Inflight] = {}
+_LOCK = threading.Lock()
+
+
+def register_inflight(
+    channel_id: str | None, *, emitter: Any | None = None, turn_id: str | None = None,
+    allow_user_messages: bool = True,
+) -> None:
+    """Mark a turn in-flight for ``channel_id`` (called at ``run_turn`` start).
+
+    Overwrites any prior entry for the channel — the dispatcher serializes per
+    channel, so a leftover entry from a crashed turn is self-healed here.
+    Snapshot the emitter's server-created AuthContext, never ambient turn state.
+    A missing carrier leaves authenticated ingress injection disabled.
+    """
+    if not channel_id:
+        return
+    from .operator_approval import clear_channel
+
+    clear_channel(channel_id)
+    with _LOCK:
+        _REGISTRY[channel_id] = _Inflight(
+            emitter=emitter, auth_context=getattr(emitter, "_auth_context", None),
+            turn_id=turn_id,
+            allow_user_messages=allow_user_messages,
+        )
+
+
+def deactivate(
+    channel_id: str | None,
+) -> tuple[
+    list["AgentEvent"],
+    list[tuple["AgentEvent", float]],
+    list[tuple["AgentEvent", str]],
+]:
+    """Atomically mark the turn done and drop its registry entry.
+
+    Returns ``(leftovers, folded, deferred)`` under the same lock that pops the
+    entry. ``leftovers`` are queued-but-not-folded events accepted after the
+    final ``before_model`` boundary; ``folded`` and ``deferred`` are the durable
+    visibility snapshots that ``run_turn`` records/re-enqueues. Taking all three
+    snapshots atomically also protects against a concurrent synchronous caller
+    draining events from ``queue`` to ``folded`` between separate
+    ``folded_records()``/``deferred_records()`` reads and deactivation.
+    """
+    if not channel_id:
+        return [], [], []
+    from .operator_approval import clear_channel
+
+    with _LOCK:
+        inflight = _REGISTRY.pop(channel_id, None)
+        if inflight is None:
+            clear_channel(channel_id)
+            return [], [], []
+        inflight.active = False
+        snapshot = _snapshot_inflight(inflight)
+    clear_channel(channel_id)
+    return snapshot
+
+
+def _snapshot_inflight(
+    inflight: _Inflight,
+) -> tuple[
+    list["AgentEvent"],
+    list[tuple["AgentEvent", float]],
+    list[tuple["AgentEvent", str]],
+]:
+    """Return copied ``(leftovers, folded, deferred)`` for an in-flight turn.
+
+    Caller must hold ``_LOCK``.
+    """
+    leftovers = list(inflight.queue)
+    folded = list(inflight.folded)
+    deferred = [
+        (e, inflight.deferred[e.source_id])
+        for e, _t in inflight.folded
+        if e.source_id in inflight.deferred
+    ]
+    return leftovers, folded, deferred
+
+
+def inject_startup_messages(channel_id: str | None, events: list["AgentEvent"]) -> int:
+    """Queue startup-drained follow-ups for the active turn (chainlink #383).
+
+    Unlike :func:`inject_message`, this path runs inside ``run_turn`` after
+    :func:`register_inflight` has armed the channel and after the dispatcher has
+    removed the events from its per-channel FIFO. A concurrent ``deactivate``
+    race cannot happen on this path, but keep the same active-entry check so a
+    setup-phase failure never silently parks events on a stale registry. Returns
+    the number accepted.
+    """
+    if not channel_id or not events:
+        return 0
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active:
+            return 0
+        inflight.queue.extend(events)
+        return len(events)
+
+
+def inject_message(channel_id: str, event: "AgentEvent") -> str:
+    """Queue a user-message ``event`` for the in-flight turn on ``channel_id``.
+
+    Returns ``"injected"`` when the turn is active, or ``"no_active_turn"`` when
+    no turn is running (so the dispatcher falls back to enqueuing a fresh event).
+    The whole event is stored so an un-folded leftover re-enqueues faithfully.
+    """
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active or not inflight.allow_user_messages:
+            return "no_active_turn"
+        inflight.queue.append(event)
+        return "injected"
+
+
+def inject_job_completion(channel_id: str, starting_turn_id: str | None, event: "AgentEvent") -> str:
+    """Admit only work owned by this exact live turn (independent of user opt-in)."""
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if (inflight is None or not inflight.active or not starting_turn_id
+                or inflight.turn_id != starting_turn_id):
+            return "no_matching_turn"
+        inflight.queue.append(event)
+        return "injected"
+
+
+def can_inject_authenticated_message(
+    channel_id: str, event: "AgentEvent", resolver: Any,
+) -> bool:
+    """Require a known incoming identity matching the frozen running principal.
+
+    Channel membership and IFC audiences describe data access, not who may issue
+    instructions using the running turn's authority. Unknown ids must not match
+    merely because IdentityResolver.resolve() passes them through unchanged.
+    """
+    from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+    from .models import AuthContext
+
+    # Callers serialize registry access with _LOCK or run synchronously on the
+    # dispatcher thread (startup drain); this function never yields.
+    inflight = _REGISTRY.get(channel_id)
+    auth = inflight.auth_context if inflight is not None and inflight.active else None
+    if (
+        not isinstance(auth, AuthContext)
+        or resolver is None
+        or not auth.principal
+        or not auth.canonical_principal
+        or auth.is_service
+        or auth.trigger != "user_message"
+        or auth.channel_id != channel_id
+        or auth.event_ingress == "http_event"
+        or event.trigger != "user_message"
+        or event.channel_id != channel_id
+        or event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is not None
+    ):
+        return False
+    incoming = resolver.identity(event.author)
+    running = resolver.identity(auth.principal)
+    return (
+        incoming is not None
+        and running is not None
+        and not incoming.access.is_service
+        and incoming.canonical == running.canonical == auth.canonical_principal
+    )
+
+
+def inject_authenticated_message(
+    channel_id: str,
+    event: "AgentEvent",
+    resolver: Any,
+) -> str:
+    """Inject only a same-principal event, then record any operator consent."""
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active:
+            return "no_active_turn"
+        if not can_inject_authenticated_message(channel_id, event, resolver):
+            return "principal_mismatch"
+        from .agent import _initialize_ifc_labels
+        from .approval_requests import pending, resolve
+
+        bare_mp_reply = ((event.content or "").strip().lower() in {"approve", "decline"}
+                         and any(entry.kind == "mp" for entry in pending(channel_id)))
+        event_labels = _initialize_ifc_labels(event, resolver=resolver)
+        reply_source = event_labels.sources[-1] if event_labels.sources else None
+        resolution = resolve(
+            event,
+            resolver,
+            approval_event=event,
+            reply_source=reply_source,
+        )
+        from .memory_proposals import is_mp_reply
+        if (resolution.entry is not None and not resolution.entry.inject_into_turn
+                or resolution.entry is None and (is_mp_reply(event) or bare_mp_reply)):
+            event.extra["_memory_proposal_resolution"] = resolution
+            return "consumed"
+        if resolution.message:
+            event.extra["operator_approval_reply"] = resolution.message
+        if resolution.status == "granted" and resolution.entry is not None and resolution.entry.kind == "op":
+            # The resolver has removed the pending request; use the grant's
+            # immutable binding rather than another channel's request.
+            from .operator_approval import _GRANTS
+
+            grant = _GRANTS.get(resolution.entry.approval_id)
+            if grant is not None and grant.sink_category is not None:
+                inflight.authenticated_grants[id(event)] = grant
+        inflight.queue.append(event)
+        return "injected"
+
+
+def _drain(channel_id: str | None) -> list["AgentEvent"]:
+    """Pop all queued events for ``channel_id`` (FIFO); ``[]`` when none.
+
+    Drained events are recorded on ``folded`` (stamped with the fold time) so
+    :func:`folded_records` can report what the turn absorbed and when (durable
+    visibility).
+    """
+    if not channel_id:
+        return []
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.queue:
+            return []
+        drained = []
+        suppressed = []
+        for event in inflight.queue:
+            job = getattr(event, "_shell_job", None)
+            check = getattr(job, "final_output_observed", None)
+            if event.trigger == "shell_job_complete" and check is not None and check():
+                suppressed.append(event)
+            else:
+                drained.append(event)
+        inflight.queue.clear()
+        authenticated_grants = {
+            id(event): inflight.authenticated_grants.pop(id(event))
+            for event in drained
+            if id(event) in inflight.authenticated_grants
+        }
+        now = time.monotonic()
+        inflight.folded.extend((e, now) for e in drained)
+        emitter = inflight.emitter
+    if suppressed:
+        from .event_logger import log_event_sync
+        for event in suppressed:
+            log_event_sync(
+                "shell_job_complete_suppressed", job_id=event.extra["job_id"],
+                turn_id=event.extra.get("starting_turn_id"), reason="output_observed",
+            )
+    from dataclasses import replace
+
+    from ._context import get_current_turn
+    from .agent import _initialize_ifc_labels, _merge_ifc_labels
+    from .operator_approval import consume_grant
+
+    ctx = get_current_turn()
+    if ctx is not None:
+        for event in drained:
+            event_labels = _initialize_ifc_labels(
+                event, resolver=getattr(ctx, "identity_resolver", None),
+            )
+            ctx.ifc_labels = _merge_ifc_labels(
+                ctx.ifc_labels,
+                event_labels,
+                source_channel=getattr(ctx, "channel_id", None),
+            )
+            if ctx.auth_context is None:
+                continue
+            ctx.ifc_labels, receipt = ctx.auth_context.ifc_state.merge_with_receipt(
+                ctx.ifc_labels,
+                event_identity=event,
+                fresh_untrusted_ingest=event_labels.has_untrusted_active_ingest,
+            )
+            ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
+            request = authenticated_grants.get(id(event))
+            if request is None:
+                continue
+            reply_source = event_labels.sources[-1] if event_labels.sources else None
+            grant = consume_grant(
+                request.channel_id,
+                request.tool_name,
+                request.target,
+                request_id=request.request_id,
+                turn_id=request.turn_id,
+                requesting_principal=request.requesting_principal,
+                sink_category=request.sink_category,
+                request_carrier=request.request_carrier,
+                ifc_state=request.ifc_state,
+                request_source_arrival_ordinal=request.request_source_arrival_ordinal,
+                approval_event=event,
+                reply_source=reply_source,
+            )
+            if grant is None or reply_source is None:
+                continue
+            installed = grant.ifc_state.install_sink_category_capability(
+                sink_category=grant.sink_category,
+                turn_id=grant.turn_id,
+                canonical_principal=grant.requesting_principal,
+                request_carrier=grant.request_carrier,
+                request_source_arrival_ordinal=grant.request_source_arrival_ordinal,
+                approval_event=grant.approval_event,
+                reply_source=grant.reply_source,
+                fold_receipt=receipt,
+            )
+            if not installed:
+                failure = (
+                    f"operator approval {grant.request_id} was invalidated because "
+                    "the turn's information-flow sources changed; request a new approval"
+                )
+                event.extra[_APPROVAL_FAILURE_EXTRA_KEY] = failure
+                log.warning("%s", failure)
+                try:
+                    from .event_logger import log_event_sync
+
+                    log_event_sync(
+                        "operator_approval_install_failed",
+                        channel_id=grant.channel_id,
+                        request_id=grant.request_id,
+                        turn_id=grant.turn_id,
+                        sink_category=grant.sink_category,
+                        reason="information_flow_binding_changed",
+                    )
+                except Exception:  # noqa: BLE001 - observability cannot break folding
+                    log.debug("operator approval failure event emit failed", exc_info=True)
+    if emitter is not None:
+        try:
+            if ctx is not None:
+                emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
+            emitter.injected_input(drained)
+        except Exception:  # noqa: BLE001 — panel telemetry is best-effort
+            log.debug("turn-event injected-input emit failed", exc_info=True)
+    return drained
+
+
+def folded_records(channel_id: str | None) -> list[tuple["AgentEvent", float]]:
+    """``(event, fold_monotonic)`` for every message folded into the in-flight
+    turn on ``channel_id`` so far.
+
+    Read in ``run_turn`` BEFORE :func:`deactivate` pops the entry, so the turn
+    can record the mid-turn inputs it consumed and place them on the timeline
+    (``TurnRecord.injected_inputs`` with a start-relative ``t_ms``). ``[]`` when
+    nothing was folded or the channel has no active turn.
+    """
+    if not channel_id:
+        return []
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None:
+            return []
+        return list(inflight.folded)
+
+
+def defer_message(channel_id: str | None, source_id: str | None, reason: str) -> str:
+    """Mark a folded message as deferred to its own later turn (chainlink #384).
+
+    Returns one of:
+      - ``"deferred"`` — recorded; ``run_turn`` will re-enqueue it as a fresh
+        force-new-turn event at turn end.
+      - ``"not_found"`` — no message with that ``source_id`` was folded into the
+        current turn (the only messages eligible to defer).
+      - ``"already_deferred"`` — idempotent no-op; it's already marked.
+      - ``"no_active_turn"`` — no injectable turn is in flight on the channel.
+
+    Note this only RECORDS intent. Whether the model also answers the deferred
+    message in this turn's final response is a cooperative contract the runtime
+    cannot enforce — the text is already in the model's context.
+    """
+    if not channel_id or not source_id:
+        return "not_found"
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active:
+            return "no_active_turn"
+        if source_id in inflight.deferred:
+            return "already_deferred"
+        if not any(e.source_id == source_id for e, _t in inflight.folded):
+            return "not_found"
+        inflight.deferred[source_id] = reason or ""
+        return "deferred"
+
+
+def deferred_records(channel_id: str | None) -> list[tuple["AgentEvent", str]]:
+    """``(folded_event, reason)`` for every message the agent deferred this turn.
+
+    Read in ``run_turn`` BEFORE :func:`deactivate` pops the entry, so the turn
+    can (a) re-enqueue each as its own fresh turn and (b) mark the matching
+    ``injected_inputs`` entry ``deferred``. ``[]`` when nothing was deferred.
+    """
+    if not channel_id:
+        return []
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None:
+            return []
+        return [
+            (e, inflight.deferred[e.source_id])
+            for e, _t in inflight.folded
+            if e.source_id in inflight.deferred
+        ]
+
+
+def render_injected_message(
+    event: "AgentEvent", *, resolver: object | None = None,
+) -> str:
+    """Render a folded event into the text the model sees mid-turn.
+
+    A normal ``user_message`` reaches the model via
+    ``prompts.build_turn_prompt``, which appends an ``Attachments:`` block and an
+    author / msg-id header to the body. Folding only ``event.content`` would
+    silently drop attachment paths (and authorship) so the model couldn't act on
+    a mid-turn attachment (mimir's #593 review). This mirrors that body
+    rendering so a folded message carries the same actionable content.
+    """
+    if event.trigger == "shell_job_complete":
+        return (
+            f"[background job {sanitize_prompt_field(event.extra.get('job_id', '?'))} finished: "
+            f"{sanitize_prompt_field(event.extra.get('status', '?'))}, "
+            f"exit code {sanitize_prompt_field(event.extra.get('exit_code'))}, "
+            f"elapsed {sanitize_prompt_field(event.extra.get('elapsed_seconds', '?'))}s]\n"
+            f"{prefix_prompt_body(event.content or '(no payload)')}"
+        )
+    if resolver is None:
+        from ._context import get_current_turn
+
+        ctx = get_current_turn()
+        resolver = getattr(ctx, "identity_resolver", None) if ctx is not None else None
+    author = (
+        resolver.display_name(event.author)
+        if resolver is not None and event.author
+        else None
+    )
+    author = sanitize_prompt_field(author or event.author_display or event.author or "-")
+    msg_id_part = (
+        f", msg_id: {sanitize_prompt_field(event.source_id)}"
+        if event.source_id else ""
+    )
+    body = prefix_prompt_body(event.content or "(no content)")
+    if event.attachment_names:
+        paths = "\n".join(
+            f"- {sanitize_prompt_field(path)}" for path in event.attachment_names
+        )
+        body = f"{body}\n\nAttachments:\n{paths}"
+    approval_failure = event.extra.get(_APPROVAL_FAILURE_EXTRA_KEY)
+    if isinstance(approval_failure, str) and approval_failure:
+        failure = sanitize_prompt_field(approval_failure)
+        body = f"{body}\n\n[operator approval refused: {failure}]"
+    return f"[mid-turn message from {author}{msg_id_part}]\n{body}"
+
+
+def _current_channel_id() -> str | None:
+    """Read ``channel_id`` from the live LangGraph config.
+
+    ``get_config()`` raises outside a graph run context (e.g. in a bare unit
+    test that calls ``before_model`` directly without monkeypatching it); treat
+    that as "no channel" so the hook degrades to a no-op rather than erroring.
+    """
+    try:
+        return get_config().get("configurable", {}).get("channel_id")
+    except Exception:  # noqa: BLE001 — no graph context / missing config
+        return None
+
+
+class MidTurnInjectionMiddleware(AgentMiddleware):
+    """Fold queued mid-turn user messages into the running turn at each
+    model-call boundary (issue #376). No-op while the per-turn queue is empty,
+    which is every turn until the dispatcher feeds it (PR 2)."""
+
+    def before_model(self, state, runtime):  # noqa: ANN001 — langchain hook shape
+        # Sync does not mean off-loop: the current framework calls this body
+        # directly on the event loop during async runs. Keep it nonblocking.
+        pending = _drain(_current_channel_id())
+        if not pending:
+            return None  # common case: one dict lookup, no state change
+        # The ``messages`` channel uses an append reducer, so returning new
+        # HumanMessages folds them into the conversation before the next call.
+        # Render each event (content + attachments + author/msg-id) so a
+        # mid-turn attachment isn't dropped — NOT just ``event.content``.
+        return {
+            "messages": [
+                HumanMessage(content=render_injected_message(e)) for e in pending
+            ]
+        }

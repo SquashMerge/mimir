@@ -1,0 +1,716 @@
+"""Tool ports for the deepagents-backed agent.
+
+Three distinct patterns from mimir's earlier tool surface translated to
+LangChain @tool. The remaining tools (channeltools, scheduletools,
+committools, spawn) follow the same patterns.
+
+Patterns covered:
+  1. Filter-args + dependency injection (file_search)
+  2. JSONL read with structured-shape return (get_turn / mimir_get_turn)
+  3. Subprocess execution within the operator-trust boundary (shell_exec)
+
+Each tool's *function-level* dependencies (Indexer, turns_log_path) are
+injected via module-level setter functions, parallel to memory_tool.py's
+set_memory_client pattern; ``server.py:build_app`` wires them at startup.
+"""
+from __future__ import annotations
+
+import json
+import os
+import select
+import signal
+import shlex
+import sqlite3
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Annotated, Any, Optional
+
+from langchain_core.tools import InjectedToolArg, ToolException, tool
+
+
+# ────────────────────────────────────────────────────────────────────
+# Pattern 1: file_search — filter args + Indexer dep injection
+# ────────────────────────────────────────────────────────────────────
+
+_SEARCH_STATE: dict[str, Any] = {"indexer": None}
+
+
+def set_indexer(indexer: Any) -> None:
+    """Inject the Indexer the file_search tool will query against."""
+    _SEARCH_STATE["indexer"] = indexer
+
+
+@tool
+async def file_search(
+    query: str,
+    scope: str = "all",
+    k: int = 5,
+    path_prefix: Optional[str] = None,
+    semantic_weight: Optional[float] = None,
+    keyword_weight: Optional[float] = None,
+    recency_weight: Optional[float] = None,
+) -> str:
+    """Hybrid semantic + keyword search over memory/ and state/ files.
+
+    Use when you need to find a file by topic, not by exact path. If
+    you know the path, call read_file directly instead. Returns up
+    to k results with path, score, snippet, description.
+
+    Scoring: ``score = w_sem·cosine + w_kw·bm25 + w_rec·recency``.
+    Default weights match production tuning (0.5 / 0.2 / 0.3). Override
+    via the weight kwargs to bias a search — e.g. ``recency_weight=0.6``
+    when looking for the latest version of something, or
+    ``semantic_weight=0.8, keyword_weight=0.0`` for pure paraphrase
+    match.
+
+    Args:
+        query: Natural-language search query.
+        scope: One of ``"memory"``, ``"state"``, or ``"all"`` (default).
+        k: Max results to return (1-20, default 5).
+        path_prefix: Optional subdir under ``scope`` to anchor results
+            (e.g. ``"state/journal"`` or ``"state/research"``). Composes
+            with ``scope`` — passing both narrows further. If
+            ``path_prefix`` is inconsistent with ``scope`` (e.g.
+            ``scope="memory", path_prefix="state/journal"``) the
+            result is silently empty — the two filters AND together.
+        semantic_weight: Weight on cosine similarity. ``None`` → use
+            production default (0.5). Must be non-negative.
+        keyword_weight: Weight on BM25 keyword match. ``None`` → 0.2.
+            Must be non-negative.
+        recency_weight: Weight on file-mtime recency decay. ``None`` →
+            0.3. Must be non-negative. Passing all three weights as
+            zero is accepted but yields ``score=0`` for every match,
+            producing arbitrary candidate-pool ordering.
+
+    Returns:
+        JSON-formatted list of matches, or "(no matches)" if empty.
+    """
+    indexer = _SEARCH_STATE["indexer"]
+    if indexer is None:
+        return "file_search failed: no Indexer configured"
+    scope_clean = (scope or "all").strip().lower()
+    if scope_clean not in ("memory", "state", "all"):
+        return (
+            f"file_search failed: scope must be one of memory/state/all "
+            f"(got {scope_clean!r})"
+        )
+    try:
+        k_clean = max(1, min(int(k), 20))
+    except (TypeError, ValueError):
+        k_clean = 5
+    try:
+        from ..read_policy import non_admin_read_filter_enabled
+
+        results = await indexer.search(
+            query, scope=scope_clean, k=k_clean,
+            path_prefix=path_prefix,
+            semantic_weight=semantic_weight,
+            keyword_weight=keyword_weight,
+            recency_weight=recency_weight,
+            include_protected=not non_admin_read_filter_enabled(),
+        )
+    except sqlite3.OperationalError as exc:
+        return f"file_search failed: invalid search query ({exc}); try simpler terms"
+    except ValueError as exc:
+        # Negative-weight rejection from the indexer surfaces as a
+        # readable tool error rather than a generic failure.
+        return f"file_search failed: {exc}"
+    if not results:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
+        return "(no matches)"
+    from .._context import get_current_turn
+    from ..access_control import (
+        invalidate_protected_result_capture,
+        protected_result_source,
+        publish_protected_result,
+    )
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    try:
+        resolved_paths = [
+            str(indexer._abs_path(r.path).resolve(strict=True)) for r in results
+        ]
+    except (OSError, RuntimeError, ValueError):
+        invalidate_protected_result_capture()
+    else:
+        publish_protected_result(tuple(
+            protected_result_source(
+                auth_context,
+                principal="filesystem",
+                domain="filesystem",
+                resource_id=resolved,
+                bridge_instance="filesystem",
+            )
+            for resolved in resolved_paths
+        ))
+    payload = [r.to_dict() for r in results]
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+# ────────────────────────────────────────────────────────────────────
+# rebuild_index — mid-turn manual INDEX.md trigger
+# ────────────────────────────────────────────────────────────────────
+
+_INDEX_GEN_STATE: dict[str, Any] = {"generator": None}
+
+_VALID_SCOPES = frozenset({"memory", "state", "wiki", "all"})
+
+
+def set_index_generator(generator: Any) -> None:
+    """Inject the IndexGenerator the rebuild_index tool will call.
+
+    The IndexGenerator (``mimir.index.IndexGenerator``) manages the
+    human-readable ``memory/INDEX.md``, ``state/INDEX.md``, and
+    ``state/wiki/index.md`` files. It is distinct from the search
+    Indexer (``mimir.search.Indexer``) injected via ``set_indexer``.
+
+    Called once at server startup by ``server.py:build_app``, the same
+    way ``set_indexer`` is called for the search Indexer.
+    """
+    _INDEX_GEN_STATE["generator"] = generator
+
+
+@tool
+async def rebuild_index(scope: str = "all") -> str:
+    """Force-rebuild memory/INDEX.md and/or state/INDEX.md mid-turn.
+
+    The post-turn hook rebuilds all indexes automatically after each
+    turn completes. Use this when a multi-step workflow writes a file
+    in one step and needs the updated INDEX immediately in a later step
+    of the *same* turn — e.g. writing a new wiki concept page and then
+    cross-linking it within the same turn.
+
+    Args:
+        scope: Which index(es) to rebuild. One of ``"memory"``,
+            ``"state"``, ``"wiki"``, or ``"all"`` (default). ``"all"``
+            rebuilds all three.
+
+    Returns:
+        Confirmation string (``rebuild_index ok: scope=<scope>``), or
+        an error string on misconfiguration.
+    """
+    generator = _INDEX_GEN_STATE["generator"]
+    if generator is None:
+        return "rebuild_index failed: no IndexGenerator configured"
+    scope_clean = (scope or "all").strip().lower()
+    if scope_clean not in _VALID_SCOPES:
+        return (
+            f"rebuild_index failed: scope must be one of "
+            f"memory/state/wiki/all (got {scope_clean!r})"
+        )
+    generator.mark_dirty(scope_clean)
+    try:
+        await generator.flush()
+    except Exception as exc:  # noqa: BLE001
+        return f"rebuild_index failed during flush: {type(exc).__name__}: {exc}"
+    return f"rebuild_index ok: scope={scope_clean}"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Pattern 2: mimir_get_turn — JSONL read, structured return
+# ────────────────────────────────────────────────────────────────────
+
+_TURN_STATE: dict[str, Optional[Path]] = {"turns_log_path": None}
+
+
+def set_turns_log_path(path: Path | None) -> None:
+    """Inject the path to turns.jsonl."""
+    _TURN_STATE["turns_log_path"] = path
+
+
+def _read_turn_record(turn_id: str) -> str:
+    """Implementation shared between ``mimir_get_turn`` and its
+    ``get_turn`` alias. Reads turns.jsonl, returns the matching record
+    JSON-formatted with large derived fields stripped, or an error
+    string."""
+    from dataclasses import replace
+    from .._context import get_current_turn
+    from ..access_control import get_trusted_service_from_auth_context
+    from .refusals import ToolPolicyRefusal
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    service = get_trusted_service_from_auth_context(auth_context)
+    synthesis = service is not None and service.authority_profile == "session-boundary"
+    if synthesis and (not turn_id or not turn_id.strip()):
+        raise ToolPolicyRefusal("get_turn refused: turn_id is required")
+    if not turn_id or not turn_id.strip():
+        raise ToolException("get_turn failed: turn_id is required")
+    path = _TURN_STATE["turns_log_path"]
+    if synthesis and (path is None or not path.is_file()):
+        raise ToolPolicyRefusal("get_turn refused: turns log unavailable")
+    if path is None:
+        raise ToolException("get_turn failed: turns log path not configured")
+    if not path.exists():
+        raise ToolException(f"get_turn failed: turns log not found at {path}")
+    target = turn_id.strip()
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("turn_id") == target:
+                from ..read_policy import non_admin_read_filter_enabled
+
+                if synthesis and row.get("integrity") != "trusted":
+                    raise ToolPolicyRefusal("get_turn refused: synthesis requires a trusted turn record")
+                if non_admin_read_filter_enabled():
+                    from ..redaction import redact_payload
+
+                    row = redact_payload(row)
+                # Strip large/derived fields to preserve context budget. NOTE:
+                # ``injected_inputs`` (chainlink #376 mid-turn folds) is small and
+                # deliberately kept — it's the only place the synthesis-visible
+                # reader can see what the turn absorbed beyond ``input``.
+                for k in ("input", "saga_atom_ids", "usage"):
+                    row.pop(k, None)
+                from ..access_control import (
+                    protected_result_source,
+                    publish_protected_result,
+                )
+
+                source = protected_result_source(
+                    auth_context,
+                    principal="mimir:turn-log",
+                    domain="turn_history",
+                    resource_id=f"turn:{target}",
+                    bridge_instance="mimir",
+                )
+                if synthesis:
+                    source = replace(source, integrity="trusted")
+                publish_protected_result((source,))
+                return json.dumps(row, indent=2, ensure_ascii=False)
+    if synthesis:
+        raise ToolPolicyRefusal("get_turn refused: no matching turn record")
+    return f"get_turn: no turn found with id {target!r}"
+
+
+@tool
+def mimir_get_turn(turn_id: str) -> str:
+    """Retrieve the full record for one previous agent turn by its ID.
+
+    The agent's per-turn telemetry (tool calls, tool results, output)
+    lives in ``turns.jsonl``. Use this to dig into what happened on a
+    specific past turn — for debugging, reflection, or auditing.
+
+    Args:
+        turn_id: The 12-char hex turn_id to retrieve.
+
+    Returns:
+        JSON-formatted turn record, with the ``input`` field stripped
+        (it's a derived prompt-render — preserve context budget). Or
+        an error if not found.
+    """
+    return _read_turn_record(turn_id)
+
+
+@tool
+def get_turn(turn_id: str) -> str:
+    """Alias of ``mimir_get_turn`` for back-compat with skill prompts.
+
+    Pre-181-N the tool was named ``get_turn`` on main; the deepagents
+    cutover renamed it to ``mimir_get_turn`` without leaving a shim.
+    Skill markdowns + system prompts that reference the old name would
+    silently fail with "tool not found." Both names work now; prefer
+    ``mimir_get_turn`` going forward (it's namespaced to mimir).
+    """
+    return _read_turn_record(turn_id)
+
+
+# Do not set ``handle_tool_error`` on these aliases.  Synthesis-read policy
+# refusals are ``ToolPolicyRefusal`` instances, and BudgetGateMiddleware must
+# observe those exceptions to record a refusal without tainting the turn.
+
+
+# ────────────────────────────────────────────────────────────────────
+# Pattern 3: shell_exec — subprocess execution within the trust boundary
+# ────────────────────────────────────────────────────────────────────
+#
+# Trust model (chainlink #226): mimir runs inside an operator-trusted
+# container. Both ``shell_exec`` (sync) and ``bash_async`` (long-running)
+# can execute arbitrary commands; the agent is trusted with shell access
+# the same way the operator who launched the container is. There is no
+# in-process allowlist gate — operator-side controls (container
+# isolation, capability drops, filesystem mounts) define the boundary.
+#
+# A previous ``set_shell_allowlist`` affordance existed but was never
+# wired in production and gave a misleading appearance of defence; it
+# was removed in chainlink #226. If you need to restrict shell access,
+# do it at the container layer, or gate ``bash_async`` and ``shell_exec``
+# together — half-gating only the sync path is security theatre.
+
+SHELL_CWD_SESSION_MAX = 256
+_SHELL_STATE: dict[str, Any] = {
+    "cwd_by_session": {},
+    "timeout_s": 60.0,
+}
+_SHELL_STATE_LOCK = threading.Lock()
+_PROJECT_TEST_CAPTURE_BYTES = 64 * 1024
+_SHELL_TERM_GRACE_S = 0.2
+
+
+def _kill_shell_process_group(proc: subprocess.Popen[bytes]) -> str:
+    """Stop an isolated group, or report that only the wrapper could be stopped."""
+    def wrapper_only(reason: str) -> str:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return f"wrapper kill denied; {reason}; descendants may still be running"
+        return f"wrapper-only cleanup; {reason}; descendants may still be running"
+
+    if os.name == "nt":
+        return wrapper_only("process-group cleanup unavailable")
+    # Compare the actual group, not the pid: a non-isolated child has a different
+    # pid but shares our group. An exited isolated leader can still leave children.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = proc.pid
+    except PermissionError:
+        return wrapper_only("process-group lookup denied")
+    if pgid == os.getpgrp():
+        return wrapper_only("process group was not isolated from the server")
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "its process group was killed"
+    except PermissionError:
+        return wrapper_only("process-group signalling denied")
+    # wait() can return as soon as bash exits, while its children are still alive.
+    time.sleep(_SHELL_TERM_GRACE_S)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return wrapper_only("process-group signalling denied")
+    return "its process group was killed"
+
+
+def _run_shell_command(
+    argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    from ..otel_credentials import filter_otlp_env
+
+    proc = subprocess.Popen(  # noqa: S603 - trusted shell wrapper or server-authorized argv
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=cwd, env=filter_otlp_env(env),
+        start_new_session=os.name != "nt",
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            exc.cleanup_message = _kill_shell_process_group(proc)
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
+            # Descendants may retain pipe fds when group signalling was refused.
+            # Never let cleanup turn a bounded command into an unbounded wait.
+            try:
+                proc.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def _remember_shell_cwd(session_id: str, cwd: Path) -> None:
+    """Remember a session cwd in a bounded least-recently-used map."""
+    with _SHELL_STATE_LOCK:
+        cwd_by_session = _SHELL_STATE["cwd_by_session"]
+        cwd_by_session.pop(session_id, None)
+        cwd_by_session[session_id] = cwd
+        while len(cwd_by_session) > SHELL_CWD_SESSION_MAX:
+            cwd_by_session.pop(next(iter(cwd_by_session)))
+
+
+def _remembered_shell_cwd(session_id: str) -> Path | None:
+    """Read and refresh one session's position in the cwd LRU."""
+    with _SHELL_STATE_LOCK:
+        cwd_by_session = _SHELL_STATE["cwd_by_session"]
+        session_cwd = cwd_by_session.pop(session_id, None)
+        if session_cwd is not None:
+            cwd_by_session[session_id] = session_cwd
+        return session_cwd
+
+
+def _run_bounded_project_test(
+    argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    """Run configured tests with bounded capture and kill their process group on timeout."""
+    from ..otel_credentials import filter_otlp_env
+
+    proc = subprocess.Popen(  # noqa: S603 - argv is server-authorized
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=filter_otlp_env(env),
+        start_new_session=os.name != "nt",
+    )
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    stop_draining = threading.Event()
+
+    def drain(name: str, stream: Any) -> None:
+        try:
+            fd = stream.fileno() if os.name != "nt" else None
+        except (OSError, ValueError):
+            fd = None
+        try:
+            while not stop_draining.is_set():
+                if fd is not None:
+                    if not select.select([fd], [], [], 0.1)[0]:
+                        continue
+                    chunk = os.read(fd, 8192)
+                else:
+                    chunk = stream.read(8192)
+                if not chunk:
+                    return
+                captured[name].extend(chunk)
+                del captured[name][:-_PROJECT_TEST_CAPTURE_BYTES]
+        finally:
+            stream.close()
+
+    threads = [
+        threading.Thread(target=drain, args=(name, stream), daemon=True)
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            exc.cleanup_message = _kill_shell_process_group(proc)
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
+    finally:
+        for thread in threads:
+            thread.join(timeout=1)
+        stop_draining.set()
+        for thread in threads:
+            thread.join(timeout=1)
+        # Readers own their streams: closing a BufferedReader from here can
+        # block on its lock while a surviving descendant holds the pipe open.
+    return subprocess.CompletedProcess(
+        argv, returncode, bytes(captured["stdout"]), bytes(captured["stderr"]),
+    )
+
+
+def _initial_shell_cwd() -> Path | None:
+    """Return the startup cwd for shell_exec, independent of process cwd."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    return Path(home).expanduser().resolve()
+
+
+def _shell_session_id() -> str | None:
+    """Return the conversation session that owns interactive shell state."""
+    from .._context import get_current_turn
+
+    turn = get_current_turn()
+    if turn is None:
+        return None
+    return (turn.session_id or turn.channel_id or "").strip() or None
+
+
+def _effective_shell_cwd(
+    cwd: str | None = None, *, allow_session_state: bool = True,
+) -> Path | None:
+    if cwd:
+        return Path(cwd).expanduser()
+    session_id = _shell_session_id() if allow_session_state else None
+    if session_id is not None:
+        session_cwd = _remembered_shell_cwd(session_id)
+        if session_cwd is not None:
+            return Path(session_cwd)
+    if not allow_session_state:
+        return None
+    return _initial_shell_cwd()
+
+
+def _cd_target(command: str, cwd: Path | None) -> Path | None:
+    """Detect simple stateful `cd <dir>` calls after bash succeeds.
+
+    Compound commands still execute normally in their subprocess; only a
+    standalone successful cd updates the cwd used by later shell_exec calls.
+    """
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not parts or parts[0] != "cd" or len(parts) > 2:
+        return None
+    raw_target = parts[1] if len(parts) == 2 else os.environ.get("HOME", "")
+    if raw_target == "-":
+        return None
+    target = Path(raw_target).expanduser()
+    if not target.is_absolute():
+        target = (cwd or Path.cwd()) / target
+    return target.resolve()
+
+
+@tool
+def shell_exec(
+    command: str,
+    cwd: str | None = None,
+    mimir_direct_argv: Annotated[list[str] | None, InjectedToolArg] = None,
+) -> str:
+    """Execute a shell command and return stdout + stderr + exit code.
+
+    User/admin calls run through ``bash -lc`` (a real login shell), so shell
+    syntax works: ``cd``-chains, pipes, redirects, ``&&`` / ``||``, globs,
+    and environment expansion. Under a trusted-service profile, the command
+    must instead be one argv with no shell syntax; the exact authorized argv
+    is executed with ``shell=False``. Recursive content reads are refused when
+    their preflight exceeds 256 entries or 8 MiB, including inside declared
+    read roots; use the typed ``grep`` tool for broad tree searches. Use ``cwd``
+    rather than a leading ``cd DIR &&``. Use ``bash_async`` for jobs that may
+    exceed the sync timeout.
+
+    Args:
+        command: The full shell command line (run via ``bash -lc`` for user/admin calls).
+        cwd: Working directory for the command. Trusted-service calls require an
+            authorized absolute directory and execute with its resolved path.
+        mimir_direct_argv: Server-injected exact argv for trusted-service calls.
+            This is never a model authority surface: middleware replaces it after
+            authorizing the original command.
+
+    Returns:
+        Formatted block: stdout, stderr, exit code.
+    """
+    if not command or not command.strip():
+        raise ToolException("shell_exec failed: command is required")
+    from ._shell_env import (
+        bound_direct_exec_argv, direct_exec_env, interactive_shell_env,
+        login_shell_command, refuse_protected_shell_operands,
+    )
+    direct_argv = bound_direct_exec_argv()
+    if direct_argv is None:
+        direct_argv = mimir_direct_argv
+    # Server-authorized argv must never inherit another session's interactive
+    # cd. An explicit/configured cwd has already been checked by middleware.
+    effective_cwd = _effective_shell_cwd(
+        cwd, allow_session_state=direct_argv is None,
+    )
+    if direct_argv is None:
+        refuse_protected_shell_operands(command, effective_cwd, "shell_exec")
+    argv = (
+        direct_argv
+        if direct_argv is not None
+        else ["bash", "-lc", login_shell_command(command)]
+    )
+    child_env = direct_exec_env(argv) if direct_argv is not None else interactive_shell_env()
+    from ..access_control import configured_project_test_cwd
+
+    is_project_test = (
+        direct_argv is not None
+        and configured_project_test_cwd(direct_argv) is not None
+    )
+    try:
+        if is_project_test:
+            proc = _run_bounded_project_test(
+                argv,
+                cwd=effective_cwd,
+                timeout=_SHELL_STATE["timeout_s"],
+                env=child_env,
+            )
+        else:
+            proc = _run_shell_command(
+                argv,
+                timeout=_SHELL_STATE["timeout_s"],
+                cwd=effective_cwd,
+                env=child_env,
+            )
+    except subprocess.TimeoutExpired as exc:
+        cleanup = getattr(exc, "cleanup_message", "process-group cleanup unconfirmed")
+        prefix = (
+            "shell_exec refused: project_test_timeout after "
+            if is_project_test else "shell_exec timed out after "
+        )
+        raise ToolException(
+            f"{prefix}{_SHELL_STATE['timeout_s']}s; {cleanup} and "
+            "partial side effects may have occurred. Check state before retrying, "
+            "or use bash_async for long jobs."
+        )
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        # Use launch-time evidence, not a racy filesystem probe. Do not expose
+        # paths or raw exception text, or guess when both targets match.
+        filename = os.fsdecode(exc.filename) if exc.filename is not None else None
+        failed_cwd = effective_cwd is not None and filename == os.fspath(effective_cwd)
+        failed_executable = bool(argv) and filename == argv[0]
+        if failed_cwd and not failed_executable:
+            reason = "not found" if isinstance(exc, FileNotFoundError) else "not a directory"
+            raise ToolException(f"shell_exec failed: working directory {reason}") from exc
+        if failed_executable and not failed_cwd:
+            # ENOENT can also mean a missing script interpreter or loader.
+            reason = "file not found" if isinstance(exc, FileNotFoundError) else "not a directory"
+            raise ToolException(
+                f"shell_exec failed: executable could not be started ({reason})"
+            ) from exc
+        raise ToolException(
+            "shell_exec failed: process could not be started (check working directory and executable)"
+        ) from exc
+
+    parts = [f"exit={proc.returncode}"]
+    stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
+    if direct_argv is not None:
+        from ._shell_env import direct_exec_redact_names, redact_direct_exec_output
+
+        names = direct_exec_redact_names(argv)
+        stdout = redact_direct_exec_output(stdout, child_env, names)
+        stderr = redact_direct_exec_output(stderr, child_env, names)
+    if proc.returncode == 0:
+        target = _cd_target(command, effective_cwd)
+        session_id = _shell_session_id() if direct_argv is None else None
+        if target is not None and target.is_dir() and session_id is not None:
+            _remember_shell_cwd(session_id, target)
+    for name, output, limit in (("stdout", stdout, 4000), ("stderr", stderr, 2000)):
+        if output:
+            if len(output) > limit:
+                output = (
+                    output[:limit // 2]
+                    + f"\n[shell {name} truncated]\n"
+                    + output[-limit // 2:]
+                )
+            parts.append(f"{name}:\n{output}")
+    result = "\n\n".join(parts)
+    if proc.returncode != 0:
+        raise ToolException(result)
+    return result
+
+
+shell_exec.handle_tool_error = True

@@ -1,0 +1,553 @@
+"""Tests for the Codex Plus end-to-end wire-up.
+
+Covers the four glue points that connect ``langchain-codex-plus`` to
+mimir's existing quota infrastructure:
+
+* ``RateLimitStore.record_sync`` — sync writer used by the chat
+  model's rate-limit callback (sync because we don't want to assume
+  whether the callback fires on the event loop or a thread executor).
+* ``make_codex_plus_rate_limit_callback`` — transcribes a
+  :class:`langchain_codex_plus.CodexRateLimits` snapshot into the
+  ``openai_five_hour`` / ``openai_seven_day`` keys
+  :class:`OpenAIQuotaProvider` reads.
+* ``mimir.agent._resolve_model`` — recognizes ``codex-plus:`` specs
+  and lazy-imports :class:`langchain_codex_plus.ChatCodexPlus`.
+* ``mimir.model_registry.detect_route`` — routes ``--subscription``
+  on a gpt-shaped model to ``codex-plus:`` (different protocol),
+  keeps the existing ``openai:`` route for pay-per-token API.
+"""
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from mimir.billing import (
+    BillingMode,
+    OpenAIQuotaProvider,
+    build_quota_providers,
+    make_codex_plus_rate_limit_callback,
+)
+from mimir.model_registry import detect_route
+from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
+
+
+# ─── RateLimitStore.record_sync ────────────────────────────────────────
+
+
+def test_record_sync_writes_snapshot_to_disk(tmp_path: Path):
+    """The sync path produces the same on-disk JSON shape as the
+    async ``record`` method — ``OpenAIQuotaProvider.current()`` can
+    read either."""
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    snap = RateLimitSnapshot(
+        status="allowed",
+        utilization=0.42,
+        resets_at=int(time.time() + 3600),
+        observed_at="2026-05-21T03:00:00+00:00",
+    )
+    store.record_sync("openai_five_hour", snap)
+    loaded = store.current()
+    assert "openai_five_hour" in loaded
+    assert loaded["openai_five_hour"].utilization == pytest.approx(0.42)
+    assert loaded["openai_five_hour"].status == "allowed"
+
+
+def test_record_sync_overwrites_existing_key(tmp_path: Path):
+    """Last-write-wins: subsequent calls replace the existing entry."""
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    now = int(time.time())
+    s1 = RateLimitSnapshot(
+        status="allowed", utilization=0.10, resets_at=now + 3600,
+        observed_at="t1",
+    )
+    s2 = RateLimitSnapshot(
+        status="allowed", utilization=0.85, resets_at=now + 3600,
+        observed_at="t2",
+    )
+    store.record_sync("openai_five_hour", s1)
+    store.record_sync("openai_five_hour", s2)
+    loaded = store.current()
+    assert loaded["openai_five_hour"].utilization == pytest.approx(0.85)
+    assert loaded["openai_five_hour"].observed_at == "t2"
+
+
+def test_record_sync_preserves_other_keys(tmp_path: Path):
+    """Writing one key doesn't blow away unrelated entries (e.g., the
+    Anthropic snapshots that the OAuth poller wrote earlier)."""
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    now = int(time.time())
+    ant = RateLimitSnapshot(
+        status="allowed", utilization=0.5, resets_at=now + 3600,
+        observed_at="t",
+    )
+    oai = RateLimitSnapshot(
+        status="allowed", utilization=0.1, resets_at=now + 3600,
+        observed_at="t",
+    )
+    store.record_sync("five_hour", ant)
+    store.record_sync("openai_five_hour", oai)
+    loaded = store.current()
+    assert "five_hour" in loaded
+    assert "openai_five_hour" in loaded
+    assert loaded["five_hour"].utilization == pytest.approx(0.5)
+
+
+# ─── make_codex_plus_rate_limit_callback ──────────────────────────────
+
+
+class _FakeQuotaWindow:
+    """Stand-in for ``langchain_codex_plus.CodexQuotaWindow`` — avoids
+    pulling in the real package for unit tests of the bridge."""
+
+    def __init__(
+        self,
+        used_percent: float,
+        window_minutes: int | None = None,
+        reset_at: int | None = None,
+        reset_after_seconds: int | None = None,
+    ) -> None:
+        self.used_percent = used_percent
+        self.window_minutes = window_minutes
+        self.reset_at = reset_at
+        self.reset_after_seconds = reset_after_seconds
+
+
+class _FakeRateLimits:
+    def __init__(
+        self,
+        primary: _FakeQuotaWindow | None = None,
+        secondary: _FakeQuotaWindow | None = None,
+    ) -> None:
+        self.primary = primary
+        self.secondary = secondary
+        self.plan_type = "plus"
+        self.active_limit = "premium"
+        self.credits = None
+        self.primary_over_secondary_limit_percent = None
+
+
+def test_callback_writes_primary_to_openai_five_hour(tmp_path: Path):
+    """Mapping: ``primary`` (5h window in Codex's vocabulary) →
+    ``openai_five_hour`` (the key OpenAIQuotaProvider reads).
+    Percent (0-100) → utilization (0-1)."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=1.0, window_minutes=300,
+            reset_at=int(time.time() + 5 * 3600),
+        ),
+    ))
+    loaded = store.current()
+    assert "openai_five_hour" in loaded
+    assert loaded["openai_five_hour"].utilization == pytest.approx(0.01)
+    # No secondary in the input → no secondary written.
+    assert "openai_seven_day" not in loaded
+
+
+def test_callback_writes_both_windows_when_present(tmp_path: Path):
+    """Both windows present → both keys written. Percent-to-fraction
+    conversion checked on both."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    # Use timestamps in the future — ``RateLimitStore.current()``
+    # filters entries whose ``resets_at`` is in the past as stale.
+    # (Pinning absolute unix-ts here was a latent bug that surfaced
+    # ~5h after a fixed value goes past now().)
+    primary_reset = int(time.time()) + 5 * 3600        # 5h window
+    secondary_reset = int(time.time()) + 7 * 24 * 3600  # 7d window
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(used_percent=25.0, window_minutes=300, reset_at=primary_reset),
+        secondary=_FakeQuotaWindow(used_percent=8.0, window_minutes=10080, reset_at=secondary_reset),
+    ))
+    loaded = store.current()
+    assert loaded["openai_five_hour"].utilization == pytest.approx(0.25)
+    assert loaded["openai_five_hour"].resets_at == primary_reset
+    assert loaded["openai_seven_day"].utilization == pytest.approx(0.08)
+    assert loaded["openai_seven_day"].resets_at == secondary_reset
+
+
+def test_callback_maps_by_window_length_pro_plan_7d_as_primary(tmp_path: Path):
+    """Pro-plan shape: the backend reports the 7-day window as PRIMARY
+    (window_minutes=10080) with an empty secondary (window_minutes=0). The 7d
+    usage must land in ``openai_seven_day`` — not ``openai_five_hour`` by
+    position — and no false 5h entry is written. Regression for the "7-day
+    usage shows 0%" bug (position-based mapping put the real 7d value under the
+    5h key and read the empty secondary for 7d)."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    reset_7d = int(time.time()) + 7 * 24 * 3600
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=9.0, window_minutes=10080, reset_at=reset_7d,
+        ),
+        secondary=_FakeQuotaWindow(
+            used_percent=0.0, window_minutes=0, reset_at=None,
+        ),
+    ))
+    loaded = store.current()
+    assert loaded["openai_seven_day"].utilization == pytest.approx(0.09)
+    assert loaded["openai_seven_day"].resets_at == reset_7d
+    # Empty secondary (window_minutes=0) is skipped; no 5h window exists.
+    assert "openai_five_hour" not in loaded
+
+
+def test_callback_reconciles_stale_misclassified_five_hour(tmp_path: Path):
+    """Migration path (chainlink #874): an older position-based mapper had
+    stored the Pro plan's 7-day usage under ``openai_five_hour`` with the
+    7-DAY reset. That reset is in the future, so ``current()`` will NOT drop
+    it as stale — it would linger as a phantom 5h bucket for up to a week.
+    A single Pro-shaped callback (7d primary, empty secondary) must remove
+    that absent-this-round owned key in the same atomic write, leaving only
+    the correct 7d entry."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    reset_7d = int(time.time()) + 7 * 24 * 3600
+    # Seed the stale, misclassified record: 7d value + 7d reset under the 5h key.
+    store.record_sync(
+        "openai_five_hour",
+        RateLimitSnapshot(status="allowed", utilization=0.09, resets_at=reset_7d),
+    )
+    assert "openai_five_hour" in store.current()  # future reset → survives staleness filter
+
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=9.0, window_minutes=10080, reset_at=reset_7d,
+        ),
+        secondary=_FakeQuotaWindow(
+            used_percent=0.0, window_minutes=0, reset_at=None,
+        ),
+    ))
+
+    loaded = store.current()
+    assert loaded["openai_seven_day"].utilization == pytest.approx(0.09)
+    # Phantom 5h key is gone — from the live view AND from disk (not merely
+    # filtered), proving reconcile deleted it rather than staleness hiding it.
+    assert "openai_five_hour" not in loaded
+    assert "openai_five_hour" not in store._load()
+
+
+def test_callback_windowless_response_preserves_existing_records(tmp_path: Path):
+    """Guard on the reconcile: a response carrying no usable window
+    (``used_percent`` omitted) must NOT wipe a previously-recorded window —
+    reconcile only runs when at least one window was reported this round, so
+    a transient headerless response never blanks the panel."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    reset_5h = int(time.time()) + 5 * 3600
+    store.record_sync(
+        "openai_five_hour",
+        RateLimitSnapshot(status="allowed", utilization=0.25, resets_at=reset_5h),
+    )
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(primary=_FakeQuotaWindow(used_percent=None)))
+    loaded = store.current()
+    assert loaded["openai_five_hour"].utilization == pytest.approx(0.25)
+
+
+def test_callback_refuses_ambiguous_window_and_preserves_existing_records(tmp_path: Path):
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    reset_7d = int(time.time()) + 7 * 24 * 3600
+    store.record_sync(
+        "openai_seven_day",
+        RateLimitSnapshot(status="allowed", utilization=0.4, resets_at=reset_7d),
+    )
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(used_percent=90.0, reset_at=reset_7d),
+    ))
+    loaded = store.current()
+    assert "openai_five_hour" not in loaded
+    assert loaded["openai_seven_day"].utilization == pytest.approx(0.4)
+
+
+def test_callback_skips_when_used_percent_missing(tmp_path: Path):
+    """A window with ``used_percent=None`` (gateway omitted the
+    header) — skip rather than write a misleading utilization=0."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(used_percent=None),
+    ))
+    assert store.current() == {}
+
+
+def test_callback_observed_at_is_iso_utc(tmp_path: Path):
+    """The observed_at field gets stamped with the current UTC time
+    in ISO format — used for staleness checks elsewhere."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    before = datetime.now(tz=timezone.utc)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=5.0,
+            window_minutes=300,
+            reset_at=int(time.time() + 3600),
+        ),
+    ))
+    after = datetime.now(tz=timezone.utc)
+    obs = datetime.fromisoformat(
+        store.current()["openai_five_hour"].observed_at
+    )
+    assert before <= obs <= after
+
+
+def test_callback_preserves_relative_reset_and_uses_it_as_fallback(tmp_path: Path):
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    before = int(time.time())
+    callback(_FakeRateLimits(primary=_FakeQuotaWindow(
+        used_percent=95.0,
+        window_minutes=300,
+        reset_at=None,
+        reset_after_seconds=120,
+    )))
+    snap = store.current()["openai_five_hour"]
+    assert snap.reset_after_seconds == 120
+    assert before + 119 <= snap.resets_at <= int(time.time()) + 121
+
+
+def test_callback_tolerates_none_input(tmp_path: Path):
+    """``ChatCodexPlus`` fires the callback only when headers parse
+    cleanly; defensively accept None anyway."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(None)
+    assert store.current() == {}
+
+
+def test_callback_emits_codex_plus_usage_ok_event(tmp_path: Path):
+    """End-to-end: the callback writes a ``codex_plus_usage_ok`` event
+    to events.jsonl so ``usage_history`` can build a time series.
+    Shape matches ``minimax_usage_ok`` / ``oauth_usage_ok``: a
+    ``recorded`` dict with un-prefixed window keys (``five_hour``,
+    ``seven_day``) and ``{utilization, resets_at, status}`` per snap."""
+    import json
+
+    from mimir.event_logger import init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="t-1")
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    primary_reset = int(time.time()) + 5 * 3600
+    secondary_reset = int(time.time()) + 7 * 24 * 3600
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=25.0, window_minutes=300, reset_at=primary_reset,
+        ),
+        secondary=_FakeQuotaWindow(
+            used_percent=8.0, window_minutes=10080, reset_at=secondary_reset,
+        ),
+    ))
+    lines = events_path.read_text().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["type"] == "codex_plus_usage_ok"
+    assert set(rec["recorded"].keys()) == {"five_hour", "seven_day"}
+    assert rec["recorded"]["five_hour"]["utilization"] == pytest.approx(0.25)
+    assert rec["recorded"]["five_hour"]["resets_at"] == primary_reset
+    assert rec["recorded"]["seven_day"]["utilization"] == pytest.approx(0.08)
+
+
+def test_callback_emits_no_event_when_no_windows(tmp_path: Path):
+    """A None input must not emit a misleading empty event."""
+    from mimir.event_logger import init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="t-2")
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(None)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(used_percent=None),
+    ))
+    assert not events_path.exists() or events_path.read_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_callback_on_running_loop_returns_before_sync_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The Codex Plus callback fires inline on model response handling.
+
+    When that path is on the asyncio loop, the callback must schedule the
+    sync JSON/event writes off-loop and return promptly rather than blocking
+    scheduler dispatch.
+    """
+    calls: list[tuple[object, object]] = []
+    callback_returned = threading.Event()
+    sync_started = threading.Event()
+    sync_finished = threading.Event()
+    callback_returned_before_sync_finished: list[bool] = []
+
+    def _blocking_reconcile_sync(updates: object, *, owned_keys: object) -> None:
+        calls.append((updates, owned_keys))
+        sync_started.set()
+        # This is a hang guard, not a latency assertion. The recorded boolean
+        # below witnesses whether the callback returned while sync I/O blocked.
+        returned = callback_returned.wait(timeout=10.0)
+        callback_returned_before_sync_finished.append(returned)
+        sync_finished.set()
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    monkeypatch.setattr(store, "reconcile_sync", _blocking_reconcile_sync)
+    callback = make_codex_plus_rate_limit_callback(store)
+
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=25.0,
+            window_minutes=300,
+            reset_at=int(time.time() + 3600),
+        ),
+    ))
+    callback_returned.set()
+
+    # These outer bounds only prevent a broken background task wedging the suite.
+    await asyncio.wait_for(asyncio.to_thread(sync_started.wait), timeout=10.0)
+    await asyncio.wait_for(asyncio.to_thread(sync_finished.wait), timeout=10.0)
+    assert callback_returned_before_sync_finished == [True]
+    assert calls and "openai_five_hour" in calls[0][0]
+
+
+# ─── End-to-end read: OpenAIQuotaProvider sees what the callback wrote ─
+
+
+def test_openai_quota_provider_reads_callback_writes(tmp_path: Path):
+    """The full loop: callback writes → provider reads → arbiter sees
+    a populated QuotaWindow. This is the load-bearing integration
+    point (PR #248 stub now has a writer feeding it)."""
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(
+            used_percent=15.0, window_minutes=300,
+            reset_at=int(time.time() + 5 * 3600),
+        ),
+        secondary=_FakeQuotaWindow(
+            used_percent=3.0, window_minutes=10080,
+            reset_at=int(time.time() + 7 * 24 * 3600),
+        ),
+    ))
+    provider = OpenAIQuotaProvider(store)
+    windows = provider.get_windows()
+    keys = {w.key for w in windows}
+    assert keys == {"five_hour", "seven_day"}
+    five = next(w for w in windows if w.key == "five_hour")
+    assert five.utilization == pytest.approx(0.15)
+    seven = next(w for w in windows if w.key == "seven_day")
+    assert seven.utilization == pytest.approx(0.03)
+
+
+# ─── build_quota_providers picks OpenAIQuotaProvider for codex-plus ────
+
+
+def test_discovery_registers_openai_provider_for_codex_plus_spec(
+    tmp_path: Path,
+):
+    """A ``codex-plus:gpt-5.4`` spec registers :class:`OpenAIQuotaProvider`
+    — the chat model's rate-limit callback feeds the same
+    ``openai_five_hour`` / ``openai_seven_day`` keys this provider
+    reads, so the arbiter sees a coherent quota window for the
+    deployment."""
+    from mimir.billing import OpenAIQuotaProvider
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="codex-plus:gpt-5.4",
+    )
+    assert len(providers) == 1
+    assert isinstance(providers[0], OpenAIQuotaProvider)
+
+
+def test_discovery_codex_plus_overrides_anthropic_base_url(tmp_path: Path):
+    """``codex-plus:`` is a model_spec prefix branch, so it takes
+    precedence over a stale ``ANTHROPIC_BASE_URL`` env (e.g., from a
+    previous run that routed to Minimax). The chat model isn't
+    actually talking to ``ANTHROPIC_BASE_URL`` for codex-plus specs;
+    quota dispatch must follow."""
+    from mimir.billing import OpenAIQuotaProvider
+
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    providers = build_quota_providers(
+        store=store,
+        billing_mode=BillingMode.QUOTA,
+        model_spec="codex-plus:gpt-5.4",
+        anthropic_base_url="https://api.minimax.io/anthropic",
+    )
+    assert isinstance(providers[0], OpenAIQuotaProvider)
+
+
+# ─── _resolve_model: codex-plus: spec lazy-imports + constructs ────────
+
+
+def test_resolve_model_codex_plus_builds_chat_codex_plus():
+    from langchain_codex_plus import ChatCodexPlus
+
+    from mimir.agent import _resolve_model
+
+    model = _resolve_model("codex-plus:gpt-5.4")
+    assert isinstance(model, ChatCodexPlus)
+    assert model.model == "gpt-5.4"
+    assert model.reasoning_effort is None
+    # No callback was passed → field defaults to None.
+    assert model.rate_limit_callback is None
+
+
+def test_resolve_model_codex_plus_propagates_callback():
+    """When the agent passes a ``rate_limit_callback``, it's wired
+    onto the ChatCodexPlus instance."""
+    from mimir.agent import _resolve_model
+
+    def _seen(_rl):
+        pass
+
+    model = _resolve_model(
+        "codex-plus:gpt-5.4",
+        rate_limit_callback=_seen,
+    )
+    assert model.rate_limit_callback is _seen
+
+
+# ─── model_registry: --subscription on gpt-* routes to codex-plus: ─────
+
+
+def test_detect_route_openai_api_default():
+    """No ``--subscription`` → ``openai:`` (langchain-openai
+    ChatOpenAI), API monitor."""
+    route = detect_route("gpt-5.4", subscription=False)
+    assert route.model_spec == "openai:gpt-5.4"
+    assert route.billing_mode == "api"
+
+
+def test_detect_route_openai_subscription_routes_to_codex_plus():
+    """``--subscription`` on a gpt-* model → ``codex-plus:`` spec.
+    Different wire protocol (chatgpt.com/backend-api), so the
+    provider has to actually differ — not just a monitor flip."""
+    route = detect_route("gpt-5.4", subscription=True)
+    assert route.model_spec == "codex-plus:gpt-5.4"
+    assert route.billing_mode == "subscription"
+    assert "Codex Plus" in route.monitor_label
+
+
+def test_detect_route_o3_subscription_also_codex_plus():
+    """Same routing applies to o3/o4 model families — they're served
+    on Codex Plus subscriptions too."""
+    route = detect_route("o3-pro", subscription=True)
+    assert route.model_spec == "codex-plus:o3-pro"
+    assert route.billing_mode == "subscription"
+
+
+def test_detect_route_prequalified_codex_plus_passes_through():
+    """A spec that's already qualified with ``codex-plus:`` should
+    pass through unchanged (the operator has made the protocol
+    choice explicit)."""
+    route = detect_route("codex-plus:gpt-5.4")
+    assert route.model_spec == "codex-plus:gpt-5.4"

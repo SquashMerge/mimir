@@ -1,0 +1,1942 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+import fcntl
+import json
+from pathlib import Path
+import subprocess
+import threading
+from typing import Sequence
+
+import pytest
+
+pytest.importorskip("mimir_cultivate", reason="Worklink claims belong to Cultivate")
+
+from mimir_cultivate.worklink.claims import (
+    MAX_SHUTDOWN_ABORT_FORGIVENESS,
+    SHUTDOWN_ABORT_PREFIX,
+    ChainlinkClaims,
+    ClaimRecord,
+    ShutdownAbortRecord,
+    _ChainlinkContentionExhausted,
+    claim_records_from_comments,
+    record_clean_park,
+)
+from mimir_cultivate.worklink.factory_state import FactoryRunRecord, FactoryStatus, save_factory_record
+from mimir_cultivate.worklink.evidence import TestResult, WorklinkEvidence
+from mimir_cultivate.worklink.orchestrator import _write_evidence
+
+
+def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(list(args), returncode, stdout="", stderr="")
+
+
+@pytest.mark.parametrize("epic", [False, True])
+def test_published_reaper_preserves_release_only_routing(tmp_path: Path, epic: bool) -> None:
+    record = ClaimRecord(439, 1, "worker", datetime(2026, 6, 11, tzinfo=UTC))
+    evidence_dir = tmp_path / "state/worklink/evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "439-1.json").write_text(json.dumps({
+        "status": "completed", "pr_url": "https://github.com/example/repo/pull/1",
+    }))
+    labels = ["worklink:review", "worklink:epic"] if epic else ["worklink:review"]
+    calls = []
+
+    def runner(args):
+        calls.append(list(args))
+        if args[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"locks": [{"issue_id": 439}]}), "")
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({
+                "labels": labels, "comments": [record.to_comment()],
+            }), "")
+        return completed(args)
+
+    claims = ChainlinkClaims(
+        agent_id="reaper", home_path=tmp_path, runner=runner,
+        clock=lambda: record.claimed_at + timedelta(days=1),
+    )
+    claims.reap_stale_claims(
+        [record], ttl=timedelta(minutes=1), release_only_issue_ids=() if epic else (439,),
+    )
+    assert ["chainlink", "locks", "release", "439"] in calls
+    assert not any(c[1:3] in (["issue", "label"], ["issue", "unlabel"]) for c in calls)
+
+
+def test_claim_records_round_trip_and_next_attempt() -> None:
+    record = ClaimRecord(
+        issue_id=439,
+        attempt=2,
+        agent_id="mimir-a",
+        claimed_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+    )
+    comments = ["noise", record.to_comment()]
+
+    parsed = claim_records_from_comments(comments)
+
+    assert parsed == [record]
+    claims = ChainlinkClaims(agent_id="mimir-b")
+    assert claims.next_attempt(comments) == 3
+
+
+def test_claim_issue_records_attempt_and_labels_transition() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(
+        chainlink_bin="chainlink",
+        agent_id="mimir-a",
+        runner=runner,
+        clock=lambda: datetime(2026, 6, 11, 5, tzinfo=UTC),
+        sleeper=sleeps.append,
+    )
+
+    result = claims.claim_issue(439)
+
+    assert result.claimed is True
+    assert sleeps == []
+    assert result.record is not None
+    assert result.record.attempt == 1
+    assert ["chainlink", "locks", "claim", "439"] in calls
+    assert ["chainlink", "issue", "unlabel", "439", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "label", "439", "worklink:in-progress"] in calls
+    comment_calls = [call for call in calls if call[:3] == ["chainlink", "issue", "comment"]]
+    assert comment_calls and "WORKLINK_CLAIM" in comment_calls[0][-1]
+
+
+@pytest.mark.timeout(30)
+def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> None:
+    start = threading.Barrier(2)
+    runner_guard = threading.Lock()
+    claim_active = False
+    overlap_detected = False
+    results = []
+    attempted = threading.Event()
+    release = threading.Event()
+    first_finished = threading.Event()
+
+    def contended_sleep(seconds):
+        # The loser only gets here after a real nonblocking flock failed.
+        attempted.set()
+        first_finished.wait()
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_active, overlap_detected
+        call = list(args)
+        if call[1:3] != ["locks", "claim"]:
+            return completed(call)
+        with runner_guard:
+            if claim_active:
+                overlap_detected = True
+                attempted.set()
+            claim_active = True
+        release.wait()
+        with runner_guard:
+            claim_active = False
+        return completed(call)
+
+    def claim(issue_id: int) -> None:
+        claims = ChainlinkClaims(
+            agent_id=f"worker-{issue_id}", runner=runner, home_path=tmp_path,
+            sleeper=contended_sleep,
+        )
+        start.wait()
+        try:
+            results.append(claims.claim_issue(issue_id, labels=["worklink:ready"]))
+        finally:
+            first_finished.set()
+
+    threads = [threading.Thread(target=claim, args=(issue_id,)) for issue_id in (1064, 1065)]
+    for thread in threads:
+        thread.start()
+    try:
+        attempted.wait()
+        assert overlap_detected is False
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join()
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert overlap_detected is False
+    assert len(results) == 2
+    assert all(result.claimed and result.record is not None for result in results)
+
+
+@pytest.mark.timeout(30)
+def test_same_issue_claim_is_serialized_through_durable_publication(tmp_path: Path) -> None:
+    published: list[str] = []
+    claim_calls = 0
+    record_clock_entered = threading.Event()
+    release_record_clock = threading.Event()
+    first_finished = threading.Event()
+    second_claim_reached = threading.Event()
+    results: list[ClaimResult] = []
+    guard = threading.Lock()
+    now = datetime(2026, 9, 24, tzinfo=UTC)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            with guard:
+                claim_calls += 1
+                ordinal = claim_calls
+            if ordinal > 1:
+                second_claim_reached.set()
+            return subprocess.CompletedProcess(
+                call, 0, stdout=("You already hold the lock" if ordinal > 1 else ""), stderr="",
+            )
+        if call[1:4] == ["issue", "comment", "1709"]:
+            published.append(call[-1])
+            return completed(call)
+        if call[1:4] == ["issue", "show", "1709"]:
+            return subprocess.CompletedProcess(call, 0, stdout=json.dumps({
+                "labels": ["worklink:ready"],
+                "comments": [{"content": value} for value in published],
+            }), stderr="")
+        return completed(call)
+
+    def claim(block_record_clock: bool) -> None:
+        clock_calls = 0
+
+        def clock() -> datetime:
+            nonlocal clock_calls
+            clock_calls += 1
+            if block_record_clock and clock_calls == 1:
+                # This point is after `locks claim` returned but before the
+                # ClaimRecord or its durable comment exists. It was outside the
+                # global mutex before finish_claim moved under after_claim.
+                record_clock_entered.set()
+                assert release_record_clock.wait(timeout=10)
+            return now
+
+        claims = ChainlinkClaims(
+            agent_id="same-agent", runner=runner, home_path=tmp_path, clock=clock,
+            sleeper=lambda _: first_finished.wait(timeout=10),
+        )
+        result = claims.claim_issue(1709, labels=["worklink:ready"])
+        results.append(result)
+        if result.claimed:
+            first_finished.set()
+
+    first = threading.Thread(target=claim, args=(True,))
+    second = threading.Thread(target=claim, args=(False,))
+    first.start()
+    assert record_clock_entered.wait(timeout=10)
+    second.start()
+    assert not second_claim_reached.wait(timeout=0.2)
+    assert claim_calls == 1
+    assert published == []
+    release_record_clock.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert second_claim_reached.is_set()
+    assert sum(result.claimed for result in results) == 1
+    assert sorted(result.reason or "" for result in results) == ["", "duplicate_run_live"]
+
+
+@pytest.mark.parametrize("winner_duration_s", [3.469, 5.0])
+def test_claim_loser_outlasts_realistic_winner(tmp_path: Path, winner_duration_s: float) -> None:
+    lock_path = tmp_path / "state" / "worklink" / "chainlink-claim.lock"
+    lock_path.parent.mkdir(parents=True)
+    elapsed = 0.0
+    calls = []
+    events = []
+
+    with lock_path.open("a") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def sleep(seconds: float) -> None:
+            nonlocal elapsed
+            elapsed += seconds
+            assert elapsed <= 6.3 + 1e-9
+            # Advance simulated time while retaining a real, independently
+            # owned flock until the measured (or slower) winner completes.
+            if elapsed >= winner_duration_s:
+                fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
+
+        def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            assert elapsed >= winner_duration_s
+            calls.append(list(args))
+            return completed(args)
+
+        result = ChainlinkClaims(
+            agent_id="loser", home_path=tmp_path, runner=runner, sleeper=sleep,
+            event_logger=lambda event, **payload: events.append((event, payload)),
+        ).claim_issue(1607, labels=["worklink:ready"])
+
+    assert result.claimed
+    assert result.record is not None and result.record.attempt == 1
+    assert ["chainlink", "locks", "claim", "1607"] in calls
+    assert elapsed == pytest.approx(6.3)
+    assert [payload["outcome"] for _, payload in events] == ["retrying"] * 6 + ["succeeded"]
+
+
+def test_missing_home_path_emits_serialization_unavailable(caplog: pytest.LogCaptureFixture) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    result = ChainlinkClaims(
+        agent_id="worker",
+        runner=lambda args: completed(args),
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    ).claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is True
+    assert len(events) == 5
+    assert all(event == "worklink_claim_serialization_unavailable" for event, _ in events)
+    assert events[0][1]["reason"] == "home_path_missing"
+    assert events[0][1]["resource"] == "chainlink_locks_worktree"
+    assert "Worklink claim serialization unavailable" in caplog.text
+
+
+def test_claim_contention_retries_with_backoff_and_emits_outcomes(tmp_path: Path) -> None:
+    claim_calls = 0
+    sleeps: list[float] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            claim_calls += 1
+            if claim_calls == 1:
+                return subprocess.CompletedProcess(
+                    call,
+                    128,
+                    stdout="",
+                    stderr=(
+                        "fatal: Unable to create '/mimir-home/.git/worktrees/"
+                        "-locks-cache/index.lock': File exists."
+                    ),
+                )
+        return completed(call)
+
+    claims = ChainlinkClaims(
+        agent_id="worker",
+        runner=runner,
+        home_path=tmp_path,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        sleeper=sleeps.append,
+    )
+    result = claims.claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is True
+    assert result.record is not None and result.record.attempt == 1
+    assert claim_calls == 2
+    assert sleeps == [0.1]
+    assert [(event, payload["outcome"]) for event, payload in events] == [
+        ("worklink_claim_contention", "retrying"),
+        ("worklink_claim_contention", "succeeded"),
+    ]
+    assert all(payload["resource"] == "chainlink_locks_worktree" for _, payload in events)
+
+
+def test_real_claim_denial_is_not_retried(tmp_path: Path) -> None:
+    claim_calls = 0
+    sleeps: list[float] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            claim_calls += 1
+            return subprocess.CompletedProcess(
+                call, 1, stdout="", stderr="issue #1064 is locked by another-agent"
+            )
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="worker",
+        runner=runner,
+        home_path=tmp_path,
+        sleeper=sleeps.append,
+    ).claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is False
+    assert result.reason == "issue #1064 is locked by another-agent"
+    assert claim_calls == 1
+    assert sleeps == []
+
+
+def test_claim_contention_retry_bound_is_explicit(tmp_path: Path) -> None:
+    claim_calls = 0
+    events: list[dict[str, object]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            claim_calls += 1
+            return subprocess.CompletedProcess(
+                call,
+                128,
+                stdout="",
+                stderr="fatal: Another git process seems to be running in this repository.",
+            )
+        return completed(call)
+
+    sleeps: list[float] = []
+    result = ChainlinkClaims(
+        agent_id="worker",
+        runner=runner,
+        home_path=tmp_path,
+        event_logger=lambda _event, **payload: events.append(payload),
+        sleeper=sleeps.append,
+    ).claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is False
+    assert result.reason == "claim_contention_exhausted"
+    assert claim_calls == 7
+    assert sleeps == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+    assert [event["outcome"] for event in events] == [
+        "retrying",
+        "retrying",
+        "retrying",
+        "retrying",
+        "retrying",
+        "retrying",
+        "exhausted",
+    ]
+    assert events[-1]["max_attempts"] == 7
+
+
+@pytest.mark.parametrize("args", [
+    ("locks", "steal", "1602"), ("locks", "release", "1602"),
+    ("locks", "list", "--json"), ("issue", "show", "1602", "--json"),
+    ("issue", "list", "--json"), ("issue", "label", "1602", "worklink:ready"),
+    ("issue", "unlabel", "1602", "worklink:ready"),
+    ("issue", "comment", "1602", "comment"),
+])
+@pytest.mark.parametrize("check", [True, False])
+def test_generic_contention_retry(tmp_path, args, check):
+    calls, sleeps, events = [], [], []
+
+    def runner(command):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 128, "", "Another git process seems to be running")
+
+    claims = ChainlinkClaims(
+        agent_id="worker", home_path=tmp_path, runner=runner, sleeper=sleeps.append,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+    with pytest.raises(RuntimeError, match="^chainlink contention exhausted"):
+        claims._run(*args, check=check)
+    assert len(calls) == 7
+    assert sleeps == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+    assert [p["outcome"] for _, p in events] == ["retrying"] * 6 + ["exhausted"]
+    assert all(p["issue_id"] == (1602 if args[2] == "1602" else None) for _, p in events)
+    assert all(p["resource"] == "chainlink_locks_worktree" for _, p in events)
+    assert "git process" not in json.dumps(events)
+
+    calls.clear()
+    sleeps.clear()
+    events.clear()
+    claims.runner = lambda command: runner(command) if not calls else completed(command)
+    assert claims._run(*args, check=check).returncode == 0
+    assert sleeps == [0.1]
+    assert [p["outcome"] for _, p in events] == ["retrying", "succeeded"]
+
+
+@pytest.mark.parametrize("after_contention", [False, True])
+def test_generic_unrelated_error_is_unchanged(tmp_path, after_contention):
+    calls, sleeps, events = [], [], []
+
+    def runner(args):
+        calls.append(args)
+        error = "permission denied"
+        if after_contention and len(calls) == 1:
+            error = "Another git process seems to be running"
+        return subprocess.CompletedProcess(args, 1, "", error)
+
+    claims = ChainlinkClaims(
+        agent_id="worker", home_path=tmp_path, runner=runner, sleeper=sleeps.append,
+        event_logger=lambda event, **payload: events.append(payload),
+    )
+    with pytest.raises(RuntimeError, match="^permission denied$"):
+        claims._run("locks", "steal", "1602")
+    assert len(calls) == 1 + after_contention
+    assert sleeps == ([0.1] if after_contention else [])
+    assert all(event["outcome"] != "succeeded" for event in events)
+
+
+@pytest.mark.parametrize("operation", ["claim", "read", "dispatch"])
+def test_independent_descriptor_excludes_invocations_and_bounds_wait(tmp_path, monkeypatch, operation):
+    lock_path = tmp_path / "state" / "worklink" / "chainlink-claim.lock"
+    lock_path.parent.mkdir(parents=True)
+    calls, sleeps, prepared = [], [], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        assert len(sleeps) <= 6, "persistent contention exceeded the retry bound"
+        assert sum(sleeps) <= 6.3 + 1e-9
+
+    claims = ChainlinkClaims(
+        agent_id="worker", home_path=tmp_path,
+        runner=lambda args: calls.append(args) or completed(args), sleeper=sleep,
+    )
+    # A separately opened descriptor owns the real OS lock. An in-process
+    # mutex cannot observe it, so that mutation would incorrectly run the CLI.
+    with lock_path.open("a") as owner:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if operation == "claim":
+            with pytest.raises(_ChainlinkContentionExhausted, match="contention exhausted"):
+                claims._claim_lock_with_retry(
+                    1602, home_path=tmp_path, before_claim=lambda: prepared.append(True),
+                )
+        elif operation == "read":
+            with pytest.raises(_ChainlinkContentionExhausted, match="contention exhausted"):
+                claims._run("issue", "show", "1602")
+        else:
+            import mimir_cultivate.worklink.orchestrator as orchestrator
+
+            events = []
+
+            async def run(self, issue_id, **kwargs):
+                return claims.claim_issue(issue_id)
+
+            monkeypatch.setattr(orchestrator.WorklinkRunner, "run", run)
+            monkeypatch.setattr(
+                orchestrator, "_log_event",
+                lambda event, **payload: events.append((event, payload)),
+            )
+            with pytest.raises(_ChainlinkContentionExhausted, match="contention exhausted"):
+                orchestrator.run_worklink(home=tmp_path, repo=tmp_path, issue_id=1602)
+            failure = next(payload for event, payload in events if event == "worklink_run_failed")
+            assert failure["attempt_consumed"] is False
+            assert failure["attempt"] is None
+            assert failure["terminal_error"] == (
+                "_ChainlinkContentionExhausted: chainlink contention exhausted (chainlink_locks_worktree)"
+            )
+        assert calls == []
+        assert prepared == []
+        assert sleeps == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+    assert lock_path.exists()
+    # Releasing the external owner lets the complete claim path run without
+    # recursively acquiring its own non-reentrant flock.
+    result = claims.claim_issue(1602, before_claim=lambda: prepared.append(True))
+    assert result.claimed
+    assert result.record is not None and result.record.attempt == 1
+    assert prepared == [True]
+    assert len(calls) == 5
+
+
+def test_heartbeat_issue_appends_fresh_claim_record() -> None:
+    calls: list[list[str]] = []
+    heartbeat_at = datetime(2026, 6, 11, 5, 30, tzinfo=UTC)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(
+        chainlink_bin="chainlink",
+        agent_id="mimir-a",
+        runner=runner,
+        clock=lambda: heartbeat_at,
+    )
+    record = ClaimRecord(
+        issue_id=439,
+        attempt=1,
+        agent_id="mimir-a",
+        claimed_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
+    )
+
+    updated = claims.heartbeat_issue(record)
+
+    assert updated.heartbeat_at == heartbeat_at
+    assert calls == [["chainlink", "issue", "comment", "439", updated.to_comment()]]
+    parsed = claim_records_from_comments([calls[0][-1]])
+    assert parsed == [updated]
+
+
+def test_claim_issue_enforces_max_active_locks_after_reservation() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        calls.append(args)
+        if args[1:4] == ["locks", "list", "--json"]:
+            # The new issue lock is already reserved; cap=1 means this would be
+            # the second active worker, so claim_issue must release it before
+            # mutating labels/comments.
+            return subprocess.CompletedProcess(args, 0, stdout='{"locks":{"old":{},"new":{}}}', stderr="")
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+    result = claims.claim_issue(8, max_active_locks=1)
+
+    assert result.claimed is False
+    assert result.reason and "concurrency cap reached" in result.reason
+    assert ["chainlink", "locks", "claim", "8"] in calls
+    assert ["chainlink", "locks", "release", "8"] in calls
+    assert not any(call[:3] == ["chainlink", "issue", "label"] for call in calls)
+    assert not any(call[:3] == ["chainlink", "issue", "comment"] for call in calls)
+
+
+@pytest.mark.parametrize("holders", [
+    {"7": {"issue_id": 7}, "8": {"issue_id": 8}},
+    {"7": {}, "8": {}},
+])
+@pytest.mark.parametrize("active_label", [None, "worklink:epic"])
+def test_claim_issue_cap_reports_known_capacity_consuming_issue_ids(holders, active_label) -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        if args[1:4] == ["locks", "list", "--json"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps({"locks": holders}),
+                stderr="",
+            )
+        if args[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps([
+                    {"id": 7, "labels": ["worklink:epic", "worklink:review"]},
+                    {"id": 8, "labels": ["worklink:epic", "worklink:ready"]},
+                ]), "",
+            )
+        return completed(args)
+
+    result = ChainlinkClaims(agent_id="mimir-a", runner=runner).claim_issue(
+        8,
+        max_active_locks=1,
+        active_label=active_label,
+    )
+
+    assert result.reason and "active issue ids: [7]" in result.reason
+
+
+def test_list_issue_ids_falls_back_when_id_is_null() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(
+                list(args),
+                0,
+                stdout=json.dumps([{"id": None, "number": 81}, {"id": "82"}]),
+                stderr="",
+            )
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="t", runner=runner)
+    assert claims.issue_ids_with_label("worklink:ready") == [81, 82]
+
+
+@pytest.mark.parametrize("epic", [False, True])
+@pytest.mark.parametrize("ledger_failure", [False, True])
+def test_claim_issue_blocks_when_attempts_exhausted(tmp_path, monkeypatch, epic, ledger_failure) -> None:
+    from mimir_cultivate.worklink import dispatch_failures
+    if ledger_failure:
+        def fail(*args, **kwargs):
+            raise OSError("ledger unavailable")
+        monkeypatch.setattr(dispatch_failures, "record_leaf_transition", fail)
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    old = [
+        ClaimRecord(7, 1, "a", datetime(2026, 6, 11, tzinfo=UTC)).to_comment(),
+        ClaimRecord(7, 2, "a", datetime(2026, 6, 11, tzinfo=UTC)).to_comment(),
+        ClaimRecord(7, 3, "a", datetime(2026, 6, 11, tzinfo=UTC)).to_comment(),
+    ]
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, max_attempts=3, home_path=tmp_path)
+
+    result = claims.claim_issue(7, old, labels={"worklink:epic"} if epic else set(), issue_title="epic" if epic else "leaf")
+
+    assert result.claimed is False
+    assert result.attempts_exhausted is True
+    # chainlink #825: exhaustion is judged AFTER lock ownership is established
+    # (so a duplicate bouncing off a live run can never mislabel it); the
+    # transient lock is released before the blocked transition.
+    assert ["chainlink", "locks", "claim", "7"] in calls
+    assert ["chainlink", "locks", "release", "7"] in calls
+    assert ["chainlink", "issue", "label", "7", "worklink:blocked"] in calls
+    notices = list(dispatch_failures.load_failure_state(
+        dispatch_failures.dispatch_failure_state_dir(tmp_path)
+    ).get("factory_transitions", {}).values())
+    assert len(notices) == (0 if ledger_failure else 1)
+    if notices:
+        assert notices[0]["kind"] == "leaf_attempts_exhausted"
+        assert notices[0]["issue_title"] == ("epic" if epic else "leaf")
+        assert notices[0]["attempt"] == 3
+        assert "3 of 3" in notices[0]["reason"]
+
+
+@pytest.mark.parametrize("ledger_failure", [False, True])
+def test_reaper_enforces_own_ttl_before_steal(tmp_path: Path, monkeypatch, ledger_failure) -> None:
+    from mimir_cultivate.worklink import dispatch_failures
+    if ledger_failure:
+        def fail(*args, **kwargs):
+            raise OSError("ledger unavailable")
+        monkeypatch.setattr(dispatch_failures, "record_leaf_transition", fail)
+    calls: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if list(args)[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, '{"labels":["worklink:in-progress"]}', "")
+        if list(args)[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                list(args),
+                0,
+                stdout=json.dumps({"locks": {"2": {"issue_id": 2}}}),
+                stderr="",
+            )
+        return completed(args)
+
+    now = datetime(2026, 6, 11, 5, tzinfo=UTC)
+    claims = ChainlinkClaims(
+        agent_id="mimir-a",
+        home_path=tmp_path,
+        runner=runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+    fresh = ClaimRecord(1, 1, "live", now - timedelta(minutes=5))
+    heartbeat = now - timedelta(hours=2)
+    stale = ClaimRecord(
+        2,
+        1,
+        "stale",
+        now - timedelta(hours=3),
+        heartbeat_at=heartbeat,
+    )
+
+    reaped = claims.reap_stale_claims([fresh, stale], ttl=timedelta(hours=1))
+
+    assert reaped.reaped == [stale]
+    assert reaped.examined == 1
+    assert reaped.skipped == {}
+    assert ["chainlink", "locks", "steal", "1"] not in calls
+    assert ["chainlink", "locks", "steal", "2"] in calls
+    assert ["chainlink", "locks", "release", "2"] in calls
+    assert ["chainlink", "issue", "label", "2", "worklink:ready"] in calls
+    comments = [call[-1] for call in calls if call[:3] == ["chainlink", "issue", "comment"]]
+    payload = json.loads(comments[-1].removeprefix("WORKLINK_REAPER "))
+    assert payload["stale_agent_id"] == "stale"
+    assert payload["last_heartbeat"] == heartbeat.isoformat()
+    assert payload["resulting_label"] == "worklink:ready"
+    assert events == [
+        (
+            "worklink_claim_stolen",
+            {
+                "issue_id": 2,
+                "prior_agent_id": "stale",
+                "heartbeat_age_s": 7200.0,
+                "guard_outcome": "stale_lock_confirmed",
+                "steal_succeeded": True,
+                "error": None,
+            },
+        ),
+        (
+            "worklink_claim_reaped",
+            {
+                "issue_id": 2,
+                "agent_id": "stale",
+                "last_heartbeat": heartbeat.isoformat(),
+                "resulting_label": "worklink:ready",
+            },
+        )
+    ]
+    notices = list(dispatch_failures.load_failure_state(
+        dispatch_failures.dispatch_failure_state_dir(tmp_path)
+    ).get("factory_transitions", {}).values())
+    assert len(notices) == (0 if ledger_failure else 1)
+    if notices:
+        assert notices[0]["kind"] == "leaf_claim_reaped"
+        assert notices[0]["attempt"] == 1
+        assert "stale" in notices[0]["reason"]
+        assert heartbeat.isoformat() in notices[0]["reason"]
+
+
+def test_reaper_blocks_after_max_attempts() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if list(args)[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, '{"labels":["worklink:in-progress"]}', "")
+        if list(args)[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                list(args),
+                0,
+                stdout=json.dumps({"locks": {"2": {"issue_id": 2}}}),
+                stderr="",
+            )
+        return completed(args)
+
+    now = datetime(2026, 6, 11, 5, tzinfo=UTC)
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, clock=lambda: now, max_attempts=3)
+    stale = ClaimRecord(2, 3, "stale", now - timedelta(hours=3))
+
+    reaped = claims.reap_stale_claims([stale], ttl=timedelta(hours=1))
+
+    assert reaped.reaped == [stale]
+    assert ["chainlink", "issue", "label", "2", "worklink:blocked"] in calls
+    assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
+
+
+def test_reaper_persists_incident_before_force_steal_and_write_failure_preserves_lock() -> None:
+    calls: list[list[str]] = []
+    now = datetime(2026, 9, 19, tzinfo=UTC)
+    stale = ClaimRecord(2, 1, "stale", now - timedelta(hours=3))
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        argv = list(args)
+        calls.append(argv)
+        if argv[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"locks": {"2": {"issue_id": 2}}}), ""
+            )
+        if argv[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "labels": ["worklink:in-progress"],
+                    "comments": [stale.to_comment()],
+                }),
+                "",
+            )
+        return completed(argv)
+
+    claims = ChainlinkClaims(
+        agent_id="mimir-a", runner=runner, clock=lambda: now
+    )
+
+    def disk_failure(record: ClaimRecord, transition: str) -> None:
+        assert record == stale
+        assert transition == "ready"
+        assert not any(call[1:3] == ["locks", "steal"] for call in calls)
+        raise OSError("disk full")
+
+    result = claims.reap_stale_claims(
+        [stale], ttl=timedelta(hours=1), before_rearm=disk_failure
+    )
+
+    assert result.reaped == []
+    assert result.skipped == {"incident_record_failed": 1}
+    assert not any(call[1:3] in (["locks", "steal"], ["locks", "release"]) for call in calls)
+    assert not any(call[1:3] in (["issue", "label"], ["issue", "unlabel"]) for call in calls)
+
+
+def test_reaper_incident_is_durable_before_steal_and_blocks_concurrent_core(
+    tmp_path: Path,
+) -> None:
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    from mimir_cultivate.worklink.orchestrator import run_worklink
+
+    calls: list[list[str]] = []
+    now = datetime(2026, 9, 19, tzinfo=UTC)
+    stale = ClaimRecord(2, 1, "stale", now - timedelta(hours=3))
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        argv = list(args)
+        calls.append(argv)
+        if argv[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"locks": {"2": {"issue_id": 2}}}), ""
+            )
+        if argv[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "labels": ["worklink:in-progress"],
+                    "comments": [stale.to_comment()],
+                }),
+                "",
+            )
+        return completed(argv)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, clock=lambda: now)
+
+    def persist_and_probe(record: ClaimRecord, transition: str) -> None:
+        record_failure(
+            dispatch_failure_state_dir(tmp_path),
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            exit_status=None,
+            error=f"stale claim requires {transition}",
+            log_path=None,
+        )
+        assert not any(call[1:3] == ["locks", "steal"] for call in calls)
+        refused = run_worklink(
+            home=tmp_path,
+            repo=tmp_path / "repo",
+            issue_id=record.issue_id,
+            autonomous=True,
+        )
+        assert refused.status == "refused"
+        assert refused.attempt is None
+
+    result = claims.reap_stale_claims(
+        [stale], ttl=timedelta(hours=1), before_rearm=persist_and_probe
+    )
+
+    assert result.reaped == [stale]
+    assert any(call[1:3] == ["locks", "steal"] for call in calls)
+    assert any(call[1:3] == ["locks", "release"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "reason", "event_type"),
+    [
+        ("lock_absent", "lock_not_held", "worklink_claim_reap_skipped"),
+        ("lock_query_broken", "lock_query_failed", "worklink_claim_reap_skipped"),
+        ("steal_failed", "lock_steal_failed", "worklink_claim_reap_skipped"),
+        ("reaped", None, "worklink_claim_reaped"),
+    ],
+)
+def test_part_a_reaper_reports_each_stale_claim_outcome(
+    scenario: str,
+    reason: str | None,
+    event_type: str,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    now = datetime(2026, 8, 23, tzinfo=UTC)
+    stale = ClaimRecord(1400, 1, "orphan", now - timedelta(hours=3))
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        if call[1:3] == ["locks", "list"]:
+            if scenario == "lock_query_broken":
+                return subprocess.CompletedProcess(call, 1, stdout="", stderr="tracker down")
+            locks = {} if scenario == "lock_absent" else {"1400": {"issue_id": 1400}}
+            return subprocess.CompletedProcess(call, 0, stdout=json.dumps({"locks": locks}), stderr="")
+        if call[1:3] == ["locks", "steal"] and scenario == "steal_failed":
+            return subprocess.CompletedProcess(call, 1, stdout="", stderr="busy")
+        if call[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"labels": ["worklink:in-progress"]}), stderr=""
+            )
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="mimir-a",
+        runner=runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    ).reap_stale_claims([stale], ttl=timedelta(hours=1))
+
+    assert result.examined == 1
+    assert [event for event, _payload in events][-1] == event_type
+    if reason is None:
+        assert result.reaped == [stale]
+        assert result.skipped == {}
+    else:
+        assert result.reaped == []
+        assert result.skipped == {reason: 1}
+        assert result.skipped_issue_ids == {reason: [1400]}
+
+
+def test_part_a_reaper_skip_event_uses_bounded_issue_samples(tmp_path: Path) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    now = datetime(2026, 8, 23, tzinfo=UTC)
+    records = [
+        ClaimRecord(issue_id, 1, "orphan", now - timedelta(hours=3))
+        for issue_id in range(1, 26)
+    ]
+    claims = ChainlinkClaims(
+        agent_id="mimir-a",
+        home_path=tmp_path,
+        runner=lambda args: subprocess.CompletedProcess(
+            list(args), 0, stdout=json.dumps({"locks": {}}), stderr=""
+        ),
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+
+    result = claims.reap_stale_claims(records, ttl=timedelta(hours=1))
+
+    assert result.skipped == {"lock_not_held": 25}
+    assert len(result.skipped_issue_ids["lock_not_held"]) == 20
+    assert [event for event, _payload in events] == ["worklink_claim_reap_skipped"]
+
+
+def test_transition_failed_attempt_with_retries_returns_to_ready() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, max_attempts=3)
+
+    claims.transition_issue(
+        2, status="failed", review_ready=False, attempt=1, reason="tests_failed"
+    )
+
+    assert ["chainlink", "issue", "label", "2", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "label", "2", "worklink:blocked"] not in calls
+    assert any(
+        call[:3] == ["chainlink", "issue", "comment"] and "tests_failed" in call[-1]
+        for call in calls
+    )
+
+
+def test_transition_blocked_comment_uses_blocked_prefix() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, max_attempts=3)
+
+    # A backend-signalled block on attempt 1: labels worklink:blocked and the
+    # reason posts under WORKLINK_BLOCKED, not the misleading WORKLINK_FAILED.
+    claims.transition_issue(
+        2, status="blocked", review_ready=False, attempt=1, reason="acceptance criteria contradict #438"
+    )
+
+    assert ["chainlink", "issue", "label", "2", "worklink:blocked"] in calls
+    assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
+    assert any(
+        call[:3] == ["chainlink", "issue", "comment"]
+        and call[-1] == "WORKLINK_BLOCKED acceptance criteria contradict #438"
+        for call in calls
+    )
+
+
+def test_transition_failed_exhausted_attempt_blocks() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, max_attempts=3)
+
+    claims.transition_issue(2, status="failed", review_ready=False, attempt=3)
+
+    assert ["chainlink", "issue", "label", "2", "worklink:blocked"] in calls
+    assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
+
+
+def _reclaim_runner(calls, stdout="You already hold the lock on issue #783", comments=()):
+    def runner(args):
+        calls.append(list(args))
+        if list(args)[1:3] == ["locks", "claim"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout=stdout, stderr="")
+        if list(args)[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout=json.dumps({"comments": list(comments)}), stderr="")
+        return subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
+    return runner
+
+
+def test_same_agent_reclaim_with_fresh_heartbeat_is_refused():
+    """chainlink #822: 'You already hold the lock' rc=0 must not admit a
+    duplicate process while the owner's claim heartbeat is fresh."""
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+    fresh = ClaimRecord(issue_id=783, attempt=1, agent_id="mimir-worklink-epic", claimed_at=now, heartbeat_at=now)
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls, comments=[fresh.to_comment()]), clock=lambda: now)
+
+    result = claims.claim_issue(783, [fresh.to_comment()])
+
+    assert result.claimed is False
+    assert result.reason == "duplicate_run_live"
+    # refused WITHOUT mutating state: reads (issue show) are fine, but no
+    # steal and no label/comment writes.
+    assert not any(
+        call[1:3] == ["locks", "steal"]
+        or (call[1] == "issue" and call[2] in ("label", "unlabel", "comment"))
+        for call in calls
+        if len(call) > 2
+    )
+
+
+def test_same_agent_reclaim_with_stale_heartbeat_steals_and_proceeds():
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+    stale = ClaimRecord(issue_id=783, attempt=1, agent_id="mimir-worklink-epic", claimed_at=now - timedelta(hours=2), heartbeat_at=now - timedelta(hours=1))
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls, comments=[stale.to_comment()]), clock=lambda: now)
+
+    result = claims.claim_issue(783, [stale.to_comment()])
+
+    assert result.claimed is True
+    assert any(call[1:3] == ["locks", "steal"] for call in calls)
+
+
+def test_same_agent_reclaim_with_no_tracker_comments_steals():
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls), clock=lambda: now)
+    caller_record = ClaimRecord(issue_id=783, attempt=1, agent_id="prior-worker", claimed_at=now)
+
+    result = claims.claim_issue(783, [caller_record.to_comment()])
+
+    assert result.claimed is True
+    assert any(call[1:3] == ["locks", "steal"] for call in calls)
+
+
+@pytest.mark.parametrize("read_failure", ["exception", "nonzero", "invalid_json", "invalid_shape", "empty"])
+def test_degraded_claim_guard_refuses_steal(read_failure: str) -> None:
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    stale = ClaimRecord(
+        issue_id=783,
+        attempt=1,
+        agent_id="prior-worker",
+        claimed_at=now - timedelta(hours=2),
+        heartbeat_at=now - timedelta(hours=1),
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+    issue_show_calls = 0
+    calls: list[list[str]] = []
+
+    def degraded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal issue_show_calls
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "show"]:
+            issue_show_calls += 1
+            if issue_show_calls == 2:
+                if read_failure == "exception":
+                    raise OSError("comments unavailable")
+                return subprocess.CompletedProcess(
+                    call, 1 if read_failure == "nonzero" else 0,
+                    stdout={"nonzero": "", "invalid_json": "{", "invalid_shape": '{"comments": {}}', "empty": ""}[read_failure],
+                    stderr="comments unavailable",
+                )
+            return subprocess.CompletedProcess(call, 0, stdout="{}", stderr="")
+        if call[1:3] == ["locks", "claim"]:
+            return subprocess.CompletedProcess(call, 0, stdout="already hold", stderr="")
+        if call[1:3] == ["locks", "steal"]:
+            return subprocess.CompletedProcess(call, 1, stdout="", stderr="steal denied")
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="mimir-worklink-epic",
+        runner=degraded_runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    ).claim_issue(783, [stale.to_comment()])
+
+    assert result.claimed is False
+    assert result.reason == "claim_guard_degraded"
+    assert not any(call[1:3] in (["locks", "steal"], ["locks", "release"], ["issue", "label"], ["issue", "unlabel"], ["issue", "comment"]) for call in calls)
+    relevant_events = [
+        item
+        for item in events
+        if item[0] in {"worklink_claim_guard_degraded", "worklink_claim_stolen"}
+    ]
+    assert len(relevant_events) == 1
+    assert relevant_events[0][0] == "worklink_claim_guard_degraded"
+    assert relevant_events[0][1]["issue_id"] == 783
+    assert relevant_events[0][1]["error"]
+
+
+def test_reaper_reports_successful_steal() -> None:
+    now = datetime(2026, 7, 3, 19, 0, tzinfo=UTC)
+    stale = ClaimRecord(issue_id=783, attempt=1, agent_id="prior-worker", claimed_at=now - timedelta(hours=2), heartbeat_at=now - timedelta(hours=1))
+
+    reaper_events: list[tuple[str, dict[str, object]]] = []
+
+    def reaper_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        if call[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"locks": {"783": {"issue_id": 783}}}), stderr=""
+            )
+        if call[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"labels": ["worklink:in-progress"]}), stderr=""
+            )
+        return completed(call)
+
+    ChainlinkClaims(
+        agent_id="reaper",
+        runner=reaper_runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: reaper_events.append((event, payload)),
+    ).reap_stale_claims([stale], ttl=timedelta(minutes=30))
+
+    stolen = next(payload for event, payload in reaper_events if event == "worklink_claim_stolen")
+    assert stolen == {
+        "issue_id": 783,
+        "prior_agent_id": "prior-worker",
+        "heartbeat_age_s": 3600.0,
+        "guard_outcome": "stale_lock_confirmed",
+        "steal_succeeded": True,
+        "error": None,
+    }
+
+
+def test_duplicate_vs_live_final_attempt_never_labels_blocked():
+    """chainlink #825 (run-15 regression): a duplicate bouncing off a LIVE
+    final-attempt claim must refuse as duplicate_run_live — the old ordering
+    declared attempts_exhausted and mislabeled the healthy epic blocked."""
+    now = datetime(2026, 7, 3, 22, 20, tzinfo=UTC)
+    calls: list[list[str]] = []
+    live_final = ClaimRecord(
+        issue_id=783, attempt=3, agent_id="mimir-worklink-epic",
+        claimed_at=now - timedelta(minutes=10), heartbeat_at=now - timedelta(minutes=1),
+    )
+    claims = ChainlinkClaims(agent_id="mimir-worklink-epic", runner=_reclaim_runner(calls, comments=[live_final.to_comment()]), clock=lambda: now)
+
+    result = claims.claim_issue(783, [live_final.to_comment()])
+
+    assert result.claimed is False
+    assert result.reason == "duplicate_run_live"
+    assert result.attempts_exhausted is False
+    assert not any(call[1:3] == ["issue", "label"] for call in calls)
+
+
+def test_active_lock_count_supports_separate_epic_and_leaf_scopes() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        if args[1:4] == ["locks", "list", "--json"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout='{"locks":{"1":{"issue_id":1},"2":{"issue_id":2}}}',
+                stderr="",
+            )
+        if args[1:5] == ["issue", "list", "--label", "worklink:epic"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout='[{"id":2}]', stderr=""
+            )
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+    assert claims.active_worklink_lock_count(label="worklink:epic") == 1
+    assert claims.active_worklink_lock_count(exclude_label="worklink:epic") == 1
+
+
+def test_claim_issue_refuses_worklink_review_label() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(100, labels=["worklink:review", "worklink:ready"])
+
+    assert result.claimed is False
+    assert result.reason == "lifecycle_state_incompatible"
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+
+
+def test_claim_issue_refuses_current_review_label_even_when_caller_omits_labels() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        calls.append(call)
+        if call[1:5] == ["issue", "show", "101", "--json"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"labels": ["worklink:review"]}), stderr=""
+            )
+        return completed(call)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(101)
+
+    assert result.claimed is False
+    assert result.reason == "lifecycle_state_incompatible"
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+
+
+def test_claim_issue_accepts_worklink_ready_label() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(102, labels=["worklink:ready"])
+
+    assert result.claimed is True
+    assert result.record is not None
+
+
+def test_claim_issue_accepts_worklink_in_progress_label() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(103, labels=["worklink:in-progress"])
+
+    assert result.claimed is True
+    assert result.record is not None
+
+
+@pytest.mark.parametrize("content", ['{"issue": 200, "attempt": 1}', "", "corrupt", None])
+@pytest.mark.parametrize("override", [False, True])
+def test_retained_publication_refuses_without_mutation_and_allows_retry_after_clear(
+    tmp_path: Path, content: str | None, override: bool,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    path = tmp_path / "state" / "worklink" / "publications" / "200.json"
+    path.parent.mkdir(parents=True)
+    if content is None:
+        path.symlink_to(path.parent / "missing-intent")
+        assert not path.exists()
+    else:
+        path.write_text(content)
+    claims = ChainlinkClaims(
+        agent_id="mimir-a", runner=runner,
+        home_path=tmp_path / "other" if override else tmp_path,
+    )
+    before_claim_calls: list[bool] = []
+    kwargs = {"home_path": tmp_path} if override else {}
+    result = claims.claim_issue(
+        200, labels=["worklink:ready"],
+        before_claim=lambda: before_claim_calls.append(True), **kwargs,
+    )
+    assert not result.claimed
+    assert result.reason == "publication_intent_exists"
+    assert not result.attempts_exhausted
+    assert result.record is None
+    assert calls == [["chainlink", "issue", "show", "200", "--json"]]
+    assert before_claim_calls == []
+    if content is None:
+        assert path.is_symlink()
+        assert not path.exists()
+    else:
+        assert path.read_text() == content
+
+    path.unlink()
+    result = claims.claim_issue(200, labels=["worklink:ready"], **kwargs)
+    assert result.claimed
+    assert result.record is not None
+    assert result.record.attempt == 1
+
+
+def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    _write_evidence(
+        tmp_path,
+        WorklinkEvidence(
+            issue=200,
+            attempt=1,
+            backend="codex",
+            branch="issue/200-a1",
+            checkout=str(tmp_path / ".worklink" / "200-1"),
+            started_at="2026-07-13T10:00:00+00:00",
+            finished_at="2026-07-13T10:05:00+00:00",
+            files_changed=["mimir/example.py"],
+            diff_stat="1 file changed",
+            commands=[],
+            tests=TestResult(cmd="pytest", exit_code=0),
+            pr_url="https://github.com/owner/repo/pull/123",
+            status="completed",
+        ),
+    )
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, home_path=tmp_path)
+
+    with caplog.at_level("INFO", logger="mimir_cultivate.worklink.claims"):
+        result = claims.claim_issue(200, labels=["worklink:ready"])
+
+    assert result.claimed is False
+    assert result.reason == "review_ready_evidence_exists"
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+    assert ["chainlink", "issue", "unlabel", "200", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "label", "200", "worklink:review"] in calls
+    assert ["chainlink", "issue", "label", "200", "worklink:ready"] not in calls
+    assert "issue_id=200 reason=review_ready_evidence_exists" in caplog.text
+    assert str(tmp_path / "state" / "worklink" / "evidence" / "200-1.json") in caplog.text
+    assert "pr_url=https://github.com/owner/repo/pull/123" in caplog.text
+
+
+def test_claim_issue_allows_without_evidence_when_worklink_ready(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    evidence_dir = tmp_path / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    result = claims.claim_issue(201, labels=["worklink:ready"], home_path=str(tmp_path))
+
+    assert result.claimed is True
+    assert result.record is not None
+
+
+def test_graceful_shutdown_releases_only_this_process_claim_and_forgives_budget() -> None:
+    calls: list[list[str]] = []
+    now = datetime(2026, 7, 29, tzinfo=UTC)
+    own = ClaimRecord(1033, 1, "mimir-worklink:process-a", now)
+    other = ClaimRecord(1029, 1, "mimir-worklink:process-b", now)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps([{"id": 1033}, {"id": 1029}]), stderr=""
+            )
+        if call[1:4] == ["issue", "show", "1033"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"comments": [{"content": own.to_comment()}]}), stderr=""
+            )
+        if call[1:4] == ["issue", "show", "1029"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"comments": [{"content": other.to_comment()}]}), stderr=""
+            )
+        return completed(call)
+
+    claims = ChainlinkClaims(
+        agent_id=own.agent_id,
+        runner=runner,
+        clock=lambda: now + timedelta(minutes=1),
+    )
+    released, failed = claims.release_owned_claims_for_shutdown()
+
+    assert released == [own]
+    assert failed == []
+    assert ["chainlink", "issue", "label", "1033", "worklink:ready"] in calls
+    assert ["chainlink", "locks", "release", "1033"] in calls
+    assert ["chainlink", "issue", "unlabel", "1033", "worklink:in-progress"] in calls
+    assert not any("1029" in call and call[1:3] != ["issue", "show"] for call in calls)
+    assert not any(call[1:3] == ["locks", "steal"] for call in calls)
+
+    abort_comment = next(
+        call[-1]
+        for call in calls
+        if call[1:3] == ["issue", "comment"] and call[-1].startswith(SHUTDOWN_ABORT_PREFIX)
+    )
+    history = [own.to_comment(), abort_comment]
+    assert claims.attempts_used(history) == 0
+    assert claims.next_attempt(history) == 2
+
+
+def test_shutdown_operator_stop_disarms_only_matching_attempt(tmp_path: Path) -> None:
+    from mimir_cultivate.worklink.control import _mark_operator_stop
+
+    now = datetime(2026, 10, 8, tzinfo=UTC)
+    stopped = ClaimRecord(1033, 2, "agent", now)
+    other = ClaimRecord(1029, 1, "agent", now)
+    _mark_operator_stop(tmp_path, stopped.issue_id, stopped.attempt)
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(call, 0, json.dumps([{"id": 1033}, {"id": 1029}]), "")
+        if call[1:3] == ["issue", "show"]:
+            record = stopped if call[3] == "1033" else other
+            return subprocess.CompletedProcess(
+                call, 0, json.dumps({"comments": [{"content": record.to_comment()}]}), "",
+            )
+        return completed(call)
+
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner)
+    released, failed = claims.release_owned_claims_for_shutdown()
+    assert released == [stopped, other] and not failed
+    assert ["chainlink", "issue", "unlabel", "1033", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "unlabel", "1033", "worklink:in-progress"] in calls
+    assert not any(call[1:3] == ["issue", "label"] and call[3] == "1033" for call in calls)
+    assert not any(call[1:3] == ["issue", "comment"] and call[3] == "1033" for call in calls)
+    assert ["chainlink", "issue", "label", "1029", "worklink:ready"] in calls
+
+    # The old marker must not disarm attempt N+1 during a later shutdown.
+    calls.clear()
+    latest = ClaimRecord(1033, 3, "agent", now + timedelta(minutes=1))
+    def next_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args[1:4]) == ["issue", "show", "1033"]:
+            call = list(args)
+            return subprocess.CompletedProcess(call, 0, json.dumps({"comments": [
+                {"content": stopped.to_comment()}, {"content": latest.to_comment()},
+            ]}), "")
+        return runner(args)
+
+    ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=next_runner).release_owned_claims_for_shutdown()
+    assert ["chainlink", "issue", "label", "1033", "worklink:ready"] in calls
+
+
+def test_transition_issue_operator_stop_does_not_rearm(tmp_path: Path) -> None:
+    from mimir_cultivate.worklink.control import _mark_operator_stop
+
+    calls: list[list[str]] = []
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner, max_attempts=5)
+    _mark_operator_stop(tmp_path, 1033, 2)
+    claims.transition_issue(1033, status="stopped", review_ready=False, attempt=2)
+    assert not any(call[1:3] == ["issue", "label"] for call in calls)
+    assert {call[-1] for call in calls if call[1:3] == ["issue", "unlabel"]} >= {
+        "worklink:ready", "worklink:in-progress",
+    }
+    calls.clear()
+    claims.transition_issue(1033, status="failed", review_ready=False, attempt=3)
+    assert ["chainlink", "issue", "label", "1033", "worklink:ready"] in calls
+
+
+def test_part_c_shutdown_reports_partial_failure_and_timeout_remainder(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 23, tzinfo=UTC)
+    records = {
+        issue_id: ClaimRecord(issue_id, 1, "mimir-worklink:process-a", now)
+        for issue_id in (1, 2, 3)
+    }
+
+    def run_case(*, timeout: bool) -> tuple[list[ClaimRecord], list[object], list[tuple[str, dict[str, object]]]]:
+        events: list[tuple[str, dict[str, object]]] = []
+
+        def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            call = list(args)
+            if call[1:3] == ["issue", "list"]:
+                return subprocess.CompletedProcess(
+                    call, 0, stdout=json.dumps([{"id": 1}, {"id": 2}, {"id": 3}]), stderr=""
+                )
+            if call[1:3] == ["issue", "show"]:
+                issue_id = int(call[3])
+                if timeout and issue_id == 1:
+                    raise subprocess.TimeoutExpired(call, 0.01)
+                return subprocess.CompletedProcess(
+                    call,
+                    0,
+                    stdout=json.dumps({"comments": [{"content": records[issue_id].to_comment()}]}),
+                    stderr="",
+                )
+            if not timeout and call[1:4] == ["locks", "release", "1"]:
+                return subprocess.CompletedProcess(call, 1, stdout="", stderr="release denied")
+            return completed(call)
+
+        released, failed = ChainlinkClaims(
+            agent_id="mimir-worklink:process-a",
+            home_path=tmp_path,
+            runner=runner,
+            event_logger=lambda event, **payload: events.append((event, payload)),
+        ).release_owned_claims_for_shutdown()
+        return released, failed, events
+
+    released, failed, events = run_case(timeout=False)
+    assert [record.issue_id for record in released] == [2, 3]
+    assert [failure.issue_id for failure in failed] == [1]
+    assert events[0][1]["released_issue_ids"] == [2, 3]
+    assert events[0][1]["failed"][0]["issue_id"] == 1
+
+    released, failed, events = run_case(timeout=True)
+    assert released == []
+    assert [failure.issue_id for failure in failed] == [1, 2, 3]
+    assert [item["issue_id"] for item in events[0][1]["failed"]] == [1, 2, 3]
+    assert events[0][1]["failed"][1]["reason"] == "abandoned_after_timeout"
+
+
+def test_shutdown_abort_forgiveness_is_capped_and_attempt_ordinals_keep_advancing() -> None:
+    now = datetime(2026, 7, 29, tzinfo=UTC)
+    history: list[str] = []
+    for attempt in range(1, MAX_SHUTDOWN_ABORT_FORGIVENESS + 2):
+        claim = ClaimRecord(
+            1033,
+            attempt,
+            f"mimir-worklink:process-{attempt}",
+            now + timedelta(minutes=attempt),
+        )
+        history.extend(
+            [
+                claim.to_comment(),
+                ShutdownAbortRecord(
+                    issue_id=claim.issue_id,
+                    attempt=claim.attempt,
+                    agent_id=claim.agent_id,
+                    claimed_at=claim.claimed_at,
+                    aborted_at=claim.claimed_at + timedelta(seconds=10),
+                ).to_comment(),
+            ]
+        )
+
+    claims = ChainlinkClaims(agent_id="next")
+    assert claims.attempts_used(history) == 1
+    assert claims.next_attempt(history) == MAX_SHUTDOWN_ABORT_FORGIVENESS + 2
+
+
+def test_shutdown_abort_marker_cannot_pre_authorize_a_later_claim() -> None:
+    now = datetime(2026, 7, 29, tzinfo=UTC)
+    claim = ClaimRecord(1033, 1, "mimir-worklink:process-a", now)
+    abort = ShutdownAbortRecord(1033, 1, claim.agent_id, now, now + timedelta(seconds=1))
+
+    claims = ChainlinkClaims(agent_id="next")
+    assert claims.attempts_used([abort.to_comment(), claim.to_comment()]) == 1
+
+
+def test_normal_failed_transition_cannot_write_shutdown_abort_marker() -> None:
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(
+        agent_id="mimir-worklink:worker",
+        runner=lambda args: calls.append(list(args)) or completed(args),
+    )
+
+    claims.transition_issue(1033, status="failed", review_ready=False, attempt=1)
+
+    assert not any(SHUTDOWN_ABORT_PREFIX in token for call in calls for token in call)
+
+
+def test_repeated_verified_parks_do_not_use_attempt_budget(tmp_path: Path, caplog) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    base = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=None, observed_at=None, controller_phase="running",
+    )
+    parked = replace(base, status=FactoryStatus(
+        run_id=base.run_id, valid=True, sandbox_path=str(sandbox),
+        status="needs-human", park_snapshot=str(snapshot),
+    ), controller_phase="parked")
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, max_attempts=2)
+    history: list[str] = []
+    with caplog.at_level("DEBUG"):
+        for attempt in range(1, 9):
+            claim = ClaimRecord(1985, attempt, "agent", datetime(2026, 10, 1, tzinfo=UTC)
+                                + timedelta(minutes=attempt))
+            history.append(claim.to_comment())
+            assert claims.attempts_used(history) == 1
+            current_park = replace(parked, observed_at=(claim.claimed_at + timedelta(seconds=1)).isoformat())
+            save_factory_record(tmp_path, current_park)
+            assert record_clean_park(tmp_path, claim, current_park)
+            save_factory_record(tmp_path, base)
+            assert claims.attempts_used(history) == 0
+            assert claims.next_attempt(history) == attempt + 1
+    assert "clean_parks=8" in caplog.text
+    assert "issue_id=1985 generation=0" in caplog.text
+    # A restore, prune or interrupted re-park must never revoke archived credit.
+    snapshot.rmdir()
+    assert claims.attempts_used(history) == 0
+    target = tmp_path / "replacement"
+    target.mkdir()
+    snapshot.symlink_to(target, target_is_directory=True)
+    assert claims.attempts_used(history) == 0
+    # Admission and the operator-facing exhaustion record include parks even
+    # when the original snapshots are gone.
+    history.extend(ClaimRecord(1985, n, "agent", datetime(2026, 10, 2, tzinfo=UTC)
+                               + timedelta(minutes=n)).to_comment() for n in (9, 10))
+    calls = []
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    claims.runner = runner
+    result = claims.claim_issue(1985, history)
+    assert result.attempts_exhausted
+    exhausted = next(json.loads(argv[-1][len("WORKLINK_REAPER "):]) for argv in calls
+                     if argv[-1].startswith("WORKLINK_REAPER "))
+    assert exhausted["clean_parks"] == 8
+    assert exhausted["generation"] == 0
+
+
+@pytest.mark.parametrize("damage", [
+    "failed", "phase", "wrong_path", "invalid", "agent_id", "claimed_at",
+    "attempt", "observed_at", "symlink", "owner", "hardlink", "extra_key",
+    "record_attempt", "record_issue",
+])
+def test_only_matching_durable_clean_parks_are_free(tmp_path: Path, damage: str, monkeypatch) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="needs-human", park_snapshot=str(snapshot),
+        ), observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, max_attempts=1)
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record)
+    marker = tmp_path / "state" / "worklink" / "clean-parks" / "1985-1.json"
+    if damage in {"agent_id", "claimed_at", "attempt"}:
+        payload = json.loads(marker.read_text())
+        payload["claim"][damage] = (
+            "other" if damage == "agent_id" else
+            "2026-10-02T00:00:00+00:00" if damage == "claimed_at" else 2
+        )
+        marker.write_text(json.dumps(payload))
+    elif damage == "owner":
+        from types import SimpleNamespace
+        from mimir_cultivate.worklink import claims as module
+        real_fstat = module.os.fstat
+        def wrong_owner(fd):
+            info = real_fstat(fd)
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1,
+                                   st_nlink=info.st_nlink, st_size=info.st_size)
+        monkeypatch.setattr(module.os, "fstat", wrong_owner)
+    elif damage == "hardlink":
+        import os
+        os.link(marker, marker.with_name("hardlink.json"))
+    elif damage == "symlink":
+        original = marker.with_name("copy.json")
+        marker.rename(original)
+        marker.symlink_to(original)
+    else:
+        payload = json.loads(marker.read_text())
+        if damage == "extra_key":
+            payload["extra"] = True
+        elif damage == "record_attempt":
+            payload["record"]["attempt"] = 2
+        elif damage == "record_issue":
+            payload["record"]["issue_id"] = 1986
+            payload["record"]["run_id"] = "chainlink-1986"
+            payload["record"]["status"]["run_id"] = "chainlink-1986"
+            other_sandbox = str(sandbox.with_name("chainlink-1986"))
+            payload["record"]["sandbox"] = other_sandbox
+            payload["record"]["status"]["sandbox_path"] = other_sandbox
+            payload["record"]["status"]["park_snapshot"] = str(snapshot.with_name("chainlink-1986"))
+        elif damage == "failed":
+            payload["record"]["status"]["status"] = "failed"
+        elif damage == "invalid":
+            payload["record"]["status"]["valid"] = False
+        elif damage == "wrong_path":
+            payload["record"]["status"]["park_snapshot"] = str(tmp_path / "unrelated")
+        elif damage == "observed_at":
+            payload["record"]["observed_at"] = "2026-09-30T00:00:00+00:00"
+        else:
+            payload["record"]["controller_phase"] = "failed"
+        marker.write_text(json.dumps(payload))
+    assert claims.attempts_used([claim.to_comment()]) == 1
+
+
+@pytest.mark.parametrize("damage", [
+    "missing_retained", "issue_id", "attempt", "layout", "observed_none", "snapshot_symlink",
+])
+def test_park_credit_requires_retained_record_at_publication(tmp_path: Path, damage: str) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="needs-human", park_snapshot=str(snapshot),
+        ), observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    if damage == "issue_id":
+        # Keep a fully valid retained record, mismatching only its claim.
+        claim = replace(claim, issue_id=1986)
+    elif damage == "attempt":
+        record = replace(record, attempt=2)
+    elif damage == "layout":
+        bad_sandbox = tmp_path / "checkout" / "other" / record.run_id
+        record = replace(record, sandbox=str(bad_sandbox),
+                         status=replace(record.status, sandbox_path=str(bad_sandbox)))
+    elif damage == "observed_none":
+        record = replace(record, observed_at=None)
+    elif damage == "snapshot_symlink":
+        snapshot.rmdir()
+        target = tmp_path / "target"
+        target.mkdir()
+        snapshot.symlink_to(target, target_is_directory=True)
+    if damage != "missing_retained":
+        save_factory_record(tmp_path, record)
+    assert not record_clean_park(tmp_path, claim, record)
+    assert not (tmp_path / "state/worklink/clean-parks" / f"{claim.issue_id}-{claim.attempt}.json").exists()
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
+        [claim.to_comment()]
+    ) == 1
+
+
+def test_shutdown_overlap_uses_one_budget_for_exhaustion(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import claims as module
+    first = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    history = [first.to_comment(), replace(first, attempt=2).to_comment()]
+    history.append(ShutdownAbortRecord(
+        first.issue_id, first.attempt, first.agent_id, first.claimed_at,
+        first.claimed_at + timedelta(seconds=1),
+    ).to_comment())
+    # Both archives are present, but shutdown forgiveness owns the first key.
+    monkeypatch.setattr(module, "_read_clean_park", lambda *args: True)
+    calls = []
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, max_attempts=1,
+                            runner=lambda argv, **kw: (calls.append(list(argv)) or
+                                subprocess.CompletedProcess(argv, 0, "{}", "")))
+    assert claims.attempt_budget(history).clean_parks == 1
+    assert claims.attempts_used(history) == 0
+    history.append(replace(first, attempt=3).to_comment())
+    monkeypatch.setattr(module, "_read_clean_park", lambda home, claim: claim.attempt < 3)
+    assert claims.claim_issue(1985, history).attempts_exhausted
+    exhausted = next(json.loads(argv[-1][len("WORKLINK_REAPER "):]) for argv in calls
+                     if argv[-1].startswith("WORKLINK_REAPER "))
+    assert exhausted["clean_parks"] == 1
+
+
+def test_archive_read_checks_safe_ancestors(tmp_path):
+    from mimir_cultivate.worklink import claims as module
+    sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/chainlink-1985"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session", handle=None,
+        status=FactoryStatus(run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+                             status="needs-human", park_snapshot=str(snapshot)),
+        observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record)
+    directory = tmp_path / "state/worklink/clean-parks"
+    moved = directory.with_name("moved-parks")
+    directory.rename(moved)
+    directory.symlink_to(moved, target_is_directory=True)
+    # Final component is still a valid, controller-owned regular archive.
+    assert (directory / "1985-1.json").is_file()
+    assert not module._read_clean_park(tmp_path, claim)
+
+
+def test_archive_read_requires_regular_descriptor(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink import claims as module
+    import stat
+    # Feed otherwise-valid archive bytes through a non-regular descriptor. A
+    # fake fstat avoids opening a FIFO/device and cannot hang under mutation.
+    original = module.os.fstat
+    def nonregular(fd):
+        info = original(fd)
+        return SimpleNamespace(st_mode=stat.S_IFIFO | 0o600, st_uid=info.st_uid,
+                               st_nlink=1, st_size=info.st_size)
+    # Reuse the complete publisher fixture, altering only the read-side fstat.
+    sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/chainlink-1985"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session", handle=None,
+        status=FactoryStatus(run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+                             status="needs-human", park_snapshot=str(snapshot)),
+        observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record)
+    monkeypatch.setattr(module.os, "fstat", nonregular)
+    assert not module._read_clean_park(tmp_path, claim)
+
+
+def test_stale_park_cannot_discount_a_later_crashed_claim(tmp_path: Path) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    old = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    crashed = ClaimRecord(1985, 2, "agent", old.claimed_at + timedelta(days=1))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="needs-human", park_snapshot=str(snapshot),
+        ), observed_at=(old.claimed_at + timedelta(minutes=1)).isoformat(),
+        controller_phase="parked",
+    )
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, old, record)
+    assert not record_clean_park(tmp_path, crashed, record)
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
+        [old.to_comment(), crashed.to_comment()]
+    ) == 1
+
+
+@pytest.mark.parametrize("function, old, new, damage, write", [
+    ("_read_clean_park", "info.st_uid != os.geteuid()", "False", "owner", False),
+    ("_read_clean_park", "info.st_nlink != 1", "False", "hardlink", False),
+    ("_read_clean_park", 'set(payload) != {"claim", "record"}', "False", "extra_key", False),
+    ("_read_clean_park", "record.attempt <= claim.attempt", "True", "record_attempt", False),
+    ("_read_clean_park", "record.issue_id == claim.issue_id", "True", "record_issue", False),
+    ("record_clean_park", "record.issue_id != claim.issue_id", "False", "issue_id", True),
+    ("record_clean_park", "record.attempt > claim.attempt", "False", "attempt", True),
+    ("_archived_park", 'sandbox.parent.name != ".factory-sandboxes"', "False", "layout", True),
+    ("_observed_during_claim", "return False", "return True", "observed_none", True),
+    ("_published_park", "and not snapshot.is_symlink()", "", "snapshot_symlink", True),
+])
+def test_clean_park_guards_are_discriminating(tmp_path, monkeypatch, function, old, new, damage, write):
+    """Each reviewer-named guard must have a regression that kills its removal."""
+    import inspect
+    from mimir_cultivate.worklink import claims as module
+    source = inspect.getsource(getattr(module, function))
+    assert old in source
+    namespace = dict(vars(module))
+    exec(compile(source.replace(old, new, 1), "<clean-park-mutant>", "exec"), namespace)
+    monkeypatch.setattr(module, function, namespace[function])
+    # The writer's independent read-back also refuses mismatches; prove the
+    # write guard prevents publication itself, not just its return value.
+    if function == "record_clean_park":
+        reader = lambda *args: True
+        namespace["_read_clean_park"] = reader
+        monkeypatch.setattr(module, "_read_clean_park", reader)
+        monkeypatch.setitem(globals(), function, namespace[function])
+    with pytest.raises(AssertionError):
+        if write:
+            test_park_credit_requires_retained_record_at_publication(tmp_path, damage)
+        else:
+            test_only_matching_durable_clean_parks_are_free(tmp_path, damage, monkeypatch)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "driver_killed", "startup_deadline", "unpublished"])
+def test_non_clean_run_cannot_publish_park_credit(tmp_path: Path, outcome: str) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    if outcome != "unpublished":
+        snapshot.mkdir(parents=True)
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=None if outcome == "startup_deadline" else FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="failed" if outcome == "failed" else
+                   "running" if outcome == "driver_killed" else "needs-human",
+            park_snapshot=str(snapshot),
+        ), observed_at="2026-10-01T00:00:01+00:00",
+        controller_phase="failed" if outcome != "unpublished" else "parked",
+    )
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record) is False
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
+        [claim.to_comment()]
+    ) == 1

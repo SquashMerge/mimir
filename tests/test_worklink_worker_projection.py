@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("mimir_cultivate", reason="Worklink worker projections belong to Cultivate")
+
+from mimir_cultivate.worklink import checkout as checkout_module
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+# Exercise real executable admission with a fixture-owned CLI, not a host install.
+from tests.opencode_fixtures import opencode_binary
+
+
+@pytest.fixture(autouse=True)
+def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+
+
+def _write_native_files(home: Path) -> None:
+    config = home / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps({
+            "model": "proxy/model",
+            "provider": {
+                "proxy": {"options": {"apiKey": "{env:PROXY_TOKEN}"}},
+                "inactive": {"options": {"url": "https://inactive.invalid"}},
+            },
+        }),
+        encoding="utf-8",
+    )
+    auth = home / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({
+        "proxy": {"type": "oauth", "access": "access", "refresh": "refresh", "expires": 7},
+        "inactive": {"type": "api", "key": "inactive"},
+    }), encoding="utf-8")
+
+
+@pytest.mark.usefixtures("stub_opencode")
+def test_enabled_opencode_spec_contains_worker_local_selected_projections(
+    monkeypatch, tmp_path: Path, opencode_binary: Path
+) -> None:
+    _write_native_files(tmp_path)
+    # ``y`` used to be accepted by Config but rejected by Worklink's copy.
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Redirecting HOME alone does not seal config resolution: opencode_config
+    # prefers XDG_CONFIG_HOME and only falls back to HOME/.config. Left set,
+    # resolution escapes tmp_path into the real config directory and picks up
+    # whatever providers it declares -- so this test passes where the variable
+    # is unset and fails where it is set, which is ambient state it does not own.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.setenv("PROXY_TOKEN", "referenced")
+    enabled_root = tmp_path / "enabled"
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", enabled_root)
+    checkout = checkout_module._isolated_checkout_path(tmp_path / "repo", ".worklink", 1410, 1)
+    order = WorkOrder(
+        issue_id=1410,
+        checkout=checkout,
+        prompt="build",
+        rules=None,
+        timeout_s=30,
+        env={"MIMIR_HOME": str(tmp_path), "UNRELATED": "omitted"},
+    )
+
+    spec = OpenCodeBackend().work_spec(
+        order,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1410-a1",
+        test_command="true",
+    )
+
+    projections = spec.backend_config["worker_projections"]
+    assert spec.local_checkout.is_relative_to(enabled_root)
+    assert [projection.path for projection in projections] == [
+        ".config/opencode/opencode.json",
+        ".local/share/opencode/auth.json",
+    ]
+    assert json.loads(projections[0].document) == {
+        "model": "proxy/model",
+        "provider": {"proxy": {"options": {"apiKey": "referenced"}}},
+        # Leaf builds get the same containment default as factory runs and
+        # spawn_open_code: the worker document is built by one function, so the
+        # deny applies to every surface rather than only the one that needed it.
+        "permission": {"external_directory": "deny"},
+    }
+    assert json.loads(projections[1].document) == {
+        "proxy": {"type": "oauth", "access": "access", "refresh": "refresh", "expires": 7}
+    }
+    assert spec.backend_config["pass_env"] == ()
+    assert spec.env == {
+        "OPENCODE_PERMISSION": spec.env["OPENCODE_PERMISSION"],
+    }
+    assert spec.local_argv is not None
+    assert spec.local_argv[0] == str(opencode_binary)
+    dir_index = spec.local_argv.index("--dir")
+    assert spec.local_argv[dir_index + 1] == "."
+    assert str(order.checkout) not in spec.local_argv
+
+
+@pytest.mark.usefixtures("stub_opencode")
+def test_disabled_opencode_spec_preserves_direct_environment(
+    monkeypatch, tmp_path: Path, opencode_binary: Path
+) -> None:
+    _write_native_files(tmp_path)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # See the note above: HOME alone does not seal opencode config resolution.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    checkout = checkout_module._isolated_checkout_path(tmp_path / "repo", ".worklink", 1410, 1)
+    order = WorkOrder(
+        issue_id=1410,
+        checkout=checkout,
+        prompt="build",
+        rules=None,
+        timeout_s=30,
+        env={"MIMIR_HOME": str(tmp_path), "PROXY_TOKEN": "direct"},
+    )
+
+    spec = OpenCodeBackend().work_spec(
+        order,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1410-a1",
+        test_command="true",
+    )
+
+    assert "worker_projections" not in spec.backend_config
+    assert spec.local_checkout == tmp_path / ".worklink" / "repo" / "1410-1"
+    assert spec.env["PROXY_TOKEN"] == "direct"
+    assert spec.env["MIMIR_HOME"] == str(tmp_path)
+    assert spec.local_argv is not None
+    assert spec.local_argv[0] == str(opencode_binary)
+    dir_index = spec.local_argv.index("--dir")
+    assert spec.local_argv[dir_index + 1] == str(order.checkout)
+
+
+@pytest.mark.usefixtures("stub_opencode")
+def test_enabled_opencode_projects_conventional_ambient_key(
+    monkeypatch, tmp_path: Path, opencode_binary: Path
+) -> None:
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"model":"proxy/model"}', encoding="utf-8")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.setenv("PROXY_API_KEY", "ambient-projected-secret")
+    order = WorkOrder(
+        issue_id=1433,
+        checkout=tmp_path / "checkout",
+        prompt="build",
+        rules=None,
+        timeout_s=30,
+        env={"MIMIR_HOME": str(tmp_path)},
+    )
+
+    spec = OpenCodeBackend().work_spec(
+        order,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1433-a1",
+        test_command="true",
+    )
+
+    assert spec.local_argv is not None
+    assert spec.local_argv[0] == str(opencode_binary)
+    projections = spec.backend_config["worker_projections"]
+    assert json.loads(projections[1].document) == {
+        "proxy": {"type": "api", "key": "ambient-projected-secret"}
+    }
+    assert "PROXY_API_KEY" not in spec.env
+    assert "ambient-projected-secret" not in spec.env.values()

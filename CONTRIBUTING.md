@@ -1,0 +1,194 @@
+# Contributing to mimir
+
+Thanks for your interest. mimir is an early-stage open-source project; the
+contribution flow is still maturing. Below is what works today.
+
+## Quick path
+
+1. Open a GitHub issue describing the bug or proposal before you start a
+   substantial change. Small fixes (typos, obvious bugs, tightening a
+   docstring) can go straight to a PR.
+2. Fork, branch off `main`, push, open a PR. Reference the issue.
+3. Run `uv run pytest` locally — CI is currently best-effort while the repo
+   moves to public Actions minutes.
+4. Sign your commits if you can; not required.
+
+## What kind of change is in scope
+
+In scope:
+
+- Bug fixes
+- Documentation improvements
+- New skills (markdown-only, additive)
+- New optional bridges (Discord/Slack-style adapters)
+- New optional model providers
+- Tests, especially regression tests for failures observed in the field
+
+Less likely to be accepted without prior discussion:
+
+- Changes to the memory backend's on-disk schema (touches saga)
+- Changes to the agent loop's prompt-construction order (affects every
+  deployment's prompt cache)
+- Replacing a dependency with a different one for taste reasons
+
+If you're unsure, open an issue first.
+
+## Changelog
+
+For each change, add one `changelog.d/<issue-id>.md` (or a short slug if there
+is no issue ID), starting with a Markdown bullet exactly as it should appear in
+the release notes. See [changelog.d/README.md](changelog.d/README.md) for an
+example. Do not edit `CHANGELOG.md`'s `[Unreleased]` section in a change PR.
+When preparing a release, run `python scripts/changelog_collect.py X.Y.Z`
+(optionally with `--date YYYY-MM-DD`) in the release PR. Commit the
+generated versioned section and fragment removals with the version bump.
+
+## Code style
+
+- Python 3.11+
+- Prefer existing patterns over introducing new abstractions
+- `from __future__ import annotations` at the top of new modules
+- Type hints on public functions; `from typing import Optional` style is fine
+- Tests live under `tests/`; one file per module under test, matching name
+- No emoji in code or commit messages unless an existing file already uses them
+
+## Tests
+
+```bash
+uv sync
+uv run pytest                                          # full suite
+uv run pytest tests/test_specific_module.py            # one file
+uv run pytest --ignore=tests/test_bench_via_mimir.py   # skip slow integration
+```
+
+There is no executable agent-loop benchmark today. Chainlink #1758 was closed
+as WONT-BUILD on 2026-09-15: the project will not build an agent-loop benchmark.
+Before opening a PR for an agent-loop change, require the full suite to pass
+in both modes, plus the change's own discriminating integration tests that
+exercise the changed agent-loop behavior and fail if it regresses:
+
+```bash
+env -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --extra dev --extra bench pytest -q -n 6
+MIMIR_ACCESS_CONTROL_ENFORCED=1 uv run --extra dev --extra bench pytest -q -n 6
+```
+
+`benchmarks.longmemeval_via_memory.runner` is SagaStore-direct: it exercises
+only the memory backend, not the agent loop or BudgetGate, and is not
+agent-loop evidence. Memory-backend changes (`mimir/saga/`) are covered by
+`tests/test_saga_*` in the main test suite; no separate `cd` is needed.
+
+### Run both, and require both green
+
+Tests have a 300-second per-test bound via pytest-timeout's POSIX `signal`
+method, including inside xdist workers. A timeout reports the failed node id and
+lets the session continue; do not switch to `thread`, which exits the worker.
+The 300-second faulthandler stack dump remains enabled for diagnostics.
+Audit slow tests with `uv run --extra dev pytest --durations=20`. If a test
+legitimately needs more than five minutes, add `@pytest.mark.timeout(seconds)`
+with a comment explaining why; do not raise or disable the default globally.
+
+A scoped run is not evidence. Before submitting a test, run it alone **and** in
+the full suite:
+
+```bash
+uv run pytest -q tests/test_<file>.py   # your file alone
+uv run pytest -q                        # the whole suite
+```
+
+The shared autouse session fixture in `tests/isolation_fixtures.py` filters
+inherited `PATH` entries containing `opencode`, `codex`, `factory.js`,
+`feature-factory`, `chainlink`, or `gh` for both core and Cultivate tests. It
+mirrors affected directories without those CLIs so `git` and other utilities
+remain available. On POSIX the session-owned mirror lives directly under `/tmp`,
+with traversable directories, rather than pytest's private basetemp or an inherited
+private `TMPDIR`. This preserves ordinary tool lookup in uid-dropping subprocesses
+without opening pytest data or changing executable-target permissions. The mirror
+is cleaned up at session teardown. The Worklink pytest gate uses these same conftests (including
+when Cultivate is selected). Tests that need a command create a fixture-owned
+executable and put its directory on `PATH`. Tests of a real installed CLI use
+`@pytest.mark.real_coding_cli("name")` and request `real_coding_cli` to obtain
+its absolute path; they skip when the host does not provide it. Do not rely on
+an ambient coding CLI in ordinary tests.
+
+**A test that passes alone and fails in the full suite is not flaky. It is
+asserting shared state.** Fix the assertion, not the ordering. Do not reach for
+ordering plugins, `importlib.reload`, or fixtures that reset globals — those hide
+the coupling instead of removing it.
+
+### Timing in tests
+
+Outer `asyncio.wait_for` timeouts on expected results are normally loose hang
+guards, not latency requirements. Exception: when the behaviour under test is
+that a configured short timeout fires, keep the assertion guard well below the
+unpatched default and any slow regression path, or patch that slow path far
+above the guard. Never widen those guards mechanically: eventual completion
+alone does not prove that the configured timeout was honoured.
+Await tasks or signals owned by the component instead
+of sleeping before an assertion. Prove overlap and ordering by observing entry,
+exit, and state transitions rather than comparing wall-clock times. Where a
+timing sample is necessary, use the minimum, not the median, of samples.
+See [Don't assert on ambient state you don't own](#dont-assert-on-ambient-state-you-dont-own)
+when choosing what to observe.
+
+### Observing queued telemetry in tests
+
+`log_event_sync` queues best-effort writes when called on an event loop.
+The shared `tests/conftest.py` read barrier drains accepted writes before
+main-test-thread reads of paths owned by an EventLogger; do not patch the
+production logger back to inline IO to make assertions pass. Queue contract
+tests in `test_event_logger.py` deliberately opt out. Worker-thread reads,
+raw descriptors, and subprocess consumers need explicit synchronization.
+See [Event-log read consistency](docs/event-log-consistency.md) for the
+reader audit, exact coverage, and production consistency requirements.
+
+### Don't assert on ambient state you don't own
+
+Asserting on mutable process state is fine when that state is the *subject* of the
+test and the test owns it — verifying that a component sets an environment variable
+or handles the working directory correctly is a legitimate test, provided the change
+is scoped and restored (`monkeypatch`) or isolated in a child process.
+
+The problem is asserting on **ambient** state: shared state outside the ownership of
+your test or the component under test, which any other test in the process may also
+touch. Two kinds have bitten this repo:
+
+- **Import-time state** — `sys.modules`, import caches, registries, singletons,
+  module-level mutable defaults. Fails at collection, because importing a sibling
+  test module is enough to populate it.
+- **Live runtime state** — the event loop's task set (`asyncio.all_tasks()`), open
+  transports and connections, threads, timers. Fails during an `await`, when a task
+  another test leaked finishes or spawns inside your measurement window — so it can
+  fail even against a clean baseline.
+
+The distinction is ownership, not mutability. `monkeypatch.setenv` on a variable your
+component reads is owned and restored. A bare read of the whole event loop's task set
+is ambient, because everything that ran before you shares it.
+
+To prove a negative — "this module does not import X", "nothing reaches Y", "no
+adapter was started", "no task was created" — pick one:
+
+1. **Scope the claim to the thing under test.** Assert no *new* task belonging to
+   your component, not equality over every task in the loop. This is usually the
+   right answer and the cheapest.
+2. **Prove it statically.** Walk the AST for imports, or read the module's own
+   declarations. Works when the property is visible in the source.
+3. **Prove it in a child process.** A fresh interpreter running only the code
+   under test. Correct but slow; reserve it for properties the other two cannot
+   express.
+
+A before/after delta is **not** sufficient on its own. Capturing state, acting,
+and re-comparing still fails when the state moves concurrently — that is exactly
+how the second kind of failure gets past review, because the test reads as
+careful.
+
+## Reviewing
+
+PRs need one approving review before merge. The bar is "does this make the
+system better and not regress anything else." Drive-by suggestions are fine
+in comments; blocking changes should map to the contribution-scope guidance
+above.
+
+## Security
+
+For vulnerabilities, see [SECURITY.md](./SECURITY.md). Do not open public
+issues for security concerns.

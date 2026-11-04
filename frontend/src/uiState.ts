@@ -1,0 +1,75 @@
+import { create } from "zustand";
+
+interface UiState {
+  detailsPanelOpen: boolean;
+  selectedChatMessageId: string;
+  collapsedRegions: Record<string, boolean>;
+  // github: shared so AppFrame can gate the whole app behind a login screen
+  // when the server is protected and no key is stored. Set by the auth form.
+  apiKeyPresent: boolean;
+  // Set when an authenticated stream rejects the stored key. Presence remains
+  // separate because the rejected key can be replaced directly in the login form.
+  apiKeyRejected: boolean;
+  // A successful session POST has not yet been confirmed by an authenticated GET/stream.
+  sessionCookiePending: boolean;
+  sessionCookieMissing: boolean;
+  // chainlink #616: bumped on EVERY key change (set/clear/switch). A switch from
+  // one valid key to another keeps apiKeyPresent=true, so identity-scoped SSE
+  // streams need this monotonic signal to reconnect with the new key and stop
+  // delivering the previous user's data.
+  apiKeyEpoch: number;
+  // github #580: true while the user is engaging the chat composer, so the
+  // agent character can show "listening" (set by ChatRoute, read by AppFrame —
+  // the composer lives in a route, the character in the app shell).
+  composerActive: boolean;
+  setDetailsPanelOpen: (open: boolean) => void;
+  setSelectedChatMessageId: (id: string) => void;
+  setCollapsedRegion: (id: string, collapsed: boolean) => void;
+  toggleCollapsedRegion: (id: string) => void;
+  setComposerActive: (active: boolean) => void;
+  setApiKeyPresent: (present: boolean) => void;
+  setApiKeyRejected: (rejected: boolean) => void;
+  setSessionCookiePending: () => void;
+  confirmSessionCookie: () => void;
+}
+
+export const useUiState = create<UiState>((set) => ({
+  detailsPanelOpen: true,
+  selectedChatMessageId: "",
+  collapsedRegions: {},
+  composerActive: false,
+  apiKeyPresent: false,
+  apiKeyRejected: false,
+  sessionCookiePending: false,
+  sessionCookieMissing: false,
+  apiKeyEpoch: 0,
+  setComposerActive: (composerActive) => set({ composerActive }),
+  // setApiKeyPresent is only invoked by useSetApiKey on an actual key change, so
+  // bumping the epoch here is 1:1 with key changes (#616).
+  setApiKeyPresent: (apiKeyPresent) =>
+    set((state) => ({ apiKeyPresent, apiKeyRejected: false, sessionCookiePending: false,
+      sessionCookieMissing: false, apiKeyEpoch: state.apiKeyEpoch + 1 })),
+  setSessionCookiePending: () => set({ sessionCookiePending: true }),
+  confirmSessionCookie: () => set({ sessionCookiePending: false }),
+  setApiKeyRejected: (apiKeyRejected) => set((state) => ({
+    apiKeyRejected,
+    sessionCookieMissing: apiKeyRejected && state.sessionCookiePending,
+    sessionCookiePending: false
+  })),
+  setDetailsPanelOpen: (detailsPanelOpen) => set({ detailsPanelOpen }),
+  setSelectedChatMessageId: (selectedChatMessageId) => set({ selectedChatMessageId }),
+  setCollapsedRegion: (id, collapsed) =>
+    set((state) => ({
+      collapsedRegions: {
+        ...state.collapsedRegions,
+        [id]: collapsed
+      }
+    })),
+  toggleCollapsedRegion: (id) =>
+    set((state) => ({
+      collapsedRegions: {
+        ...state.collapsedRegions,
+        [id]: !state.collapsedRegions[id]
+      }
+    }))
+}));

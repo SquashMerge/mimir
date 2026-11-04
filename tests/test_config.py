@@ -1,0 +1,906 @@
+"""Unit tests for ``mimir.config`` — env parsing, caps, Config.from_env defaults,
+and Config properties (chainlink #247, slice 2/5).
+
+Coverage map:
+- ``_parse_sources``     — all three output shapes (frozenset, frozenset(), None)
+- ``_parse_chat_skill_allowlist`` — normalization, dedupe, invalid-drop
+- ``_env_float``         — unset/empty/valid
+- ``_env_int``           — unset/valid/negative
+- ``_turns_cap``         — default, normal, ceiling clamp
+- ``_events_cap``        — default, normal, ceiling clamp
+- ``Config.from_env``    — defaults, MIMIR_HOME, MIMIR_AGENT_ID, MIMIR_WEB_PORT,
+                           MIMIR_MODEL, MIMIR_PROMPTS_DIR,
+                           MIMIR_TURNS_ARCHIVE_DIR, MIMIR_RECENT_SOURCES,
+                           MIMIR_TOOL_CALL_BUDGET
+- ``Config`` properties  — logs_dir, turns_log, events_log, commitments_log,
+                           sdk_env_overrides (omits empty values)
+
+NB: ``_env_bool`` and ``_parse_folders`` have dedicated files in the test
+suite (test_config_env_bool.py, test_config_folders.py); this file adds the
+remaining surface.
+"""
+from __future__ import annotations
+
+import dataclasses
+import logging
+import os
+from pathlib import Path
+
+import pytest
+
+from mimir.config import (
+    _EVENTS_CAP_DEFAULT,
+    _EVENTS_CAP_MAX,
+    _TURNS_CAP_DEFAULT,
+    _TURNS_CAP_MAX,
+    _env_float,
+    _env_int,
+    _parse_chat_skill_allowlist,
+    _events_cap,
+    _parse_sources,
+    _turns_cap,
+)
+
+
+def test_home_dotenv_cannot_grant_plugins_across_loads(tmp_path, monkeypatch):
+    from mimir.config import Config
+
+    (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\nMIMIR_MODEL_SPEC=openai:test\n")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    first = Config.from_env()
+    second = Config.from_env()
+    assert first.plugin_manager.policy.frozen and second.plugin_manager.policy.frozen
+    assert first.plugin_manager.plugins == second.plugin_manager.plugins == ()
+    assert "MIMIR_PLUGINS" not in os.environ
+    assert first.model_spec == second.model_spec == "openai:test"
+    assert repr(dataclasses.asdict(first)["plugin_manager"]) == "<plugin runtime policy>"
+
+
+def test_home_dotenv_preserves_process_grant_even_on_failure(tmp_path, monkeypatch):
+    from mimir.config import _load_home_dotenv
+
+    (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\n")
+    monkeypatch.setenv("MIMIR_PLUGINS", "beta")
+
+    def fail(*args, **kwargs):
+        os.environ["MIMIR_PLUGINS"] = "alpha"
+        raise RuntimeError("dotenv failed")
+
+    monkeypatch.setattr("mimir.config.load_dotenv", fail)
+    with pytest.raises(RuntimeError, match="dotenv failed"):
+        _load_home_dotenv(tmp_path)
+    assert os.environ["MIMIR_PLUGINS"] == "beta"
+
+
+def test_config_captures_process_plugins_before_dotenv(tmp_path, monkeypatch):
+    from mimir.config import Config
+
+    (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\n")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_PLUGINS", "beta")
+    selections = []
+    from mimir.plugins import manager
+
+    original = manager.load_plugins
+
+    def capture(*, enable):
+        selections.append(enable)
+        return original(enable="")
+
+    monkeypatch.setattr(manager, "load_plugins", capture)
+    config = Config.from_env()
+    assert selections == ["beta"]
+    assert config.plugin_manager.policy.frozen
+    assert os.environ["MIMIR_PLUGINS"] == "beta"
+
+
+# ---------------------------------------------------------------------------
+# _parse_sources
+# ---------------------------------------------------------------------------
+
+class TestParseSources:
+    """``_parse_sources`` maps MIMIR_RECENT_SOURCES env text to a frozenset or None."""
+
+    def test_empty_string_returns_empty_frozenset(self) -> None:
+        """Explicitly empty value → allow nothing (bench-friendly default)."""
+        assert _parse_sources("") == frozenset()
+
+    def test_none_equiv_empty_returns_empty_frozenset(self) -> None:
+        """None-like (empty after strip) → same as empty."""
+        assert _parse_sources("   ") == frozenset()
+
+    def test_star_returns_none(self) -> None:
+        """``*`` → None means allow every source including legacy source=None."""
+        assert _parse_sources("*") is None
+
+    def test_all_returns_none(self) -> None:
+        """``all`` is an alias for ``*``."""
+        assert _parse_sources("all") is None
+
+    def test_all_is_case_sensitive(self) -> None:
+        """``all`` check is a literal string match — ``ALL`` is NOT the sentinel,
+        it falls through to tokenisation and produces a frozenset.
+        This pins the current behaviour so a future refactor doesn't
+        silently change the semantics.
+        """
+        result = _parse_sources("ALL")
+        # "ALL" is not in {"*", "all"} → parsed as a source name, lowercased
+        assert result == frozenset({"all"})
+
+    def test_star_with_whitespace(self) -> None:
+        """Whitespace around ``*`` is stripped before comparison."""
+        assert _parse_sources("  *  ") is None
+
+    def test_normal_comma_list(self) -> None:
+        result = _parse_sources("slack,discord,web")
+        assert result == frozenset({"slack", "discord", "web"})
+
+
+# ---------------------------------------------------------------------------
+# _parse_chat_skill_allowlist
+# ---------------------------------------------------------------------------
+
+class TestParseChatSkillAllowlist:
+    def test_empty_string_returns_empty_tuple(self) -> None:
+        assert _parse_chat_skill_allowlist("") == ()
+
+    def test_normalizes_dedupes_and_drops_invalid_entries(self) -> None:
+        assert _parse_chat_skill_allowlist(
+            " /Memory, github, GITHUB, //oops, world_scanning, foo/bar, review "
+        ) == ("memory", "github", "review")
+
+
+class TestParseSourcesTokens:
+    def test_normalises_to_lowercase(self) -> None:
+        """Tokens are lowercased for normalisation."""
+        result = _parse_sources("Slack,DISCORD")
+        assert result == frozenset({"slack", "discord"})
+
+    def test_strips_whitespace_around_tokens(self) -> None:
+        result = _parse_sources(" slack , discord , web ")
+        assert result == frozenset({"slack", "discord", "web"})
+
+    def test_empty_tokens_skipped(self) -> None:
+        """Consecutive commas produce empty tokens — those are discarded."""
+        result = _parse_sources(",slack,,discord,")
+        assert result == frozenset({"slack", "discord"})
+
+    def test_single_token(self) -> None:
+        assert _parse_sources("stdin") == frozenset({"stdin"})
+
+    def test_default_sources_string(self) -> None:
+        """The default string hard-coded in from_env produces the expected set."""
+        raw = "slack,discord,bluesky,web,stdin,acp"
+        result = _parse_sources(raw)
+        assert result == frozenset(
+            {"slack", "discord", "bluesky", "web", "stdin", "acp"}
+        )
+
+
+# ---------------------------------------------------------------------------
+# _env_float
+# ---------------------------------------------------------------------------
+
+class TestEnvFloat:
+    def test_unset_returns_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MIMIR_TEST_FLOAT_X", raising=False)
+        assert _env_float("MIMIR_TEST_FLOAT_X", 0.9) == pytest.approx(0.9)
+
+    def test_empty_returns_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_TEST_FLOAT_X", "")
+        assert _env_float("MIMIR_TEST_FLOAT_X", 1.5) == pytest.approx(1.5)
+
+    def test_valid_float(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_TEST_FLOAT_X", "3.14")
+        assert _env_float("MIMIR_TEST_FLOAT_X", 0.0) == pytest.approx(3.14)
+
+    def test_integer_string_parses_as_float(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_TEST_FLOAT_X", "5")
+        assert _env_float("MIMIR_TEST_FLOAT_X", 0.0) == pytest.approx(5.0)
+
+    def test_zero_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_TEST_FLOAT_X", "0")
+        assert _env_float("MIMIR_TEST_FLOAT_X", 99.9) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# _env_int
+# ---------------------------------------------------------------------------
+
+class TestEnvInt:
+    def test_unset_returns_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MIMIR_TEST_INT_X", raising=False)
+        assert _env_int("MIMIR_TEST_INT_X", 42) == 42
+
+    def test_empty_returns_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_TEST_INT_X", "")
+        assert _env_int("MIMIR_TEST_INT_X", 7) == 7
+
+    def test_valid_integer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_TEST_INT_X", "100")
+        assert _env_int("MIMIR_TEST_INT_X", 0) == 100
+
+    def test_negative_integer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_TEST_INT_X", "-5")
+        assert _env_int("MIMIR_TEST_INT_X", 0) == -5
+
+
+# ---------------------------------------------------------------------------
+# _turns_cap / _events_cap
+# ---------------------------------------------------------------------------
+
+class TestLogCaps:
+    """Caps clamp at hard ceiling values to prevent runaway disk usage."""
+
+    def test_turns_cap_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MIMIR_MAX_TURNS", raising=False)
+        assert _turns_cap() == _TURNS_CAP_DEFAULT
+
+    def test_turns_cap_normal_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_MAX_TURNS", "1000")
+        assert _turns_cap() == 1000
+
+    def test_turns_cap_clamps_at_max(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Values above _TURNS_CAP_MAX are silently clamped down."""
+        monkeypatch.setenv("MIMIR_MAX_TURNS", str(_TURNS_CAP_MAX + 99999))
+        assert _turns_cap() == _TURNS_CAP_MAX
+
+    def test_events_cap_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MIMIR_MAX_EVENTS", raising=False)
+        assert _events_cap() == _EVENTS_CAP_DEFAULT
+
+    def test_events_cap_normal_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_MAX_EVENTS", "10000")
+        assert _events_cap() == 10000
+
+    def test_events_cap_clamps_at_max(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MIMIR_MAX_EVENTS", str(_EVENTS_CAP_MAX + 99999))
+        assert _events_cap() == _EVENTS_CAP_MAX
+
+    def test_events_default_is_15x_turns_default(self) -> None:
+        """Events cap default is 15× turns cap default (matches measured ~14 events/turn)."""
+        assert _EVENTS_CAP_DEFAULT == _TURNS_CAP_DEFAULT * 15
+
+    def test_events_max_is_15x_turns_max(self) -> None:
+        assert _EVENTS_CAP_MAX == _TURNS_CAP_MAX * 15
+
+
+# ---------------------------------------------------------------------------
+# Config.from_env — field defaults + overrides
+# ---------------------------------------------------------------------------
+
+class TestConfigFromEnv:
+    """Key from_env fields get sensible defaults and honour env overrides.
+
+    Each test calls ``Config.from_env()`` with MIMIR_HOME=/tmp so it
+    doesn't depend on the live container's home directory.
+    """
+
+    def _base(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Set the bare minimum to make from_env() deterministic in tests."""
+        monkeypatch.setenv("MIMIR_HOME", "/tmp")
+        # Avoid picking up the live oauth credentials path from the container.
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+
+    def test_home_from_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.home == tmp_path.resolve()
+
+    def test_agent_id_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_AGENT_ID", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.agent_id == "mimir"
+
+    def test_agent_id_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_AGENT_ID", "sentinel")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.agent_id == "sentinel"
+
+    def test_web_port_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_WEB_PORT", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.web_port == 8080
+
+    def test_web_port_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_WEB_PORT", "9090")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.web_port == 9090
+
+    def test_empty_web_host_uses_loopback_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_WEB_HOST", "")
+        from mimir.config import Config
+
+        assert Config.from_env().web_host == "127.0.0.1"
+
+    def test_web_host_and_chat_stream_cap_unset_defaults(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_WEB_HOST", raising=False)
+        monkeypatch.delenv("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", raising=False)
+        from mimir.config import Config
+
+        config = Config.from_env()
+
+        assert config.web_host == "127.0.0.1"
+        assert config.chat_stream_max_subscribers == 8
+
+    def test_empty_chat_stream_subscriber_cap_warns_and_uses_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", "")
+        from mimir.config import Config
+
+        with caplog.at_level(logging.WARNING, logger="mimir.config"):
+            config = Config.from_env()
+
+        assert config.chat_stream_max_subscribers == 8
+        assert "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS" in caplog.text
+
+    def test_explicit_empty_values_with_distinct_semantics_are_preserved(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_RECENT_SOURCES", "")
+        monkeypatch.setenv("MIMIR_COMMITMENTS_DUE_CHECK_CRON", "")
+        monkeypatch.setenv("MIMIR_HEALTH_PROBE_CRON", "")
+        from mimir.config import Config
+
+        config = Config.from_env()
+
+        assert config.recent_sources == frozenset()
+        assert config.commitments_due_check_cron == ""
+        assert config.health_probe_cron == ""
+
+    def test_attachments_max_bytes_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#495: a sane 25MiB inbound-attachment cap by default, so the bridge
+        size gate is armed (it's a no-op when None)."""
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_ATTACHMENTS_MAX_BYTES", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.attachments_max_bytes == 25 * 1024 * 1024
+
+    def test_attachments_max_bytes_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_ATTACHMENTS_MAX_BYTES", str(500 * 1024 * 1024))
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.attachments_max_bytes == 500 * 1024 * 1024
+
+    def test_model_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_MODEL", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.model == "claude-opus-4-7"
+
+    def test_model_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_MODEL", "claude-haiku-4-5")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.model == "claude-haiku-4-5"
+
+    def test_tool_call_budget_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_TOOL_CALL_BUDGET", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.tool_call_budget == 200
+
+    def test_turn_timeout_default_matches_documented_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_TURN_TIMEOUT_SECONDS", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.turn_timeout_seconds == 3600
+
+    def test_turn_timeout_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_TURN_TIMEOUT_SECONDS", "1800")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.turn_timeout_seconds == 1800
+
+    def test_tool_call_budget_zero_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Setting MIMIR_TOOL_CALL_BUDGET=0 disables the cap entirely."""
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_TOOL_CALL_BUDGET", "0")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.tool_call_budget == 0
+
+    def test_activity_panel_channels_off_by_default_and_parsed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_ACTIVITY_PANEL_CHANNELS", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.activity_panel_channels == ()
+
+        monkeypatch.setenv("MIMIR_ACTIVITY_PANEL_CHANNELS", "slack-C01, dm-slack-")
+        cfg = Config.from_env()
+        assert cfg.activity_panel_channels == ("slack-C01", "dm-slack-")
+
+    def test_chat_skills_disabled_with_empty_allowlist_by_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_CHAT_SKILLS_ENABLED", raising=False)
+        monkeypatch.delenv("MIMIR_CHAT_SKILL_ALLOWLIST", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.chat_skills_enabled is False
+        assert cfg.chat_skill_allowlist == ()
+
+    def test_chat_skill_allowlist_from_env_is_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_CHAT_SKILLS_ENABLED", "true")
+        monkeypatch.setenv(
+            "MIMIR_CHAT_SKILL_ALLOWLIST",
+            " /Memory, github, GITHUB, //oops, foo/bar, review ",
+        )
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.chat_skills_enabled is True
+        assert cfg.chat_skill_allowlist == ("memory", "github", "review")
+
+    def test_coding_capability_requires_selected_installed_plugin(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+        from mimir.config import Config
+
+        assert not Config.from_env().plugin_manager.plugins
+
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        assert not Config.from_env().plugin_manager.plugins
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+        selected = Config.from_env().plugin_manager
+        assert {plugin.candidate.name for plugin in selected.plugins} == {"cultivate"}
+        assert selected.policy.policy_consumer_hooks is not None
+
+    def _coding_warnings(self, monkeypatch, caplog, home: Path, *, plugins: str = "") -> list[str]:
+        import logging
+
+        import mimir.config as config_module
+
+        # The once-per-process ledger is owned by mimir.config; give each test
+        # a fresh one instead of asserting against whatever ran earlier.
+        monkeypatch.setattr(config_module, "_retired_coding_warned", set())
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.setenv("MIMIR_PLUGINS", plugins)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="mimir.config"):
+            config_module.Config.from_env()
+        return [r.getMessage() for r in caplog.records
+                if r.name == "mimir.config" and ("CODING IS DISABLED" in r.getMessage()
+                                                 or "no selected plugin owns it" in r.getMessage())]
+
+    def _assert_upgrade_hint(self, message: str) -> None:
+        assert "uv sync --all-packages" in message
+        assert "--build-arg MIMIR_PLUGIN_SELECTION=cultivate" in message
+        assert "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build" in message
+        assert "set MIMIR_PLUGINS=cultivate in the process or supervisor environment" in message
+        assert "Do NOT put MIMIR_PLUGINS in the agent home's .env" in message
+
+    def test_retired_coding_flag_without_provider_warns_with_upgrade_steps(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        warnings = self._coding_warnings(monkeypatch, caplog, tmp_path)
+        assert len(warnings) == 1
+        assert warnings[0].startswith("MIMIR_CODING_ENABLED=true is retired and ignored: CODING IS DISABLED")
+        assert "MIMIR_PLUGINS=''" in warnings[0]
+        self._assert_upgrade_hint(warnings[0])
+
+    def test_retired_coding_flag_from_home_dotenv_warns_and_still_boots(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        # The realistic upgrade: the flag was set in the home .env, which still
+        # loads, and selecting a plugin there is impossible.
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        (tmp_path / ".env").write_text("MIMIR_CODING_ENABLED=yes\n")
+        warnings = self._coding_warnings(monkeypatch, caplog, tmp_path)
+        assert len(warnings) == 1 and "CODING IS DISABLED" in warnings[0]
+        self._assert_upgrade_hint(warnings[0])
+
+    def test_falsy_retired_coding_flag_only_asks_for_removal(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        import logging
+
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
+        self._coding_warnings(monkeypatch, caplog, tmp_path)
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert ("MIMIR_CODING_ENABLED is retired and ignored; coding is selected only by "
+                "MIMIR_PLUGINS. Remove MIMIR_CODING_ENABLED from the deployment") in messages
+        assert not any("CODING IS DISABLED" in message for message in messages)
+
+    def test_provider_owned_home_files_without_provider_warn_and_still_boot(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        (tmp_path / "worklink.yaml").write_text("tool_pins: {}\n")
+        (tmp_path / "repositories.yaml").write_text("repositories: []\n")
+        warnings = self._coding_warnings(monkeypatch, caplog, tmp_path)
+        assert len(warnings) == 2
+        for name, message in zip(("worklink.yaml", "repositories.yaml"), warnings, strict=True):
+            assert message.startswith(f"{tmp_path / name} exists but no selected plugin owns it")
+            assert "IGNORED and coding is disabled" in message
+            self._assert_upgrade_hint(message)
+
+    def test_retired_coding_warnings_fire_once_per_process(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        import logging
+
+        from mimir.config import Config
+
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+        (tmp_path / "worklink.yaml").write_text("tool_pins: {}\n")
+        assert len(self._coding_warnings(monkeypatch, caplog, tmp_path)) == 2
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="mimir.config"):
+            Config.from_env()
+        assert not [r for r in caplog.records if "CODING IS DISABLED" in r.getMessage()
+                    or "no selected plugin owns it" in r.getMessage()]
+
+    def test_selected_provider_owns_home_files_and_flag_only_asks_for_removal(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        (tmp_path / "worklink.yaml").write_text("tool_pins: {}\n")
+        assert self._coding_warnings(monkeypatch, caplog, tmp_path, plugins="cultivate") == []
+        assert any(r.getMessage().startswith("MIMIR_CODING_ENABLED is retired and ignored; coding is "
+                                             "selected only by MIMIR_PLUGINS") for r in caplog.records)
+
+    def test_opencode_config_uses_native_surface(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        self._base(monkeypatch)
+        path = tmp_path / "operator-opencode.jsonc"
+        monkeypatch.setenv("OPENCODE_CONFIG", str(path))
+        from mimir.config import Config
+
+        assert not hasattr(Config.from_env(), "opencode_config_path")
+        pytest.importorskip("mimir_cultivate")
+        from mimir_cultivate.opencode import opencode_config_path
+
+        assert opencode_config_path() == path
+
+    def test_enforced_coding_config_does_not_require_opencode_on_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+
+        import shutil
+        original_which = shutil.which
+
+        def unexpected_probe(binary: str) -> str | None:
+            if binary == "opencode":
+                raise AssertionError("config inventory validation must not probe OpenCode on PATH")
+            return original_which(binary)
+
+        monkeypatch.setattr("mimir.providers.shutil.which", unexpected_probe)
+
+        from mimir.config import Config
+
+        config = Config.from_env()
+        assert config.access_control_enforced is True
+        assert config.plugin_manager.policy.policy_consumer_hooks is not None
+
+    def test_startup_logs_effective_file_roots_with_origin(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+        from mimir.config import Config
+
+        with caplog.at_level(logging.INFO):
+            Config.from_env()
+
+        assert f"path='{home.resolve()}' mode=rw origin=derived-home" in caplog.text
+        assert f"path='{repo.resolve()}' mode=ro origin=configured" in caplog.text
+
+    def test_removed_file_op_roots_warns_without_configuring_roots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+        monkeypatch.setenv("MIMIR_FILE_OP_ROOTS", f"{repo}:rw")
+        from mimir.config import Config
+
+        with caplog.at_level(logging.WARNING):
+            config = Config.from_env()
+
+        assert str(repo.resolve()) not in dict(config.file_tool_roots)
+        assert "MIMIR_FILE_OP_ROOTS is retired and ignored" in caplog.text
+        assert "migrate its required roots to MIMIR_FILE_TOOL_ROOTS" in caplog.text
+
+    def test_removed_file_op_roots_absence_does_not_warn(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.delenv("MIMIR_FILE_OP_ROOTS", raising=False)
+        from mimir.config import Config
+
+        with caplog.at_level(logging.WARNING):
+            Config.from_env()
+
+        assert "MIMIR_FILE_OP_ROOTS is retired and ignored" not in caplog.text
+
+    def test_prompts_dir_none_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_PROMPTS_DIR", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.prompts_dir is None
+
+    def test_prompts_dir_resolves_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_PROMPTS_DIR", str(tmp_path))
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.prompts_dir == tmp_path.resolve()
+
+    def test_turns_archive_dir_none_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_TURNS_ARCHIVE_DIR", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.turns_archive_dir is None
+
+    def test_turns_archive_dir_resolves_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_TURNS_ARCHIVE_DIR", str(tmp_path))
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.turns_archive_dir == tmp_path.resolve()
+
+    def test_recent_sources_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_RECENT_SOURCES", raising=False)
+        from mimir.config import Config
+
+        assert Config.from_env().recent_sources == frozenset(
+            {"slack", "discord", "bluesky", "web", "stdin", "acp"}
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("", frozenset()), ("discord", frozenset({"discord"}))],
+    )
+    def test_recent_sources_explicit_policy_is_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        value: str,
+        expected: frozenset[str],
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_RECENT_SOURCES", value)
+        from mimir.config import Config
+
+        assert Config.from_env().recent_sources == expected
+
+    def test_recent_sources_star_allows_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_RECENT_SOURCES", "*")
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.recent_sources is None
+
+    def test_acp_journal_ttl_default_and_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_ACP_JOURNAL_TTL_DAYS", raising=False)
+        from mimir.config import Config
+
+        assert Config.from_env().acp_journal_ttl_days == 7
+        monkeypatch.setenv("MIMIR_ACP_JOURNAL_TTL_DAYS", "30")
+        assert Config.from_env().acp_journal_ttl_days == 30
+
+    @pytest.mark.parametrize("value", ["", "0", "-1", "+7", "1.5", "seven"])
+    def test_acp_journal_ttl_rejects_non_positive_decimal_values(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_ACP_JOURNAL_TTL_DAYS", value)
+        from mimir.config import Config
+
+        with pytest.raises(
+            ValueError,
+            match="MIMIR_ACP_JOURNAL_TTL_DAYS must be a positive decimal integer",
+        ):
+            Config.from_env()
+
+    def test_home_dotenv_loads_defaults(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        (tmp_path / ".env").write_text(
+            "MIMIR_MODEL_SPEC=anthropic:claude-haiku-4-5\n"
+            "ANTHROPIC_API_KEY=from-dotenv\n",
+            encoding="utf-8",
+        )
+
+        from mimir.config import Config
+        cfg = Config.from_env()
+
+        assert cfg.model_spec == "anthropic:claude-haiku-4-5"
+        assert cfg.anthropic_api_key == "from-dotenv"
+        assert os.environ["ANTHROPIC_API_KEY"] == "from-dotenv"
+
+    def test_home_dotenv_does_not_override_exported_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-4.1-mini")
+        (tmp_path / ".env").write_text(
+            "MIMIR_MODEL_SPEC=anthropic:claude-haiku-4-5\n",
+            encoding="utf-8",
+        )
+
+        from mimir.config import Config
+        cfg = Config.from_env()
+
+        assert cfg.model_spec == "openai:gpt-4.1-mini"
+
+    def test_home_dotenv_absent_is_noop(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        # #1209 pinned an explicit anthropic spec here so the test could run
+        # under enforcement — the old claude-code default failed the startup
+        # preflight. The default is enforcement-compatible now, so this goes
+        # back to exercising the fallback path, which is what the test is for.
+        monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+        assert not (tmp_path / ".env").exists()
+
+        from mimir.config import Config
+        cfg = Config.from_env()
+
+        assert cfg.model_spec == "codex-plus:gpt-5.6-luna"
+        assert not (tmp_path / ".env").exists()
+
+
+# ---------------------------------------------------------------------------
+# Config properties
+# ---------------------------------------------------------------------------
+
+class TestConfigProperties:
+    def _cfg(self, monkeypatch: pytest.MonkeyPatch, home: str = "/tmp") -> object:
+        monkeypatch.setenv("MIMIR_HOME", home)
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        from mimir.config import Config
+        return Config.from_env()
+
+    def test_logs_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.logs_dir == tmp_path.resolve() / "logs"
+
+    def test_turns_log(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.turns_log == tmp_path.resolve() / "logs" / "turns.jsonl"
+
+    def test_events_log(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.events_log == tmp_path.resolve() / "logs" / "events.jsonl"
+
+    def test_commitments_log(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """commitments_log lives under ``.mimir/`` (not ``logs/``) so the
+        indexer doesn't treat it as searchable content.
+        """
+        cfg = self._cfg(monkeypatch, home=str(tmp_path))
+        assert cfg.commitments_log == tmp_path.resolve() / ".mimir" / "commitments.jsonl"
+
+    def test_sdk_env_overrides_omits_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """sdk_env_overrides only includes non-empty override values."""
+        monkeypatch.setenv("MIMIR_HOME", "/tmp")
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.delenv("ANTHROPIC_CUSTOM_MODEL_OPTION", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        assert cfg.sdk_env_overrides() == {}
+
+    def test_sdk_env_overrides_includes_set_values(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", "/tmp")
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.com")
+        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-opus-4-7")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_CUSTOM_MODEL_OPTION", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", raising=False)
+        from mimir.config import Config
+        cfg = Config.from_env()
+        overrides = cfg.sdk_env_overrides()
+        assert overrides["ANTHROPIC_BASE_URL"] == "https://proxy.example.com"
+        assert overrides["ANTHROPIC_MODEL"] == "claude-opus-4-7"
+        assert "ANTHROPIC_AUTH_TOKEN" not in overrides
+
+
+# ---------------------------------------------------------------------------
+# _env_int / _env_float garbage handling (chainlink #259)
+# ---------------------------------------------------------------------------
+
+class TestEnvNumericGarbage:
+    """Garbage numeric env vars warn + fall back to default rather than
+    crashing boot with an opaque ValueError traceback (matches _env_bool)."""
+
+    def test_env_int_garbage_returns_default_and_warns(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.setenv("MIMIR_TEST_INT_X", "808O")  # typo: letter O
+        with caplog.at_level(logging.WARNING):
+            assert _env_int("MIMIR_TEST_INT_X", 8080) == 8080
+        assert any("not a valid integer" in r.getMessage() for r in caplog.records)
+
+    def test_env_float_garbage_returns_default_and_warns(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.setenv("MIMIR_TEST_FLOAT_X", "3.1foo")
+        with caplog.at_level(logging.WARNING):
+            assert _env_float("MIMIR_TEST_FLOAT_X", 2.5) == pytest.approx(2.5)
+        assert any("not a valid float" in r.getMessage() for r in caplog.records)

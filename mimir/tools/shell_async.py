@@ -1,0 +1,634 @@
+"""Async-shell tools: ``bash_async`` / ``bash_jobs_list`` / ``bash_job_output``.
+
+Port of ``mimir/shelltools.py`` from main, adapted from the
+SDK MCP-tool surface to native LangChain ``@tool`` callables. The
+synchronous ``shell_exec`` in ``mimir/tools/extra.py`` is fine for
+sub-second commands, but anything that has to wait on a webhook /
+CI / long build / etc. needs the async-job path so the dispatcher's
+event loop isn't held captive for the full subprocess duration.
+
+A ``shell_job_complete`` AgentEvent fires when each spawned process
+exits, so the agent gets a fresh turn with the exit-code + tail
+output rather than having to poll ``bash_jobs_list``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import shlex
+from pathlib import Path
+from typing import Annotated, Any, Callable, Optional
+
+from langchain.tools import ToolRuntime
+from langchain_core.tools import InjectedToolArg, ToolException, tool
+
+from ..models import AuthContext
+from ..shell_jobs import (
+    SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
+    ShellJobRegistry,
+    normalize_shell_job_scope,
+    normalize_shell_job_stream,
+    parse_shell_job_tail_lines,
+    shell_job_snapshots,
+)
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Intent normalization for wait-on-pending guard (chainlink #189 / #192)
+# ---------------------------------------------------------------------------
+
+# Bumped from 100 → 200 to reduce false-positive truncation collisions where
+# two genuinely-different commands share a long common prefix (chainlink #192).
+_INTENT_PREFIX_MAX_CHARS = 200
+_ENV_VAR_TOKEN_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=")
+
+# Matches shell-wrapper invocations: /bin/bash -c, bash -lc, /bin/sh -c, etc.
+# Used to unwrap the inner command before intent normalisation.
+_SHELL_WRAPPER_RE = re.compile(
+    r"^\s*(?:/[^\s]*/)?(?:ba)?sh\s+(?:-[a-z]+\s+)+",
+    re.IGNORECASE,
+)
+
+# Matches AT-protocol and HTTP/S URIs — used as a supplementary intent key.
+_URI_RE = re.compile(r"(?:at://|https?://)\S+")
+
+
+def _unwrap_shell_wrapper(command: str) -> str:
+    """Strip a shell-wrapper prefix and return the inner command.
+
+    If ``command`` is of the form ``/bin/bash -c '...'`` (or any
+    ``[/path/]bash``/``sh`` with ``-c`` / ``-lc`` / etc.), extract the
+    quoted inner body and return it.  Handles both single-quoted and
+    double-quoted bodies.  Returns ``command`` unchanged if it does not
+    start with a recognised shell wrapper.
+
+    Examples::
+
+        '/bin/bash -c "cd /tmp && echo hi"'  →  'cd /tmp && echo hi'
+        "bash -lc 'export X=1 && foo bar'"   →  'export X=1 && foo bar'
+        'echo hello'                          →  'echo hello'  (unchanged)
+    """
+    stripped = command.strip()
+    m = _SHELL_WRAPPER_RE.match(stripped)
+    if not m:
+        return command
+    after_shell = stripped[m.end():]
+    if not after_shell:
+        return command
+    # Strip outer single or double quotes if the remainder is fully quoted.
+    if after_shell[0] in ("'", '"'):
+        quote_char = after_shell[0]
+        close = after_shell.rfind(quote_char)
+        if close > 0:
+            return after_shell[1:close]
+    return after_shell
+
+
+def _take_last_chain_segment(command: str) -> str:
+    """Return the last ``&&``-separated segment of a shell command chain.
+
+    Strips leading ``cd /path &&`` patterns and similar multi-step setup
+    chains so the core executable is what remains.
+
+    Examples::
+
+        'cd /mimir-home && social-cli like at://...'  →  'social-cli like at://...'
+        'cd /a && export X=1 && node cli.js foo'      →  'node cli.js foo'
+        'git fetch origin'                             →  'git fetch origin' (unchanged)
+    """
+    parts = [p.strip() for p in command.split("&&")]
+    parts = [p for p in parts if p]
+    return parts[-1] if parts else command
+
+
+def _intent_prefix(command: str) -> str:
+    """Return a normalized intent string for duplicate-spawn detection.
+
+    Handles (in order):
+
+    1. **Shell-wrapper escalation** (chainlink #192) — strips ``/bin/bash -c '...'``
+       wrappers so the inner command is what's compared.
+    2. **``&&``-chain prefixes** — takes the last segment of chains like
+       ``cd /path && export X=1 && <real-command>``.
+    3. **Leading env-var exports** — strips ``export FOO=bar`` and bare
+       ``VAR=val`` prefix tokens (original chainlink #189 logic).
+    4. **Absolute-path executables** — normalises ``/usr/bin/node`` →
+       ``node`` so the guard is insensitive to whether the caller used a
+       symbolic name or the full binary path.
+
+    Returns the first ``_INTENT_PREFIX_MAX_CHARS`` characters lower-cased
+    with whitespace collapsed.  Intent equality is heuristic; see also
+    ``_intent_suffix_key`` for the URI-based supplementary check.
+    """
+    cmd = command.strip()
+
+    # 1. Unwrap shell wrappers (e.g. /bin/bash -c '...')
+    cmd = _unwrap_shell_wrapper(cmd)
+
+    # 2. Take the last segment of a && chain (strips cd /path && ... prefixes)
+    cmd = _take_last_chain_segment(cmd)
+
+    # 3. Tokenise and skip leading ``export`` keywords and ``VAR=val`` tokens.
+    tokens = cmd.split()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "export":
+            i += 1
+        elif _ENV_VAR_TOKEN_RE.match(tok):
+            i += 1
+        else:
+            break
+    tokens = tokens[i:]
+
+    # 4. Normalise the executable: absolute paths → basename.
+    if tokens and "/" in tokens[0]:
+        tokens[0] = tokens[0].rsplit("/", 1)[-1]
+
+    remaining = " ".join(tokens)
+    normalized = " ".join(remaining.lower().split())
+    return normalized[:_INTENT_PREFIX_MAX_CHARS]
+
+
+def _intent_suffix_key(command: str) -> str | None:
+    """Return the rightmost URI in the command, or ``None`` if absent.
+
+    Supplementary target key; callers must also compare cwd and action.
+    A shared URI alone does not imply a shared intent.
+
+    Matches ``at://…``, ``https://…``, and ``http://…`` URIs.  Strips
+    trailing shell-quote artefacts (``'``, ``"``).  Returns the rightmost
+    match lower-cased so the check is case-insensitive.
+    """
+    # Strip trailing quotes that bash -c wrappers leave on the last token.
+    cmd = command.strip().rstrip("'\"")
+    matches = _URI_RE.findall(cmd)
+    if not matches:
+        return None
+    uri = matches[-1].rstrip("'\".,;)")
+    return uri.lower()
+
+
+def _intent_cwd(command: str, cwd: str | None) -> Path:
+    """Resolve the launch directory plus literal cd setup in an && chain."""
+    directory = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    for segment in _unwrap_shell_wrapper(command).split("&&")[:-1]:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        if tokens[:1] == ["cd"]:
+            if tokens[1:2] == ["--"]:
+                tokens.pop(1)
+            if len(tokens) == 2 and tokens[1] != "-":
+                target = Path(tokens[1]).expanduser()
+                directory = (directory / target).resolve()
+            elif len(tokens) == 1:
+                directory = Path.home().resolve()
+    return directory
+
+
+def _intent_action(command: str) -> tuple[str, ...]:
+    """Keep the executable and verb path (including gh's resource subcommand)."""
+    action = []
+    for token in _intent_prefix(command).split():
+        if token.startswith("-") or _URI_RE.match(token):
+            break
+        action.append(token)
+    return tuple(action)
+
+
+# Module-level dependency injection — populated by ``server.py:build_app``
+# (or, in tests, by hand). ``_on_complete`` is the bridge into
+# ``Agent._handle_shell_job_complete`` that fires the
+# ``shell_job_complete`` AgentEvent when a job exits.
+_REGISTRY: Optional[ShellJobRegistry] = None
+_ON_COMPLETE: Optional[Callable[[Any], None]] = None
+
+
+def set_shell_job_registry(
+    registry: ShellJobRegistry | None,
+    on_complete: Callable[[Any], None] | None = None,
+) -> None:
+    """Wire the per-process ShellJobRegistry into the async-shell tools.
+
+    Called once at startup from ``server.py:build_app``. ``on_complete``
+    is the wake-up bridge: when a spawned subprocess exits, it's
+    invoked with the ``ShellJob`` so the agent dispatcher gets a
+    fresh ``shell_job_complete`` turn. ``None`` is valid (test
+    harnesses + bench runners); jobs still spawn + log, but no event
+    fires on exit.
+    """
+    global _REGISTRY, _ON_COMPLETE
+    _REGISTRY = registry
+    _ON_COMPLETE = on_complete if registry is not None else None
+
+
+@tool(
+    "bash_async",
+    description=(
+        "Spawn a command in the background. User/admin calls run through "
+        "``bash -lc`` with full shell syntax. Under a trusted-service profile, "
+        "the command must be one argv with no shell syntax and is executed "
+        "with ``shell=False``. Use ``cwd`` instead of a leading ``cd DIR &&``. "
+        "Returns immediately "
+        "with a ``job_id``. When the command exits, a "
+        "``shell_job_complete`` event fires on this channel with the "
+        "exit code and tail output — folded into this turn if still running, "
+        "otherwise delivered as a follow-up; no need to poll. "
+        "Use this for commands that block on an event "
+        "you're waiting for (a webhook, a CI pipeline, a long build). "
+        "Don't use for sub-second commands — call shell_exec instead. "
+        "Don't use for things that might never finish — wrap in "
+        "``timeout 1h ...``."
+    ),
+)
+async def bash_async(
+    command: str,
+    session_id: Optional[str] = None,
+    cwd: Optional[str] = None,
+    mimir_direct_argv: Annotated[Optional[list[str]], InjectedToolArg] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Args:
+        command: The command to spawn. User/admin calls run via ``bash -lc``;
+            trusted-service calls execute one server-authorized argv directly.
+        session_id: Optional saga session id used only to confirm the caller's
+            active turn. It cannot select a different completion channel.
+        cwd: Working directory for the command. Trusted-service calls require an
+            authorized absolute directory and execute with its resolved path.
+        mimir_direct_argv: Server-injected exact argv for trusted-service calls.
+    """
+    if _REGISTRY is None:
+        return "bash_async failed: no shell-job registry configured"
+    if not command or not command.strip():
+        return "bash_async failed: command is required"
+
+    # Resolve the caller's channel independently of the model-provided session
+    # id. The session id may identify the caller's turn, but must never select
+    # where completion output is delivered.
+    # The runtime auth carrier and dispatcher ContextVar survive the SDK/MCP
+    # forked-task path and are server-controlled. get_current_turn() remains the
+    # direct-call fallback used by tests and in-process handlers.
+    from .._context import get_current_turn, is_same_turn_auth_carrier, resolve_active_ctx
+    from .registry import _current_channel_id_var
+    runtime_auth = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    current_ctx = get_current_turn()
+    channel_id = (
+        runtime_auth.channel_id
+        if runtime_auth is not None
+        else (_current_channel_id_var.get() or "").strip() or None
+    )
+    if channel_id is None and current_ctx is not None:
+        channel_id = getattr(current_ctx, "channel_id", None)
+
+    if channel_id is None:
+        # Preserve the deliberate in-process behavior: callers without a
+        # resolvable delivery channel may still spawn a job. In that case the
+        # model-provided session id selects neither routing nor authorization.
+        ctx = current_ctx
+        resolution = "contextvar" if ctx is not None else "missing"
+    else:
+        ctx, resolution = resolve_active_ctx(
+            {"session_id": session_id}, caller_channel_id=channel_id,
+        )
+    if resolution == "channel_mismatch":
+        return (
+            "bash_async refused: session_id belongs to a different channel; "
+            "use the current turn's session_id"
+        )
+
+    auth_context = runtime_auth or getattr(ctx, "auth_context", None)
+    if isinstance(auth_context, AuthContext) and auth_context.channel_id != channel_id:
+        return (
+            "bash_async refused: authorization context does not belong to the "
+            "caller's channel"
+        )
+    if not isinstance(auth_context, AuthContext):
+        auth_context = None
+    if is_same_turn_auth_carrier(ctx, auth_context):
+        auth_context = ctx.auth_with_plugin_state()
+
+    # Wait-on-pending guard (chainlink #189 / #192): refuse if a same-intent
+    # job is already running on this channel.  Prevents the retry-escalation
+    # failure mode where the agent spawns N async variants of the same command
+    # without ever seeing results from the first.
+    #
+    # Two-key match (chainlink #192 — wrapper-invariance):
+    #   1. Prefix key — normalised first N chars after stripping wrappers,
+    #      cd-chains, env-exports, and path prefixes on the executable.
+    #      Catches plain retries and env-export variants.
+    #   2. Suffix key — rightmost AT-URI / HTTP-URI with equal executable
+    #      and verb path. Different actions on one target are not duplicates.
+    #
+    # Scope: per-channel and resolved effective working directory.
+    #
+    # chainlink #193: emit algedonic event on refusal so the operator can
+    # audit "how many refused respawns happened" without reading turn
+    # transcripts.  The tool return-string is the agent-visible signal;
+    # the event is the operator/introspection-visible audit trail.
+    from .extra import _effective_shell_cwd
+    from ._shell_env import bound_direct_exec_argv
+
+    # Match shell_exec's default/session cwd; service argv never inherits it.
+    direct_execution = bound_direct_exec_argv() is not None or mimir_direct_argv is not None
+    effective_cwd = _effective_shell_cwd(cwd, allow_session_state=not direct_execution)
+    cwd = str(effective_cwd) if effective_cwd is not None else None
+    effective_intent_cwd = _intent_cwd(command, cwd)
+    if channel_id is not None:
+        new_intent = _intent_prefix(command)
+        new_suffix = _intent_suffix_key(command)
+        new_action = _intent_action(command)
+        for running_job in _REGISTRY.running_jobs():
+            if running_job.channel_id != channel_id:
+                continue
+            running_cwd = getattr(running_job, "intent_cwd", None)
+            if running_cwd is None:
+                running_cwd = _intent_cwd(running_job.command, None)
+            if running_cwd != effective_intent_cwd:
+                continue
+            prefix_match = _intent_prefix(running_job.command) == new_intent
+            suffix_match = (
+                new_suffix is not None
+                and new_suffix == _intent_suffix_key(running_job.command)
+                and new_action == _intent_action(running_job.command)
+            )
+            if prefix_match or suffix_match:
+                match_kind = "prefix" if prefix_match else "uri-target"
+                # chainlink #193: best-effort event so operator audit doesn't
+                # require reading turn transcripts.  ``safe_log_event`` silences
+                # logger-not-initialized in test harnesses / bench runners.
+                from ..event_logger import safe_log_event as _safe_log  # lazy — avoids top-level cycle
+                await _safe_log(
+                    "bash_async_refused_same_intent",
+                    channel_id=channel_id,
+                    running_job_id=running_job.job_id,
+                    new_command=command[:200],
+                    intent_prefix=new_intent,
+                )
+                return (
+                    f"bash_async refused: a job with the same intent is already "
+                    f"running (job_id={running_job.job_id!r}, pid={running_job.pid}, "
+                    f"match={match_kind!r}). "
+                    f"Check its status with "
+                    f"bash_job_output(job_id={running_job.job_id!r}) before spawning "
+                    f"a retry.  To see all in-flight jobs: bash_jobs_list()."
+                )
+
+    redact_names: tuple[str, ...] = ()
+    try:
+        from ._shell_env import (
+            bound_direct_exec_argv,
+            direct_exec_env_overlay,
+            direct_exec_redact_names,
+            filter_shell_env_overlay,
+            interactive_shell_env_overlay,
+            login_shell_command,
+            refuse_protected_shell_operands,
+        )
+        direct_argv = bound_direct_exec_argv()
+        if direct_argv is None:
+            direct_argv = mimir_direct_argv
+        if direct_argv is None:
+            refuse_protected_shell_operands(
+                command, Path(cwd).expanduser() if cwd else None, "bash_async",
+            )
+        argv = (
+            direct_argv
+            if direct_argv is not None
+            else ["bash", "-lc", login_shell_command(command)]
+        )
+        spawn_kwargs: dict[str, Any] = {
+            "argv": argv,
+            "channel_id": channel_id,
+            "on_complete": _ON_COMPLETE,
+            "auth_context": auth_context,
+        }
+        if ctx is not None and getattr(ctx, "turn_id", None) and ctx.channel_id == channel_id:
+            spawn_kwargs["starting_turn_id"] = ctx.turn_id
+            spawn_kwargs["completion_chain_id"] = getattr(ctx, "completion_chain_id", None) or ctx.turn_id
+            spawn_kwargs["ifc_labels"] = (
+                auth_context.ifc_state.current(auth_context.ifc_labels)
+                if auth_context is not None else getattr(ctx, "ifc_labels", None)
+            )
+        if cwd:
+            spawn_kwargs["cwd"] = str(Path(cwd).expanduser())
+        if direct_argv is not None:
+            redact_names = direct_exec_redact_names(argv)
+            overlay = direct_exec_env_overlay(argv)
+            spawn_kwargs["env_overlay"] = overlay
+            if redact_names:
+                spawn_kwargs["redact_values"] = tuple(
+                    value for name in redact_names if (value := overlay.get(name))
+                )
+        else:
+            spawn_kwargs["env_overlay"] = interactive_shell_env_overlay()
+        spawn_kwargs["env_overlay"] = filter_shell_env_overlay(spawn_kwargs["env_overlay"])
+        job = _REGISTRY.spawn(
+            command,  # original (clean) command recorded for display
+            **spawn_kwargs,
+        )
+        job.intent_cwd = effective_intent_cwd
+        if "ifc_labels" not in spawn_kwargs:
+            job.ifc_labels = (
+                auth_context.ifc_state.current(auth_context.ifc_labels)
+                if auth_context is not None else getattr(ctx, "ifc_labels", None)
+            )
+    except Exception as exc:  # noqa: BLE001
+        from .refusals import ToolPolicyRefusal
+
+        if isinstance(exc, ToolPolicyRefusal):
+            return str(exc)
+        if redact_names:
+            return f"bash_async failed: {type(exc).__name__}"
+        return f"bash_async failed: {exc}"
+
+    return (
+        f"Spawned job {job.job_id} (pid {job.pid}). When it exits, a "
+        f"shell_job_complete notice will report the exit code and output "
+        f"tail on this channel. Check progress with "
+        f"``bash_jobs_list`` or "
+        f"``bash_job_output(job_id={job.job_id!r})``."
+    )
+
+
+@tool(
+    "bash_jobs_list",
+    description=(
+        "List registered async shell jobs. ``scope`` ∈ "
+        "{running, visible, all} — running is the default (in-flight "
+        "only); visible adds recently-finished jobs; all includes "
+        "everything in the registry."
+    ),
+)
+async def bash_jobs_list(
+    scope: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Args:
+        scope: One of ``running`` (default), ``visible``, ``all``.
+    """
+    if _REGISTRY is None:
+        return "bash_jobs_list failed: no shell-job registry configured"
+    try:
+        resolved_scope = normalize_shell_job_scope(scope)
+    except ValueError as exc:
+        return f"bash_jobs_list failed: {exc}"
+    auth_context = _reading_auth_context(runtime)
+    snapshots = shell_job_snapshots(
+        _REGISTRY, auth_context=auth_context, scope=resolved_scope,
+    )
+    if not snapshots:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
+        return f"No jobs in scope={resolved_scope}."
+    _publish_shell_job_provenance(
+        [str(s["job_id"]) for s in snapshots], auth_context,
+    )
+    lines = [f"Jobs (scope={resolved_scope}, count={len(snapshots)}):"]
+    for s in snapshots:
+        cmd = (s.get("command") or "")[:120]
+        lines.append(
+            f"  {s['job_id']} [{s['status']}] "
+            f"elapsed={s['elapsed_seconds']}s pid={s['pid']} — {cmd}"
+        )
+    return "\n".join(lines)
+
+
+@tool(
+    "bash_job_output",
+    description=(
+        "Return tail of stdout/stderr for one job. ``stream`` ∈ "
+        "{stdout, stderr, both}; ``tail_lines`` defaults to "
+        f"{SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES}. Use after spawning "
+        "to check mid-flight progress, or after a shell_job_complete "
+        "event to read more than the wake-up summary tail."
+    ),
+)
+async def bash_job_output(
+    job_id: str,
+    tail_lines: Optional[int] = None,
+    stream: Optional[str] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Args:
+        job_id: The ``job_id`` returned by ``bash_async``.
+        tail_lines: How many lines from the end to include
+            (default ``SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES``).
+        stream: ``stdout`` / ``stderr`` / ``both`` (default ``both``).
+    """
+    if _REGISTRY is None:
+        raise ToolException("bash_job_output failed: no shell-job registry configured")
+    if not job_id:
+        raise ToolException("bash_job_output failed: job_id is required")
+    try:
+        resolved_tail = parse_shell_job_tail_lines(tail_lines)
+        resolved_stream = normalize_shell_job_stream(stream)
+    except ValueError as exc:
+        raise ToolException(f"bash_job_output failed: {exc}") from exc
+
+    # ``read_output`` does sync file IO (seek-from-end tail). Wrap in
+    # ``asyncio.to_thread`` so a multi-MB read doesn't freeze the
+    # event loop while the tail walks backward through chunks.
+    auth_context = _reading_auth_context(runtime)
+    result = await asyncio.to_thread(
+        _REGISTRY.read_output,
+        job_id, auth_context=auth_context,
+        tail_lines=resolved_tail, stream=resolved_stream,
+    )
+    if "error" in result:
+        raise ToolException(result["error"])
+    _publish_shell_job_provenance([job_id], auth_context)
+    from .._context import get_current_turn, is_same_turn_auth_carrier
+
+    ctx = get_current_turn()
+    if ctx is not None and is_same_turn_auth_carrier(ctx, auth_context):
+        job = _REGISTRY.get_owned(job_id, auth_context=auth_context)
+        if job is not None:
+            job.mark_final_output_observed(ctx.turn_id, result.get("exit_code"))
+    lines = [
+        f"Job {result['job_id']} [{result['status']}] "
+        f"elapsed={result['elapsed_seconds']}s pid={result['pid']} "
+        f"exit_code={result['exit_code']}",
+        f"Command: {result.get('command', '')}",
+    ]
+    if resolved_stream in ("stdout", "both"):
+        stdout = result.get("stdout_tail") or "(empty)"
+        lines.append("")
+        lines.append("--- stdout tail ---")
+        lines.append(stdout)
+    if resolved_stream in ("stderr", "both"):
+        stderr = result.get("stderr_tail") or "(empty)"
+        lines.append("")
+        lines.append("--- stderr tail ---")
+        lines.append(stderr)
+    return "\n".join(lines)
+
+
+bash_job_output.handle_tool_error = True
+
+
+def _reading_auth_context(runtime: ToolRuntime[AuthContext] | None) -> AuthContext | None:
+    """Resolve only a server-created reading-turn authorization carrier."""
+    if runtime is not None and isinstance(runtime.context, AuthContext):
+        return runtime.context
+    from .._context import get_current_turn
+
+    auth_context = getattr(get_current_turn(), "auth_context", None)
+    return auth_context if isinstance(auth_context, AuthContext) else None
+
+
+def _publish_shell_job_provenance(
+    job_ids: list[str], auth_context: AuthContext | None,
+) -> None:
+    """Preserve both job metadata ACLs and the labels inherited at spawn."""
+    from ..access_control import protected_result_source, publish_protected_result
+    from ..models import InformationFlowLabels
+
+    sources = []
+    for job_id in job_ids:
+        job = (
+            _REGISTRY.get_owned(job_id, auth_context=auth_context)
+            if _REGISTRY is not None
+            else None
+        )
+        sources.append(protected_result_source(
+            auth_context,
+            principal="mimir:shell-jobs",
+            domain="shell_jobs",
+            resource_id=f"job:{job_id}",
+            bridge_instance="shell",
+        ))
+        inherited = getattr(job, "ifc_labels", None)
+        if inherited is None:
+            sources.append(protected_result_source(
+                auth_context,
+                principal=None,
+                domain="shell_jobs",
+                resource_id=f"job:{job_id}:output",
+                bridge_instance="shell",
+            ))
+        elif isinstance(inherited, InformationFlowLabels):
+            sources.extend(inherited.sources)
+    publish_protected_result(tuple(sources))
+
+
+__all__ = (
+    "bash_async",
+    "bash_jobs_list",
+    "bash_job_output",
+    "set_shell_job_registry",
+    # Exposed for testing:
+    "_intent_prefix",
+    "_intent_suffix_key",
+    "_unwrap_shell_wrapper",
+    "_take_last_chain_segment",
+)

@@ -1,0 +1,779 @@
+"""Per-channel + global message buffer (SPEC §5.4).
+
+On startup ``chat_history.jsonl`` is replayed into two ``deque``s:
+- ``message_history_all`` (bounded, default 500)
+- ``message_history_by_channel[channel_id]`` (each bounded, default 250)
+
+New messages append to both. In-memory retention uses ``deque.maxlen`` and the
+on-disk file periodically rotates to its newest bounded tail.
+
+``recent_activity()`` produces the chronological merge that goes into the
+turn prompt under ``## Recent activity``: within-channel last N + cross-channel
+same-user last M with adjacent assistant replies (DM channels excluded from the
+cross pull — privacy rule).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import threading
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Literal
+
+from ._jsonl_tail import _tail_lines, count_lines_chunked
+from .access_control import ChannelResourceAdapter
+from .pollers import POLLER_CHANNEL_PREFIX
+from .prompt_safety import prefix_prompt_body, sanitize_prompt_field
+from .redaction import redact_payload
+from .scheduler import SCHEDULER_CHANNEL_PREFIX
+
+#: Channel-id prefixes that identify synthetic per-tick channels (no
+#: narrative continuity across turns — each turn has a discrete job).
+#: Used by :meth:`MessageBuffer.assemble_recent_activity_candidates` to skip the
+#: within-channel pull for these channels. Chainlink #78 (2026-05-11)
+#: extended via PR #127 review (poller:* added 2026-05-11).
+SYNTHETIC_CHANNEL_PREFIXES = (SCHEDULER_CHANNEL_PREFIX, POLLER_CHANNEL_PREFIX)
+DEFAULT_HISTORY_DISK_MAX = 5000
+
+log = logging.getLogger(__name__)
+
+MessageKind = Literal["user_message", "assistant_message", "system_note"]
+
+
+@dataclass
+class Message:
+    ts: str
+    msg_id: str | None
+    channel_id: str
+    author: str | None
+    author_display: str | None
+    kind: MessageKind
+    content: str
+    thread_id: str | None = None
+    # Origin tag for the Recent-activity allowlist. None on legacy records;
+    # set to the inbound AgentEvent.source on new records (SPEC §5.4).
+    source: str | None = None
+    # Server-derived integrity at persistence time. Legacy records fail closed.
+    integrity: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "ts": self.ts,
+            "msg_id": self.msg_id,
+            "channel_id": self.channel_id,
+            "author": self.author,
+            "author_display": self.author_display,
+            "kind": self.kind,
+            "content": self.content,
+            "thread_id": self.thread_id,
+            "source": self.source,
+            "integrity": self.integrity,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Message":
+        return cls(
+            ts=data.get("ts", ""),
+            msg_id=data.get("msg_id"),
+            channel_id=data.get("channel_id", ""),
+            author=data.get("author"),
+            author_display=data.get("author_display"),
+            kind=data.get("kind", "user_message"),
+            content=data.get("content", ""),
+            thread_id=data.get("thread_id"),
+            source=data.get("source"),
+            integrity=data.get("integrity"),
+        )
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+# ── Process-global buffer accessor ──────────────────────────────────
+#
+# Single ``MessageBuffer`` per process (created by ``server.py`` at
+# startup). Outbound paths that don't have a direct handle to the Agent
+# instance — chiefly the ``send_message`` tool (``mimir/tools/registry.py``),
+# which is the sole delivery path as of 0.3.0 — look up the buffer here so
+# they can append to the conversational record without needing buffer
+# plumbed through every call path.
+#
+# Was lost in PR #181 (deepagents migration) — the SDK-era code
+# inlined ``buffer.append`` in the agent's pre/post hooks; the
+# LangGraph rewrite dropped those calls. As a result, ``chat_history.jsonl``
+# stopped being appended to on 2026-05-17; the agent's "Recent activity"
+# block in the prompt was whatever was on disk at last process start.
+
+_global_buffer: "MessageBuffer | None" = None
+
+
+def set_global_buffer(buf: MessageBuffer | None) -> None:
+    """Register the process's single ``MessageBuffer``. Called once by
+    ``server.py`` after the buffer is constructed + replayed."""
+    global _global_buffer
+    _global_buffer = buf
+
+
+def get_global_buffer() -> "MessageBuffer | None":
+    """Resolve the registered ``MessageBuffer``. Returns ``None`` when
+    nothing has registered yet (test paths that don't go through
+    ``server.serve``) — callers must handle the ``None`` case."""
+    return _global_buffer
+
+
+def _is_private_channel(channel_id: str) -> bool:
+    """SPEC §5.4 privacy rule — any ``dm-*`` channel is private."""
+    return channel_id.startswith("dm-")
+
+
+@dataclass
+class MessageBuffer:
+    """In-memory deques + JSONL append. One instance per process.
+
+    ``resolver`` (FUTURE_WORK §6.1) is an optional ``IdentityResolver``
+    that maps platform-prefixed author ids to a canonical for cross-
+    channel / cross-platform pull. ``None`` (the default) makes
+    ``cross_author_messages`` fall back to direct equality on
+    ``msg.author`` — same behavior as before identity reconciliation
+    landed.
+    """
+
+    history_path: Path
+    global_max: int = 500
+    per_channel_max: int = 250
+    resolver: object | None = None  # IdentityResolver | None — typed loosely to
+    # avoid a hard import dep in this module (history.py loads early).
+    cross_platform_pull: bool = True
+    disk_max: int = DEFAULT_HISTORY_DISK_MAX
+    _all: deque[Message] = field(default_factory=deque)
+    _by_channel: dict[str, deque[Message]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._all = deque(maxlen=self.global_max)
+        self.disk_max = max(1, self.disk_max)
+        self._line_count = count_lines_chunked(self.history_path)
+        self._trim_lock: asyncio.Lock | None = None
+        self._io_condition = threading.Condition()
+        self._active_writers = 0
+        self._trimming = False
+        # Per-channel deques are created lazily on first message for that channel.
+
+    def replay(self) -> int:
+        """Read ``chat_history.jsonl`` from disk and rehydrate the deques.
+
+        Returns the number of messages loaded. Idempotent — replaying twice
+        just re-overwrites with the same tail (deques are bounded).
+        """
+        self._all = deque(maxlen=self.global_max)
+        self._by_channel = {}
+        if not self.history_path.is_file():
+            return 0
+        loaded = 0
+        try:
+            with self.history_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = Message.from_dict(data)
+                    self._append_in_memory(msg)
+                    loaded += 1
+        except OSError as exc:
+            log.warning("chat_history.jsonl replay failed: %s", exc)
+        return loaded
+
+    def _append_in_memory(self, msg: Message) -> None:
+        # Normalize client IDs at live/replay ingress, not only during rendering.
+        if msg.msg_id is not None:
+            msg.msg_id = sanitize_prompt_field(msg.msg_id)
+        ch = self._by_channel.get(msg.channel_id)
+        if ch is None:
+            ch = deque(maxlen=self.per_channel_max)
+            ch.extend(m for m in self._all if m.channel_id == msg.channel_id)
+            self._by_channel[msg.channel_id] = ch
+        self._all.append(msg)
+        ch.append(msg)
+
+    async def append(self, msg: Message, *, require_disk: bool = False) -> None:
+        """Redact a copy, then append to disk + both deques.
+
+        With ``require_disk``, propagate write errors and populate memory only
+        after the write succeeds. Used when history itself is delivery.
+
+        Redaction is write-only: legacy records are not scrubbed on read or
+        rewritten. Both live prompt history and disk receive the redacted copy;
+        the caller's message remains unchanged.
+
+        The in-memory deque mutation is single-threaded under asyncio
+        (synchronous, no awaits inside ``_append_in_memory``), and the disk
+        write goes through ``asyncio.to_thread``. Concurrent writes share a
+        condition only with the infrequent exclusive retention trim. Each
+        ``_append_disk`` call opens the file with ``"a"`` and writes one
+        JSON line — POSIX guarantees ``O_APPEND`` writes are atomic at
+        the kernel level for a single ``write(2)`` syscall, so concurrent
+        appends from different threads can't corrupt or interleave at the
+        byte level. They may land out of call order on disk (whichever
+        thread wins the inode-lock race), but each line is whole.
+
+        Avoiding an asyncio lock across ``await asyncio.to_thread(...)`` lets callers
+        actually fan out to separate threads instead of serializing
+        through one. See CR#17.
+
+        Note: caller-visible flush ordering is preserved by keeping the
+        ``await``; on return, this message's disk write has completed.
+        Tests and graceful-shutdown paths depend on that. A more
+        aggressive fix would make the write fire-and-forget with a
+        bounded queue — deferred (would need bg-task tracking on the
+        buffer instance plus test-side flush hooks)."""
+        msg = Message.from_dict(redact_payload(msg.to_dict()))
+        if require_disk:
+            await asyncio.to_thread(self._append_disk, msg, raise_errors=True)
+            self._append_in_memory(msg)
+        else:
+            self._append_in_memory(msg)
+            await asyncio.to_thread(self._append_disk, msg)
+        self._line_count += 1
+        if self._line_count > int(self.disk_max * 1.1):
+            if self._trim_lock is None:
+                self._trim_lock = asyncio.Lock()
+            async with self._trim_lock:
+                if self._line_count > int(self.disk_max * 1.1):
+                    await asyncio.to_thread(self._trim_sync)
+
+    def _append_disk(self, msg: Message, *, raise_errors: bool = False) -> None:
+        """Append one JSONL record. **Interleave-atomicity, not
+        durability** (CR2 memory & retrieval clarification).
+
+        ``open("a")`` + ``write(...)`` produces a single ``write(2)``
+        per call thanks to Python's text-mode buffering inside the
+        ``with`` block, and POSIX guarantees ``O_APPEND`` writes are
+        atomic at the kernel level — so concurrent appends from
+        different threads can't corrupt or interleave at the byte
+        level (each line is whole). They may land out of call order
+        on disk (whichever thread wins the inode-lock race), but the
+        file stays valid JSONL.
+
+        However: this is NOT a durability guarantee. The ``with``
+        block's ``close()`` flushes Python's buffer to the OS page
+        cache; we do NOT call ``os.fsync()``. A crash between
+        write-return and OS flush loses the recent records that were
+        in the page cache. ``chat_history.jsonl`` is operator-
+        readable conversational state — informational, not load-
+        bearing — so the durability trade-off (perf cost on every
+        append vs. losing the last few records on crash) lands on
+        skipping fsync. If a future use makes this load-bearing,
+        either ``os.fsync(f.fileno())`` here or rely on the writer
+        to call sync explicitly.
+        """
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._io_condition:
+            while self._trimming:
+                self._io_condition.wait(timeout=1.0)
+            self._active_writers += 1
+        try:
+            with self.history_path.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(msg.to_dict(), ensure_ascii=True, default=str) + "\n"
+                )
+        except OSError as exc:
+            if raise_errors:
+                raise
+            log.warning("chat_history.jsonl append failed: %s", exc)
+        finally:
+            with self._io_condition:
+                self._active_writers -= 1
+                if self._active_writers == 0:
+                    self._io_condition.notify_all()
+
+    def _trim_sync(self) -> None:
+        try:
+            with self._io_condition:
+                self._trimming = True
+                while self._active_writers:
+                    self._io_condition.wait(timeout=1.0)
+            kept_reversed: list[str] = []
+            for line in _tail_lines(self.history_path):
+                stripped = line.strip()
+                if stripped:
+                    kept_reversed.append(stripped)
+                if len(kept_reversed) >= self.disk_max:
+                    break
+            if kept_reversed:
+                tmp = self.history_path.with_suffix(".jsonl.tmp")
+                tmp.write_text(
+                    "\n".join(reversed(kept_reversed)) + "\n", encoding="utf-8"
+                )
+                tmp.replace(self.history_path)
+            self._line_count = len(kept_reversed)
+        except OSError as exc:
+            log.warning("chat_history.jsonl trim failed: %s", exc)
+        finally:
+            with self._io_condition:
+                self._trimming = False
+                self._io_condition.notify_all()
+
+    def evict_channel(self, channel_id: str) -> bool:
+        """Drop an idle channel's dedicated deque; global/disk history remains."""
+        return self._by_channel.pop(channel_id, None) is not None
+
+    def make_message(
+        self,
+        *,
+        channel_id: str,
+        kind: MessageKind,
+        content: str,
+        author: str | None = None,
+        author_display: str | None = None,
+        msg_id: str | None = None,
+        thread_id: str | None = None,
+        ts: str | None = None,
+        source: str | None = None,
+        integrity: str | None = None,
+    ) -> Message:
+        return Message(
+            ts=ts or _utc_now_iso(),
+            msg_id=msg_id,
+            channel_id=channel_id,
+            author=author,
+            author_display=author_display,
+            kind=kind,
+            content=content,
+            thread_id=thread_id,
+            source=source,
+            integrity=integrity,
+        )
+
+    # ---- read paths --------------------------------------------------------
+
+    def channel_count(self, channel_id: str) -> int:
+        ch = self._by_channel.get(channel_id)
+        return len(ch) if ch is not None else 0
+
+    def recent_in_channel(self, channel_id: str, limit: int) -> list[Message]:
+        """Last ``limit`` messages for exactly ``channel_id``, oldest→newest.
+
+        This is the web-history alias of ``recent_for_channel``. It restores a
+        conversation when the user re-opens the chat.
+        """
+        if limit <= 0:
+            return []
+        ch = self._by_channel.get(channel_id)
+        if not ch:
+            return []
+        return list(ch)[-limit:]
+
+    def total_count(self) -> int:
+        return len(self._all)
+
+    def recent_for_channel(
+        self,
+        channel_id: str,
+        limit: int,
+        *,
+        source_allowlist: frozenset[str] | None = None,
+    ) -> list[Message]:
+        """Last ``limit`` messages from exactly ``channel_id``.
+
+        Cross-channel context is assembled separately by
+        :meth:`assemble_recent_activity_candidates`, where it can be scoped to the
+        initiating user's canonical identity. Keeping this primitive exact is
+        also the privacy boundary for DMs and contextual query rewriting.
+
+        ``source_allowlist`` filters by ``Message.source``. ``None`` means no
+        filter; messages with ``source=None`` are excluded when an allowlist
+        is set.
+        """
+        if limit <= 0:
+            return []
+        channel = self._by_channel.get(channel_id)
+        if not channel:
+            return []
+        pool = list(channel)
+        if source_allowlist is not None:
+            pool = [m for m in pool if m.source in source_allowlist]
+        return pool[-limit:]
+
+    def cross_author_messages(
+        self,
+        *,
+        author: str,
+        exclude_channel: str,
+        limit: int,
+        within_hours: int,
+        source_allowlist: frozenset[str] | None = None,
+        include_private: bool = False,
+    ) -> list[Message]:
+        """Last ``limit`` messages by ``author`` on channels other than
+        ``exclude_channel``, within the time window. DMs are excluded unless
+        ``include_private`` is true for a private target.
+
+        Author matching goes through the optional ``IdentityResolver``
+        (FUTURE_WORK §6.1) — so ``slack-U123ABC`` and ``discord-456789``
+        both resolve to ``alice`` and surface together when alice's
+        identity is mapped in ``state/identities.yaml``. Without a
+        resolver (or for unknown ids), comparison falls back to direct
+        equality.
+
+        ``source_allowlist`` filters by ``Message.source`` (same semantics as
+        ``recent_for_channel``)."""
+        if not author or limit <= 0:
+            return []
+        if not self.cross_platform_pull:
+            # Operator opted out of cross-platform pull (e.g. compliance);
+            # fall back to direct equality, no resolver consulted.
+            target_canonical = author
+            resolve = None
+        else:
+            target_canonical = self._resolve(author)
+            resolve = self._resolve
+        cutoff = datetime.now(tz=timezone.utc).timestamp() - within_hours * 3600
+        out: list[Message] = []
+        # Walk newest-first for cheap early exit.
+        for msg in reversed(self._all):
+            if len(out) >= limit:
+                break
+            if msg.channel_id == exclude_channel:
+                continue
+            if _is_private_channel(msg.channel_id) and not include_private:
+                continue
+            msg_canonical = resolve(msg.author) if resolve else msg.author
+            if msg_canonical != target_canonical:
+                continue
+            if source_allowlist is not None and msg.source not in source_allowlist:
+                continue
+            try:
+                msg_ts = datetime.fromisoformat(
+                    msg.ts.replace("Z", "+00:00")
+                ).timestamp()
+            except (ValueError, AttributeError):
+                continue
+            if msg_ts < cutoff:
+                # Older than the window — and since we're walking newest-first,
+                # everything else is older too.
+                break
+            out.append(msg)
+        out.reverse()
+        return out
+
+    def cross_author_context(
+        self,
+        *,
+        author: str,
+        exclude_channel: str,
+        limit: int,
+        within_hours: int,
+        source_allowlist: frozenset[str] | None = None,
+        include_private: bool = False,
+    ) -> list[Message]:
+        """Cross-channel context anchored to ``author``'s messages.
+
+        Select the most recent ``limit`` messages written by the same
+        canonical user on other public channels, then include immediately
+        following assistant replies from those channels. This preserves enough
+        conversational context to understand an imported user message without
+        turning every public channel into one global transcript.
+        """
+        anchors = self.cross_author_messages(
+            author=author,
+            exclude_channel=exclude_channel,
+            limit=limit,
+            within_hours=within_hours,
+            source_allowlist=source_allowlist,
+            include_private=include_private,
+        )
+        if not anchors:
+            return []
+
+        anchor_ids = {id(msg) for msg in anchors}
+        selected: list[Message] = []
+        include_replies_by_channel: dict[str, bool] = {}
+        # Walk the bounded global deque rather than only the per-channel deques:
+        # idle-channel eviction intentionally drops those dedicated deques, but
+        # cross-channel context must remain available until the global window
+        # itself ages the conversation out.
+        for msg in self._all:
+            channel_id = msg.channel_id
+            if channel_id == exclude_channel:
+                continue
+            if _is_private_channel(channel_id) and not include_private:
+                continue
+            if id(msg) in anchor_ids:
+                selected.append(msg)
+                include_replies_by_channel[channel_id] = True
+                continue
+            if msg.kind == "user_message":
+                include_replies_by_channel[channel_id] = False
+                continue
+            if include_replies_by_channel.get(channel_id) and msg.kind == "assistant_message":
+                if source_allowlist is None or msg.source in source_allowlist:
+                    selected.append(msg)
+
+        def _timestamp(msg: Message) -> float:
+            try:
+                return datetime.fromisoformat(msg.ts.replace("Z", "+00:00")).timestamp()
+            except (ValueError, AttributeError):
+                return 0.0
+
+        return sorted(selected, key=_timestamp)
+
+    def _resolve(self, author: str | None) -> str | None:
+        """Map ``author`` through the resolver if one is wired; else return
+        unchanged. Falls through to direct equality when no resolver."""
+        if self.resolver is None or author is None:
+            return author
+        return self.resolver.resolve(author)
+
+    def assemble_recent_activity_candidates(
+        self,
+        *,
+        channel_id: str,
+        author: str | None,
+        recent_per_channel: int,
+        recent_author_cross: int,
+        cross_hours: int,
+        source_allowlist: frozenset[str] | None = None,
+    ) -> list[Message]:
+        resolved_channel = ChannelResourceAdapter._resolve_channel(channel_id)
+
+        def same_channel(candidate: str) -> bool:
+            return (
+                ChannelResourceAdapter._resolve_channel(candidate)
+                == resolved_channel
+            )
+
+        if (
+            channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
+            or recent_per_channel <= 0
+        ):
+            within: list[Message] = []
+        else:
+            same_channel_messages = [
+                message
+                for buffered_channel, messages in self._by_channel.items()
+                if same_channel(buffered_channel)
+                for message in messages
+                if source_allowlist is None or message.source in source_allowlist
+            ]
+            within = sorted(
+                same_channel_messages, key=lambda message: message.ts,
+            )[-recent_per_channel:]
+
+        anchors: list[Message] = []
+        if author and recent_author_cross > 0:
+            target_identity = None
+            target_identity_loaded = False
+            cutoff = datetime.now(tz=timezone.utc).timestamp() - cross_hours * 3600
+            for message in reversed(self._all):
+                if len(anchors) >= recent_author_cross:
+                    break
+                if same_channel(message.channel_id) or not message.author:
+                    continue
+                if source_allowlist is not None and message.source not in source_allowlist:
+                    continue
+                if self.cross_platform_pull:
+                    identity = getattr(self.resolver, "identity", None)
+                    if not target_identity_loaded:
+                        target_identity = identity(author) if callable(identity) else None
+                        target_identity_loaded = True
+                    candidate_identity = (
+                        identity(message.author) if callable(identity) else None
+                    )
+                    if (
+                        target_identity is None
+                        or candidate_identity is None
+                        or candidate_identity.canonical != target_identity.canonical
+                    ):
+                        continue
+                elif message.author != author:
+                    continue
+                try:
+                    message_ts = datetime.fromisoformat(
+                        message.ts.replace("Z", "+00:00")
+                    ).timestamp()
+                except (ValueError, AttributeError):
+                    continue
+                if message_ts < cutoff:
+                    break
+                anchors.append(message)
+        anchors.reverse()
+
+        anchor_ids = {id(message) for message in anchors}
+        cross: list[Message] = []
+        include_replies_by_channel: dict[str, bool] = {}
+        for message in self._all:
+            if same_channel(message.channel_id):
+                continue
+            if id(message) in anchor_ids:
+                cross.append(message)
+                include_replies_by_channel[message.channel_id] = True
+                continue
+            if message.kind == "user_message":
+                include_replies_by_channel[message.channel_id] = False
+                continue
+            if (
+                message.kind == "assistant_message"
+                and include_replies_by_channel.get(message.channel_id)
+                and (
+                    source_allowlist is None
+                    or message.source in source_allowlist
+                )
+            ):
+                cross.append(message)
+
+        merged = sorted((*within, *cross), key=lambda message: message.ts)
+        seen: set[tuple[str, str | None, str]] = set()
+        unique: list[Message] = []
+        for message in merged:
+            key = (message.channel_id, message.msg_id, message.ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(message)
+        return unique
+
+
+def render_recent_activity(
+    messages: Iterable[Message],
+    *,
+    max_chars: int = 0,
+    resolver: object | None = None,
+) -> str:
+    """Render metadata headers followed by ``| ``-prefixed message body lines.
+
+    ``max_chars`` (>0) caps each individual message's content; longer bodies
+    are truncated with ``…[truncated]`` (same convention as ``turn_logger``'s
+    tool-result cap). The per-message cap protects against a single huge
+    inbound (e.g. a 500-post bluesky seed transcript) blowing the model's
+    context when prior messages are included via the SPEC §5.4 deque pull.
+
+    ``resolver`` (FUTURE_WORK §6.1) — when present, lookups happen on
+    both axes:
+
+    - **Author side.** If the message's author has an identity record,
+      render the record's ``display_name`` instead of the per-message
+      ``author_display``. Alice on Slack and Alice on Discord render
+      with the same name.
+    - **Channel side** (chainlink #40 Phase C). If the message's
+      ``channel_id`` is registered, render
+      ``<display_name> (<channel_id>)`` so the agent reads
+      ``[ts jason-mimir (discord-1500…)]`` instead of bare opaque ids.
+      The id stays in the line so the agent can still target the
+      channel by id when needed. Channels not registered fall through
+      to the bare id (existing format).
+
+    The "Known identities" preamble (built separately by
+    ``render_identity_context``) surfaces canonicals + aliases so the
+    agent connects the dots between the rendered name and the platform
+    ids.
+    """
+    lines: list[str] = []
+    for m in messages:
+        ts_short = sanitize_prompt_field(m.ts[:16] if m.ts else "")
+        author = None
+        if resolver is not None and m.author and m.kind != "assistant_message":
+            author = resolver.display_name(m.author)
+        if not author:
+            author = (
+                m.author_display
+                or m.author
+                or ("(assistant)" if m.kind == "assistant_message" else "(system)")
+            )
+        if m.kind == "assistant_message":
+            author = "(assistant)"
+        # Identity labels are untrusted; sanitize only the prompt-facing copy.
+        author = sanitize_prompt_field(author)
+        content = m.content or ""
+        if max_chars > 0 and len(content) > max_chars:
+            content = content[:max_chars] + "…[truncated]"
+        # Surface msg_id when present so the agent can target older
+        # messages with ``<react message="<id>" />``. Skipped when the
+        # record has no id (legacy entries, system_notes).
+        id_part = f" id={sanitize_prompt_field(m.msg_id)}" if m.msg_id else ""
+        # Phase C channel-side resolution: if the resolver knows this
+        # channel, prefix its display_name. ``getattr`` guards against
+        # legacy resolvers without the channel API.
+        channel_field = sanitize_prompt_field(m.channel_id)
+        if resolver is not None:
+            channel_lookup = getattr(resolver, "channel_display_name", None)
+            if callable(channel_lookup):
+                display = channel_lookup(m.channel_id)
+                if display:
+                    channel_field = f"{sanitize_prompt_field(display)} ({channel_field})"
+        lines.append(f"[{ts_short} {channel_field}{id_part}] {author}:\n{prefix_prompt_body(content)}")
+    return "\n".join(lines)
+
+
+def render_identity_context(
+    messages: Iterable[Message],
+    event_author: str | None,
+    resolver: object | None,
+) -> str | None:
+    """Build a 'Known identities' block for the turn prompt (FUTURE_WORK §6.1).
+
+    Lists every identity record matching an author in ``messages`` or the
+    inbound ``event_author``, deduplicated by canonical. Format per line:
+
+        - **<canonical>** — <display_name> (<notes>) · aliases: <a1, a2, ...>
+
+    Display name, notes, and aliases are each only included when present.
+    Returns ``None`` when no resolver is wired or no author maps to a
+    record — the caller drops the section entirely in that case.
+    """
+    if resolver is None:
+        return None
+
+    candidate_authors: list[str] = []
+    if event_author:
+        candidate_authors.append(event_author)
+    for m in messages or []:
+        if m.author and m.kind != "assistant_message":
+            candidate_authors.append(m.author)
+
+    # Dedupe on canonical so cross-platform messages from one identity
+    # produce a single entry.
+    seen: dict[str, object] = {}
+    by_canonical = {i.canonical: i for i in resolver.all_identities()}
+    for author in candidate_authors:
+        canonical = resolver.resolve(author)
+        if canonical is None or canonical == author:
+            # No identity record (resolver fell through unchanged).
+            continue
+        identity = by_canonical.get(canonical)
+        if identity is None:
+            continue
+        seen[canonical] = identity
+
+    if not seen:
+        return None
+
+    lines: list[str] = []
+    for canonical, identity in seen.items():
+        parts = [f"- **{sanitize_prompt_field(canonical)}**"]
+        if getattr(identity, "display_name", None):
+            parts.append(f" — {sanitize_prompt_field(identity.display_name)}")
+        if getattr(identity, "notes", None):
+            parts.append(f" ({sanitize_prompt_field(identity.notes)})")
+        aliases = getattr(identity, "aliases", None) or []
+        if aliases:
+            parts.append(f" · aliases: {', '.join(sanitize_prompt_field(a) for a in aliases)}")
+        # Captured DM channels — so the agent can DM this person directly
+        # (send_message to the channel_id, NOT the user id).
+        dm_channels = getattr(identity, "dm_channels", None) or {}
+        if dm_channels:
+            dm_str = ", ".join(
+                f"{sanitize_prompt_field(platform)}: {sanitize_prompt_field(cid)}"
+                for platform, cid in sorted(dm_channels.items())
+            )
+            parts.append(f" · DM: {dm_str}")
+        lines.append("".join(parts))
+    return "\n".join(lines)

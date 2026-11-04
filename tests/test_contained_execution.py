@@ -1,0 +1,539 @@
+from __future__ import annotations
+
+import asyncio
+import errno
+import os
+from pathlib import Path
+import stat
+from typing import Any
+
+import pytest
+from tests.timing import HANG_GUARD_SECONDS
+
+pytest.importorskip("mimir_cultivate", reason="Contained execution belongs to Cultivate")
+
+import mimir_cultivate.contained_execution as contained
+import mimir.output_capture as output_capture
+from mimir_cultivate.contained_execution import (
+    SensitiveMaterialScrubber,
+    base_worker_environment,
+    execute_contained,
+    opencode_worker_environment,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_explicit_opencode_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+
+
+class Capability:
+    path = Path("/issued/checkout")
+
+
+class Process:
+    def __init__(self, stdout: bytes, stderr: bytes, *, immediate: bool = True) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
+        self.release = asyncio.Event()
+        if immediate:
+            self.release.set()
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        await self.release.wait()
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+class Client:
+    def __init__(
+        self, stdout: bytes = b"", stderr: bytes = b"", *, immediate: bool = True
+    ) -> None:
+        self.process = Process(stdout, stderr, immediate=immediate)
+        self.launched: list[dict[str, Any]] = []
+        self.cancelled: list[str] = []
+
+    async def launch(self, **kwargs: Any) -> Process:
+        self.launched.append(kwargs)
+        kwargs["stdout_sink"].file.write(bytes(self.process.stdout._buffer))
+        kwargs["stdout_sink"].file.flush()
+        kwargs["stderr_sink"].file.write(bytes(self.process.stderr._buffer))
+        kwargs["stderr_sink"].file.flush()
+        return self.process
+
+    async def cancel(self, identifier: str) -> None:
+        self.cancelled.append(identifier)
+        self.process.returncode = -15
+        self.process.release.set()
+
+
+def install_client(monkeypatch: pytest.MonkeyPatch, client: Client) -> None:
+    monkeypatch.setattr(contained, "WorkerClient", lambda _directory: client)
+
+
+@pytest.mark.asyncio
+async def test_execute_contained_returns_only_a_capped_collected_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = Client(b"abcdef", b"12345")
+    install_client(monkeypatch, client)
+
+    stdout_path = tmp_path / "run.stdout.log"
+    stderr_path = tmp_path / "run.stderr.log"
+    result = await execute_contained(
+        ("tool", "arg"),
+        Capability(),
+        {"PATH": "/usr/bin"},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=1,
+        stdout_limit=4,
+        stderr_limit=3,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == b"abcd"
+    assert result.stderr == b"123"
+    assert result.output_overflow is True
+    assert result.stdout_dropped_bytes == 2
+    assert result.stderr_dropped_bytes == 2
+    assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+    assert client.launched[0]["local_checkout"] == Capability.path
+    assert client.launched[0]["timeout_s"] == 1
+    assert stdout_path.read_bytes() == b"abcd"
+    assert stderr_path.read_bytes() == b"123"
+    assert stdout_path.stat().st_mode & 0o777 == 0o600
+    assert stderr_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_execute_contained_timeout_cancels_and_reaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Client(b"partial", b"error", immediate=False)
+    install_client(monkeypatch, client)
+
+    result = await execute_contained(
+        ("tool",),
+        Capability(),
+        {},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=0.01,
+        stdout_limit=100,
+        stderr_limit=100,
+    )
+
+    assert result.timed_out is True
+    assert result.exit_code == -15
+    assert result.stdout == b"partial"
+    assert result.stderr == b"error"
+    assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+
+
+@pytest.mark.asyncio
+async def test_execute_contained_timeout_reaps_when_cancel_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RacedClient(Client):
+        async def cancel(self, identifier: str) -> None:
+            await super().cancel(identifier)
+            raise RuntimeError("unknown worker id")
+
+    client = RacedClient(b"partial", b"error", immediate=False)
+    install_client(monkeypatch, client)
+
+    result = await execute_contained(
+        ("tool",),
+        Capability(),
+        {},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=0.01,
+        stdout_limit=100,
+        stderr_limit=100,
+    )
+
+    assert result.timed_out is True
+    assert result.exit_code == -15
+    assert result.stdout == b"partial"
+    assert result.stderr == b"error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller_owned", [False, True])
+@pytest.mark.parametrize("overflow", [False, True])
+async def test_execute_contained_cancellation_sends_cancel_before_reraising(
+    monkeypatch: pytest.MonkeyPatch, caller_owned: bool, overflow: bool,
+) -> None:
+    collecting = asyncio.Event()
+    cancelling_overflow = asyncio.Event()
+    owned_tasks: dict[str, asyncio.Task[Any]] = {}
+    create_task = asyncio.create_task
+
+    def track_task(coro: Any, **kwargs: Any) -> asyncio.Task[Any]:
+        task = create_task(coro, **kwargs)
+        if coro.cr_code.co_qualname.startswith("execute_contained.<locals>."):
+            owned_tasks[coro.cr_code.co_name] = task
+        return task
+
+    monkeypatch.setattr(contained.asyncio, "create_task", track_task)
+
+    class CancellingClient(Client):
+        async def cancel(self, identifier: str) -> None:
+            if overflow and not cancelling_overflow.is_set():
+                cancelling_overflow.set()
+                await asyncio.Event().wait()
+            await super().cancel(identifier)
+
+    client = CancellingClient(b"x" * 101 if overflow else b"", immediate=False)
+    wait = client.process.wait
+
+    async def observed_wait() -> int:
+        collecting.set()
+        return await wait()
+
+    monkeypatch.setattr(client.process, "wait", observed_wait)
+    install_client(monkeypatch, client)
+    sinks = output_capture.open_output_pair(None, 100, None, 100) if caller_owned else None
+    task = asyncio.create_task(
+        execute_contained(
+            ("tool",),
+            Capability(),
+            {},
+            identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            timeout_s=10,
+            stdout_limit=100,
+            stderr_limit=100,
+            stdout_sink=sinks[0] if sinks else None,
+            stderr_sink=sinks[1] if sinks else None,
+        )
+    )
+    try:
+        await asyncio.wait_for(collecting.wait(), HANG_GUARD_SECONDS)
+        if overflow:
+            await asyncio.wait_for(cancelling_overflow.wait(), HANG_GUARD_SECONDS)
+        launched_sinks = [client.launched[0][name] for name in ("stdout_sink", "stderr_sink")]
+        descriptors = [sink.fd for sink in launched_sinks]
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+        assert client.process.returncode == -15
+        assert set(owned_tasks) == {"monitor_output", "collect"} | (
+            {"cancel_for_overflow"} if overflow else set()
+        )
+        assert all(task.done() for task in owned_tasks.values())
+        assert owned_tasks["monitor_output"].cancelled()
+        if overflow:
+            assert owned_tasks["cancel_for_overflow"].cancelled()
+        for sink, fd in zip(launched_sinks, descriptors):
+            if caller_owned:
+                assert sink.fd == fd
+                os.fstat(fd)
+            else:
+                assert sink.fd == -1
+                with pytest.raises(OSError) as raised:
+                    os.fstat(fd)
+                assert raised.value.errno == errno.EBADF
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for owned_task in owned_tasks.values():
+            owned_task.cancel()
+        await asyncio.gather(*owned_tasks.values(), return_exceptions=True)
+        for launch in client.launched:
+            launch["stdout_sink"].close()
+            launch["stderr_sink"].close()
+        if sinks:
+            for sink in sinks:
+                sink.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"argv": ()},
+        {"argv": ("bad\x00arg",)},
+        {"worker_env": {"HOME": "/controller"}},
+        {"stdout_limit": 0},
+        {"stderr_limit": -1},
+        {"timeout_s": 0},
+    ],
+)
+async def test_execute_contained_rejects_invalid_inputs_before_launch(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any]
+) -> None:
+    client = Client()
+    install_client(monkeypatch, client)
+    values: dict[str, Any] = {
+        "argv": ("tool",),
+        "directory": Capability(),
+        "worker_env": {},
+        "identifier": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "timeout_s": 1,
+        "stdout_limit": 1,
+        "stderr_limit": 1,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError):
+        await execute_contained(**values)
+    assert client.launched == []
+
+
+def test_worker_environment_builders_are_closed() -> None:
+    identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    base = base_worker_environment(identifier)
+
+    assert set(base) == {
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+    }
+    assert "HOME" not in base
+    assert "OPENCODE_CONFIG" not in base
+    env = opencode_worker_environment(
+        base,
+        {"OPENCODE_PERMISSION": '{"edit":"allow"}', "MIMIR_SPAWN_DEPTH": "1"},
+    )
+    assert env["OPENCODE_CONFIG"].startswith(
+        "/var/lib/mimir-worklink/homes/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/"
+    )
+    with pytest.raises(ValueError):
+        opencode_worker_environment(base, {"OPENAI_API_KEY": "secret"})
+
+
+def test_sensitive_material_scrubber_covers_bytes_and_path_forms(tmp_path: Path) -> None:
+    home = tmp_path / 'controller "home"'
+    checkout = tmp_path / "checkout"
+    scrubber = SensitiveMaterialScrubber(home=home, checkout=checkout)
+    scrubber.add_document(b"arbitrary credential bytes")
+    scrubber.add_scalar("scalar-secret")
+
+    payload = (
+        f"{home} {home.as_uri()} scalar-secret ".encode()
+        + b"arbitrary credential bytes"
+    )
+    scrubbed = scrubber.scrub_bytes(payload)
+    assert str(home).encode() not in scrubbed
+    assert home.as_uri().encode() not in scrubbed
+    assert b"scalar-secret" not in scrubbed
+    assert b"arbitrary credential bytes" not in scrubbed
+    assert scrubbed.count(b"<redacted>") >= 3
+    assert "_materials" not in repr(scrubber)
+    assert scrubber.contains_sensitive(b"proposal scalar-secret") is True
+
+
+_SECRET = b"sk-live-ABCDEFGHIJKLMNOPQRSTUV"
+_TRUNCATION_OUTPUT = b"begin " + _SECRET + b" end-of-log"
+
+
+def _secret_scrubber() -> SensitiveMaterialScrubber:
+    scrubber = SensitiveMaterialScrubber(home="", checkout=None)
+    scrubber.add_scalar(_SECRET)
+    return scrubber
+
+
+def _surviving_fragment(scrubber: SensitiveMaterialScrubber, emitted: bytes) -> bytes:
+    """The longest non-empty piece of the secret left after scrubbing ``emitted``."""
+    scrubbed = scrubber.scrub_bytes(emitted)
+    for length in range(len(_SECRET), 0, -1):
+        if _SECRET[:length] in scrubbed:
+            return _SECRET[:length]
+    return b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", range(1, len(_TRUNCATION_OUTPUT)))
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+async def test_truncation_never_emits_a_fragment_of_a_secret(
+    monkeypatch: pytest.MonkeyPatch, limit: int, stream: str
+) -> None:
+    """No cut point may leave a piece of a secret that whole-value scrubbing misses.
+
+    Every offset is exercised because the cut lands wherever the cap falls: a
+    single hand-picked limit passes while the neighbouring ones leak.
+    """
+    on_stdout = stream == "stdout"
+    client = Client(
+        _TRUNCATION_OUTPUT if on_stdout else b"",
+        b"" if on_stdout else _TRUNCATION_OUTPUT,
+    )
+    install_client(monkeypatch, client)
+    scrubber = _secret_scrubber()
+
+    result = await execute_contained(
+        ("tool",),
+        Capability(),
+        {},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=1,
+        stdout_limit=limit if on_stdout else 4096,
+        stderr_limit=4096 if on_stdout else limit,
+        scrubber=scrubber,
+    )
+
+    emitted = result.stdout if on_stdout else result.stderr
+    dropped = result.stdout_dropped_bytes if on_stdout else result.stderr_dropped_bytes
+    assert _surviving_fragment(scrubber, emitted) == b""
+    assert len(emitted) <= limit
+    # Trimming past the cap stays honest: the counter accounts for every byte
+    # the caller does not receive, not just the ones the cap itself dropped.
+    assert dropped == len(_TRUNCATION_OUTPUT) - len(emitted)
+
+
+@pytest.mark.asyncio
+async def test_truncation_keeps_the_whole_cap_when_no_secret_spans_the_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output a secret was never in is capped exactly, not trimmed defensively.
+
+    The cut is chosen from secrets actually spanning it rather than from tails
+    that merely look like the start of one, so a run of a material's leading
+    byte -- ``/`` is the first byte of every registered path -- costs nothing.
+    """
+    payload = b"/usr/lib/" + b"/" * 4000 + b"trailing"
+    client = Client(payload)
+    install_client(monkeypatch, client)
+    scrubber = _secret_scrubber()
+    scrubber.add_scalar("/mimir-home/state/liveness.json")
+
+    result = await execute_contained(
+        ("tool",),
+        Capability(),
+        {},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=1,
+        stdout_limit=2000,
+        stderr_limit=2000,
+        scrubber=scrubber,
+    )
+
+    assert result.stdout == payload[:2000]
+    assert result.stdout_dropped_bytes == len(payload) - 2000
+
+
+def test_safe_truncation_length_moves_the_cut_off_a_spanning_secret() -> None:
+    scrubber = _secret_scrubber()
+    payload = _TRUNCATION_OUTPUT
+    start = payload.index(_SECRET)
+
+    assert scrubber.lookahead_bytes() == len(_SECRET) - 1
+    # A cut anywhere inside the secret retreats to where it begins.
+    for limit in range(start + 1, start + len(_SECRET)):
+        assert scrubber.safe_truncation_length(payload, limit) == start
+    # Cuts clear of it are left alone, including the two boundaries.
+    for limit in (0, start, start + len(_SECRET), len(payload)):
+        assert scrubber.safe_truncation_length(payload, limit) == limit
+    # A limit past the buffer cannot invent bytes.
+    assert scrubber.safe_truncation_length(payload, len(payload) + 50) == len(payload)
+
+
+def test_safe_truncation_length_without_materials_is_the_limit() -> None:
+    scrubber = SensitiveMaterialScrubber(home="", checkout=None)
+
+    assert scrubber.lookahead_bytes() == 0
+    assert scrubber.safe_truncation_length(b"plain output", 5) == 5
+
+
+def test_output_sink_creation_uses_exclusive_nofollow_private_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "private" / "transcripts" / "stdout.log"
+    real_open = os.open
+    output_open: tuple[int, int] | None = None
+
+    def observed_open(
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal output_open
+        if target == path.name and dir_fd is not None:
+            output_open = (flags, mode)
+        return real_open(target, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(output_capture.os, "open", observed_open)
+    sink = output_capture.open_output_sink(path, 100)
+    sink.close()
+
+    assert output_open is not None
+    flags, mode = output_open
+    assert flags & os.O_EXCL
+    assert flags & getattr(os, "O_NOFOLLOW", 0) == getattr(os, "O_NOFOLLOW", 0)
+    assert mode == 0o600
+
+
+def test_output_sink_exclusive_create_symlink_refusal_and_private_modes(tmp_path: Path) -> None:
+    root = tmp_path / "private" / "transcripts"
+    path = root / "stdout.log"
+    sink = output_capture.open_output_sink(path, 100)
+    try:
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        sink.close()
+
+    with pytest.raises(FileExistsError):
+        output_capture.open_output_sink(path, 100)
+
+    link = root / "stderr.log"
+    link.symlink_to(path)
+    with pytest.raises(OSError) as raised:
+        output_capture.open_output_sink(link, 100)
+    assert raised.value.errno in {errno.EEXIST, errno.ELOOP}
+
+
+def test_output_sink_refuses_unsafe_parent_and_relative_root(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    with pytest.raises(PermissionError, match="unsafe writable"):
+        output_capture.open_output_sink(unsafe / "run" / "stdout.log", 100)
+    with pytest.raises(ValueError, match="absolute"):
+        output_capture.open_output_sink(Path("relative/stdout.log"), 100)
+
+
+@pytest.mark.parametrize("written", [0, -1, 2])
+def test_output_writer_refuses_zero_negative_and_short_writes(
+    monkeypatch: pytest.MonkeyPatch, written: int
+) -> None:
+    sink = output_capture.open_output_sink(None, 100)
+    real_write = os.write
+    calls = 0
+
+    def faulty_write(fd: int, value: bytes | memoryview) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if written > 0:
+                real_write(fd, bytes(value)[:written])
+            return written
+        return real_write(fd, value)
+
+    monkeypatch.setattr(output_capture.os, "write", faulty_write)
+    try:
+        if written <= 0:
+            with pytest.raises(OSError, match="incomplete Worklink output write"):
+                sink.file.write(b"abcd")
+        else:
+            assert sink.file.write(b"abcd") == 4
+            assert sink.read_bounded()[0] == b"abcd"
+    finally:
+        sink.close()

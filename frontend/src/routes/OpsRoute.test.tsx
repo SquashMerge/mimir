@@ -1,0 +1,154 @@
+// @vitest-environment jsdom
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type React from "react";
+
+import { opsDashboardFixture } from "../fixtures/api";
+import { getOpsDashboard } from "../api";
+import { OpsRoute, UsageRoute } from "./OpsRoute";
+
+vi.mock("../api", () => ({
+  getOpsDashboard: vi.fn(async () => ({ ok: true, version: "v1", data: opsDashboardFixture }))
+}));
+
+function renderUsageRoute(initialEntry = "/usage") {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <UsageRoute />
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+
+function renderOpsRoute(initialEntry = "/ops", PullRequests?: () => React.ReactNode) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <OpsRoute PullRequests={PullRequests} />
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+describe("UsageRoute dashboard (#573)", () => {
+  it.each([
+    ["America/New_York", ["Aug 31", "Sep 6"]],
+    ["UTC", ["Sep 1", "Sep 6"]],
+    ["Asia/Tokyo", ["Sep 1", "Sep 7"]]
+  ] as const)("keeps calendar buckets aligned and timestamps local in %s", async (timeZone, timestampLabels) => {
+    const DateTimeFormat = Intl.DateTimeFormat;
+    // Simulate the browser's default zone/locale, but honor explicit formatter options.
+    vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (locales, options) {
+      return new DateTimeFormat(locales ?? "en-US", { timeZone, ...options });
+    });
+    const buckets = [
+      ["2026-08-30", "Aug 30"],
+      ["2026-09-01", "Sep 1"],
+      ["2026-09-04", "Sep 4"],
+      ["2026-09-06", "Sep 6"]
+    ] as const;
+    vi.mocked(getOpsDashboard).mockResolvedValueOnce({
+      ok: true,
+      version: "v1",
+      data: {
+        ...opsDashboardFixture,
+        token_usage_history: buckets.map(([date]) => ({
+          date, turn_count: 1, input_tokens: 110_271_350,
+          cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+          output_tokens: 0, total_cost_usd: null
+        })),
+        usage_history: {
+          codex_plus: {
+            five_hour: ["2026-09-01T00:30:00Z", "2026-09-06T23:30:00Z"].map((ts) => ({
+              ts, utilization: 0.12, resets_at: null, projection: null, pressure: "clear"
+            }))
+          }
+        }
+      }
+    });
+    renderUsageRoute();
+    const chart = await screen.findByLabelText("Daily token volume by token type with token-count axis");
+    for (const [date, label] of buckets) {
+      const bar = within(chart).getByTitle(`${date}: 110,271,350 tokens · 1 turns`);
+      expect(bar.querySelector(".ops-token-day__label")?.textContent).toBe(label);
+      const row = screen.getByRole("cell", { name: date }).closest("tr")!;
+      expect(within(row).getByRole("cell", { name: "110.3M" })).toBeTruthy();
+    }
+    const quota = screen.getByLabelText("codex_plus quota utilization line chart with percent axis");
+    expect(Array.from(quota.querySelectorAll(".ops-quota-line-labels span"), (node) => node.textContent))
+      .toEqual(timestampLabels);
+  });
+
+  it("renders usage as its own top-level surface with only usage information", async () => {
+    renderUsageRoute("/usage");
+
+    expect(await screen.findByRole("heading", { name: "Usage Dashboard" })).toBeTruthy();
+    expect(screen.queryByRole("tab")).toBeNull();
+    expect(await screen.findByText("Token Usage")).toBeTruthy();
+    expect(screen.getByLabelText("Daily token volume by token type with token-count axis")).toBeTruthy();
+    expect(screen.getByLabelText("codex_plus quota utilization line chart with percent axis")).toBeTruthy();
+    // Per-window projection lives in the legend below the chart (the redundant
+    // header summary was removed in #584).
+    expect(screen.getByText(/five hour: 12\.0% · projected 20\.0% · resets in .* · clear/)).toBeTruthy();
+    expect(screen.queryByText(/five hour: 12\.0% · projected 20\.0% · reset .* ago · clear/)).toBeNull();
+    expect(screen.getByText(/seven day: 42\.0% · projected 84\.0% · reset.* · tight/)).toBeTruthy();
+    expect(screen.queryByText("Scheduler, Poller, and Job Signals")).toBeNull();
+  });
+});
+
+describe("OpsRoute", () => {
+  it("keeps ops separate from Usage and omits usage and Chainlink tabs", async () => {
+    renderOpsRoute("/ops");
+
+    expect(await screen.findByRole("heading", { name: "Ops Dashboard" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Usage" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Resources" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Chainlink" })).toBeNull();
+    expect(await screen.findByRole("tab", { name: "Overview" })).toBeTruthy();
+    expect(await screen.findByRole("tab", { name: "Signals" })).toBeTruthy();
+  });
+
+  it("renders the Signals sub-page from the agent feedback block", async () => {
+    renderOpsRoute("/ops?tab=signals");
+
+    expect(await screen.findByRole("tabpanel", { name: "Signals" })).toBeTruthy();
+    expect(screen.getByText("Recent feedback signals")).toBeTruthy();
+    expect(screen.getByText(/Negative \(last 24h\):/)).toBeTruthy();
+    expect(screen.getByText(/tool_error \(×2 in 24h\) \[web-default\]/)).toBeTruthy();
+    expect(screen.getByText(/Positive \(last 24h\):/)).toBeTruthy();
+  });
+
+  it("does not offer a JSON link that cannot send the API key", async () => {
+    renderOpsRoute("/ops?days=14");
+
+    expect(await screen.findByRole("heading", { name: "Ops Dashboard" })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "JSON" })).toBeNull();
+  });
+
+  it("does not render the legacy PR board from the ops payload", async () => {
+    renderOpsRoute("/ops");
+    expect(await screen.findByRole("tab", { name: "Overview" })).toBeTruthy();
+    expect(screen.queryByText("Open PRs")).toBeNull();
+    expect(screen.queryByText("Proposal: tighten Worklink evidence")).toBeNull();
+  });
+
+  it("mounts only a selected plugin PR panel and retains keyboard tab navigation", async () => {
+    renderOpsRoute("/ops", () => <section data-testid="cultivate-pr-panel">Plugin open PRs</section>);
+    expect(await screen.findByTestId("cultivate-pr-panel")).toBeTruthy();
+    const signals = screen.getByRole("tab", { name: "Signals" });
+    signals.focus();
+    expect(document.activeElement).toBe(signals);
+    fireEvent.click(signals);
+    expect(screen.queryByTestId("cultivate-pr-panel")).toBeNull();
+  });
+});

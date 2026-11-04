@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+import asyncio
+from importlib.util import find_spec
+import os
+import json
+from pathlib import Path
+import subprocess
+from types import SimpleNamespace
+
+import pytest
+
+from mimir.tools.registry import (
+    _SPAWN_DEPTH_ENV,
+    _SPAWN_GUARD,
+    _spawn_acquire_rate_slot,
+    _spawn_guard_init,
+    _spawn_release_rate_slot,
+    _spawn_reset_for_tests,
+    set_spawn_config,
+)
+if find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.opencode import spawn_open_code
+else:
+    spawn_open_code = None
+
+
+@pytest.fixture(autouse=True)
+def reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    _spawn_reset_for_tests()
+    for name in (
+        _SPAWN_DEPTH_ENV,
+        "MIMIR_SPAWN_MAX_CONCURRENT",
+        "MIMIR_SPAWN_MAX_PER_HOUR",
+        "MIMIR_SPAWN_MAX_DEPTH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_guard_defaults() -> None:
+    guard = _spawn_guard_init()
+    assert guard.max_concurrent == 3
+    assert guard.max_per_hour == 20
+    assert guard.max_depth == 2
+
+
+def test_guard_operator_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "4")
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "3")
+    guard = _spawn_guard_init()
+    assert (guard.max_concurrent, guard.max_per_hour, guard.max_depth) == (1, 4, 3)
+
+
+def test_invalid_caps_use_defaults_and_zero_floors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "invalid")
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "0")
+    guard = _spawn_guard_init()
+    assert guard.max_concurrent == 3
+    assert guard.max_per_hour == 1
+
+
+@pytest.mark.asyncio
+async def test_rate_cap_refuses_after_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "2")
+    guard = _spawn_guard_init()
+    first, error = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    assert first is not None and error is None
+    second, error = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    assert second is not None and error is None
+    token, error = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    assert token is None
+    assert "per-hour cap" in error
+
+
+@pytest.mark.asyncio
+async def test_release_removes_only_own_rate_token() -> None:
+    guard = _spawn_guard_init()
+    first, _ = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    second, _ = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    await _spawn_release_rate_slot(guard, first)
+    assert list(guard.recent) == [second]
+
+
+@pytest.mark.asyncio
+async def test_semaphore_enforces_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+    guard = _spawn_guard_init()
+    assert guard.sem is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    order = []
+
+    async def holder(label: str) -> None:
+        assert guard.sem is not None
+        async with guard.sem:
+            order.append(label)
+            if label == "first":
+                entered.set()
+                await release.wait()
+
+    first = asyncio.create_task(holder("first"))
+    await entered.wait()
+    second = asyncio.create_task(holder("second"))
+    await asyncio.sleep(0)
+    assert order == ["first"]
+    release.set()
+    await asyncio.gather(first, second)
+    assert order == ["first", "second"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_cap,new_cap", [(1, 3), (3, 1)])
+async def test_capacity_change_waits_for_holders_and_waiters(
+    monkeypatch: pytest.MonkeyPatch, old_cap: int, new_cap: int,
+) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", str(old_cap))
+    guard = _spawn_guard_init()
+    sem = guard.sem
+    for _ in range(old_cap):
+        await sem.acquire()
+    waiter = asyncio.create_task(sem.acquire())
+    await asyncio.sleep(0)
+    try:
+        monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", str(new_cap))
+        assert _spawn_guard_init().sem is sem
+        assert guard.max_concurrent == old_cap
+        assert not waiter.done()
+        # A released permit is reserved for the queued waiter, not idle capacity.
+        sem.release()
+        assert _spawn_guard_init().sem is sem
+        await waiter
+        assert _spawn_guard_init().sem is sem
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+        for _ in range(old_cap):
+            sem.release()
+    assert _spawn_guard_init().max_concurrent == new_cap
+    assert guard.sem is not sem
+    for _ in range(new_cap):
+        await guard.sem.acquire()
+    assert guard.sem.locked()
+    for _ in range(new_cap):
+        guard.sem.release()
+
+
+@pytest.mark.asyncio
+async def test_capacity_change_preserves_partially_occupied_semaphore(monkeypatch):
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "3")
+    guard = _spawn_guard_init()
+    sem = guard.sem
+    await sem.acquire()
+    try:
+        assert not sem.locked()
+        monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+        assert _spawn_guard_init().sem is sem
+        assert guard.max_concurrent == 3
+    finally:
+        sem.release()
+    assert _spawn_guard_init().max_concurrent == 1
+
+
+def test_reset_clears_loop_bound_state() -> None:
+    guard = _spawn_guard_init()
+    guard.recent.extend((1.0, 2.0))
+    _spawn_reset_for_tests()
+    assert _SPAWN_GUARD.sem is None
+    assert _SPAWN_GUARD.rate_lock is None
+    assert not _SPAWN_GUARD.recent
+
+
+def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from mimir_cultivate import contained_checkout, contained_execution
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    home = tmp_path / "home"
+    seed = tmp_path / "seed"
+    home.mkdir()
+    seed.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local/share"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
+    auth = home / ".local/share/opencode/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "test"}}))
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(home, "test")
+    subprocess.run(["git", "init", "-q", str(seed)], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "test@example.invalid"], check=True)
+    (seed / "README").write_text("seed")
+    subprocess.run(["git", "-C", str(seed), "add", "README"], check=True)
+    subprocess.run(
+        ["git", "-C", str(seed), "-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"],
+        check=True,
+    )
+    set_spawn_config({"default_cwd": tmp_path, "artifact_root": home / "artifacts"})
+    calls = {"factory": 0, "envs": []}
+
+    class Checkout:
+        def __init__(self, path):
+            self.path = path
+            self.capability = SimpleNamespace(path=path)
+            self.base_tree = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD^{tree}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+        def close(self):
+            pass
+
+    def factory(source, **kwargs):
+        calls["factory"] += 1
+        return Checkout(source)
+
+    async def runner(argv, directory, worker_env, projections=(), **kwargs):
+        calls["envs"].append(dict(worker_env))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(contained_checkout, "create_opencode_checkout", factory)
+    monkeypatch.setattr(contained_execution, "execute_contained", runner)
+    return seed, calls, contained_execution
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(spawn_open_code is None, reason="requires installed Cultivate")
+async def test_tool_depth_refusal_and_below_cap_propagation(tmp_path, monkeypatch):
+    seed, calls, _module = _surface_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "2")
+    monkeypatch.setenv(_SPAWN_DEPTH_ENV, "2")
+    refused = await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(seed)})
+    assert "depth cap" in refused
+    assert not calls["envs"]
+
+    _spawn_reset_for_tests()
+    monkeypatch.setenv(_SPAWN_DEPTH_ENV, "1")
+    payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(seed)}))
+    assert payload["status"] == "succeeded"
+    assert calls["envs"][-1][_SPAWN_DEPTH_ENV] == "2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.skipif(spawn_open_code is None, reason="requires installed Cultivate")
+async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monkeypatch):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    seed, calls, contained_execution = _surface_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    maximum = 0
+    attempted = asyncio.Event()
+    guard = _spawn_guard_init()
+    acquire = guard.sem.acquire
+    acquisitions = 0
+
+    async def observed_acquire():
+        nonlocal acquisitions
+        acquisitions += 1
+        if acquisitions == 2:
+            attempted.set()
+        return await acquire()
+
+    monkeypatch.setattr(guard.sem, "acquire", observed_acquire)
+
+    async def runner(argv, directory, worker_env, projections=(), **kwargs):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        if active == 2:
+            attempted.set()  # A bypass must reach the assertion, not hang.
+        entered.set()
+        await release.wait()
+        active -= 1
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(contained_execution, "execute_contained", runner)
+    first = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "one", "cwd": str(seed)}))
+    await entered.wait()
+    second = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "two", "cwd": str(seed)}))
+    try:
+        await attempted.wait()
+        assert maximum == 1
+        assert acquisitions == 2
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+    assert maximum == 1

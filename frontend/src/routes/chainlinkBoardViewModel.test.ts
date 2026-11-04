@@ -1,0 +1,142 @@
+import { describe, expect, it } from "vitest";
+import {
+  formatBoardTime,
+  isCompletedStatus,
+  issueMatchesFilters,
+  partitionDependencies,
+  safeChainlinkBoardData
+} from "./chainlinkBoardViewModel";
+
+describe("chainlink board view-model", () => {
+  it("keeps selected detail separate from page summaries and retains pagination", () => {
+    const board = safeChainlinkBoardData({
+      issues: [{ id: 251 }], total_count: 501, offset: 250, next_offset: 500, truncated: true,
+      selected_issue: { id: 1, description: "Full detail", comments: [{ body: "Comment" }] },
+      selected_issue_state: "loaded"
+    });
+    expect(board.offset).toBe(250);
+    expect(board.next_offset).toBe(500);
+    expect(board.total_count).toBe(501);
+    expect(board.selected_issue?.description).toBe("Full detail");
+    expect(board.selected_issue?.comments[0].body).toBe("Comment");
+    expect(board.issues.map((issue) => issue.id)).toEqual([251]);
+  });
+
+  it("does not classify absent blockers as resolved on partial pages", () => {
+    const board = safeChainlinkBoardData({ issues: [
+      { id: 1, blocked_by: [999], blocking: [2] },
+      { id: 2, blocked_by: [1] }
+    ] });
+    const dependencies = partitionDependencies(board.issues);
+    expect(dependencies.ready).toEqual([]);
+    expect(dependencies.blocked[0].unknownBlockerIds).toEqual([999]);
+    expect(dependencies.blocked[1].blockers.map((issue) => issue.id)).toEqual([1]);
+  });
+
+  it("normalizes board payloads and derives lifecycle columns", () => {
+    const board = safeChainlinkBoardData({
+      available: true,
+      generated_at: "2026-06-18T00:00:00Z",
+      issues: [
+        {
+          id: 545,
+          title: "Board",
+          status: "review",
+          priority: "medium",
+          labels: ["frontend", "worklink:review"],
+          child_progress: { done: 1, total: 2 },
+          blocked_by: [540],
+          comments: [{ body: "evidence posted" }],
+          worklink: {
+            issue: 545,
+            attempt: 2,
+            status: "completed",
+            evidence_href: "/api/v1/chainlink-board/artifact?path=state/worklink/evidence/545-2.json"
+          }
+        },
+        {
+          id: 540,
+          title: "Prereq",
+          status: "done",
+          priority: "low",
+          labels: []
+        }
+      ],
+      edges: [{ from: 540, to: 545, kind: "blocks" }],
+      roots: [545],
+      filters: { labels: ["frontend"], statuses: ["review"], priorities: ["medium"] },
+      total_count: 1
+    });
+
+    expect(board.available).toBe(true);
+    expect(board.columns.find((column) => column.id === "review")?.issue_ids).toEqual([545]);
+    expect(board.issues[0].worklink?.attempt).toBe(2);
+    expect(board.issues[0].comments[0].body).toBe("evidence posted");
+    expect(board.edges).toEqual([{ from: 540, to: 545, kind: "blocks" }]);
+  });
+
+  it("drops unsafe Worklink artifact links", () => {
+    const board = safeChainlinkBoardData({
+      available: true,
+      issues: [{
+        id: 1,
+        title: "Unsafe",
+        worklink: {
+          pr_url: "javascript:alert(1)",
+          transcript_href: "//evil.test/transcript",
+          evidence_href: "/api/v1/chainlink-board/artifact?path=state/worklink/evidence/1.json"
+        }
+      }]
+    });
+
+    expect(board.issues[0].worklink?.pr_url).toBe("");
+    expect(board.issues[0].worklink?.transcript_href).toBe("");
+    expect(board.issues[0].worklink?.evidence_href).toBe("/api/v1/chainlink-board/artifact?path=state/worklink/evidence/1.json");
+  });
+
+  it("degrades malformed payloads to an unavailable empty board", () => {
+    const board = safeChainlinkBoardData({ available: "yes", issues: "bad", filters: null });
+
+    expect(board.available).toBe(false);
+    expect(board.issues).toEqual([]);
+    expect(board.columns).toHaveLength(6);
+    expect(board.filters.labels).toEqual([]);
+  });
+
+  it("filters by label, status, and priority", () => {
+    const board = safeChainlinkBoardData({
+      available: true,
+      issues: [{ id: 1, title: "A", status: "ready", priority: "high", labels: ["frontend"] }]
+    });
+    const issue = board.issues[0];
+
+    expect(issueMatchesFilters(issue, { label: "frontend", status: "ready", priority: "high" })).toBe(true);
+    expect(issueMatchesFilters(issue, { label: "backend", status: "ready", priority: "high" })).toBe(false);
+    expect(issueMatchesFilters(issue, { label: "", status: "", priority: "" })).toBe(true);
+    expect(formatBoardTime("not-a-date")).toBe("not-a-date");
+  });
+
+  it("partitions active issues into ready and blocked by live dependencies (#570)", () => {
+    const board = safeChainlinkBoardData({
+      available: true,
+      issues: [
+        // done prereq — resolved, so #2 is no longer blocked by it
+        { id: 1, title: "done prereq", status: "done", priority: "low", blocking: [2] },
+        // unblocked + blocks an active issue -> ready, "unlocks #4"
+        { id: 3, title: "unlocker", status: "open", priority: "high", blocking: [4] },
+        // blocked by an active issue (#3) -> blocked
+        { id: 4, title: "downstream", status: "open", priority: "medium", blocked_by: [3] },
+        // blocked_by only a done issue (#1) -> not blocked; blocks nothing active -> not listed
+        { id: 2, title: "freed", status: "open", priority: "low", blocked_by: [1] }
+      ]
+    });
+
+    const { ready, blocked } = partitionDependencies(board.issues);
+    expect(ready.map((entry) => entry.issue.id)).toEqual([3]);
+    expect(ready[0].unlocks.map((item) => item.id)).toEqual([4]);
+    expect(blocked.map((entry) => entry.issue.id)).toEqual([4]);
+    expect(blocked[0].blockers.map((item) => item.id)).toEqual([3]);
+    expect(isCompletedStatus("done")).toBe(true);
+    expect(isCompletedStatus("open")).toBe(false);
+  });
+});

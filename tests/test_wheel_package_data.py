@@ -1,0 +1,301 @@
+"""Regression guard for wheel packaging (chainlink #290).
+
+The wheel's ``[tool.hatch.build].include`` list is an allowlist: any
+runtime data file not matched by a pattern silently drops from the
+published wheel. That shipped a string of broken fresh-install bugs in
+0.2.0/0.2.1 — saga's ``schema.sql`` (read on fresh-DB init), the default
+prompt templates, the scheduler template, the credential manifest, and
+some skills' support files (tmux ``.sh``, chainlink ``.fragment``) were
+all absent from the wheel even though the installed package reads them at
+runtime.
+
+These tests assert (a) the critical data files still exist in the source
+tree and (b) the include config actually covers them, using a faithful
+translation of the git-wildmatch globs hatchling uses. Pure stdlib
+(``tomllib`` + ``re``) so it runs anywhere pytest does — no build step and
+no ``uv`` / ``hatchling`` / ``pathspec`` dependency.
+"""
+
+from __future__ import annotations
+
+import re
+import hashlib
+import shutil
+import subprocess
+import tomllib
+from pathlib import Path
+from zipfile import ZipFile
+
+import pytest
+
+from tests.uv_subprocess import isolated_uv_env
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+
+# Data files the INSTALLED package reads at runtime — each MUST ship in the
+# wheel. Add new runtime data files here as they're introduced; keeping this
+# list current is the whole point of the guard.
+CRITICAL_RUNTIME_DATA = (
+    "mimir/saga/schema.sql",  # SagaStore executescript()s this on fresh-DB init
+    "mimir/scheduler_template.yaml",  # seed_scheduler's default scheduler
+    "mimir/credentials.yaml",  # cred_verify._PACKAGE_MANIFEST, loaded at import
+    "mimir/prompt_templates/heartbeat.md",  # seed_prompts default tick prompts
+    "mimir/prompt_templates/reflect.md",
+    "mimir/prompt_templates/issues-audit.md",
+    "mimir/prompt_templates/commitments-review.md",
+    "mimir/prompt_templates/upgrade.md",  # version-triggered defaults reconciliation
+    "mimir/memory_templates/core/00-identity.md",  # setup core-memory defaults
+    "mimir/memory_templates/core/05-non-goals.md",
+    "mimir/memory_templates/core/06-action-boundaries.md",
+    "mimir/memory_templates/core/20-vsm-terms.md",
+    "mimir/memory_templates/core/30-reflection-policy.md",
+    "mimir/memory_templates/core/40-learned-behaviors.md",
+    "mimir/memory_templates/core/50-heartbeat-patterns.md",
+    "mimir/memory_templates/core/60-filing-rules.md",
+    "mimir/skills/tmux/scripts/find-sessions.sh",  # tmux skill support scripts
+    "mimir/skills/tmux/scripts/wait-for-text.sh",
+    "mimir/skills/chainlink/dockerfile.fragment",  # chainlink scaffold fragment
+    "mimir/skills/tool-pin-drift/scripts/check_tool_pins.py",  # declared immutable drift script
+    "mimir/skills/tool-pin-drift/scripts/targets.json",  # source-controlled drift inventory
+    "mimir/optional-skills/dependency-advisory-watch/SKILL.md",  # OSV dependency advisory poller (opt-in)
+    "mimir/optional-skills/dependency-advisory-watch/scripts/poller.py",  # poller entry point
+    "mimir/optional-skills/dependency-advisory-watch/pollers.json",  # poller manifest
+    "mimir/optional-skills/dependency-advisory-watch/scripts/scanner.py",  # OSV scanning logic
+    "mimir/optional-skills/dependency-advisory-watch/dockerfile.fragment",  # pinned osv-scanner installer
+    "mimir/web_auth.js",  # web_ui serves this at /app/auth.js (_load_web_auth_js)
+)
+
+
+def _gitwildmatch_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translate the git-wildmatch glob subset hatchling uses into an
+    anchored full-path regex.
+
+    Handles the three constructs our include/exclude patterns use:
+    ``**/`` (zero or more whole path segments), ``*`` (anything but ``/``
+    within a segment), and ``?`` (one non-``/`` char). Everything else is a
+    literal. Faithful enough for the patterns pyproject.toml actually uses;
+    ``test_gitwildmatch_to_regex_semantics`` pins the behavior.
+    """
+    out = ["^"]
+    i, n = 0, len(pattern)
+    while i < n:
+        if pattern.startswith("**/", i):
+            out.append("(?:[^/]+/)*")  # zero or more full directory segments
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")  # within a single path segment
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    out.append("$")
+    return re.compile("".join(out))
+
+
+def _build_include_exclude() -> tuple[list[str], list[str]]:
+    cfg = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    build = cfg["tool"]["hatch"]["build"]
+    return build.get("include", []), build.get("exclude", [])
+
+
+def test_gitwildmatch_to_regex_semantics() -> None:
+    # ``**`` crosses path separators; ``*`` does not.
+    r = _gitwildmatch_to_regex("mimir/**/*.py")
+    assert r.match("mimir/server.py")  # zero intermediate dirs
+    assert r.match("mimir/saga/client.py")  # nested
+    assert not r.match("mimir/server.pyc")  # extension is matched exactly
+
+    r = _gitwildmatch_to_regex("mimir/saga/*.sql")
+    assert r.match("mimir/saga/schema.sql")
+    assert not r.match("mimir/saga/sub/x.sql")  # ``*`` stops at ``/``
+
+    r = _gitwildmatch_to_regex("mimir/skills/**/*")
+    assert r.match("mimir/skills/tmux/scripts/find-sessions.sh")
+    assert r.match("mimir/skills/chainlink/dockerfile.fragment")
+    assert not r.match("mimir/saga/schema.sql")  # outside skills/
+
+    r = _gitwildmatch_to_regex("mimir/scheduler_template.yaml")
+    assert r.match("mimir/scheduler_template.yaml")
+    assert not r.match("mimir/scheduler_template-yaml")  # ``.`` is a literal
+
+
+def test_critical_runtime_data_files_exist_in_source() -> None:
+    missing = [rel for rel in CRITICAL_RUNTIME_DATA if not (REPO_ROOT / rel).is_file()]
+    assert not missing, f"runtime data files absent from the source tree: {missing}"
+
+
+def test_coding_prompts_ship_only_in_cultivate() -> None:
+    plugin_root = REPO_ROOT / "plugins/cultivate"
+    config = tomllib.loads((plugin_root / "pyproject.toml").read_text(encoding="utf-8"))
+    wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
+    sdist = config["tool"]["hatch"]["build"]["targets"]["sdist"]
+    assert wheel["packages"] == ["mimir_cultivate"]
+    for name in ("worklink-order.md", "decompose.md"):
+        rel = f"mimir_cultivate/prompt_templates/{name}"
+        assert (plugin_root / rel).is_file()
+        assert not (REPO_ROOT / "mimir/prompt_templates" / name).exists()
+        assert "mimir_cultivate/**/*" in sdist["include"]
+        assert not any(_gitwildmatch_to_regex(pattern).match(rel)
+                        for pattern in wheel.get("exclude", ()))
+
+
+def test_cultivate_wheel_contains_original_logo_and_both_licenses(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["uv", "build", "--package", "mimir-cultivate", "--wheel", "--out-dir", str(tmp_path)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        env=isolated_uv_env(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    wheel, = tmp_path.glob("*.whl")
+    with ZipFile(wheel) as archive:
+        logo = "mimir_cultivate/brand/cultivate-logo-dark-v1.png"
+        assert archive.namelist().count(logo) == 1
+        assert hashlib.sha256(archive.read(logo)).digest() == hashlib.sha256(
+            (REPO_ROOT / "brand/logos/cultivate-logo-dark-v1.png").read_bytes()
+        ).digest()
+        for license_path in ("LICENSE", "brand/LICENSE"):
+            original = (REPO_ROOT / "plugins/cultivate" / license_path).read_bytes()
+            assert original in (archive.read(name) for name in archive.namelist()
+                                if name.endswith(license_path))
+
+
+def test_wheel_include_config_covers_critical_runtime_data() -> None:
+    include, exclude = _build_include_exclude()
+    inc = [_gitwildmatch_to_regex(p) for p in include]
+    exc = [_gitwildmatch_to_regex(p) for p in exclude]
+    uncovered = [
+        rel
+        for rel in CRITICAL_RUNTIME_DATA
+        if not any(r.match(rel) for r in inc) or any(r.match(rel) for r in exc)
+    ]
+    assert not uncovered, (
+        "these runtime data files are NOT packaged by "
+        f"[tool.hatch.build].include (or are killed by exclude): {uncovered}. "
+        "Add a matching include glob in pyproject.toml (see chainlink #290)."
+    )
+
+
+def test_example_distribution_is_not_in_mimir_agent_wheel_allowlist() -> None:
+    include, exclude = _build_include_exclude()
+    fixture = "tests/fixtures/plugins/example/mimir_example_plugin/mimir-plugin.toml"
+    assert (REPO_ROOT / fixture).is_file()
+    assert not any(_gitwildmatch_to_regex(pattern).match(fixture) for pattern in include)
+    assert any(_gitwildmatch_to_regex(pattern).match(fixture) for pattern in exclude)
+    build = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["hatch"]["build"]
+    assert build["targets"]["wheel"]["packages"] == ["mimir"]
+    assert not any(source.startswith("tests/fixtures/plugins/example")
+                   for source in _force_include())
+
+
+# ---- Reference docs shipped via force-include (mimir/doc_seed.py) ----------
+# The operator docs live at the repo root but must ALSO ship in the wheel under
+# mimir/bundled_docs/ so `mimir setup` can seed them into <home>/docs/. They're
+# packaged via [tool.hatch.build.targets.wheel.force-include], not the include
+# allowlist above.
+
+def _force_include() -> dict:
+    cfg = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    return (
+        cfg["tool"]["hatch"]["build"]["targets"]["wheel"].get("force-include", {})
+    )
+
+
+def test_docs_force_included_into_wheel() -> None:
+    fi = _force_include()
+    # Sources map under mimir/bundled_docs/ so doc_seed.source_root() finds them.
+    assert fi.get("docs") == "mimir/bundled_docs/docs"
+    assert fi.get("README.md") == "mimir/bundled_docs/README.md"
+    assert fi.get(".env.example") == "mimir/bundled_docs/.env.example"
+    # And the sources exist in the tree.
+    for rel in ("docs/configuration.md", "README.md", ".env.example"):
+        assert (REPO_ROOT / rel).is_file(), f"seed source missing: {rel}"
+
+
+def _sdist_force_include() -> dict:
+    cfg = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    return cfg["tool"]["hatch"]["build"]["targets"]["sdist"].get("force-include", {})
+
+
+def test_sdist_carries_every_wheel_force_include_source() -> None:
+    """Every source the wheel force-includes must also ship in the sdist.
+
+    ``uv build`` (and PyPA build front-ends generally) builds the wheel FROM the
+    freshly built sdist, so a root path that only exists in the checkout is not
+    there when the wheel is assembled -- hatchling then aborts with "Forced
+    include not found". hatchling's default sdist selection ships only the
+    inferred package directory, so each source needs an explicit sdist entry at
+    the SAME relative path the wheel's force-include reads it from.
+    """
+    sdist = _sdist_force_include()
+    missing = {
+        source: sdist.get(source)
+        for source in _force_include()
+        if sdist.get(source) != source
+    }
+    assert not missing, (
+        "these wheel force-include sources are not carried by the sdist at the "
+        f"same path, so `uv build` cannot assemble the wheel: {missing}. Add "
+        "them to [tool.hatch.build.targets.sdist.force-include] mapped to "
+        "themselves."
+    )
+
+
+def test_doc_seed_enumerates_operator_docs_excluding_internal() -> None:
+    from mimir import doc_seed
+
+    root = doc_seed.source_root()
+    assert root is not None
+    rels = {rel for rel, _src in doc_seed._seed_items(root)}
+    assert "docs/configuration.md" in rels
+    assert "docs/README.md" in rels
+    assert "docs/.env.example" in rels
+    # docs/internal/ is never seeded into the home
+    assert not any(r.startswith("docs/internal") or "internal" in r for r in rels)
+
+
+def test_include_covers_every_tracked_package_file() -> None:
+    """The sdist ships only what ``include`` matches -- so it must match everything.
+
+    The wheel target sets ``packages = ["mimir"]``, which bypasses the global
+    ``include`` allowlist and ships the whole tracked package tree. The sdist has
+    no such override, so ``include`` alone decides its contents -- and ``uv
+    build`` assembles the published wheel FROM the sdist. Any tracked file under
+    ``mimir/`` that no pattern matches is therefore present in a direct wheel and
+    absent from a released one, which is exactly how ``mimir/web_auth.js``
+    (served at ``/app/auth.js``) came to be missing from the published 0.6.9
+    wheel. Assert parity for the whole tree rather than one file at a time.
+    """
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git unavailable; cannot enumerate tracked files")
+    proc = subprocess.run(
+        [git, "-C", str(REPO_ROOT), "ls-files", "-z", "mimir/"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"not a git checkout; cannot enumerate tracked files: {proc.stderr.strip()}")
+    tracked = [f for f in proc.stdout.split("\0") if f]
+    assert tracked, "git ls-files returned no files under mimir/"
+
+    include, exclude = _build_include_exclude()
+    inc = [_gitwildmatch_to_regex(p) for p in include]
+    exc = [_gitwildmatch_to_regex(p) for p in exclude]
+    uncovered = [
+        rel
+        for rel in tracked
+        if not any(r.match(rel) for r in inc) and not any(r.match(rel) for r in exc)
+    ]
+    assert not uncovered, (
+        "these tracked package files match no [tool.hatch.build].include pattern, "
+        "so they ship in a direct wheel but NOT in the sdist -- and the published "
+        f"wheel is built from the sdist: {uncovered}. Add a covering include glob "
+        "(or an explicit exclude if the file genuinely must not ship)."
+    )

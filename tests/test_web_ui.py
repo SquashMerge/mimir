@@ -1,0 +1,3661 @@
+"""Turn viewer + log API routes (SPEC §11)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import sqlite3
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from tests.timing import HANG_GUARD_SECONDS
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
+
+from mimir.config import Config
+from mimir.dashboard_extensions import (
+    DashboardExtensionManifest,
+    add_plugin_routes,
+    first_party_dashboard_extensions,
+)
+from mimir.chainlink_board import build_chainlink_board_payload
+from mimir import web_ui
+from mimir.commitments.models import CommitmentRecord
+from mimir.commitments.store import CommitmentsStore
+from mimir.identities import IdentityResolver
+from mimir.identities_populator import issue_web_key
+from mimir.pollers import PollerConfig
+from mimir.scheduler import Scheduler, SchedulerJob
+from mimir.turn_event_bus import TurnEventBus
+from mimir.web_contracts import (
+    render_typescript_contracts,
+    validate_api_envelope,
+    validate_live_event,
+    validate_list_meta,
+)
+
+
+def _selected_web_manager(tmp_path: Path, monkeypatch, *, plugins: tuple[dict, ...], enable: str | None = None):
+    """Discover and load distribution-owned manifests through the real selected path."""
+    from mimir.plugins.manager import load_plugins
+    from mimir.plugins.manifest import _SKIN_TOKENS
+
+    entries = []
+    loaded = []
+    for spec in plugins:
+        name = spec["name"]
+        root = tmp_path / f"package-{name}"
+        root.mkdir()
+        skin = {
+            "id": spec.get("skin_id", f"{name}-skin"), "label": name.title(),
+            "version": "1", "default": spec.get("default", True),
+            "tokens": {token: "#123456" for token in _SKIN_TOKENS},
+            "chrome": {"layout": "sidebar", "density": "compact", "accentPlacement": "side-rule"},
+            "panel": {"surface": "flat", "borderStyle": "solid", "hoverBehavior": "none"},
+            "characterRenderer": {
+                "kind": "static-image", "componentSlot": "agent-character", "variant": "default",
+                "assets": [{"id": "avatar", "type": "image", "href": "avatar.png"}],
+                "stateMap": {"idle": "avatar"}, "fallbackState": "idle",
+                "capabilities": {"supportsExpressions": False, "supportsMotion": False},
+            },
+            "fonts": [{"family": "Local", "src": [{"url": "font.woff2", "format": "woff2"}]}],
+        }
+        (root / "skin.json").write_text(json.dumps(skin))
+        (root / "avatar.png").write_bytes(b"avatar")
+        (root / "font.woff2").write_bytes(b"font")
+        (root / "module.js").write_text("export default true")
+        (root / "bundle.css").write_text(":root { color: red; }")
+        (root / "private.txt").write_text("private")
+        (root / "mimir-plugin.toml").write_text(
+            f'name = "{name}"\nversion = "1.2.3"\nlicense = "MIT"\n'
+            'requires_mimir = ">=0.9,<1"\nthemes = ["skin.json"]\n'
+            '[frontend]\napi_major = 1\nmodule = "module.js"\ncss = "bundle.css"\n'
+            f'[config.MIMIR_PLUGIN_{name.upper()}_LABEL]\ntype = "string"\n'
+            f'[config.MIMIR_PLUGIN_{name.upper()}_TOKEN]\ntype = "string"\nsecret = true\nsecurity = true\n'
+        )
+        paths = [Path(f"package-{name}/{path}") for path in (
+            "mimir-plugin.toml", "skin.json", "avatar.png", "font.woff2",
+            "module.js", "bundle.css", "private.txt",
+        )]
+
+        class Distribution:
+            files = paths
+            metadata = {"Name": f"provider-{name}"}
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        def register(registrar, spec=spec, name=name):
+            async def respond(_request):
+                return web.json_response({"plugin": name})
+
+            registrar.register_route("GET", f"/api/v1/plugins/{name}/status", respond)
+            registrar.register_route("POST", f"/api/v1/plugins/{name}/admin", respond, role="admin")
+            registrar.register_dashboard_entry(name, DashboardExtensionManifest(
+                id=name, label=name.title(), route_path=spec.get("route_path", f"/{name}"),
+                requires_role="admin", enabled=spec.get("enabled", True),
+            ))
+
+        def load(register=register, name=name):
+            loaded.append(name)
+            return SimpleNamespace(register=register)
+
+        entries.append(SimpleNamespace(name=name, value=f"provider_{name}:register",
+                                       dist=Distribution(), load=load))
+
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: entries)
+    return load_plugins(enable=enable if enable is not None else ",".join(spec["name"] for spec in plugins)), loaded
+
+
+def _operator_skin_from_plugin(path: Path) -> dict:
+    raw = json.loads(path.read_text())
+    raw["name"] = raw.pop("label")
+    raw["tokens"] = {
+        re.sub(r"-([a-z0-9])", lambda match: match[1].upper(), name.removeprefix("--mimir-")): value
+        for name, value in raw["tokens"].items()
+    }
+    return raw
+
+
+@pytest.fixture
+def app(tmp_path: Path) -> tuple[web.Application, Path, Path]:
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    a = web.Application()
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log)
+    return a, turns_log, events_log
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("config_source", ["home", "env"])
+async def test_saga_route_uses_configured_path(tmp_path, monkeypatch, explicit, config_source):
+    from mimir.saga import _config_io
+
+    monkeypatch.setattr(_config_io, "_config", None)
+    monkeypatch.setattr(_config_io, "_config_loaded", False)
+    monkeypatch.setattr(_config_io, "_explicit_keys", {})
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "custom.db"\n')
+    configured = tmp_path / ".mimir" / "custom.db"
+    if config_source == "env":
+        configured = tmp_path / "external.db"
+        config = tmp_path / "external.toml"
+        config.write_text(f'[storage]\ndb_path = "{configured}"\n')
+        monkeypatch.setenv("SAGA_CONFIG", str(config))
+    override = tmp_path / "override.db"
+    expected = override if explicit else configured
+    seen = []
+
+    def stats(path):
+        seen.append(path)
+        return {"configured_path": str(path)}
+
+    monkeypatch.setattr(web_ui, "build_db_stats_payload", stats)
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl", home=tmp_path,
+        saga_db=override if explicit else None,
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/saga?view=stats")
+        assert response.status == 200
+        assert (await response.json())["configured_path"] == str(expected)
+    assert seen == [expected]
+    assert not expected.exists()
+    assert not (tmp_path / ".mimir" / "saga.db").exists()
+
+
+def test_generated_typescript_contracts_are_current():
+    generated = Path("frontend/src/api/generated/contracts.ts").read_text(
+        encoding="utf-8"
+    )
+    assert generated == render_typescript_contracts()
+
+
+async def test_plugin_routes_are_owner_scoped_and_admin_checked():
+    from mimir.plugins.registry import PolicyRegistry
+
+    policy = PolicyRegistry()
+
+    async def ok(_request):
+        return web.json_response({"ok": True})
+
+    policy.registrar("sample").register_route("GET", "/api/v1/plugins/sample/status", ok)
+    policy.registrar("sample").register_route("POST", "/api/v1/plugins/sample/admin", ok, role="admin")
+
+    @web.middleware
+    async def authenticated(request, handler):
+        if request.headers.get("X-Identity"):
+            request["auth_identity"] = object()
+            request["auth_is_admin"] = request.headers["X-Identity"] == "admin"
+        return await handler(request)
+
+    app = web.Application(middlewares=[authenticated])
+    add_plugin_routes(app, policy)
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/v1/plugins/sample/status")).status == 401
+        assert (await client.get("/api/v1/plugins/sample/status", headers={"X-Identity": "user"})).status == 200
+        assert (await client.post("/api/v1/plugins/sample/admin", headers={"X-Identity": "user"})).status == 403
+        assert (await client.post("/api/v1/plugins/sample/admin", headers={"X-Identity": "admin"})).status == 200
+
+    app = web.Application()
+    app.router.add_get("/api/v1/plugins/sample/status", ok)
+    with pytest.raises(ValueError, match="plugin route collision"):
+        add_plugin_routes(app, policy)
+
+
+async def test_selected_web_host_bootstrap_assets_and_admin_route(tmp_path, monkeypatch):
+    from mimir.server import _make_auth_middleware
+
+    manager, loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha"}, {"name": "disabled", "default": False},
+    ), enable="alpha")
+    assert loaded == ["alpha"]
+    root = tmp_path / "package-alpha"
+    (root / "escape.js").symlink_to(tmp_path / "outside.js")
+    (tmp_path / "outside.js").write_text("outside")
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    app["api_key"] = "web-key"
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    app["identity_resolver"] = resolver
+    app.middlewares.append(_make_auth_middleware("web-key"))
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl", home=tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/v1/plugins/alpha/status")).status == 401
+        headers = {"X-API-Key": "web-key"}
+        status = await client.get("/api/v1/plugins/alpha/status", headers=headers)
+        assert (await status.json())["plugin"] == "alpha"
+        assert (await client.get("/api/v1/plugins/alpha/status", headers={"X-API-Key": user_key})).status == 200
+        assert (await client.post("/api/v1/plugins/alpha/admin", headers={"X-API-Key": user_key})).status == 403
+        assert (await client.post("/api/v1/plugins/alpha/admin", headers=headers)).status == 200
+        assert (await client.get("/api/v1/plugins/disabled/status", headers=headers)).status == 404
+        bootstrap = (await (await client.get("/api/v1/web/bootstrap", headers=headers)).json())["data"]
+        assert next(entry for entry in bootstrap["dashboard_extensions"] if entry["id"] == "alpha")["plugin"] == "alpha"
+        assert "disabled" not in {entry["id"] for entry in bootstrap["dashboard_extensions"]}
+        assert all(entry["plugin"] is None for entry in bootstrap["dashboard_extensions"] if entry["id"] != "alpha")
+        assert bootstrap["plugin_bundles"] == [{
+            "plugin": "alpha", "apiMajor": 1,
+            "moduleUrl": "/plugins/alpha/assets/module.js?v=1.2.3",
+            "cssUrl": "/plugins/alpha/assets/bundle.css?v=1.2.3",
+        }]
+        assert bootstrap["ui"]["default_skin"] == "alpha-skin"
+        (skin,) = bootstrap["skins"]["plugins"]
+        assert skin["name"] == "Alpha" and skin["plugin"] == "alpha"
+        assert len(skin["tokens"]) == 66
+        assert set(skin["tokens"]) == web_ui.SKIN_TOKEN_NAMES
+        assert skin["fonts"][0]["src"][0]["url"] == "/plugins/alpha/assets/font.woff2?v=1.2.3"
+        assert skin["characterRenderer"]["assets"][0]["href"] == "/plugins/alpha/assets/avatar.png?v=1.2.3"
+        for path in ("font.woff2", "avatar.png", "module.js", "bundle.css"):
+            assert (await client.get(f"/plugins/alpha/assets/{path}?v=1.2.3", headers=headers)).status == 200
+        versioned = await client.get("/plugins/alpha/assets/module.js?v=1.2.3", headers=headers)
+        assert versioned.status == 200
+        assert versioned.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+        for suffix in ("", "?v=other"):
+            assert (await client.get(f"/plugins/alpha/assets/module.js{suffix}", headers=headers)).headers["Cache-Control"].startswith("no-store")
+        for path in ("private.txt", "escape.js", "%2e%2e%2foutside.js"):
+            assert (await client.get(f"/plugins/alpha/assets/{path}?v=1.2.3", headers=headers)).status == 404
+        assert (await client.get("/plugins/disabled/assets/module.js?v=1.2.3", headers=headers)).status == 404
+
+
+async def test_selected_dashboard_owners_come_from_policy_not_route_or_manifest(tmp_path, monkeypatch):
+    manager, loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha", "route_path": "/beta-lookalike", "default": False},
+        {"name": "beta", "default": False},
+        {"name": "hidden", "enabled": False, "default": False},
+    ))
+    assert loaded == ["alpha", "beta", "hidden"]
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/v1/web/bootstrap")
+        assert response.status == 200
+        entries = {entry["id"]: entry for entry in (await response.json())["data"]["dashboard_extensions"]}
+
+    assert entries["alpha"]["route_path"] == "/beta-lookalike"
+    assert entries["alpha"]["plugin"] == "alpha"
+    assert entries["beta"]["plugin"] == "beta"
+    assert entries["chat"]["plugin"] is None
+    assert "hidden" not in entries
+    assert all("plugin" in entry for entry in entries.values())
+
+
+@pytest.mark.parametrize("route_paths,expected", [
+    (("/chat",), "/chat"),
+    (("/shared", "/shared"), "/shared"),
+])
+def test_selected_plugin_dashboard_path_collisions_fail_boot(tmp_path, monkeypatch, route_paths, expected):
+    specs = tuple({"name": name, "route_path": path, "default": False}
+                  for name, path in zip(("alpha", "beta"), route_paths))
+    manager, _loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=specs)
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    with pytest.raises(ValueError, match=f"duplicate dashboard route_path: {expected}"):
+        web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
+
+
+@pytest.mark.parametrize("collision", ["built-in", "operator", "plugin"])
+def test_selected_plugin_skin_id_collisions_fail_boot(tmp_path, monkeypatch, collision):
+    specs = [{"name": "alpha", "default": False,
+              "skin_id": "neon-terminal" if collision == "built-in" else "shared-skin"}]
+    if collision == "plugin":
+        specs.append({"name": "beta", "default": False, "skin_id": "shared-skin"})
+    manager, _loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=tuple(specs))
+    if collision == "operator":
+        skins = tmp_path / "skins"
+        skins.mkdir()
+        (skins / "shared.json").write_text(json.dumps(
+            _operator_skin_from_plugin(tmp_path / "package-alpha" / "skin.json")
+        ))
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    with pytest.raises(ValueError, match="duplicate web skin"):
+        web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl",
+                               events_log=tmp_path / "events.jsonl", home=tmp_path)
+
+
+@pytest.mark.parametrize("override,plugin_default,expected", [
+    (None, True, "alpha-skin"), (None, False, "neon-terminal"),
+    ("neon-terminal", True, "neon-terminal"),
+    ("operator-skin", True, "operator-skin"),
+])
+async def test_selected_plugin_default_skin_precedence(tmp_path, monkeypatch, override, plugin_default, expected):
+    manager, _loaded = _selected_web_manager(
+        tmp_path, monkeypatch, plugins=({"name": "alpha", "default": plugin_default},)
+    )
+    skins = tmp_path / "skins"
+    skins.mkdir()
+    operator_skin = _operator_skin_from_plugin(tmp_path / "package-alpha" / "skin.json")
+    operator_skin["id"] = "operator-skin"
+    (skins / "operator.json").write_text(json.dumps(operator_skin))
+    if override:
+        monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", override)
+    else:
+        monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN", raising=False)
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl", home=tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        payload = (await (await client.get("/api/v1/web/bootstrap")).json())["data"]
+    assert payload["ui"]["default_skin"] == expected
+
+
+def test_conflicting_selected_plugin_defaults_need_operator_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", "neon-terminal")
+    manager, _loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha"}, {"name": "beta"},
+    ))
+    monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN")
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    with pytest.raises(ValueError, match="alpha:alpha-skin, beta:beta-skin"):
+        web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
+
+
+def test_plugin_config_owner_reads_only_declared_keys(monkeypatch):
+    from mimir.plugins.config_api import plugin_config_rows, validate_plugin_config_write
+
+    manifests = {
+        "sample": SimpleNamespace(config={
+            "MIMIR_PLUGIN_SAMPLE_TOKEN": {"secret": True, "security": True},
+            "MIMIR_PLUGIN_SAMPLE_LABEL": {"secret": False},
+        }),
+        "other": SimpleNamespace(config={"MIMIR_PLUGIN_OTHER_LABEL": {}}),
+    }
+    monkeypatch.setenv("MIMIR_PLUGIN_SAMPLE_TOKEN", "hidden")
+    monkeypatch.setenv("MIMIR_PLUGIN_SAMPLE_LABEL", "visible")
+    monkeypatch.setenv("MIMIR_PLUGIN_OTHER_LABEL", "foreign")
+    monkeypatch.setenv("MIMIR_API_KEY", "core")
+    rows = plugin_config_rows("sample", manifests)
+    assert {row["name"] for row in rows} == set(manifests["sample"].config)
+    assert next(row for row in rows if row["secret"])["value"] == "[REDACTED]"
+    assert next(row for row in rows if not row["secret"])["value"] == "visible"
+    assert all(row["mutable"] is False for row in rows)
+    validate_plugin_config_write("sample", "MIMIR_PLUGIN_SAMPLE_LABEL", manifests)
+    for owner, name in (
+        ("sample", "MIMIR_PLUGIN_SAMPLE_TOKEN"),
+        ("sample", "MIMIR_PLUGIN_SAMPLE_UNKNOWN"),
+        ("sample", "MIMIR_PLUGIN_OTHER_LABEL"),
+        ("sample", "MIMIR_API_KEY"),
+        ("missing", "MIMIR_PLUGIN_SAMPLE_LABEL"),
+    ):
+        with pytest.raises(ValueError, match="not writable"):
+            validate_plugin_config_write(owner, name, manifests)
+    with pytest.raises(ValueError, match="not enabled"):
+        plugin_config_rows("missing", manifests)
+
+
+def test_admin_config_contains_only_selected_declared_plugin_keys(tmp_path, monkeypatch):
+    from dataclasses import dataclass
+    from mimir.admin_config import build_admin_config_payload
+
+    manager, loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha"}, {"name": "disabled", "default": False},
+    ), enable="alpha")
+    assert loaded == ["alpha"]
+    monkeypatch.setenv("MIMIR_PLUGIN_ALPHA_LABEL", "public value")
+    monkeypatch.setenv("MIMIR_PLUGIN_ALPHA_TOKEN", "private value")
+    monkeypatch.setenv("MIMIR_PLUGIN_ALPHA_UNDECLARED", "should not appear")
+    monkeypatch.setenv("MIMIR_PLUGIN_DISABLED_LABEL", "disabled value")
+    @dataclass
+    class AdminConfigFixture:
+        home: Path
+        plugin_manager: object
+        model_spec: str = ""
+
+    config = AdminConfigFixture(home=tmp_path, plugin_manager=manager)
+    payload = build_admin_config_payload(config=config)
+    plugin_rows = [row for row in payload["env"] if row["name"].startswith("MIMIR_PLUGIN_")]
+    assert {row["name"] for row in plugin_rows} == {
+        "MIMIR_PLUGIN_ALPHA_LABEL", "MIMIR_PLUGIN_ALPHA_TOKEN",
+    }
+    assert {row["name"]: row["value"] for row in plugin_rows} == {
+        "MIMIR_PLUGIN_ALPHA_LABEL": "public value",
+        "MIMIR_PLUGIN_ALPHA_TOKEN": "[REDACTED]",
+    }
+    assert all(row["mutable"] is False for row in plugin_rows)
+    assert payload["mutation_policy"]["mode"] == "read_only_v1"
+    assert payload["mutation_policy"]["mutable_fields"] == []
+
+
+def test_server_builtin_skin_ids_match_frontend_registry():
+    source = Path("frontend/src/skins/SkinProvider.tsx").read_text(encoding="utf-8")
+    match = re.search(r"export const localSkins = \{(?P<body>.*?)\n\}", source, re.S)
+    assert match is not None
+    frontend_ids = set(re.findall(r'"([^"]+)":\s+\w+Skin', match.group("body")))
+    assert frontend_ids == set(web_ui.BUILT_IN_WEB_SKIN_IDS)
+
+
+def test_global_dashboard_extensions_are_admin_only_in_nav_payload():
+    manifests = {
+        item["id"]: item
+        for item in first_party_dashboard_extensions().navigation_payload()
+    }
+
+    assert manifests["ops"]["requires_role"] == "admin"
+    assert manifests["chainlink-board"]["requires_role"] == "admin"
+    assert manifests["scheduler"]["requires_role"] == "admin"
+    # Endpoints are admin-gated (_ADMIN_REQUIRED_PREFIXES), so these nav entries
+    # must be admin-only too or a non-admin sees a tab that only 403s.
+    assert manifests["usage"]["requires_role"] == "admin"
+    assert manifests["saga"]["requires_role"] == "admin"
+    assert manifests["state-memory"]["requires_role"] == "admin"
+    assert manifests["admin-mcp"]["requires_role"] == "admin"
+    assert manifests["chat"]["requires_role"] is None
+
+
+def test_admin_subsurfaces_are_nav_hidden_but_still_registered():
+    # admin-users / admin-mcp render as sub-tabs of the consolidated "Admin"
+    # surface, so they are hidden from the top nav — but they keep their own
+    # api_namespace and stay enabled(), so add_backend_namespace_routes still
+    # registers their backend routes.
+    manifests = {
+        item["id"]: item
+        for item in first_party_dashboard_extensions().navigation_payload()
+    }
+    assert manifests["admin-config"]["nav_hidden"] is False
+    assert manifests["admin-users"]["nav_hidden"] is True
+    assert manifests["admin-mcp"]["nav_hidden"] is True
+    # nav_hidden does NOT drop them from enabled() (route registration source).
+    enabled_ids = {m.id for m in first_party_dashboard_extensions().enabled()}
+    assert {"admin-config", "admin-users", "admin-mcp"} <= enabled_ids
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_api_lists_updates_bound_policy_and_removes(tmp_path: Path):
+    from mimir.mcp_client import MCPPolicyStore
+
+    store = MCPPolicyStore(tmp_path / "state" / "mcp-policy.json")
+    store.upsert_server({
+        "server_config_id": "server-1", "name": "docs", "command": "docs-mcp",
+        "args": [], "env": {}, "policy_version": "ui-v1",
+        "adapters": [{"name": "mimir-ui-server-1", "version": "1", "policy_version": "ui-v1", "direction": "neither"}],
+    })
+    store.save({"tool-1": {
+        "tool_id": "tool-1", "server_config_id": "server-1",
+        "original_tool_name": "search", "display_name": "mcp_docs_search",
+        "config_digest": "config-a", "schema_digest": "schema-a",
+        "classification": "", "policy_version": "",
+        "argument_egress": "taint_gated", "is_tombstoned": False,
+    }})
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        listed = await client.get("/api/v1/admin/mcp/servers")
+        assert listed.status == 200
+        assert (await listed.json())["data"]["servers"][0]["tools"][0]["classification"] == ""
+
+        updated = await client.put("/api/v1/admin/mcp/tools/tool-1/policy", json={
+            "classification": "open",
+            "argument_egress": "allowed", "config_digest": "config-a",
+            "schema_digest": "schema-a",
+        })
+        assert updated.status == 200
+        policy_data = (await updated.json())["data"]
+        assert policy_data["restart_required"] is True
+        assert "result_integrity" not in policy_data["tool"]
+        assert "result_integrity" not in store.load()["tool-1"]
+
+        conflict = await client.put("/api/v1/admin/mcp/tools/tool-1/policy", json={
+            "classification": "open",
+            "argument_egress": "allowed", "config_digest": "stale",
+            "schema_digest": "schema-a",
+        })
+        assert conflict.status == 409
+
+        removed = await client.delete("/api/v1/admin/mcp/servers/server-1")
+        assert removed.status == 200
+        assert store.load()["tool-1"]["is_tombstoned"] is True
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_listing_redacts_all_config_values_and_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from mimir.mcp_client import MCPManager, MCPPolicyStore
+
+    store = MCPPolicyStore(tmp_path / "state" / "mcp-policy.json")
+    original = {
+        "server_config_id": "server-1",
+        "name": "private",
+        "command": "runner token=command-secret",
+        "args": ["--api-key=argument-secret", "--safe", "value"],
+        "env": {
+            "GITHUB_PAT": "opaque-pat",
+            "BEARER": "opaque-bearer",
+            "TOKEN_REF": "${MCP_TOKEN}",
+            "TOKEN_MIXED": "${MCP_TOKEN}:literal-secret",
+        },
+        "policy_version": "ui-v1",
+        "adapters": [{
+            "name": "mimir-ui-server-1", "version": "1",
+            "policy_version": "ui-v1", "direction": "neither",
+        }],
+    }
+    store.upsert_server(original)
+    monkeypatch.setattr(
+        MCPManager, "start_servers", AsyncMock(return_value=[]),
+    )
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns", events_log=tmp_path / "events",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        listed = await client.get("/api/v1/admin/mcp/servers")
+        projected = (await listed.json())["data"]["servers"][0]
+        updated = await client.put(
+            "/api/v1/admin/mcp/servers/server-1", json=projected,
+        )
+
+    assert listed.status == 200
+    assert projected["command"] == "runner token=[REDACTED]"
+    assert projected["args"] == ["--api-key=[REDACTED]", "--safe", "value"]
+    assert projected["env"] == {
+        "GITHUB_PAT": "[REDACTED]",
+        "BEARER": "[REDACTED]",
+        "TOKEN_REF": "${MCP_TOKEN}",
+        "TOKEN_MIXED": "${MCP_TOKEN}[REDACTED]",
+    }
+    assert updated.status == 200
+    persisted = store.load_server_records()["server-1"]
+    assert persisted["command"] == original["command"]
+    assert persisted["args"] == original["args"]
+    assert persisted["env"] == original["env"]
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_discovers_before_persisting_and_reports_missing_command(
+    tmp_path: Path,
+) -> None:
+    from mimir.mcp_client import MCPPolicyStore
+
+    command = "mimir-definitely-missing-mcp-1234"
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/admin/mcp/servers", json={
+            "name": "broken",
+            "command": command,
+            "args": [],
+            "env": {},
+        })
+        body = await resp.json()
+
+    assert resp.status == 400
+    assert body["error"]["code"] == "mcp_discovery_failed"
+    assert command in body["error"]["message"]
+    assert MCPPolicyStore(
+        tmp_path / "state" / "mcp-policy.json"
+    ).load_server_records() == {}
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_persists_after_successful_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from mimir.mcp_client import MCPManager, MCPPolicyStore
+
+    start_servers = AsyncMock(return_value=[])
+    monkeypatch.setattr(MCPManager, "start_servers", start_servers)
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/admin/mcp/servers", json={
+            "name": "valid",
+            "command": "valid-mcp",
+            "args": [],
+            "env": {},
+        })
+
+    assert resp.status == 200
+    records = MCPPolicyStore(
+        tmp_path / "state" / "mcp-policy.json"
+    ).load_server_records()
+    assert next(iter(records.values()))["command"] == "valid-mcp"
+    assert start_servers.await_args.kwargs == {"fail_fast": True}
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_discovery_and_tombstones_never_write_result_integrity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.mcp_client import MCPManager, MCPPolicyStore, MCPProvenance
+
+    async def discover(_manager, configs, **_kwargs):
+        provenance = MCPProvenance.create(configs[0], "search", {})
+        return [SimpleNamespace(name="mcp_docs_search", mcp_provenance=provenance)]
+
+    monkeypatch.setattr(MCPManager, "start_servers", discover)
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    store = MCPPolicyStore(tmp_path / "state" / "mcp-policy.json")
+    async with TestClient(TestServer(app)) as client:
+        created = await client.post("/api/v1/admin/mcp/servers", json={"name": "docs", "command": "docs-mcp"})
+        assert created.status == 200
+        server = (await created.json())["data"]["servers"][0]
+        [tool] = server["tools"]
+        assert "result_integrity" not in tool
+        assert tool["classification"] == "admin_required"
+        # A disappeared tool is retained as a tombstone during rediscovery.
+        store.save({**store.load(), "gone": {**tool, "tool_id": "gone", "original_tool_name": "gone"}})
+        updated = await client.put(f"/api/v1/admin/mcp/servers/{server['server_config_id']}", json=server)
+        assert updated.status == 200
+        assert store.load()["gone"]["is_tombstoned"] is True
+        assert all("result_integrity" not in record for record in store.load().values())
+        removed = await client.delete(f"/api/v1/admin/mcp/servers/{server['server_config_id']}")
+        assert removed.status == 200
+        assert all(record["is_tombstoned"] for record in store.load().values())
+        assert all("result_integrity" not in record for record in store.load().values())
+
+
+def test_dashboard_extension_registry_sorts_hides_and_validates_scope():
+    registry = first_party_dashboard_extensions(
+        [
+            DashboardExtensionManifest(
+                id="late",
+                route_path="/late",
+                label="Late",
+                nav_position=20,
+            ),
+            DashboardExtensionManifest(
+                id="early",
+                route_path="/early",
+                label="Early",
+                nav_position=10,
+            ),
+            DashboardExtensionManifest(
+                id="hidden",
+                route_path="/hidden",
+                label="Hidden",
+                nav_position=1,
+                enabled=False,
+            ),
+        ]
+    )
+
+    assert [manifest.id for manifest in registry.enabled()] == ["early", "late"]
+    assert [item["id"] for item in registry.navigation_payload()] == ["early", "late"]
+
+    with pytest.raises(ValueError, match="trusted first-party"):
+        first_party_dashboard_extensions(
+            [
+                DashboardExtensionManifest(
+                    id="remote",
+                    route_path="/remote",
+                    label="Remote",
+                    trusted_first_party=False,
+                )
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir import chainlink_board
+
+    home = tmp_path / "home"
+    home.mkdir()
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (home / "state" / "worklink" / "transcripts").mkdir(parents=True)
+    (evidence_dir / "545-2.json").write_text(
+        json.dumps({
+            "issue": 545,
+            "attempt": 2,
+            "backend": "codex",
+            "status": "completed",
+            "branch": "issue/545-a2",
+            "diff_stat": "3 files changed",
+            "tests": {"cmd": "npm test", "exit_code": 0},
+            "transcript": "state/worklink/transcripts/545-2.jsonl",
+            "pr_url": "https://example.test/pr/1",
+        }),
+        encoding="utf-8",
+    )
+    export_payload = {"version": 1, "exported_at": "2026-06-18T03:00:00Z", "issues": [
+        {"id": 524, "title": "Parent", "status": "open", "priority": "high", "labels": ["epic"], "parent_id": None, "description": "Parent description", "comments": [], "created_at": "2026-06-17T00:00:00Z", "closed_at": None, "updated_at": "2026-06-18T00:00:00Z"},
+        {"id": 545, "title": "Board", "status": "open", "priority": "medium", "labels": ["worklink:review", "frontend"], "parent_id": 524, "description": "Board description", "comments": [], "created_at": "2026-06-17T00:00:00Z", "closed_at": None, "updated_at": "2026-06-18T01:00:00Z"},
+        {"id": 540, "title": "Prereq", "status": "closed", "priority": "low", "labels": [], "parent_id": None, "description": "Prereq description", "comments": [], "created_at": "2026-06-16T00:00:00Z", "closed_at": "2026-06-17T00:00:00Z", "updated_at": "2026-06-17T00:00:00Z"},
+    ]}
+    detail_payloads = {
+        "545": {"id": 545, "blocked_by": [540], "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]},
+        "524": {"id": 524, "subissues": [545]},
+        "540": {"id": 540},
+    }
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def communicate(self):
+            return json.dumps(self.payload).encode(), b""
+
+    async def create_subprocess_exec(program, *args, **kwargs):
+        assert program == "chainlink"
+        assert kwargs["cwd"] == str(home)
+        payload = export_payload if args == ("export", "--json") else detail_payloads[args[2]]
+        return FakeProcess(payload)
+
+    # The original executable had to start another Python interpreter inside a
+    # five-second production timeout. Under host load that tested scheduling,
+    # not board parsing. This fake retains the byte-level JSON decode boundary.
+    monkeypatch.setattr(
+        chainlink_board.asyncio, "create_subprocess_exec", create_subprocess_exec
+    )
+
+    payload = await build_chainlink_board_payload(home, issue=545)
+
+    assert payload["available"] is True
+    board = next(issue for issue in payload["issues"] if issue["id"] == 545)
+    parent = next(issue for issue in payload["issues"] if issue["id"] == 524)
+    assert board["status"] == "review"
+    assert board["blocked_by"] == [540]
+    assert payload["selected_issue_state"] == "loaded"
+    assert payload["selected_issue"]["comments"][0]["body"] == "WORKLINK_EVIDENCE attached"
+    assert board["worklink"] is None
+    assert parent["child_progress"] == {"done": 0, "total": 1}
+    assert {"from": 524, "to": 545, "kind": "parent"} in payload["edges"]
+    assert {"from": 540, "to": 545, "kind": "blocks"} in payload["edges"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("export_payload", [
+    [], [{"id": 1}], {}, {"version": 1}, {"issues": None},
+    {"issues": {}}, {"issues": [None]}, {"issues": [{"id": 1}, "bad"]},
+])
+async def test_chainlink_board_rejects_invalid_export_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, export_payload,
+):
+    from mimir import chainlink_board
+
+    calls = []
+
+    async def run(home, args):
+        calls.append(args)
+        return export_payload, None
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    result = await build_chainlink_board_payload(tmp_path)
+    assert result["available"] is False
+    assert result["error"] == "chainlink returned non-list payload"
+    assert result["issues"] == []
+    assert calls == [["export", "--json"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [{}, {"version": 1, "exported_at": "2026-06-18T03:00:00Z"}])
+async def test_chainlink_board_accepts_empty_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata,
+):
+    from mimir import chainlink_board
+
+    async def run(home, args):
+        assert args == ["export", "--json"]
+        return {**metadata, "issues": []}, None
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    result = await build_chainlink_board_payload(tmp_path)
+    assert result["available"] is True
+    assert result["issues"] == []
+    assert result["total_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_pages_filter_before_cutoff_and_load_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir import chainlink_board
+
+    # CLI order puts more than a page of closed history ahead of older work.
+    closed = [
+        {"id": 2000 + i, "title": f"Closed {i}", "status": "closed"}
+        for i in range(300)
+    ]
+    active = [
+        {"id": i, "title": f"Active {i}", "status": "open", "labels": ["old"],
+         "priority": "high" if i == 1168 else "normal"}
+        for i in range(1000, 1300)
+    ]
+    # Match the pinned CLI export record, not the sparse issue-list shape.
+    for item in closed + active:
+        item.setdefault("labels", [])
+        item.setdefault("priority", "normal")
+        item.update({
+            "parent_id": None, "description": "Exported description", "comments": [],
+            "created_at": "2026-06-17T00:00:00Z",
+            "updated_at": "2026-06-18T00:00:00Z",
+            "closed_at": "2026-06-18T00:00:00Z" if item["status"] == "closed" else None,
+        })
+    active[168]["labels"].append("worklink:blocked")
+    active[214]["parent_id"] = 1168
+    calls = []
+    fail_detail = False
+
+    async def run(home, args):
+        assert home == tmp_path
+        calls.append(args)
+        if args == ["export", "--json"]:
+            assert all(not ({"blocked_by", "blocking", "relations"} & item.keys())
+                       for item in closed + active)
+            return {"version": 1, "exported_at": "2026-06-18T03:00:00Z",
+                    "issues": closed + active}, None
+        assert args[:2] == ["issue", "show"]
+        if fail_detail:
+            return None, "temporary CLI failure"
+        issue_id = int(args[2])
+        return {"id": issue_id, "description": "Old selected detail",
+                "blocked_by": [1299] if issue_id in (1168, 1214) else []}, None
+
+    async def request(expected_shows, **kwargs):
+        calls.clear()
+        result = await build_chainlink_board_payload(tmp_path, **kwargs)
+        assert result["available"] is True, result
+        assert calls[0] == ["export", "--json"]
+        shows = [args for args in calls if args[:2] == ["issue", "show"]]
+        assert len(calls) == 1 + expected_shows
+        assert len(shows) == expected_shows
+        assert len({args[2] for args in shows}) == expected_shows
+        return result
+
+    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
+    first = await request(250, show_completed=False)
+    assert first["total_count"] == 300
+    assert first["truncated"] is True
+    assert first["next_offset"] == 250
+    assert len(first["issues"]) == 250
+    blocked = next(item for item in first["issues"] if item["id"] == 1168)
+    assert blocked["labels"] == ["old", "worklink:blocked"]
+    assert blocked["status"] == "blocked"
+    dependency_only = next(item for item in first["issues"] if item["id"] == 1214)
+    assert dependency_only["status"] == "blocked"
+    assert {"from": 1299, "to": 1168, "kind": "blocks"} in first["edges"]
+    assert {"from": 1168, "to": 1214, "kind": "parent"} in first["edges"]
+    assert first["filters"]["labels"] == ["old", "worklink:blocked"]
+    second = await request(50, show_completed=False, offset=250)
+    assert second["next_offset"] is None
+    assert second["truncated"] is True
+    assert second["total_count"] == 300
+    assert {item["id"] for item in first["issues"] + second["issues"]} == {
+        item["id"] for item in active
+    }
+
+    filtered = await request(
+        2, label="old", status="blocked", priority="high", show_completed=False,
+        issue=1299,
+    )
+    assert [item["id"] for item in filtered["issues"]] == [1168]
+    assert filtered["total_count"] == 1
+    assert filtered["truncated"] is False
+    assert filtered["selected_issue"]["id"] == 1299
+    assert filtered["selected_issue"]["description"] == "Old selected detail"
+    assert filtered["selected_issue_state"] == "loaded"
+    # Global blocked filtering uses lifecycle labels, not dependency discovery.
+    lifecycle = await request(1, status="blocked", show_completed=False)
+    assert [item["id"] for item in lifecycle["issues"]] == [1168]
+    in_page = await request(250, show_completed=False, issue=1214)
+    assert in_page["selected_issue_state"] == "loaded"
+    off_page = await request(251, show_completed=False, issue=1299)
+    assert off_page["selected_issue"]["id"] == 1299
+    done = await request(250, status="done", show_completed=False)
+    assert done["total_count"] == 300
+    assert all(item["status"] == "done" for item in done["issues"])
+    empty = await request(0, label="absent", issue=9999)
+    assert empty["issues"] == []
+    assert empty["total_count"] == 0
+    assert empty["truncated"] is False
+    assert empty["selected_issue_state"] == "missing"
+    fail_detail = True
+    unavailable = await request(250, show_completed=False, issue=1214)
+    assert unavailable["selected_issue_state"] == "unavailable"
+    assert unavailable["selected_issue"] is None
+    assert next(item for item in unavailable["issues"] if item["id"] == 1168)["labels"] == ["old", "worklink:blocked"]
+    off_page_failure = await request(251, show_completed=False, issue=1299)
+    assert off_page_failure["selected_issue_state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_query_parameters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    calls = []
+
+    async def build(home, **kwargs):
+        calls.append((home, kwargs))
+        return {"available": True}
+
+    monkeypatch.setattr(web_ui, "build_chainlink_board_payload", build)
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/api/v1/chainlink-board?offset=250&issue=1214&label=old&status=blocked&priority=high&show_completed=false"
+        )
+        assert response.status == 200
+        assert calls == [(tmp_path, {
+            "offset": 250, "issue": 1214, "label": "old", "status": "blocked",
+            "priority": "high", "show_completed": False, "evidence_provider": None,
+        })]
+        for query in ("offset=-1", "offset=abc", "issue=0", "issue=-1", "issue=abc", "show_completed=maybe"):
+            response = await client.get(f"/api/v1/chainlink-board?{query}")
+            assert response.status == 400
+        assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_chainlink_board_degrades_when_cli_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    payload = await build_chainlink_board_payload(tmp_path)
+
+    assert payload["available"] is False
+    assert payload["issues"] == []
+    assert "chainlink CLI not on PATH" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_core_web_has_no_factory_runs_routes(tmp_path: Path):
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    assert "factory-runs" not in {entry.id for entry in web_ui.first_party_dashboard_extensions().manifests}
+
+    async with TestClient(TestServer(app)) as client:
+        for method, path in (
+            ("get", "/api/v1/factory-runs"),
+            ("get", "/api/v1/factory-runs/834"),
+            ("post", "/api/v1/factory-runs/834/archive"),
+        ):
+            assert (await getattr(client, method)(path)).status == 404
+
+
+def test_dashboard_extension_route_path_allows_app_prefix_words_only():
+    DashboardExtensionManifest(
+        id="apple",
+        route_path="/apple",
+        label="Apple",
+    ).validate()
+    DashboardExtensionManifest(
+        id="applications",
+        route_path="/applications",
+        label="Applications",
+    ).validate()
+
+    with pytest.raises(ValueError, match="route_path"):
+        DashboardExtensionManifest(
+            id="app",
+            route_path="/app",
+            label="App",
+        ).validate()
+    with pytest.raises(ValueError, match="route_path"):
+        DashboardExtensionManifest(
+            id="app-child",
+            route_path="/app/child",
+            label="App Child",
+        ).validate()
+
+    for unsafe_path in ("//status", "/../status", "/status/../secret", "/\\status"):
+        with pytest.raises(ValueError, match="route_path"):
+            DashboardExtensionManifest(
+                id="unsafe",
+                route_path=unsafe_path,
+                label="Unsafe",
+            ).validate()
+
+
+@pytest.mark.asyncio
+async def test_turns_page_serves_html(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/turns")
+        assert resp.status == 200
+        assert resp.content_type == "text/html"
+        assert resp.headers["X-Mimir-Frontend"] == "legacy-html"
+        assert resp.headers["Link"] == '</app>; rel="alternate"'
+        body = await resp.text()
+        assert "mimir turns" in body  # header title (renamed from "Turn Viewer")
+        assert "/api/turns" in body  # the page polls this endpoint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/turns", "/ops", "/saga", "/state"])
+async def test_legacy_html_routes_are_marked(path, tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=tmp_path,
+        saga_db=tmp_path / "saga.db",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(path)
+
+    assert resp.status == 200
+    assert resp.content_type == "text/html"
+    assert resp.headers["X-Mimir-Frontend"] == "legacy-html"
+    assert resp.headers["Link"] == '</app>; rel="alternate"'
+
+
+@pytest.mark.asyncio
+async def test_api_turns_returns_records(app):
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "t1", "channel_id": "c1", "output": "hi"},
+        {"turn_id": "t2", "channel_id": "c1", "output": "ok"},
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/turns")
+        body = await resp.json()
+    assert [t["turn_id"] for t in body["turns"]] == ["t1", "t2"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_turns_returns_envelope_and_list_metadata(app):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turns?limit=2")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    validate_list_meta(body["meta"])
+    assert [t["turn_id"] for t in body["data"]["turns"]] == ["t3", "t4"]
+    assert body["meta"] == {
+        "cursor": "t4",
+        "limit": 2,
+        # Cursor-limited turn pages intentionally do not count the full log;
+        # exact totals require decoding every retained row and defeat
+        # progressive loading on large turns.jsonl files.
+        "total": None,
+        "truncated": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_v1_turns_offloads_tail_read(monkeypatch, app):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    calls = []
+    real_to_thread = web_ui.asyncio.to_thread
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(web_ui.asyncio, "to_thread", fake_to_thread)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turns?limit=2")
+        body = await resp.json()
+
+    assert resp.status == 200
+    assert [t["turn_id"] for t in body["data"]["turns"]] == ["t3", "t4"]
+    assert "_turns_response" in calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["user_message", "assistant_message"])
+async def test_api_v1_sessions_redacts_stored_message_credentials(tmp_path: Path, kind: str):
+    from mimir.history import MessageBuffer
+
+    credential = "ghp_" + "syntheticDeployCredential123456789"
+    content = f"Deploy with {credential}\n\tThen report back: caf\u00e9, \u6771\u4eac."
+    ts = "2026-06-18T10:00:00Z"
+    buf = MessageBuffer(history_path=tmp_path / "messages" / "chat_history.jsonl")
+    await buf.append(buf.make_message(
+        channel_id="web-a", kind=kind, content=content, author="alice", ts=ts,
+    ))
+    turns_log = tmp_path / "turns.jsonl"
+    turns_log.write_text(json.dumps({
+        "turn_id": "t1", "ts": ts, "trigger": "user_message",
+        "channel_id": "web-a", "input": "deploy", "output": "received",
+    }) + "\n")
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=turns_log, events_log=tmp_path / "events.jsonl", home=tmp_path,
+    )
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/sessions")
+        raw = await resp.text()
+
+    assert resp.status == 200
+    assert credential not in raw
+    body = json.loads(raw)
+    validate_api_envelope(body, expect_ok=True)
+    [session] = body["data"]["sessions"]
+    [message] = session["messages"]
+    assert message["kind"] == kind
+    assert message["content"] == content.replace(credential, "[REDACTED]")
+
+
+@pytest.mark.asyncio
+async def test_api_v1_sessions_groups_missing_saga_session_id_by_channel_time(tmp_path: Path):
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    home = tmp_path / "home"
+    home.mkdir()
+    rows = [
+        {
+            "turn_id": "t1",
+            "ts": "2026-06-18T10:00:00Z",
+            "trigger": "user_message",
+            "channel_id": "web-a",
+            "input": "alpha prompt",
+            "output": "alpha answer",
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-06-18T10:05:00Z",
+            "trigger": "user_message",
+            "channel_id": "web-a",
+            "input": "follow up",
+            "output": "still alpha",
+        },
+        {
+            "turn_id": "t3",
+            "ts": "2026-06-18T11:00:00Z",
+            "trigger": "scheduled_tick",
+            "channel_id": "web-a",
+            "input": "later",
+            "output": "later answer",
+        },
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    a = web.Application()
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log, home=home)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/sessions?q=alpha&channel=web-a&trigger=user_message")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert body["meta"]["total"] == 1
+    [session] = body["data"]["sessions"]
+    assert session["synthetic"] is True
+    assert session["saga_session_id"] is None
+    assert session["turn_ids"] == ["t1", "t2"]
+    assert session["triggers"] == ["user_message"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_sessions_includes_synthesis_only_saga_summary(tmp_path: Path):
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    home = tmp_path / "home"
+    saga_dir = home / ".mimir"
+    saga_dir.mkdir(parents=True)
+    saga_db = saga_dir / "saga.db"
+    conn = sqlite3.connect(saga_db)
+    try:
+        conn.executescript((Path("mimir/saga/schema.sql")).read_text(encoding="utf-8"))
+        conn.execute(
+            """
+            INSERT INTO sessions (
+                id, channel_id, started_at, ended_at, summary, reflected_at,
+                topics_discussed, decisions_made, unfinished, closed_since
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "saga-web-a-1",
+                "web-a",
+                "2026-06-18T10:00:00Z",
+                "2026-06-18T10:30:00Z",
+                "Synthesized without retained turn records.",
+                "2026-06-18T10:31:00Z",
+                json.dumps(["browser"]),
+                json.dumps([]),
+                json.dumps(["wire detail view"]),
+                json.dumps([]),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO atoms (
+                id, content, content_hash, source_type, created_at, session_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "atom-1",
+                "Session atom tied to synthesis-only browser work.",
+                "hash-1",
+                "conversation",
+                "2026-06-18T10:32:00Z",
+                "saga-web-a-1",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    a = web.Application()
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log, home=home)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/sessions?q=retained")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    [session] = body["data"]["sessions"]
+    assert session["id"] == "saga-web-a-1"
+    assert session["turn_ids"] == []
+    assert session["summary"] == "Synthesized without retained turn records."
+    assert session["unfinished"] == ["wire detail view"]
+    assert session["related_saga_atoms"][0]["id"] == "atom-1"
+
+
+@pytest.mark.asyncio
+async def test_api_turns_with_after_filter(app):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/turns?after=t2")
+        body = await resp.json()
+    # Strictly after t2 — t3, t4.
+    assert [t["turn_id"] for t in body["turns"]] == ["t3", "t4"]
+
+
+@pytest.mark.asyncio
+async def test_api_turns_limit_returns_newest_page(app):
+    """Progressive loading: ?limit=N returns the newest N turns (file tail)."""
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/turns?limit=2")
+        body = await resp.json()
+    # Newest 2 (file is oldest-first; tail is t3, t4).
+    assert [t["turn_id"] for t in body["turns"]] == ["t3", "t4"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/turns?limit=2", "/api/v1/turns?limit=2"])
+async def test_api_turns_limit_stops_tail_reading_after_page(monkeypatch, app, path):
+    """React/legacy progressive loads must not decode every retained turn."""
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(5)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    calls = 0
+    real_tail = web_ui.tail_jsonl_records
+
+    def counting_tail(path_arg, **kwargs):
+        nonlocal calls
+        for record in real_tail(path_arg, **kwargs):
+            calls += 1
+            yield record
+
+    monkeypatch.setattr(web_ui, "tail_jsonl_records", counting_tail)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(path)
+        body = await resp.json()
+
+    turns = body.get("turns") or body["data"]["turns"]
+    assert [t["turn_id"] for t in turns] == ["t3", "t4"]
+    assert calls == 2
+
+
+def test_turn_cursor_helpers_bound_decoded_records(monkeypatch, tmp_path: Path):
+    turns_log = tmp_path / "turns.jsonl"
+    rows = [{"turn_id": f"t{i}"} for i in range(web_ui._TURNS_MAX_SCAN_RECORDS + 100)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    calls = 0
+    real_tail = web_ui.tail_jsonl_records
+
+    def counting_tail(path_arg, **kwargs):
+        nonlocal calls
+        for record in real_tail(path_arg, **kwargs):
+            calls += 1
+            yield record
+
+    monkeypatch.setattr(web_ui, "tail_jsonl_records", counting_tail)
+
+    assert web_ui._turns_after_page(turns_log, after="absent") == ([], False)
+    assert calls == web_ui._TURNS_MAX_SCAN_RECORDS
+
+    calls = 0
+    assert web_ui._turns_before_page(turns_log, before="absent", limit=200) == (
+        [],
+        False,
+        False,
+    )
+    assert calls == web_ui._TURNS_MAX_SCAN_RECORDS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/api/turns", "/api/v1/turns"])
+@pytest.mark.parametrize("cursor_param", ["after", "before"])
+async def test_api_turns_reports_cursor_outside_scan_window(
+    app, endpoint, cursor_param
+):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(web_ui._TURNS_MAX_SCAN_RECORDS + 1)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(f"{endpoint}?{cursor_param}=absent&limit=200")
+        body = await resp.json()
+
+    error = body["error"]
+    assert resp.status == 409
+    assert error["code"] == "cursor_not_found"
+    details = error.get("details", error)
+    assert details["cursor"] == "absent"
+    assert details["scan_limit"] == web_ui._TURNS_MAX_SCAN_RECORDS
+
+
+@pytest.mark.asyncio
+async def test_api_turns_clamps_huge_limit_and_bounds_decoding(monkeypatch, app):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(web_ui._TURNS_MAX_PAGE_RECORDS + 100)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    calls = 0
+    real_tail = web_ui.tail_jsonl_records
+
+    def counting_tail(path_arg, **kwargs):
+        nonlocal calls
+        for record in real_tail(path_arg, **kwargs):
+            calls += 1
+            yield record
+
+    monkeypatch.setattr(web_ui, "tail_jsonl_records", counting_tail)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turns?limit=99999999")
+        body = await resp.json()
+
+    assert resp.status == 200
+    assert len(body["data"]["turns"]) == web_ui._TURNS_MAX_PAGE_RECORDS
+    assert body["meta"]["limit"] == web_ui._TURNS_MAX_PAGE_RECORDS
+    assert calls == web_ui._TURNS_MAX_PAGE_RECORDS
+
+
+@pytest.mark.asyncio
+async def test_api_turns_before_returns_older_page(app):
+    """Progressive loading: ?before=<id>&limit=N returns up to N turns
+    immediately OLDER than the cursor (scroll-back page)."""
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(6)]  # t0..t5
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    async with TestClient(TestServer(a)) as client:
+        # Two turns older than t4 -> t2, t3.
+        resp = await client.get("/api/turns?before=t4&limit=2")
+        body = await resp.json()
+        # Unknown cursor is distinguishable from a valid empty older page.
+        resp2 = await client.get("/api/turns?before=nope&limit=2")
+        body2 = await resp2.json()
+    assert [t["turn_id"] for t in body["turns"]] == ["t2", "t3"]
+    assert resp2.status == 409
+    assert body2["turns"] == []
+    assert body2["error"]["code"] == "cursor_not_found"
+
+
+@pytest.mark.asyncio
+async def test_api_turns_handles_missing_file(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/turns")
+        body = await resp.json()
+    assert body == {"turns": []}
+
+
+@pytest.mark.asyncio
+async def test_removed_unversioned_routes_return_404(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        bootstrap = await client.get("/api/web/bootstrap")
+        events = await client.get("/api/events")
+
+    assert bootstrap.status == 404
+    assert events.status == 404
+
+
+@pytest.mark.asyncio
+async def test_log_read_failure_is_degraded_and_emits_once_per_path(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import _jsonl_tail
+
+    a, turns_log, events_log = app
+    turns_log.write_text("", encoding="utf-8")
+    events_log.write_text("", encoding="utf-8")
+    emitted: list[tuple[str, dict[str, str]]] = []
+
+    def unreadable(_path: Path):
+        raise PermissionError("permission denied")
+
+    async def record_event(event_type: str, **payload: str) -> None:
+        emitted.append((event_type, payload))
+
+    monkeypatch.setattr(_jsonl_tail, "_tail_lines", unreadable)
+    monkeypatch.setattr(web_ui, "safe_log_event", record_event)
+
+    async with TestClient(TestServer(a)) as client:
+        legacy_turns = await client.get("/api/turns?limit=2")
+        repeated_turns = await client.get("/api/v1/turns?limit=2")
+        events = await client.get("/api/v1/events")
+        live_events = await client.get("/api/v1/live-events?once=1")
+
+        assert await legacy_turns.json() == {"turns": [], "degraded": True}
+        assert (await repeated_turns.json())["data"] == {
+            "turns": [],
+            "degraded": True,
+        }
+        assert (await events.json())["data"] == {
+            "events": [],
+            "degraded": True,
+        }
+        assert 'event: state-degraded\ndata: {"degraded": true}' in await live_events.text()
+
+    assert [event_type for event_type, _payload in emitted] == [
+        "state_read_failed",
+        "state_read_failed",
+    ]
+    assert {payload["path"] for _event_type, payload in emitted} == {
+        str(turns_log),
+        str(events_log),
+    }
+    assert all("PermissionError: permission denied" in payload["error"] for _, payload in emitted)
+
+
+@pytest.mark.asyncio
+async def test_empty_logs_are_healthy_empty_without_event(
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, turns_log, events_log = app
+    turns_log.write_text("", encoding="utf-8")
+    events_log.write_text("", encoding="utf-8")
+    emitted: list[str] = []
+
+    async def record_event(event_type: str, **_payload: str) -> None:
+        emitted.append(event_type)
+
+    monkeypatch.setattr(web_ui, "safe_log_event", record_event)
+
+    async with TestClient(TestServer(a)) as client:
+        turns = await client.get("/api/turns?limit=2")
+        events = await client.get("/api/v1/events")
+        live_events = await client.get("/api/v1/live-events?once=1")
+
+        assert turns.status == 200
+        assert await turns.json() == {"turns": []}
+        assert events.status == 200
+        assert (await events.json())["data"] == {"events": []}
+        assert "degraded" not in await live_events.text()
+
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_api_v1_events_filters_by_type_and_limit(app):
+    a, _, events_log = app
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "turn_started"},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "tool_call"},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "tool_call"},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "turn_finished"},
+    ]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/events?type=tool_call")
+        body = (await resp.json())["data"]
+        assert all(e["type"] == "tool_call" for e in body["events"])
+        assert len(body["events"]) == 2
+
+        # Multiple types via repeated query param.
+        resp = await client.get("/api/v1/events?type=turn_started&type=turn_finished")
+        body = (await resp.json())["data"]
+        assert {e["type"] for e in body["events"]} == {"turn_started", "turn_finished"}
+
+        # Comma-joined form should work too.
+        resp = await client.get("/api/v1/events?type=turn_started,turn_finished")
+        body = (await resp.json())["data"]
+        assert {e["type"] for e in body["events"]} == {"turn_started", "turn_finished"}
+
+        # Limit returns the tail.
+        resp = await client.get("/api/v1/events?limit=2")
+        body = (await resp.json())["data"]
+        assert [e["type"] for e in body["events"]] == ["tool_call", "turn_finished"]
+
+        # since= drops anything before the timestamp.
+        resp = await client.get("/api/v1/events?since=2026-01-01T00:00:02Z")
+        body = (await resp.json())["data"]
+        assert [e["type"] for e in body["events"]] == ["tool_call", "turn_finished"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_events_reads_jsonl_off_event_loop(monkeypatch, app):
+    """Dashboard polling must not tail/parse JSONL logs on the aiohttp loop."""
+    a, _, events_log = app
+    rows = [
+        {"timestamp": f"2026-01-01T00:00:0{i}Z", "type": "tool_call"}
+        for i in range(4)
+    ]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    loop_thread = threading.get_ident()
+    real_read_jsonl = web_ui._read_jsonl
+    read_threads: list[int] = []
+
+    def recording_read_jsonl(*args, **kwargs):
+        read_threads.append(threading.get_ident())
+        return real_read_jsonl(*args, **kwargs)
+
+    monkeypatch.setattr(web_ui, "_read_jsonl", recording_read_jsonl)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/events?limit=2")
+        body = await resp.json()
+
+    events = body["data"]["events"]
+    assert resp.status == 200
+    assert [e["timestamp"] for e in events] == [
+        "2026-01-01T00:00:02Z",
+        "2026-01-01T00:00:03Z",
+    ]
+    assert read_threads
+    assert all(thread_id != loop_thread for thread_id in read_threads)
+
+
+@pytest.mark.asyncio
+async def test_api_v1_events_returns_envelope_and_list_metadata(app):
+    a, _, events_log = app
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "turn_started"},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "tool_call"},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "tool_call"},
+    ]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/events?type=tool_call&limit=1")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert [e["timestamp"] for e in body["data"]["events"]] == ["2026-01-01T00:00:02Z"]
+    assert body["meta"] == {
+        "cursor": "2026-01-01T00:00:02Z",
+        "limit": 1,
+        "total": 2,
+        "truncated": True,
+    }
+
+
+def _sse_data_items(text: str) -> list[dict]:
+    items = []
+    for block in text.strip().split("\n\n"):
+        data_lines = [
+            line.removeprefix("data: ").removeprefix("data:")
+            for line in block.splitlines()
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            items.append(json.loads("\n".join(data_lines)))
+    return items
+
+
+async def _read_sse_data(resp, *, timeout: float = HANG_GUARD_SECONDS) -> dict:
+    while True:
+        line = await asyncio.wait_for(resp.content.readline(), timeout=timeout)
+        assert line, "SSE stream closed before data"
+        text = line.decode("utf-8").strip()
+        if text.startswith("data: "):
+            return json.loads(text[6:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [False, True])
+async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
+):
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity,
+    )
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", str(enforced).lower())
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"web-alice"}),
+        sources=(SourceLabel(
+            principal="alice", domain="channel", resource_id="web-alice",
+            bridge_instance="web", sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        ),),
+    )
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="web-alice",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=enforced, domain="channel",
+        resource_id="web-alice", bridge_instance="web",
+    )
+    bus = TurnEventBus()
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        turn_event_bus=bus,
+    )
+    secret = "sk-live-secret-value"
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turn-events?channel=web-alice")
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+
+        bus.publish(
+            {
+                "type": "tool_result",
+                "phase": "chunk",
+                "turn_id": "t1",
+                "channel_id": "web-alice",
+                "seq": 1,
+                "ts": "2026-07-02T00:00:00+00:00",
+                "args": {
+                    "cmd": f"echo {secret} > /tmp/leak.txt",
+                    "api_key": "ghp_supersecret",
+                },
+                "content_delta": f"result TOKEN=abc {secret} attachments/private.txt",
+                "text": f"reasoning saw {secret} in memory/core/00-identity.md",
+                "_ifc_labels": labels,
+                "_auth_context": auth,
+            }
+        )
+        event = await _read_sse_data(resp)
+        resp.close()
+
+    serialized = json.dumps(event, ensure_ascii=False)
+    assert secret not in serialized
+    assert "TOKEN=abc" not in serialized
+    assert "ghp_supersecret" not in serialized
+    assert "/tmp/leak.txt" not in serialized
+    assert "attachments/private.txt" not in serialized
+    assert "memory/core/00-identity.md" not in serialized
+    assert event["args"]["api_key"] == "[redacted]"
+    assert "[redacted]" in serialized
+    assert "[path]" in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [False, True])
+@pytest.mark.parametrize("taint", ["snapshot", "live", "missing"])
+@pytest.mark.parametrize("subscription", ["web-alice", "*"])
+async def test_api_v1_turn_events_gates_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    enforced: bool, taint: str, subscription: str,
+):
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity,
+    )
+
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", str(enforced).lower())
+    sink_events = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: sink_events.append((kind, fields)),
+    )
+
+    def labels(channel):
+        return InformationFlowLabels(
+            labels=frozenset({"private"}),
+            source_channels=frozenset({channel}),
+            sources=(SourceLabel(
+                principal="alice", domain="channel", resource_id=channel,
+                bridge_instance="web", sensitivity="private",
+                authorized_principals=frozenset({"alice"}),
+            ),),
+        )
+
+    def auth():
+        return AuthContext(
+            principal="alice", canonical_principal="alice", roles=(),
+            event_ingress=None, trigger="user_message", channel_id="web-alice",
+            interactivity=TurnInteractivity.INTERACTIVE,
+            enforcement_enabled=enforced, domain="channel",
+            resource_id="web-alice", bridge_instance="web",
+        )
+
+    carrier = auth()
+    event_labels = labels("web-private")
+    if taint == "live":
+        # The queued snapshot is compatible; the live turn gained private taint.
+        carrier.ifc_state.merge(event_labels)
+        event_labels = labels("web-alice")
+    elif taint == "missing":
+        carrier = None
+        event_labels = None
+
+    bus = TurnEventBus()
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl", turn_event_bus=bus,
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(f"/api/v1/turn-events?channel={subscription}")
+        assert resp.status == 200
+        event = {
+            "type": "tool_result", "phase": "chunk", "turn_id": "private-turn",
+            "channel_id": "web-alice", "seq": 1,
+            "content_delta": "confidential tool output",
+            "_ifc_labels": event_labels, "_auth_context": carrier,
+        }
+        bus.publish(event)
+        bus.publish({
+            **event, "turn_id": "allowed-turn", "content_delta": "allowed output",
+            "_ifc_labels": labels("web-alice"), "_auth_context": auth(),
+        })
+        received = [await _read_sse_data(resp)]
+        if not enforced:
+            received.append(await _read_sse_data(resp))
+        resp.close()
+
+    # Enforcement omits the entire denied event, without closing the stream or
+    # leaking its content in a placeholder. A subsequent allowed turn still flows.
+    assert [item["content_delta"] for item in received] == (
+        ["allowed output"] if enforced
+        else ["confidential tool output", "allowed output"]
+    )
+    assert all("_ifc_labels" not in item and "_auth_context" not in item for item in received)
+    assert sink_events == [("sink_blocked", {
+        "sink": "web_turn_events",
+        "reason": "missing_ifc_labels" if taint == "missing" else "ifc_label_blocked:same_channel",
+        "sink_category": "same_channel", "target_channel": "web-alice",
+        "allowed": not enforced, "status": "denied" if enforced else "would_block",
+        "enforcement_enabled": enforced, "is_shadow_decision": not enforced,
+    })]
+@pytest.mark.parametrize("endpoint", ["live-events", "turn-events"])
+@pytest.mark.parametrize(
+    "dotenv_value,process_value,expected",
+    [("32", None, 32), ("32", "2", 2), ("8x", None, 8), ("32", "8x", 8)],
+)
+async def test_event_stream_cap_from_env(
+    tmp_path, monkeypatch, caplog, endpoint, dotenv_value, process_value, expected
+):
+    from mimir.config import Config
+
+    key = "MIMIR_LIVE_EVENTS_MAX_STREAMS"
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    if process_value is not None:
+        monkeypatch.setenv(key, process_value)
+    (tmp_path / ".env").write_text(f"{key}={dotenv_value}\n")
+    config = Config.from_env()
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        home=config.home,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        turn_event_bus=TurnEventBus(),
+    )
+    if (process_value or dotenv_value) == "8x":
+        assert f"{key}='8x' is not a valid integer; using default 8" in caplog.text
+
+    async with TestClient(TestServer(app)) as client:
+        streams = []
+        try:
+            for _ in range(expected):
+                response = await client.get(f"/api/v1/{endpoint}")
+                streams.append(response)
+                assert response.status == 200
+            rejected = await client.get(f"/api/v1/{endpoint}")
+            streams.append(rejected)
+            assert rejected.status == 429
+        finally:
+            for response in streams:
+                response.close()
+
+
+def test_bad_stream_cap_does_not_crash_import(monkeypatch):
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8x")
+    subprocess.run(
+        [sys.executable, "-c", "import mimir.web_ui"], check=True,
+        capture_output=True, text=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_v1_turn_events_rejects_when_stream_cap_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "1")
+    bus = TurnEventBus()
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        turn_event_bus=bus,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        first = await client.get("/api/v1/turn-events?channel=web-alice")
+        second = await client.get("/api/v1/turn-events?channel=web-alice")
+        body = await second.text()
+        first.close()
+
+    assert first.status == 200
+    assert second.status == 429
+    assert "too many turn event streams" in body
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_backfill_orders_and_dedups(app):
+    a, turns_log, _ = app
+    rows = [
+        {
+            "turn_id": "t1",
+            "ts": "2026-01-01T00:00:01Z",
+            "events": [{"type": "reasoning", "content": "a"}],
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-01-01T00:00:02Z",
+            "events": [
+                {"type": "tool_call", "id": "call-1"},
+                {"type": "tool_result", "id": "call-1"},
+            ],
+        },
+        {
+            "turn_id": "t2",
+            "ts": "2026-01-01T00:00:02Z",
+            "events": [{"type": "tool_call", "id": "call-1"}],
+        },
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert resp.content_type == "text/event-stream"
+    assert resp.headers["X-Accel-Buffering"] == "no"
+    items = _sse_data_items(body)
+    assert [item["cursor"] for item in items] == [
+        "2026-01-01T00:00:01Z:t1:000000",
+        "2026-01-01T00:00:01Z:t1:000001",
+        "2026-01-01T00:00:02Z:t2:000000",
+        "2026-01-01T00:00:02Z:t2:000001",
+        "2026-01-01T00:00:02Z:t2:000002",
+    ]
+    assert len({item["id"] for item in items}) == len(items)
+    for item in items:
+        validate_live_event(item["event"])
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_fresh_backfill_is_bounded(app):
+    from mimir.live_events import FRESH_BACKFILL_MAX_RECORDS
+
+    a, turns_log, _ = app
+    rows = [
+        {
+            "turn_id": f"t{index:03d}",
+            "ts": f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+        }
+        for index in range(FRESH_BACKFILL_MAX_RECORDS + 2)
+    ]
+    turns_log.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    items = _sse_data_items(body)
+    assert len(items) == FRESH_BACKFILL_MAX_RECORDS
+    assert items[0]["event"]["turn_id"] == "t002"
+    assert items[-1]["event"]["turn_id"] == f"t{FRESH_BACKFILL_MAX_RECORDS + 1:03d}"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_fresh_backfill_honors_larger_client_limit(app):
+    from mimir.live_events import FRESH_BACKFILL_MAX_RECORDS
+
+    a, turns_log, _ = app
+    requested = FRESH_BACKFILL_MAX_RECORDS + 25
+    rows = [
+        {
+            "turn_id": f"t{index:03d}",
+            "ts": f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+        }
+        for index in range(requested + 10)
+    ]
+    turns_log.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(f"/api/v1/live-events?once=1&limit={requested}")
+        body = await resp.text()
+
+    items = _sse_data_items(body)
+    assert len(items) == requested
+    assert items[0]["event"]["turn_id"] == "t010"
+    assert items[-1]["event"]["turn_id"] == f"t{requested + 9:03d}"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_since_backfill_is_strict(app):
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "t1", "ts": "2026-01-01T00:00:01Z", "events": [{"type": "a"}]},
+        {"turn_id": "t2", "ts": "2026-01-01T00:00:02Z", "events": [{"type": "b"}]},
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1&since=2026-01-01T00:00:01Z:t1:000001")
+        body = await resp.text()
+
+    assert resp.status == 200
+    items = _sse_data_items(body)
+    assert [item["cursor"] for item in items] == ["2026-01-01T00:00:02Z:t2:000000", "2026-01-01T00:00:02Z:t2:000001"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_scoped_live_events_poll_advances_past_filtered_records(
+    app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mimir.live_events import read_live_event_items_since, turn_record_to_live_items
+
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "alice", "ts": "2026-01-01T00:00:01Z", "channel_id": "web-alice"},
+        {"turn_id": "bob", "ts": "2026-01-01T00:00:02Z", "channel_id": "web-bob"},
+    ]
+    turns_log.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+    calls: list[str | None] = []
+    second_scan = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def recording_reader(path: Path, **kwargs):
+        calls.append(kwargs.get("since"))
+        if len(calls) == 2:
+            loop.call_soon_threadsafe(second_scan.set)
+        return read_live_event_items_since(path, **kwargs)
+
+    monkeypatch.setattr(web_ui, "read_live_event_items_since", recording_reader)
+    monkeypatch.setattr(web_ui, "LIVE_EVENTS_POLL_S", 0.01)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?channel=web-alice")
+        delivered = await _read_sse_data(resp)
+        await second_scan.wait()
+        resp.close()
+
+    scanned_cursor = turn_record_to_live_items(rows[-1])[-1].cursor
+    assert delivered["event"]["channel_id"] == "web-alice"
+    assert len(calls) >= 2
+    assert calls[:2] == [None, scanned_cursor]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_cursor_is_monotonic_for_random_turn_ids(app):
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "f1c5e26f1c2e", "ts": "2026-01-01T00:00:01Z"},
+        {"turn_id": "37387608ce3b", "ts": "2026-01-01T00:00:02Z"},
+    ]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(
+            "/api/v1/live-events?once=1&since=2026-01-01T00:00:01Z:f1c5e26f1c2e:000000"
+        )
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert [item["event"]["turn_id"] for item in _sse_data_items(body)] == ["37387608ce3b"]
+
+
+def test_turn_record_to_live_items_carries_seq_on_lifecycle():
+    from mimir.live_events import turn_record_to_live_items
+
+    items = turn_record_to_live_items({"turn_id": "t1", "ts": "2026-01-01T00:00:00Z", "seq": 42})
+    lifecycle = next(i for i in items if i.event["kind"] == "turn.lifecycle")
+    assert lifecycle.event["seq"] == 42
+    # Records predating seq surface None (the dossier just ignores them).
+    legacy = turn_record_to_live_items({"turn_id": "t2", "ts": "2026-01-01T00:00:01Z"})
+    assert legacy[0].event["seq"] is None
+
+
+def test_turn_record_to_live_items_carries_channel_and_trigger():
+    from mimir.live_events import turn_record_to_live_items
+
+    items = turn_record_to_live_items({
+        "turn_id": "t1",
+        "ts": "2026-01-01T00:00:00Z",
+        "channel_id": "web-default",
+        "trigger": "user_message",
+        "events": [{"type": "tool_call", "name": "x"}],
+    })
+    lifecycle = next(i for i in items if i.event["kind"] == "turn.lifecycle")
+    event = next(i for i in items if i.event["kind"] == "turn.event")
+    assert lifecycle.event["channel_id"] == "web-default"
+    assert lifecycle.event["trigger"] == "user_message"
+    assert event.event["channel_id"] == "web-default"
+    assert event.event["trigger"] == "user_message"
+
+
+def test_read_live_event_items_since_stops_after_crossing_acknowledged_timestamp(tmp_path: Path):
+    from mimir.live_events import read_live_event_items_since
+
+    path = tmp_path / "turns.jsonl"
+    path.write_text("", encoding="utf-8")
+    rows = [
+        {"turn_id": "very-old", "ts": "2026-01-01T00:00:00Z"},
+        {"turn_id": "old", "ts": "2026-01-01T00:00:01Z"},
+        {"turn_id": "seen", "ts": "2026-01-01T00:00:02Z"},
+        {"turn_id": "new", "ts": "2026-01-01T00:00:03Z"},
+    ]
+    calls = []
+
+    def tail_reader(_path: Path):
+        for row in reversed(rows):
+            calls.append(row["turn_id"])
+            yield row
+
+    items = read_live_event_items_since(
+        path,
+        since="2026-01-01T00:00:02Z:seen:000000",
+        tail_reader=tail_reader,
+    )
+
+    assert [item.event["turn_id"] for item in items] == ["new"]
+    assert calls == ["new", "seen", "old"]
+
+
+def test_read_live_event_items_bounds_fresh_backfill_without_cursor_regression(tmp_path: Path):
+    from mimir.live_events import FRESH_BACKFILL_MAX_RECORDS, read_live_event_items_since
+
+    path = tmp_path / "turns.jsonl"
+    rows = [
+        {"turn_id": f"t{index:03d}", "ts": f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z"}
+        for index in range(FRESH_BACKFILL_MAX_RECORDS + 25)
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    fresh = read_live_event_items_since(path)
+    assert len(fresh) == FRESH_BACKFILL_MAX_RECORDS
+    assert fresh[0].event["turn_id"] == "t025"
+    assert fresh[-1].event["turn_id"] == f"t{FRESH_BACKFILL_MAX_RECORDS + 24:03d}"
+
+    # An explicit cursor retains the larger reconnect window and strict
+    # comparison, including records older than the bounded fresh backfill.
+    resumed = read_live_event_items_since(
+        path,
+        since="2026-01-01T00:00:00Z:t000:000000",
+    )
+    assert len(resumed) == len(rows) - 1
+    assert resumed[0].event["turn_id"] == "t001"
+    assert resumed[-1].cursor == fresh[-1].cursor
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_auth_uses_header_not_query_param(tmp_path: Path):
+    from mimir.server import _make_auth_middleware
+
+    turns_log = tmp_path / "turns.jsonl"
+    events_log = tmp_path / "events.jsonl"
+    turns_log.write_text(
+        json.dumps({"turn_id": "t1", "ts": "2026-01-01T00:00:01Z"}) + "\n",
+        encoding="utf-8",
+    )
+    a = web.Application(middlewares=[_make_auth_middleware("live-secret")])
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log)
+
+    async with TestClient(TestServer(a)) as client:
+        query_resp = await client.get("/api/v1/live-events?once=1&api_key=live-secret")
+        assert query_resp.status == 401
+
+        resp = await client.get(
+            "/api/v1/live-events?once=1",
+            headers={"X-API-Key": "live-secret"},
+        )
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert _sse_data_items(body)[0]["cursor"] == "2026-01-01T00:00:01Z:t1:000000"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_rejects_when_stream_cap_exhausted(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "0")
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert resp.status == 429
+    assert "too many live event streams" in body
+
+
+@pytest.mark.asyncio
+async def test_api_v1_live_events_releases_slot_when_prepare_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "1")
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+    )
+
+    original_prepare = web.StreamResponse.prepare
+    calls = 0
+
+    async def flaky_prepare(self, request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("client disconnected during SSE handshake")
+        return await original_prepare(self, request)
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", flaky_prepare)
+
+    async with TestClient(TestServer(a)) as client:
+        failed_resp = await client.get("/api/v1/live-events?once=1")
+        await failed_resp.text()
+
+        resp = await client.get("/api/v1/live-events?once=1")
+        body = await resp.text()
+
+    assert calls >= 2
+    assert resp.status == 200
+    assert "too many live event streams" not in body
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["live", "turn"])
+async def test_sse_releases_slot_under_repeated_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: str,
+):
+    import inspect
+
+    from aiohttp.test_utils import make_mocked_request
+
+    monkeypatch.setenv("MIMIR_LIVE_EVENTS_MAX_STREAMS", "1")
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl", turn_event_bus=TurnEventBus(),
+    )
+    path = f"/api/v1/{stream}-events"
+    request = make_mocked_request("GET", path, app=a)
+    handler = (await a.router.resolve(request)).handler
+    # Hold only this stream's admission lock, not shared event-loop state.
+    acquire = inspect.getclosurevars(handler).nonlocals[f"_try_acquire_{stream}_event_slot"]
+    lock = inspect.getclosurevars(acquire).nonlocals[f"{stream}_events_lock"]
+    preparing = asyncio.Event()
+
+    async def blocked_prepare(self, request):
+        preparing.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", blocked_prepare)
+    task = asyncio.create_task(handler(request))
+    try:
+        await asyncio.wait_for(preparing.wait(), timeout=HANG_GUARD_SECONDS)
+        async with lock:
+            task.cancel()
+            # The original cleanup suspends on the held lock here, so another
+            # cancellation aborts the decrement and permanently consumes capacity.
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def disconnected_prepare(self, request):
+        raise ConnectionResetError("client disconnected")
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", disconnected_prepare)
+    for _ in range(2):
+        response = await handler(make_mocked_request("GET", path, app=a))
+        assert response.status == 200, "cancelled stream leaked its only slot"
+
+
+@pytest.mark.asyncio
+async def test_read_jsonl_caps_at_max_records(app):
+    """Pattern A (2026-05-10): ``_read_jsonl`` is bounded by
+    ``max_records`` (default 5000). Pre-2026-05-10 it forward-read
+    the entire file synchronously per HTTP request — combined with
+    the turn-viewer polling every 5s, the loop got pinned re-parsing
+    hundreds of MB on a hot file. The cap means older records past
+    the limit are silently dropped from the response."""
+    from mimir.web_ui import _read_jsonl
+
+    a, _, events_log = app
+    # Write 50 records but cap at 10.
+    rows = [{"i": i, "type": "x"} for i in range(50)]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    out = _read_jsonl(events_log, max_records=10)
+    # Output is chronological — most recent 10 records (i=40..49).
+    assert [r["i"] for r in out] == list(range(40, 50))
+
+
+@pytest.mark.asyncio
+async def test_read_jsonl_under_cap_returns_all(app):
+    """When the file has fewer records than the cap, all are returned
+    in chronological order (no silent dropping)."""
+    from mimir.web_ui import _read_jsonl
+
+    a, _, events_log = app
+    rows = [{"i": i, "type": "x"} for i in range(7)]
+    events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    out = _read_jsonl(events_log, max_records=100)
+    assert [r["i"] for r in out] == list(range(7))
+
+
+@pytest.mark.asyncio
+async def test_register_routes_is_idempotent(app):
+    """Calling register_routes twice (e.g. server rebuild) doesn't crash."""
+    a, turns_log, events_log = app
+    web_ui.register_routes(a, turns_log=turns_log, events_log=events_log)
+    # Should still work.
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/health" if False else "/api/turns")
+        assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<div id="root"></div><script src="/app/assets/app.js"></script>',
+        encoding="utf-8",
+    )
+    (assets / "app.js").write_text("console.log('mimir app')", encoding="utf-8")
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=dist,
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/app")
+        assert resp.status == 200
+        assert resp.content_type == "text/html"
+        assert "X-Mimir-Frontend" not in resp.headers
+        assert resp.headers["Cache-Control"].startswith("no-store")
+        assert "/app/assets/app.js" in await resp.text()
+
+        asset_resp = await client.get("/app/assets/app.js")
+        assert asset_resp.status == 200
+        assert await asset_resp.text() == "console.log('mimir app')"
+
+        missing_resp = await client.get("/app/assets/missing-abc123.js")
+        assert missing_resp.status == 404
+        assert missing_resp.content_type == "text/plain"
+        assert missing_resp.headers["Cache-Control"].startswith("no-store")
+        assert "<div" not in await missing_resp.text()
+
+        fallback_resp = await client.get("/app/turns/42")
+        assert fallback_resp.status == 200
+        assert fallback_resp.headers["Cache-Control"].startswith("no-store")
+        assert "/app/assets/app.js" in await fallback_resp.text()
+
+        dotted_resp = await client.get("/app/wiki/notes/2026-10-09.md")
+        assert dotted_resp.status == 200
+        assert dotted_resp.headers["Cache-Control"].startswith("no-store")
+        assert "/app/assets/app.js" in await dotted_resp.text()
+
+        # Preserve the existing containment guard even for missing asset requests.
+        traversal_resp = await client.get("/app/assets/%2e%2e/%2e%2e/secret.js")
+        assert traversal_resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_react_app_rejects_escaped_path_after_routing(tmp_path: Path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("dashboard")
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl", react_app_dist=dist,
+    )
+
+    # Browsers normalize literal dot segments before sending them. Supply the
+    # decoded route parameter directly to exercise the handler's containment guard.
+    request = make_mocked_request("GET", "/app/assets/escape", app=a)
+    match_info = await a.router.resolve(request)
+    match_info["path"] = "assets/../../secret.js"
+    request._match_info = match_info
+    response = await match_info.handler(request)
+    assert response.status == 404
+
+
+@pytest.mark.asyncio
+async def test_react_app_dist_can_use_live_deployment_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_dist = tmp_path / "checkout" / "react_app" / "dist"
+    live_dist.mkdir(parents=True)
+    (live_dist / "index.html").write_text("live-checkout-build", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_REACT_APP_DIST", str(live_dist))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/app")
+        body = await response.text()
+
+    assert response.status == 200
+    assert body == "live-checkout-build"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_reports_resolved_empty_host_as_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_WEB_HOST", "")
+    config = Config.from_env()
+    from mimir.server import _make_auth_middleware
+
+    a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
+    a["api_key"] = "super-secret"
+    a["config"] = config
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(
+            "/api/v1/web/bootstrap", headers={"X-API-Key": "super-secret"},
+        )
+        body = await resp.json()
+
+    assert body["data"]["server"] == {
+        "web_host": "127.0.0.1",
+        "public_bind": False,
+        "unauthenticated_allowed": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_path: Path):
+    from mimir.server import _make_auth_middleware
+
+    class _Config:
+        web_host = "0.0.0.0"
+        model_spec = "codex_plus:gpt-5.5"
+
+    a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
+    a["api_key"] = "super-secret"
+    a["config"] = _Config()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(
+            "/api/v1/web/bootstrap", headers={"X-API-Key": "super-secret"},
+        )
+        body_text = await resp.text()
+        body = json.loads(body_text)
+
+    assert resp.status == 200
+    assert resp.headers["Cache-Control"].startswith("no-store")
+    assert "super-secret" not in body_text
+    validate_api_envelope(body, expect_ok=True)
+    assert body["data"]["version"]  # mimir build/release version surfaced
+    # Running model = the model part of the provider:model spec.
+    assert body["data"]["model"] == "gpt-5.5"
+    # No turns logged in this fixture -> running total is 0.
+    assert body["data"]["turns_total"] == 0
+    # No home configured -> agent UI config falls back to defaults.
+    assert body["data"]["ui"] == {
+        "agent_name": "Mimir", "skin": "neon-terminal", "default_skin": "neon-terminal",
+    }
+    assert body["data"]["auth"]["required"] is True
+    assert body["data"]["server"]["public_bind"] is True
+    assert [item["id"] for item in body["data"]["dashboard_extensions"]][:4] == [
+        "chat",
+        "usage",
+        "turns",
+        "ops",
+    ]
+    usage_manifest = next(
+        item for item in body["data"]["dashboard_extensions"] if item["id"] == "usage"
+    )
+    assert usage_manifest["label"] == "Usage"
+    assert usage_manifest["route_path"] == "/usage"
+    assert usage_manifest["api_namespace"] is None
+    ops_manifest = next(
+        item for item in body["data"]["dashboard_extensions"] if item["id"] == "ops"
+    )
+    assert ops_manifest["label"] == "Ops"
+    assert ops_manifest["api_namespace"] == "ops"
+    assert ops_manifest["trusted_first_party"] is True
+    assert all(item["plugin"] is None for item in body["data"]["dashboard_extensions"])
+
+
+@pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_reads_turn_total_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+
+    def recording_read_turns_total(path: Path) -> int:
+        read_threads.append(threading.get_ident())
+        return 123
+
+    monkeypatch.setattr(web_ui, "read_turns_total", recording_read_turns_total)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/web/bootstrap")
+        body = await resp.json()
+
+    assert resp.status == 200
+    assert body["data"]["turns_total"] == 123
+    assert read_threads
+    assert all(thread_id != loop_thread for thread_id in read_threads)
+
+
+def test_read_web_ui_config_reads_agent_file(tmp_path: Path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "web_ui.json").write_text(
+        json.dumps({"agent_name": "Nebula-9", "skin": "cosmic-nebula"}), encoding="utf-8"
+    )
+    assert web_ui.read_web_ui_config(tmp_path) == {
+        "agent_name": "Nebula-9",
+        "skin": "cosmic-nebula",
+    }
+
+
+def test_read_web_ui_config_falls_back_to_defaults(tmp_path: Path):
+    defaults = {"agent_name": "Mimir", "skin": "neon-terminal"}
+    state = tmp_path / "state"
+    state.mkdir()
+    # No home, missing file, malformed JSON, and partial config all fall back.
+    assert web_ui.read_web_ui_config(None) == defaults
+    assert web_ui.read_web_ui_config(tmp_path) == defaults
+    (state / "web_ui.json").write_text("{ not json", encoding="utf-8")
+    assert web_ui.read_web_ui_config(tmp_path) == defaults
+    (state / "web_ui.json").write_text(
+        json.dumps({"agent_name": "  Solo  "}), encoding="utf-8"
+    )
+    assert web_ui.read_web_ui_config(tmp_path) == {
+        "agent_name": "Solo",
+        "skin": "neon-terminal",
+    }
+
+
+def test_read_turns_total_uses_newest_seq(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    assert web_ui.read_turns_total(path) == 0  # missing file -> 0
+    path.write_text(
+        json.dumps({"turn_id": "a", "seq": 41}) + "\n"
+        + json.dumps({"turn_id": "b", "seq": 42}) + "\n",
+        encoding="utf-8",
+    )
+    assert web_ui.read_turns_total(path) == 42  # newest record's seq
+
+
+def test_ensure_web_ui_config_seeds_defaults_without_clobbering(tmp_path: Path):
+    path = tmp_path / "state" / "web_ui.json"
+    # Missing -> seeded with defaults (and the state/ dir is created).
+    web_ui.ensure_web_ui_config(tmp_path)
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "agent_name": "Mimir",
+        "skin": "neon-terminal",
+    }
+    # Existing -> left untouched (agent edits survive restarts).
+    path.write_text(
+        json.dumps({"agent_name": "Nebula-9", "skin": "cosmic-nebula"}),
+        encoding="utf-8",
+    )
+    web_ui.ensure_web_ui_config(tmp_path)
+    assert json.loads(path.read_text(encoding="utf-8"))["agent_name"] == "Nebula-9"
+    # No home is a no-op (doesn't raise).
+    web_ui.ensure_web_ui_config(None)
+
+
+def _operator_skin_manifest(skin_id: str = "operator-mint") -> dict:
+    return {
+        "id": skin_id,
+        "name": "Operator Mint",
+        "version": "1.0.0",
+        "tokens": {
+            "colorText": "#eefbf3",
+            "colorBackground": "#06120d",
+            "fontFamilyBase": "system-ui, sans-serif",
+        },
+        "chrome": {
+            "layout": "top-nav",
+            "density": "compact",
+            "accentPlacement": "top-rule",
+        },
+        "panel": {
+            "surface": "flat",
+            "borderStyle": "solid",
+            "hoverBehavior": "border-accent",
+        },
+        "characterRenderer": {
+            "kind": "react-placeholder",
+            "componentSlot": "agent-character",
+            "variant": "operator",
+            "assets": [],
+            "stateMap": {},
+            "fallbackState": "idle",
+            "capabilities": {
+                "supportsExpressions": False,
+                "supportsMotion": False,
+            },
+        },
+    }
+
+
+def test_operator_skin_discovery_validates_and_skips_bad_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    skins = tmp_path / "skins"
+    skins.mkdir()
+    (skins / "valid.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    (skins / "malformed.json").write_text("{ not json", encoding="utf-8")
+    (skins / "missing.json").write_text(
+        json.dumps({"id": "missing-fields"}),
+        encoding="utf-8",
+    )
+    font_manifest = _operator_skin_manifest("operator-fonts")
+    font_manifest["fonts"] = [
+        {
+            "family": "Operator Sans",
+            "src": [{"url": "/skins/operator/operator.woff2", "format": "woff2"}],
+            "weight": "400 700",
+            "style": "normal",
+            "display": "swap",
+            "unicodeRange": "U+000-5FF",
+        }
+    ]
+    (skins / "fonts.json").write_text(
+        json.dumps(font_manifest),
+        encoding="utf-8",
+    )
+    (skins / "collide.json").write_text(
+        json.dumps(_operator_skin_manifest("neon-terminal")),
+        encoding="utf-8",
+    )
+    (skins / "dupe.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    forbidden = _operator_skin_manifest("operator-bad-token")
+    forbidden["tokens"]["backgroundImage"] = "url(javascript:alert(1))"
+    (skins / "forbidden-token.json").write_text(
+        json.dumps(forbidden), encoding="utf-8"
+    )
+    bad_font = _operator_skin_manifest("operator-bad-font")
+    bad_font["fonts"] = [{"family": "Operator Sans", "src": [{"url": 42}]}]
+    (skins / "bad-font.json").write_text(json.dumps(bad_font), encoding="utf-8")
+
+    manifests = web_ui.read_operator_skin_manifests(tmp_path)
+
+    assert sorted(manifest["id"] for manifest in manifests) == [
+        "operator-fonts",
+        "operator-mint",
+    ]
+    assert "skipping operator skin" in caplog.text
+
+
+def test_operator_skin_missing_directory_is_empty(tmp_path: Path):
+    assert web_ui.read_operator_skin_manifests(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_exposes_operator_skins(tmp_path: Path):
+    home = tmp_path / "home"
+    skins = home / "skins"
+    skins.mkdir(parents=True)
+    (skins / "operator-mint.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/web/bootstrap")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    assert set(body["data"]["skins"]["built_in_ids"]) == set(
+        web_ui.BUILT_IN_WEB_SKIN_IDS
+    )
+    assert [skin["id"] for skin in body["data"]["skins"]["operator"]] == [
+        "operator-mint"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_prefs_skin_validation_accepts_builtin_operator_and_null(
+    tmp_path: Path,
+):
+    home = tmp_path / "home"
+    skins = home / "skins"
+    skins.mkdir(parents=True)
+    (skins / "operator-mint.json").write_text(
+        json.dumps(_operator_skin_manifest("operator-mint")),
+        encoding="utf-8",
+    )
+    issue_web_key(home, "alice", roles=["user"])
+    resolver = IdentityResolver(home)
+    resolver.reload()
+    identity = resolver.identity("alice")
+    assert identity is not None
+
+    @web.middleware
+    async def identity_middleware(request: web.Request, handler):
+        request["auth_identity"] = identity
+        request["auth_is_master"] = False
+        return await handler(request)
+
+    a = web.Application(middlewares=[identity_middleware])
+    a["identity_resolver"] = resolver
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        built_in = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": "neon-terminal"}},
+        )
+        operator = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": "operator-mint"}},
+        )
+        unknown = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": "missing-skin"}},
+        )
+        cleared = await client.post(
+            "/api/v1/user/prefs",
+            json={"prefs": {"skin": None}},
+        )
+        unknown_body = await unknown.json()
+        cleared_body = await cleared.json()
+
+    assert built_in.status == 200
+    assert operator.status == 200
+    assert unknown.status == 400
+    validate_api_envelope(unknown_body, expect_ok=False)
+    assert unknown_body["error"]["message"] == "unknown skin 'missing-skin'"
+    assert cleared.status == 200
+    validate_api_envelope(cleared_body, expect_ok=True)
+    assert cleared_body["data"]["prefs"].get("skin") is None
+
+
+@pytest.mark.asyncio
+async def test_first_party_backend_namespace_hook_registers_ops_api(tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/ops")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_disabled_backend_namespace_manifest_skips_ops_api(tmp_path: Path):
+    registry = first_party_dashboard_extensions(
+        [
+            DashboardExtensionManifest(
+                id="ops",
+                route_path="/ops",
+                label="Ops",
+                nav_position=10,
+                enabled=False,
+                api_namespace="ops",
+            )
+        ]
+    )
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+        dashboard_extensions=registry,
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/ops")
+        bootstrap = await client.get("/api/v1/web/bootstrap")
+        body = await bootstrap.json()
+
+    assert resp.status == 404
+    assert body["data"]["dashboard_extensions"] == []
+
+
+@pytest.mark.asyncio
+async def test_api_v1_memory_tree_search_and_file_detail(tmp_path: Path):
+    home = tmp_path / "home"
+    memory = home / "memory"
+    state = home / "state"
+    memory.mkdir(parents=True)
+    state.mkdir(parents=True)
+    (memory / "INDEX.md").write_text("<!-- desc: Memory index -->\n# Memory\n")
+    topics = memory / "topics"
+    topics.mkdir()
+    (topics / "alpha.md").write_text("<!-- desc: Alpha topic -->\nAlpha memory note\n")
+    wiki = state / "wiki"
+    wiki.mkdir()
+    (wiki / "alpha.md").write_text("# Alpha state\nSearchable alpha state note\n")
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        tree_resp = await client.get("/api/v1/memory?view=tree")
+        tree_body = await tree_resp.json()
+        search_resp = await client.get("/api/v1/memory?view=search&q=alpha")
+        search_body = await search_resp.json()
+        file_resp = await client.get("/api/v1/memory?view=file&path=state/wiki/alpha.md")
+        file_body = await file_resp.json()
+
+    assert tree_resp.status == 200
+    validate_api_envelope(tree_body, expect_ok=True)
+    assert [child["name"] for child in tree_body["data"]["children"]] == [
+        "memory",
+        "state",
+    ]
+
+    def _find_path(node: dict, path: str) -> dict | None:
+        if node.get("path") == path:
+            return node
+        for child in node.get("children", []):
+            found = _find_path(child, path)
+            if found is not None:
+                return found
+        return None
+
+    alpha_node = _find_path(tree_body["data"], "memory/topics/alpha.md")
+    assert alpha_node is not None
+    assert alpha_node["desc"] == "Alpha topic"
+
+    assert search_resp.status == 200
+    validate_api_envelope(search_body, expect_ok=True)
+    validate_list_meta(search_body["meta"])
+    hit_paths = {hit["path"] for hit in search_body["data"]["hits"]}
+    assert {"memory/topics/alpha.md", "state/wiki/alpha.md"} <= hit_paths
+    assert search_body["meta"]["total"] >= 2
+
+    assert file_resp.status == 200
+    validate_api_envelope(file_body, expect_ok=True)
+    assert file_body["data"]["path"] == "state/wiki/alpha.md"
+    assert "Searchable alpha state note" in file_body["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_memory_file_errors_are_enveloped(tmp_path: Path):
+    home = tmp_path / "home"
+    (home / "memory").mkdir(parents=True)
+    (home / "state").mkdir(parents=True)
+    (home / "state" / "note.txt").write_text("not markdown\n")
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        missing_path = await client.get("/api/v1/memory?view=file")
+        non_md = await client.get("/api/v1/memory?view=file&path=state/note.txt")
+        missing_file = await client.get("/api/v1/memory?view=file&path=state/missing.md")
+        missing_query = await client.get("/api/v1/memory?view=search")
+
+        missing_path_body = await missing_path.json()
+        non_md_body = await non_md.json()
+        missing_file_body = await missing_file.json()
+        missing_query_body = await missing_query.json()
+
+    assert missing_path.status == 400
+    validate_api_envelope(missing_path_body, expect_ok=False)
+    assert missing_path_body["error"]["code"] == "missing_path"
+
+    assert non_md.status == 400
+    validate_api_envelope(non_md_body, expect_ok=False)
+    assert non_md_body["error"]["code"] == "memory_file_error"
+    assert "only .md" in non_md_body["error"]["message"]
+
+    assert missing_file.status == 404
+    validate_api_envelope(missing_file_body, expect_ok=False)
+    assert "not found" in missing_file_body["error"]["message"]
+
+    assert missing_query.status == 400
+    validate_api_envelope(missing_query_body, expect_ok=False)
+    assert missing_query_body["error"]["code"] == "missing_query"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_wiki_index_and_page_detail(tmp_path: Path):
+    home = tmp_path / "home"
+    wiki = home / "state" / "wiki"
+    (wiki / "concepts").mkdir(parents=True)
+    (wiki / "topics").mkdir()
+    (wiki / "concepts" / "alpha.md").write_text(
+        "# Alpha\n\nSee [[beta]] and [[ghost]].\n",
+        encoding="utf-8",
+    )
+    (wiki / "topics" / "beta.md").write_text(
+        "# Beta\n\nBack to [[alpha]].\n",
+        encoding="utf-8",
+    )
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        index_resp = await client.get("/api/v1/wiki")
+        index_body = await index_resp.json()
+        page_resp = await client.get("/api/v1/wiki/concepts/alpha")
+        page_body = await page_resp.json()
+
+    assert index_resp.status == 200
+    validate_api_envelope(index_body, expect_ok=True)
+    assert index_body["data"]["page_count"] == 2
+    assert {p["path"] for p in index_body["data"]["pages"]} == {
+        "concepts/alpha.md",
+        "topics/beta.md",
+    }
+    assert index_body["data"]["graph"]["nodes"]
+    assert index_body["data"]["graph"]["edges"]
+    assert index_body["data"]["health"] == {
+        "has_orphans": False,
+        "has_dangling_links": True,
+        "has_slug_collisions": False,
+    }
+
+    assert page_resp.status == 200
+    validate_api_envelope(page_body, expect_ok=True)
+    assert page_body["data"]["slug"] == "alpha"
+    assert page_body["data"]["title"] == "Alpha"
+    assert page_body["data"]["path"] == "concepts/alpha.md"
+    assert page_body["data"]["markdown"].startswith("# Alpha")
+    assert page_body["data"]["backlinks"] == ["topics/beta.md"]
+    assert page_body["data"]["outlinks"] == ["beta", "ghost"]
+    assert page_body["data"]["dangling_links"] == [
+        {"target": "ghost", "source": "concepts/alpha.md", "line": 3}
+    ]
+    assert page_body["data"]["flags"] == {
+        "is_orphan": False,
+        "has_dangling_links": True,
+        "has_slug_collision": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_v1_wiki_errors_are_enveloped(tmp_path: Path):
+    app_without_home = web.Application()
+    web_ui.register_routes(
+        app_without_home,
+        turns_log=tmp_path / "t1.jsonl",
+        events_log=tmp_path / "e1.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    home_without_wiki = tmp_path / "home-without-wiki"
+    home_without_wiki.mkdir()
+    app_without_wiki = web.Application()
+    web_ui.register_routes(
+        app_without_wiki,
+        turns_log=tmp_path / "t2.jsonl",
+        events_log=tmp_path / "e2.jsonl",
+        home=home_without_wiki,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    home = tmp_path / "home-with-wiki"
+    wiki = home / "state" / "wiki"
+    wiki.mkdir(parents=True)
+    app_with_wiki = web.Application()
+    web_ui.register_routes(
+        app_with_wiki,
+        turns_log=tmp_path / "t3.jsonl",
+        events_log=tmp_path / "e3.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(app_without_home)) as client:
+        no_home_resp = await client.get("/api/v1/wiki")
+        no_home_body = await no_home_resp.json()
+    async with TestClient(TestServer(app_without_wiki)) as client:
+        no_wiki_resp = await client.get("/api/v1/wiki")
+        no_wiki_body = await no_wiki_resp.json()
+    async with TestClient(TestServer(app_with_wiki)) as client:
+        missing_page_resp = await client.get("/api/v1/wiki/missing")
+        missing_page_body = await missing_page_resp.json()
+
+    assert no_home_resp.status == 503
+    validate_api_envelope(no_home_body, expect_ok=False)
+    assert no_home_body["error"]["code"] == "home_not_configured"
+
+    assert no_wiki_resp.status == 404
+    validate_api_envelope(no_wiki_body, expect_ok=False)
+    assert no_wiki_body["error"]["code"] == "wiki_not_found"
+
+    assert missing_page_resp.status == 404
+    validate_api_envelope(missing_page_body, expect_ok=False)
+    assert missing_page_body["error"]["code"] == "wiki_page_not_found"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_wiki_filesystem_reads_are_off_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    wiki = home / "state" / "wiki"
+    wiki.mkdir(parents=True)
+    main_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def fake_index_payload(wiki_dir: Path) -> dict:
+        worker_threads.append(threading.get_ident())
+        assert wiki_dir == wiki
+        return {
+            "page_count": 0,
+            "pages": [],
+            "graph": {"nodes": [], "edges": []},
+            "orphans": [],
+            "dangling_links": [],
+            "slug_collisions": {},
+            "health": {
+                "has_orphans": False,
+                "has_dangling_links": False,
+                "has_slug_collisions": False,
+            },
+        }
+
+    def fake_page_payload(wiki_dir: Path, slug: str) -> dict:
+        worker_threads.append(threading.get_ident())
+        assert wiki_dir == wiki
+        assert slug == "alpha"
+        return {
+            "slug": "alpha",
+            "title": "Alpha",
+            "category": "_root",
+            "path": "alpha.md",
+            "mtime": None,
+            "markdown": "# Alpha\n",
+            "backlinks": [],
+            "outlinks": [],
+            "dangling_links": [],
+            "flags": {
+                "is_orphan": True,
+                "has_dangling_links": False,
+                "has_slug_collision": False,
+            },
+        }
+
+    monkeypatch.setattr(web_ui, "_build_wiki_index_payload", fake_index_payload)
+    monkeypatch.setattr(web_ui, "_build_wiki_page_payload", fake_page_payload)
+
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=home,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        index_resp = await client.get("/api/v1/wiki")
+        page_resp = await client.get("/api/v1/wiki/alpha")
+
+    assert index_resp.status == 200
+    assert page_resp.status == 200
+    assert len(worker_threads) == 2
+    assert all(thread_id != main_thread for thread_id in worker_threads)
+
+
+@pytest.mark.asyncio
+async def test_api_v1_web_bootstrap_limits_unauthenticated_operator_data(
+    tmp_path: Path,
+):
+    from mimir.server import _make_auth_middleware
+
+    class _Config:
+        web_host = "0.0.0.0"
+        model_spec = "provider:private-model"
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "web_ui.json").write_text(json.dumps({
+        "agent_name": "Private Agent Name", "skin": "neon-terminal",
+    }))
+
+    a = web.Application(middlewares=[_make_auth_middleware("super-secret")])
+    a["api_key"] = "super-secret"
+    a["config"] = _Config()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        home=tmp_path,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        public_v1 = await (await client.get("/api/v1/web/bootstrap")).json()
+        full_v1 = await (await client.get(
+            "/api/v1/web/bootstrap", headers={"X-API-Key": "super-secret"},
+        )).json()
+
+    validate_api_envelope(public_v1, expect_ok=True)
+    assert set(public_v1["data"]) == {"version", "auth"}
+    assert public_v1["data"]["auth"] == {"required": True}
+    assert "Private Agent Name" not in json.dumps(public_v1)
+    assert full_v1["data"]["ui"]["agent_name"] == "Private Agent Name"
+    assert full_v1["data"]["model"] == "private-model"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_admin_config_requires_auth_and_redacts_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.server import _make_auth_middleware
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:MiniMax-M2.7")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-admin-config-secret")
+    monkeypatch.setenv("MIMIR_API_KEY", "admin-route-secret")
+    monkeypatch.setenv("ADMIN_CONFIG_MCP_SECRET", "nested-admin-config-secret")
+    monkeypatch.setenv(
+        "MIMIR_MCP_SERVERS_JSON",
+        '[{"name": "demo", "command": "uvx", "args": ["mcp-server-demo"], '
+        '"env": {"API_KEY": "${ADMIN_CONFIG_MCP_SECRET}"}}]',
+    )
+    monkeypatch.setenv(
+        "MIMIR_STATE_REPO",
+        "https://user:raw-git-token@example.invalid/repo.git?token=ghp_adminconfigquerytoken",
+    )
+    monkeypatch.setenv(
+        "MIMIR_PUBLIC_CALLBACK_URL",
+        "https://example.invalid/hook?api_key=sk-public-admin-config-value",
+    )
+    monkeypatch.setenv("MIMIR_PUBLIC_BARE_VALUE", "ghp_adminconfigbaretoken")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "private-operator-channel")
+    config = Config.from_env()
+    config.resend_nudge_channels = ("channel-with-secret-shaped-value",)
+    config.file_tool_roots = ((str(tmp_path / "private-extra-root"), "ro"),)
+
+    (tmp_path / "scheduler.yaml").write_text(
+        "- name: heartbeat\n"
+        "  prompt: Check status.\n"
+        "  cron: '0 * * * *'\n"
+        "  channel_id: null\n",
+        encoding="utf-8",
+    )
+
+    a = web.Application(middlewares=[_make_auth_middleware("admin-route-secret")])
+    a["api_key"] = "admin-route-secret"
+    a["config"] = config
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        denied = await client.get("/api/v1/admin/config")
+        allowed = await client.get(
+            "/api/v1/admin/config",
+            headers={"X-API-Key": "admin-route-secret"},
+        )
+        body = await allowed.json()
+
+    assert denied.status == 401
+    assert allowed.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    data = body["data"]
+    assert data["model"]["model_spec"] == "anthropic:MiniMax-M2.7"
+    assert data["model"]["provider"] == "minimax"
+    assert data["model"]["context_window"] == "1m beta"
+    assert data["schedules"][0]["name"] == "heartbeat"
+    assert data["mutation_policy"] == {
+        "mode": "read_only_v1",
+        "mutable_fields": [],
+        "reveal_secret_values": False,
+        "reveal_path": None,
+        "edit_path": None,
+        "rate_limited": False,
+    }
+
+    env_by_name = {row["name"]: row for row in data["env"]}
+    assert env_by_name["ANTHROPIC_API_KEY"]["present"] is True
+    assert env_by_name["ANTHROPIC_API_KEY"]["secret"] is True
+    assert env_by_name["ANTHROPIC_API_KEY"]["value"] == "[REDACTED]"
+    assert env_by_name["MIMIR_OPERATOR_ALERT_CHANNEL"]["secret"] is True
+    assert env_by_name["MIMIR_OPERATOR_ALERT_CHANNEL"]["value"] == "[REDACTED]"
+    serialized = json.dumps(data)
+    assert "sk-ant-admin-config-secret" not in serialized
+    assert "nested-admin-config-secret" not in serialized
+    assert "raw-git-token" not in serialized
+    assert "ghp_adminconfigquerytoken" not in serialized
+    assert "sk-public-admin-config-value" not in serialized
+    assert "ghp_adminconfigbaretoken" not in serialized
+    assert "channel-with-secret-shaped-value" not in serialized
+    assert "private-extra-root" not in serialized
+    assert "private-operator-channel" not in serialized
+    assert data["raw_config"]["anthropic_api_key"] == "[REDACTED]"
+    assert data["raw_config"]["mcp_servers"][0]["env"]["API_KEY"] == "[REDACTED]"
+    assert (
+        data["raw_config"]["git_state_repo"]
+        == "https://[REDACTED]@example.invalid/repo.git?token=[REDACTED]"
+    )
+    assert env_by_name["MIMIR_PUBLIC_CALLBACK_URL"]["value"] == (
+        "https://example.invalid/hook?api_key=[REDACTED]"
+    )
+    assert env_by_name["MIMIR_PUBLIC_BARE_VALUE"]["value"] == "[REDACTED]"
+    assert "resend_nudge_channels" not in data["raw_config"]
+    assert "file_tool_roots" not in data["raw_config"]
+
+
+@pytest.mark.asyncio
+async def test_api_v1_ops_errors_use_stable_envelope(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/ops?days=bad")
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "invalid_days"
+
+
+@pytest.mark.asyncio
+async def test_api_v1_scheduler_lists_schedules_pollers_and_commitments(tmp_path: Path):
+    async def enqueue(_event):
+        return True
+
+    home = tmp_path / "home"
+    home.mkdir()
+    scheduler_yaml = home / "scheduler.yaml"
+    scheduler = Scheduler(scheduler_yaml, enqueue, home=home)
+    await scheduler.add_job(
+        SchedulerJob(
+            name="morning-review",
+            prompt_file="morning.md",
+            cron="0 8 * * *",
+            channel_id="ops",
+            priority="normal",
+        )
+    )
+    scheduler._pollers["github"] = PollerConfig(  # noqa: SLF001
+        name="github",
+        command="python poller.py",
+        cron="*/5 * * * *",
+        env={
+            "API_KEY": "poller-secret-value",
+            "PUBLIC_URL": "https://user:embedded-token@example.invalid/path",
+            "NESTED": {"PASSWORD": "nested-secret-value"},
+        },  # type: ignore[arg-type]
+        pass_env=("GITHUB_TOKEN", "PUBLIC_FLAG"),
+        env_required=("GITHUB_TOKEN",),
+        skill_dir=home,
+        priority="high",
+    )
+    scheduler._pollers["never-fired"] = PollerConfig(  # noqa: SLF001
+        name="never-fired",
+        command="python poller.py",
+        cron="0 0 1 * *",
+        env={},
+        skill_dir=home,
+    )
+    events_log = tmp_path / "events.jsonl"
+    old_schedule_event = json.dumps({
+        "timestamp": "2026-06-15T08:00:00+00:00",
+        "type": "scheduled_tick",
+        "schedule_name": "morning-review",
+        "channel_id": "ops",
+    })
+    events_log.write_text(
+        old_schedule_event
+        + "\n"
+        + "\n".join(
+            json.dumps({
+                "timestamp": f"2026-06-18T07:{minute:02d}:00+00:00",
+                "type": "noise",
+            })
+            for minute in range(5000)
+        )
+        + "\n"
+        + json.dumps({
+            "timestamp": "2026-06-18T08:02:00+00:00",
+            "type": "poller_complete",
+            "poller": "github",
+            "events_emitted": 2,
+            "events_rejected": 0,
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store = CommitmentsStore(home / ".mimir" / "commitments.jsonl")
+    await store.add(
+        CommitmentRecord(
+            id="c-soon",
+            channel_id="ops",
+            text="Send the scheduler report",
+            due_window_start_unix=60,
+            due_window_end_unix=3600,
+        )
+    )
+
+    a = web.Application()
+    a["scheduler"] = scheduler
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=events_log,
+        home=home,
+        commitments_store=store,
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler?due_window=overdue")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    validate_list_meta(body["meta"])
+    assert body["data"]["schedules"][0]["name"] == "morning-review"
+    assert body["data"]["schedules"][0]["prompt_source"] == "file:morning.md"
+    assert body["data"]["schedules"][0]["last_run_at"] == "2026-06-15T08:00:00+00:00"
+    assert body["data"]["schedules"][0]["recent_result"] == "scheduled_tick"
+    pollers = {row["name"]: row for row in body["data"]["pollers"]}
+    assert pollers["github"]["priority"] == "high"
+    assert pollers["github"]["recent_result"] == "emitted=2 rejected=0"
+    assert pollers["never-fired"]["last_run_at"] is None
+    assert pollers["never-fired"]["recent_result"] is None
+    poller = pollers["github"]
+    assert poller["pass_env"] == ["[REDACTED]", "PUBLIC_FLAG"]
+    assert poller["env_required"] == ["[REDACTED]"]
+    assert poller["config"]["env"]["API_KEY"] == "[REDACTED]"
+    assert poller["config"]["env"]["NESTED"]["PASSWORD"] == "[REDACTED]"
+    assert poller["config"]["env"]["PUBLIC_URL"] == "https://[REDACTED]@example.invalid/path"
+    serialized = json.dumps(body)
+    assert "poller-secret-value" not in serialized
+    assert "nested-secret-value" not in serialized
+    assert "embedded-token" not in serialized
+    assert "GITHUB_TOKEN" not in serialized
+    assert body["data"]["commitments"][0]["id"] == "c-soon"
+    assert body["data"]["actions"]["mutations_enabled"] is False
+    assert "trigger" in body["data"]["actions"]["deferred"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("healthy_sibling", [False, True])
+@pytest.mark.parametrize("failure,expected_name,detail", [
+    ({"type": "poller_reload_invalid_manifest", "error": "Invalid JSON", "preserved_pollers": []},
+     "broken/pollers.json", "Invalid JSON"),
+    ({"type": "poller_reload_invalid_entry", "poller": "broken", "reason": "command must be a string"},
+     "broken", "command must be a string"),
+    ({"type": "poller_reload_invalid_entry", "poller": None, "reason": "entry must be an object"},
+     "broken/pollers.json", "entry must be an object"),
+    ({"type": "poller_reload_invalid_cron", "poller": "broken", "cron": "bad",
+      "error": "ValueError: Wrong number of fields", "preserved_pollers": []},
+     "broken", "ValueError: Wrong number of fields"),
+])
+async def test_api_v1_scheduler_shows_unregistered_poller_failures(
+    tmp_path: Path, healthy_sibling, failure, expected_name, detail,
+):
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    records = [{
+        **failure, "manifest_path": "broken/pollers.json",
+        "timestamp": "2026-09-07T10:00:00Z",
+    }]
+    if healthy_sibling:
+        scheduler._pollers["healthy"] = PollerConfig("healthy", "true", "* * * * *", {}, tmp_path)
+        await scheduler.add_job(SchedulerJob(name="healthy-schedule", prompt="Check", cron="* * * * *"))
+        records.extend([
+            {"type": "poller_complete", "poller": "healthy", "events_emitted": 1,
+             "timestamp": "2026-09-07T11:00:00Z"},
+            {"type": "scheduled_tick", "schedule_name": "healthy-schedule",
+             "timestamp": "2026-09-07T11:00:00Z"},
+        ])
+    records.extend([
+        {"type": "unrelated_error", "poller": "broken", "manifest_path": "unrelated.json", "error": "excluded"},
+        {"type": "poller_exec_error", "poller": "unregistered-runtime", "error": "excluded"},
+        {"type": "poller_complete", "poller": "unregistered-success"},
+        {"type": "unrelated_error", "poller": "healthy", "error": "excluded"},
+        {"type": "poller_reload_invalid_entry", "reason": "excluded"},
+    ])
+    events_log = tmp_path / "events.jsonl"
+    events_log.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    a = web.Application()
+    a["scheduler"] = scheduler
+    web_ui.register_routes(a, turns_log=tmp_path / "turns.jsonl", events_log=events_log, home=tmp_path)
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler")
+        body = await resp.json()
+
+    assert resp.status == 200
+    validate_api_envelope(body, expect_ok=True)
+    rows = {row["name"]: row for row in body["data"]["pollers"]}
+    assert set(rows) == {expected_name} | ({"healthy"} if healthy_sibling else set())
+    assert rows[expected_name]["id"] == f"poller:{expected_name}"
+    assert rows[expected_name]["recent_error"] == detail
+    assert rows[expected_name]["manifest_path"] == "broken/pollers.json"
+    assert rows[expected_name]["next_run_at"] is None
+    assert rows[expected_name]["last_run_at"] == "2026-09-07T10:00:00Z"
+    if healthy_sibling:
+        assert rows["healthy"]["recent_result"] == "emitted=1 rejected=0"
+        assert rows["healthy"]["recent_error"] is None
+    assert "excluded" not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal,fields,detail", [
+    ("poller_tick_hard_deadline",
+     {"elapsed_seconds": 48.2, "startup_consumed_seconds": 3.1, "hard_deadline_seconds": 48,
+      "truncated": {"reviews": 2}},
+     "elapsed_seconds=48.2 startup_consumed_seconds=3.1 hard_deadline_seconds=48 truncated={'reviews': 2}"),
+    ("poller_pr_reconcile_truncated", {"deadline_seconds": 30, "truncated": {"ci": 4}},
+     "deadline_seconds=30 truncated={'ci': 4}"),
+    ("poller_reload_invalid_entry", {"reason": "missing command"}, "missing command"),
+    ("poller_reload_invalid_cron", {"error": "invalid cron"}, "invalid cron"),
+])
+async def test_api_v1_scheduler_renders_poller_failure_details(tmp_path: Path, signal, fields, detail):
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    scheduler._pollers["github"] = PollerConfig("github", "true", "* * * * *", {}, tmp_path)
+    events_log = tmp_path / "events.jsonl"
+    events_log.write_text("".join(json.dumps(record) + "\n" for record in [
+        {"type": "poller_complete", "poller": "github", "timestamp": "2026-09-07T09:00:00Z"},
+        {"type": signal, "poller": "github", "timestamp": "2026-09-07T10:00:00Z", **fields},
+        {"type": "unrelated_error", "poller": "github", "error": "excluded"},
+    ]), encoding="utf-8")
+    a = web.Application()
+    a["scheduler"] = scheduler
+    web_ui.register_routes(a, turns_log=tmp_path / "turns.jsonl", events_log=events_log, home=tmp_path)
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler")
+        body = await resp.json()
+
+    assert resp.status == 200
+    row, = body["data"]["pollers"]
+    assert row["recent_error"] == (f"{signal}: {detail}" if "truncated" in fields else detail)
+    assert row["last_run_at"] == "2026-09-07T10:00:00Z"
+
+
+def test_scheduler_state_event_scan_has_bounded_never_fired_path(tmp_path: Path):
+    events_log = tmp_path / "events.jsonl"
+    old_matching_event = json.dumps({
+        "timestamp": "2026-06-01T00:00:00+00:00",
+        "type": "scheduled_tick",
+        "schedule_name": "too-old",
+    })
+    events_log.write_text(
+        old_matching_event
+        + "\n"
+        + "\n".join(
+            json.dumps({"type": "noise", "i": i})
+            for i in range(web_ui.SCHEDULER_STATE_EVENT_SCAN_RECORDS + 5)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = web_ui._read_jsonl_matching(  # noqa: SLF001
+        events_log,
+        max_records=web_ui.SCHEDULER_STATE_EVENT_SCAN_RECORDS,
+        include=lambda record: record.get("type") == "scheduled_tick",
+        stop_when=lambda records: False,
+    )
+
+    assert records == []
+
+
+@pytest.mark.asyncio
+async def test_api_v1_scheduler_rejects_invalid_due_window(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/scheduler?due_window=never")
+        body = await resp.json()
+
+    assert resp.status == 400
+    validate_api_envelope(body, expect_ok=False)
+    assert body["error"]["code"] == "invalid_due_window"
+
+
+@pytest.mark.asyncio
+async def test_shared_web_auth_script_served_no_store(tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/app/auth.js")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert resp.headers["Cache-Control"].startswith("no-store")
+    assert "window.MimirAuth" in body
+    assert "api_key=" not in body
+
+
+@pytest.mark.asyncio
+async def test_react_app_missing_build_returns_503(tmp_path: Path):
+    a = web.Application()
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/app")
+        assert resp.status == 503
+        assert "npm run build" in await resp.text()
+
+
+def _make_min_saga_db(path: Path) -> None:
+    """Minimal saga DB with just the tables build_db_stats_payload reads."""
+    import sqlite3
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE atoms (id TEXT, tombstoned INTEGER DEFAULT 0);"
+        "CREATE TABLE sessions (id TEXT);"
+        "CREATE TABLE triples (id TEXT, tombstoned INTEGER DEFAULT 0);"
+        "CREATE TABLE schema_version (version INTEGER);"
+        "INSERT INTO atoms (id, tombstoned) VALUES ('a1', 0);"
+        "INSERT INTO schema_version (version) VALUES (1);"
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_saga_db_fallback_uses_dot_mimir_not_state(tmp_path: Path):
+    """Regression (saga page 'db not found or unreadable'): with home set
+    and no explicit saga_db, the /saga dashboard must read
+    <home>/.mimir/saga.db (saga's canonical default), not the stale
+    <home>/state/saga.db that no longer exists."""
+    _make_min_saga_db(tmp_path / ".mimir" / "saga.db")
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "t.jsonl", events_log=tmp_path / "e.jsonl",
+        home=tmp_path,  # no saga_db → exercises the fallback
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/saga?view=stats")
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload.get("ready") is True, payload
+        assert payload["db_path"].replace("\\", "/").endswith("/.mimir/saga.db"), \
+            payload["db_path"]
+
+
+@pytest.mark.asyncio
+async def test_saga_db_explicit_kwarg_wins(tmp_path: Path):
+    """server.py passes the saga.toml-resolved path as saga_db=; it must
+    take precedence over the home-derived fallback."""
+    db = tmp_path / "custom" / "saga.db"
+    _make_min_saga_db(db)
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "t.jsonl", events_log=tmp_path / "e.jsonl",
+        home=tmp_path, saga_db=db,
+    )
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/saga?view=stats")
+        payload = await resp.json()
+        assert payload.get("ready") is True, payload
+        assert payload["db_path"].replace("\\", "/").endswith("/custom/saga.db"), \
+            payload["db_path"]

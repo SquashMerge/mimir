@@ -1,0 +1,179 @@
+"""v0.4 §4: reflection skill — bundling, scaffolding, policy starter.
+
+The skill *behavior* (how the agent decides to propose vs. apply) is
+exercised at runtime, not in unit tests. These tests cover the seams
+that have to be right for the skill to even run: skill registration,
+setup_home file scaffolding, the policy-file shape the skill reads at
+the start of every reflection turn."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from mimir.cli import (
+    DEFAULT_LEARNED_BEHAVIORS,
+    DEFAULT_PROPOSED_CHANGES,
+    DEFAULT_REFLECTION_POLICY,
+    setup_home,
+)
+from mimir.skill_defs import _bundled_skill_names
+
+
+# ---- Skill bundling ------------------------------------------------------
+
+
+def test_reflection_prompt_template_is_bundled():
+    """Reflection's workflow ships as an operator prompt template,
+    NOT as a bundled skill. Per the skills-architecture-restoration
+    plan, scheduled-task workflows (heartbeat, reflection) live in
+    ``mimir/prompt_templates/`` and get seeded to a deployment's
+    ``<home>/prompts/`` directory on first setup."""
+    template = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "reflect.md"
+    )
+    assert template.is_file(), f"reflection prompt template missing at {template}"
+
+
+def test_reflection_prompt_documents_both_tracks():
+    body = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "reflect.md"
+    ).read_text()
+    # Two tracks the workflow must teach.
+    assert "behavioral" in body.lower()
+    assert "memory architecture review" in body.lower()
+    # Promotion criteria — load-bearing for atom-to-core decisions.
+    for criterion in ("Recurrence", "Generality", "Stability", "Cost of forgetting"):
+        assert criterion in body, f"missing promotion criterion: {criterion}"
+
+
+def test_reflection_prompt_respects_maintenance_shell_profile():
+    """Scheduled reflection must not instruct a denied general CLI entry point."""
+    body = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "reflect.md"
+    ).read_text()
+    assert "profile does not admit the `mimir` CLI" in body
+    assert "state/reports/introspection-YYYY-MM-DD.md" in body
+    assert "state/reports/applied-audit-YYYY-MM-DD.md" in body
+    assert "```bash" not in body
+
+
+def test_reflection_prompt_defines_gepa_recommendation_boundary():
+    body = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "reflect.md"
+    ).read_text()
+    assert "GEPA-shaped artifact failures" in body
+    assert "bounded textual artifact" in body
+    assert "meaningful evaluator or trace set" in body
+    assert "must not auto-run GEPA" in body
+    assert "auto-apply an optimized artifact" in body
+
+
+# ---- setup_home additions -----------------------------------------------
+
+
+def test_setup_writes_reflection_policy(tmp_path: Path):
+    home = tmp_path / "agent"
+    setup_home(home)
+    policy = home / "memory" / "core" / "30-reflection-policy.md"
+    assert policy.is_file()
+    body = policy.read_text()
+    # First line is the desc-comment so memory/INDEX.md stays clean.
+    assert body.splitlines()[0].startswith("<!-- desc:")
+    # Two policy sections — autonomous and propose-only.
+    assert "## Autonomous" in body
+    assert "## Propose-only" in body
+    # chainlink #342: ALL core edits (incl. persona + learned-behavior
+    # promotion), skill creation, and deletions are HITL — core is read-only
+    # at runtime, no autonomous core write.
+    assert "persona blocks" in body
+    assert "submit_proposal" in body
+    assert "Prompt edits" in body
+    assert "Skill creation" in body
+    assert "Memory file deletions" in body
+    assert "READ-ONLY at runtime" in body
+
+
+def test_setup_writes_learned_behaviors_starter(tmp_path: Path):
+    home = tmp_path / "agent"
+    setup_home(home)
+    learned = home / "memory" / "core" / "40-learned-behaviors.md"
+    assert learned.is_file()
+    body = learned.read_text()
+    assert body.splitlines()[0].startswith("<!-- desc:")
+    assert "# Learned Behaviors" in body
+
+
+def test_setup_writes_legacy_proposed_changes_starter(tmp_path: Path):
+    home = tmp_path / "agent"
+    setup_home(home)
+    proposed = home / "state" / "proposed-changes.md"
+    assert proposed.is_file()
+    body = proposed.read_text()
+    assert "# Proposed Changes (Legacy)" in body
+    assert "Protected surfaces" in body
+    assert "open_proposal" in body
+    # The three buckets retained for migrating historical entries.
+    assert "## Pending" in body
+    assert "## Applied" in body
+    assert "## Rejected" in body
+
+
+def test_setup_files_are_idempotent(tmp_path: Path):
+    home = tmp_path / "agent"
+    setup_home(home)
+    # User edits the policy.
+    policy = home / "memory" / "core" / "30-reflection-policy.md"
+    user_body = "<!-- desc: my custom policy -->\n# My Policy\n"
+    policy.write_text(user_body)
+    setup_home(home)
+    assert policy.read_text() == user_body  # not clobbered
+
+
+def test_setup_scheduler_yaml_documents_reflect_entry(tmp_path: Path):
+    home = tmp_path / "agent"
+    setup_home(home)
+    body = (home / "scheduler.yaml").read_text()
+    assert "reflect" in body
+    # Sunday 06:00 UTC — runs after the saga-consolidate cron at 04:00
+    # so the reflection turn reads post-consolidation state.
+    assert "0 6 * * 0" in body
+
+
+# ---- Constant content sanity --------------------------------------------
+
+
+def test_default_reflection_policy_has_required_sections():
+    body = DEFAULT_REFLECTION_POLICY
+    assert "## Autonomous" in body
+    assert "## Propose-only" in body
+    assert "SAGA atom decay" in body
+    assert "persona blocks" in body
+    # chainlink #342: core is read-only at runtime — no autonomous core write.
+    assert "READ-ONLY at runtime" in body
+    assert "Append-only edits to memory/core/40-learned-behaviors.md" not in body
+
+
+def test_default_learned_behaviors_starts_with_desc_comment():
+    assert DEFAULT_LEARNED_BEHAVIORS.startswith("<!-- desc:")
+
+
+def test_default_proposed_changes_documents_format():
+    body = DEFAULT_PROPOSED_CHANGES
+    assert "Source:" in body
+    assert "Proposal:" in body
+    assert "Rationale:" in body
+    assert "proposal PR body" in body

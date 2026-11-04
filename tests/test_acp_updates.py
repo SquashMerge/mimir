@@ -1,0 +1,767 @@
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from tests.timing import HANG_GUARD_SECONDS
+
+from mimir.acp.agent import MimirAcpAgent
+from mimir.acp.sdk import RequestError
+from mimir.acp.updates import MAX_UPDATE_BYTES, MAX_UPDATE_ITEMS, UpdateDispatcher, _event_bytes
+
+
+class Publisher:
+    def __init__(self) -> None:
+        self.updates = []
+        self.calls = 0
+        self.fail_at: int | None = None
+        self.block = False
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def publish_live(self, update):
+        self.calls += 1
+        self.entered.set()
+        if self.block:
+            await self.release.wait()
+        if self.fail_at == self.calls:
+            raise RuntimeError("delivery")
+        self.updates.append(update)
+
+
+async def finish(dispatcher: UpdateDispatcher) -> None:
+    await dispatcher.close()
+
+
+@pytest.mark.parametrize("method", ["drain", "terminalize_failure", "terminalize_cancelled"])
+@pytest.mark.asyncio
+async def test_stalled_dispatcher_join_is_bounded(monkeypatch, method) -> None:
+    from mimir.acp import updates
+
+    monkeypatch.setattr(updates, "UPDATE_DELIVERY_TIMEOUT", 0.02)
+    publisher = Publisher()
+    publisher.block = True
+    stalled = asyncio.Event()
+    dispatcher = UpdateDispatcher(publisher, on_stall=stalled.set)
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "tool"})
+    await publisher.entered.wait()
+    try:
+        with pytest.raises(TimeoutError, match="ACP update delivery stalled"):
+            # Below the unpatched 2s delivery timeout (configured: 0.02s).
+            await asyncio.wait_for(getattr(dispatcher, method)(), 1.0)
+        assert stalled.is_set()
+        assert isinstance(dispatcher.failure, RuntimeError if method == "terminalize_failure" else TimeoutError)
+        assert not publisher.release.is_set()
+    finally:
+        publisher.release.set()
+        await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_unusable_update_client_rejects_further_writes() -> None:
+    from mimir.acp.updates import UpdateClient
+
+    calls = []
+
+    class Peer:
+        async def session_update(self, session_id, update):
+            calls.append(update)
+
+    client = UpdateClient(Peer(), lambda: None, lambda: True)
+    with pytest.raises(ConnectionError, match="unusable"):
+        await client.session_update("session", "update")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_slow_dispatcher_progress_renews_drain_budget() -> None:
+    from mimir.acp import updates
+
+    loop = asyncio.get_running_loop()
+
+    class SlowPublisher(Publisher):
+        async def publish_live(self, update):
+            ready = asyncio.Event()
+            timer = loop.call_later(0.1, ready.set)
+            try:
+                await ready.wait()
+                await super().publish_live(update)
+            finally:
+                timer.cancel()
+
+    publisher = SlowPublisher()
+    dispatcher = UpdateDispatcher(publisher)
+    for index in range(30):
+        dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": str(index)})
+    started = loop.time()
+    try:
+        await asyncio.wait_for(dispatcher.drain(), 15)
+        assert loop.time() - started > updates.UPDATE_DELIVERY_TIMEOUT
+        assert len(publisher.updates) == 30
+        assert dispatcher.failure is None
+    finally:
+        await dispatcher.close()
+
+
+_MISSING = object()
+_PRESENTATION_CASES = [
+    ("read_file", {"file_path": "src/example.py"}, "Read src/example.py", "read"),
+    ("hands_read", {"path": "notes.txt"}, "Read notes.txt", "read"),
+    ("memory_get", {"atom_ids": ["atom-1"]}, "Read atom-1", "read"),
+    ("edit_file", {"file_path": "src/example.py"}, "Edit src/example.py", "edit"),
+    ("write_file", {"file_path": "src/example.py"}, "Edit src/example.py", "edit"),
+    ("hands_edit", {"path": "notes.txt"}, "Edit notes.txt", "edit"),
+    ("glob", {"pattern": "*.py"}, "Search *.py", "search"),
+    ("grep", {"pattern": "needle"}, "Search needle", "search"),
+    ("file_search", {"query": "symbol"}, "Search symbol", "search"),
+    ("web_search", {"query": "release notes"}, "Search release notes", "search"),
+    ("memory_query", {"query": "prior decision"}, "Search prior decision", "search"),
+    ("shell_exec", {"command": "python --token supersecret"}, "Run python", "execute"),
+    ("bash_async", {"command": "make test"}, "Run make", "execute"),
+    ("hands_shell", {"command": '"my tool" --flag'}, "Run my tool", "execute"),
+    ("hands_python", {"code": "print('supersecret')"}, "Run Python", "execute"),
+    ("fetch_url", {"url": "example.com"}, "Fetch example.com", "fetch"),
+    ("write_todos", {"todos": [{"content": "supersecret"}]}, "Update todos", "other"),
+    ("hands_request_scope", {"path": "src/example.py"}, "Request scope src/example.py", "other"),
+]
+
+
+def _start_event(lifecycle: str, name: object, args: object) -> dict[str, object]:
+    if lifecycle == "start":
+        event: dict[str, object] = {"type": "tool_call", "phase": "start", "id": "tool"}
+    elif lifecycle == "tool_call_end":
+        event = {"type": "tool_call", "phase": "end", "id": "tool"}
+    else:
+        event = {
+            "type": "tool_result",
+            "phase": "end",
+            "id": "tool",
+            "status": "ok",
+        }
+    if name is not _MISSING:
+        event["tool_name"] = name
+    if args is not _MISSING:
+        event["args"] = args
+    return event
+
+
+@pytest.mark.parametrize("lifecycle", ["start", "tool_call_end", "tool_result_end"])
+@pytest.mark.parametrize("name,args,title,kind", _PRESENTATION_CASES)
+@pytest.mark.asyncio
+async def test_finite_tool_presentation_matrix_at_every_start_site(
+    lifecycle: str,
+    name: str,
+    args: object,
+    title: str,
+    kind: str,
+) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event(lifecycle, name, args))
+    await dispatcher.drain()
+
+    starts = [item for item in publisher.updates if item.session_update == "tool_call"]
+    assert len(starts) == 1
+    assert (starts[0].title, starts[0].kind) == (title, kind)
+    await finish(dispatcher)
+
+
+_DETAIL_LIMIT = "x" * 77 + "..."
+_PRESENTATION_EDGES = [
+    ("read_file", {"file_path": "x" * 100}, f"Read {_DETAIL_LIMIT}", "read"),
+    ("x" * 100, {}, _DETAIL_LIMIT, "other"),
+    ("read_file", {"file_path": "token=supersecret"}, "Read [redacted]", "read"),
+    ("read_file", {"file_path": "/private/example.py"}, "Read [path]", "read"),
+    ("read_file", {"file_path": "~/private/example.py"}, "Read [path]", "read"),
+    ("read_file", {"file_path": "C:\\Users\\me\\example.py"}, "Read [path]", "read"),
+    ("read_file", {"file_path": "src/example.py"}, "Read src/example.py", "read"),
+    ("read_file", {"file_path": "tests/example.py"}, "Read [path]", "read"),
+    ("arbitrary_tool", {}, "arbitrary_tool", "other"),
+    ("read_file_extra", {"file_path": "src/example.py"}, "read_file_extra", "other"),
+    ("Read_File", {"file_path": "src/example.py"}, "Read_File", "other"),
+    (" read_file ", {"file_path": "src/example.py"}, "read_file", "other"),
+    (_MISSING, {}, "unknown", "other"),
+    ("", {}, "unknown", "other"),
+    ("   ", {}, "unknown", "other"),
+    ("read_file", _MISSING, "Read", "read"),
+    ("read_file", None, "Read", "read"),
+    ("read_file", "src/example.py", "Read", "read"),
+    ("read_file", {"file_path": 42}, "Read", "read"),
+    ("read_file", {"file_path": None}, "Read", "read"),
+    ("memory_get", {}, "Read", "read"),
+    ("memory_get", {"atom_ids": None}, "Read", "read"),
+    ("memory_get", {"atom_ids": "atom-1"}, "Read", "read"),
+    ("memory_get", {"atom_ids": []}, "Read", "read"),
+    ("memory_get", {"atom_ids": [42, "atom-2"]}, "Read", "read"),
+    ("memory_get", {"atom_ids": ["atom-1", "token=supersecret"]}, "Read atom-1", "read"),
+    ("hands_python", {"code": "token='supersecret'\nprint(token)"}, "Run Python", "execute"),
+    ("write_todos", {"todos": [{"content": "token=supersecret"}]}, "Update todos", "other"),
+    ("hands_request_scope", {"path": ""}, "Request scope", "other"),
+]
+
+
+@pytest.mark.parametrize("lifecycle", ["start", "tool_call_end", "tool_result_end"])
+@pytest.mark.parametrize("name,args,title,kind", _PRESENTATION_EDGES)
+@pytest.mark.asyncio
+async def test_tool_presentation_edges_at_every_start_site(
+    lifecycle: str,
+    name: object,
+    args: object,
+    title: str,
+    kind: str,
+) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event(lifecycle, name, args))
+    await dispatcher.drain()
+
+    starts = [item for item in publisher.updates if item.session_update == "tool_call"]
+    assert len(starts) == 1
+    assert (starts[0].title, starts[0].kind) == (title, kind)
+    assert "supersecret" not in starts[0].title
+    await finish(dispatcher)
+
+
+_SHELL_EDGES = [
+    ({"command": "python --token supersecret"}, "Run python"),
+    ({"command": "python"}, "Run python"),
+    ({"command": "/usr/bin/python --version"}, "Run [path]"),
+    ({"command": "bin/tool --flag"}, "Run bin/tool"),
+    ({"command": '"my tool" --token supersecret'}, "Run my tool"),
+    ({"command": "token=supersecret --flag"}, "Run [redacted]"),
+    (_MISSING, "Run"),
+    (None, "Run"),
+    ({}, "Run"),
+    ({"command": None}, "Run"),
+    ({"command": 42}, "Run"),
+    ({"command": ""}, "Run"),
+    ({"command": "   "}, "Run"),
+    ({"command": "'unterminated"}, "Run"),
+    ({"command": "'' second"}, "Run"),
+]
+
+
+@pytest.mark.parametrize("lifecycle", ["start", "tool_call_end", "tool_result_end"])
+@pytest.mark.parametrize("name", ["shell_exec", "bash_async", "hands_shell"])
+@pytest.mark.parametrize("args,title", _SHELL_EDGES)
+@pytest.mark.asyncio
+async def test_shell_presentation_exposes_only_first_argv_at_every_start_site(
+    lifecycle: str,
+    name: str,
+    args: object,
+    title: str,
+) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event(lifecycle, name, args))
+    await dispatcher.drain()
+
+    starts = [item for item in publisher.updates if item.session_update == "tool_call"]
+    assert len(starts) == 1
+    assert (starts[0].title, starts[0].kind) == (title, "execute")
+    assert "supersecret" not in starts[0].title
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_complete_suppression_tool_and_redaction_mapping() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    for kind in ["turn", "reasoning", "model", "outbound_message", "injected_input"]:
+        dispatcher.enqueue({"type": kind, "phase": "end", "content": "private"})
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "s", "tool_name": "send_message"})
+    dispatcher.enqueue({"type": "tool_call", "phase": "chunk", "id": "1", "tool_name": "search", "args": "delta"})
+    dispatcher.enqueue({"type": "tool_result", "phase": "start", "id": "1", "tool_name": "search"})
+    dispatcher.enqueue({"type": "tool_result", "phase": "chunk", "id": "1", "tool_name": "search", "content": "delta"})
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "1", "tool_name": "search"})
+    dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "1", "tool_name": "search", "args": {"apiKey": "x", "nested": [{"password": "y", "ok": 1}], "_auth": "private", "nan": float("nan")}})
+    dispatcher.enqueue({"type": "tool_result", "phase": "end", "id": "1", "tool_name": "search", "status": "ok", "content": {"accessToken": "z", "result": True}})
+    await dispatcher.drain()
+    assert [item.session_update for item in publisher.updates] == ["tool_call", "tool_call_update", "tool_call_update"]
+    assert [item.status for item in publisher.updates] == ["pending", "in_progress", "completed"]
+    assert publisher.updates[1].raw_input == {"apiKey": "[redacted]", "nested": [{"password": "[redacted]", "ok": 1}], "nan": "[redacted]"}
+    assert publisher.updates[2].raw_output == {"accessToken": "[redacted]", "result": True}
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_tool_input_and_output_use_the_same_client_redaction_policy() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "1", "tool_name": "hands_read",
+        "args": {"path": "/workspace/private.txt", "token": "input-secret"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_result", "phase": "end", "id": "1", "tool_name": "hands_read",
+        "status": "ok",
+        "content": {"path": "/workspace/private.txt", "token": "output-secret"},
+    })
+
+    await dispatcher.drain()
+
+    progress = [item for item in publisher.updates if item.status != "pending"]
+    assert progress[0].raw_input == {"path": "[path]", "token": "[redacted]"}
+    assert progress[1].raw_output == {"path": "[path]", "token": "[redacted]"}
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_permission_snapshot_pins_first_unscrubbed_arguments() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    streamed_path = "/tmp/streamed-notes.txt"
+    block_path = "/tmp/block-notes.txt"
+
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "start", "id": "streamed",
+        "tool_name": "hands_edit",
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "streamed",
+        "tool_name": "hands_edit",
+        "args": {"path": streamed_path, "old_text": "old", "new_text": "new"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "streamed",
+        "tool_name": "hands_edit",
+        "args": {"path": "/tmp/later.txt", "old_text": "new", "new_text": "later"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "start", "id": "block",
+        "tool_name": "hands_edit",
+        "args": {"path": block_path, "old_text": "old", "new_text": "new"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "end", "id": "block",
+        "tool_name": "hands_edit",
+        "args": {"path": "/tmp/changed.txt", "old_text": "new", "new_text": "later"},
+    })
+    dispatcher.enqueue({
+        "type": "tool_call", "phase": "start", "id": "missing",
+        "tool_name": "hands_shell",
+    })
+
+    await dispatcher.drain()
+
+    assert dispatcher.permission_snapshot("streamed").raw_input == {
+        "path": streamed_path, "old_text": "old", "new_text": "new",
+    }
+    assert dispatcher.permission_snapshot("block").raw_input == {
+        "path": block_path, "old_text": "old", "new_text": "new",
+    }
+    assert dispatcher.permission_snapshot("missing") is None
+    assert (
+        dispatcher.permission_snapshot("streamed").title,
+        dispatcher.permission_snapshot("streamed").kind,
+    ) == ("hands_edit", "other")
+    assert (
+        dispatcher.permission_snapshot("block").title,
+        dispatcher.permission_snapshot("block").kind,
+    ) == ("hands_edit", "other")
+    raw_inputs = {
+        update.tool_call_id: update.raw_input
+        for update in publisher.updates
+        if update.status == "in_progress" and update.tool_call_id in {"streamed", "block"}
+    }
+    assert raw_inputs == {
+        "streamed": {"path": "[path]", "old_text": "new", "new_text": "later"},
+        "block": {"path": "[path]", "old_text": "new", "new_text": "later"},
+    }
+    starts = {
+        update.tool_call_id: (update.title, update.kind, update.raw_input)
+        for update in publisher.updates
+        if update.status == "pending" and update.tool_call_id in {"streamed", "block"}
+    }
+    assert starts == {
+        "streamed": ("Edit", "edit", {}),
+        "block": (
+            "Edit [path]",
+            "edit",
+            {"path": "[path]", "old_text": "old", "new_text": "new"},
+        ),
+    }
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_orphan_ends_synthesize_pending_in_order() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "a", "tool_name": "edit", "args": {"path": "x"}})
+    dispatcher.enqueue({"type": "tool_result", "phase": "end", "id": "b", "tool_name": "search", "status": "error", "content": "details"})
+    await dispatcher.drain()
+    assert [(item.tool_call_id, item.status) for item in publisher.updates] == [("a", "pending"), ("a", "in_progress"), ("b", "pending"), ("b", "failed")]
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_write_todos_is_one_ordered_full_replacement() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    todos = [{"content": "First", "status": "in_progress"}, {"content": "Second", "status": "pending"}, {"content": "Third", "status": "completed"}]
+    dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "t", "tool_name": "write_todos", "args": {"todos": todos}})
+    dispatcher.enqueue({"type": "tool_result", "phase": "end", "id": "t", "tool_name": "write_todos", "status": "ok", "content": "done"})
+    await dispatcher.drain()
+    plans = [item for item in publisher.updates if item.session_update == "plan"]
+    assert len(plans) == 1
+    assert [(entry.content, entry.status, entry.priority) for entry in plans[0].entries] == [("First", "in_progress", "medium"), ("Second", "pending", "medium"), ("Third", "completed", "medium")]
+    await finish(dispatcher)
+
+
+@pytest.mark.parametrize("args,status", [({}, "ok"), ({"todos": []}, "ok"), ({"todos": [{"content": "", "status": "pending"}]}, "ok"), ({"todos": [{"content": "x", "status": "bad"}]}, "ok"), ({"todos": [{"content": "x", "status": "pending", "priority": "high"}]}, "ok"), ({"todos": [{"content": "x", "status": "pending"}], "delta": True}, "ok"), ({"todos": [{"content": "x", "status": "pending"}]}, "error")])
+@pytest.mark.asyncio
+async def test_invalid_partial_delta_or_failed_todos_emit_no_plan(args, status) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "t", "tool_name": "write_todos", "args": args})
+    dispatcher.enqueue({"type": "tool_result", "phase": "end", "id": "t", "tool_name": "write_todos", "status": status})
+    await dispatcher.drain()
+    assert all(item.session_update != "plan" for item in publisher.updates)
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    for index in range(MAX_UPDATE_ITEMS):
+        dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": str(index), "tool_name": "search", "args": {"index": index}})
+    await publisher.entered.wait()
+    drain = asyncio.create_task(dispatcher.drain())
+    await asyncio.sleep(0)
+    assert not drain.done()
+    publisher.release.set()
+    await drain
+    progress = [item.raw_input["index"] for item in publisher.updates if item.status == "in_progress"]
+    assert progress == list(range(MAX_UPDATE_ITEMS))
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp import updates
+
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    event = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search"}
+    for _ in range(MAX_UPDATE_ITEMS):
+        dispatcher.enqueue(event)
+    # This generous bound is a hang guard, not a latency assertion.
+    try:
+        await asyncio.wait_for(publisher.entered.wait(), 10)
+    except TimeoutError:
+        pytest.fail("hang guard expired waiting for the worker to enter publish_live")
+    # The in-flight publication has freed a slot. Fill it so close cannot
+    # enqueue its sentinel before timing out.
+    dispatcher.enqueue(event)
+    assert dispatcher.queue.full(), "precondition failed: update queue is not full"
+    budgets: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def tracked_wait_for(awaitable, timeout):
+        budgets.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(updates.asyncio, "wait_for", tracked_wait_for)
+    monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
+    monkeypatch.setattr(updates, "UPDATE_CANCEL_TIMEOUT", 1.0)
+    worker = dispatcher._worker
+    assert worker is not None, "precondition failed: dispatcher worker was not started"
+    closing = asyncio.create_task(dispatcher.close())
+    try:
+        await asyncio.sleep(0)
+        assert not closing.done(), "close did not suspend while the full worker was blocked"
+        # This generous bound is a hang guard, not a latency assertion.
+        done, _ = await asyncio.wait({closing}, timeout=10)
+        assert closing in done, "hang guard expired waiting for close to complete"
+        try:
+            await closing
+        except Exception as exc:
+            pytest.fail(f"close raised unexpectedly: {exc!r}")
+        assert worker.cancelled(), "close must stop the worker, not just detach it"
+        assert not dispatcher._publication_failed, "close incorrectly recorded a publication failure"
+        assert isinstance(dispatcher.failure, TimeoutError), "close did not retain its timeout failure"
+        assert not publisher.release.is_set(), "close incorrectly released the blocked publisher"
+        assert dispatcher._worker is None, "close did not clear the cancelled worker"
+        assert budgets == [0.02, 1.0], budgets
+        assert dispatcher.queue.empty(), "close left updates in the queue"
+        assert dispatcher.queued_bytes == 0, "close left queued byte accounting nonzero"
+        # This generous bound is a hang guard, not a latency assertion.
+        try:
+            await asyncio.wait_for(dispatcher.queue.join(), 10)
+        except TimeoutError:
+            pytest.fail("hang guard expired waiting for the emptied queue to join")
+    finally:
+        closing.cancel()
+        worker.cancel()
+        await asyncio.gather(closing, worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_close_backstop_reports_a_cancellation_resistant_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.acp import updates
+
+    class ResistantPublisher(Publisher):
+        async def publish_live(self, update):
+            self.entered.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    # Deliberately broken dependency to exercise the backstop.
+                    continue
+
+    publisher = ResistantPublisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(_start_event("start", "search", {}))
+    await publisher.entered.wait()
+    monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
+    monkeypatch.setattr(updates, "UPDATE_CANCEL_TIMEOUT", 0.02)
+    worker = dispatcher._worker
+    closing = asyncio.create_task(dispatcher.close())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=1)
+        assert closing in done, "close's cancellation backstop was not bounded"
+        with pytest.raises(TimeoutError):
+            await closing
+        assert dispatcher._worker is worker
+        assert worker is not None and not worker.done()
+    finally:
+        publisher.release.set()
+        worker.cancel()
+        await asyncio.gather(closing, worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_first_delivery_failure_is_retained_and_remaining_queue_is_acked() -> None:
+    publisher = Publisher()
+    publisher.fail_at = 2
+    dispatcher = UpdateDispatcher(publisher)
+    for index in range(5):
+        dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": str(index), "tool_name": "search"})
+    with pytest.raises(RequestError, match="Internal error") as caught:
+        await dispatcher.drain()
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert publisher.calls == 2
+    assert publisher.updates[0].tool_call_id == "0"
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_is_recorded_before_nominal_success_queue_drains() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "a", "tool_name": "search"})
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "b", "tool_name": "edit"})
+    await dispatcher.queue.join()
+    dispatcher.enqueue({"type": "tool_result", "phase": "end", "id": "a", "tool_name": "search", "status": "ok", "content": "nominal"})
+    dispatcher.enqueue({"type": "tool_result", "phase": "end", "id": "b", "tool_name": "edit", "status": "ok", "content": "nominal"})
+    core_error = RuntimeError("core private detail")
+    with pytest.raises(RequestError, match="Internal error") as caught:
+        await dispatcher.terminalize_failure(core_error)
+    assert caught.value.__cause__ is core_error
+    assert [(item.tool_call_id, item.status) for item in publisher.updates] == [("a", "pending"), ("b", "pending"), ("a", "failed"), ("b", "failed")]
+    assert dispatcher._open_tools == {}
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_terminal_publish_failure_stops_publication_but_closes_all_tools() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    for tool_id in ["a", "b", "c"]:
+        dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": tool_id, "tool_name": "search"})
+    await dispatcher.queue.join()
+    publisher.fail_at = 4
+    first = asyncio.CancelledError()
+    with pytest.raises(RequestError) as caught:
+        await dispatcher.terminalize_failure(first)
+    assert caught.value.__cause__ is first
+    assert publisher.calls == 4
+    assert dispatcher._open_tools == {}
+    assert [(item.tool_call_id, item.status) for item in publisher.updates[-1:]] == [("c", "pending")]
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_every_send_message_lifecycle_phase_is_suppressed() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    for event_type in ["tool_call", "tool_result"]:
+        for phase in ["start", "chunk", "end"]:
+            dispatcher.enqueue(
+                {
+                    "type": event_type,
+                    "phase": phase,
+                    "id": f"{event_type}-{phase}",
+                    "tool_name": "send_message",
+                    "args": {"text": "private"},
+                    "content": "private",
+                    "status": "ok",
+                }
+            )
+    await dispatcher.drain()
+    assert publisher.updates == []
+    await finish(dispatcher)
+
+
+@pytest.mark.parametrize("status", [None, "ok", "completed", "success"])
+@pytest.mark.asyncio
+async def test_every_accepted_success_status_completes(status: str | None) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    event = {
+        "type": "tool_result",
+        "phase": "end",
+        "id": "tool",
+        "tool_name": "search",
+        "content": "result",
+    }
+    if status is not None:
+        event["status"] = status
+    dispatcher.enqueue(event)
+    await dispatcher.drain()
+    assert [(item.status, item.tool_call_id) for item in publisher.updates] == [
+        ("pending", "tool"),
+        ("completed", "tool"),
+    ]
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_is_error_discriminator_overrides_nominal_success() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(
+        {
+            "type": "tool_result",
+            "phase": "end",
+            "id": "tool",
+            "tool_name": "search",
+            "status": "success",
+            "is_error": True,
+            "content": "private detail",
+        }
+    )
+    await dispatcher.drain()
+    assert [(item.status, item.tool_call_id) for item in publisher.updates] == [
+        ("pending", "tool"),
+        ("failed", "tool"),
+    ]
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_update_item_limit_admits_exact_boundary_and_rejects_next() -> None:
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    event = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search"}
+    for _ in range(MAX_UPDATE_ITEMS):
+        dispatcher.enqueue(event)
+    with pytest.raises(RequestError, match="Internal error"):
+        dispatcher.enqueue(event)
+    assert dispatcher.queue.qsize() == MAX_UPDATE_ITEMS
+    assert dispatcher.failure is not None
+    publisher.release.set()
+    with pytest.raises(RequestError, match="Internal error"):
+        await dispatcher.drain()
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_update_byte_limit_admits_exact_boundary_and_rejects_next() -> None:
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    base = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search", "args": {"value": ""}}
+    overhead = _event_bytes(base)
+    event = {**base, "args": {"value": "a" * (MAX_UPDATE_BYTES - overhead)}}
+    assert _event_bytes(event) == MAX_UPDATE_BYTES
+    dispatcher.enqueue(event)
+    assert dispatcher.queued_bytes == MAX_UPDATE_BYTES
+    with pytest.raises(RequestError, match="Internal error"):
+        dispatcher.enqueue({"type": "tool_call"})
+    publisher.release.set()
+    with pytest.raises(RequestError, match="Internal error"):
+        await dispatcher.drain()
+    await dispatcher.close()
+    assert dispatcher.queued_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_overflow_cancels_owner_quarantines_follow_on_events() -> None:
+    blocked_publisher = Publisher()
+    blocked_publisher.block = True
+    source: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    dispatcher_ready: asyncio.Future[UpdateDispatcher] = (
+        asyncio.get_running_loop().create_future()
+    )
+    owner_cancelled = asyncio.Event()
+    follow_ons_enqueued = asyncio.Event()
+    source_drained = asyncio.Event()
+
+    async def own_connection() -> None:
+        dispatcher = UpdateDispatcher(blocked_publisher)
+        dispatcher_ready.set_result(dispatcher)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            owner_cancelled.set()
+            await follow_ons_enqueued.wait()
+            await source.join()
+            source_drained.set()
+            await blocked_publisher.release.wait()
+            with pytest.raises(RequestError, match="Internal error"):
+                await dispatcher.drain()
+            await dispatcher.close()
+            raise
+
+    owner = asyncio.create_task(own_connection())
+    dispatcher = await dispatcher_ready
+    forwarder = asyncio.create_task(MimirAcpAgent._forward_updates(source, dispatcher))
+    event = {
+        "type": "tool_call",
+        "phase": "start",
+        "id": "blocked",
+        "tool_name": "search",
+    }
+    await source.put(event)
+    await blocked_publisher.entered.wait()
+    for index in range(MAX_UPDATE_ITEMS):
+        await source.put({**event, "id": str(index)})
+    await source.put({**event, "id": "limit-plus-one"})
+    await owner_cancelled.wait()
+    assert dispatcher.queue.qsize() == MAX_UPDATE_ITEMS
+
+    for index in range(5):
+        await source.put({**event, "id": f"quarantined-{index}"})
+    follow_ons_enqueued.set()
+    await source_drained.wait()
+    assert source.empty()
+    assert forwarder.done() is False
+
+    independent_publisher = Publisher()
+    independent = UpdateDispatcher(independent_publisher)
+    await independent.submit(
+        {"type": "tool_call", "phase": "start", "id": "live", "tool_name": "search"}
+    )
+    await independent.drain()
+    assert [(item.tool_call_id, item.status) for item in independent_publisher.updates] == [
+        ("live", "pending")
+    ]
+
+    blocked_publisher.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    forwarder.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder
+    await independent.close()

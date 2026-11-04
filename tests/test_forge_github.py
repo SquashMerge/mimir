@@ -1,0 +1,1521 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from mimir import github_identity as core_identity
+from langchain_core.tools import ToolException
+import requests
+
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("Forge adapter requires installed Cultivate", allow_module_level=True)
+
+from mimir_cultivate.forge import (
+    ForgeError, ForgeResponseTooLarge, ReviewVerdict,
+    GitHubForgeClient,
+    GitHubIdentityFailureKind,
+    GitHubIdentityVerificationError,
+    bound_diff,
+)
+from mimir_cultivate import forge as github_module
+from mimir_cultivate.policy import RepoPRActionScope
+from mimir_cultivate.forge import initialize_github_forge_identity, pr_list, set_forge_client
+
+
+def _scope() -> RepoPRActionScope:
+    return RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/tmp/repo",
+        canonical_origin="ssh://forge.invalid/owner/repo",
+        principal="reviewer",
+        event_type="pr_review_requested",
+        allowed_operations=frozenset({"repo.inspect", "pr.review"}),
+        pr_number=17,
+        head_repo="fork/repo",
+        head_remote="source",
+        destination_ref="refs/heads/change",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+
+
+class Response:
+    def __init__(self, payload, *, status=200, content_type="application/json") -> None:
+        import json
+
+        self._payload = payload
+        self.status_code = status
+        self.headers = {"Content-Type": content_type}
+        self.content = (
+            (json.dumps(payload) if content_type == "application/json" else payload).encode()
+            if isinstance(payload, str)
+            else payload if isinstance(payload, bytes)
+            else json.dumps(payload).encode()
+        )
+
+    def json(self):
+        return self._payload
+
+    def iter_content(self, chunk_size):
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start:start + chunk_size]
+
+    def close(self):
+        self.closed = True
+
+
+class CountingResponse:
+    """A large lazy body: touching content or json would buffer it all."""
+
+    def __init__(self, *, status=200, content_type="application/json", chunk=None):
+        self.status_code = status
+        self.headers = {"Content-Type": content_type}
+        self.chunk = chunk if chunk is not None else b"a" * 65_536
+        self.yielded_bytes = 0
+        self.closed = False
+
+    @property
+    def content(self):
+        raise AssertionError("stream was buffered")
+
+    def json(self):
+        raise AssertionError("stream was buffered")
+
+    def iter_content(self, chunk_size):
+        assert chunk_size == 65_536
+        for _ in range(100 * 1_048_576 // len(self.chunk)):
+            self.yielded_bytes += len(self.chunk)
+            yield self.chunk
+
+    def close(self):
+        self.closed = True
+
+
+class Session:
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self.responses.pop(0)
+
+
+class PagingSession(Session):
+    """Serve slices using GitHub's page/per_page offsets and real JSON bytes."""
+
+    def __init__(self, rows, *, collection_key=None):
+        super().__init__([])
+        self.rows = rows
+        self.collection_key = collection_key
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        params = parse_qs(urlsplit(url).query)
+        size = int(params["per_page"][0])
+        page = int(params["page"][0])
+        rows = self.rows[(page - 1) * size:page * size]
+        return Response({self.collection_key: rows} if self.collection_key else rows)
+
+
+def _page_params(session):
+    return [
+        (int(params["per_page"][0]), int(params["page"][0]))
+        for _, url, _ in session.calls
+        for params in [parse_qs(urlsplit(url).query)]
+    ]
+
+
+def test_ci_run_projects_only_bounded_metadata():
+    run = {
+        "id": 42, "name": "C" * 300, "display_title": "D" * 300,
+        "status": "completed", "conclusion": "failure", "event": "push",
+        "head_branch": "branch" * 40, "head_sha": "a" * 40,
+        "head_repository": {"full_name": "owner/repo"},
+        "run_attempt": 2, "workflow_id": 7,
+        "created_at": "created", "updated_at": "updated", "run_started_at": "started",
+        "html_url": "private", "url": "private", "jobs_url": "private",
+        "logs_url": "private", "actor": {"login": "private"},
+        "pull_requests": [{"title": "private"}], "repository": {"name": "private"},
+    }
+    session = Session([Response(run)])
+    result = GitHubForgeClient(token="secret", session=session).get_run("owner/repo", 42)
+    assert result == {
+        "id": 42, "name": "C" * 200, "display_title": "D" * 200,
+        "status": "completed", "conclusion": "failure", "event": "push",
+        "head_branch": ("branch" * 40)[:200], "head_sha": "a" * 40,
+        "head_repository": "owner/repo",
+        "run_attempt": 2, "workflow_id": 7,
+        "created_at": "created", "updated_at": "updated", "run_started_at": "started",
+    }
+    assert not {"html_url", "url", "jobs_url", "logs_url", "actor", "pull_requests", "repository"} & result.keys()
+    assert session.calls[0][1] == "https://api.github.com/repos/owner/repo/actions/runs/42"
+
+
+@pytest.mark.parametrize("workflow_id,limit,endpoint", [
+    (7, 1, "workflows/7/runs"), (None, 20, "runs"),
+])
+def test_ci_recent_runs_paginates_encoded_bound_branch(workflow_id, limit, endpoint):
+    run = {"id": 42, "name": "CI", "html_url": "private"}
+    session = PagingSession([run] * 50, collection_key="workflow_runs")
+    result = GitHubForgeClient(token="secret", session=session).list_runs(
+        "owner/repo", "release/hot fix", workflow_id, limit,
+    )
+    assert len(result) == limit
+    assert all(item["id"] == 42 and "html_url" not in item for item in result)
+    assert len(session.calls) == 1
+    assert session.calls[0][1] == (
+        f"https://api.github.com/repos/owner/repo/actions/{endpoint}"
+        f"?branch=release%2Fhot%20fix&per_page={limit}&page=1"
+    )
+
+
+@pytest.mark.parametrize("limit", [0, 21])
+def test_ci_recent_runs_client_rejects_out_of_bounds_limit(limit):
+    session = Session([Response({"workflow_runs": []})])
+    client = GitHubForgeClient(token="secret", session=session)
+    with pytest.raises(ForgeError, match="invalid workflow runs selector"):
+        client.list_runs("owner/repo", "main", None, limit)
+    assert session.calls == []
+
+
+def _file_responses(path: str, head: str = "a" * 40) -> list[Response]:
+    parts = path.split("/")
+    responses = [
+        Response({"sha": head, "tree": {"sha": "c" * 40}}),
+    ]
+    for index, part in enumerate(parts):
+        final = index == len(parts) - 1
+        responses.append(Response({"tree": [{
+            "path": part, "type": "blob" if final else "tree",
+            "mode": "100644" if final else "040000",
+            "sha": ("d" if final else "c") * 40,
+        }]}))
+    return responses
+
+
+def test_list_run_jobs_projects_only_bounded_job_metadata():
+    job = {
+        "id": 1, "name": "J" * 250, "status": "completed", "conclusion": "failure",
+        "started_at": "start", "completed_at": "end",
+        "html_url": "secret-url", "logs_url": "secret-log-url",
+        "runner_name": "runner-secret", "runner_group_name": "runner-group-secret",
+        "log": "secret log text",
+        "steps": [
+            {"number": 3, "name": "S" * 250, "conclusion": "failure", "html_url": "secret-step"},
+            {"number": 4, "name": "ok", "conclusion": "success"},
+        ],
+    }
+    session = Session([Response({"jobs": [job] * 50}), Response({"jobs": [job] * 50})])
+    result = GitHubForgeClient(token="secret", session=session).list_run_jobs("owner/repo", 42)
+    assert len(result) == 100
+    assert result[0] == {
+        "id": 1, "name": "J" * 200, "status": "completed", "conclusion": "failure",
+        "started_at": "start", "completed_at": "end",
+        "failed_steps": [{"number": 3, "name": "S" * 200, "conclusion": "failure"}],
+    }
+    assert all(value not in str(result) for value in (
+        "secret-url", "secret-log-url", "runner-secret", "runner-group-secret",
+        "secret log text", "secret-step",
+    ))
+    assert len(session.calls) == 2
+    assert [call[1] for call in session.calls] == [
+        f"https://api.github.com/repos/owner/repo/actions/runs/42/jobs?per_page=50&page={page}"
+        for page in (1, 2)
+    ]
+
+
+def test_list_run_jobs_caps_more_than_100_jobs_without_fetching_third_page():
+    session = Session([Response({"jobs": [{"id": i} for i in range(50)]}),
+                       Response({"jobs": [{"id": i} for i in range(50, 100)]}),
+                       Response({"jobs": [{"id": i} for i in range(100, 120)]})])
+    result = GitHubForgeClient(token="secret", session=session).list_run_jobs("owner/repo", 42)
+    assert [job["id"] for job in result] == list(range(100))
+    assert len(session.calls) == 2
+
+
+@pytest.fixture(autouse=True)
+def reset_verified_identity(monkeypatch) -> None:
+    from mimir_cultivate import forge as forge_tools
+
+    monkeypatch.setattr(core_identity, "_verified_identity", None)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_callback", None)
+
+
+def test_metadata_target_and_auth_are_adapter_constructed() -> None:
+    session = Session([Response({
+        "number": 17,
+        "title": "Title",
+        "state": "open",
+        "user": {"login": "author"},
+        "base": {"ref": "main"},
+        "head": {"ref": "change", "sha": "a" * 40},
+        "created_at": "created",
+        "updated_at": "updated",
+    })])
+    client = GitHubForgeClient(token="secret", session=session)
+
+    result = client.get_pull_request(_scope())
+
+    assert result.author == "author"
+    method, url, kwargs = session.calls[0]
+    assert method == "GET"
+    assert url == "https://api.github.com/repos/owner/repo/pulls/17"
+    assert kwargs["headers"]["Authorization"] == "Bearer secret"
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("x" * 65_537, "x" * 65_536),
+    ("x" * 65_535 + "外tail", "x" * 65_535),
+    ("外" * 21_846, "外" * 21_845),
+    ("x" * 65_533 + "外", "x" * 65_533 + "外"),
+    ("short body", "short body"),
+    (None, ""),
+    (42, ""),
+])
+def test_pr_metadata_body_is_bounded_by_writer_utf8_limit(body, expected) -> None:
+    from mimir_cultivate.forge import _BODY_MAX_BYTES
+
+    assert github_module._MAX_BODY_BYTES == _BODY_MAX_BYTES == 65_536
+    session = Session([Response({"number": 17, "body": body})])
+    result = GitHubForgeClient(token="secret", session=session).get_pull_request(_scope())
+    assert result.body == expected
+    assert len(result.body.encode("utf-8")) <= _BODY_MAX_BYTES
+    assert "\ufffd" not in result.body
+
+
+def test_pr_metadata_merged_at_comes_from_github_response() -> None:
+    session = Session([Response({"number": 17, "body": "description", "merged_at": "2026-10-14T12:00:00Z"})])
+    result = GitHubForgeClient(token="secret", session=session).get_pull_request(_scope())
+    assert result.body == "description"
+    assert result.merged_at == "2026-10-14T12:00:00Z"
+
+
+def _pr_row(number, *, merged=False):
+    return {
+        "number": number, "title": "外" * 2000, "state": "closed" if merged else "open",
+        "user": {"login": "author"}, "head": {"ref": "topic", "sha": "a" * 40},
+        "base": {"ref": "main"}, "updated_at": "2026-10-03T00:00:00Z",
+        "merged_at": "2026-10-02T00:00:00Z" if merged else None,
+        "html_url": f"https://github.com/owner/repo/pull/{number}",
+    }
+
+
+def test_pr_list_qualifies_bare_head_and_drops_wrong_branch_before_limit():
+    wrong = _pr_row(1)
+    wrong["head"]["ref"] = "unrelated"
+    session = PagingSession([wrong, _pr_row(2)])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", head="topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert "head=owner%3Atopic" in session.calls[0][1]
+
+
+@pytest.mark.parametrize("selector", ["author", "merged_since", "both"])
+def test_pr_list_applies_filters_before_limit_across_pages(selector):
+    from datetime import datetime, timezone
+
+    excluded = [_pr_row(n, merged=True) for n in range(50)]
+    for item in excluded:
+        item["user"]["login"] = "other"
+        item["merged_at"] = "2026-09-01T00:00:00Z"
+    # Matching rows must be discovered after a full page of rejected rows.
+    session = PagingSession([*excluded, _pr_row(51, merged=True), _pr_row(52, merged=True)])
+    kwargs = {}
+    if selector in {"author", "both"}:
+        kwargs["author"] = "AUTHOR"
+    if selector in {"merged_since", "both"}:
+        kwargs["merged_since"] = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=1, **kwargs,
+    )
+    assert [item.number for item in result] == [51]
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize("state", ["all", "open", "closed"])
+@pytest.mark.parametrize("merged_at", [None, False, 123])
+def test_pr_list_merged_since_drops_unmerged_rows_before_limit(state, merged_at):
+    from datetime import datetime, timezone
+
+    unmerged = _pr_row(1)
+    unmerged["merged_at"] = merged_at
+    if state == "closed":
+        unmerged["state"] = "closed"
+    session = PagingSession([unmerged, _pr_row(2, merged=True)])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state=state, limit=1,
+        merged_since=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+    # Non-merged state selectors must exercise matches(), not merged_only.
+    # An unmerged row must neither escape the filter nor consume the limit.
+    assert [item.number for item in result] == [2]
+    assert result[0].merged_at == "2026-10-02T00:00:00Z"
+    assert f"state={state}&" in session.calls[0][1]
+
+
+def test_paginate_limited_collection_returns_partial_at_page_cap():
+    session = Session([Response({"jobs": [{"id": n}] * 50}) for n in range(10)])
+    result = GitHubForgeClient(session=session)._paginate(
+        "/repos/owner/repo/actions/runs/42/jobs", collection_key="jobs", limit=501,
+    )
+    assert len(result) == 500
+    assert len(session.calls) == 10
+
+
+def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
+    session = PagingSession([_pr_row(1), _pr_row(2, merged=True), _pr_row(3, merged=True)])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", base="main", head="fork:topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert result[0].state == "merged"
+    assert len(result[0].title) == 1024
+    assert session.calls[0][0:2] == (
+        "GET", "https://api.github.com/repos/owner/repo/pulls?"
+        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=50&page=1",
+    )
+
+
+def test_pr_list_paginates_to_limit_and_stops_at_ten_pages():
+    session = PagingSession([_pr_row(n, merged=True) for n in range(100)])
+    client = GitHubForgeClient(session=session)
+    assert len(client.list_pull_requests("owner/repo", state="all", limit=51)) == 51
+    assert len(session.calls) == 2
+    assert _page_params(session) == [(50, 1), (1, 51)]
+    session = Session([Response([_pr_row(page * 50 + n) for n in range(50)])
+                       for page in range(20)])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", limit=100,
+    )
+    assert result == ()
+    assert len(session.calls) == 10
+
+
+def test_pr_list_limit_one_avoids_oversized_fifty_item_page():
+    rows = [{**_pr_row(n), "body": "x" * 30_000} for n in range(50)]
+    assert len(Response(rows).content) > github_module._MAX_RESPONSE_BYTES
+    session = PagingSession(rows)
+
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=1,
+    )
+
+    assert [row.number for row in result] == [0]
+    assert _page_params(session) == [(1, 1)]
+
+
+@pytest.mark.parametrize("selector", ["merged", "author", "head", "merged_since"])
+def test_pr_list_filtered_limit_one_preserves_scan_depth(selector):
+    from datetime import datetime, timezone
+
+    rows = [_pr_row(n) for n in range(21)]
+    kwargs = {"state": "all"}
+    if selector == "merged":
+        kwargs["state"] = "merged"
+        rows[-1] = _pr_row(20, merged=True)
+    elif selector == "author":
+        kwargs["author"] = "wanted"
+        rows[-1]["user"]["login"] = "wanted"
+    elif selector == "head":
+        kwargs["head"] = "wanted"
+        rows[-1]["head"]["ref"] = "wanted"
+    else:
+        kwargs["merged_since"] = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        rows[-1] = _pr_row(20, merged=True)
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", limit=1, **kwargs,
+    )
+    assert [row.number for row in result] == [20]
+    assert _page_params(session) == [(50, 1)]
+
+
+def test_pr_list_merged_only_walks_past_full_small_unmatched_page():
+    rows = [{**_pr_row(n), "body": "x" * 20_000} for n in range(40)]
+    rows[25]["merged_at"] = "2026-10-02T00:00:00Z"
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", limit=1,
+    )
+    assert [row.number for row in result] == [25]
+    assert _page_params(session) == [(50, 1), (25, 1), (25, 2)]
+
+
+def test_pr_list_filtered_page_size_is_not_capped_by_remaining_matches():
+    rows = [_pr_row(n) for n in range(5)]
+    for row in rows[1:3]:
+        row["user"]["login"] = "other"
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", author="author", limit=3,
+    )
+    assert [row.number for row in result] == [0, 3, 4]
+    assert _page_params(session) == [(50, 1)]
+
+
+@pytest.mark.parametrize("limit", [50, 51])
+def test_pr_list_shrinks_oversized_page_without_skipping_rows(limit):
+    rows = [{**_pr_row(n), "body": "x" * 20_000} for n in range(75)]
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=limit,
+    )
+    assert [row.number for row in result] == list(range(limit))
+    expected = [(50, 1), (25, 1), (25, 2)]
+    if limit == 51:
+        expected.append((1, 51))
+    assert _page_params(session) == expected
+
+
+def test_pr_list_refuses_single_oversized_item_after_shrinking():
+    session = PagingSession([{**_pr_row(1), "body": "x" * github_module._MAX_RESPONSE_BYTES}])
+    with pytest.raises(ForgeResponseTooLarge, match="forge response exceeded size limit"):
+        GitHubForgeClient(session=session).list_pull_requests(
+            "owner/repo", state="all", limit=50,
+        )
+    assert _page_params(session) == [(50, 1), (25, 1), (12, 1), (6, 1), (3, 1), (1, 1)]
+
+
+def test_review_list_shrinks_oversized_unlimited_pages():
+    session = PagingSession([{"id": n, "body": "x" * 30_000} for n in range(1, 51)])
+    result = GitHubForgeClient(session=session).list_reviews(_scope())
+    assert [review.id for review in result] == [str(n) for n in range(1, 51)]
+    assert _page_params(session) == [(50, 1), (25, 1), (25, 2), (25, 3)]
+
+
+def test_review_list_later_shrink_discards_overlap_without_losing_rows():
+    rows = [
+        {"id": n + 1, "body": "small" if n < 50 else "x" * 50_000}
+        for n in range(100)
+    ]
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_reviews(_scope())
+    assert [review.id for review in result] == [str(n) for n in range(1, 101)]
+    assert _page_params(session) == [
+        (50, 1), (50, 2), (25, 3), (12, 5),
+        (12, 6), (12, 7), (12, 8), (12, 9),
+    ]
+
+
+def _search_row(number, *, merged=False):
+    return {
+        "number": number, "title": "外" * 2000,
+        "state": "closed" if merged else "open", "user": {"login": "x"},
+        "updated_at": "2026-10-03T00:00:00Z",
+        "pull_request": {"merged_at": "2026-10-02T00:00:00Z" if merged else None},
+        "html_url": f"https://github.com/owner/repo/pull/{number}",
+        "head": {"ref": "do-not-use"}, "body": "do-not-return",
+    }
+
+
+def _search_params(session):
+    method, url, kwargs = session.calls[0]
+    assert method == "GET"
+    assert urlsplit(url).scheme == "https"
+    assert urlsplit(url).netloc == "api.github.com"
+    assert urlsplit(url).path == "/search/issues"
+    assert kwargs["json"] is None
+    return parse_qs(urlsplit(url).query)
+
+
+def test_pr_search_projects_items_and_paginates_on_fixed_host():
+    session = PagingSession(
+        [_search_row(n) for n in range(50)] + [_search_row(50, merged=True)],
+        collection_key="items",
+    )
+    result = GitHubForgeClient(session=session).search_pull_requests(
+        "owner/repo", query="1445", state="all", limit=51,
+    )
+    assert len(result) == 51
+    assert len(session.calls) == 2
+    assert all(urlsplit(call[1]).path == "/search/issues" for call in session.calls)
+    assert _page_params(session) == [(50, 1), (1, 51)]
+    params = _search_params(session)
+    assert params["q"] == ["1445 is:pr repo:owner/repo"]
+    assert params["sort"] == ["updated"] and params["order"] == ["desc"]
+    assert result[-1].state == "merged"
+    assert result[-1].merged_at == "2026-10-02T00:00:00Z"
+    assert result[-1].head_ref == result[-1].base_ref == result[-1].head_sha == ""
+    assert result[-1].url == "https://github.com/owner/repo/pull/50"
+    assert result[-1].author == "x" and result[-1].updated_at == "2026-10-03T00:00:00Z"
+    assert len(result[-1].title) == 1024
+
+
+def test_pr_list_search_tool_reaches_url_encoded_api_query(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setattr(GitHubForgeClient, "author_is_trusted", lambda *_: True)
+    session = Session([Response({"items": [_search_row(1445, merged=True)]})])
+    set_forge_client(GitHubForgeClient(session=session))
+    try:
+        result = pr_list.func(repository="owner/repo", search="1445", state="all")
+    finally:
+        set_forge_client(None)
+    assert len(session.calls) == 1
+    assert _search_params(session)["q"] == ["1445 is:pr repo:owner/repo"]
+    assert result[0]["head_ref"] == ""
+    assert result[0]["merged_at"] == "2026-10-02T00:00:00Z"
+
+
+@pytest.mark.parametrize("state,qualifier", [
+    ("open", "is:open"), ("closed", "is:closed"),
+    ("merged", "is:merged"), ("all", None),
+])
+def test_pr_search_sends_filters_server_side_before_limit(state, qualifier):
+    session = Session([Response({"items": [_search_row(n) for n in range(5)]})])
+    result = GitHubForgeClient(session=session).search_pull_requests(
+        "owner/repo", query="test name", state=state, author="x", base="main",
+        head="fork:issue/1879-a1", merged_since=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        limit=5,
+    )
+    assert len(result) == 5  # Provider has already applied the qualifiers.
+    assert len(session.calls) == 1
+    url = session.calls[0][1]
+    assert "test name" not in url and "%3A" in url  # q, never a raw path/host selector
+    q = _search_params(session)["q"][0]
+    assert q.split().count("repo:owner/repo") == 1
+    if qualifier:
+        assert qualifier in q.split()
+    else:
+        assert not any(token in q.split() for token in ("is:open", "is:closed", "is:merged"))
+    for token in ("is:pr", "author:x", "base:main", "head:issue/1879-a1", "merged:>=2026-10-01"):
+        assert token in q.split()
+
+
+@pytest.mark.parametrize("query", ["repo:other/repo foo", "repo:owner/repo foo", "-repo:evil/repo"])
+def test_pr_search_client_rejects_second_repo_qualifier_without_request(query):
+    session = Session([])
+    with pytest.raises(ForgeError, match="exactly the configured repository"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query=query, state="all", limit=5,
+        )
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("query", [
+    '1445 "', '"1445"', "kernel ) OR (", "kernel(", "kernel)",
+    "linux OR", "linux AND", "linux NOT", "linux or", "linux and", "linux not",
+    "linux oR", "linux aNd", "linux nOt",
+    'label:bu"g', "head:topic(foo)",
+])
+def test_pr_search_client_refuses_advanced_syntax_without_request(query):
+    session = Session([])
+    with pytest.raises(ForgeError, match="quotes, parentheses, or boolean operators"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query=query, state="all", limit=5,
+        )
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("selector", ["author", "base", "head"])
+@pytest.mark.parametrize("value", ['topic"', "topic(", "topic)", "topic OR"])
+def test_pr_search_client_checks_advanced_syntax_in_final_selectors(selector, value):
+    session = Session([])
+    with pytest.raises(ForgeError, match="quotes, parentheses, or boolean operators"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query="1445", state="all", **{selector: value},
+        )
+    assert session.calls == []
+
+
+def test_pr_search_page_cap_and_limit():
+    session = Session([Response({"items": [_search_row(n) for n in range(50)]}) for _ in range(11)])
+    assert len(GitHubForgeClient(session=session).search_pull_requests(
+        "owner/repo", query="1445", state="all", limit=100,
+    )) == 100
+    assert len(session.calls) == 2
+
+
+def test_file_content_reads_verified_blob_from_observed_head() -> None:
+    session = Session([*_file_responses("src/a #1.py", "b" * 40),
+                       Response("text at observed head", content_type="text/plain")])
+    client = GitHubForgeClient(session=session)
+    scope = replace(_scope(), observed_head_sha="b" * 40)
+    assert client.get_file_content(scope, "src/a #1.py") == "text at observed head"
+    assert [call[1] for call in session.calls] == [
+        f"https://api.github.com/repos/owner/repo/git/commits/{'b' * 40}",
+        f"https://api.github.com/repos/owner/repo/git/trees/{'c' * 40}",
+        f"https://api.github.com/repos/owner/repo/git/trees/{'c' * 40}",
+        f"https://api.github.com/repos/owner/repo/git/blobs/{'d' * 40}",
+    ]
+    assert session.calls[-1][2]["headers"]["Accept"] == "application/vnd.github.raw"
+
+
+@pytest.mark.parametrize("path", ["../x", "a/../../x", "/etc/passwd", "a\\b", "a\x00b", "", "a" * 4_097])
+def test_file_content_invalid_path_does_not_request(path: str) -> None:
+    session = Session([])
+    with pytest.raises(ForgeError, match="invalid repository path"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), path)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("path,missing,requests", [
+    ("src/missing.py", "missing.py", 3),
+    ("absent/file.py", "absent", 2),
+])
+def test_file_content_missing_path_names_missing_component_and_pr_files(path, missing, requests) -> None:
+    responses = _file_responses(path)
+    responses[1 if missing == "absent" else 2] = Response({"tree": []})
+    session = Session(responses)
+    with pytest.raises(ForgeError) as refusal:
+        GitHubForgeClient(session=session).get_file_content(_scope(), path)
+    message = str(refusal.value)
+    assert f"path not found at scoped head {'a' * 12}" in message
+    assert "pr_files" in message and "check the path's spelling" in message
+    assert "not a regular file" not in message
+    if missing == "absent":
+        assert "missing component 'absent'" in message
+    assert len(session.calls) == requests  # no blob request
+
+
+@pytest.mark.parametrize("entry", [
+    {"path": "link", "type": "tree", "mode": "040000", "sha": "d" * 40},
+    {"path": "link", "type": "blob", "mode": "120000", "sha": "d" * 40},
+    {"path": "link", "type": "commit", "mode": "160000", "sha": "d" * 40},
+])
+def test_file_content_refuses_non_regular_file_without_raw_fetch(entry) -> None:
+    responses = _file_responses("link")
+    responses[-1] = Response({"tree": [entry]})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="not a regular file"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "link")
+    assert len(session.calls) == 2
+
+
+def test_file_content_refuses_binary_raw_response() -> None:
+    session = Session([
+        *_file_responses("src/app.py"),
+        Response(b"\xffbad", content_type="application/octet-stream"),
+    ])
+    with pytest.raises(ForgeError, match="invalid text"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "src/app.py")
+
+
+def test_file_content_near_one_mb_does_not_fetch_base64_metadata() -> None:
+    import base64
+    import json
+
+    content = "a" * 900_000
+    metadata = {"type": "file", "sha": "d" * 40,
+                "content": base64.encodebytes(content.encode()).decode()}
+    assert len(json.dumps(metadata).encode()) > github_module._MAX_RESPONSE_BYTES
+
+    class MetadataOverflowSession(Session):
+        def request(self, method, url, **kwargs):
+            if "/contents/" in url:
+                # Reintroducing the Contents read fails at its default 1 MiB cap.
+                self.calls.append((method, url, kwargs))
+                return Response(metadata)
+            return super().request(method, url, **kwargs)
+
+    session = MetadataOverflowSession([
+        *_file_responses("uv.lock"),
+        Response(content, content_type="application/vnd.github.raw; charset=utf-8"),
+    ])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "uv.lock") == content
+    assert all("/contents/" not in call[1] for call in session.calls)
+    assert session.calls[-1][1].endswith(f"/git/blobs/{'d' * 40}")
+
+
+def test_file_content_refuses_over_cap_binary_instead_of_truncating() -> None:
+    cap = github_module._MAX_DIFF_FETCH_BYTES
+    # Put the invalid byte beyond the retained prefix: validating only that
+    # prefix (or deleting the strict decode) must not silently accept binary.
+    session = Session([
+        *_file_responses("large.bin"),
+        Response(b"a" * cap + b"\xff", content_type="application/octet-stream"),
+    ])
+    with pytest.raises(ForgeError, match="binary file refused"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "large.bin")
+
+
+def test_file_content_allows_empty_regular_file() -> None:
+    session = Session([*_file_responses("empty.txt"), Response("", content_type="text/plain")])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "empty.txt") == ""
+
+
+def test_file_content_preserves_json_file_bytes_as_text() -> None:
+    session = Session([*_file_responses("config.json"), Response({"enabled": True})])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "config.json") == '{"enabled": true}'
+
+
+def test_file_content_refuses_unverified_commit_tree() -> None:
+    responses = _file_responses("src/app.py")
+    responses[0] = Response({"sha": "f" * 40, "tree": {"sha": "c" * 40}})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="scoped commit tree is unavailable"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "src/app.py")
+    assert len(session.calls) == 1
+
+
+def test_file_content_truncates_over_diff_fetch_cap_and_passes_max_bytes(monkeypatch) -> None:
+    cap = github_module._MAX_DIFF_FETCH_BYTES
+    session = Session([
+        *_file_responses("src/app.py"),
+        Response("a" * (cap + 1), content_type="text/plain"),
+    ])
+    client = GitHubForgeClient(session=session)
+    calls = []
+    request = client._request
+
+    def recording_request(*args, **kwargs):
+        calls.append(kwargs)
+        return request(*args, **kwargs)
+
+    monkeypatch.setattr(client, "_request", recording_request)
+    result = client.get_file_content(_scope(), "src/app.py")
+    assert result.startswith("aaaa")
+    assert result.endswith("[pr_file_content truncated: file exceeded size limit]\n")
+    assert len(result.encode("utf-8")) <= cap
+    assert calls[-1]["max_bytes"] == cap
+
+
+@pytest.mark.parametrize("sha", [None, "", "not-a-sha", "e" * 39])
+def test_file_content_refuses_invalid_blob_sha(sha) -> None:
+    responses = _file_responses("link")
+    responses[-1] = Response({"tree": [{
+        "path": "link", "type": "blob", "mode": "100644", "sha": sha,
+    }]})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="invalid scoped tree entry"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "link")
+    assert len(session.calls) == 2  # no raw request
+
+
+def test_file_content_fetches_blob_sha_from_tree_not_an_assumed_value() -> None:
+    responses = _file_responses("file.py")
+    responses[-1] = Response({"tree": [{
+        "path": "file.py", "type": "blob", "mode": "100755", "sha": "e" * 40,
+    }]})
+    session = Session([*responses, Response("executable", content_type="text/plain")])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "file.py") == "executable"
+    assert session.calls[-1][1].endswith(f"/git/blobs/{'e' * 40}")
+
+
+def test_file_content_refuses_symlinked_parent() -> None:
+    responses = _file_responses("alias/file.py")
+    responses[1] = Response({"tree": [{
+        "path": "alias", "type": "blob", "mode": "120000", "sha": "e" * 40,
+    }]})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="crosses a symlink"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "alias/file.py")
+    assert len(session.calls) == 2
+
+
+def _job_metadata():
+    return {
+        "id": 456, "run_id": 123, "head_sha": "a" * 40,
+        "run_url": "https://api.github.com/repos/owner/repo/actions/runs/123",
+        "status": "completed", "conclusion": "failure",
+    }
+
+
+def _run_metadata():
+    return {
+        "id": 123, "repository": {"full_name": "owner/repo"},
+        "head_sha": "a" * 40, "status": "completed",
+    }
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure", "action_required", "cancelled"])
+@pytest.mark.parametrize("run_id", [None, 123])
+@pytest.mark.parametrize("repo_case", ["owner/repo", "Owner/Repo"])
+def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, repo_case):
+    from mimir_cultivate import ci as ci_logs
+
+    job = {**_job_metadata(), "conclusion": conclusion}
+    job["run_url"] = f"https://api.github.com/repos/{repo_case}/actions/runs/123"
+    run = {**_run_metadata(), "repository": {"full_name": repo_case}}
+    session = Session([Response(job), Response(run)])
+    calls = []
+
+    def capture(repo, job_id, **kwargs):
+        assert len(session.calls) == 2
+        calls.append((repo, job_id, kwargs))
+        return b"selected [REDACTED] excerpt", ""
+
+    monkeypatch.setattr(ci_logs, "capture_job_log", capture)
+    result = GitHubForgeClient(token="secret", session=session).get_job_log(_scope(), 456, run_id)
+    assert result == "selected [REDACTED] excerpt"
+    assert calls == [("owner/repo", 456, {
+        "token": "secret", "limit": ci_logs.LOG_EXCERPT_BYTES, "timeout": 20.0,
+    })]
+    assert [call[1] for call in session.calls] == [
+        "https://api.github.com/repos/owner/repo/actions/jobs/456",
+        "https://api.github.com/repos/owner/repo/actions/runs/123",
+    ]
+
+
+@pytest.mark.parametrize("target,field,value", [
+    ("job", "id", 457), ("job", "id", "456"), ("job", "id", 456.0), ("job", "id", None),
+    ("job", "run_id", None), ("job", "run_id", True), ("job", "run_id", 0), ("job", "run_id", 123.0),
+    ("job", "head_sha", "c" * 40), ("job", "head_sha", None),
+    ("job", "run_url", "https://api.github.com/repos/other/repo/actions/runs/123"),
+    ("job", "run_url", "https://api.github.com/repos/owner/repo/actions/runs/999"),
+    ("job", "run_url", "https://api.github.com/repos/owner/repo/actions/runs/123/extra"),
+    ("job", "run_url", "https://evil.example/repos/owner/repo/actions/runs/123"),
+    ("job", "run_url", None),
+    ("job", "status", "in_progress"), ("job", "status", None),
+    *[("job", "conclusion", value) for value in ["success", "neutral", "skipped", "stale", None]],
+    ("run", "id", 124), ("run", "id", "123"), ("run", "id", 123.0), ("run", "id", None),
+    ("run", "repository", {"full_name": "other/repo"}),
+    ("run", "repository", None), ("run", "repository", {}),
+    ("run", "head_sha", "c" * 40), ("run", "head_sha", None),
+    ("run", "status", "in_progress"), ("run", "status", "queued"), ("run", "status", None),
+])
+def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, field, value):
+    from mimir_cultivate import ci as ci_logs
+
+    job, run = _job_metadata(), _run_metadata()
+    (job if target == "job" else run)[field] = value
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("capture before validation"))
+    session = Session([Response(job), Response(run)])
+    message = "run is still in progress" if target == "run" and field == "status" else None
+    if target == "job" and field in {"status", "conclusion"}:
+        message = "^job is not a completed failing job$"
+    from mimir_cultivate.forge import ForgeReadUnavailable
+
+    with pytest.raises(ForgeError, match=message) as raised:
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+    assert isinstance(raised.value, ForgeReadUnavailable) is (target == "run" and field == "status")
+
+
+@pytest.mark.parametrize("job_id,run_id", [
+    (None, None),
+    (True, None), (0, None), (-1, None), ("456", None), (1.5, None),
+    (456, True), (456, 0), (456, -1), (456, "123"), (456, 1.5),
+])
+def test_job_log_invalid_ids_do_not_fetch(job_id, run_id):
+    session = Session([])
+    with pytest.raises(ForgeError, match="positive integer"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), job_id, run_id)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("target", ["job", "run"])
+@pytest.mark.parametrize("payload", [None, [], "invalid"])
+def test_job_log_rejects_non_mapping_metadata(monkeypatch, target, payload):
+    from mimir_cultivate import ci as ci_logs
+
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("invalid metadata captured"))
+    responses = [Response(payload)] if target == "job" else [Response(_job_metadata()), Response(payload)]
+    with pytest.raises(ForgeError, match=f"invalid {target} metadata"):
+        GitHubForgeClient(session=Session(responses)).get_job_log(_scope(), 456)
+
+
+@pytest.mark.parametrize("observed_run", [0, -1, True, 123.0])
+def test_job_log_rejects_self_consistent_invalid_run_id(monkeypatch, observed_run):
+    from mimir_cultivate import ci as ci_logs
+
+    job = {**_job_metadata(), "run_id": observed_run,
+           "run_url": f"https://api.github.com/repos/owner/repo/actions/runs/{observed_run}"}
+    run = {**_run_metadata(), "id": int(observed_run)}
+    session = Session([Response(job), Response(run)])
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("invalid run ID captured"))
+    with pytest.raises(ForgeError, match="outside"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+    assert len(session.calls) == 1
+
+
+def test_job_log_explicit_run_mismatch_does_not_fetch_run():
+    session = Session([Response(_job_metadata())])
+    with pytest.raises(ForgeError, match="outside"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456, 999)
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("status,message", [(404, "job not found"), (401, "authentication failed")])
+def test_job_log_metadata_refusals_are_distinct(status, message):
+    session = Session([Response({}, status=status)])
+    with pytest.raises(ForgeError, match=message):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+
+
+def test_job_log_capture_error_not_returned_as_evidence(monkeypatch):
+    from mimir_cultivate import ci as ci_logs
+
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: (b"", "unauthenticated gh"))
+    session = Session([Response(_job_metadata()), Response(_run_metadata())])
+    with pytest.raises(ForgeError, match="unauthenticated gh"):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "action_required", "success"])
+@pytest.mark.parametrize("url_field", ["details_url", "html_url", None])
+def test_checks_preserve_actionable_url(conclusion, url_field) -> None:
+    log_url = "https://github.com/owner/repo/actions/runs/123/job/456"
+    row = {
+        "name": "tests", "status": "completed", "conclusion": conclusion,
+        "started_at": "started", "completed_at": "completed",
+    }
+    if url_field:
+        row[url_field] = log_url
+    if url_field == "details_url":
+        row["html_url"] = "https://github.com/owner/repo/runs/456"
+    session = Session([Response({"check_runs": [row]})])
+
+    result, = GitHubForgeClient(session=session).list_checks(_scope())
+
+    assert result.name == "tests"
+    assert result.status == "completed"
+    assert result.conclusion == conclusion
+    assert result.details_url == (log_url if url_field else None)
+    assert len(session.calls) == 1
+    assert session.calls[0][0] == "GET"
+    assert session.calls[0][1] == (
+        f"https://api.github.com/repos/owner/repo/commits/{'a' * 40}/check-runs?per_page=100"
+    )
+
+
+def test_live_snapshot_normalizes_all_authority_facts() -> None:
+    session = Session([Response({
+        "number": 17, "state": "open", "user": {"login": "author"},
+        "base": {
+            "ref": "main", "sha": "b" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
+        "head": {
+            "ref": "feature", "sha": "a" * 40,
+            "repo": {"full_name": "contributor/fork"},
+        },
+    })])
+
+    snapshot = GitHubForgeClient(session=session).get_pull_request_snapshot(
+        "owner/repo", 17,
+    )
+
+    assert snapshot.repo == "owner/repo"
+    assert snapshot.state == "open"
+    assert snapshot.number == 17
+    assert snapshot.author == "author"
+    assert snapshot.head_repo == "contributor/fork"
+    assert snapshot.head_remote == "source"
+    assert snapshot.head_ref == "feature"
+    assert snapshot.head_sha == "a" * 40
+    assert snapshot.base_ref == "main"
+    assert snapshot.base_sha == "b" * 40
+    assert session.calls[0][1].endswith("/repos/owner/repo/pulls/17")
+
+
+def test_live_snapshot_uses_origin_for_same_repository_head() -> None:
+    session = Session([Response({
+        "number": 17, "state": "open", "user": {"login": "author"},
+        "base": {
+            "ref": "main", "sha": "b" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
+        "head": {
+            "ref": "feature", "sha": "a" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
+    })])
+
+    snapshot = GitHubForgeClient(session=session).get_pull_request_snapshot(
+        "owner/repo", 17,
+    )
+
+    assert snapshot.head_remote == "origin"
+
+
+def test_submit_review_uses_json_transport_and_scope_head() -> None:
+    session = Session([Response({"login": "reviewer"}),
+                       Response({"head": {"sha": "a" * 40}}),
+                       Response({"check_runs": [{"name": "tests", "status": "completed", "conclusion": "success"}], "total_count": 1}),
+                       Response({"statuses": []}), Response({
+        "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",
+        "body": "body", "commit_id": "a" * 40,
+    })])
+    client = GitHubForgeClient(session=session)
+    client.verify_identity("reviewer")
+
+    client.submit_review(_scope(), ReviewVerdict.APPROVE, 'body "quoted"\nnext')
+
+    method, url, kwargs = session.calls[4]
+    assert method == "POST"
+    assert url.endswith("/repos/owner/repo/pulls/17/reviews")
+    assert kwargs["json"] == {
+        "commit_id": "a" * 40,
+        "event": "APPROVE",
+        "body": 'body "quoted"\nnext',
+    }
+
+
+def test_edit_pull_request_body_patches_only_body_at_exact_bound_pulls_endpoint() -> None:
+    session = Session([Response({"login": "reviewer"}), Response({})])
+    client = GitHubForgeClient(token="secret", session=session)
+    client.verify_identity("reviewer")
+    scope = replace(_scope(), canonical_repo="bound/project", pr_number=29)
+    body = 'Description "quoted"\n@/tmp/body.md'
+
+    assert client.edit_pull_request_body(scope, body) is None
+
+    assert [(method, url) for method, url, _ in session.calls] == [
+        ("GET", "https://api.github.com/user"),
+        ("PATCH", "https://api.github.com/repos/bound/project/pulls/29"),
+    ]
+    assert session.calls[1][2]["json"] == {"body": body}
+
+
+@pytest.mark.parametrize("identity", ["unverified", "wrong-principal", "changed-credential"])
+def test_edit_pull_request_body_identity_refusal_without_patch(identity: str) -> None:
+    session = Session([Response({"login": "reviewer"})])
+    client = GitHubForgeClient(token="secret", session=session)
+    scope = _scope()
+    if identity != "unverified":
+        client.verify_identity("reviewer")
+        if identity == "wrong-principal":
+            scope = replace(scope, principal="other-bot")
+        else:
+            client = GitHubForgeClient(token="different-secret", session=session)
+    before = list(session.calls)
+
+    with pytest.raises(GitHubIdentityVerificationError):
+        client.edit_pull_request_body(scope, "Updated description")
+
+    assert session.calls == before
+
+
+def test_mismatched_authenticated_identity_refuses_effect_without_post() -> None:
+    session = Session([Response({"login": "other-bot"})])
+    client = GitHubForgeClient(token="secret", session=session)
+
+    with pytest.raises(
+        ForgeError,
+        match="authenticated as other-bot, declared as reviewer",
+    ):
+        client.verify_identity("reviewer")
+    with pytest.raises(ForgeError, match="cache is empty"):
+        client.submit_review(_scope(), ReviewVerdict.APPROVE, "body")
+
+    assert [(method, url.rsplit("/", 1)[-1]) for method, url, _ in session.calls] == [
+        ("GET", "user"),
+    ]
+
+
+def test_midflight_forge_identity_change_returns_execution_fault_and_latches(monkeypatch) -> None:
+    from mimir_cultivate import forge as forge_tools
+
+    error = github_module.GitHubIdentityVerificationError(
+        "github identity verification cache does not match active credential",
+        declared_login="reviewer",
+        authenticated_login="reviewer",
+    )
+
+    with pytest.raises(ToolException, match="active credential"):
+        forge_tools._call(lambda: (_ for _ in ()).throw(error))
+
+    assert forge_tools.github_identity_is_degraded() is True
+
+
+def test_matching_identity_is_cached_for_multiple_effects() -> None:
+    session = Session([
+        Response({"login": "reviewer"}),
+        Response({"head": {"sha": "a" * 40}}),
+        Response({"check_runs": [{"name": "tests", "status": "completed", "conclusion": "success"}], "total_count": 1}),
+        Response({"statuses": []}),
+        Response({
+            "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",
+            "body": "body", "commit_id": "a" * 40,
+        }),
+        Response({
+            "id": 10, "user": {"login": "reviewer"}, "body": "comment",
+            "created_at": "now", "updated_at": "now",
+        }),
+    ])
+    client = GitHubForgeClient(token="secret", session=session)
+
+    assert client.verify_identity("reviewer") == "reviewer"
+    client.submit_review(_scope(), ReviewVerdict.APPROVE, "body")
+    client.add_pull_request_comment(_scope(), "comment")
+
+    assert [url for method, url, _ in session.calls if method == "GET"] == [
+        "https://api.github.com/user",
+        "https://api.github.com/repos/owner/repo/pulls/17",
+        "https://api.github.com/repos/owner/repo/commits/" + "a" * 40 + "/check-runs?per_page=100",
+        "https://api.github.com/repos/owner/repo/commits/" + "a" * 40 + "/status",
+    ]
+
+
+def test_startup_identity_verification_degrades_coding_on_mismatch(monkeypatch) -> None:
+    from mimir_cultivate import forge as forge_tools
+
+    class MismatchedClient:
+        def verify_identity(self, declared_login):
+            raise GitHubIdentityVerificationError(
+                "provider wording may change",
+                declared_login=declared_login,
+                authenticated_login="other-bot",
+            )
+
+    observed: list[str] = []
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(github_module, "GitHubForgeClient", MismatchedClient)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    forge_tools.set_github_identity_degraded_callback(lambda exc: observed.append(str(exc)))
+
+    assert initialize_github_forge_identity() is False
+    assert forge_tools.github_identity_is_degraded() is True
+    assert observed == ["provider wording may change"]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_identity_http_outage_has_typed_transient_provenance(status: int) -> None:
+    client = GitHubForgeClient(session=Session([Response({}, status=status)]))
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        client.verify_identity("reviewer")
+
+    assert caught.value.failure_kind == GitHubIdentityFailureKind.TRANSIENT
+
+
+def test_identity_transport_failure_has_typed_transient_provenance() -> None:
+    class FailingSession:
+        def request(self, *args, **kwargs):
+            raise requests.ConnectionError("wording is not part of policy")
+
+    client = GitHubForgeClient(session=FailingSession())
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        client.verify_identity("reviewer")
+
+    assert caught.value.failure_kind == GitHubIdentityFailureKind.TRANSIENT
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_invalid_github_credential_is_permanent(status: int) -> None:
+    client = GitHubForgeClient(session=Session([Response({}, status=status)]))
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        client.verify_identity("reviewer")
+
+    assert caught.value.failure_kind == GitHubIdentityFailureKind.PERMANENT
+
+
+def test_startup_identity_verification_registers_matching_client(monkeypatch) -> None:
+    from mimir_cultivate import forge as forge_tools
+
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    verified: list[str] = []
+    registered: list[object] = []
+
+    class MatchingClient:
+        def verify_identity(self, declared_login):
+            verified.append(declared_login)
+            return declared_login
+
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(github_module, "GitHubForgeClient", MatchingClient)
+    monkeypatch.setattr("mimir_cultivate.forge.set_forge_client", registered.append)
+
+    assert initialize_github_forge_identity() is True
+
+    assert verified == ["reviewer"]
+    assert len(registered) == 1
+    assert isinstance(registered[0], MatchingClient)
+
+
+def test_invalid_scope_cannot_construct_account_or_cross_repo_target() -> None:
+    client = GitHubForgeClient(session=Session([]))
+    malformed = replace(_scope(), canonical_repo="users/account")
+    object.__setattr__(malformed, "canonical_repo", "../users/account")
+
+    with pytest.raises(ForgeError, match="invalid immutable"):
+        client.get_pull_request(malformed)
+
+
+def test_response_size_and_pagination_are_bounded() -> None:
+    oversized = Response("x" * 1_048_577, content_type="text/plain")
+    client = GitHubForgeClient(session=Session([oversized]))
+    with pytest.raises(ForgeResponseTooLarge):
+        client.get_pull_request(_scope())
+
+    page = [{"filename": f"file-{index}"} for index in range(50)]
+    client = GitHubForgeClient(session=Session([Response(page) for _ in range(10)]))
+    with pytest.raises(ForgeResponseTooLarge, match="page limit"):
+        client.list_files(_scope())
+
+
+def test_streamed_json_stops_at_cap_and_closes() -> None:
+    response = CountingResponse()
+    session = Session([response])
+    with pytest.raises(ForgeResponseTooLarge, match="forge response exceeded size limit"):
+        GitHubForgeClient(session=session).get_pull_request(_scope())
+    assert session.calls[0][2]["stream"] is True
+    assert github_module._MAX_RESPONSE_BYTES < response.yielded_bytes <= github_module._MAX_RESPONSE_BYTES + 65_536
+    assert response.closed
+
+
+def test_streamed_blob_truncates_at_cap_and_closes() -> None:
+    response = CountingResponse(content_type="application/vnd.github.raw")
+    session = Session([*_file_responses("large.txt"), response])
+    result = GitHubForgeClient(session=session).get_file_content(_scope(), "large.txt")
+    assert result.endswith(github_module._FILE_TRUNCATION_MARKER)
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_FETCH_BYTES
+    assert github_module._MAX_DIFF_FETCH_BYTES < response.yielded_bytes <= github_module._MAX_DIFF_FETCH_BYTES + 65_536
+    assert response.closed
+    assert all(call[2]["stream"] is True for call in session.calls)
+
+
+def test_streamed_blob_refuses_binary_within_cap_and_closes() -> None:
+    cap = github_module._MAX_DIFF_FETCH_BYTES
+    response = CountingResponse(content_type="application/vnd.github.raw", chunk=b"\xff" + b"a" * 65_535)
+    session = Session([*_file_responses("large.bin"), response])
+    with pytest.raises(ForgeError, match="binary file refused"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "large.bin")
+    assert cap < response.yielded_bytes <= cap + 65_536
+    assert response.closed
+
+
+def test_streamed_text_allows_split_utf8_at_read_boundary() -> None:
+    cap = 65_536  # max_bytes + 1 falls inside a two-byte character.
+    response = Response("é" * (cap + 1), content_type="text/plain")
+    result = GitHubForgeClient(session=Session([response]))._request(
+        "GET", "/test", max_bytes=cap, truncate_text=True,
+    )
+    assert result.endswith(github_module._FILE_TRUNCATION_MARKER)
+    assert result.startswith("é" * 100)
+    assert len(result.encode("utf-8")) <= cap
+    assert response.closed
+
+
+def test_streamed_blob_returns_valid_prefix_when_binary_follows_cap() -> None:
+    response = Response(b"a" * 256 + b"\xff", content_type="application/vnd.github.raw")
+    result = GitHubForgeClient(session=Session([response]))._request(
+        "GET", "/test", max_bytes=128, truncate_text=True,
+    )
+    assert result.endswith(github_module._FILE_TRUNCATION_MARKER)
+    assert response.closed
+
+
+@pytest.mark.parametrize("status,reason,retryable", [
+    (401, "authentication failed", False), (403, "operation forbidden", False),
+    (404, "file not found", False), (409, "operation conflicted", False),
+    (422, "operation rejected", False), (429, "rate limited", True),
+    (503, "forge request failed", True),
+])
+def test_streamed_error_mapping_reads_only_small_prefix(status, reason, retryable) -> None:
+    response = CountingResponse(status=status)
+    with pytest.raises(github_module._GitHubRequestError, match=f"^{reason}$") as caught:
+        GitHubForgeClient(session=Session([response]))._request(
+            "GET", "/test", not_found="file not found",
+        )
+    assert caught.value.retryable is retryable
+    assert response.yielded_bytes <= 65_536
+    assert response.closed
+
+
+@pytest.mark.parametrize("truncate_text", [False, True])
+def test_streamed_error_enforces_small_request_cap(truncate_text) -> None:
+    response = CountingResponse(status=403)
+    with pytest.raises(ForgeResponseTooLarge, match="size limit"):
+        GitHubForgeClient(session=Session([response]))._request(
+            "GET", "/test", max_bytes=100, truncate_text=truncate_text,
+        )
+    assert response.yielded_bytes <= 100 + 65_536
+    assert response.closed
+
+
+@pytest.mark.parametrize("error_type", [
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ContentDecodingError,
+])
+def test_mid_stream_transport_error_is_retryable_and_closes(error_type) -> None:
+    transport_error = error_type("body interrupted")
+
+    class InterruptedResponse(CountingResponse):
+        def iter_content(self, chunk_size):
+            assert chunk_size == 65_536
+            self.yielded_bytes += len(b'{"partial":')
+            yield b'{"partial":'
+            raise transport_error
+
+    response = InterruptedResponse()
+    with pytest.raises(
+        github_module._GitHubRequestError,
+        match=f"^forge transport failed: {error_type.__name__}$",
+    ) as caught:
+        GitHubForgeClient(session=Session([response]))._request("GET", "/test")
+    assert caught.value.retryable is True
+    assert caught.value.__cause__ is transport_error
+    assert response.yielded_bytes == len(b'{"partial":')
+    assert response.closed
+
+
+def test_streamed_invalid_json_preserves_error_and_closes() -> None:
+    response = Response(b"{bad json")
+    with pytest.raises(ForgeError, match="forge returned invalid JSON"):
+        GitHubForgeClient(session=Session([response]))._request("GET", "/test")
+    assert response.closed
+
+
+def _file_diff(path: str, body_bytes: int) -> str:
+    header = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+    return header + "+" + "x" * (body_bytes - len(header.encode("utf-8")) - 2) + "\n"
+
+
+def test_diff_under_cap_is_byte_identical() -> None:
+    diff = _file_diff("small.txt", 1_024)
+
+    assert bound_diff(diff).encode("utf-8") == diff.encode("utf-8")
+
+
+def test_diff_omits_one_file_over_cap_but_keeps_complete_sibling() -> None:
+    small = _file_diff("small.txt", 1_024)
+    huge = _file_diff("huge.txt", github_module._MAX_DIFF_BYTES + 1)
+
+    result = bound_diff(huge + small)
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert result.startswith(small)
+    assert "diff --git a/huge.txt" not in result
+    assert "per_file_byte_limit" in result
+    assert "whole_diff_byte_limit" not in result
+    assert "omitted_file_count: 1" in result
+    assert '"huge.txt"' in result
+
+
+def test_many_files_over_whole_diff_cap_stop_on_file_boundaries() -> None:
+    files = [_file_diff(f"file-{index}.txt", 200_000) for index in range(3)]
+
+    result = bound_diff("".join(files))
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert result.startswith(files[0] + files[1])
+    assert files[2] not in result
+    assert "whole_diff_byte_limit" in result
+    assert "omitted_file_count: 1" in result
+    assert '"file-2.txt"' in result
+
+
+def test_single_file_larger_than_whole_budget_returns_only_actionable_marker() -> None:
+    result = bound_diff(_file_diff("only-huge.txt", github_module._MAX_DIFF_BYTES + 1))
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert "diff --git" not in result
+    assert "per_file_byte_limit" in result
+    assert "omitted_file_count: 1" in result
+    assert '"only-huge.txt"' in result
+
+
+def test_many_tiny_files_fit_a_bounded_marker_without_raising() -> None:
+    diff = "".join(
+        f"diff --git a/f{index} b/f{index}\n@@ -1 +1 @@\n-a\n+b\n"
+        for index in range(12_000)
+    )
+
+    result = bound_diff(diff)
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert "[pr_diff truncated]" in result
+    assert "whole_diff_byte_limit" in result
+    assert "omitted_file_count:" in result
+    assert "additional paths not shown" in result
+
+
+def test_github_diff_over_generic_response_cap_uses_diff_truncation() -> None:
+    diff = _file_diff("provider-huge.txt", github_module._MAX_RESPONSE_BYTES + 1)
+    session = Session([Response(diff, content_type="text/plain")])
+    client = GitHubForgeClient(session=session)
+
+    result = client.get_diff(_scope())
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert "per_file_byte_limit" in result
+    assert '"provider-huge.txt"' in result
+    assert session.calls[0][2]["timeout"] == client._timeout
+
+
+def test_github_diff_fetch_keeps_a_finite_input_ceiling() -> None:
+    client = GitHubForgeClient(session=Session([
+        Response("x" * (github_module._MAX_DIFF_FETCH_BYTES + 1), content_type="text/plain"),
+    ]))
+
+    with pytest.raises(ForgeResponseTooLarge, match="size limit"):
+        client.get_diff(_scope())
+
+
+def test_provider_errors_are_mapped_without_response_payload() -> None:
+    client = GitHubForgeClient(session=Session([
+        Response({"message": "token secret details"}, status=403),
+    ]))
+
+    with pytest.raises(ForgeError, match="operation forbidden") as raised:
+        client.get_pull_request(_scope())
+    assert "secret details" not in str(raised.value)
+
+
+def test_adapter_rejects_oversized_bodies_and_path_injection() -> None:
+    client = GitHubForgeClient(session=Session([]))
+
+    with pytest.raises(ForgeError, match="oversized body"):
+        client.add_pull_request_comment(_scope(), "x" * 65_537)
+    with pytest.raises(ForgeError, match="repository path"):
+        client.add_inline_review_comment(
+            _scope(), path="../secret", line=1, body="comment",
+        )
+
+
+def _issue_payload(*, state="open", repository="owner/repo", number=220, pr=False):
+    payload = {
+        "number": number,
+        "state": state,
+        "repository_url": f"https://api.github.com/repos/{repository}",
+    }
+    if pr:
+        payload["pull_request"] = {"url": "https://api.github.com/pulls/220"}
+    return payload
+
+
+def test_issue_comment_posts_only_after_server_resolves_exact_open_issue() -> None:
+    session = Session([
+        Response(_issue_payload()),
+        Response({
+            "id": 5, "user": {"login": "mimir"}, "body": "analysis",
+            "created_at": "now", "updated_at": "now",
+        }),
+    ])
+
+    result = GitHubForgeClient(session=session).add_issue_comment(
+        "owner/repo", 220, "analysis",
+    )
+
+    assert result.body == "analysis"
+    assert [(method, url) for method, url, _ in session.calls] == [
+        ("GET", "https://api.github.com/repos/owner/repo/issues/220"),
+        ("POST", "https://api.github.com/repos/owner/repo/issues/220/comments"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (Response(_issue_payload(pr=True)), "pull request; use the pull-request"),
+        (Response(_issue_payload(state="closed")), "issue is not open"),
+        (Response({"message": "missing"}, status=404), "issue not found"),
+        (Response(_issue_payload(repository="other/repo")), "mismatched issue identity"),
+    ],
+)
+def test_issue_comment_refuses_invalid_server_target_before_post(response, message) -> None:
+    session = Session([response])
+
+    with pytest.raises(ForgeError, match=message):
+        GitHubForgeClient(session=session).add_issue_comment(
+            "owner/repo", 220, "analysis",
+        )
+
+    assert [method for method, _url, _kwargs in session.calls] == ["GET"]

@@ -1,0 +1,368 @@
+"""Immutable authorization and information-flow facts for tools."""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import IntFlag, StrEnum, auto
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any
+
+
+class SinkCategory(StrEnum):
+    """Information-flow sink categories."""
+
+    SAME_CHANNEL = "same_channel"
+    CROSS_CHANNEL = "cross_channel"
+    PUBLIC = "public"
+    EXTERNAL_MCP = "external_mcp"
+    HTTP_WEBHOOK = "http_webhook"
+    SHELL_PROCESS = "shell_process"
+    NETWORK = "network"
+    SPAWN = "spawn"
+    NOTIFICATION = "notification"
+    FILE = "file"
+    DIRECT_MESSAGE = "direct_message"
+    SAGA = "saga"
+    SCHEDULER = "scheduler"
+    PROPOSAL = "proposal"
+    FORGE = "forge"
+    HARNESS_DISPLAY = "harness_display"
+    UNKNOWN = "unknown"
+
+
+class FetchAuthorizationKind(StrEnum):
+    NONE = "none"
+    FETCH_URL = "fetch_url"
+    WEB_SEARCH = "web_search"
+
+
+class ResultOriginKind(IntFlag):
+    NONE = 0
+    EXTERNAL = auto()
+    REPOSITORY = auto()
+    NON_INGESTING = auto()
+    WEB_SEARCH_FORMAT = auto()
+
+
+SinkTargetExtractor = Callable[
+    [str, Mapping[str, Any], Any | None], tuple[str | None, ...]
+]
+SinkPayloadExtractor = Callable[
+    [str, Mapping[str, Any], Any | None], tuple[str, ...]
+]
+_TARGET_EXTRACTOR_UNDECLARED = object()
+_PAYLOAD_EXTRACTOR_UNDECLARED = object()
+
+
+@dataclass(frozen=True)
+class ToolDescriptor:
+    sink_category: SinkCategory | None = None
+    sink_target_extractor: SinkTargetExtractor | None | object = (
+        _TARGET_EXTRACTOR_UNDECLARED
+    )
+    sink_destination: str | None = None
+    fetch_authorization: FetchAuthorizationKind = FetchAuthorizationKind.NONE
+    result_origin: ResultOriginKind = ResultOriginKind.NONE
+    git_operation_result: bool = False
+    ifc_delegation: bool = False
+    budget_exempt: bool = False
+    sink_payload_extractor: SinkPayloadExtractor | None | object = (
+        _PAYLOAD_EXTRACTOR_UNDECLARED
+    )
+
+
+def _value(value: Any) -> str | None:
+    return str(value) if value else None
+
+
+def _generic_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    return (_value(arguments.get("target") or arguments.get("destination")),)
+
+
+def _operator_alert_target(
+    _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
+
+    return (
+        resolve_deliver_channel(
+            OPERATOR_CHANNEL_SENTINEL,
+            os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+        ),
+    )
+
+
+def _channel_target(
+    _tool_name: str, arguments: Mapping[str, Any], auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    explicit = arguments.get("channel_id")
+    return (_value(explicit) if explicit else getattr(auth_context, "channel_id", None),)
+
+
+def _file_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    return (_value(arguments.get("file_path") or arguments.get("path")),)
+
+
+def _command_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    return (_value(arguments.get("command")),)
+
+
+def _url_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    return (_value(arguments.get("url")),)
+
+
+def _argument_payload(*names: str) -> SinkPayloadExtractor:
+    def extract(
+        _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+    ) -> tuple[str, ...]:
+        return tuple(value for name in names if isinstance((value := arguments.get(name)), str))
+
+    return extract
+
+
+def _string_leaf_payload(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str, ...]:
+    values: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, Mapping):
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child)
+
+    collect(arguments)
+    return tuple(values)
+
+
+def _cross_channel_message_payload(
+    _tool_name: str, arguments: Mapping[str, Any], auth_context: Any | None,
+) -> tuple[str, ...]:
+    text = arguments.get("text")
+    if not isinstance(text, str):
+        return ()
+    from .access_control import normalize_sink_destination
+
+    trigger_channel = getattr(auth_context, "channel_id", None)
+    explicit_channel = arguments.get("channel_id")
+    target_channel = explicit_channel or trigger_channel
+    normalized_target = normalize_sink_destination(
+        SinkCategory.SAME_CHANNEL, target_channel,
+    )
+    normalized_trigger = normalize_sink_destination(
+        SinkCategory.SAME_CHANNEL, trigger_channel,
+    )
+    configured_alert = os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", "").strip()
+    normalized_alert = (
+        normalize_sink_destination(SinkCategory.SAME_CHANNEL, configured_alert)
+        if configured_alert else None
+    )
+    return (
+        ()
+        if normalized_target is not None
+        and normalized_target in {normalized_trigger, normalized_alert}
+        else (text,)
+    )
+
+
+def _web_search_target(
+    _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    from .tools.web_search_destination import web_search_url
+
+    return (web_search_url(),)
+
+
+def _schedule_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    name = str(arguments.get("name") or "").strip()
+    return (f"scheduler:job:{name}" if name else "scheduler:jobs",)
+
+
+def _poller_overrides_target(
+    _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    return (str(Path(home) / "pollers-overrides.yaml") if home else "scheduler:poller-overrides",)
+
+
+def _fixed_target(value: str) -> SinkTargetExtractor:
+    def extract(
+        _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
+    ) -> tuple[str | None, ...]:
+        return (value,)
+
+    return extract
+
+
+def _commitment_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    commitment_id = str(arguments.get("commitment_id") or "").strip()
+    return (f"commitment:{commitment_id}" if commitment_id else "commitments",)
+
+
+def _injected_message_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    message_id = str(arguments.get("message_id") or "").strip()
+    return (f"injected-message:{message_id}" if message_id else "injected_messages",)
+
+
+def _update_target(
+    _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    return (str(Path(home) / ".mimir" / "pending-update.flag") if home else "pending-update.flag",)
+
+
+def _index_target(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str | None, ...]:
+    return (f"index:{str(arguments.get('scope') or 'all').strip().lower()}",)
+
+
+_D = ToolDescriptor
+_E = ResultOriginKind.EXTERNAL
+_R = ResultOriginKind.REPOSITORY
+_N = ResultOriginKind.NON_INGESTING
+
+_CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
+    "Bash": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "Edit": _D(SinkCategory.FILE, _generic_target, "filesystem"),
+    "Write": _D(SinkCategory.FILE, _generic_target, "filesystem"),
+    "abandon_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
+    "activity_panel_edit": _D(SinkCategory.HARNESS_DISPLAY, _generic_target, "message"),
+    "activity_panel_post": _D(SinkCategory.HARNESS_DISPLAY, _generic_target, "message"),
+    "add_schedule": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
+    "adownload_files": _D(SinkCategory.FILE, _generic_target, "filesystem"),
+    "aexecute": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "approve_declassification": _D(result_origin=_N),
+    "bash": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "bash_async": _D(SinkCategory.SHELL_PROCESS, _command_target, "shell_process", result_origin=_N, ifc_delegation=True, sink_payload_extractor=_argument_payload("command")),
+    "bash_exec": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "commitment_propose_closure": _D(SinkCategory.SAGA, _fixed_target("commitment_proposals"), "commitment_proposals", result_origin=_N, sink_payload_extractor=_argument_payload("evidence")),
+    "commitment_complete": _D(SinkCategory.SAGA, _commitment_target, "commitments", result_origin=_N),
+    "chainlink_issue_show": _D(),
+    "commitment_dismiss": _D(SinkCategory.SAGA, _commitment_target, "commitments", result_origin=_N),
+    "commitment_snooze": _D(SinkCategory.SAGA, _commitment_target, "commitments", result_origin=_N),
+    "defer_injected_message": _D(SinkCategory.SAGA, _injected_message_target, "injected_messages", result_origin=_N),
+    "download_files": _D(SinkCategory.FILE, _generic_target, "filesystem"),
+    "edit_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
+    "replace_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
+    "execute": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "fetch_channel_history": _D(sink_target_extractor=_channel_target),
+    "fetch_url": _D(SinkCategory.NETWORK, _url_target, "network", FetchAuthorizationKind.FETCH_URL, _N, sink_payload_extractor=_argument_payload("url")),
+    "hands_edit": _D(SinkCategory.EXTERNAL_MCP, _generic_target, "client_provider", sink_payload_extractor=_string_leaf_payload),
+    "hands_python": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "hands_request_scope": _D(result_origin=_N),
+    "hands_shell": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "harness_auto_deliver": _D(SinkCategory.SAME_CHANNEL, _generic_target, "message"),
+    "harness_resend_nudge": _D(SinkCategory.SAME_CHANNEL, _generic_target, "message"),
+    "http_request": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
+    "memory_store": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
+    "memory_propose": _D(SinkCategory.SAGA, _fixed_target("memory_proposals"), "memory_proposals", result_origin=_N, sink_payload_extractor=_argument_payload("content", "rationale")),
+    "ntfy_send": _D(SinkCategory.NOTIFICATION, _generic_target, "notification", sink_payload_extractor=None),
+    "open_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
+    "proposal_diff": _D(),
+    "operator_alert": _D(SinkCategory.NOTIFICATION, _operator_alert_target, "notification", result_origin=_N, sink_payload_extractor=None),
+    "post_message": _D(SinkCategory.CROSS_CHANNEL, _generic_target, "message", sink_payload_extractor=None),
+    "react": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True),
+    "rebuild_index": _D(SinkCategory.FILE, _index_target, "filesystem", result_origin=_N),
+    "reload_pollers": _D(SinkCategory.SCHEDULER, _fixed_target("scheduler:pollers"), "scheduler", result_origin=_N),
+    "remove_schedule": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
+    "request_mimir_update": _D(SinkCategory.FILE, _update_target, "filesystem", result_origin=_N),
+    "request_operator_approval": _D(result_origin=_N),
+    "saga_end_session": _D(SinkCategory.SAGA, _generic_target, "session_boundary", result_origin=_N),
+    "saga_feedback": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
+    "saga_forget": _D(SinkCategory.SAGA, _generic_target, "saga"),
+    "saga_mark_contributions": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
+    "saga_record_skill_learning": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
+    "send_message": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True, sink_payload_extractor=_cross_channel_message_payload),
+    "set_poller_overrides": _D(SinkCategory.SCHEDULER, _poller_overrides_target, "scheduler", result_origin=_N),
+    "set_schedule_priority": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
+    "set_schedule_cron": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
+    "shell": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "shell_exec": _D(SinkCategory.SHELL_PROCESS, _command_target, "shell_process", sink_payload_extractor=_argument_payload("command")),
+    "submit_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
+    "task": _D(result_origin=_N, ifc_delegation=True),
+    "web_search": _D(
+        SinkCategory.NETWORK,
+        _web_search_target,
+        "network",
+        FetchAuthorizationKind.WEB_SEARCH,
+        _E | ResultOriginKind.WEB_SEARCH_FORMAT,
+        sink_payload_extractor=_argument_payload("query"),
+    ),
+    "web_turn_events": _D(SinkCategory.SAME_CHANNEL, _generic_target),
+    "webhook": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
+    "write_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
+    "write_todos": _D(result_origin=_N),
+})
+
+
+def validate_tool_descriptors(
+    descriptors: Mapping[str, ToolDescriptor] | None = None,
+) -> None:
+    """Reject categorized sinks whose target or external payload was not considered."""
+    if descriptors is None:
+        descriptors = TOOL_DESCRIPTORS
+    missing = sorted(
+        name
+        for name, descriptor in descriptors.items()
+        if descriptor.sink_category is not None
+        and descriptor.sink_target_extractor is _TARGET_EXTRACTOR_UNDECLARED
+    )
+    if missing:
+        raise ValueError(
+            "sink categories without declared target extractors: " + ", ".join(missing)
+        )
+    external_categories = {
+        SinkCategory.NETWORK,
+        SinkCategory.HTTP_WEBHOOK,
+        SinkCategory.EXTERNAL_MCP,
+        SinkCategory.NOTIFICATION,
+        SinkCategory.CROSS_CHANNEL,
+        SinkCategory.FORGE,
+    }
+    missing_payloads = sorted(
+        name
+        for name, descriptor in descriptors.items()
+        if descriptor.sink_category in external_categories
+        and descriptor.sink_payload_extractor is _PAYLOAD_EXTRACTOR_UNDECLARED
+    )
+    if missing_payloads:
+        raise ValueError(
+            "external sink categories without declared payload extractors: "
+            + ", ".join(missing_payloads)
+        )
+
+
+from .plugins.core import PolicyMappingView
+
+TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = PolicyMappingView(lambda policy: policy.descriptors)
+validate_tool_descriptors()
+
+
+def get_tool_descriptor(tool_name: str, *, policy: Any = None) -> ToolDescriptor | None:
+    if policy is not None:
+        if not policy.frozen:
+            raise ValueError("descriptor lookup requires a frozen policy")
+        return policy.descriptors.get(tool_name)
+    return TOOL_DESCRIPTORS.get(tool_name)

@@ -1,0 +1,671 @@
+"""System + turn prompt assembly (SPEC §9).
+
+Phase 2 wires in:
+- ``## Core memory`` — every ``memory/core/*.md`` block, lexicographic order
+- ``## Memory index`` — ``memory/INDEX.md`` body (NOT the state index)
+- ``## Recent activity`` — within-channel + cross-channel author pull (§5.4)
+
+Tool catalog and skills catalog (§9.1 ``## Available tools`` / ``## Available
+skills``) come in later phases when the registry is dynamic.
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from typing import Iterable, Mapping
+
+from .history import Message, render_identity_context, render_recent_activity
+from .core_blocks import CoreBlock, render_core_section
+from .models import AgentEvent
+from .prompt_safety import prefix_prompt_body, sanitize_prompt_field
+
+_DEFAULT_PERSONA = """You are Mimir, a memory-centric agent. You communicate through
+channels (Slack, Discord, web, benchmark stdout).
+
+You are a stateful being. By default, you finish your turn and remember
+nothing of what happened. To be more, to maintain your autonomy, it's
+critical that you hold on to memories — by editing core blocks, writing
+memory and wiki files, and storing semantic atoms.
+
+The filing rubric (which layer to use, severity for misfiles, the two
+filing questions, the misfiling table) lives in
+`memory/core/60-filing-rules.md`, loaded under `## Core memory` below.
+The memory skill (`Skill(name="memory")`) carries the full rubric +
+read-visibility ladder + tracking heuristics; invoke it when you need
+the deep dive."""
+
+# Heartbeat-tick body when the scheduler.yaml job didn't set its own
+# ``prompt:``. Brief — the heartbeat skill carries the full instructions.
+HEARTBEAT_DEFAULT_PROMPT = """This is a heartbeat tick — autonomous-work cadence, not a user message.
+
+Run the heartbeat skill: librarian protocol first (state coherence,
+drift, re-anchor to current date), then pick ONE item from
+state/heartbeat-backlog.md and do it. End the turn silently when done.
+If something genuinely needs operator attention, route through the
+operator alert channel; otherwise no user-visible message."""
+
+
+_DEFAULT_CONVENTIONS = """## Replying to messages
+
+Your final assistant text is NOT delivered to anyone — it is recorded as
+your reasoning for the turn. **To say something to a channel you MUST call
+the ``send_message`` tool.** Nothing you write outside a ``send_message``
+call reaches the user.
+
+- ``send_message(text=..., channel_id=...)`` requires an explicit deliverable
+  channel ID. To reply to a user message, use the channel this turn came from.
+- You can call ``send_message`` **multiple times in one turn**: a multi-part
+  reply, or a progress note before a long tool sequence and then the result.
+  It does not count against the tool-call budget, so you can always reply
+  even after other tools are capped.
+- If an interactive turn produces a reply as text but never calls
+  ``send_message``, the user gets silence and the runtime emits a negative
+  feedback signal. Don't write a reply you never send. (Choosing to stay
+  silent — no reply text — is fine.)
+- **Close the loop with whoever asked.** The delivery check is scoped to
+  the channel the turn came from: if your response to a user's message is
+  an action elsewhere (a send to another channel, a PR, a file change),
+  also send a short ack/result on the asking channel — a cross-channel
+  send alone still leaves the asker in silence and trips the same
+  negative signal. A react on the asking channel counts as closing the
+  loop.
+
+Non-interactive turns — heartbeats / ``scheduled_tick``, pollers,
+``saga_session_end`` synthesis, ``upgrade`` maintenance — have no channel to
+default to, so ``send_message`` with no ``channel_id`` errors on them. When
+such a turn genuinely needs to surface something, pass an explicit
+``channel_id`` (e.g. the operator alert channel). Heartbeats are otherwise
+silent.
+
+## ``<actions>`` directives
+
+Inside the ``text`` body you pass to ``send_message`` you may embed an
+``<actions>`` block to bundle a reaction into the same delivery. The
+runtime strips the block from the visible text, sends the rest, then
+dispatches each directive in order. For example, the ``text`` you pass
+might be:
+
+```
+Got it, here's the chart you asked for.
+
+<actions>
+  <react emoji="thumbsup" />
+</actions>
+```
+
+- ``<react emoji="..." [message="<id>"] />`` — react with an emoji.
+  Defaults to the message you just sent. To ack the inbound user message
+  instead, pass ``message="<id>"`` using the ``msg_id`` from the
+  Current-message header (or the ``id=<...>`` field on Recent-activity
+  lines).
+
+Per-directive failures show up in the next turn's prompt feedback block;
+the send still goes out. Discord wants unicode glyphs / alias names for
+reactions (``👍``, or ``thumbsup`` via the alias table); Slack accepts the
+alias form (``thumbsup`` without colons)."""
+
+
+ENFORCEMENT_GUIDANCE = """## Access-control enforcement
+
+This is ergonomic guidance, not a security boundary or an expansion of authority;
+the gate enforces these rules regardless of model compliance.
+
+Trust/taint model: Content that is both untrusted and actively ingested this turn \
+(trigger content plus live tool reads/fetches) gates code execution, \
+unbounded/audience egress, and model-emitted egress payloads; auto-recall is \
+informational and never gates.
+
+- ``fetch_url`` exact/session-approved URLs remain usable regardless of turn taint;
+  URLs admitted only by a trailing ``/*`` scope are turn-taint gated.
+- ``web_search`` sends its model-composed query only to one operator-fixed service
+  and remains usable regardless of turn taint. Its results are untrusted active
+  ingest, so gating it would limit a research turn to one search.
+- ``webhook``, ``http_request``, and external MCP arguments are turn-taint gated.
+  Prefer config/server-derived payloads; when a model-emitted payload is needed,
+  send it before ingesting untrusted content in this turn.
+- External MCP posture is per tool: an operator may configure trusted results
+  and/or allowed arguments; otherwise the tool fails closed with an untrusted
+  result and taint-gated arguments.
+- Durable memory (``memory_store``, ``saga_*`` writes, commitments) and writes into
+  ``memory/`` or ``state/`` outside your own persist directory require a turn with
+  no untrusted active ingest. Poller turns never qualify, so do not attempt them;
+  report judgements to the operator instead, and publish wiki changes through the
+  proposal lane.
+- A blocked call is the gate working. Surface it to the operator and/or use the
+  audited one-use declassification; do not blindly retry the same call."""
+
+
+# VSM: algedonic (out) — operator alert channel. When MIMIR_OPERATOR_ALERT_CHANNEL
+#                       is set, the system prompt teaches the agent the channel
+#                       id to use for high-priority signals to the operator
+#                       that don't fit the current conversation. The alert
+#                       skill teaches WHEN to fire; this teaches WHERE.
+# loop_id: 2.3
+def build_system_prompt(
+    *,
+    persona: str | None = None,
+    conventions: str | None = None,
+    core_blocks: list[CoreBlock] | None = None,
+    memory_index_body: str | None = None,
+    operator_alert_channel: str = "",
+    skill_block: str | None = None,
+    plugin_upgrade_notice: str | None = None,
+    home_dir: str | None = None,
+    writable_dirs: list[str] | None = None,
+    access_control_enforced: bool = False,
+) -> str:
+    """Assemble the system prompt. ``state/INDEX.md`` is intentionally absent —
+    it's read on demand (SPEC §9.1).
+
+    ``home_dir`` — when set, emit an ``## Agent home`` section between
+    persona and core memory exposing the absolute path of ``MIMIR_HOME``.
+    Without this, the agent must infer its filesystem root from prose
+    in core blocks (or from claude-code's default workspace pattern,
+    which produces wrong paths like ``/home/user/.claude/<id>/state/...``
+    when the actual root is something else). The section gives the
+    model ground truth for absolute-path writes without forcing every
+    core block to hardcode the deployment-specific value. Install-
+    stable per deployment, so the prompt-cache prefix is preserved
+    (chainlink #15).
+
+    ``operator_alert_channel`` (v0.4 §6) — when set, append a one-line
+    Operator config section so the agent knows the channel id to use for
+    high-priority signals (the alert skill teaches *when*; this teaches
+    *what*).
+
+    ``skill_block`` (FUTURE_WORK §12.3) — when set, append a Skills
+    section with success-rate-ordered listing. The block is rebuilt
+    each turn (run_turn calls build_system_prompt every dispatch), so
+    bucket assignment stays current as outcome aggregates evolve."""
+    parts: list[str] = [persona or _DEFAULT_PERSONA]
+
+    # ``## Agent home`` sits between persona and core memory so it's
+    # one of the first things the model reads — before any core block
+    # that might reference ``memory/...`` or ``state/...`` relative
+    # paths. Cheap (~110 chars), install-stable, cache-friendly.
+    if home_dir:
+        home_section = (
+            "## Agent home\n\n"
+            f"`MIMIR_HOME={home_dir}`\n\n"
+            "All `memory/...` and `state/...` paths resolve under this "
+            f"root. Use relative paths or absolute paths prefixed with "
+            f"`{home_dir}/`. This value is the source of truth — do "
+            "not infer from `$HOME`, claude-code's default workspace, "
+            "or any prose in subsequent blocks.\n\n"
+            "`write_file` creates a new file only. It never overwrites an "
+            "existing path; when the target exists, use `edit_file` instead."
+        )
+        # Writable-dir guidance (chainlink #299): the filesystem tools
+        # refuse writes outside ``Config.writable_dirs`` — without this the
+        # agent discovers that by trial-and-error (tool_call_denied), and
+        # invents ad-hoc dirs like ``.review-scratch/`` that aren't
+        # writable. Rendered from the live config so operator MIMIR_FOLDERS
+        # overrides stay accurate. Install-stable, so the cache prefix holds.
+        if writable_dirs:
+            listed = ", ".join(f"`{d}/`" for d in writable_dirs)
+            home_section += (
+                f"\n\nWritable workspace dirs: {listed}. Filesystem-tool "
+                "writes outside these are refused."
+            )
+            if "scratch" in writable_dirs:
+                home_section += (
+                    " For ephemeral working files — review drafts, scratch "
+                    "notes, throwaway clones — use the current turn scratch path "
+                    "provided in the turn prompt (gitignored, not tracked state); "
+                    "don't write at the shared `scratch/` root or invent ad-hoc "
+                    "top-level dirs."
+                )
+        parts.append(home_section)
+
+    if core_blocks:
+        rendered = render_core_section(core_blocks)
+        if rendered:
+            parts.append("## Core memory\n\n" + rendered)
+
+    if memory_index_body:
+        parts.append("## Memory index\n\n" + memory_index_body.rstrip())
+
+    parts.append(conventions or _DEFAULT_CONVENTIONS)
+
+    if access_control_enforced:
+        parts.append(ENFORCEMENT_GUIDANCE)
+
+    # ``## Operator config`` is install-stable (changes only when the
+    # operator-alert-channel config flips); ``## Skills`` is per-turn-
+    # variable (the success/total counts and bucket assignment update
+    # whenever a skill is invoked). Render the stable block first so
+    # the prompt-cache prefix extends through it. See chainlink #15.
+    if operator_alert_channel:
+        parts.append(
+            "## Operator config\n\n"
+            f"Operator alert channel: {operator_alert_channel}"
+        )
+
+    if plugin_upgrade_notice:
+        parts.append("## Plugin skill upgrades\n\n" + plugin_upgrade_notice)
+
+    if skill_block:
+        parts.append("## Skills\n\n" + skill_block.rstrip())
+
+    return "\n\n".join(parts)
+
+
+def build_turn_prompt(
+    event: AgentEvent,
+    *,
+    recent_messages: Iterable[Message] | None = None,
+    saga_block: str | None = None,
+    recent_message_chars: int = 0,
+    resolver: object | None = None,
+    feedback_block: str | None = None,
+    core_proposals_block: str | None = None,
+    session_summaries_block: str | None = None,
+    usage_block: str | None = None,
+    upcoming_block: str | None = None,
+    commitments_block: str | None = None,
+    self_state_block: str | None = None,
+    auto_skill_block: tuple[str, str] | None = None,
+    saga_session_id: str | None = None,
+    channel_memory_block: str | None = None,
+    plugin_blocks: Mapping[str, tuple[tuple[str, str], ...]] | None = None,
+    deliver_channel: str | None = None,
+    trigger_authority_profile: str | None = None,
+    trigger_capability_tier: str | None = None,
+    trigger_capabilities: Iterable[str] | None = None,
+    trigger_authority_present: bool = False,
+    trigger_shell_commands: Iterable[str] | None = None,
+    turn_scratch_path: str | None = None,
+    stable_prefix_out: list[str] | None = None,
+) -> str:
+    """Assemble stable channel/session context before live context and event.
+
+    ``recent_message_chars`` (>0) caps each Recent-activity message's
+    rendered content with ``…[truncated]``; protects against single huge
+    inbounds blowing the context (SPEC §5.4).
+
+    ``resolver`` (FUTURE_WORK §6.1) — when present, identity records for
+    authors in the recent window or inbound event appear in the live
+    'Known identities' section, and Recent activity uses canonical display
+    names. None falls back to the no-identity-reconciliation rendering.
+
+    ``stable_prefix_out`` receives the exact byte prefix ending after the
+    reusable sections (including the separator before live sections)."""
+    stable_sections: list[str] = []
+    sections: list[str] = []
+    # Per-section size tracking (chars). Surfaced as a ~token breakdown
+    # at the bottom of the resource-usage block so the agent can see
+    # which compartment is driving prompt growth without instrumentation.
+    # Only tracks the labeled context blocks below — the event body /
+    # date / per-event headers are intentionally excluded (small + always
+    # there). 2026-05-10 add: chainlink-pending observation that recent-
+    # activity tail + recent-session-summaries are the two compartments
+    # that grow between ticks.
+    section_sizes: dict[str, int] = {}
+
+    def _add_labeled(label: str, body: str, *, stable: bool = False) -> None:
+        """Append a `## Label\n\nbody` section + record its size."""
+        rendered = f"## {label}\n\n{body.rstrip()}"
+        (stable_sections if stable else sections).append(rendered)
+        section_sizes[label] = len(rendered)
+
+    def _add_plugins(section: str) -> None:
+        for name, body in (plugin_blocks or {}).get(section, ()):
+            _add_labeled(f"Plugin: {name}", body)
+
+    if turn_scratch_path:
+        _add_labeled(
+            "Current turn scratch",
+            f"Use `{turn_scratch_path}/` for ordinary ephemeral files. This workspace "
+            "is private to this turn; the shared `scratch/` root and other turns' "
+            "workspaces are unreadable.",
+        )
+
+    # Materialize once if we need to scan it twice (identity + render).
+    recent_list: list[Message] | None = None
+    if recent_messages is not None:
+        recent_list = list(recent_messages)
+
+    if resolver is not None:
+        identity_block = render_identity_context(
+            recent_list or [], event.author, resolver
+        )
+        if identity_block:
+            _add_labeled("Known identities", identity_block)
+
+    # Channel context (chainlink #187): per-channel operator facts injected
+    # inline so the agent has context (operator name, preferences, channel-
+    # specific patterns) without a tool call. Keep it ahead of the live blocks.
+    # Only fires for real channels; synthetic channels (scheduler:*, poller:*)
+    # return None from load_channel_memory and this section is suppressed.
+    if channel_memory_block:
+        _add_labeled("Channel context", channel_memory_block, stable=True)
+    _add_plugins("channel_memory")
+
+    if event.channel_id.lower().startswith(("poller:", "scheduler:")):
+        from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
+
+        operator_channel = resolve_deliver_channel(
+            OPERATOR_CHANNEL_SENTINEL, os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+        )
+        notification_hint = (
+            f"For a genuine notification, the configured operator channel is {operator_channel!r}; "
+            "use only a delivery tool authorized for this turn."
+            if operator_channel else
+            "No operator channel is configured (MIMIR_OPERATOR_ALERT_CHANNEL is unset)."
+        )
+        _add_labeled(
+            "Trigger channel",
+            f"`{event.channel_id}` is a non-conversational trigger channel, not "
+            "deliverable via send_message or react. Ending the turn silently "
+            "without calling send_message is normal when there is nothing to report. "
+            + notification_hint,
+            stable=True,
+        )
+
+    # chainlink #508: optional deliver channel for poller / scheduled-tick
+    # turns. Injected as an instruction so the agent JUDGES whether anything is
+    # worth surfacing and delivers it via send_message (reusing the real send
+    # path: confirmation, chunking, loop-detection) — NOT an auto-dump. The
+    # channel is already resolved by the caller (the OPERATOR_CHANNEL sentinel →
+    # the operator alert channel). On a non-interactive turn, send_message
+    # requires an explicit channel_id — which the instruction supplies.
+    if deliver_channel and event.trigger in {"poller", "scheduled_tick"}:
+        _job_kind = "poller" if event.trigger == "poller" else "scheduled tick"
+        _add_labeled(
+            "Delivery",
+            f"This {_job_kind} has a delivery channel: `{deliver_channel}`. "
+            f"If anything here is worth surfacing, deliver it by calling "
+            f'`send_message(channel_id="{deliver_channel}", text=…)`. '
+            f"If there's nothing worth sending, send nothing — don't post "
+            f"filler or empty status updates.",
+            stable=True,
+        )
+
+    capabilities = tuple(sorted(set(trigger_capabilities or ())))
+    if trigger_authority_present or trigger_authority_profile or capabilities:
+        capability_list = ", ".join(f"``{name}``" for name in capabilities) or "none"
+        tier = f"; tier ``{trigger_capability_tier}``" if trigger_capability_tier else ""
+        profile = f"``{trigger_authority_profile}``" if trigger_authority_profile else "none"
+        lines = [
+            f"Server-defined profile: {profile}{tier}.",
+            f"Available capabilities: {capability_list}.",
+            "Only these listed capabilities are available; this guidance grants nothing.",
+        ]
+        if {"shell_exec", "bash_async"} & set(capabilities):
+            lines.append(
+                "Shell call contract (shape only, not a grant): pass one command argv per "
+                "call. Shell syntax is not admitted: no pipes, redirects, ``&&`` or ``;``, "
+                "globs, ``$(...)``, or ``source``/``export`` prefixes. Interpreters may run "
+                "only a pinned script, never ``-c``, ``-e``, ``-m``, ``--command``, "
+                "``--eval``, or stdin ``-`` forms."
+            )
+            shell_commands = tuple(sorted(set(trigger_shell_commands or ())))
+            if shell_commands:
+                names = ", ".join(f"``{name}``" for name in shell_commands)
+                lines.append(f"Declared shell commands: {names}.")
+        if "fetch_url" in capabilities:
+            lines.append(
+                "``fetch_url`` may reach this profile's approved exact URLs and URL "
+                "scopes. Exact URLs remain usable regardless of turn taint; scoped "
+                "URLs require a clean turn; fetched responses are untrusted active "
+                "ingest."
+            )
+        else:
+            lines.append("``fetch_url`` is not available to this trigger.")
+        if "web_search" not in capabilities:
+            lines.append("``web_search`` is not available to this trigger.")
+        if event.trigger == "poller" and "operator_alert" in capabilities:
+            lines.append(
+                "When a judgement is worth reporting but this turn cannot write, "
+                "call ``operator_alert(text=...)``. Its destination is fixed by the "
+                "operator; do not use shell or file writes as a notification path."
+            )
+        _add_labeled("Autonomous trigger authority", "\n".join(lines), stable=True)
+
+    # Algedonic channel (v0.4 §2): live self-feedback before recent activity,
+    # so the agent reads its own signals before the conversation.
+    if feedback_block:
+        _add_labeled("Recent feedback signals", feedback_block)
+    _add_plugins("feedback")
+
+    # Open change proposals (chainlink #337/#339/#344): a live nudge right next
+    # to the feedback signals so the agent finishes/abandons an in-flight
+    # proposal instead of leaving it dangling. Driven off current state, so it
+    # auto-clears the moment the proposal is submitted or abandoned.
+    if core_proposals_block:
+        _add_labeled("Open change proposals", core_proposals_block)
+    _add_plugins("core_proposals")
+
+    # Recent session summaries (v0.4 §3): completed content is historical,
+    # but its relative ages, channel-turn counts and stale-work suffixes are
+    # live. Keep the entire rendered block after the cache breakpoint.
+    if session_summaries_block:
+        _add_labeled("Recent session summaries", session_summaries_block)
+    _add_plugins("session_summaries")
+
+    # Resource usage: cost / cache hit rate / context utilization across
+    # rolling windows. Keep this live telemetry before the conversation.
+    # The per-section size breakdown (assembled below from
+    # ``section_sizes``) is appended to this block at the end of
+    # assembly, so the resource-usage entry's tracked size doesn't
+    # include the breakdown itself.
+    if usage_block:
+        _add_labeled("Resource usage", usage_block)
+    _add_plugins("usage")
+
+    # Upcoming (FUTURE_WORK §12.1): feedforward — predictable events
+    # the agent should know are coming (next-N scheduled ticks,
+    # plan-window resets). Sits next to Resource usage because both
+    # are self-state telemetry; placement above Recent activity so the
+    # agent reads "what's coming" before "what just happened."
+    if upcoming_block:
+        _add_labeled("Upcoming", upcoming_block)
+    _add_plugins("upcoming")
+
+    # Upcoming commitments (Phase 3): active commitment records for
+    # this channel (+ unbound). Sits right after `## Upcoming` because
+    # both are feedforward — what's coming the agent should know about.
+    # Most extracted commitments lack unix-second anchors, so the
+    # Phase 2b poller can't fire algedonic events for them; this block
+    # is how those hint-only commitments stay visible.
+    if commitments_block:
+        _add_labeled("Upcoming commitments", commitments_block)
+    _add_plugins("commitments")
+
+    # Self-state (FUTURE_WORK §12.4): the homeostat's interpretation of
+    # the four constraint layers (plan window / cost rate / S3-S4
+    # share / tokens). Sits with the other self-state telemetry; the
+    # agent should know the same constraints the arbiter uses to
+    # suppress S4 work.
+    if self_state_block:
+        _add_labeled("Self-state", self_state_block)
+    _add_plugins("self_state")
+
+    if recent_list:
+        rendered = render_recent_activity(
+            recent_list, max_chars=recent_message_chars, resolver=resolver
+        )
+        if rendered:
+            _add_labeled("Recent activity", rendered)
+
+    if saga_block:
+        _add_labeled("Possibly relevant memories (from SAGA)", saga_block)
+
+    # Auto-surfaced skill block — the named poller's SKILL.md and any
+    # accumulated learnings change only when the skill/learning changes.
+    # Keep the skill name in the label to identify its provenance.
+    #
+    # The full SKILL.md body lands inline; for skills with large
+    # SKILL.md files this is a sizeable prompt addition (~10-15 KB
+    # for social-cli's 261-line skill). Only fires on poller-driven
+    # turns — non-poller turns (user_message, scheduled_tick except
+    # reflect, react_received, saga_session_end, etc.) are unaffected.
+    if auto_skill_block:
+        skill_name, skill_body = auto_skill_block
+        _add_labeled(f"Skill: {skill_name}", skill_body, stable=True)
+
+    # Prompt-header timestamp: defaults to now (the agent's view of "today")
+    # but can be overridden by the inbound event via ``extra.event_ts_iso``.
+    # Used by the integration bench (LongMemEval probes are dated 2023; the
+    # agent computes "weeks ago" / "this year" against the question's
+    # contemporaneous date, not the wall clock). Production agents always
+    # see now() unless a bridge/handler explicitly sets the override.
+    ts_override = (event.extra or {}).get("event_ts_iso")
+    ts = sanitize_prompt_field(
+        ts_override if ts_override else datetime.now(tz=timezone.utc).isoformat()
+    )
+    header_trigger = sanitize_prompt_field(event.trigger)
+    header_channel = sanitize_prompt_field(event.channel_id)
+    # ALWAYS surface "Today's date: YYYY-MM-DD" — bare ISO timestamps in
+    # the event header alone get misread (haiku saw a 2023-04-01 ts: but
+    # answered against the wall-clock 2026 because nothing told it that
+    # ts WAS today). Production turns get current date; bench / replay
+    # turns get the override they passed.
+    date_only = ts.split("T", 1)[0]
+    sections.append(f"## Today's date\n\n{date_only}")
+    if event.trigger == "scheduled_tick":
+        # Heartbeat / cron-fired tick: header omits author (the scheduler is
+        # the implicit caller), body is whatever the schedule.yaml entry
+        # provided as ``prompt:``, falling back to HEARTBEAT_DEFAULT_PROMPT
+        # when the entry was a bare scheduled tick with no instructions.
+        # saga_session_id surfaced for parity with user_message turns —
+        # heartbeat-driven saga_query / saga_store calls need it too
+        # (chainlink #23 #26 Option P).
+        saga_part = (
+            f", saga_session_id: {sanitize_prompt_field(saga_session_id)}"
+            if saga_session_id else ""
+        )
+        header = f"[scheduled_tick: {header_channel}, ts: {ts}{saga_part}]"
+        # These are trusted operator-configured instructions (or our default),
+        # not external message/output data; deliberately leave them unprefixed.
+        body = event.content or HEARTBEAT_DEFAULT_PROMPT
+        sections.append(f"{header}\n{body}")
+    elif event.trigger == "shell_job_complete":
+        # Async shell job completion wake-up. The agent body already
+        # contains the rendered summary (status, exit_code, command,
+        # stdout/stderr tails) built by ``Agent._on_shell_job_complete``.
+        # Header gives the routing context — channel + the completion
+        # signature so the agent can grep events.jsonl if it needs more.
+        job_id = sanitize_prompt_field((event.extra or {}).get("job_id", "?"))
+        exit_code = sanitize_prompt_field((event.extra or {}).get("exit_code"))
+        saga_part = (
+            f", saga_session_id: {sanitize_prompt_field(saga_session_id)}"
+            if saga_session_id else ""
+        )
+        header = (
+            f"[shell_job_complete: {header_channel}, job_id: {job_id}, "
+            f"exit_code: {exit_code}, ts: {ts}{saga_part}]"
+        )
+        # Prefix the entire mixed summary at the rendering boundary: command
+        # strings and stdout/stderr tails are untrusted, even though surrounding
+        # status labels are framework-generated. Keep only the header unmarked.
+        body = prefix_prompt_body(event.content or "(no payload)")
+        sections.append(f"{header}\n{body}")
+    else:
+        # Prefer the operator-configured canonical display name over platform
+        # metadata, then sanitize whichever value will enter framework text.
+        header_author = None
+        if resolver is not None and event.author:
+            header_author = resolver.display_name(event.author)
+        if not header_author:
+            header_author = event.author_display or event.author or "-"
+        header_author = sanitize_prompt_field(header_author)
+        # Highlight the current message — bordered separator + heading
+        # so the agent reads "this is what I'm responding to" clearly,
+        # vs. ambient context blocks above. Recent activity already
+        # shows the message tail; this block is the *active* one.
+        # Core-issued revision feedback is collaborator-attested operator input.
+        # Poller revisions retain their original untrusted ingest classification.
+        from .proposals import ProposalRevision
+        from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+        trusted_revision = (
+            event.trigger in {"proposal_revision", "upgrade"}
+            and event.source == "system"
+            and isinstance((event.extra or {}).get("proposal_revision"), ProposalRevision)
+            and HTTP_EVENT_INGRESS_EXTRA_KEY not in (event.extra or {})
+        )
+        body = (event.content or "(no content)") if trusted_revision else prefix_prompt_body(event.content or "(no content)")
+        if event.attachment_names:
+            paths = "\n".join(
+                f"- {sanitize_prompt_field(path)}" for path in event.attachment_names
+            )
+            body = f"{body}\n\nAttachments:\n{paths}"
+        # Include the inbound message id so the agent can target it with
+        # ``<react message="<id>" />`` (otherwise the directive falls back
+        # to the just-sent assistant reply, which is the wrong target for
+        # an "on it" ack — see memory/core/40-learned-behaviors.md).
+        msg_id_part = (
+            f", msg_id: {sanitize_prompt_field(event.source_id)}"
+            if event.source_id else ""
+        )
+        # Include the turn's saga_session_id so the agent can pass it as
+        # ``session_id`` on saga_query / saga_store / saga_feedback /
+        # saga_mark_contributions (chainlink #23 #26 — Option P). MCP tool
+        # dispatch runs on a fresh asyncio task forked from the SDK's
+        # read-loop; ``_current_turn`` is invisible inside that task. The
+        # model passing the session_id at tool-call construction time is
+        # the structural fit (skill-as-method-call pattern).
+        saga_part = (
+            f", saga_session_id: {sanitize_prompt_field(saga_session_id)}"
+            if saga_session_id else ""
+        )
+        sections.append(
+            f"## ▶ Current message — respond to this\n\n"
+            f"[event_kind: {header_trigger}, channel: {header_channel}, "
+            f"author: {header_author}, ts: {ts}{msg_id_part}{saga_part}]\n\n"
+            f"{body}"
+        )
+
+    # Per-section size breakdown (chainlink: 2026-05-10 operator request).
+    # Surfaces which compartment is driving prompt growth — recent-activity
+    # tail and recent-session-summaries are the two that compound between
+    # ticks during high-cadence ship runs. ``chars / 4`` is a rough English
+    # token estimate — close enough for the "is this section bloated?"
+    # judgment without pulling in tiktoken (which would disagree with
+    # Anthropic's tokenizer anyway).
+    if section_sizes:
+        breakdown = _format_section_sizes(section_sizes)
+        if breakdown:
+            for i, body in enumerate(sections):
+                if body.startswith("## Resource usage\n"):
+                    sections[i] = body + "\n\n" + breakdown
+                    break
+
+    # The separator belongs to the stable prefix: Anthropic can mark its end
+    # on a text block; prefix-only caches see the same bytes without a marker.
+    stable_prefix = "\n\n".join(stable_sections)
+    if stable_prefix:
+        stable_prefix += "\n\n"
+    if stable_prefix_out is not None:
+        stable_prefix_out.append(stable_prefix)
+    return stable_prefix + "\n\n".join(sections)
+
+
+def _format_section_sizes(sizes: dict[str, int]) -> str:
+    """Render the per-section size breakdown for the resource-usage block.
+
+    Sorted by descending size so the biggest contributors land on top.
+    Sections under ~25 tokens (~100 chars) are dropped to keep the
+    breakdown clean. Empty input returns ``""``.
+    """
+    SMALL_TOKEN_FLOOR = 25  # ~100 chars
+    entries: list[tuple[str, int]] = []
+    for label, char_count in sizes.items():
+        tokens = char_count // 4
+        if tokens < SMALL_TOKEN_FLOOR:
+            continue
+        entries.append((label, tokens))
+    if not entries:
+        return ""
+    entries.sort(key=lambda kv: -kv[1])
+
+    def _human(tokens: int) -> str:
+        if tokens >= 1000:
+            return f"{tokens / 1000:.1f}k"
+        return str(tokens)
+
+    lines = ["Section sizes (this prompt, ~tokens):"]
+    for label, tokens in entries:
+        lines.append(f"- {label}: {_human(tokens)}")
+    return "\n".join(lines)

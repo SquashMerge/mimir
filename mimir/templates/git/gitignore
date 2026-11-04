@@ -1,0 +1,101 @@
+# mimir-home .gitignore — allowlist pattern.
+#
+# Block-everything-then-unblock. Easier to audit than a long blocklist;
+# new file types fail closed (don't get committed) until an operator
+# decides they should be tracked. See MIMIR_HOME_GIT_TRACKING.md
+# §"Allowlist .gitignore".
+
+# Block everything by default. Writable-but-ephemeral dirs (attachments/,
+# scratch/) are therefore untracked automatically — scratch/ in particular
+# is the agent's working area (drafts, throwaway clones, scratch notes) and
+# must NOT be unblocked: nested git repos there once broke the per-turn
+# commit hook (chainlink #299).
+*
+!*/
+
+# Tracked: human-readable curated state. ``state/**`` is allowlisted broadly
+# (like memory/prompts/skills) so the agent's working state persists by default
+# rather than being silently dropped — the binary/log + credential-shaped
+# re-blocks below still strip artifacts, and the pre-commit content scan is the
+# real secret guard. (chainlink #352/#353)
+!memory/**
+!prompts/**
+!skills/**
+!state/**
+
+# Top-level tracked files.
+!.gitignore
+!README.md
+!saga.toml
+!scheduler.yaml
+
+# Deployment infrastructure — track so the repo serves as a
+# disaster-recovery snapshot of how this agent is wired (UID
+# mapping, port binding, build extras, skill-fragment composition,
+# operator override mounts). Behavioral state (memory/, skills/,
+# state/wiki) shows what the agent KNOWS; these files show how it
+# RUNS. ``compose.env`` stays blocked (real secrets); the sanitized
+# ``compose.env.example`` template can live alongside if useful.
+!Dockerfile
+!compose.yml
+!compose.override.yml
+!start.sh
+!compose.env.example
+
+# Re-block any binary/log artifact that slipped past the include rules
+# above (belt-and-suspenders; if a future change drops atoms.db into
+# memory/, the include rule for memory/** would otherwise pick it up).
+# Worklink backend transcripts are full sub-agent stdout dumps (MBs per
+# attempt, one timestamped file per attempt) — debugging material, not
+# durable state; tracking them grows .git/objects permanently.
+state/worklink/transcripts/
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+*.log
+*.tmp
+*.swp
+*.pyc
+*.pyo
+*.bak
+__pycache__/
+.DS_Store
+.cache/
+embeddings/
+
+# Re-block credential-shaped filenames as a content-of-last-resort defence
+# (the pre-commit content scan is the primary line; this catches the case
+# where the hook is bypassed or absent). chainlink #352: ``*token*`` /
+# ``*credential*`` were dropped — too-weak signals that false-block legit
+# notes (e.g. memory/issues/gog-token-expiry.md); the kept patterns are
+# high-signal and the content scan guards everything else.
+#
+# These MUST stay in sync with the pre-commit hook's NAME_PATTERNS. A name the
+# hook refuses but the gitignore admits is worse than useless: ``git add -A``
+# (per-turn commit) stages it, the hook then hard-fails the commit, and the
+# index stays poisoned so every later turn's commit also fails (chainlink #299).
+*.key
+*.pem
+oauth_*.json
+rate_limits.json
+.env
+.env.*
+
+# Re-allow the few jsonl files we genuinely want tracked.
+!state/applied-proposals.jsonl
+
+# Bundled skills are refreshed from the mimir package on every boot
+# (see mimir.skill_defs.refresh_builtin_skills). Tracking them would
+# fight that refresh — every startup would produce a no-op diff. The
+# leading ``*`` already blocks this since no ``!.mimir_builtin_skills``
+# allowlist exists; the explicit entry is belt-and-suspenders in case
+# an operator switches to a blocklist style.
+.mimir_builtin_skills/
+
+# scratch/ is already untracked via the allowlist, but ``!*/`` re-includes
+# directories — so an embedded git repo under scratch/ (e.g. a core-memory
+# proposal worktree under scratch/core-proposals/) would otherwise be grabbed
+# by the per-turn ``git add -A`` as a gitlink and break the commit hook
+# (chainlink #299). Ignore scratch/ explicitly so worktrees there stay invisible.
+scratch/

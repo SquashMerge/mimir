@@ -1,0 +1,3769 @@
+# Changelog
+
+All notable changes will land here. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with
+[SemVer](https://semver.org/spec/v2.0.0.html) for versioning.
+
+## [Unreleased]
+
+Changes awaiting release are recorded in [changelog.d/](changelog.d/).
+
+## [0.9.11] — 2026-11-01
+
+- **0.9.11 is the last release with Worklink and the feature factory bundled.** From the next release, coding work (Worklink, the feature factory and the related skills) ships separately as the Cultivate plugin, and `mimir-agent` no longer includes it.
+
+- Remove `saga` from the published `dev` and `bench` extras. On PyPI that name belongs to an unrelated package, so `pip install 'mimir-agent[dev]'` installed it; `saga` now comes only from the workspace dependency groups, and a packaging test rejects any workspace-only name in published metadata (#2080).
+
+- Exclude nested factory worktrees and sandboxes from frontend test collection (#1981).
+
+- Bump feature-factory and opencode-feature-factory to 0.10.18 for merge proof and provider overload retry fixes (#1982).
+
+- Stop file-index sweeps between files and join their in-flight work before the server releases its agent home (#1992).
+
+- Add a read-only prompt cache-hit report for retained turn logs with daily, trigger and session-kind breakdowns.
+
+- Preserve conversation-history offload provenance on file-tool read-back across turns.
+
+- Keep PR lease reads author-attested after merging a verified unprotected base (#1995).
+
+- Scope untrusted tool offloads and fetches to turns, purge legacy bytes, and taint shell reads of persistent logs by name.
+
+- Preserve bounded GitHub PR author-attestation failure causes across poller and lease refusals, forward subprocess diagnostics, and resolve mixed-case repository URLs (#1997).
+
+- Reorder turn prompts to keep reusable context ahead of live context and mark its end for Anthropic API prompt caching (#1998).
+
+- Return bounded, content-free task errors to the parent agent when a subagent fails instead of aborting the turn (#2002).
+
+- Prevent content-free glob timeouts from falsely tainting attested PR checkout edits (#2003).
+
+- Set the matching home and user environment for non-root s6 services in the root image (#2004).
+
+- Right-size unfiltered GitHub forge pages to the requested limit, preserve filtered-query scan depth, and reuse smaller page sizes after oversized responses.
+
+- Make social-cli daily cap decisions use one UTC day and pin the midnight boundary in tests (#2031).
+
+- Allow Cultivate Worklink to publish after an operator-stopped attempt with no PR, while retaining the publication fence for unsafe evidence (#2037).
+
+- Remove executor pytest basetemp directories when Worklink attempts end (#2041).
+
+- Add byte-exact PR history restores and paged historical-file reads for remediation and review.
+
+- Keep pytest gate regression tests compatible with pytest 9.2 and third-party plugin deprecations.
+
+- Accept root-controlled uutils coreutils applet symlinks in the maintenance shell while executing their validated multi-call target.
+
+- Size test hang guards for parallel full-suite load: redaction cost-bound span, Vitest and Testing Library timeouts, the identities writer process guard, the ACP journal faulthandler period, and the github-poller tick deadline bound (carried from epic #1949).
+
+- Defaults upgrade: when a three-way merge fails part way, the upgrade lane now discards its own half-merged proposal worktree and reports the error, instead of raising from `abandon_proposal` (which refuses uncommitted changes since #2384).
+
+- Make two timing-sensitive tests robust under parallel load: the ACP blocked-main matrix stops its journal's periodic faulthandler dump before the watchdog exit (a dump racing the exit crashed the child with SIGSEGV), and both it and the event-logger spawn test use hang guards instead of tight latency ceilings.
+
+- Make the shell-timeout process-group test deterministic: it now mocks `os.getpgid` for its fabricated PID, so a real process that happens to own that PID can no longer change the result.
+
+## [0.9.10] — 2026-10-15
+
+- Alert operators through the configured operator channel when a feature-factory epic parks for human input, once per park.
+
+- Diagnose refused PR checkout lease attestations with content-free, turn-deduplicated reason events (#1951).
+
+- Park quiet live factory drivers after a separate conservative idle backstop without consuming an attempt, and preserve bare run-id recovery request bytes; resumed-driver context remains unresolved (#1952).
+
+- Fix factory-run stop across split user IDs by verifying process identity and cancellation through the privileged executor (#1953).
+
+- Resume parked factory epics in a fresh OpenCode session after a verified lock handoff.
+
+- Prompt the agent on factory parks, blocked and partial endings with durable, deduplicated Worklink notices for autonomous and operator-launched runs; validate real ending-to-receipt delivery and normalize stop fields to the receipt contract.
+
+- Prompt the agent on blocked leaves, exhausted attempts, invalid templates and reaped leaf claims.
+
+- Retain dead but resumable factory attempt checkouts for a configurable window after their last observation (#1957).
+
+- Park verified-dead factory runs left running by a crashed controller before resuming them (#1959).
+
+- Keep supervising factory drivers across controller observation errors and retain recently stopped factory checkouts for at least 15 minutes (#1960).
+
+- Use the executing uid's identity for local Worklink test gates and isolate nested pytest temporary directories (#1962).
+- Keep reindex and calibration test providers isolated from import order by patching the consumer's captured provider and config lookups.
+
+- Bump feature-factory and opencode-feature-factory to 0.10.16 for reviewed conflicted base syncs, verification evidence replay, and clearer compaction guidance (#1963).
+
+- Missing-path and explicitly content-free filesystem errors do not taint a turn, while errors exposing discovered names or resolved targets remain untrusted; PR lease lookup handles missing paths beneath a lease.
+- Collaborator-remediation integration coverage uses a test-only Git status hang guard on loaded runners and verifies that a timed-out attestation still taints checkout reads and blocks edits, without changing production timeout bounds.
+
+- Record exact reasons for untrusted repository results and attest collaborator PR checkouts based on the exact lease head even when the base is a feature branch.
+
+- Keep fixed pre-execution repository refusals from tainting remediation turns and renew active PR checkout leases on reuse.
+
+- Keep failed single-file reads under their file's trust anchor and identify untrusted sources in write vetoes.
+
+- Retry poller turns after transient provider failures with durable, capped backoff without spending content attempts.
+
+- Reclaim expired PR checkout leases through tombstones and refuse recovery of broken or marked leases.
+
+- Preserve scoped forge author provenance when a native PR read fails after attestation, while rejecting intervening head changes (#1971).
+
+- Warn that `replace_file` deletes omitted content and refuse large accidental shrinks unless explicitly allowed (#1972).
+
+- Make SAGA bulk forget previews binding, guard large deletions, and allow operator restoration of forgotten atoms.
+
+- Preserve pytest summaries and failing node IDs in bounded `repo_test` output, with separate accounting for returned truncation (#1974).
+
+- Kill synchronous shell process groups on timeout and warn that partial side effects may have occurred (#1975).
+
+- Make poller override and schedule edits explicit about merging and replacement, preserve scheduler comments, and guard destructive PR-body and proposal edits.
+
+- Route tainted poller drafts to scratch or reviewed proposals, report vetoed poller destinations, and make refused durable writes honest. Scheduled commitments review now reads autonomously and queues redacted, expiring closure proposals for one-step authenticated operator approval; CARE items are escalated, dismissals require individual approval, and changed commitments are skipped atomically without weakening direct-write vetoes.
+
+- Make tool refusals and incomplete results actionable, suppress repeated PR blocker escalations, and remove autonomous Worklink guard-bypass hints.
+
+- Add a bounded Chainlink issue reader, PR merge metadata, and actionable git-range refusals for service turns.
+
+- Allow read-only Gmail turns to select configured accounts and read messages with `gmail messages get` (#1980).
+
+- CI loads the root Dockerfile's base image from the Actions cache (pulling with backoff only on a weekly miss), so the image-build test stops failing on public.ecr.aws 429 rate limits.
+
+- Factory park alerts go to the operator channel only; they no longer send an ntfy push (#1950 follow-up).
+
+## [0.9.9] — 2026-10-11
+
+- Measure proposed post-ingest egress vetoes with shadow-only `egress_veto_would_block` telemetry and a read-only `mimir stats --egress-shadow` report; authorization behavior is unchanged.
+
+- Retry the authenticated pinned Chainlink CLI CI install and skip pytest evidence uploads cleanly when setup fails early (#1916).
+
+- Independently attest scoped check/server projections so parallel read order does not taint an attested PR; keep post-push forge scope unchanged, preserve successful writes when follow-up attestation is unavailable without trusting their results, and distinguish content-free in-progress log refusals from untrusted adapter errors.
+
+- Persist active-ingest taint sources ahead of informational feedback in turn records, with per-category counts and taint domains (#1918).
+
+- Close SSE streams and start dispatcher drain during HTTP shutdown so container stops write a clean marker within the supervisor grace.
+
+- Point Worklink incident turns at build evidence and report missing in-root records as not found instead of access denied.
+
+- Give macOS pytest jobs more headroom, log runner capacity and slow tests, rebalance xdist workers, and shorten the recovery test's configured polling wait (#1922).
+
+- Keep author-attested checkout provenance on bounded `repo_test` failure summaries, allowing fix-and-rerun while keeping requested raw failure output untrusted. Validate failing ids against controller-owned test definitions before execution and again at classification; strip bounded parameter suffixes, cap total id bytes, and parse undecorated pytest `-q` counts. Counts remain output observations, not independently attested run totals.
+- The credential-material snapshot-refusal assertion in `tests/test_repo_tools.py` was inverted: the controller's fixed diagnostic now raises an unlabelled `ToolPolicyRefusal`, rather than tainting the turn. Arbitrary diagnostics remain untrusted.
+- Make the ACP cancellation-order regression release the resistant runner before asserting ordering, so an ordering violation fails rather than hangs.
+
+- Return 404 for missing dashboard assets and recover once from stale lazy-loaded chunks after a deploy (#1924).
+
+- Prevent broadcast and role/group pings in Discord and Slack outbound messages and neutralize display names in pairing alerts (#1925).
+
+- Enforce operator-configured Discord and Slack channel scope before inbound intake, with protected file or process-environment settings and content-free drop events.
+
+- Discord and Slack denied DM senders now receive one-time pairing codes by default; operators can approve with `mimir identities approve-pairing --code <CODE>`.
+
+- Allow admins to approve or reject pending Discord and Slack pairings from the Users page or by request ID in the operator channel.
+
+- Warn when enforced Discord/Slack pairing has no operator alert channel, and list chat, dashboard, and CLI approval paths in pairing digests.
+
+- Add per-platform DM/channel unknown-sender intake policy in identities.yaml, with silent ignore and private decline modes.
+
+- Add opt-in Discord guild-role admission with per-message rechecks and automatic user-role revocation.
+
+- Serialize identity CLI edits and setup seeding with server writes to prevent lost identities and pairing state, and abort identity transactions on read errors, malformed YAML, or invalid document shapes instead of overwriting recoverable files; accept empty/comment-only documents and null `people` while preserving the comment header.
+
+- Pull the Python base image from the ECR Public Docker Official Images mirror by default in the deployment and scaffolded Dockerfiles, with a `BASE_IMAGE` build-arg override (#1933).
+
+- Preserve trusted PR checkout leases across clean local commits and verified protected-base rebases, while refusing tainted or unrecorded lineage and dropping stale own-push remediation triggers.
+
+- Keep attested own-repository Git, forge, test, and CI output trusted across failures so remediation can continue after conflicts.
+
+- Refuse model tool calls that write code or live state after untrusted active ingest, regardless of enforcement mode, including repository execution/publication, ACP hands and SAGA mutations; retain scratch and gated operator-reviewed proposals, keep egress approvals from unlocking writes, close scratch-backed live loaders, and preserve server-owned continuation, offload and retrieval bookkeeping (#1937).
+
+- Add shared content-free GitHub author withholding helpers and pin untrusted GitHub URL fetch provenance (#1938).
+
+- Withhold non-collaborator GitHub PRs and thread content before scoped tools can read them.
+
+- Withhold outsider GitHub issues, PR activity, reviews and CI content from poller prompts; surface content-free operator notices instead.
+
+- Create a private per-turn scratch directory before agent tools run and refuse symlinked scratch paths.
+
+- Replace the model-callable ingest-taint clear with authenticated operator Clear/Keep requests in ACP and one-shot trust replies in chat; keep source provenance append-only and re-taint on new untrusted content (#1942).
+
+- Trust successful results from configured MCP servers by default while keeping drift, failure, and unresolved results untrusted; remove the retired per-tool result-integrity control from the admin UI and policy API, and warn when hand-written server policies still include it.
+
+- Add a scoped, trusted `pr_spec` read of the armed Chainlink spec bound to a pull request by Worklink evidence.
+
+- **social-cli skill:** the `social-cli-notifications` and `social-cli-feed` pollers grant `approved_urls: ["https://public.api.bsky.app/"]` (Bluesky's public read-only API), so their routine `fetch_url` reads are an approved destination for the egress veto (#1903). Installed homes pick this up with `mimir skills update social-cli --apply`.
+
+## [0.9.8] — 2026-10-09
+
+- Fix false scheduler-wedge alarms and preserve mapping-form scheduler.yaml when merging new default jobs (#1915).
+
+## [0.9.7] — 2026-10-09
+
+- **Operator action (#1872):** Generic shell execution after untrusted active
+  ingest is refused on interactive and continuation turns for every shell-process
+  tool, even with IFC enforcement off. Use a bounded or declared command,
+  `read_file`/`glob`/`grep` for reads, or `open_proposal` for repo edits. An
+  operator can clear ingest taint, start a fresh turn, or grant one exact shell
+  call with `approve_sink_once` / `request_operator_approval`.
+
+- Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
+  models and real stdio contract tests. This fixes the silent tool-discovery
+  failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
+  A dedicated lifecycle task owns SDK contexts so production shutdown can
+  be requested from a different task without leaking the server subprocess.
+
+- Deliver substantive autonomous `send_message` briefs after stripping a trailing skip-list stop sentence, while continuing to block narration (#1892).
+
+- **Operator action (#1893):** After untrusted ingest, schedule writes and edits to
+  live scheduler, prompt, poller override, core memory, index and skill instruction
+  files are refused even with IFC enforcement in shadow mode. Propose the change
+  with `open_proposal` / `submit_proposal` for operator merge instead. Poller reload
+  and edits inside proposal worktrees remain available. `list_schedules` now
+  preserves trusted turn integrity.
+
+- **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
+  `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
+  bounded argv with scrubbed environment and value-free audit events; job grants
+  remain job-scoped. Mutating verbs must not be declared. Read queries can bring
+  sensitive data into the still-tainted turn; outbound sink checks remain in force.
+
+- Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
+
+- **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
+  active ingest even in shadow mode, for service and operator turns alike. Ask
+  the operator to arm the leaf for server-side ready-queue dispatch or run the
+  Worklink CLI from a clean operator context.
+
+- After untrusted ingest, admitted Chainlink calls through declared service or
+  request-bound operator command paths cannot change `worklink:*` labels, create
+  armed issues, or update armed issues even in shadow mode (#1897). Bounded
+  unarmed issue filing and comments remain available; the operator must review
+  an unarmed description before applying `worklink:ready`. Attached
+  `-l=worklink:ready` labels are normalized like Clap. The veto classifies the
+  admitted execution argv (the operator binding or service-profile parser), so
+  quoted literal `? * [ ] { }` in titles and descriptions cannot skip it.
+  Admitted Chainlink argv outside the built-in classifier fail closed on tainted
+  turns (including end-of-options `--`), except known read-only issue queries.
+  This also refuses unclassified unarmed mutations; use a canonical unarmed
+  command or comment instead. Unknown service commands remain subject to the
+  existing exact-argv profile gate, without a substring veto on read-only
+  diagnostics. The shell-wide post-ingest veto is described above (#1872).
+  Clean turns are unchanged; this gate does not provide filesystem confinement
+  for other tools or broaden any declared-command profile.
+
+- ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
+  internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).
+
+- Hold genuine OpenCode quota failures until the Codex reset (or one-hour fallback), without charging an attempt; escalate after four consecutive holds (#1899).
+
+- Upgrade both feature-factory packages and their exact adapter pins to 0.10.14
+  (#1900). The release adds concept/name drift review instructions, an audited
+  operator `sync-base` recovery for eligible parked runs, and remediation-slice
+  path amendments. Worklink continues to tolerate additive factory state fields.
+
+- Collect per-change changelog fragments into versioned release notes, avoiding
+  competing edits to the Unreleased section (#1901).
+
+- **Authz (#1904):** Refuse GitHub CLI declarations in `operator_shell_commands`
+  at load and save, including aliases and symlinks; refuse operator-declared `gh`
+  before environment construction, credentials, or identity handling at execution.
+  Basename checks are case-insensitive, including wrapper arguments and paths.
+  The execution refusal names the offending argument (including literal `gh`
+  search arguments). Use a fresh untainted turn or forge tools for GitHub access
+  after untrusted ingest.
+
+- **IFC (#1905):** `memory_query` and `memory_get` now preserve SAGA's
+  server-reported per-atom integrity. Trusted reads no longer taint the turn;
+  absent or invalid provenance remains untrusted active ingest.
+
+- **Web sign-in (#1906):** Set the session cookie's `Secure` flag from HTTPS rather than the Host name, allowing sign-in over plain HTTP on non-loopback hosts. Distinguish a missing post-sign-in cookie from a rejected key and keep 403 stream errors out of re-authentication.
+
+- **Intake (#1907):** Start Discord typing only after admission, preserving
+  an authorized turn's hold when another message is refused or fails. Print
+  escaped console pairing hints with a bounded, process-wide 1024-author LRU.
+
+- **SAGA (#1908):** Session-end prompts list tools from the session-boundary
+  capability set and limit verification to known atom and turn IDs; claims
+  needing file reads are tagged for later verification.
+
+- **Gmail poller (#1909):** Pass the declared agent command its gog account and keyring environment, permit read-only message and thread gets, and enforce gog's `--readonly` and `--gmail-no-send` flags using the pinned `/usr/local/bin/gog`. The wrapper supplies the declared account so documented commands need no shell expansion. Installed homes must refresh their copy of `<home>/skills/gmail-poller` to pick up this fix.
+
+- Clarify that `repo_merge` is the default PR base-update path; reserve
+  `repo_rebase` guidance for history-rewrite event turns (#1910).
+
+- Make repository refusals actionable (#1911): `pr_file_content` distinguishes
+  paths missing at the scoped head from non-files, and `repo_commit` names
+  bounded, escaped out-of-scope staged paths with a recovery hint.
+
+- **Own-PR provenance (#1912):** Attested checkout, Git operations, server-posted
+  comments, review requests and constrained status metadata retain trusted
+  exact-scope labels across protected-base merges and patch-identical rebases.
+  Replayed non-server authors require the server committer and an original
+  attested whitespace-preserving patch match, consumed once per original commit,
+  never a display-name/login match. Replay checks fail closed above 500 original
+  commits or on Git without `patch-id --verbatim` support. Operators may set
+  `MIMIR_GITHUB_TRUSTED_BOT_LOGINS=dependabot[bot]` to attest that exact bot;
+  the default trusts no bots. CI logs remain untrusted.
+
+- Refuse `repo_test` after untrusted content is read, even with access-control enforcement off; review the diff or CI instead, or request a one-time operator grant (#1913).
+
+- Honor operator-allowlisted GitHub bot authors on github-poller payloads as well as forge reads (#1914).
+
+- **Codex Plus adapter:** require `langchain-codex-plus>=0.0.12`. Since 2026-10-06, Codex has delivered parallel tool calls' arguments only in the final `.done` frames, and 0.0.11 turned 70-85% of parallel batches into empty-argument calls ("Tool argument validation failed"). 0.0.12 reconciles arguments from the final frames. `langchain-claude-code-mimir` is already at its latest (`>=0.1.3`).
+
+## [0.9.6] — 2026-10-08
+
+**Fixed:**
+
+- Cap `mcp<2`: the MCP Python SDK 2.x renamed result fields to snake_case,
+  which broke MCP tool discovery for PyPI installs (every configured MCP
+  server's tools silently disappeared); the full 2.x upgrade is tracked in
+  #1891.
+
+## [0.9.5] — 2026-10-08
+
+The `claude-code:*` route now works end to end on a fresh install. The
+`claude-code` extra requires `langchain-claude-code-mimir>=0.1.3`, whose fix
+lets bridged mimir tools (e.g. `memory_query`) execute — earlier adapter builds
+failed every bridged tool with a missing `config` argument. A Claude Code login
+managed by the CLI itself (macOS Keychain) is accepted for inference, `mimir
+setup` re-runs report the home's real model, and frontend dependencies pick up
+security bumps (react-router, fflate, postcss, browserslist, vite).
+
+**Operator actions:**
+
+- Upgrade the adapter with the package: `pip install -U 'mimir-agent[claude-code]'`
+  (or `uv sync --extra claude-code`); mimir refuses adapters older than 0.1.3.
+
+**Changes:**
+
+- Accept CLI-managed Claude Code logins (including macOS Keychain) for inference
+  after a bounded `claude -p ping` succeeds; cache successful checks per CLI path.
+  Quota polling still requires file-based OAuth credentials (#1888).
+- Claude Code: require `langchain-claude-code-mimir>=0.1.3` so bridged
+  LangChain tools execute through the adapter's public invocation path;
+  reject older builds and exercise a bridged tool in CI (#1890).
+- `mimir setup` re-runs report and configure provider/usage-monitor defaults for
+  the existing home's `MIMIR_MODEL_SPEC` (unless overridden by an exported spec),
+  with a hint explaining the preserved value. Correct the HTTP API key header
+  example to `X-API-Key` (#1889).
+
+## [0.9.4] — 2026-10-07
+
+A security release from the 2026-10-06 external review. Bridge intake, attachment
+downloads and reactions are gated on the author allowlist; the interactive shell
+runs with a scrubbed environment and mimir processes are non-dumpable; the
+remaining `fetch_url`/`gh` paths used by routine flows move to scoped, read-only
+forge tools (`pr_file_content`, `pr_list` with scoped `search`, `ci_run_jobs`,
+`ci_run`, `ci_recent_runs`) plus `proposal_diff` and an atomic `replace_file`.
+The canonical image preloads jemalloc, and `mimir run` trims fragmented glibc
+heap when jemalloc is absent. Dependency security bumps throughout.
+
+**Operator actions:**
+
+- Add every Discord/Slack participant who should start turns to
+  `<MIMIR_HOME>/state/identities.yaml` before upgrading, or set
+  `MIMIR_OPEN_BRIDGE=true` while IFC enforcement is off (#1871).
+- Set `MIMIR_SHELL_PASS_ENV` to the exact variables your shell workflows need
+  (e.g. `gog`/`acli` credentials); everything else is scrubbed (#1873).
+- Rebuild the image of a source deployment that runs the canonical image to pick
+  up jemalloc (`LD_PRELOAD=/usr/local/lib/libjemalloc.so.2`; set `LD_PRELOAD=`
+  to opt out) (#2249).
+- Run sidecar processes launched with the container's full environment (for
+  example `codex-auth-sync` and dev `vite`/`esbuild` watchers) with minimal
+  environments (#1873).
+
+**Changes:**
+
+- Bridges: unknown/non-allowlisted authors are refused at intake even in IFC
+  shadow mode (#1871); attachments download only after intake admits the
+  message (#1876); reactions are gated by the same decision (#1877).
+- GitHub Actions are pinned to full commit SHAs and Dependabot covers Actions
+  (#1874).
+- Security lows: `request_mimir_update` validation and approval, a `fetch_url`
+  DNS-rebinding fix, an HttpOnly web-key cookie, SECURITY.md and docs drift
+  (#1875).
+- Forge: `pr_file_content` (#1878), `ci_run_jobs` (#1879), `pr_list` (#1881) with
+  scoped `search` that refuses repo/org/user qualifiers, boolean operators,
+  quotes and parentheses (#1886), `ci_run`/`ci_recent_runs` (#1884).
+- Proposals: `proposal_diff` for upgrade turns (#1880).
+- gmail-poller: file tools replace shell `ls`/`wc`/`cat` of its state (#1882).
+- Filesystem: `replace_file` atomically replaces an existing file (#1883).
+- Dependencies: aiohttp, pillow, pyasn1, pyjwt, pypdf, cryptography, urllib3,
+  anyio, multidict, fsspec, langgraph-sdk, langgraph-checkpoint, starlette,
+  python-multipart, pydantic-settings, mcp; frontend undici, vitest,
+  source-map-js; GitHub Actions versions.
+- `mimir run` now trims freed glibc heap off the event loop every five minutes
+  on supported Linux deployments. Set `MIMIR_MALLOC_TRIM_CRON=""` to disable or
+  supply another cron; only RSS drops of at least 16 MB emit an event (#1885).
+- GitHub forge reads now stream only through the request's byte cap (or a
+  64 KiB error-body bound) and close the response promptly. Oversized
+  `pr_file_content` reads still truncate valid UTF-8 with a marker, but binary
+  bytes occurring only after the cap are no longer detected; a valid prefix is
+  returned as truncated text (#1887).
+
+**Operator action:** Interactive `shell_exec` and `bash_async` commands no longer
+inherit the agent's environment. Add any variable a shell workflow genuinely
+needs to `MIMIR_SHELL_PASS_ENV` (exact comma-separated names). Ad hoc `gh`,
+`acli`, `gog`, and `social-cli` shell calls may need explicit passthrough or a
+declared command/forge tool; service-shell and forge authentication are unchanged
+(#1873). On Linux, every `mimir` CLI subcommand now disables process dumpability,
+including the server (`mimir run`), watchdog and Worklink processes. This prevents
+same-uid shells from reading their original environments through procfs. The
+server reapplies the control after a pending-update exec. Restart these processes
+to activate it; same-uid procfs inspection and core dumps are disabled. Non-mimir
+same-uid processes launched with the container's full environment (for example
+`codex-auth-sync` and dev `vite`/`esbuild` watchers) remain readable: deploy them
+with minimal environments or separate identities, and do not grant children
+root/CAP_SYS_PTRACE. The literal operand screen is best effort, not a sandbox.
+
+**Operator action:** Before upgrading, add Discord and Slack participants who
+should be able to start turns to `<MIMIR_HOME>/state/identities.yaml` with the
+`user` role (or `admin`). Unknown, missing and non-allowlisted bridge authors
+are now refused at intake even in IFC shadow mode. To retain open bridge intake
+while IFC enforcement is off, explicitly set `MIMIR_OPEN_BRIDGE=true`; it cannot
+override `MIMIR_ACCESS_CONTROL_ENFORCED=true` (#1871).
+
+## [0.9.3] — 2026-10-04
+
+SAGA now actually loads each home's `saga.toml`, which had been silently ignored
+since 2026-09-12. Social-outbox dispatch works against the real social-cli, and gmail
+batches no longer cut off the Jev triage line. Declared shell commands can use
+virtualenv interpreters, and several taint and attestation false positives are
+fixed. feature-factory moves to 0.10.11.
+
+**Operator actions:**
+
+- Rebuild the image of a source deployment that runs the canonical image. The
+  feature-factory and adapter pins moved to 0.10.11.
+- `mimir run` now loads `<home>/saga.toml` (#2204). Its configured SAGA LLM
+  provider/model, embedding provider and retrieval flags take effect on upgrade,
+  which can change LLM spend and retrieval behaviour. A present but unreadable or
+  malformed file now stops startup instead of silently using defaults. Homes
+  created by older `mimir setup` runs log an unknown-key warning for
+  `[retrieval] enable_missing_ref_pivot`; that key was never read, so delete the
+  line (#2206).
+- Gmail account rules now render once per batch (#2207). If you lowered a gmail
+  poller's `batch_size` to stop the triage/NOTIFY line being truncated, you can
+  restore it.
+- Declared shell commands now execute at their declared path (#2208), so a
+  virtualenv interpreter such as `/home/mimir/venv/bin/python3` can be declared
+  directly. A declaration whose symlink chain passes through an agent-writable
+  directory is now refused when the job loads.
+- Research pollers may now request `memory_propose` (#2209). Add it to a research
+  poller's capabilities to let it queue memories for operator approval.
+- Social-outbox files must be named `outbox-*.yaml` and use social-cli's own
+  outbox schema (`- like: {platform, id}`, `- reply: {platform, id, text}`, and
+  so on); the older `action:` shape is refused, as is `media`. Each file is
+  dry-run before it is recorded as dispatched (#2202, #2203).
+
+**Changes**
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.11. The
+  factory can amend owned paths in-band on a running run, with exclusive path
+  ownership between active slices and activation deferred for overlapping
+  slices. Fewer epics park in `needs-human`, though some waves serialize
+  (#2213).
+- `mimir run` now loads `<home>/saga.toml` into SAGA (or the exported
+  `SAGA_CONFIG` override). Previously the home file was ignored: upgrading
+  activates its configured SAGA LLM provider/model, embedding provider, and
+  retrieval flags, potentially changing LLM spend and retrieval behaviour.
+  An unreadable or malformed selected file now stops startup rather than
+  silently using defaults. `saga-reembed` and `reindex` use the same config
+  selection without writing `SAGA_CONFIG` to the process environment (#2204).
+- `mimir setup` no longer writes the dead `[retrieval] enable_missing_ref_pivot`
+  key, which nothing read. It is also removed from the LongMemEval bench runner
+  and the eight bench presets, and a test checks that every `[retrieval]` key
+  setup writes is one SAGA knows (#2206).
+- Pollers can supply a shared `batch_context` that renders once per batch; items
+  keep their tail when truncated. The gmail poller moves account rules into it,
+  so the Jev triage/NOTIFY line is never cut off (#2207).
+- Declared shell commands execute at the declared path while every symlink hop
+  is checked against agent-writable roots, and interpreter rules also consider
+  the declared executable name (#2208).
+
+**Social outbox**
+
+- Social-outbox PRs get their own title, `[social outbox:<poller>] rolling
+  outbox`. Submitting a file not named `outbox-*.yaml` is refused, and the
+  dispatcher flags such files once instead of silently ignoring them (#2202).
+- Dispatch runs `social-cli dispatch <file>` with the file positional, validates
+  against social-cli's own schema (including `follow`, `bookmark` and
+  `highlight`), refuses `media`, dry-runs each file before its ledger entry is
+  consumed, and names its snapshot `outbox-<platform>.yaml` so the right sent
+  ledger is used (#2203).
+
+**Authorization and taint**
+
+- `ls` labels a listing by the directory listed, not by each child name, so
+  listing a trusted directory no longer taints a turn through untrusted child
+  names. Untrusted directories, and symlink children that resolve elsewhere,
+  still carry their own labels (#2210).
+- Forge attestation uses the commit's committer login first (skipping
+  `web-flow`), falling back to the author. Every attestation downgrade is now
+  logged, with a warning if the event cannot be written (#2212).
+- After a verified own push, forge reads are attested at the new head, reusing
+  the head lineage from the write path (#2211).
+- Research pollers may request `memory_propose` (#2209).
+
+**Fixes**
+
+- The scheduler-wedge alarm measures staleness from the later of the last
+  heartbeat and the scheduler's start, so a restart after an outage no longer
+  sends a false "heartbeat stale" page (#2201).
+- Completed gmail turns no longer linger as in flight; session-boundary
+  (synthesis) turns are shown only the tools their profile admits; and the
+  built-in `pollers` skill description fits the 1,024-character limit (#2205).
+- The `repo_test` suite refusal names the suite argument and the selector rules
+  (#2211).
+
+## [0.9.2] — 2026-10-01
+
+Tainted turns can now propose memories and posts for operator approval instead
+of being refused outright, and reading mimir's own PRs no longer taints forge
+actions after its own push. Outbound text is privacy-scanned, Codex quota state
+follows the server's verdict, and feature-factory moves to 0.10.10.
+
+**Operator actions:**
+
+- Rebuild the image of a source deployment that runs the canonical image. The
+  feature-factory and adapter pins moved to 0.10.10.
+- Social-cli no longer dispatches posts from the agent turn. Posts go out only
+  after an operator merges the rolling social-outbox PR, so set
+  `MIMIR_SOCIAL_OUTBOX_APPROVERS` to the GitHub logins allowed to approve. While
+  it is unset or empty, every dispatch is withheld (`no_approvers_configured`).
+  The social-cli pollers' `pass_env` now forwards `GITHUB_TOKEN`,
+  `MIMIR_SOURCE_DIR` and `MIMIR_SOCIAL_OUTBOX_APPROVERS`, so make sure those are
+  present in the container environment.
+- Installed `github-poller` and `chainlink-orchestrator` manifests must pick up
+  their new `hooks` fields through the startup auto-update or
+  `mimir skills update`. See the entry below.
+- The unversioned `/api/web/bootstrap` and `/api/events` routes are removed.
+  Nothing in mimir consumed them; any external consumer must move to the
+  versioned API.
+
+**Memory and post proposals**
+
+- `memory_propose` queues a memory from a tainted turn in a server-owned store
+  (`<home>/.mimir/memory-proposals.jsonl`) that file tools cannot read or write
+  (#2194).
+- An authenticated operator reply resolves a proposal. `approve mp-xxxx` stores
+  the queued text in SAGA, and `approve mp-xxxx: <edit>` stores the operator's
+  edited text instead, both with `operator_approved_proposal` provenance.
+  `decline mp-xxxx` marks the proposal declined and stores nothing. No model
+  turn runs or sees the command, including when it arrives mid-turn (#2197).
+- A server-posted digest lists pending proposals on the operator alert channel.
+  `mimir memory proposals list` shows them; the CLI has no approve or decline
+  (#2198).
+- Operator approval requests carry typed IDs (`op-xxxx`, `mp-xxxx`). A reply
+  resolves only the request it names, or the one a Discord reply references,
+  and a bare `approve` is accepted only when exactly one request is pending
+  (#2191).
+- Proposal pollers get per-poller surfaces, including a protected social-outbox
+  surface with one rolling PR. One identity-based guard protects the proposal
+  store and live outbox paths for every turn kind, admin included (#2195).
+- Social-cli proposes posts through the rolling outbox PR and pings the operator
+  when it adds to it. The poller dispatches only content an approver merged,
+  verified against the forge, once each (#2196).
+- `social-cli count` works without the image shim and fails closed
+  (`CAP UNKNOWN`, exit 3) on an unreadable, empty or malformed ledger or an
+  unresolved thread. Each thread post counts against the cap (#2190).
+- Proposal pollers write drafts under `state/pollers/<name>/`, and the new
+  proposal-poller guide documents the pattern (#2187). Prompts state that
+  tainted turns cannot write durable memory (#2188).
+
+**Taint and authorization**
+
+- After its own verified push, mimir keeps acting on its own PR through
+  turn-local head lineage, and mismatch diagnostics name the real cause (#2185).
+- A replayed poller event is re-attested at recovery instead of defaulting to
+  untrusted (#2193). `pass_env` redaction no longer masks mimir's own login, so
+  own-PR remediation scope is granted again (#2158).
+- On a tainted turn, `fetch_url` may reach a URL that appeared verbatim in the
+  turn's untrusted ingest (#2157).
+- Authorization uses one per-tool descriptor (#2170). The no-op
+  `audit_declassification` is removed (#2167).
+
+**Outbound privacy**
+
+- External-sink writes are scanned. Credentials are always refused; private
+  terms from `<home>/private-terms.txt` are shadow-logged unless
+  `MIMIR_OUTBOUND_PRIVACY_ENFORCE` is set (#2175). Social-cli outbox posts are
+  scanned at write and at dispatch (#2177).
+- An opt-in Jev PII detector (`MIMIR_OUTBOUND_PII_JEV` with `JEV_KEY`) runs in
+  shadow and fails open (#2179). The operator alert channel is exempt, and
+  GitHub text is scanned (#2180).
+
+**Gmail triage**
+
+- The gmail-poller can run per-account Jev triage that drops confident skips
+  before they cost an agent turn. Rules come from the account prompt, with a
+  shadow mode (#2174, #2176) and an optional `mode: decide` where the Jev notify
+  score decides both ways (#2189).
+
+**Models, quota and synthesis**
+
+- Codex quota records the server's `limit_reached` verdict, smooths noisy usage
+  readings, and re-checks a quota pause with a canary instead of trusting its
+  `resets_at` (#2183, `MIMIR_QUOTA_RECHECK_SECONDS`).
+- Codex-Plus accepts `max` and `ultra` effort and omits reasoning when unset
+  (#2182). Non-interactive turns buffer the model step so mid-response stream
+  drops can be retried (#2178, `MIMIR_CODEX_PLUS_BUFFER_NONINTERACTIVE`).
+- Worklink OpenCode leaf builds pass the agent's reasoning effort as
+  `--variant`, overridable with `MIMIR_WORKLINK_REASONING_EFFORT` (#2184).
+- Requires `langchain-codex-plus` 0.0.11 (Codex client 0.159.1, which admits
+  gpt-6.1-sol) (#2181).
+- Synthesis turns can read back their own evicted tool results (#2186). The SAGA
+  embedding-dimension check ignores tombstoned atoms (#2156).
+
+**Internals**
+
+- The per-turn prompt-block loaders and the SAGA query run concurrently
+  (#2166).
+- budget_gate shares one core between its sync and async paths (#2162) and
+  detects tool failure from a typed signal (#2171).
+- One typed provider-error classifier serves retry and quota pause (#2163), and
+  one event emitter is shared (#2172).
+- Write authorization no longer runs the full `Config.from_env()` per call
+  (#2161).
+- `tool_pins.py` holds pin data only (#2165).
+- Dead code is removed (#2160).
+
+**Feature factory and pollers**
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.10 (#2199). Integrated-stage
+  findings can open reviewed remediation slices via `factory remediate` (at most 2
+  per run), so epic runs may take longer when a remediation opens. Test and
+  repository-verify output now has run-local logs with redacted tails. A source
+  deployment must rebuild its image to install the new package and adapter pins.
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.8. Repository
+  `verify` now runs on each slice, bootstrap runs before every verify, and an
+  identical tree reuses its green verify. Epic runs therefore take longer per
+  slice. A source deployment must rebuild its image to install the new package
+  and adapter pins.
+- Poller recovery and delivery-receipt behavior is now selected by each skill's
+  declared `hooks` profile instead of generic-runner name checks. Installed
+  `github-poller` and `chainlink-orchestrator` manifests must pick up their new
+  `hooks` fields through the normal startup auto-update or `mimir skills update`
+  for that behavior to remain active; startup logs and emits
+  `poller_hooks_undeclared` when an older reserved manifest is still installed.
+
+## [0.9.1] — 2026-09-24
+
+Fixes the upgrade from 0.8.x. On 0.9.0, a SAGA store written by 0.8.x refused
+to migrate and every turn failed. Upgrade straight to 0.9.1; no manual step is
+needed.
+
+**Operator action:** a source deployment that runs the canonical image must
+rebuild it, because the feature-factory pins moved to 0.10.6.
+
+- **SAGA: an 0.8.x store now migrates to v14.** 0.8.x stored every atom with the
+  default label `integrity='untrusted'`, and v13 exists to relabel those rows
+  before v14 drops the column. The 0.9.0 pre-check refused them before v13 could
+  run, so an upgraded install failed every turn with
+  `migration v14 refused: atoms contain nontrusted rows`. The early refusal now
+  applies only once v13 has been applied. A store below v13 runs v12, v13 and v14
+  in order. v14's own guard still refuses empty or unknown labels, leaving the
+  column intact. If you relabelled a store by hand on 0.9.0, it is already at v14
+  and nothing changes.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.6. The 0.10.5
+  release adds the `.factory.json` `max_retries` default and the read-only
+  `factory identity` publishing-identity probe; this repository now declares a
+  retry budget of 5 so direct `/feature` runs match Worklink launches. The 0.10.6
+  workflow binds `KEY` only from the resolver's `run_id`, a ticket-key input, or
+  not at all for free text, and never decorates it with `#`. Source deployments
+  must rebuild the image to install the new package and adapter pins.
+- Size the pytest hang guard on the two Dockerfile build tests above the
+  subprocess bounds they own (1500s and 420s). The suite-wide 300s default had
+  killed a cold-cache image build that was still within its own 1200s bound.
+
+## [0.9.0] — 2026-09-24
+
+Five hundred and seventeen commits since 0.8.8. Three threads run through them:
+the ACP server and Hands, which let an editor drive the agent with client-side
+execution; a worklink controller/executor split, which runs builds and
+remediation as a separate uid behind an owner-controlled boundary; and
+authorization provenance, which now attests collaborator content instead of
+tainting it wholesale.
+
+**Operator action is required.** A version bump alone satisfies none of these:
+
+- **The canonical image now requires provenance build arguments.**
+  `MIMIR_GIT_REF`, `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT` must be
+  set, and the two commits must be equal full SHAs. An argument-less build fails
+  in its first stage. The worklink executor compares its image commit to the
+  controller source, so a forgotten pin bump fails loudly instead of shipping a
+  stale root executor.
+- **feature-factory moves from 0.8.x to 0.10.4**, and the pin lives in an image
+  layer. Rebuild the image; a pull and a restart are not enough. Exact-match
+  admission refuses a mismatched install.
+- **Skills changed**, including the optional `chainlink-orchestrator`,
+  `github-poller`, `github-ci-watch` and `gmail-poller`, and the bundled
+  `pollers`. A restart refreshes bundled skills and safely auto-updates installed
+  optional skills. Read the startup skill digest. Run
+  `mimir skills update <name>` only when it reports a partial update or remaining
+  drift, and inspect its diff before adding `--apply`.
+- **The console entry point is now `mimir.entrypoint:main`**, and
+  `mimir-agent` is installed alongside `mimir`. Reinstall any wrapper script
+  that imported `mimir.cli:main` directly.
+
+### Highlights
+
+- **ACP:** mimir serves the Agent Client Protocol (`agent-client-protocol`
+  0.12.0) for editors such as Zed. Hands are proxy-hosted with per-call client
+  authorization, session grants and a persistent Python REPL. Execution is
+  confined by macOS Seatbelt. A Linux AppArmor backend ships parser-checked in
+  CI, but its real-hardware enforcement is still unverified. Where no backend is
+  available, Hands runs unconfined only after the operator explicitly accepts
+  that risk. Confined Hands output no longer taints the turn.
+- **Worklink remediation:** the worklink controller and executor are split,
+  with builds and factory runs executing as the agent uid. Retained checkouts
+  sit behind an owner-controlled boundary. A retained remediation is proven end
+  to end, and an unparseable factory record no longer aborts the reattach sweep.
+- **Authorization:** `repo_*` results over an attested PR checkout lease now
+  inherit the PR author's attestation, cached per observed checkout HEAD. A
+  trusted collaborator's comment on mimir's own open PR grants remediation
+  scope rather than review-only. Together these cleared about 400 of the
+  would-block decisions that shadow enforcement recorded against collaborator
+  work.
+- **Git health:** a stale `.git/index.lock` escalates on its first blocked
+  commit with an operator recovery step, and repeated `git_commit_failed` now
+  escalates too. Mimir never deletes the lock itself.
+- **Tests:** a per-test `pytest-timeout` bound of 300 seconds fails a stalled
+  test by node id instead of hanging the session, and the suite runs under
+  `pytest-xdist`.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+The per-change entries follow.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.4. This is a
+  pin-only update and changes no contract consumed by mimir.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.2 and accept
+  the release's `extra_attempts` and `retry_limit` slice status fields.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.0. Remove the
+  `.factory.json` `publish` override so the factory's default publisher honors
+  `PR_DRAFT` and validates the resulting URL. The sibling
+  `prime-agent-feature-factory` remains unconsumed and is not installed or pinned
+  here.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.2, matching the
+  exact-match `FACTORY_VERSION` admission check. Both packages mimir installs are
+  published at 0.9.2; `prime-agent-feature-factory` remains at 0.9.1 and is not
+  installed or pinned here, so it does not gate this bump.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.1, matching the
+  exact-match `FACTORY_VERSION` admission check. All three published packages
+  (`feature-factory`, `opencode-feature-factory`, `prime-agent-feature-factory`)
+  are 0.9.1, and the two adapter workflows are byte-identical to the canonical
+  one, verified from the published tarballs rather than the build log.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.0. The release
+  removes the imported production-line ceiling that the factory's own brief
+  imposed on projects, and adds `factory decide` plus workflow refresh on resume
+  so a parked run can take an operator decision without being relaunched. The
+  status payload contract is unchanged from 0.8.9; verified by diffing the
+  published tarballs' status emitter rather than the release notes.
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.9 so exact-match
+  admission permits the planning-review policy fix and stricter review acceptance
+  checks. Keep runtime, image, drift-detection, and documentation pins in lockstep.
+- Upgrade `feature-factory` and `opencode-feature-factory` from 0.8.5 to 0.8.7,
+  reconciling the autonomous-mode prose with the publication block it contradicted.
+  0.8.5's executable path already selected ready-for-review publication for
+  `PR_DRAFT=false`, but its narrative described the autonomous terminal state purely
+  in draft terms, so a driver reading it saw a conflict against this repository's
+  `.factory.json` `"pr_draft": false` and parked rather than guessing. Mimir requires
+  ready-for-review PRs — `orchestrator.py` refuses a draft at both the factory-status
+  and GitHub-verification gates — so the setting was correct and the prose was not.
+  0.8.7 also makes park-publication step 3 explicitly exclude only the plane-root
+  `factory.lock` and require a lock-named file below that root to match, aligning
+  the driver-facing staging contract with `planeInventory`'s exact root-relative
+  exclusion and the nested-lock regression. The contract test pins both rules.
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.5, which makes
+  both skills carry the complete `factory init` invocation, bound to `WORKFLOW.md`
+  by byte equality. 0.8.4 described that command's tail three incompatible ways —
+  a `$RUN_REPO` tail claim, "repository flag last", and a canonical block ending
+  `--repo "$O" --json` — so a driver following the prose built init from a
+  compatibility stem, omitted `--json`, and could not read a successful init's
+  response; the workflow then correctly refused to reinitialize. The canonical
+  block also gained `--max-retries`, and `status --json` now reports
+  `max_retries`.
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.4, which
+  reconciles the `feature` skill and the staged workflow on admission rules:
+  0.8.3 stopped rather than improvising when the skill consumed a leading
+  `--max-retries` as an option while the staged workflow preserved it as
+  request content.
+- Add proxy-hosted ACP Hands with exact-call session grants, a persistent
+  per-session Python REPL, profile-owned timeouts, and complete lifecycle cleanup.
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.3 for the ordered
+  park sequence, and surface its `park_snapshot` in parked-run records and reports.
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.2, carrying
+  diagnostic control-plane snapshots for parked runs.
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.1, which moves
+  repository resolver intake before run initialization so rendered work-item
+  context is available before a run ID is allocated.
+
+## [0.8.8] — 2026-08-28
+
+A same-day upstream release broke live turns; this restores them.
+
+deepagents 0.7.10 added a `session_id` argument to `_offload_to_backend` and
+`_aoffload_to_backend`. mimir's monkeypatch wrappers restated upstream's parameter
+list, so every turn that offloaded raised
+
+    TypeError: _DeepAgentsSummarizationMiddleware._aoffload_to_backend()
+    takes 3 positional arguments but 4 were given
+
+before reaching upstream. Nothing in mimir changed — the pin is
+`deepagents>=0.7.1,<0.8` and a rebuild resolved the new release.
+
+The wrappers now forward `*args, **kwargs` untouched. They exist to substitute the
+backend with a logging proxy; everything after it belongs to deepagents. A wrapper
+that restates a signature it does not own breaks again on the next change inside
+the pinned range, so the regression test asserts forwarding rather than arity.
+
+**Operator note, not fixed here.** `uv.lock` pins deepagents 0.7.1, but a source
+deployment whose startup builds a wheel and pip-installs it resolves dependencies
+fresh and can take any release inside the range. That is how 0.7.10 reached
+production without a change on our side. Deployments that want the locked set must
+install from the lock.
+
+## [0.8.7] — 2026-08-28
+
+One hundred and seventy-nine pull requests since 0.8.6. The through-line is the
+autonomous build pipeline: it could write code but not deliver it, and every
+layer between "the build finished" and "the pull request exists" turned out to be
+broken in a different way.
+
+**Operator action is required.** A version bump alone satisfies none of these:
+
+- **feature-factory moves to 0.8.0**, and the pin lives in an image layer. A
+  source deployment needs its image rebuilt, not only a pull and a restart. The
+  version-drift check fails closed against a 0.7.x image, so a missed rebuild is
+  loud rather than silent.
+- **`.factory.json` no longer declares `publishing_identity`.** 0.8.0 rejects the
+  key outright, and the identity now comes from the environment. Set
+  `MIMIR_FACTORY_PUBLISHING_IDENTITY` in the deployment that runs builds; without
+  it the resolver refuses and every epic dispatch fails closed. A maintainer
+  running the factory by hand sets it to their own account.
+- **Bundled skills changed** — `chainlink-orchestrator`, `github-poller`,
+  `github-ci-watch`, `gmail-poller` and `dependency-advisory-watch`. Skills are
+  installed INTO the agent home, so a pull and a restart leave the deployed copies
+  stale. Run `mimir skills update <name> --apply`; without `--apply` the command is
+  read-only and prints the diff first. The `chainlink-orchestrator` change is
+  load-bearing: its `pass_env` list is what carries the publishing identity to a
+  dispatched build.
+
+### Publication, end to end
+
+Builds had been completing and publishing nothing since 2026-08-10, recorded as
+`completed` the whole time. Four separate defects, each sufficient on its own:
+
+- Publication ran unauthenticated — the credential-helper capture used a regex
+  whose character class excluded every key containing the letter `s`, which is
+  every `https://` key.
+- The executor report directory was created unshared, so the uid-dropped worker
+  could not write it. Sharing is now a precondition that raises before launch
+  rather than a best-effort chown.
+- The gate reported `counts: None` on a passing suite, so evidence carried no
+  totals and no failed-test names.
+- The factory-dispatch checkout was not placed on the target ref, so `pr_base`
+  disagreed with the record.
+
+A failed publication is now loud instead of being recorded as success.
+
+### The build pipeline stops discarding finished work
+
+A status refusal at the terminal gate used to archive the run record and let the
+checkout be swept, destroying everything the build had produced. Chainlink #1337
+lost seven hours and twenty-two commits that way, one step from publication,
+because `parse_factory_status` demanded an object for a `validator` field that
+feature-factory's own contract defines as a verdict string (`GO` /
+`GO-WITH-NITS` / `NO-GO`).
+
+Both halves are fixed: the parser accepts the documented shape and refuses an
+unknown verdict, and a post-merge failure now pushes the built branch before the
+record is archived, recording the ref in the escalated signal and the archived
+record. Preservation failure never replaces the underlying refusal.
+
+### Turn capability, operator arm
+
+The untrusted-active-ingest refusal is now conditional on the requested sink's
+boundedness for server-authored argv, so a turn that ingested untrusted content
+can still run a server-bound command while an unbounded `bash -lc` stays refused.
+A bounded reader that binds no operand is refused rather than executed verbatim,
+and `shell_exec` binds its child's stdin so a direct execution cannot consume the
+agent's.
+
+### Also
+
+- Ten observability changes, including terminal-outcome events on the epic path,
+  which previously emitted nothing on failure while the leaf path recorded all of it.
+- Ten authorization changes on the enforcement-enablement path.
+- A blocking macOS CI leg alongside the Ubuntu 3.11/3.12 matrix, and a
+  `pytest-worker-uid` leg that runs the suite as the non-owning worker uid.
+- The web Factory Runs detail view loads again; it had rejected every run by
+  validating run ids against a digits-only pattern the system never mints.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+## [0.8.6] — 2026-08-20
+
+Twenty-four pull requests since 0.8.5. The through-line is the agent's ability
+to act on its own pull requests: it could reach a verdict but not deliver one,
+and the reasons were spread across the poller, the forge tools and the
+information-flow labels.
+
+**Operator action is required.** Two items, and a version bump alone satisfies
+neither:
+
+- `pypdf>=6.16` was added, so a source deployment needs `uv sync` and not only
+  a pull.
+- The bundled `github-poller` skill changed. Skills are installed *into the
+  agent home*, so a pull and a restart leave the deployed copy stale and the
+  PR-snapshot fix inert. Run `mimir skills update github-poller --apply`.
+  Verify with `mimir skills update github-poller` first — it is read-only and
+  prints the diff.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+### Fixed
+
+**The agent could not act on most pull requests.** `mimir/access_control.py`
+issues a `RepoPRActionScope` only from a complete PR snapshot — `head_repo`,
+`head_remote`, `head_ref`, `head_sha`, `base_ref`, `base_sha`. Only four
+github-poller passes supplied one. Measured against a live payload, 16 of 16
+items from those passes were scopeable and 0 of 27 from the rest: 19
+`pr_synchronize`, 4 `pr_opened`, 4 `pr_review`. Those three are the ordinary
+ways a pull request becomes worth looking at — it opened, its head moved, or
+someone reviewed it. Every PR tool refused for such a turn, and the refusal
+named the live-discovery operator gate rather than the missing snapshot, so the
+agent reported that it needed an authenticated operator turn and escalated to a
+human. It could review only when a review was *explicitly requested*, because
+that one pass carried the snapshot.
+
+**It also could not remediate its own pull requests.** The `pr_review` pass put
+the *reviewer's* login in `author`, which the framework reads as the scope
+principal. Remediation authority is granted only when that principal is the
+agent itself, so a CHANGES_REQUESTED review on the agent's own PR produced the
+review-only action set — no write, commit or push. It could read the review and
+never fix it. `author` now carries the PR's author, with the reviewer in its own
+field.
+
+**A scope miss was reported as missing authority.** `resolve_review_state_for_context`
+refused with the live-discovery gate message whenever the cache and registry
+both missed, which is a precondition of the fallback path rather than the
+caller's actual failure. A service turn can never satisfy that gate and was
+never meant to. The refusal now names the requested repository and pull request,
+states that it is outside the turn's scope, and enumerates the in-scope targets
+bounded to five with an overflow count.
+
+**`pr_diff` failed outright above its size cap**, so the diff was unavailable
+for exactly the pull requests most in need of review. It now returns a bounded
+diff truncated on file boundaries, with a marker naming the truncation reasons,
+the original size and the omitted paths. The fetch itself remains bounded, at a
+ceiling above the output cap.
+
+**A fetched PDF was unreadable.** `fetch_url` returned bytes no turn could
+interpret, and the `pdftotext` shortcut was unavailable to precisely the turns
+that fetch PDFs. Extraction is now bounded by page count and output bytes, with
+the two limits reported distinctly.
+
+**`operator_alert` was granted and sink-policed but had no tool**, so an
+untrusted-ingest poller with no other egress reached for the shell instead. It
+now exists as a tool with no destination parameter, bounded per turn.
+
+**Tool-event errors carried unbounded argument text into durable logs.** The
+budget gate now truncates with an explicit elision marker and an allowlist of
+argument keys.
+
+**Information-flow labels.** Several fixes to which sources a prompt carries
+and what they permit: agent-authored feedback telemetry is now labelled from
+provenance rather than assumed; ownerless non-agent-self feedback records no
+longer receive an empty ACL that aborted the whole turn; framework-written
+telemetry is recognised as agent-self, so the no-reply loop no longer silences
+same-channel replies; `protected_prompt` and `protected_tool` are aligned as
+ACL-gated server-mediated sources; first-party file reads no longer land in the
+fail-closed unknown-provenance label; and channel egress now compares channel
+*audiences* rather than identities, scoped to the bridge authority that issued
+the channel, so one user's history cannot cross into another's channel on a
+normalised-name collision.
+
+**Worklink and the factory.** The feature-factory backend moved to the 0.7.0
+three-package architecture. A bare `shutil.rmtree` raced concurrent removal, so
+git auto-maintenance could fail a live publication teardown. Factory-recovery
+argv assertions read `WORKLINK_RUN_BIN` off the environment, so they passed in
+CI and failed in every deployment sandbox — they are now pinned.
+
+**CI.** The macOS leg is green and ready to be promoted to a required check.
+
+## [0.8.5] — 2026-08-17
+
+A large patch release: 66 pull requests, almost all of them acting on a
+whole-codebase review rather than on new feature work.
+
+**Operator action is required for any deployment that runs the contained
+worklink executor.** `_LAUNCH_FIELDS` — the controller-to-executor launch
+protocol — gained `executor_identity`, and it is validated as an exact key set.
+The executor is image-resident while the controller runs from the source
+checkout, so a `git pull` and restart advances only one half and every contained
+launch (`repo_test`, `spawn_open_code`) is refused. **Rebuild the image**:
+
+```
+docker compose -p <project> -f <compose.yml> up -d --build
+```
+
+Passing `-p <project>` is not optional; without it the default project name can
+orphan the named workspace volume. The refusal is now diagnostic rather than
+generic — it names the drift and tells you to rebuild — but it still fails
+closed. Deployments that do not use contained execution need only the package.
+
+One dependency was added since 0.8.4 (`packaging>=24.0`), so a source
+deployment also needs `uv sync`. The `Dockerfile` changed too, in the s6-overlay
+download layer.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+### Fixed
+
+**Credentials reaching durable logs.** `redact_text` — the redactor behind
+`turns.jsonl` and `events.jsonl` — masked only `=`-delimited assignments, so a
+credential written in a header, YAML or JSON colon form reached disk in
+cleartext, and a quoted value was masked only to its first space. All colon
+forms are now masked across every combination of key and value quote style,
+with escapes and YAML line continuations consumed to the true closing
+delimiter. Multiline block scalars are parsed properly, including sequence
+entries and explicit mapping keys. A single-quoted value containing a backslash
+is *declined untouched* rather than half-masked, because the Python-repr and
+YAML readings of those bytes genuinely disagree and a partial mask reads as
+scrubbed. A conformance test now asserts the durable path can never again mask
+less than the ephemeral one. (#1214, #1261, #1262, #1274)
+
+**Authorization gates that failed open or disclosed.** Every service shell
+profile admitted an unconstrained `jq` filter, and a jq program can read the
+whole process environment through `env`/`$ENV` (#1208). The maintenance profile
+admitted `cat`/`head`/`tail` on `/proc/self/environ`, disclosing every
+credential — the same class. Three policies were enforced in two places that
+disagreed (#1226). A model-supplied `mimir_direct_argv` survived on non-shell
+tools and hijacked the next nested shell (#1212). The GitHub review guard probed
+a different working directory than `shell_exec` ran in (#1220) and failed open on
+newline-separated commands and `gh` short flags. State-changing server routes had
+no `Origin`/`Sec-Fetch-Site` check, and keyless loopback was documented as safe.
+
+**The staged-secret gate.** It scanned only the diff and only line-wise, so any
+file git treats as binary bypassed it (#1209), and it missed credential shapes the
+redactor already recognised (#1210). It then scanned *whole blobs*, which locked
+the factory out of the eight files that legitimately carry credential fixtures —
+including every redaction test. It now refuses only a secret that is **new**
+relative to the base blob, verified per path, and still fails closed on an
+unreadable base. (#1271)
+
+**PR checkout leases.** A superseded lease was refused as retaining unpublished
+work when its head was already published, and a *rebased* head defeated
+publication-ancestry proof entirely — the common case, since base reconciliation
+rebases routinely. Release now also accepts per-path content equivalence against
+a verified base. Successful acquisition is audited for the first time, recording
+the bound head that the typed tools never carry in their arguments. Operator-invoked
+runs died on `EACCES` against their own checkout (#1259), a claim reset restarted
+attempt numbering and collided with retained checkouts, and run termination never
+escalated to `SIGKILL` while an orphan worker live-locked its leaf. (#1272, #1273)
+
+**Contained execution.** The layer hardcoded the published image's uids, so it
+failed closed on any deployment numbering its users differently; identities now
+resolve by account name through one cached accessor shared by the executor and
+the agent-side handoff (#1269). The bound runner resolved an absolute path across
+the `0700` boundary, discarding local test evidence (#1263). Stale root-executor
+protocol drift is now detected before launch and named (#1266). `repo_test` also
+ran git under a different identity than the host, so authorization tests passed
+on a developer machine and failed in the runner — which produced a false
+changes-request on a correct branch. (#1279)
+
+**Shell jobs and tools.** Two file descriptors leaked per finished job, the log
+directory grew without bound with unreachable restart residue, and the working
+directory was process-global and sticky. A drainer write failure wedged the child
+forever and permanently burned a live-job slot (#1219). `bash_async`'s
+`session_id` was model-controlled, routing job output to another channel and
+nulling auth. A schema-invalid `pr_*`/`repo_*` call raised `AttributeError` out
+of the middleware and killed the whole turn.
+
+**Saga.** `reasoning_effort` was hardcoded to none on the `codex_plus` path, so
+the `saga.toml` setting was silently ignored (#1207). Migration v5 permanently
+deleted session-boundary atoms whose v2 backfill was skipped (#1242). Write-side
+boundary violations let thematic consolidation cross owners and `intersect_acl`
+ignore its argument (#1248). An empty-built vector index was permanently dead and
+re-asserted facts never resurfaced (#1249). The evidence-count sweep was
+tombstone-blind, and its test was circular (#1255).
+
+**Credentials and budget.** `not_implemented` probes made every Type B/C rotation
+roll back to the revoked secret (#1211). The probe validated a stripped value,
+OAuth refresh-token loss was invisible, and backups retained material (#1236).
+Budget severity latched TIGHT forever on an undeclared store key (#1244).
+
+**Scheduler, pollers and remediation.** An override cron was validated by the
+wrong parser, background tasks were never drained, and the quota recheck missed
+the misfire grace window. A poller manifest name was unvalidated as a path
+component, escaping `state/pollers` (#1224). Four unbounded parses ran
+synchronously on the event loop (#1225). Every hard refusal received the 24-hour
+permanent-fault backoff, so a pull request whose transient blocker had cleared sat
+idle for a day; self-clearing refusals now retry on the normal hourly cadence
+while operator-gated faults keep the backstop (#1275).
+
+**Frontend and dashboards.** Both non-chat SSE clients retried a terminal
+401/403 forever at one second — the bug already fixed in `chat.ts`. Search boxes
+were wiped on any URL change, a trigger parameter was shared, the skin query
+pinned the picker, a `pr_url` href was unsanitized, and there was no error
+boundary. Three `--mimir-*` tokens were defined by no skin, and a hardcoded neon
+palette was applied to all skins (#1230). The file-memory dashboard's `esc()` did
+not escape quotes but was used in an attribute (#1227). Legacy turns/ops
+dashboards were dead on first visit, saga atom rows were unclickable, and ops
+tabs were inert on fetch failure.
+
+**Configuration and CLI.** An empty environment value was read as an explicit
+value, so `GITHUB_REPOS=` crash-looped boot (#1251). `regenerate-api-key` was a
+silent no-op in Docker, leaving the old key valid (#1247). The `scaffold-docker`
+opencode block rendered an unparseable `Dockerfile` (#1250). Usage ceilings were
+decorative and a pre-release never saw its stable release (#1254).
+
+**Tests that could not fail.** Fourteen tests across unrelated subsystems named a
+property they could not fail on (#1257). The poller process-group teardown check
+sampled once instead of polling.
+
+### Added
+
+- A **non-blocking macOS CI leg** across Python 3.11 and 3.12, as a separate job
+  so the required `pytest (3.11)` / `pytest (3.12)` check names are unchanged.
+  It immediately surfaced two latent environment assumptions that had been
+  misfiring on Linux and being dismissed as flakes, and both are now fixed
+  (#1277, #1278). One test snapshotted a repository tree that git's background
+  auto-maintenance was concurrently writing into; it now disables
+  `maintenance.auto` for its fixture rather than excluding `.git` from the
+  comparison, which would have stopped detecting source mutations the snapshot
+  exists to catch. The other raced the shell-job eviction sweep two ways — the
+  sweep can evict a job before a poll observes its exit code, and `_evict_stale`
+  pops the registry entry under its lock but unlinks output files outside it —
+  so it now waits on the whole postcondition instead of on either intermediate
+  state. Neither was a Darwin defect; macOS surfaced them because its runners
+  are slower.
+- **Remediation on CI failure** for Mimir-owned pull requests, with durable
+  delivery receipts written only after enqueue succeeds, so a rejected handoff
+  retries instead of being silently consumed. (#1270)
+- A committed **redaction hot-path benchmark** (`benchmarks/redaction_hot_path.py`),
+  so the next change to the pattern tuple is measured rather than argued about.
+- `repo_test` now reports the **Git execution context** it ran under, making a
+  containment-attributable failure recognisable from its output alone.
+
+### Changed
+
+- The full test suite was audited and pruned (#1267) and then profiled and sped
+  up (#1268); one file alone went from 91.7s to 0.6s.
+- Redaction's hot path was restored after a regression introduced during this
+  same release cycle: three credential-key rules each rescanned the whole
+  string, taking `redact_text` from 66 to 185 microseconds per call. It now runs
+  at 53 microseconds — faster than before the regression — by anchoring on
+  credential-word offsets, with byte-identical masking verified across 14,040
+  input combinations. (#1276)
+
+## [0.8.4] — 2026-08-15
+
+A patch release. **No operator action is required** — no dependency changed and
+the `Dockerfile` is untouched, so a deployment already carrying the 0.8.1
+containment layer needs only the package.
+
+Most of this release comes from acting on recorded `shadow_tool_decision` events
+and from three defects that were costing the agent its own local test evidence.
+Every grant below is sized to observed use rather than to convenience, and
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+### Fixed
+
+- Autonomous turns could not reply to the operator. A turn that ingested anything
+  untrusted lost `send_message` for the rest of the turn, including to the
+  channel it came from. Measured on muninn: 109 of 192 sends would have been
+  refused with `ifc_label_blocked:same_channel`, 26 of them on interactive
+  operator turns. The operator alert channel is now always reachable, and a
+  `user_message` turn can always answer the channel it arrived on; cross-channel,
+  shell, file and webhook sinks are unchanged. `upgrade` is also trusted at
+  ingress like `scheduled_tick`, so the framework's own upgrade carrier no longer
+  taints its turn. (#1196)
+- Resolved proposal branches were never swept. A rejected proposal's content is
+  never on `main`, so the content check could only ever refuse, and a merged
+  branch stopped qualifying once `main` moved on. Cleanup now uses the forge's
+  terminal PR state, falling back to the content check only when no PR exists.
+  17 branches had accumulated across two agent homes. (#1197)
+- The scoped test command died before collection on an `EACCES` it did not name.
+  `uv` canonicalises the physical cwd, so an fd-entered checkout beneath a `0700`
+  isolation boundary failed before pytest started. Permission failures now report
+  the absolute path, mode, uid/gid and the ancestor whose traversal failed. This
+  had silently degraded three PR reviews to CI-only evidence and withheld one
+  validated push. (#1201)
+- A superseded PR checkout lease blocked the next checkout for the remainder of
+  its two-hour TTL, though it could no longer authorise anything — the push path
+  already refuses a stale head. Such a lease is now released when the server
+  observes the head has moved, and refused rather than released when it holds
+  retained work. (#1202)
+- A refused remediation turn was charged as a successful attempt, so a blocked
+  pull request burned its whole retry budget and reported `gave_up`. Tool and
+  authorization refusals are now recorded as such and exempt; content failures,
+  and any turn that actually committed, pushed, commented or re-requested, stay
+  charged. (#1205)
+- The execution copy made for the worklink runner was chowned but never chmodded,
+  so a `0700` source directory left the runner locked out of the directory
+  created for it. The copy now reuses the same normalisation the sibling checkout
+  path already applied; the `0700` source boundary is unchanged. (#1206)
+- `web_search` and `fetch_url` are declared taint-independent, but only one of the
+  two egress gates honoured the exemption. (#1195)
+- Only *belated* remediation was authorised: a fresh changes-requested review
+  minted a review-only scope, so every prompt fix pushed outside its scope and
+  would have been refused under enforcement. A changes-requested review on the
+  agent's own pull request now mints remediation authority, derived server-side
+  from the forge's own review list. (#1199)
+
+### Added
+
+- Operator approval that the model cannot forge. The model may *request* approval
+  for one tool and target; the grant is recorded only from an inbound operator
+  message the server authenticated at ingress, from an admin, non-service
+  identity. Timeout, decline, autonomous triggers and unreachable operators all
+  fail closed, and the grant is inert until consumed. (#1203)
+- The operator can vouch for a turn's already-ingested sources once per sink
+  category rather than per action. Per-action approval measured a median of 35
+  prompts on an affected turn and 295 at worst, which is a blanket exemption with
+  extra steps; per category it is roughly 3. The grant is pinned to the turn's
+  exact label state and dies the instant any new source is ingested, is bound to
+  one principal and one turn, and never applies to `NETWORK`, `HTTP_WEBHOOK` or
+  `EXTERNAL_MCP`. Supersedes #1059. (#1467)
+
+### Changed
+
+- Autonomous turns can recall the agent's own memory. The `saga_full_corpus_read`
+  flag existed for exactly this but had never been set on the pollers or
+  heartbeat, so a poller could read 85 of 2,083 atoms — 4% — with the rest of the
+  corpus, including the entire `legacy_admin` history, invisible to it. The flag
+  is granted per principal with the reasoning recorded; the builder default stays
+  `False`, so a future poller gains nothing by existing. Read authority only:
+  tenant isolation on outputs is unchanged. (#1204)
+- Writes to `skills/` and poller manifests now require an admin operator turn.
+  A poller could previously rewrite the manifest that grants its own authority.
+  Skill upgrades are unaffected — they do not pass through the file-tool gate.
+  (#1193)
+
+### Internal
+
+- The test suite passes on macOS again. A regression pinned `uv`'s exit code and
+  `/proc`, and its unsearchable-boundary premise silently did not hold when the
+  suite ran as root — root ignores the directory mode, so the case under test
+  never occurred. The factory declaration also now sets `verify_timeout_ms`,
+  since the default was shorter than this suite and surfaced as a numeric test
+  failure rather than a timeout. (#1194, #1469)
+
+
+## [0.8.3] — 2026-08-13
+
+A patch release carrying one change: the poller shell remediation from #1449,
+which did not make 0.8.2. No operator action is required.
+
+### Changed
+
+- `gmail-poller` and `social-cli` declare the shell commands their poller turns
+  actually run, via wrapper scripts that hold the working directory and
+  environment those turns previously had to shell-prefix by hand.
+
+  The calls were being refused for SHAPE, not authority: `cd … && social-cli`,
+  `export PYTHONPATH=… && python3 -c …`, `source …/activate && …`, and
+  `ls … 2>/dev/null` are compounds, redirects and code-from-argv, none of which
+  bind to a single argv no matter what capability is granted. Of roughly 290
+  recorded attempts across the three pollers, about 15 were bindable as written.
+
+  A wrapper moves the environment and working directory inside a pinned script,
+  leaving one bindable argv outside — the pattern `run-fetch-news.sh` already
+  established. The wrappers live under `<skill>/scripts/`, writable only on a
+  trusted-operator turn, so a poller turn cannot rewrite what it is about to run.
+
+  The `research` authority profile gains exactly three capabilities to make this
+  possible — `shell_exec`, `bash_jobs_list` and `bash_job_output` — taking it from
+  17 to 20. The two job-inspection capabilities are companions that
+  `_missing_capability_companions` requires: without them the principal fails to
+  construct rather than degrading. This is a **ceiling**, not a grant: a
+  research-profile poller gains nothing until its own manifest declares the
+  capability, and only these three manifests do.
+
+
+## [0.8.2] — 2026-08-13
+
+A patch release. Unlike 0.8.1, **no operator action is required**: no dependency
+changed, and the `Dockerfile` is untouched, so a deployment already carrying the
+0.8.1 containment layer needs only the package.
+
+Most of this release comes from acting on recorded `shadow_tool_decision` events —
+calls that succeed today because enforcement is off, and would stop silently the
+moment `MIMIR_ACCESS_CONTROL_ENFORCED` is set. Each grant below is sized to
+observed use rather than to convenience.
+
+### Fixed
+
+- Output truncation could emit a fragment of a registered secret. The cap cut at
+  an arbitrary byte offset and scrubbing replaces whole values, so a cut through
+  the middle of a secret left a prefix that matched nothing. Collection now
+  buffers past the cap far enough to see a value spanning the cut. (#1442)
+- A tool call from a model that serialises arrays as `{"item": [...]}` was lost
+  entirely, and the validation error was discarded so the failure was
+  undiagnosable. Such payloads are now unwrapped for list-typed parameters only,
+  and validation failures record the parameter and error type — never argument
+  values. One deployment was losing 137 session boundaries a day to this. (#1444)
+- `repo_test` could not snapshot this repository at all: the credential preflight
+  refused 114 tracked files — `README.md`, `SPEC.md`, workflows, test fixtures —
+  because they contain credential-SHAPED text. Tracked content is already
+  committed, already in the pull request, and already on the remote, so scanning
+  it prevented nothing while disabling the tool. Untracked and ignored entries
+  are still scanned, which is where the control actually applies. (#1445)
+- A nested Git repository in a source tree was refused as a malformed path.
+  `git ls-files --others` reports an embedded repo as one entry with a trailing
+  slash, which tripped the guard written for `..` and absolute paths — so a
+  worktree refused identically to a hostile path. It now has its own error and
+  reason code. (#1442)
+
+### Changed
+
+- A shell refusal now returns the stable `binding_rule` to the caller alongside
+  the human-readable reason, so an agent can distinguish "wrong flag" from "not
+  admitted" from "you wrote a shell form, not an argv" without parsing message
+  wording. A refusal path that omits the rule degrades to `binding_rule=unknown`
+  rather than raising inside the authorization gate. (#1443)
+- The autonomous trigger authority block now states the argv contract for
+  shell-bearing capabilities — one command per call, no pipes, redirects, `&&`,
+  globs, `$(...)`, or interpreter `-c`/`-m` forms — and names any declared
+  shell commands. A principal with no authority profile now receives a block
+  saying so, where previously it received nothing at all. (#1448)
+- `saga_end_session` states that an explicit call requires the capability, and
+  that principals without it should not attempt one because the synthesis turn
+  closes the session. (#1447)
+
+### Added
+
+- The `research` authority profile grants `saga_record_skill_learning`, so a
+  poller that runs a skill can record what it learned. The tool was always aimed
+  at skill-running turns; only session-boundary principals could reach it. (#1446)
+- The `session-boundary` profile grants `rebuild_index`, with an explicit
+  `SCOPE_CONTAINED` tier entry so it is reachable by principals capped below
+  `UNBOUNDED`. Taint gating is unchanged: a turn carrying untrusted active
+  ingest is still refused. (#1450)
+
+
+## [0.8.1] — 2026-08-11
+
+A patch by version number, but the containment work below changes what an **image**
+must provide. A deployment that upgrades the package without rebuilding its image
+starts cleanly, reports healthy, and has silently lost `repo_test` and
+`spawn_open_code`.
+
+### Operator actions required
+
+1. **The image must provide the Worklink containment layer.** Contained execution
+   now backs `repo_test` and `spawn_open_code`, not only Worklink builds. The image
+   needs: a `worklink` user and group at **uid/gid 1002**; the agent user at
+   **uid 1001**, and a member of the `worklink` group; `/var/lib/mimir-worklink`
+   (`root:root 0711`) containing `checkouts`, `repo-test-checkouts` and
+   `opencode-checkouts` (`root:mimir 0771`) and `homes` (`root:worklink 0710`); a
+   root-owned executor virtualenv; and the `worklink-execd` s6 service, which
+   listens on `/run/mimir-worklink/socket/worklink-execd.sock`.
+
+   The `Dockerfile` in this repository does all of it. **A deployment that builds
+   its own image must port it** — mimirbot builds from its own `Dockerfile`, did not
+   inherit any of this, and lost both tools until it was ported.
+
+   Failure mode: `test_containment_unavailable` from `repo_test` and
+   `containment_available=false` from `spawn_open_code`. Both fail closed, which is
+   the safe direction, but neither names the missing piece, and nothing fails at
+   startup — the tools simply refuse the next time they are called.
+
+2. **The agent must run as uid 1001.** `MIMIR_UID` is a literal in
+   `mimir/worklink/worker_exec.py` and `mimir/worklink/checkout.py`. The root
+   executor refuses any peer whose uid differs, and the agent-side checkout handoff
+   chowns each checkout to `WORKLINK_GID`, which is what the group membership in (1)
+   is for — POSIX only lets a non-root process set a file's group to a group it
+   belongs to. Renumbering an existing deployment means chowning its workspace
+   volume. #1439 tracks resolving both by account name so this stops being a
+   deployment constraint.
+
+### Added
+
+- Contained execution is now a reusable entry point (`mimir/contained_execution.py`,
+  `mimir/contained_checkout.py`, `mimir/contained_snapshot.py`). `repo_test` and
+  `spawn_open_code` run through it, as the unprivileged `worklink` user inside an
+  issued checkout, instead of spawning directly. (#1438)
+- Worklink builds run as a separate `worklink` user, launched by a root
+  `worklink-execd` service rather than under the agent's own identity. (#1426)
+- `procps`, so `ps`, `pgrep`, `pkill` and `top` resolve in the image. A missing `ps`
+  reports "executable file not found", which reads as a dead process; that false
+  negative had cost three diagnoses of healthy runs. (#1434)
+
+### Changed
+
+- A job-bound scheduled tick may read all of `memory/channels/**`. The previous
+  per-job narrowing was an artifact of reusing the single-channel check rather than
+  a designed boundary, and it left `memory-hygiene` unable to perform the channel
+  scan its own prompt specifies. Scheduled ticks have no inbound message, so there
+  is no injection at the trigger. (#1435)
+- The shipped `scheduler_template.yaml` heartbeat record carries
+  `authority_profile: heartbeat`, matching the 0.8.0 operator action. (#1427)
+- github-poller coalesces repeated events for the same subject. (#1432)
+
+### Fixed
+
+- Output truncation could emit a fragment of a registered secret. The output cap cut
+  at an arbitrary byte offset, and scrubbing replaces whole values — so a cut through
+  the middle of a secret left a prefix that matched nothing and was emitted verbatim.
+  Collection now buffers past the cap far enough to see a value spanning the cut and
+  retreats to where it begins. (#1438)
+- Declared `shell_commands` were authorized and then refused: the execution gate
+  dropped the declarations, so per-job command grants had never worked. (#1430)
+- Concurrent Worklink builds sharing the `worklink` uid could read and modify each
+  other's checkouts by traversing `../<other-issue>-<attempt>`. (#1428)
+
+## [0.8.0] — 2026-08-09
+
+Minor rather than patch because two changes require an operator to edit
+deployment configuration, and both fail *silently* if that edit is missed.
+
+### Operator actions required
+
+1. **Every `scheduler.yaml` heartbeat record needs `authority_profile: heartbeat`.**
+   Heartbeat authority is now selected by the record instead of by the job's name.
+   A heartbeat record without the key resolves to the shared `scheduled_tick`
+   grant — 53 capabilities down to 25, losing `fetch_url`, `operator_alert` and the
+   whole PR-review toolkit while gaining `spawn_open_code`. Nothing raises: the
+   heartbeat keeps firing on schedule and quietly stops being able to do its job.
+   The key is ignored by 0.7.x, so it can be added before upgrading. A record
+   named `heartbeat` that omits it now logs a warning at scheduler load.
+2. **Any declaration pinning a built-in skill script must move to `scripts/`.**
+   Executable code in shipped skills now lives at `<skill>/scripts/`. Declared
+   scripts are pinned by absolute path and declaration parsing requires the file to
+   exist, so a stale path does not merely disable that step — it fails the
+   declaration and disables the whole job. The known case is a `morning-briefing`
+   declaring `.mimir_builtin_skills/weather/get_weather.py`, which becomes
+   `.mimir_builtin_skills/weather/scripts/get_weather.py`. Update the declaration
+   *after* upgrading, since the new path does not exist until then.
+3. **Optional: delete any deployment-local `prompts/reflect.md` override.** An
+   override wins over the shipped template, so the reflection fix below does not
+   reach an agent that carries a stale copy of the prompt.
+
+### Added
+- Scheduler records may name their authority profile with `authority_profile`.
+  A record that names none keeps today's shared `scheduled_tick` authority
+  unchanged, and an unknown profile name is refused at load rather than falling
+  back to a weaker principal. (#1417)
+- A `tool-pin-drift` built-in skill that checks pinned npm packages and GitHub
+  release tags from a script, emitting JSON with per-target error isolation. The
+  script form is deliberate: a declared script's internals are not gated by the
+  shell profile, so one job gets one script rather than every scheduled job on
+  every deployment gaining `npm`. (#1414)
+- `skills/*/scripts/` is writable only on a trusted operator turn, so a skill can
+  ship and run its own code without the agent being able to rewrite what it will
+  later execute. (#1415)
+
+### Changed
+- Executable code in shipped skills moved from the skill root to
+  `<skill>/scripts/`, across `mimir/skills/` and `mimir/optional-skills/`, with
+  every `pollers.json` entry point updated in the same change.
+  `predictions/script.py` became `predictions/scripts/predictions_cli.py`. See
+  operator action 2. (#1416)
+- `heartbeat` is an ordinary scheduler record rather than a name special-cased in
+  code. Its effective authority is unchanged; what moved is where the selection
+  comes from. Declarations (`shell_commands`) are now parsed and applied for every
+  job including heartbeat — previously they were silently ignored on that one job,
+  so a heartbeat declaration would review cleanly, deploy, and change nothing.
+  (#1417)
+- The factory declaration gains `bootstrap` (`uv sync --locked --extra dev --extra
+  bench`, so a sandbox installs dependencies before any gate) and `pr_draft: false`
+  (so factory PRs publish ready for review — a draft cannot be merged without a
+  manual `gh pr ready` and is invisible to pollers acting on open PRs).
+  (#1418, #1424)
+- `langchain-codex-plus` pinned to 0.0.7. (#1412)
+
+### Fixed
+- Every scheduled job now has a filesystem read scope of its own. Previously only
+  the heartbeat did, so each other job resolved `channel_memory_directory` to
+  `None` and could not read its own channel notes — muninn's morning briefing
+  among them. Each job now reads its own channel memory and its skill `scripts`
+  root, and still cannot read another job's channel. (#1413)
+- A job-bound scheduled tick can read `memory/core/**` again. The read-scope work
+  above denied it, which broke the reflection and memory-hygiene workflows: both
+  document a core-memory read as required, and `reflect.md` states the read "is
+  permitted". The denial protected nothing — core blocks are already rendered into
+  the system prompt, so it blocked a `read_file` on content the model was already
+  holding while emitting a denial on every run. Caught before any release shipped
+  it. (#1420)
+- The weekly reflection turn once again sees recent session boundaries across
+  channels. Its prompt instructed reading `<home>/.mimir/session_boundaries.jsonl`,
+  a local mirror deliberately removed when SAGA moved in-process — no writer, no
+  reader. The block is now assembled cross-channel from SAGA's sessions table for
+  that turn, bounded by the `recent_boundaries` setting; every other turn stays
+  channel-scoped. (#1422)
+- A symlinked `MIMIR_HOME` no longer makes every declared shell command under home
+  unusable — an unresolved path comparison, regression from #1406. (#1407)
+- `test_run_poller_timeout_kills_child_holding_pipes` no longer fails as a function
+  of CI load. It asserted a one-second wall-clock reap budget behind a 0.25s poller
+  timeout, so it failed unrelated PRs at random; it now proves process-group killing
+  by asserting the spawned child never survives long enough to write its marker.
+  (#1421)
+- Two prerequisites for running the factory against `main`. (#1409)
+
+## [0.7.4] — 2026-08-07
+
+### Added
+- Per-job shell command grants. A scheduled job or poller declares the commands
+  it needs, in `scheduler.yaml` or its poller manifest, additively on top of its
+  shell profile — so teaching one job about a deployment's own CLI no longer
+  requires a mimir release, and no longer widens a profile every other job on the
+  box shares. mimir ships no catalogue of tools; what lives in code is the shape a
+  declaration must take: an absolute pinned path outside every agent-writable
+  root, a non-empty subcommand table (a bare binary is inexpressible, because
+  `gog gmail search` and `gog gmail send` are one executable), an option
+  allowlist, and interpreters only with a pinned script the agent cannot rewrite.
+  (#1402)
+- `cat`, `head`, `tail`, `stat` and `date` under the `maintenance` shell profile,
+  each with its own option allowlist and pin. These are 44 of 190 service-shell
+  refusals measured on a live deployment, 20 of them on the hourly heartbeat —
+  which binds a built-in principal that cannot carry per-job declarations.
+  `date` admits no `-s`/`--set` and `tail` no `-f`/`--follow`. (#1403)
+
+### Fixed
+- A scheduled job with a malformed but *falsey* `shell_commands` value no longer
+  fires without its declaration. `Scheduler._fire` branched on truthiness, so
+  `shell_commands: {}` or `shell_commands: ""` stored cleanly, skipped validation
+  entirely, and the job ran with no grants and no error — a job that looks
+  configured and is not. Those shapes now reach validation and stop the job the
+  same way a bad path does; an explicit empty list remains valid and means
+  "declare nothing". (#1406)
+- The `maintenance` git allowlist now covers what the shipped scheduled-tick
+  prompts actually run. 49 of 190 service-shell refusals measured on a live
+  deployment were `git` — the largest single command bucket — and nearly all were
+  the upgrade-reconciliation turn unable to inspect the proposal workspace it had
+  just built. `log --all`, `diff --no-ext-diff`, `rev-parse`, `branch -a`,
+  `cat-file`, `ls-tree`, `ls-files` and `show` are admitted, each through its own
+  option allowlist; every mutation stays refused, `branch -D` and `--force`
+  included. (#1405)
+- A quoted metacharacter is a value, not a shell operator. The service-shell rule
+  scanned the raw command string, so `grep -r '<<<<<<<' <path>` — a search for a
+  merge conflict marker — was refused as a redirection, and a conflict-scanning
+  turn could not search for conflict markers. Detection now follows the shell's
+  own quoting rules: unquoted operators still refused, single-quoted characters
+  literal, `$`/`` ` `` still refused inside double quotes, and CR/LF refused
+  under any quoting. (#1401)
+- A time-truncated directory walk always visits at least one entry. The deadline
+  was checked before the first visit, so a tight budget produced a truncated
+  result having visited nothing — an operator log line reading "cut short after 0
+  entries", and a bound that raced process scheduling rather than the size of the
+  tree. It failed roughly 1 run in 6 under CPU contention and cost a build
+  attempt. (#1398)
+
+### Changed
+- The feature-factory control plane and run sandboxes are gitignored. Their
+  absence made the factory's own per-merge verify refuse to run — the integration
+  worktree was never clean — so runs produced PRs whose slices were never
+  verified by the gate that exists to verify them. (#1400)
+- `AGENTS.md`/`CLAUDE.md` record the conventions an automated contributor needs:
+  run both the scoped and full suites, don't assert on ambient state you don't
+  own, and resolve a dependency's source from an import rather than a path guess.
+  (#1394, #1397)
+
+## [0.7.3] — 2026-08-04
+
+### Fixed
+- **The agent could not read its own skills, and nothing said so.** The home read
+  boundary admitted only `state`, `memory`, `docs`, the artifact root and the turn
+  scratch, so `<home>/skills` and `<home>/.mimir_builtin_skills` were refused and the
+  skills loader silently loaded nothing on non-admin and service turns. The silence was
+  the reason it survived: before a named denied read returned an error, `ls` on those
+  directories succeeded and returned empty, so the loader had nothing to report —
+  mimirbot's log holds nine starts across four days with no such warning, and the first
+  one appeared eleven minutes after the disclosure fix shipped. Pollers kept firing
+  throughout, because their manifests are read by mimir's own poller loader rather than
+  by the skills middleware, which is much of why the failure looked like nothing was
+  wrong. Both roots are now readable at all three read-policy sites and in service read
+  scope, and remain unwritable. Service access to a shared root is limited to `SKILL.md`
+  while full access stays scoped to the principal's own `owned_skill_directory`, so one
+  poller does not gain every other skill's files; protected-name rules still apply
+  inside both roots, making this a location admitted and not a naming exemption. (#1158)
+- **The social-cli skill documented an outbox filename dispatch does not read.** The
+  skill told the agent to write `<state_dir>/outbox.yaml`, but social-cli defaults
+  `state.platformIsolation` to true, and `dispatch --platform <p>` then resolves
+  `outbox-<p>.yaml` and takes no fallback to the shared path. Worse, both pollers
+  rendered that same wrong path into every wake-up prompt, so the runtime kept
+  instructing the agent into the failure — which is quiet in both directions: a missing
+  outbox prints `No outbox file found at <path>, skipping.` and exits 0, and the stale
+  `outbox.yaml` left behind then fails every later write to that path with "already
+  exists". Measured on muninn over 2026-08-02..04: 24 failed reads of `outbox-bsky.yaml`
+  and 44 write refusals on `outbox.yaml`. That home had already filed the filename
+  mismatch twice, plus two more issue notes for its downstream effects — a write
+  refused on an existing outbox, and stale queued actions firing from a prior session.
+  The hints now derive `outbox-<platform>.yaml` and the matching `--platform` from the
+  event's platform; the skill documents all three resolution rules, including that a
+  no-platform dispatch *can* fall back to the shared file while a platform-specific one
+  cannot, and that a stale suffixed file therefore wins over a fresh shared one. The
+  seeded `.gitignore` now covers the suffixed outboxes, which were the one transient it
+  did not ignore.
+- **A proposal that pushed but failed to open a PR was reported as recoverable.** The
+  upgrade path left such a proposal marked open so a reconciliation turn could retry,
+  but `finalize_proposal` removes the worktree once it has pushed — so there was nothing
+  left to recover and a real failure was reported as a non-error. It now returns
+  `ok=False` when the push succeeded and the PR did not, and retains the worktree only
+  for push or commit failures, which do leave it in place.
+
+### Changed
+- **`submit_proposal` failures are typed rather than stringly-reported.** Failures
+  raised no error and returned a message, so a caller could not tell failure from
+  success without parsing prose. They now raise `ProposalSubmissionError` carrying
+  `reason` and `lane`, and PR-open failures raise `ProposalPrError` for its three modes:
+  `gh` unavailable, `gh` failure, and a command that returns no pull-request URL.
+
+## [0.7.2] — 2026-08-04
+
+### Fixed
+- **Review remediation did the work and stranded it.** Force-with-lease was gated on
+  the event type, and `pr_changes_requested_stale` — the trigger for remediating a
+  CHANGES_REQUESTED review — was not in the set, so a turn asked to rebase onto a
+  moved base rebased, ran the suite, and then could not push
+  (`force_push_refused`). The capability was already implemented and already safe:
+  an `ls-remote` pre-check confirms the remote head still matches the observed head
+  and returns `stale_scope` otherwise. All three remediation triggers already shared
+  one validation path, so the asymmetry was a single set membership. `main` and
+  `master` remain unforceable from every scope on this path, and the force flag is
+  now attached only to pushes whose history has actually diverged rather than to
+  every push from a rewrite-capable trigger. On PR #1377 the rebased commit survived
+  only because the lease-preservation bundle had captured it. (#1157)
+- **`glob` crashed on an omitted `path`.** The tool middleware converts an omitted
+  optional `path` to `None`, which reached the backend's path resolver and raised
+  `AttributeError: 'NoneType' object has no attribute 'startswith'`. The agent got an
+  opaque exception naming no argument, so the call was simply lost — four occurrences
+  on one deployment in a day. `None` is now treated as "search the file-tool root",
+  and genuinely invalid argument types return a refusal naming the offending argument.
+- **`glob` burned the full external deadline and recorded nothing.** The walk was
+  bounded by entry count only, and a count does not bound time, so a large tree
+  exceeded the upstream 10s deadline and the call was cancelled — discarding a useful
+  partial result and recording neither the pattern nor the root. The walk is now also
+  bounded by elapsed time, at half the upstream budget read at call time so the two
+  cannot converge across an upgrade, and returns its own truncated result naming the
+  searched root and entry count. A `filesystem_glob_search` event records the pattern,
+  resolved root, visited entries, elapsed time and truncation reason.
+- **Read-policy denials were invisible in `glob` and `ls`.** Both returned success with
+  fewer results, so the agent could not distinguish an empty directory from one it was
+  not allowed to see, and could not self-correct. A named withheld path now returns an
+  error with the reason and remediation, matching `read`; entries withheld while
+  traversing a permitted path return the permitted results plus a notice with the
+  withheld count and reason class. Withheld path names are never disclosed, and
+  naming-rule denials are omitted entirely so the presence of a secret-shaped file is
+  not advertised.
+- **Reference docs seeded into the agent home were unreadable by the agent.** The home
+  read boundary admitted only `state`, `memory`, the artifact root and the turn
+  scratch, so `<home>/docs/` was withheld — and `glob`/`ls` showed it as empty rather
+  than denied. `<home>/docs` is now a read-only root; secret-shaped names inside it
+  (`.env.*`, `.key`, `credentials/`) remain denied, and it stays unwritable. The
+  upgrade turn now names the docs that changed in that upgrade.
+- **A completed Worklink build could be discarded as a permission refusal.** A
+  substring scan for permission-denied text matched the executor's own edited source,
+  forcing a failure at exit 0 with work committed and the gate green, and the reason
+  was then dropped because failure was keyed off the exit code. The refusal is now
+  honored only when positioned as a signal or accompanied by a nonzero exit, and a
+  backend-reported failure surfaces its reason independently of the exit code.
+
+### Added
+- **A typed `issue_comment` tool.** The review poller could comment on a pull request
+  but not on an issue: `gh issue comment` is not in the `repo_review` shell allowlist,
+  so a prepared analysis had to be relayed by hand. Rather than widen that allowlist —
+  the same widening that once leaked credentials through `gh`'s `--jq` filter — issues
+  get a typed tool alongside `pr_comment`. It refuses pull-request numbers, because
+  GitHub serves both from `/issues/{n}/comments` and without that check the narrower
+  issue capability would bypass the server-discovered review authority `pr_comment`
+  requires. The destination is a server-fetched issue rather than the caller's
+  selector, validated against the identity the server returns. An issue comment
+  requires the turn to hold at least one repository-derived source, and that
+  source's repository must match the issue's; the resource within the repository
+  need not, so a turn that read a pull request may comment on an issue in the same
+  repository, while cross-repository flow is denied. Granted to the review poller
+  only, and not inherited by custom trigger profiles. (#1156)
+- **Worklink builds can contribute a PR body section.** A build may write Markdown to
+  `.worklink-pr-body.md` in its checkout; the harness consumes it before staging — so
+  it never enters the diff — and places the bounded, scrubbed contents in a
+  harness-owned `Build summary` section ahead of the unchanged evidence block. This is
+  not a general PR-body write capability: the build supplies content the harness
+  places.
+
+## [0.7.1] — 2026-08-03
+
+### Fixed
+- **Upgrade reconciliation was hard-blocked from the proposal workspace it had just
+  created.** The upgrade turn opens a proposal worktree and is then told to read and
+  reconcile the changed files inside it, but the workspace was outside the turn's read
+  scope — 81 real refusals in six minutes on one deployment. The upgrade principal's
+  read roots now include the proposal root it owns. (#1363)
+- **Upgrade reconciliation could not inspect its own proposal PR.** `gh pr view` for the
+  PR the turn had just opened resolved as `admin_required` — shadow-only at the time, but
+  it would have broken the flow outright once enforcement is enabled. (#1362)
+
+### Changed
+- Version bumped to 0.7.1 and the 0.7.0 changelog completed. (#1361)
+
+## [0.7.0] — 2026-08-03
+
+### Fixed (landed 2026-08-03, before the 0.7.0 tag)
+- **Stale Worklink claims were never reaped.** The concurrency lock records the
+  Chainlink tracker identity while a claim records the Worklink process identity;
+  comparing them made every normally shaped live lock look like another owner's,
+  so a claim whose heartbeat stopped kept `worklink:in-progress` indefinitely and
+  could not be re-dispatched. Ownership and freshness now come from the latest
+  structured claim comment.
+- **A failed run could be recorded with no reason.** Evidence validation named
+  every failure it caused but not one arriving already failed, and factory cleanup
+  emitted `Cleanup failed: None` by propagating the input alert's empty reason.
+  Both synthesize a concrete reason; repeated cleanup failures escalate on a
+  stable classifier rather than on raw command output, and re-alert daily instead
+  of going permanently silent.
+- **Exceeding the project-test output cap killed the test run.** A suite emitting
+  more than the capture limit was `SIGKILL`ed and reported as failed regardless of
+  its real exit status — so a chatty but passing suite failed a build for reasons
+  unrelated to the change. The cap is now a ring buffer retaining the tail, so the
+  pytest summary and `FAILED` lines survive; only a timeout kills the process group.
+- **Memory read policy was a growing list of exact paths.** It is now one rule: a
+  turn may read anything under `<home>/memory/` except a channel directory that is
+  not its own session channel. Core memory is readable by every turn and writable
+  by none outside the proposal path. Protected names and secret-bearing content
+  stay withheld inside readable directories.
+- **Shell refusals were opaque.** A command refused by a trusted-service shell
+  profile now names the typed tool to use instead where one exists, and says
+  plainly when none does, rather than only reporting the rejected shape.
+
+### Added (landed 2026-08-03, before the 0.7.0 tag)
+- **Read-denial telemetry records the session channel**, so a denial can be
+  attributed to the session that caused it from the event alone.
+- **Operator guide for the code-building pipeline**
+  ([`docs/code-building-pipeline.md`](./docs/code-building-pipeline.md)): declaring
+  repositories, Worklink configuration, the strict leaf format and the validator
+  contract that silently blocks a malformed leaf, dispatch and claim lifecycle,
+  and the GitHub review flow. The documented leaf markers are pinned to
+  `_REQUIRED_SECTIONS` by test.
+
+> **Authorization enforcement ships off by default. Leave it that way for now.**
+> The authorization / information-flow framework below is complete and validated
+> — every one of #854's 94 sub-issues is closed, and the full test suite is green
+> under `MIMIR_ACCESS_CONTROL_ENFORCED=1` in both provider configurations. What
+> has *not* happened is observation of a running deployment under enforcement.
+> Before enabling it on a live agent:
+>
+> - **Configure `MIMIR_EGRESS_APPROVED_URLS`.** Application egress is
+>   deny-by-default (arbitrary egress is the exfiltration path). With no
+>   configured list, `fetch_url` is denied except to destinations approved within
+>   the session, so an agent that browses will stop browsing.
+> - **Deploy first, then read the shadow log.** Decisions are recorded as
+>   `shadow_tool_decision` events with an explicit `would_block`; a deployment
+>   running older code emits older event shapes, and classifying them requires
+>   replaying the gate. Observe under the code you intend to enforce.
+> - **Follow the runbook** in [`docs/authorization.md`](./docs/authorization.md),
+>   which carries the flip-time preconditions and re-verification commands.
+
+### Added
+- **Typed repository and pull-request capabilities for scoped review and remediation.** PR metadata, files, diffs, checks, reviews, comments, review requests, and bounded write actions now use typed tools; repository checkout, status, diff, stage, commit, merge/rebase/revert, push, and cleanup operate only on the immutable PR scope and active checkout lease. `repo_test` runs the deployment's `worklink.yaml` `defaults.test_command` without accepting a model-supplied command or shell environment.
+- **Tool-authorization and information-flow control framework, in shadow mode (#854, all 94 sub-issues closed).** A requester/resource authorization model with a documented threat model (#856), a frozen per-turn authorization context with an exact-turn carrier (#864), a decision engine with an operation catalog and service capability tiers (#865), resource adapters for channel messaging and history (#866), commitments (#867), and the filesystem / indexed-read admin baseline (#868), MCP provenance classification and drift detection (#870), and per-turn information-flow labels with a sink gate (#871). Nothing is enforced by default: decisions are observable only, so the framework can be evaluated against real traffic before it gates anything.
+- **SAGA ownership, scoped reads, and derived ACL propagation (#869 and children).** Atom, triple, and session reads carry a parameterized authorization predicate applied in SQL, so authorization happens before content or existence is exposed. Admins read everything; platform services get broad internal read; regular users see public plus their own rows.
+- **Enforcement is validated continuously, not once (#1216).** A standing `pytest-enforced` CI job runs the full suite with `MIMIR_ACCESS_CONTROL_ENFORCED=1` on every pull request, deliberately leaving `MIMIR_MODEL_SPEC` unset so it exercises the shipped default a fresh install receives. Authorization regressions were previously invisible to CI by construction — every gate that fails closed only under enforcement passed silently with the flag off, which is how three such regressions reached `main` and had to be found by hand. A green run means "nothing failed", not "enforcement is covered"; an executable guard rejects any test skipped *because* enforcement is on, so the job cannot decay into "nothing ran".
+- **`mimir memory doctor` and a prompt-budget linter (#742 and children).** A read-only memory-health diagnostic with text and JSON output, plus a linter for prompt budget growth.
+- **Chat-invocable skill commands with a React slash menu (#783 and 12 children).** Skills can be invoked directly from chat, with server-owned command metadata stripped from client-controlled HTTP ingress so a client cannot forge privileged skill parameters.
+- **Wiki viewer and reader in the React app, with a `[[wikilink]]` graph view (#672, #710, #711, #712).** The graph is built on reagraph, contained to a bounded panel, declutters labels at zoom, and derives its colors from the active dashboard theme.
+- **Consolidated admin tab (#1169).** Config, users, and MCP server management move into one admin-only tab with sub-tabs, including an MCP list and edit modal.
+- **Dependency security advisory monitoring for lockfiles (#849 and children).** A poller surfaces advisories affecting pinned dependencies.
+- **Activity panel for bridge channels (#725).** Per-turn progress panels, opt-in per channel by prefix allow-list and gated by trigger so session-boundary and other internal turns never render one.
+- **Reference docs ship in the wheel and seed into the agent home (#1053).** `docs/`, `README.md`, and `.env.example` are force-included and copied into `<home>/docs/` on setup, so an operator has the configuration reference locally rather than needing the repository.
+
+### Changed
+- **Coding and PR remediation are explicit operator opt-ins.** `MIMIR_CODING_ENABLED` gates the coding tool surface, and `MIMIR_PR_CHECKOUT_LEASE_ROOT` supplies the root for atomic scope-bound PR checkout leases without granting general authority over that root or the live source checkout.
+- **Worklink execution terminology and evidence use `checkout`.** Per-attempt execution uses self-contained isolated checkouts; new evidence writes `checkout`, while continuation recovery alone accepts the historical `worktree` field for persisted evidence compatibility.
+- **The default `MIMIR_MODEL_SPEC` is now `codex-plus:gpt-5.6-luna` (#1212).** The previous `claude-code:claude-sonnet-4-6` default could not be combined with enforcement, so a fresh install that enabled authorization failed startup preflight until the operator also changed provider. There is now **one** default: `mimir setup` and the `Config.from_env` fallback read the same constant, pinned together by a test so they cannot drift. Consequence for `mimir setup --subscription`: with a subscription-backed default the bare flag is a no-op, and Claude Max now needs `--model claude-sonnet-4-6 --subscription`. The default's adapter extra is `mimir-agent[codex-plus]`.
+- **Every provider works under enforcement (#910).** The Claude Code SDK's `PreToolUse` hook now receives the exact server-created per-turn `AuthContext` through a server-owned carrier bound per invocation, so the startup refusal for `claude-code:*` is gone. The carrier is not `session_id` (model-influenceable) and not bare `ContextVar` inheritance; it rebinds per invocation with teardown, and an absent carrier still fails closed.
+- **Worklink epic execution moved off the docker-sibling stack (#830, closing out #768 and its 14 children).** Integrated epic-PR mode was built, run 17 times, and retired without a single completed review — every failure traced to distribution overhead rather than the agent's work. Per-leaf worklink remains; the docker/broker infrastructure is gone in favour of an isolated-checkout runner, `spawn_codex` is replaced by `spawn_opencode`, and epic-scale work moves to the external OpenCode feature-factory stack (#875, #877 track the migration and its canary). The epic-run hardening from that period (#799-#828) is retained where it applies to the surviving per-leaf path.
+- **`claude-code:*` is a supported provider route (#732 and 7 children)** after an authenticated operator-container soak and deployment-helper reconciliation. The supported install path is `mimir-agent[claude-code]` / `uv sync --extra claude-code` plus an authenticated Claude Code CLI.
+- **Scheduled introspection reports include a compact `mimir memory doctor` summary** so memory health sits alongside behavioral and tool health. Reports now pass `home` into the aggregator, which also enables other home-gated sections such as skill health. The doctor run is read-only; use `mimir memory doctor --json` for full diagnostic detail.
+- **Trust derivation for autonomous turns (#980).** Contributor-authored GitHub content and fetched pages from operator-approved URLs are treated as trusted input; the agent's own memory and state are no longer labelled as untrusted active ingest. Non-contributor GitHub content, non-allow-listed fetches, and arbitrary attachments remain untrusted.
+
+### Fixed
+- **Autonomous turns crashed on every tool call under a populated authorization context (#971, critical).** The injected `ToolRuntime` was serialized during tool-argument parsing, and a `frozenset[SourceLabel]` reached a duck-typed serializer that turned each label into an unhashable dict. Information-flow label sources are now an append-only deduplicated tuple, coerced in `__post_init__`, so the structure survives serialization regardless of which path reaches it. Type-level serializers alone did not fix this — the data structure had to change.
+- **A 429 whose message mentioned tokens was classified non-retryable (#993).** The non-retryable check ran first and matched substrings like "max tokens" / "too long", so a genuine rate-limit response with Anthropic's wording failed fast instead of retrying. HTTP status now outranks message keywords.
+- **Dispatcher turn concurrency under enforcement (#999).** A synthetic test event carried no bridge attribution, the enforced ingress gate correctly denied it, and the failed assertion left a scheduler turn parked on an unreleased event — which stranded the rest of the suite rather than failing one test. Teardown now releases and drains regardless of assertion outcome.
+- **Windowed log scans silently truncated when the record cache saturated (#1003).** `aggregate` (1h/5h/7d usage), the alert-cooldown dedup, and the S3/S4 turn partition used the saturation-unaware iterator, so a cache that filled *inside* the requested window under-reported with no error. Because those figures feed the homeostat, the failure direction was fail-open: less resource pressure observed than was real. Converted to the saturation-aware iterator introduced for exactly this case; the two genuinely non-windowed scans are deliberately unchanged.
+- **Budget and arbiter log scans blocked the event loop (#1004).** `worklink_run` consulted the homeostat synchronously under a comment asserting the call was cheap — it reads `turns.jsonl` — and the poller budget check re-scanned the file twice per fire without using the cache. Both now run off-loop, matching the pattern the scheduler already used; the helpers stay synchronous and the async callers wrap them.
+- **Test-suite state leaked between tests through the process environment (#1005).** `_load_home_dotenv` calls `load_dotenv(override=False)`, which mutates `os.environ`; `monkeypatch` cannot restore what python-dotenv set underneath it, so keys written by a temp-home `.env` outlived their test. Under enforcement one such leak cascaded into roughly 186 unrelated failures from a single root cause. Runtime behaviour is unchanged — mutating the process environment is correct at runtime — and an autouse fixture now snapshots and restores it. Two tests that had been silently depending on the leak are fixed; one of them had been failing whenever its file was run on its own.
+- **Comprehensive code-review sweep (#746 and 11 children)** covering correctness and hardening findings across the tool, poller, and worklink surfaces.
+- **Worklink claim and evidence correctness.** A closed-unmerged PR left stale `completed` evidence that permanently blocked re-attempts (#972); crash-reattach re-ran a completed attempt and force-pushed over its PR branch (#975); poller events were consumed then lost on unclean restart, because the cursor advanced at emit while the in-memory queue was wiped (#974); summarization offload silently dropped context (#973).
+- **Read-policy, capability, and write-scope correctness under the new framework.** Non-admin read scope rejected the agent's own virtual home paths — `/state/x` denied while `<home>/state/x` resolved (#977, 313 would-blocks); service capability sets were incomplete, granting a shell capability without its job-inspection companions and omitting saga/memory operations (#978, 79 would-blocks); dynamic trigger principals were denied the memory and state writes their shipped prompts instruct (#982, 48 would-blocks); scheduled and heartbeat principals were bound to a read-only shell profile that refused the commands their own prompts issue (#922, #979); and symlinked read roots could never match, because roots were compared literally while targets were resolved (#987).
+- **Shadow decisions are self-classifying (#976, #1010).** Calls that enforcement would have allowed by service capability no longer emit false would-blocks, and each `shadow_tool_decision` event carries a `would_block` flag, the resolved sink target, the originating trigger, and the principal — so the enablement audit can classify a decision from the event alone instead of replaying it through the gate. #1010 replaced the initial `reason is not None` heuristic with an explicit per-branch value asserted in tests against a real enforced decision, and added a conformance test so a new denial branch cannot silently omit it (the field defaults to false, so an omission would claim enforcement *permitted* the call).
+- **Stuck-PR reminders are reconciled against outcomes, not emissions (#985).** The changes-requested reminder counted emissions, so a completed turn that produced no commit was indistinguishable from work in progress and recovery waited on a fixed timer. Reminders now carry a bounded attempt series with a one-shot give-up signal, a head change re-arms immediately, and a stranded series re-arms after a backstop rather than going silent forever. Per-PR events are no longer batched into one turn.
+- **Session-boundary summaries no longer assert stale artifact state (#986).** Unfinished-work items naming a PR, issue, commit, or branch are validated against current state before a turn quotes them, so a merged PR is not described as open. Validation is batched, capped, and fails open by marking an item unverified rather than dropping real work.
+- **Turn outcomes that did no work are no longer logged as successes (#983).** `model_context_window_exceeded` is classified as an error, and a turn that hit an actual tool-call budget denial is classified `tool_budget_exhausted` — read from the existing `TurnContext` fields, so a soft warning alone still counts as success and cannot double-count against the existing budget feedback rule. The final tool-call count is recorded on the turn record and both terminal events. Deterministic budget exhaustion is deliberately excluded from generic poller retry recovery: replaying an unchanged item under the same budget would repeat partial work and spend another full budget, so the outcome stays visible for telemetry without being re-fired.
+- **Codex quota windows were mapped by position rather than length (#1058)**, which reported a 7-day window as 0% used on a Pro plan.
+- **Memory-leak fixes and scratch self-cleanup (#1105).** From the 2026-07-17 audit: the turn-record snapshot retained untruncated tool-call arguments and reasoning, and scratch directories grew without bound.
+
+### Security
+- **Service shell profiles admit only validated argv, and the argv is the execution artifact (#922, #979, #991).** `parse_service_shell_argv` returns the exact argv callers must exec with `shell=False`; a purpose-built `repo_review` profile covers PR inspection and a `maintenance` profile covers scheduled upkeep. Git invocations must name their target with `-C <configured-root>` so the target lives in the authorization artifact rather than in the working directory, and every admitted argv is hardened in place against configuration-driven execution (`core.fsmonitor`, `core.hooksPath`, `diff.external`, external diff, textconv, per-driver content filters, optional locks). `npm ci` requires `--ignore-scripts`, pytest options are allow-listed with response-file operands rejected and collection confined to relative in-repo paths, and `PYTEST_ADDOPTS` / `PYTEST_PLUGINS` are removed for pytest argv on both the synchronous and asynchronous exec paths.
+- **Every admitted service executable is pinned to a fixed absolute file (#991).** Bare `argv[0]` was resolved through a PATH whose first entry was the workspace virtualenv — a directory service principals can write — so authorization could approve one program while the runtime executed another. Pins must resolve, be non-symlinked regular executables, and lie outside every configured service-writable root; a script pin must name its interpreter so a shebang cannot reintroduce PATH resolution; and a missing pin fails closed with a distinct log fingerprint.
+- **Service principals cannot write git metadata or the workspace virtualenv (#984, #991).** A path component of `.git` or `.venv` is denied on both the lexical and resolved path, closing deferred execution through hooks, repository configuration, and planted interpreters. `.gitignore` and `.gitattributes` remain writable — they can select a diff or filter driver but cannot define one, and driver definitions live in configuration, which is denied.
+- **Shadow-decision targets are redacted before they reach the event log (#1010).** The recorded sink destination previously went in raw, so a token in a `fetch_url` query string was written to `events.jsonl` in plaintext. The destination is now normalized and passed through the secret-scrub path.
+- **Cross-user and cross-channel data-exposure fixes.** Client-controlled HTTP ingress is stripped of server-owned chat-skill keys, worklink continuation hints, and bridge-owned authority metadata before an event is constructed, and a per-user key may target only its own channel. Turn logs are redacted (#1133), spawn artifact handling closes an `openat`/`O_NOFOLLOW` race (#1134), factory-run views are admin-gated server-side rather than only in React navigation (#1135), `POST /event` binds `channel_id` to the authenticated identity (#1130), and worklink gained a secret scan mirroring the pre-commit hook (#1137).
+- **Agent-self diagnostics no longer carry user-scoped data across channels (#1006).** Principal-less self-regulation feedback is redacted before render, so one user's input text or channel id cannot surface in another user's prompt. `client.end_session` with no authorization context now fails closed instead of skipping its mutation-scope and session-binding checks.
+- **Prohibited-action guard** blocks force-pushes to `main`/`master` and comparable destructive shapes before execution.
+
+### Documentation
+- **The enablement runbook is accurate and executable (#952).** `docs/authorization.md` carries the flip-time preconditions with copy-pasteable re-verification commands, names the standing enforced CI job as the continuous validation, and states what a green run does and does not prove.
+- **`docs/security/enforcement-enablement.md`** describes the authorization model, the shell profiles and their rationale, the trust-derivation decisions, and the closed-out enablement blockers.
+- Document `mimir memory doctor` usage, JSON/text output, read-only boundaries, status semantics, and automation guidance.
+- Complete configuration reference covering every environment flag (#1052).
+
+### Known issues
+- **Per-turn tool-call budget is a single global value sized for heartbeats (#992).** PR-remediation turns exhaust 200 calls reliably, which interacts badly with the bounded reminder attempts added in #985.
+- **`MIMIR_EGRESS_APPROVED_URLS` is unset in shipped defaults.** That is deliberate — egress is deny-by-default — but it means enabling enforcement without configuring it stops the agent fetching URLs it previously could.
+
+## [0.6.9] — 2026-06-29
+
+### Added
+- **Per-poller cost budgets (#925, #934, #935).** Config-driven per-poller budgets — `max_api_calls` / `max_api_bytes` / `max_external_usd` caps over `1h` / `24h` windows, declared in `<home>/pollers-overrides.yaml`. Poller subprocesses may emit validated `poller_usage` signal records (API calls / bytes / estimated external $), which the scheduler aggregates alongside agent-turn usage. Inside the existing global `HomeostaticArbiter`, only an over-budget poller is suppressed (others keep firing under the same CLEAR pressure), via a `poller_budget_suppressed` event; the subprocess is skipped so cursor state is untouched. Unsupported window labels are warn-dropped at parse time, and budget aggregation fails open (a telemetry/read error never halts a poller).
+- **Per-user UI skins (#931).** Users select a skin that is persisted server-side keyed to their authenticated identity (`POST /api/v1/user/prefs`), with no cross-user write.
+- **Operator-installable skins + server-side skin validation (#936).** A deployment can drop `SkinManifest` JSON into `<home>/skins/` — discovered and validated fail-open (required fields, unique non-colliding id, token-key allow-list, font-entry shape) — without rebuilding the frontend. The bootstrap exposes built-in ids plus operator manifests; the frontend merges them into its runtime skin registry. `POST /api/v1/user/prefs` now validates the requested skin against the built-in ∪ operator set (400 on an unknown id) instead of trusting the client, and a parity test keeps the server's built-in id list in sync with the bundle.
+
+### Changed
+- Bumped pinned external coding-CLI tool versions (#932).
+
+### Fixed
+- **Block leading `[skip]` / `[skipped]` marker on poller/scheduled `send_message` (#937).** A non-interactive (`poller` / `scheduled_tick`) turn whose send begins with a `[skip]` / `[skipped]` narration marker is rejected through the existing skip-list block path (tool error + `send_message_blocked_skiplist` event), keeping non-delivery narration out of operator/chat channels even when the message is too long to trip the short-message dominance gate.
+- **Validate heuristic `saga_atom_ids` against the SAGA store (#933).** Atom ids collected by shape from tool results / triples are checked against the store (a single batched, fail-open lookup) before being recorded, so phantom 16-hex tokens (e.g. a gmail message_id) no longer render as unresolvable "Atoms cited" citations or pollute synthesis credit. Query-response atoms are treated as known-real and not re-validated.
+- **Collapse repeated algedonic signal fingerprints (#928).** Repeated feedback signals are deduplicated on a stable fingerprint (kind + normalized content + channel) while preserving count and recency, so numeric-drift variants of the same suppression/escalation no longer flood the feedback block.
+- Tolerate naive (timezone-less) turn timestamps in skill-outcomes rather than raising (#930).
+- Tolerate malformed activation summaries in the saga dashboard (#929).
+
+### Documentation
+- Document `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS` in `.env.example`, with a recommendation to enable it for weaker / tool-shy models (e.g. Minimax M3) where the final-text-without-`send_message` action-seam failure is common (#924).
+
+## [0.6.8] — 2026-06-29
+
+### Added
+- **Wiki viewer in the React dashboard** — an auth-gated, read-only wiki browser: a non-mutating payload/graph builder (`build_wiki_payload`), admin-gated `GET /api/v1/wiki` + `/api/v1/wiki/{slug}` routes, a lazy-loaded React reader with `[[wikilink]]` navigation + backlinks, and an interactive wikilink graph view built on reagraph (force-directed community clusters, visible edges, pan/zoom, hover-isolate, bounded panel, theme-matched colors derived from the dashboard's design tokens).
+- **`send_message` delivery guards** — opt-in auto-delivery of an interactive turn's final text when the model didn't call `send_message` (`MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS`; emits an informational `interactive_turn_auto_delivered` and supersedes the resend-nudge per channel); rejection of `send_message` to non-deliverable channels (`poller:`/`scheduler:`/`system`/empty/blank); and rejection of poller/scheduled-turn sends whose text matches a non-delivery "skip-list" (e.g. "skip bucket", "end silently"), keeping silence-narration out of operator channels.
+- `set_poller_overrides` tool so the agent can self-manage `<home>/pollers-overrides.yaml` (schema-validated against `POLLER_OVERRIDE_KEYS`; other top-level home files stay write-blocked).
+- Read-only per-poller LLM usage attribution.
+- `social-cli count` command — derive the daily Bluesky post count from the dispatch ledger (retires the hand-maintained counter).
+- Ops dashboard "Open PRs" panel — the agent's home-repo open PRs with links (fail-soft, admin-gated).
+- Quota reset times in the usage view.
+
+### Changed
+- Centralized `Config` → model-kwargs resolution into a single helper.
+- `shell_exec` now defaults its working directory to `MIMIR_HOME` instead of the s6 service dir, so relative-path commands run from the home.
+- Refreshed default memory-template references (`00-persona.md` → `00-identity.md`, documented coding CLI tools, corrected the learned-behaviors lifecycle); added a core-memory lesson that per-deployment poller tuning belongs in `<home>/pollers-overrides.yaml`.
+
+### Fixed
+- Offload async event-logging append IO off the loop thread (cache the events.jsonl dir creation), reducing residual scheduler loop-lag.
+- Keep missing-file (introspection) recurrences path-specific — key off the full path instead of a 100-char-truncated preview.
+- Add anti-buffering headers to SSE streams.
+- Fix synthesis session-window timestamp parsing.
+- Return non-2xx statuses from the legacy `/api/saga` endpoints on embedded error payloads.
+
+### Security
+- Redact forwarded `pass_env` / `poller.env` secret **values** (by value, regardless of the env-var name) across all durable poller event sinks — stderr, invalid-line, signal payloads, and prompt previews — closing a leak where non-standard-named secrets bypassed the name-pattern redaction.
+
+### Documentation
+- Record the folded-message saga-retrieval decision (v1 keeps raw fold-in + agent-driven `memory_query`).
+
+## [0.6.7] — 2026-06-26
+
+### Added
+
+- **Session-boundary retrieval lane, on by default (#880, #882, #886).** Session
+  summaries now act as a routing signal during recall: `SagaStore.query` searches
+  matching session boundaries, expands the top matches to their member atoms, and
+  feeds those as a secondary `session_boundary` RRF pathway (default weight 0.5,
+  top-3 sessions, ≤30 atoms/session). It re-ranks retrieval toward the right
+  conversational episode without rendering summaries to the reader, reuses the
+  query's connection, and short-circuits cheaply on homes that have no sessions
+  yet. Validated on the two weakest LongMemEval categories from the prior 500q
+  baseline (+6.02pp multi-session; single-session-preference flat). Tunable via
+  `[retrieval]` `enable_session_boundary_rrf` / `session_boundary_weight` /
+  `_limit` / `_alpha` / `_atoms_per_session`. Built on a new generic
+  `extra_atom_ranked_pathways` / `rrf_pathway_weights` API on `query`/`recall`;
+  injected lanes are still subject to every normal tombstoned/agent/skill/
+  confidence filter and are de-duplicated before fusion.
+- **Configurable file-tool roots outside the home (#650).** `MIMIR_FILE_TOOL_ROOTS`
+  lets an operator grant the agent's file tools (`read_file`/`ls`/`glob`/`edit_file`)
+  real access to absolute repos **outside** `<home>` — e.g. a source checkout the
+  agent develops, or a work codebase on a PyPI-wheel deployment. Format:
+  `path[:ro|:rw]`, comma-separated; bare `path` defaults to `rw`. `/tmp` is always
+  added `rw` when present. Roots are routed via deepagents' `CompositeBackend`
+  (the home stays the default); reads/writes hit real disk, `:ro` roots block
+  writes. Validation rejects non-absolute, missing, `~`, `..`, system roots
+  (`/`, `/etc`, `/proc`, `/sys`, `/dev`, `/root`, `/boot`, `/usr`, `/var`, …), and
+  any root overlapping the home. With `MIMIR_FILE_TOOL_ROOTS` unset the agent
+  still gets `/tmp` rw (the always-on scratch root, when present). This fixes the
+  long-standing `/workspace/mimir` false-not-found (the file tools ran
+  `virtual_mode` rooted at the home, silently remapping `/workspace/mimir/x` →
+  `<home>/workspace/mimir/x` → "not found" while `shell_exec` saw the real file —
+  746 such failures over 9 days in one deployment).
+- **ripgrep installed by default in the runtime image (#673).** The agent's
+  file-search/grep tool uses the fast, `.gitignore`-aware, GIL-free `rg`
+  subprocess; shipping it by default avoids falling back to the unbounded
+  pure-Python walk that, on large file-tool roots, ran for minutes and starved
+  the event loop into an unclean restart.
+- **LongMemEval session-boundary bench harness (#674, #676–#680).**
+  `--question-types` category targeting, `--session-boundary-treatment generated`
+  (real boundary synthesis), `--session-boundary-rrf-lane`,
+  `--retrieval-debug-jsonl` + `--capture-reader-prompt`, and a review-before-run
+  runbook for the adoption slice.
+
+### Changed
+
+- **Bounded recursive grep/glob (#673).** The file-search tool skips vendor/VCS/
+  build trees (`.git`, `node_modules`, `.venv`, `.worktrees`, `dist`, `build`,
+  caches) and caps matches / scanned files / runtime; truncation is logged
+  server-side rather than surfaced as a result error, so a broad multi-root grep
+  keeps the matches it already merged.
+- **Loop-lag monitor distinguishes host/VM deschedules from real on-loop stalls
+  (#682).** The scheduler's loop-lag monitor now samples loop-thread CPU
+  (`time.thread_time`) across the wake window and combines it with the watchdog's
+  stall stack: a late wake counts as a real on-loop stall when a non-idle frame
+  was captured (covers a sync-I/O block that burns no CPU) **or** the loop thread
+  spent ≥ 50% of the lag on CPU. Otherwise the loop was merely parked/idle while
+  the host failed to schedule us (e.g. a Docker-Desktop / VM scheduling hiccup),
+  and it's emitted as an informational `scheduler_loop_lag_host` event instead of
+  the negative `scheduler_loop_lag` — kept out of the algedonic `(×N in 24h)`
+  count but escalated if it goes chronic. The watchdog now captures below the
+  monitor threshold so a sub-CPU on-loop block isn't misclassified, and
+  `scheduler_loop_lag` gains `cause` and `loop_cpu_s` fields.
+- **File tools return an actionable error for unreachable absolute paths (#650).**
+  An absolute path that names a real file **outside** the file-tool root (and not
+  under any configured root) now returns "outside the file-tool root … use
+  shell_exec, or add its directory to MIMIR_FILE_TOOL_ROOTS" instead of a silent
+  false "not found"/empty listing.
+- **Off-loop offloads for dispatcher responsiveness (#867, #681).** Web-UI
+  event-log reads and the per-turn algedonic feedback-block render now run via
+  `asyncio.to_thread` instead of blocking the event loop during prompt assembly.
+- **Index-skip is configurable per deployment (#648, #688).** Search + state
+  `INDEX.md` generation share one skip list: framework defaults skip runtime
+  package/build artifacts and known noisy `state/` trees, and a deployment can add
+  home-relative paths in `<home>/.mimir/index-skip.txt` (matched on a path
+  boundary, comments allowed). Operator-specific experiment dirs moved out of the
+  framework default — upgrading operators who want those trees kept out of the
+  index should add them to their `index-skip.txt`.
+- **Web-chat composer controls (#667).** The composer's inert glyph grid is
+  replaced with working Clear / Skills / Shortcuts controls plus an in-flight
+  send guard.
+
+### Fixed
+
+- **Health probe no longer stalls the event loop (#682).** `health_probe.probe_once`
+  ran `probe_pwd` — which forks a `pwd` subprocess — synchronously on the event
+  loop. `fork()` cost scales with the parent's resident memory, so on a multi-GB
+  agent each probe stalled the loop ~1s+ (a recurring `scheduler_loop_lag` source
+  on VirtioFS/Docker-Desktop deployments). It now runs via `asyncio.to_thread`.
+- **github-poller review detection + retry suppression (#868, #870).** Detects a
+  `gh pr review` submission even when a `--repo`/`-R` flag is interposed (no more
+  false "missed submission" signals), and suppresses re-request retries once the
+  same reviewer already has a substantive review at the PR's current head.
+
+### Documentation
+
+- **Non-Docker guide refreshed for 0.5.0→0.6.x (#650).** `docs/mimir-nondocker-guide.md`
+  now covers the host tools mimir shells out to (`ripgrep`, `git`, `jq`,
+  `poppler-utils`/`tesseract-ocr`, Node for source builds) with per-OS install
+  commands, `MIMIR_FILE_TOOL_ROOTS` (with the Docker bind-mount caveat), the
+  React console build step for source installs, `<home>/.env` defaults loading
+  (#447), and the systemd/watchdog/graceful-drain service story. `.env.example`
+  gains `MIMIR_FILE_TOOL_ROOTS` and the reliability vars added since 0.5.0
+  (`MIMIR_MAX_TURN_ITERATIONS`, `MIMIR_DRAIN_TIMEOUT_SECONDS`,
+  `MIMIR_RESEND_NUDGE_CHANNELS`, `MIMIR_LIVENESS_BEAT_SECONDS`, watchdog sinks,
+  `MIMIR_CHAINLINK_AUTOINIT`). README documents file-tool roots for both Docker
+  and non-Docker readers.
+- **Skills doc: reserve tool-call budget for required side effects (#646).**
+
+## [0.6.6] — 2026-06-23
+
+### Added
+
+- **Defaults-upgrade now reconciles `scheduler.yaml` (#666).** New default
+  scheduled ticks added to the bundled `scheduler_template.yaml` propagate to
+  existing homes through the upgrade-lane proposal, instead of needing a manual
+  per-home edit. The reconciliation is job-aware (matched by name), not a line
+  merge: it appends default ticks that are new in the current template (absent
+  from the previous-template baseline and from the home), preserves
+  operator-customized and operator-added jobs untouched, and never removes a job
+  — a default the home dropped is not re-added. Appends as text so operator
+  comments/formatting survive. The version that first ships the template into the
+  vendor branch is a deliberate no-op (no baseline to diff), so it can't double-add
+  a tick the same release's upgrade prompt installs.
+
+- **`add_schedule` accepts `prompt_file` (#666).** A scheduled tick can be
+  registered against a bundled/operator prompt file (e.g.
+  `prompt_file="memory-hygiene.md"`) instead of an inline `prompt` — the
+  canonical shape used by `scheduler_template.yaml`. Exactly one of
+  `prompt`/`prompt_file` is required (mirrors the scheduler.yaml load-side
+  validation); a `prompt_file` missing under `<home>/prompts/` is rejected up
+  front. This is the guardrail-respecting, live-and-durable way for an agent to
+  self-register a tick (it writes through the scheduler's reload/validate path).
+
+- **Upgrade prompt `0.6.6.md`.** One-shot nudge that checks for the
+  `memory-hygiene` tick and, if absent, registers it via the new
+  `add_schedule(prompt_file=…)` in the canonical shape (idempotent; no-op if
+  already present).
+
+### Changed
+
+- **Core memory: honor file-tool write refusals regardless of mechanism.**
+  `memory/core/06-action-boundaries.md` now states that a refused write (the
+  core/prompts runtime block or the path-confinement allowlist) is changed
+  through its sanctioned route — a proposal PR for `memory/core/*` and
+  `prompts/*`, the scheduler API for `scheduler.yaml` — not routed around with
+  `shell_exec` (which also skips the scheduler's reload/validation, landing an
+  edit on disk but not in the running scheduler).
+
+## [0.6.5] — 2026-06-23
+
+### Added
+
+- **`turn_failed` events carry a `request_summary` for provider content
+  rejections.** When a model call fails with an error exposing a PII-light
+  request-content inventory (langchain-codex-plus ≥ 0.0.5 attaches one to
+  `CodexResponseError` — content-part type counts, image MIME/scheme, sizes;
+  never raw text), it's recorded on `turn_failed` so an `HTTP 400: Unsupported
+  content type` names which content types were in the request. Inert on
+  providers that don't surface it. This PR also bumps the `langchain-codex-plus`
+  dep floor to ≥ 0.0.5 (now published), so the diagnostic activates once this
+  version is deployed.
+
+- **Version-specific upgrade prompts (#645).** One-shot migration nudges that
+  run once when a home crosses a target mimir version during a defaults
+  upgrade. Authored as `mimir/prompt_templates/upgrades/<version>.md` (filename
+  = target version), dispatched cumulatively (`prev < v <= current`, oldest
+  first) on the synthetic `upgrade-prompt:<version>` channel, once per bump
+  (gated to the version-advancing upgrade actions, so a restart can't re-run
+  them). Absent prompt = clean no-op. The first one, `0.6.5.md`, nudges a
+  channel-memory review + a memory-hygiene pass. See `upgrades/README.md` for
+  the authoring convention.
+
+- **Memory-hygiene scheduled tick (#644).** A weekly deterministic scan
+  (Tuesdays 08:00 UTC, `normal` priority) that surfaces channel-memory bloat,
+  stale/resolved `memory/issues/*`, missing descriptions, and obvious misfiles
+  as bounded cleanup candidates — keeping reflection focused instead of growing
+  more mandatory sub-passes. Flag, don't delete.
+
+- **Composer action buttons (#581).** The web-chat composer's inert glyph grid
+  is replaced with working Clear / Skills / Shortcuts / insert / SEND controls,
+  with an in-flight guard (no double-send) and per-user shortcut snippets.
+
+- **Cluster-observation GEPA evaluator (#626).** An ASI-rich evaluator + GEPA
+  adapter for the SAGA cluster→observation prompt pilot (parser-compatibility
+  gate, symbolic-retention scoring, support/overclaim checks, prompt-overfit
+  regularizer), under `evals/cluster_observation/`.
+
+### Changed
+
+- **Runtime now loads `<home>/.env` as defaults (#447).** `Config.from_env()`
+  reads the setup-written file before constructing configuration, while real
+  process environment values still win. This makes fresh setup homes runnable
+  without a one-key scaffold parser and establishes the durable contract:
+  exported deployment env overrides `<home>/.env`; absent `.env` is a no-op.
+
+- **Unspecified scheduled-job priority defaults to `normal` instead of `low`
+  (#656).** Periodic jobs are no longer the first thing shed at the mildest
+  quota signal (ELEVATED) — they yield only under real pressure (TIGHT).
+  Explicit `low` remains available for disposable jobs.
+
+- **`state/proposed-changes.md` retired as the protected-surface proposal path
+  (#638, #640).** `memory/core/*` and `prompts/*` changes now route through
+  `open_proposal` / `submit_proposal` PRs; proposed-changes is legacy/migration
+  only.
+
+- **Default channel-memory filing rules clarified + over-filing non-goal added
+  (#635, #636).** Bundled core memory now documents what auto-loads (top-level
+  `memory/channels/<id>/*.md`, ~8 KB cap, synthetic channels excluded) and warns
+  against hoarding low-value/episodic notes (use SAGA retrieval instead).
+
+- **External tool pins bumped (#632).** `@openai/codex` 0.139.0 → 0.141.0 and
+  `@anthropic-ai/claude-code` 2.1.177 → 2.1.185. `gogcli` held at v0.9.0 pending
+  an authenticated `gog` smoke (its smoke command + risk note were hardened).
+
+### Fixed
+
+- **Oversized real channel memory now surfaces algedonically.**
+  When injected `memory/channels/<id>/*.md` content exceeds the channel-memory
+  prompt cap, mimir emits a negative `channel_memory_over_cap` signal naming the
+  channel/path/size so stale truncated context prompts a trim instead of hiding
+  inside the injected block. Synthetic scheduler/poller channels remain skipped.
+  chainlink #643.
+
+- **Scheduler cron day-of-week now follows standard crontab numbering.**
+  Numeric day-of-week fields are interpreted as Sunday=0/7, Monday=1, and so on
+  before APScheduler registration. Existing weekly jobs that used numeric weekdays
+  move by one day on upgrade to their standard-cron day (for example, a prior
+  `1` now fires Monday instead of APScheduler's old Tuesday interpretation).
+  chainlink #658.
+
+- **github-poller detects stale reviews after a content-free rebase (#558).**
+  Compares the PR's own patch signature at review time vs. now (equal = a
+  content-free rebase) instead of the unreliable `compare.files` heuristic, so a
+  rebase that didn't address a `CHANGES_REQUESTED` review still re-nudges.
+
+- **Scheduler dashboard `LAST` shows the persistent all-time last fire (#657).**
+  Sourced from the event log (bounded scan) rather than only the current
+  process, so a job that fired before the last restart no longer shows `n/a`.
+
+## [0.6.4] — 2026-06-22
+
+### Fixed
+
+- **Spurious "unclean restart" pages on deploy recreates.** `_on_cleanup` now writes
+  the clean-shutdown marker as its very first action, before `await log_event(…)` and
+  the drain. Previously a stalled await during an active turn could let the stop grace
+  period expire (SIGKILL) before the marker was written, so an intended stop looked
+  like a crash and paged the operator (seen on muninn's busy Discord/poller workload).
+  chainlink #507.
+
+## [0.6.3] — 2026-06-22
+
+### Security
+
+- **The agent can no longer edit `state/identities.yaml` via its file tools.** That
+  file is the auth identity + role registry; with `state/` otherwise writable, a
+  prompt-injected chat user could talk the agent into adding an `admin` role alias
+  for themselves (privilege escalation, now that web RBAC gates saga/memory/ops/admin
+  on the admin role). `WriteGuardBackend` now denies writes/edits/uploads to it
+  unconditionally. Legitimate changes still go through the operator path
+  (`mimir identities …` CLI, the admin Users UI, or direct file edit) — none of which
+  route through the agent's tools.
+
+### Fixed
+
+- **Resend-nudge is on by default for web chat.** `web-*` channels are single-user and
+  interactive, so a tool-shy model (minimax M3) that answers in final text without
+  calling `send_message` now always gets the corrective re-prompt — previously web
+  replies could be silently dropped unless `MIMIR_RESEND_NUDGE_CHANNELS` listed `web-`.
+- **Admin-only dashboard tabs are hidden from non-admins.** `Usage`, `SAGA`, and
+  `State/Memory` are marked `requires_role="admin"` to match their already-admin-gated
+  endpoints, so a non-admin no longer sees tabs that only return `forbidden`.
+
+## [0.6.2] — 2026-06-22
+
+### Added
+
+- **Chainlink store auto-init on startup.** If the `chainlink` CLI is installed and
+  `<home>/.chainlink` doesn't exist yet, `build_app` runs `chainlink init` so the
+  Tasks board works out of the box instead of reporting the tracker "unavailable".
+  Best-effort (never fails startup), gated on the binary (plain `pip install`s
+  without the CLI are unaffected), and disableable via `MIMIR_CHAINLINK_AUTOINIT=0`.
+
+### Fixed
+
+- **Clearer chat-stream auth error.** When `/chat/stream` is rejected because the
+  admin/master key isn't a chat identity (`master_key_not_chat_identity`, 403) or no
+  user is signed in (401), the chat panel now shows an actionable message ("sign in
+  with a per-user key (Admin → Users)…") instead of the generic "Chat stream
+  unavailable; reconnecting…", and **stops the reconnect loop** that otherwise re-sent
+  the same 401/403 every second. Transient failures (429/5xx/network) still retry.
+
+## [0.6.1] — 2026-06-22
+
+### Fixed
+
+- **`/app/` returned "React app build not found" on a fresh install** (packaging
+  regression). The 0.6.0 wheel shipped with no `mimir/react_app/` at all: the built
+  Vite/React bundle (`mimir/react_app/dist/`) is gitignored, and hatchling's `include`
+  allowlist is intersected with VCS-tracked files, so the `include` glob matched nothing
+  and the dist silently dropped from the wheel. Added a `[tool.hatch.build] artifacts`
+  entry that force-includes the VCS-ignored dist, plus a `publish.yml` step that runs
+  `npm ci && npm run build` before `uv build` and a post-build assertion that the wheel
+  contains `react_app/dist/index.html`. A fresh `pip install mimir-agent` now serves
+  `/app/` out of the box.
+
+## [0.6.0] — 2026-06-22
+
+Headline: **React web console + identity-scoped web chat**. The browser UI
+moves from server-rendered dashboards to a typed Vite/React app with live chat,
+turn streaming, task/SAGA/memory/ops dashboards, themed shells, admin controls,
+and authenticated per-user channel scope. The release also includes the
+performance/reliability hardening found while dogfooding that UI: progressive
+turn loading, loop-stall reductions, stricter web redaction/RBAC, Worklink
+ready-queue fixes, and SAGA/search scheduler robustness.
+
+### Added
+
+- **React web app foundation and dashboard cutover.** Added the Vite/React
+  frontend, typed API clients/contracts, reusable dashboard components,
+  app-shell routing, extension/tab contracts, and static serving/build plumbing
+  for the new console.
+- **React parity dashboards and drilldowns.** Ported Ops, State/Memory, SAGA,
+  Turns, Scheduler/Pollers/Commitments, admin config/model/env, and
+  Chainlink/Worklink task views to React, including a Kanban-style task board,
+  session/conversation browser, cross-dashboard deep links, one-line turn rows,
+  pop-out/current-turn detail panels, and collapsible reasoning/tool blocks.
+- **New web chat experience.** Added a React chat UI over the existing web-chat
+  bridge with reload-on-entry history, bottom-anchored transcript behavior,
+  token-level reply streaming, live activity/field-log panels, chat-scoped
+  dossier context, and real-time turn-event updates.
+- **Live event and agent-character UI.** Added a unified live-event stream,
+  live turn-event bus, running turn counts, live accordion Field Log,
+  talking/listening/typing/thinking/tool/error character states, and
+  skinned Lottie-based agent character assets.
+- **Theming and UI configuration.** Added skin manifests, default retro / Neon
+  Terminal / Cosmic Nebula skins, skin-owned fonts, skin-driven shell layouts,
+  agent-owned `web_ui.json` configuration, build-version bootstrap data, and
+  onboarding docs for name/skin configuration.
+- **Web auth, users, and RBAC.** Added per-user web keys, backend RBAC
+  primitives, a protected-server login screen, admin Users UI, role-gated admin
+  surfaces, and centralized auth/bootstrap handling.
+- **Ops visibility.** Added an ops signals page, promoted the usage dashboard,
+  and added loop-stall instrumentation with collapsed-lag signals and
+  incremental event emission.
+- **Worklink autonomy support.** Added controller restart reattachment for
+  in-flight Worklink runs, optional-skill auto-refresh, and improved
+  published-runtime/deploy support including `jq` in the Docker image and
+  smoke-validated worker Dockerfile updates.
+
+### Changed
+
+- **Chat and live endpoints are identity-scoped.** Web chat channels and live
+  streams now derive from the authenticated web identity rather than
+  client-selected channel state, with a reserved shared default channel and
+  API-key-change handling that resets/reconnects browser state.
+- **Admin/dashboard APIs are more strictly gated and redacted.** Saga, memory,
+  ops, raw config, admin config/model/env, and token-shaped values are
+  admin-gated or fail-closed redacted where appropriate.
+- **React console layout and navigation were polished.** The dashboard gained
+  top-nav/header/footer shell polish, compact status, rounded/glowing skin
+  treatments, outlined nav tabs, redesigned Tasks dependency views,
+  collapsible status, scroll-contained tables and chat panes, fixed usage-chart
+  scales, and progressive turn rendering.
+- **Dashboard and loop performance moved off hot paths.** Ops payload parsing,
+  session-summary turn counts, scheduler index-integrity checks, Codex quota
+  callback writes, SAGA embedding preparation, and DeepAgents tool-schema token
+  counting were offloaded or cached to reduce event-loop stalls.
+- **Worklink dispatch rules are stricter and more observable.** Ready-queue
+  handling skips blocked leaves, rejects invalid ready leaves before dispatch,
+  tolerates text ready output, surfaces worker failure reasons, keeps cleanup
+  failures post-transition, and treats planner-provided test commands as
+  advisory rather than authoritative.
+- **Frontend tests and state isolation were expanded.** Added broad React
+  route/component/API coverage and reset Zustand UI state between tests to
+  remove collapse-state flakiness.
+
+### Fixed
+
+- **Vestigial chat URL params after identity-scoped chat** (#840). Removed and
+  cleaned obsolete `channel` and `filter` URL parameters from chat flows after
+  chat channel selection moved to authenticated identity scope, while preserving
+  unrelated params such as `tab`.
+- **Autonomous Worklink runs couldn't open PRs (`gh` had no token)** (chainlink
+  #537 rail). The `chainlink-orchestrator` ready-queue poller now passes
+  `GITHUB_TOKEN` through to controller-side `mimir worklink run`, so `_open_pr`
+  can use `gh pr create` after a poller-dispatched run passes.
+- **Web chat isolation and connection correctness.** Fixed authenticated-user
+  chat scoping, required an auth identity for chat, reconnected identity-scoped
+  SSE streams on API-key changes, capped/reconnected chat streams, released
+  live-event slots on prepare failure, and reset browser state when API keys
+  change.
+- **Web security hardening.** Fixed unsafe frontend href/query-param handling,
+  ensured admin raw config redaction fails closed, redacted token-shaped admin
+  config values, and admin-gated ops/SAGA/memory APIs.
+- **React UI correctness regressions.** Fixed turn viewer chronological ordering
+  and progressive loading, chat/field-log overflow and scroll anchoring, stuck
+  character-state decay, wide Ops table overflow, usage chart polish,
+  scheduler's confusing read-only Actions section, self-hosted dotLottie WASM
+  loading, and several high-priority chat history/turn-detail UI bugs.
+- **SAGA and search robustness.** Bounded SQL passthrough CPU and per-value
+  memory, moved SAGA store embedding computation outside the write lock, and
+  made reindex writes transactional.
+- **Agent, feedback, budget, and scheduler reliability.** Preserved quota
+  coasting demotion, kept turn errors visible past bypass signals, cached
+  expensive DeepAgents token schema counts, skipped per-delta partial JSON
+  parsing for Codex streams, and offloaded scheduler integrity/session-summary
+  work.
+- **Poller and Worklink reliability.** Repaired ready-queue poller imports and
+  installed-poller venv deps, avoided rejected 7-day bases for derived 5-hour
+  poller usage windows, pruned relocated Worklink attempt checkouts, and
+  blocked invalid or already-blocked Worklink leaves from dispatch.
+- **Runtime/build polish.** Suppressed ignored-note noise for marked artifact
+  trees and kept the published runtime image aligned with the React/Worklink
+  toolchain needs.
+
+## [0.5.1] — 2026-06-17
+
+### Added
+
+- **docker-sibling broker: operator-declared read-only credential mounts**
+  (chainlink #539, rail #537). The broker launches workers with an env-only
+  `docker run`, which can't carry *file*-based backend credentials — e.g.
+  codex's ChatGPT OAuth bundle (`~/.codex/auth.json`), needed for the worker to
+  authenticate the model. The static broker policy now takes an optional
+  `creds_mounts: [{source, target}]` list, mounted into every worker container
+  **read-only** (`-v src:dst:ro`). It's operator-owned and opt-in: the agent
+  can't request or widen a mount, and a policy without `creds_mounts` mounts
+  nothing. Sources must be absolute host paths. This is what lets a docker-sibling
+  codex worker authenticate the model while keeping the broker's narrow trust
+  boundary intact.
+
+- **Remote worklink runs now re-run tests in a sandboxed job** (chainlink #538,
+  part of the docker-sibling rail #537). On a non-shared compute substrate
+  (docker-sibling / ECS) the controller can't run the worker's untrusted branch
+  itself, so the remote gate previously stubbed tests `observed=false` and
+  **failed closed** on `tests_not_observed` — review-ready was unreachable.
+  The controller now re-derives the diff from the pushed refs (unchanged) and,
+  when the run **completed** and that diff is real, dispatches a fresh
+  **`test_only`** worker job on the pushed branch via the *same* compute backend;
+  the job clones + checks out the branch, runs `test_command`, and exits with the
+  test's code, which the controller folds into the evidence (exit-code is the
+  trust channel — the controller never checks out or runs the untrusted branch).
+  A passing job makes the run review-ready; a non-zero job stays `tests_failed`;
+  a launch/timeout/dispatch failure leaves tests unobserved (still fail-closed).
+  The test job is gated on the implement run having completed, so a run that
+  already failed/blocked (but left a partial diff) is never re-tested or laundered
+  into review-ready. Unblocks review-ready outcomes for the docker-sibling/ECS
+  runner.
+
+- **docker-sibling deploy-prep artifacts** (chainlink #539, docker-sibling rail
+  #537). Committed, CI-validated example configs under
+  `docs/examples/worklink/`: `worklink.docker-sibling.yaml` (a complete
+  agent-side config), `docker-broker-policy.yaml` (the broker trust boundary),
+  and a `worklink-worker.Dockerfile` template for the `mimir-worklink` worker
+  image that was referenced throughout the runbook but never had a build recipe.
+  The `WORKLINK.md` operator runbook now points to them, documents building the
+  worker image (pin a release including the #538 `test_only` worker), and notes
+  the sandboxed test job in the smoke evidence step.
+  `tests/test_worklink_example_configs.py` keeps the examples loadable by the
+  real parsers. The `worklink-worker.Dockerfile` template now reflects everything
+  the first real smoke (#540) proved a worker needs: `uv` (for `uv run` test
+  commands), a git credential helper + commit identity (clone/push + the worker's
+  own commit), a writable `/work`, and `CODEX_HOME` for the creds-mount target.
+
+- **Resend-nudge: forgot-to-send recovery** (opt-in). When an interactive turn
+  produces a reply but never calls `send_message` (so the user gets nothing),
+  the agent now re-prompts itself **once** to call `send_message` — recovering
+  the reply the user is waiting on, where the existing forgot-to-send guard
+  (#423) only flagged it for the *next* turn. Aimed at tool-shy models (minimax
+  M3) that answer in final text instead of calling the tool. The re-prompt is
+  **folded into the same turn/thread**, so it inherits the original turn's
+  context and triggers **no additional SAGA recall/synthesis**; it's loop-safe
+  (exactly one re-prompt, then it logs `resend_nudge_failed` and gives up) and
+  includes a 24h recidivism tally in the nudge. Opt-in per channel via
+  `MIMIR_RESEND_NUDGE_CHANNELS` (prefix allow-list, `*` = all; empty = off).
+
+### Fixed
+
+- **Worklink worker failed to prepare a fresh-cloned repo when the base branch
+  was checked out** (docker-sibling / ECS path; rail #537). `_prepare_repo`
+  force-updated the local base ref (`git branch -f main FETCH_HEAD`) *before*
+  moving off it, but a fresh `git clone`'s HEAD is on `main`, so git refused:
+  `cannot force update the branch 'main' used by worktree`. The local-subprocess
+  path never hit it (its checkout isn't on the base branch). Now the worker
+  checks out the attempt branch off `FETCH_HEAD` first, then materializes the
+  base ref — surfaced by the first real docker-sibling smoke (#540).
+
+- **Worklink worker ignored the orchestrator-resolved backend config on
+  non-shared substrates** (docker-sibling / ECS; rail #537). `run_worker_payload`
+  rebuilt the backend from its *own* empty registry (`registry.get(spec.backend)`),
+  discarding `spec.backend_config` — the `bin` + `args` the orchestrator already
+  resolved (e.g. codex `--sandbox danger-full-access`). With no `worklink.yaml`
+  of its own, the worker fell back to default codex args, ran sandboxed, wrote
+  nothing, and the run failed not-review-ready with no push. The worker now
+  builds the backend from `spec.backend_config` when present. Also surfaced by
+  the #540 smoke. (The docker-sibling smoke script now configures codex with
+  `danger-full-access` like a real `worklink.yaml`, so the orchestrator resolves
+  it into the spec.)
+
+## [0.5.0] — 2026-06-17
+
+### Added
+
+- **`list_schedules` surfaces pollers and priority; schedule priority is
+  settable via tools** (chainlink #522, #523). `list_schedules` previously
+  showed only the yaml-config scheduler jobs — skill pollers (a separate
+  registry) were invisible, so the schedule looked empty even when pollers were
+  firing, and a job's arbiter `priority` wasn't shown at all. It now tags each
+  entry with a `type` (`"job"` | `"poller"`), includes `priority`, and appends
+  poller rows (name + cron + priority) via the new
+  `Scheduler.registered_poller_details()`. `add_schedule` takes an optional
+  `priority` (validated `low|normal|high`; invalid values are rejected, not
+  silently coerced), and a new `set_schedule_priority(name, priority)` tool
+  changes an existing job's band without rewriting its prompt/prompt_file
+  (refusing callable jobs, which bypass the arbiter gate). Both mutation tools
+  are admin-gated alongside `add_schedule`/`remove_schedule`.
+
+
+- **Per-turn model-iteration ceiling** (chainlink #511). A configurable, 3-tier
+  cap (`MIMIR_MAX_TURN_ITERATIONS`, default **200**; 0 disables) on how many
+  model iterations a turn runs, enforced by a new `IterationGateMiddleware`:
+  **75%** a gentle wrap-up nudge (no event), **90%** an urgent nudge +
+  `iteration_budget_warning`, **100%** a hard stop — it force-ends the turn
+  (`jump_to: end`), logs `iteration_budget_reached`, and notifies the channel
+  (the triggering channel for an interactive turn, or the `deliver:` channel
+  for a poller/tick) so the truncation isn't silent. Belt-and-suspenders
+  alongside the per-turn tool-call budget + the homeostat — it catches a
+  low-tool loop that would spin under the tool cap. Default 200 is set above the
+  observed ceiling of real turns (mimirbot p99≈91 / max 154 over ~4.5k turns)
+  so it only fires on a genuine runaway.
+- **Graceful-drain restart** (chainlink #510). On `SIGTERM`/`SIGINT` the
+  dispatcher stops accepting new events and waits up to
+  `MIMIR_DRAIN_TIMEOUT_SECONDS` (default 30) for in-flight turns to finish
+  before exiting — so a deploy restart lets live turns complete instead of
+  killing them, and deploys no longer need a manual idle-check. If the drain
+  overruns, the remaining turns are cancelled and a `dispatcher_drain_timeout`
+  event is logged (the exit stays deterministic). The scaffold `compose.yml`
+  now sets `stop_grace_period: 45s` (Docker's 10s default would SIGKILL through
+  the drain); systemd's `TimeoutStopSec` covers it by default. Runbook:
+  `docs/graceful-restart.md`.
+- **Optional `deliver:` channel on pollers + scheduled ticks** (chainlink #508).
+  A poller (`pollers.json` / `pollers-overrides.yaml`) or scheduled tick
+  (`scheduler.yaml`) can set an optional `deliver:` channel. It's injected into
+  the triggered turn as an instruction — the agent **judges** whether anything
+  is worth surfacing and delivers it via `send_message` (reusing the real send
+  path; not an auto-dump). On a hard turn failure (the agent couldn't report),
+  the framework posts a `⚠️ <job> failed: <error>` notice there — the only
+  mechanical send. The literal **`OPERATOR_CHANNEL`** resolves to
+  `MIMIR_OPERATOR_ALERT_CHANNEL`. `deliver` is distinct from the event's own
+  `channel_id` (its queue) — it only routes OUTPUT. Unset = today's silent
+  behavior; the no-reply guard is unaffected (the instruction supplies the
+  explicit channel a non-interactive turn needs).
+- **Liveness watchdog — out-of-process dead-man's-switch** (chainlink #507).
+  The agent writes a liveness beat to `.mimir/liveness.json` every
+  `MIMIR_LIVENESS_BEAT_SECONDS` (default 60; an event-loop task, so it also
+  stops on a *wedge*), and a new `mimir watchdog` command — run as a compose
+  sidecar or host cron, i.e. *outside* the agent process — alerts out-of-band
+  when the beat goes stale. Closes the one gap that survives even with `ntfy`:
+  a hard failure (OOM/SIGKILL/hung loop/dead container) can't self-report.
+  Sinks are pluggable, not ntfy-locked: `NTFY_TOPIC` and/or a generic
+  `MIMIR_WATCHDOG_WEBHOOK_URL` (Slack-incoming-webhook / PagerDuty / custom
+  shape). Loop mode gates the first alarm on having seen the agent alive (no
+  cold-start false alarm) and pushes a recovery notice. `--once` (cron) is
+  **exit-code-only** — it returns `1` when down and posts nothing, leaving
+  paging to the cron monitor (a fresh process per tick can't dedupe). Runbook:
+  `docs/watchdog.md`.
+- **Clean-shutdown marker → unclean-restart notice** (chainlink #507). A
+  sidecar-free complement to the watchdog: the agent writes a `clean: false`
+  marker to `.mimir/session.json` at startup and flips it to `clean: true` on a
+  graceful (SIGTERM-initiated) shutdown. If the next boot still sees
+  `clean: false`, the previous run was killed/crashed/OOM'd (or wedged then
+  killed) — the agent logs a `liveness_unclean_restart` event and pushes an
+  out-of-band notice on the same sinks as the watchdog. First boot and a clean
+  prior stop both no-op.
+- **`HEALTHCHECK` → `/health` in the container image.** The scaffold
+  `Dockerfile` now defines a Docker healthcheck that polls the in-process
+  `/health` endpoint (a timeout catches a *wedged* loop, not just a dead
+  process). Note: `restart: unless-stopped` does **not** act on health status —
+  pair with an autoheal sidecar or a host/Swarm probe to restart on
+  `unhealthy`. See `docs/watchdog.md`.
+- **systemd unit templates for non-Docker / local deployments** — `mimir run`
+  under systemd with `Restart=on-failure` and an `OnFailure=` hook that runs
+  the new `mimir notify-restart` command (a self-contained ntfy/webhook push,
+  no live agent needed). Templates in `deploy/systemd/`; runbook in
+  `docs/systemd.md` (incl. the macOS/launchd note).
+- **In-container liveness watcher via s6-overlay.** The scaffold image now runs
+  s6-overlay as PID 1 (superseding tini) supervising two services: the agent and
+  `mimir watchdog --restart-on-stale`. On a stale beat the watcher alerts **and**
+  kills the agent (SIGTERM→SIGKILL by its beat PID) so s6 restarts it — the
+  recovery path for a wedge, which neither s6 nor Docker `restart:` catch on
+  their own (the process is still alive). Same-container, no docker socket. New
+  `--restart-on-stale` / `--restart-grace` flags on `mimir watchdog`; tune the
+  threshold with `MIMIR_WATCHDOG_STALE_AFTER` (default 300s). s6 service defs in
+  `deploy/s6-overlay/`. The unclean-restart notice is now coalesced within a
+  120s window so a crash-loop doesn't page on every boot (the event is still
+  logged each time).
+- **`GET /` redirects to `/turns`** — the bare web root now sends browsers to
+  the turn viewer (302) instead of 404ing.
+
+### Fixed
+
+- **Worklink pushes the attempt branch from the checkout that owns it, not the
+  parent repo** (chainlink #518). With the isolated-checkout shape (#517), the
+  attempt branch and its commit live only inside `lease.path` (its own `.git`,
+  with `origin` already pointed at the remote). The local-path PR step still
+  pushed from `self.repo`, so once a run actually got through containment +
+  evidence it failed at publish with `src refspec issue/<id>-a<attempt> does not
+  match any` — the work was done safely but couldn't be published without manual
+  salvage. The push now runs from `lease.path`, which is also correct for the
+  legacy worktree shape (it shares the parent's refs). Surfaced by the first
+  clean autonomous run on the #517 rail.
+- **Worklink fails loud if codex runs on the controller without an isolated
+  checkout** (chainlink #517). The codex CLI resolves the git project root from
+  the filesystem, so when it executes on the controller (a shared-filesystem
+  compute) it must be pointed at an *isolated* checkout with its own `.git`,
+  never a parent-pointing worktree, or it edits the **repo root** (seen on
+  #512/#513). `_create_backend_checkout` already routes codex + shared-filesystem
+  to an isolated checkout; the orchestrator now also asserts that invariant after
+  lease creation (`worklink_unsafe_codex_checkout` → `blocked`) as a backstop
+  against the routing regressing. This is deliberately scoped to **controller**
+  execution: remote computes (`docker_sibling`/`ecs`) report
+  `shared_filesystem=false` because they run codex inside the worker's own clone,
+  which is the safe, preferred isolated-dispatch path and is left untouched.
+- **Worklink isolated checkout is relocated outside the parent repo** (chainlink
+  #517). On the `codex` + `shared_filesystem` path the attempt checkout was a
+  `git clone --local` *nested inside* the repo at `repo/.worklink/<id>-<attempt>`
+  — a clone-into-self that, under concurrent load, was the leading suspect for
+  the non-deterministic root leaks. The clone now lives at a sibling
+  `<repo.parent>/.worklink/<repo.name>/<id>-<attempt>`, fully detached from the
+  repo it was cloned from. A new cheap, deterministic **self-containment assert**
+  (`git rev-parse --show-toplevel` / `--absolute-git-dir`) runs right after the
+  clone and refuses (and cleans up) any checkout that resolves back to the
+  parent, before a metadata-inspecting backend like codex is ever pointed at it.
+- **Worklink quarantines leaked root edits recoverably** (chainlink #517). When
+  the `backend_wrote_outside_worktree` detector fires, the leaked paths are now
+  moved into a named, path-scoped `git stash` (`worklink-leak-<id>-a<attempt>`)
+  so the repo root is left clean without manual salvage — and *recoverably*, so
+  a containment regression can't silently destroy salvageable work. Pre-existing
+  unrelated dirt in the root is untouched; the stash label is surfaced in the
+  failure reason.
+
+## [0.4.1] — 2026-06-16
+
+### Added
+
+- **`mimir setup` seeds an onboarding `init` block on a fresh home** (#708) —
+  a brand-new home gets `memory/core/01-init.md` pointing the agent at its
+  onboarding skill, so onboarding reliably fires on first contact instead of
+  depending on the model noticing it has no persona blocks. First-run only:
+  the onboarding skill removes it (via the proposal that establishes the
+  persona) and `setup` never re-seeds it.
+- **First-contact DM-channel capture + a `list_channels` tool** (#710) — the
+  first time a user messages on a bridge, the framework resolves their DM
+  channel (`bridge.resolve_dm_channel` → Slack `conversations.open`, Discord
+  `create_dm`; opens the conversation, sends nothing) and caches it under
+  that person's `dm_channels:` map in `state/identities.yaml` (fill-blank,
+  header-preserving). Surfaced in the per-turn "Known identities" block and
+  via a new read-only `list_channels(platform=None)` tool, so the agent can
+  DM a person by their `dm-…` channel id without operator setup. A DM channel
+  id is the platform's *conversation* id, never the user id — docs corrected
+  accordingly.
+
+### Fixed
+
+- **Containers run under `tini` (PID 1) to reap zombies** (#709) — the
+  non-reaping PID 1 let orphaned `git` (and codex/hermes/openclaw) children
+  accumulate as zombies. `tini` is added to the top-level Dockerfile + both
+  scaffold modes and wraps the ENTRYPOINT. (The hand-maintained mimirbot /
+  muninn operator Dockerfiles got the same change in their own repos, since
+  they don't inherit the scaffold.)
+
+## [0.4.0] — 2026-06-16
+
+Headline: **Worklink slices 2–3** (the autonomous worker rail grows a
+planner, pluggable compute backends, and an arbiter-gated ready-queue),
+a **full adversarial-audit hardening pass** (the #476–#503 backlog —
+high-severity through low, every finding verified against live code
+before fixing, each with a regression test), and **non-Docker
+portability** (mimir refuses to start without an explicit home and no
+longer hard-codes container paths).
+
+### Added
+
+- **Worklink — planner + decomposition contract** (`docs/internal/WORKLINK.md`,
+  chainlink #380): a planner decomposition contract (#647), portable
+  worker entrypoint (#655), and the operator `run` vertical's slice-1
+  runbook (#646).
+- **Worklink — pluggable `ComputeBackend` (execution substrate) axis**,
+  orthogonal to the `ToolBackend` (codex / claude_cli) axis:
+  - Local compute-backend seam (#653) and a claude-cli tool backend (#657).
+  - DockerSibling config surface (#672), broker client (#674), broker
+    policy guard (#680), and a sibling smoke runbook (#687).
+  - ECS `RunTask` remote compute backend (#673) with re-derived,
+    **observed** remote compute evidence — backend self-reports are
+    never trusted (#656).
+- **Worklink slice 3 — autonomy** (#444): an arbiter-gated ready-queue
+  poller with a concurrency cap, TTL reaper, and `worklink_run`; the
+  compute-backend autonomy policy **refuses unsandboxed autonomous
+  dispatch** (#460, #690), and autonomous claim safety is hardened
+  against races (#691).
+- **Worklink — tool-pin inventory + drift detection**: parse (#659),
+  inventory (#661), seed (#666), and a drift poller (#664) for the
+  configured coding-CLI pins.
+- **Worklink — backend-blocked path** (#466): added (#670), then
+  activated + hardened as a follow-up (#671); configurable base branch
+  + feature-branch model (#467, #669).
+- **Operator poller overrides** via `<home>/pollers-overrides.yaml`
+  (#651) — tune or disable discovered pollers without editing skills.
+
+### Changed
+
+- **Non-Docker portability** (#701): `mimir run` refuses to start
+  without an explicit `--home`/`MIMIR_HOME` (the silent cwd-as-home
+  fallback was the root of a cluster of coworker bugs — files
+  "not existing," wrong-channel replies); container paths
+  (`/mimir-home`, `/workspace/mimir`) are no longer hard-coded — they
+  read from env with safe fallbacks, and a misconfigured worklink
+  tool-pins poller emits `worklink_tool_pins_misconfigured` instead of
+  assuming `/mimir-home`.
+- **Coding-CLI pins bumped** (#679) and the `claude-code` CLI install
+  is gated in the scaffold Dockerfile (#650).
+- **Docker images ship Node 22 LTS** (was 20) — both the scaffold
+  generator and the top-level PyPI `Dockerfile` (#703).
+
+### Fixed
+
+- **Adversarial-audit hardening pass — the #476–#503 backlog**, every
+  finding verified against live code before fixing, each with a
+  regression test:
+  - *High-severity (#482–#486, #692):* retry-path remote-sync now holds
+    the home lock; the budget `snapshot()` staleness guard no longer
+    trusts stale no-reset observations.
+  - *Security cluster (#494, #495, #499, #500, #693):* child-spawn env
+    allowlist; expanded secret-redaction patterns (AKIA/ASIA, AWS
+    `*_key=`, JSON OAuth tokens); transactional skill install with
+    escaping-symlink rejection.
+  - *Server + scheduler (#487, #488, #694):* attachment/`extra` type
+    checks on inbound events; the poller fire re-consults the arbiter
+    after acquiring its slot.
+  - *Budget / quota (#489, #490, #696):* quota-recovery emit is
+    cross-process coordinated; a Codex cap reset is respected even when
+    the remaining-percent is unparseable.
+  - *Saga (#491, #492, #493, #695):* `agent_id IN (?, 'shared')`
+    scoping; index-add under lock; embedding-provider provenance
+    (`provider_name`/`model_id`) so `reindex` never stamps one
+    provider's vectors as another's.
+  - *Feedback (#496, #498, #697):* windowed scans complete under
+    snapshot saturation; dedup-set completeness.
+  - *Skills (#501, #502, #699):* skill-metadata conformance gate.
+  - *Reflection + commitments (#497, #503, #700):* applied-audit section
+    boundaries; commitment-snooze naive-ISO → UTC.
+  - *Worklink low-severity (#481, #698):* autonomy edge cases.
+  - Earlier correctness guards from the same sweep: stale quota evidence
+    + mismatched-dim session embeddings (#667).
+- **Robustness against bad input + scheduling races:**
+  - Non-UTF-8 bytes in core/index reads (#470, #663) and scheduled-tick
+    `prompt_file` reads (#470, #665) no longer crash the turn; broader
+    `UnicodeDecodeError` turn-failure hardening (#662).
+  - LLM-tick jobs no longer inherit the 1s misfire grace that silently
+    skipped the heartbeat (#660); the scheduler surfaces event-loop lag
+    (#675) and attributes it to the active turn hogging the loop (#702).
+  - `SchedulerJob` is constructed before `Scheduler.add_job` (#682);
+    mid-turn injection snapshots finalize atomically (#688); denied
+    writes are scoped by turn (#686); an aborted spawn releases its
+    exact rate slot (#685).
+  - `send_message` ignores undelivered sends in the loop detector
+    (#676); malformed action directive blocks are stripped (#677);
+    forced extra-file removals are backed up (#678); gave-up signal
+    counts stay distinct (#683); the defaults-upgrade ignores the
+    vendor scratch worktree (#684).
+  - Naive Anthropic reset headers are handled (#658); the ONNX default
+    model is used in the API-key embedding fallback (#681).
+- **Docs:** chainlink block argument order (#654); codex sandbox
+  boundary clarified (#648); ComputeBackend execution-substrate axis +
+  verified sandbox profile documented (#652); the web UI's turn viewer
+  + ops pages are highlighted across the onboarding skill, README, and
+  docker docs (#704); a non-Docker setup/troubleshooting guide
+  (`docs/mimir-nondocker-guide.md`) was added (#701); the SPEC +
+  `docs/internal/*` design docs were refreshed against the current code
+  (#705); and the skill-creator skill now documents channel addressing
+  for message-sending skills — prefix-qualified ids, no hardcoding (#707).
+
+## [0.3.5] — 2026-06-11
+
+### Added
+
+- **Worklink slice 1 — the chainlink worker rail** (`mimir/worklink/`,
+  spec: `docs/internal/WORKLINK.md`, chainlink #380 subissues #438–#441;
+  built largely by mimir itself through the normal PR/review loop):
+  - Race-safe chainlink claiming with attempt caps + TTL reaper (the
+    slice-0 probe verified `chainlink locks` atomicity: 20/20 races,
+    zero double-claims; `locks steal` is forceful, so the reaper
+    enforces its own staleness evidence) (#637, #638).
+  - Attempt-scoped worktree lifecycle and **observed** evidence: the
+    executor itself diffs `base...HEAD` + untracked files and runs the
+    test command anchored to the attempt checkout — backend
+    self-reports are never trusted; `completed` with an empty diff
+    demotes to `failed` (#638, #641).
+  - Pluggable `ToolBackend` protocol (capability declarations incl.
+    `tool_category` + `quota_pool`) with a codex adapter:
+    process-group timeout kill, transcripts under
+    `<home>/state/worklink/transcripts/`, config-driven selection via
+    `worklink.yaml` (#639).
+  - `mimir worklink run <issue> [--backend X] [--dry-run]` — the
+    operator vertical: validate leaf → claim → worktree → backend →
+    observed evidence → gated label transitions (failure with retries
+    returns to `worklink:ready`) → push + PR → cleanup (#641).
+- **github-poller: state-based reconciliation for own PRs stuck at
+  CHANGES_REQUESTED** (`pr_changes_requested_stale`, chainlink #449):
+  a turn that consumes a review event without pushing fixes gets one
+  deduped reminder per `(pr, head_sha)` — validated in production the
+  same day (#640).
+
+### Fixed
+
+- **Poller discovery no longer descends into hidden directories**
+  (#642): `skill_install`'s `.pre-update-backup` snapshot includes
+  `pollers.json`, and with first-wins duplicate-name dedupe the backup
+  shadowed the freshly-updated live manifest — the scheduler ran the
+  OLD poller from the backup dir every tick (found live on mimirbot).
+- **social-cli pollers pass ATPROTO credentials via `pass_env`**
+  (#643): the subprocess depended on a hand-seeded `STATE_DIR/.env`;
+  an operator app-password rotation in `compose.env` never reached it,
+  producing a 3-day Bluesky failed-login storm surfacing as
+  rate-limiting. `compose.env` is now the source of truth.
+
+## [0.3.4] — 2026-06-11
+
+### Fixed
+
+- **Adversarial-review hardening batch** — 17 confirmed findings across
+  four PRs (#630–#633), from a six-reviewer adversarial sweep of the
+  codebase (chainlinks #408–#425):
+  - *Delivery/lifecycle (#630):* `send_message` `<react>` directives feed
+    the same confirmed-delivery accounting as the react tool and emit
+    `send_message_directive_failed` on failure; Discord emoji aliases
+    actually resolve (`resolve_for_discord` had zero callers — the
+    documented `thumbsup` ack 400'd); `run_turn`'s setup phase runs inside
+    its cleanup `finally` (no more leaked injection entries / typing holds
+    / turn contexts on setup-phase cancellation).
+  - *Pollers (#632):* circuit breaker re-arms on every failure at/past the
+    threshold (was exact-`==` — a hard-down poller stormed forever after
+    one backoff); the post-drain `proc.wait()` is bounded (a child closing
+    its pipes but living on pinned a global semaphore slot permanently);
+    recovery watermark can't regress (`max`); invalid-cron reloads
+    preserve the prior poller + emit `poller_reload_invalid_cron`;
+    duplicate poller names are skipped loudly; the manifest `env` map is
+    process-control-filtered (`LD_PRELOAD` et al.); recovery re-enqueue
+    re-stamps event identity (forge-proof).
+  - *Saga (#631):* skill-memory injection reads through a locked store
+    seam (cross-thread sqlite access was segfault-class); `evidence_count`
+    means relation count (refresh_trend stopped clobbering it); skill-
+    memory dedup removes tombstoned FAISS vectors + `rebuild_if_needed`
+    wired (was dead code); all embeddings precompute before
+    `BEGIN IMMEDIATE` (a hung embed stalled every memory write).
+  - *Quota (#633):* transient-429 backoff decay is end-anchored (the
+    escalation ladder actually escalates — record-anchored it self-reset
+    to the 60s floor forever); early-clear disarms the one-shot recovery
+    wake (no double catch-up heartbeat); `resets_at=None` snapshots
+    staleness-guarded by window length (a stale ≥wall reading could wedge
+    severity TIGHT on Codex).
+
+### Changed
+
+- **Quota severity recalibrated: pace floor + higher wall (#629).** The M
+  bands engage only when the projected end-of-window utilization exceeds
+  **75%** — a window not even projected near its cap has no quota story to
+  tell, no matter how small M is (observed live: muninn's heartbeats went
+  dark over a projected-68% week). The raw-utilization wall moves
+  **0.80 → 0.90**; the canonical time-left asymmetry is unchanged; direct
+  and derived thresholds now coincide at 0.90; the early-recovery probe's
+  hot-window veto follows the same threshold.
+- **The forgot-to-send guard is channel-scoped (#634).** A confirmed
+  delivery must reach the *triggering* channel — a cross-channel-only send
+  (e.g. an ops alert) no longer suppresses the `no_reply` signal for the
+  user who asked; the event carries `delivered_elsewhere`, and the prompt
+  conventions teach "close the loop with whoever asked" (a react counts).
+- **The `claude-code:` model route was temporarily deprecated (#634).** Its
+  tools executed inside the Claude Code subprocess, bypassing the per-turn tool
+  budget and prohibited-action screen, so `_resolve_model` refused it unless
+  explicitly enabled the route. Later releases restored this route
+  as supported once the controlled adapter and PreToolUse enforcement hook path
+  were available.
+
+### Added
+
+- **WORKLINK design spec (#635)** — `docs/internal/WORKLINK.md`:
+  chainlink worker orchestration (planner/executor split, observed
+  evidence, pluggable toolchain backends). Spec only; implementation
+  tracked as chainlink #380 subissues.
+
+## [0.3.3] — 2026-06-10
+
+### Added
+
+- **Priority-banded suppression for ALL autonomous work — pollers included.**
+  The homeostat previously made a binary fire/suppress call for heartbeats
+  only; pollers bypassed it entirely, so under quota pressure heartbeats
+  backed off while a `* * * * *` poller kept spawning turns (burning the
+  window tail, or 429ing and refreshing the pause every minute). The arbiter
+  now grades pressure into a severity ladder (CLEAR / ELEVATED / TIGHT /
+  BLOCKED) and gates each unit of work by its declared priority: `low` sheds
+  at ELEVATED, `normal` at TIGHT, `high` only at BLOCKED (recorded 429).
+  Pollers declare `priority` in `pollers.json` (default `normal`); scheduled
+  ticks declare it per scheduler.yaml entry (default `low` — heartbeats yield
+  first). Shed poller fires skip the subprocess (cursor frozen — events
+  delayed, not lost) and emit `poller_fire_suppressed`.
+- **Pace-aware subscription severity (burst multiple M).** Subscription
+  (quota) decisions are now based on projected usage with time-awareness:
+  M = (1−util)/(pace×time_left) — how many times the established pace the
+  agent would have to sustain for the rest of the window to hit 100%. The
+  same projected 80% grades CLEAR with 1 day left of a 7d window (busting
+  needs ~2.75× pace) but TIGHT with 5 days left (~1.35×). Band edges are
+  scaled by an early-window confidence ramp (γ = elapsed/0.25, capped at 1)
+  so a noisy first hour can't shed work. Raw utilization ≥ 0.80 is a
+  TIGHT wall, demoted to ELEVATED when the same window's own pace shows
+  coasting (M ≥ the ELEVATED edge) — near the cap but not going to hit it
+  sheds low-priority work only; without pace evidence (pegged / derived /
+  early windows) the wall stays TIGHT. API (pay-as-you-go) billing:
+  cost-rate alert → TIGHT, within 80% of the hourly-limit or spike trip →
+  ELEVATED.
+- **429 early-recovery probe.** While a quota pause is active, an interval
+  job (`MIMIR_QUOTA_RECHECK_SECONDS`, default 180s) checks whether the
+  window cleared before the recorded reset: an authoritative cap, plus a
+  rate-limit-store snapshot observed after the pause was recorded, with no
+  current window at/over the wall → pause clears immediately,
+  `quota_recovered` fires with `early=true`, and a catch-up heartbeat runs.
+  The current severity (when above CLEAR) renders into the agent's
+  Self-state block as an `autonomy throttle` line.
+
+### Changed
+
+- Internal API only — no operator-facing surface changes (patch
+  release): `HomeostaticArbiter.should_fire_heartbeat()`
+  is replaced by `should_fire(priority=...)` returning a `FireDecision`;
+  `billing.evaluate_quota()` is replaced by `evaluate_quota_severity()`.
+  The fixed on-pace suppress thresholds (0.90 5h / 0.95 7d) are superseded
+  by the M bands. `scheduled_tick_suppressed` events now carry `priority`,
+  `severity`, and (for pace decisions) `burst_multiple`.
+
+## [0.3.2] — 2026-06-09
+
+### Fixed
+
+- **The forgot-to-send guard no longer flags react-only replies.** A `react`
+  (an emoji acknowledgment) is a valid interactive response, but
+  `interactive_turn_no_send_message` only counted `send_message`, so a turn
+  that responded with just a reaction was falsely flagged as "no reply"
+  (observed live on muninn). The `react` tool now bumps a `react_count` on the
+  turn context (on a confirmed react), and the guard fires only when an
+  interactive turn produced text and delivered **neither** a `send_message`
+  **nor** a `react`.
+
+## [0.3.1] — 2026-06-09
+
+Follow-up to the 0.3.0 explicit-delivery switch.
+
+### Fixed
+
+- **Upgrade reconciliation now notifies the operator.** The version-triggered
+  upgrade-reconciliation turn opens a propose-only PR (`submit_proposal`), but
+  it ran on a non-interactive channel and never surfaced the PR — so the
+  reconciliation could sit unreviewed (mimirbot's 0.3.0 reconciliation PR did
+  exactly this). The upgrade prompt (`prompt_templates/upgrade.md` + the inline
+  fallback) now instructs the agent to `send_message` the operator-alert
+  channel (explicit `channel_id`, since the turn is non-interactive) with the
+  PR URL after submitting.
+
+## [0.3.0] — 2026-06-09
+
+**BREAKING — explicit message delivery.** The agent's final turn text is no
+longer auto-delivered to the channel. To say anything to a channel the agent
+MUST call the `send_message` tool. This makes delivery an explicit,
+inspectable action and removes the "the agent thought out loud and it got
+shipped" failure mode; the unsent final text is captured as reasoning.
+
+### Changed
+
+- **No auto-dispatch.** The end-of-turn auto-send and the mid-turn streaming
+  plan-flush are both removed (the `_streaming_dispatch` module is retired).
+  The model's final text is captured as reasoning in the turn record (`output`
+  + a reasoning event) and is NOT sent to the channel or recorded as a sent
+  message. `send_message` is the sole delivery path and may be called multiple
+  times per turn (multi-part replies, progress notes).
+- **`send_message` channel defaulting is gated by interactivity.** A
+  channel-less `send_message` defaults to the turn's channel only on an
+  interactive turn (`user_message` / `shell_job_complete` on a registered
+  bridge). On a non-interactive turn — heartbeat / `scheduled_tick`, poller,
+  `saga_session_end` synthesis, `upgrade` maintenance — it errors and requires
+  an explicit `channel_id` (e.g. the operator alert channel). Explicit-channel
+  sends are unchanged, so heartbeat→operator-alert still works.
+- **Typing indicator** fires at turn start on interactive turns and is
+  released only at turn end, so it persists across multiple `send_message`
+  calls instead of being tied to a per-send flush.
+- Reply conventions (`prompts.py`) and `core/06-action-boundaries.md` rewritten
+  to require `send_message`; `<actions>` directives (`<react>` / `<send-file>`)
+  now ride inside the `send_message` text body.
+
+### Added
+
+- `interactive_turn_no_send_message` algedonic signal — an interactive turn
+  that produced final text but never called `send_message` emits a negative
+  feedback signal (the reply was stuck as reasoning, the user got nothing),
+  surfaced in the next turn's feedback panel so the agent self-corrects.
+- `channel_registry.is_interactive_turn` / `INTERACTIVE_TRIGGERS` — the shared
+  interactivity gate used by both the `send_message` tool and the dispatcher.
+
+### Migration
+
+Agents reply via `send_message` now; the bundled prompt + core-memory defaults
+teach this and the algedonic signal reinforces it. `send_message` remains
+exempt from the per-turn tool-call budget, so the agent can always reply even
+after other tools are capped.
+
+## [0.2.18] — 2026-06-08
+
+GEPA prompt-optimization lands as an opt-in capability (skill + extra + first
+pilot), the skill-extras gap that pruned deps on restart is closed, plus two
+saga/proposal correctness fixes and a core-memory default.
+
+### Added
+
+- **GEPA prompt optimization** — an opt-in framework for evaluator-backed
+  optimization of bounded textual artifacts:
+  - a bundled `gepa` skill (shipped as an **optional** skill) with explicit
+    fit/anti-fit gates, an ASI-rich evaluator requirement, and a mandatory
+    PR/proposal adoption gate — it never auto-replaces a production prompt
+    (#611, moved to `optional-skills/` in #614);
+  - an opt-in `gepa` extra plus `mimir.gepa_support`, which routes gepa's
+    `reflection_lm` through mimir's already-configured ChatModel (codex-plus /
+    minimax / anthropic) — no separate LiteLLM/OpenAI key (#614);
+  - the first pilot harness (`evals/commitments_extraction/`, repo-root, not
+    shipped in the wheel): reference-free self-containment metrics + ASI, a gepa
+    adapter over the real extractor model path, and a `--baseline`/optimize
+    runner that reads real in-home turns and never auto-applies a candidate
+    (#616, #617).
+- **Skill-declared `requires_extras`** + `mimir skills required-extras`:
+  workspace-mode `start.sh` derives its `uv sync` extras from the installed
+  skills, so an optional skill's dependency (e.g. `gepa`) isn't pruned on
+  restart. CI validates that every declared extra is a real pyproject extra (#615).
+- **Frame-checking non-goal** in the bundled core-memory defaults —
+  `memory/core/05-non-goals.md` ("don't accept the source frame uncritically"),
+  with a matching learned-behaviors procedure (#613).
+
+### Fixed
+
+- **Protected-surface proposals fail closed on leftover git conflict markers.**
+  `finalize_proposal` refuses to submit `memory/core/` or `prompts/` content
+  still containing a `<<<<<<<` / `=======` / `>>>>>>>` marker (the separator
+  matched as a standalone 7-`=` line to avoid false-positives on setext rules),
+  keeping the worktree open for re-resolution (#609).
+- **Deterministic world-state lookup.** `saga.get_current_value` now orders by
+  `valid_from DESC, rowid DESC LIMIT 1`, so a transient dual-`is_current` row
+  resolves to the newest fact instead of an arbitrary one (#610).
+
+### Changed
+
+- **External tool pins bumped** — claude-code CLI `2.1.168`, codex CLI
+  `0.137.0`, gogcli `v0.9.0` + Go `1.26.4`, chainlink `chainlink-1.6.0`
+  (retiring the floating git HEAD), and the `langchain-claude-code` fork ref.
+  Every pin verified to resolve upstream (#612).
+
+## [0.2.17] — 2026-06-07
+
+### Fixed
+
+- **Five bundled skills were silently dropped** by a malformed-YAML frontmatter
+  description. `try-harder`, `social-cli`, `gmail-poller`, `github-ci-watch`, and
+  `github-poller` had an unquoted colon-space in their `description:` (e.g.
+  `Opt-in: copy ...`, `verifiable diff: edit ...`); YAML reads that as a nested
+  mapping ("mapping values are not allowed here"), so both the deepagents
+  `SkillsMiddleware` and `skill_outcomes` failed to parse the frontmatter and
+  skipped the skill entirely. Descriptions are now quoted. Added a strict-YAML
+  conformance guard (`test_skill_frontmatter_is_valid_yaml`) over both
+  `mimir/skills/` and `mimir/optional-skills/` — the existing test only scanned
+  `skills/` and used the lenient parser, which is how this shipped. (#608)
+
+## [0.2.16] — 2026-06-07
+
+Mid-turn user-message injection (Claude Code-style continuous input) plus a
+codebase-review batch of concurrency / correctness fixes.
+
+### Added
+
+- **Mid-turn user-message injection (#376).** On opted-in channels
+  (`MIMIR_MIDTURN_INJECTION_CHANNELS` — comma-separated channel-id prefixes, or
+  `*`; empty/default = off), a follow-up sent while a turn is running folds into
+  that turn at the next reasoning-step boundary instead of queuing as a separate
+  next turn. Durably recorded in `TurnRecord.injected_inputs`, the synthesis
+  summary, chat history, and the turn viewer (woven into the chronological
+  timeline at its fold time). (#591, #593, #594, #595, #596, #597)
+- **`defer_injected_message` tool (#384).** Escape hatch so the agent can punt a
+  folded message to its own later turn when it's a true topic switch / unrelated
+  work (e.g. several people in one channel) rather than mixing it into the
+  current answer. Loop-guarded via `force_new_turn`; the originating turn's
+  `injected_inputs` entry is marked `deferred` for auditability. (#598)
+- **Turn viewer: progressive (infinite-scroll) loading.** `/api/turns` now
+  paginates (`?limit` / `?before` / `?after`); the viewer loads the newest page,
+  fetches older pages on scroll, and polls only new turns — replacing the
+  whole-file refetch every 5s that got slow as `turns.jsonl` grew. (#599)
+- Pinned bundled npm CLI versions for reproducible images. (#585)
+- Reflection / five-whys GEPA recommendation hooks (docs). (#587, #588)
+
+### Fixed
+
+Codebase-review batch — 1 critical, 2 high, 5 medium:
+
+- **saga consolidate could segfault under concurrent load (critical).**
+  Consolidate's shared-sqlite-connection reads now run under `_db_lock`, so a
+  concurrent turn's write never touches the same connection object at the same
+  time (sqlite3 + FTS5 hazard). (#386)
+- **`bash_async` stuck-job leak (high).** A command that backgrounds a grandchild
+  holding the pipe open no longer wedges the waiter forever (leaking the job +
+  threads + FDs): bounded drainer-join, pipe close, and a live-job cap. (#387)
+- **Synthesis crash on a malformed operator template (high).** A stray brace in
+  an operator `saga_session_end.md` override no longer crashes every session-end
+  turn — `_safe_format` falls back to the bundled default. (#388)
+- **Post-turn work could wedge a channel (medium).** Finalize hooks and the
+  end-of-turn `bridge.send` are now bounded by `MIMIR_POST_TURN_TIMEOUT_SECONDS`
+  (default 180s); the model-loop timeout didn't cover post-loop awaits. (#389)
+- **saga consolidate index / restructure correctness (medium).** Dedup-tombstoned
+  atoms are removed from the FAISS index; a `_restructure` rollback tombstones the
+  orphan observation instead of leaving it unbacked (and retry-duplicated).
+  (#390, #391)
+- **`bash_async` routed to no channel under MCP dispatch (medium).** Channel
+  resolution uses `resolve_active_ctx` + the live ContextVar instead of a dead
+  `_STATE` key — restoring the duplicate-spawn guard and the completion wake-up.
+  (#392)
+- **event_logger could lose a sync write during a trim (medium).** A shared
+  threading lock serializes `log_sync` against the async `_trim_sync` rename.
+  (#393)
+- git-tracking no longer surfaces transient `attachments/` notes (reverts #356's
+  attachments add). (#590)
+
+## [0.2.15] — 2026-06-05
+
+Reliability + observability: automatic GitHub Releases, poller `MIMIR_HOME`
+injection, proposal-branch cleanup, richer skills-drift remediation, background-
+task failure logging, and a world_state dual-current repair.
+
+### Added
+
+- **Automatic GitHub Releases.** `publish.yml` now creates a GitHub Release for
+  each `v*` tag (after the PyPI publish gate), with notes from the matching
+  CHANGELOG section — so tags appear on the repo's Releases page, not just PyPI.
+  (#581)
+- **`mimir skills update` shows a content diff.** A bounded, redacted unified diff
+  (installed vs source) per drifted file, so the agent can tell intentional drift
+  (→ `mimir skills accept`) from stale drift (→ `--apply`). Shown by default for a
+  single named skill; `--diff` forces it under `--all`. (#579)
+- **Resolved proposal branches are cleaned up.** Consolidation sweeps merged /
+  closed `proposal/*` branches (and their worktrees), fail-closed on unknown PR
+  status so it never deletes a branch with novel unmerged content. (#576)
+
+### Fixed
+
+- **Pollers always get `MIMIR_HOME`.** The poller runner injects `MIMIR_HOME` (from
+  `Config.home`) alongside `STATE_DIR`/`POLLER_NAME`, so a poller resolving paths
+  under the agent home no longer depends on per-entry `pass_env` — which accepted
+  skill-drift could freeze out (the gmail-poller "MIMIR_HOME is unset" warning).
+  (#580)
+- **The skills-drift digest names the keep-vs-overwrite choice.** It now points to
+  `mimir skills accept` (keep intentional local changes) alongside `--apply`
+  (overwrite from source), instead of steering an agent with intentional drift into
+  a clobber loop. (#577)
+- **world_state dual-current rows are repaired.** Consolidation collapses any
+  `(subject, predicate)` left with >1 `is_current` row by a transient write race —
+  keeping the newest, end-dating the rest — so `get_current_value` can't stay
+  ambiguous. Runs on every non-dry-run consolidate. (#582)
+- **Background-task failures are logged.** Fire-and-forget tasks spawned via
+  `spawn_background` emit a `background_task_failed` event (redacted, bounded) on a
+  non-cancellation exception, instead of surfacing only via asyncio's default
+  handler. (#575)
+
+## [0.2.14] — 2026-06-04
+
+Release hardening for scheduler recovery, skill drift, git tracking, prompt
+refresh, event redaction, background tasks, and weather timeouts.
+
+### Added
+
+- **Poller recovery wiring is now covered by regression tests.** Added coverage
+  for poller recovery wake-up registration and timeout process-group cleanup,
+  plus shell-job output-drainer completion handling before jobs are marked done.
+  (#568)
+- **Deepagents graph rebuilds when prompt inputs change.** The agent now
+  re-renders the system prompt on each build check, fingerprints the rendered
+  prompt plus skill catalog, reuses the graph when bytes are unchanged, and
+  rebuilds when core memory, memory index, operator-alert config, or bundled
+  skill docs change without requiring a process restart. (#572)
+- **Shared background-task helper.** Fire-and-forget bridge/server tasks now go
+  through a shared strong-reference helper so asyncio tasks are retained until
+  completion. (#573)
+
+### Fixed
+
+- **Version-bump skill-drift digest no longer lists orphaned skills.** The
+  `mimir_update_digest` skills_drift list (#565) counted orphaned custom
+  skills (no shipped source) as "drift" — but they aren't fixable via
+  `mimir skills update --apply`, so they were noise. Now only skills with a
+  source counterpart (real differs/added drift) are reported. Surfaced by the
+  0.2.13 rollout, which flagged ~12 orphaned skills per agent. (#567)
+- **Transient Codex Plus stream drops are retried.** The agent patches the
+  langchain-codex-plus streaming path to retry transient stream failures instead
+  of failing the whole turn immediately. (#569)
+- **Fingerprint-accepted skill drift stays accepted.** Optional-skill drift
+  acceptance now records and honors source fingerprints so operator-accepted
+  drift does not keep resurfacing as actionable drift. (#570)
+- **Release-polish fixes for git tracking, poller feedback, and OAuth usage.**
+  Home git tracking is guarded on main, squash-sync/proposal bookkeeping is
+  tightened, poller feedback rendering is cleaned up, and OAuth usage polling
+  handles the release-polish edge cases. (#571)
+- **Event logs redact token-shaped secrets at the sink.** `EventLogger._record()`
+  now recursively redacts token-shaped strings before writing `events.jsonl`, and
+  `git_bootstrap` reuses the shared redactor instead of carrying duplicate
+  regexes. (#573)
+- **Bridge/server fire-and-forget tasks retain strong references.** Discord and
+  Slack bridge retry/logging tasks, Discord typing-trigger work, and startup
+  index sweeps now keep tasks strongly referenced until they finish. (#573)
+- **Weather skill network calls have explicit timeouts.** OpenWeather `urlopen()`
+  calls now use a 10-second timeout so a stalled network request does not hang
+  the skill path indefinitely. (#573)
+
+## [0.2.13] — 2026-06-03
+
+Memory by-id loads, SAGA read concurrency, tool-error observability, and a
+version-bump skill-drift notice.
+
+### Added
+
+- **`memory_get` tool** — batch by-id atom load. The agent can fetch atoms
+  whose ids it already knows (e.g. ids cited in an observation, or the
+  session-boundary "atoms cited" list) in ONE call, instead of stuffing each
+  id into the semantic `memory_query` tool and fanning out parallel calls.
+  Pure read, no access events (a by-id load doesn't reinforce activation); runs
+  on a per-call connection. The session-boundary synthesis prompt steers it to
+  load cited atoms before judging their usefulness. (#564)
+- **Tool call/error stats** — `tool_call`/`tool_error` events (tool name,
+  ok/error, duration, denial), a per-tool failure-rate panel on the ops
+  dashboard, and `mimir stats --tools`. `tool_error` is wired as a negative
+  algedonic signal — closes the gap where tool *errors* (vs denials) went
+  unaggregated. (#364, #566)
+- **Version-bump skill-drift notice** — operator deploys (`pip install` /
+  `git pull` + restart) now emit a `mimir_update_digest` when installed
+  optional skills have drifted from the shipped source, with the
+  `mimir skills update --apply` remediation, so skills don't go silently
+  stale. (#363, #565)
+
+### Fixed
+
+- **Concurrent SAGA reads no longer segfault.** Read-heavy `SagaStore` methods
+  open a short-lived per-call sqlite connection instead of sharing one across
+  worker threads — FTS5 on a shared `check_same_thread=False` connection could
+  segfault under concurrent `memory_query`. Writes stay serialized; FAISS index
+  mutation/build is lock-guarded. (#365, #566)
+- **Parallel `memory_query` no longer crashes with "cannot start a transaction
+  within a transaction".** The retrieval access-event write is serialized and
+  best-effort: a non-essential reinforcement write never fails the user-facing
+  query, and never rolls back another caller's open transaction. (#564)
+
+## [0.2.12] — 2026-06-03
+
+Quota-pause hardening: short transient backoff + a recovery wake, and Codex
+429 reset-header support.
+
+### Fixed
+
+- **Transient 429s no longer cause a multi-hour idle.** A header-less 429 (e.g.
+  Codex's bare "Rate limit exceeded") now gets a short, escalating, decaying
+  backoff (60s → 4m → 16m → …) instead of a blind 5-hour pause; a genuine cap
+  still pauses to its real reset. An active authoritative cap is never shortened
+  or seeded by a transient 429. (#559)
+- **Recovery no longer waits for the next scheduled tick.** A one-shot wake is
+  armed at the pause's reset (and re-armed on startup), so the agent retries the
+  moment the window rolls over instead of idling until the next hourly
+  heartbeat. (#559)
+- **Codex 429s carry their reset.** With `langchain-codex-plus >= 0.0.3`
+  surfacing the `x-codex-*` rate-limit headers on errors, a Codex cap pauses
+  until the real window reset when the binding window is genuinely at cap; a
+  low-utilization 429 is treated as transient. (#559)
+
+### Changed
+
+- Pin `langchain-codex-plus >= 0.0.3` (surfaces rate-limit headers on 429s). (#559)
+- **Optional-skill pollers seed a transient-state `.gitignore`.** Each poller
+  (github-poller, github-ci-watch, gmail-poller, and social-cli's notifications
+  + feed pollers) now writes a per-`STATE_DIR` `.gitignore` (write-if-missing)
+  so its high-churn cursor / dedup / working files aren't committed to the home
+  repo, while durable session logs, ledgers, and operator config stay tracked.
+  Removes the `git_ignored_note_skipped` noise seen when a home `.gitignore`
+  blanket-blocked `state/pollers/`. (#561)
+
+## [0.2.11] — 2026-06-02
+
+Version-triggered defaults-upgrade proposals (epic #346) plus home-git
+tracking hardening.
+
+### Added
+
+- **Version-triggered defaults-upgrade proposals** (epic #346): on a
+  version bump, startup rewrites a local `mimir-defaults` vendor branch to
+  the shipped `prompts/` + `memory/core/` defaults, runs git's native 3-way
+  `merge-file` to reconcile them against the operator's home files in an
+  `upgrade`-lane proposal, and fires an agent reconciliation turn — or
+  auto-submits a conflict-free merge when
+  `MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN` is set. Core memory + prompts
+  now seed from bundled templates and stay operator-editable; upgrades flow
+  through an operator-gated PR. (#552, #554, #555)
+- **Per-lane proposal worktrees** (chainlink #348): proposals are isolated
+  per lane (`agent` vs `upgrade`) with independent one-open guards. (#553)
+
+### Fixed
+
+- **Multi-region conflict merges no longer abort the upgrade** — a file the
+  operator customized in several spots that the new defaults also changed
+  now opens a conflict proposal instead of failing with a fake error
+  (`git merge-file` exit codes 2..127 are conflict-region counts, not
+  process errors). (#556)
+- **Home `.gitignore` tracks all of `state/**`** so agent state is not
+  silently dropped, and re-blocks `.env` / `.env.*` to match the pre-commit
+  hook's `NAME_PATTERNS` — preventing a wedged per-turn commit (or a
+  cleartext leak if the hook is bypassed). (#548, #557)
+- **Silently-ignored notes are surfaced** — prose written under a tracked
+  root that the `.gitignore` would drop now emits a feedback signal instead
+  of vanishing. (#551)
+- **Pollers with unset required env are skipped at discovery** rather than
+  scheduled to no-op every tick. (#549)
+- **`rebuild_index` tool wired up** — `set_index_generator(indexes)` is now
+  called in `build_app`; the tool was previously dead. (#547)
+
+### Changed
+
+- Dropped the over-broad `*token*` / `*credential*` gitignore + pre-commit
+  filename guards (they false-blocked legitimate notes); the content scan
+  remains the primary secret guard. (#550)
+- introspection skill docs reference the correct runtime tool name and
+  bundled-skill paths (`read_file`, `/mimir/skills`). (#541)
+
+## [0.2.3] — 2026-05-31
+
+The unified provider-registry refactor, Codex support, and the
+post-update operator digest.
+
+### Added
+
+- **`spawn_codex` tool** (chainlink #293): a Codex analogue of
+  the existing coding-tool spawn path — runs `codex exec <prompt>` once, async, reusing
+  the shared spawn caps (per-hour / concurrency / recursion-depth).
+  Registered only when the `codex` CLI is on PATH. (#505)
+- **codex CLI in codex-subscription images** (chainlink #293):
+  `mimir scaffold-docker` installs `@openai/codex` when the deployment
+  uses the `codex-plus` extra, so `spawn_codex` + Codex Plus auth work in
+  the container. (#506)
+- **Post-update operator digest** (chainlink #284): after an approved
+  update, a first-occurrence `mimir_update_digest` feedback event
+  surfaces the scheduler-tick delta (new ticks to add), optional-skill
+  drift, and missing required env vars. (#499)
+- **`mimir setup` surfaces the model-adapter extra** — prints
+  `pip install mimir-agent[<extra>]` for the chosen model, so operators
+  install the adapter at setup rather than via a runtime ImportError.
+  (#504)
+
+### Changed
+
+- **Unified LLM-provider registry** (chainlink #292): the provider
+  taxonomy — name patterns, Anthropic-compat base URLs, quota pollers,
+  pip extras, CLI dependencies — now lives once in `mimir/providers.py`
+  as a `ProviderSpec` table. `detect_route` (routing) and
+  `build_quota_providers` (quota) consult it; adding a provider is one
+  table entry. Behavior-preserving. (#501, #504)
+- **The former Claude coding tool was gated on CLI availability** — moved
+  from the static tool list into a conditional registration on the
+  `claude` CLI being present, mirroring `spawn_codex`. (#503)
+- **social-cli pinned to a SHA** (chainlink #188): the scaffold fragment
+  now checks out a fixed commit instead of a floating `--depth 1` clone
+  of `main`, for reproducible image builds. (#500)
+
+### Fixed
+
+- **`mimir setup` codex-plus install hint** named the wrong distribution
+  (`mimir` → `mimir-agent`). (#504)
+- **`spawn_*` subprocesses no longer inherit stdin** (`DEVNULL`) —
+  `codex exec` reads stdin and would otherwise block a headless spawn
+  until timeout. (#505)
+
+## [0.2.2] — 2026-05-30
+
+Packaging fix. The published wheel was missing several runtime data files,
+so a fresh `pip install mimir-agent` was broken at first run. Existing
+deployments (with persistent saga DBs + already-seeded homes) were
+unaffected — this only bit new installs.
+
+### Fixed
+
+- **Wheel now bundles all runtime data files** (chainlink #290). The
+  `[tool.hatch.build]` include list is an allowlist that silently drops
+  any file it doesn't match — and several files the installed package
+  reads at runtime weren't matched:
+  - `saga/schema.sql` — `SagaStore` `executescript()`s it on fresh-DB
+    init, so a first-run install crashed with `FileNotFoundError` before
+    saga could come up.
+  - `prompt_templates/*.md` — the glob pointed at `mimir/prompts/` (a
+    directory that doesn't exist; the templates live in
+    `prompt_templates/`), so no default scheduler-tick prompts seeded.
+  - `scheduler_template.yaml` — no default scheduler seeded on setup.
+  - `credentials.yaml` — the mimir-core credential manifest never loaded.
+  - `skills/**/*.sh` (tmux) and `skills/**/*.fragment` (chainlink) — skill
+    support files outside the old `.md`/`.json`/`.py` allowlist.
+
+  The skills entry is now the whole subtree (`mimir/skills/**/*`) so a new
+  support-file type can't silently drop, and a stdlib regression test
+  (`tests/test_wheel_package_data.py`) asserts the include config covers
+  every runtime data file. Pre-existing since 0.2.0 and earlier.
+
+## [0.2.1] — 2026-05-30
+
+13 commits since v0.2.0 — dashboard polish, **Voyage as the default
+embedding provider**, the backlog-audit scheduler ticks, and a batch of
+container/boot bug fixes.
+
+### Added
+
+- **Backlog-audit scheduler ticks** (chainlink #283, #164): a monthly
+  `issues-audit` tick triages the `memory/issues/` gotcha layer (retire
+  resolved entries, file chainlink bugs for real code-level gotchas,
+  escalate judgment calls) and a weekly `commitments-review` tick runs a
+  validity pass over non-terminal durable commitments. Split into two jobs
+  so neither turn exceeds the per-turn tool-call budget; both are
+  budget-aware. (#489)
+- **longmemeval category-skew warning** — `--limit N` now warns when the
+  truncated sample is category-skewed, so partial bench runs aren't
+  mistaken for representative. (#485)
+
+### Changed
+
+- **Voyage is now the default embedding provider** — the unused NVIDIA NIM
+  embedding provider was removed. No-API-key deployments still fall back to
+  on-device bge-small. (#492)
+- **Removed the vestigial `allowed-tools` skill field** and the dead
+  skill-as-subagent wiring (no skill used either; the general-purpose
+  subagent path is unaffected). (chainlink #285, #494)
+- **Dashboards** — unified headers and added cross-navigation links across
+  all four pages; the memory page is now **state**. (#480, #482)
+
+### Fixed
+
+- **git_bootstrap** no longer re-appends `credential.helper` and
+  `safe.directory` on every container boot — the git config stopped
+  growing without bound. (chainlink #248, #477)
+- **/saga dashboard** reads the live `.mimir/saga.db` instead of a stale
+  `state/saga.db` path that never existed. (#481)
+- **Dashboard API key** is now stored under one shared localStorage key
+  across all four pages, so entering it once works everywhere. (chainlink
+  #271, #486)
+- **Index writes** use unique per-call temp names and sweep orphaned temp
+  files, fixing a collision window under concurrent rebuilds. (chainlink
+  #272, #484)
+- **Pre-commit secret scan** tightened its `sk-` pattern so hyphenated
+  slugs no longer trip a false positive. (#479)
+
+## [0.2.0] — 2026-05-29
+
+74 commits since v0.1.3 — a minor bump carrying the first **skill-memory
+system**, a batch of **security hardening**, a 17-item code-review sweep,
+and several structural refactors splitting large modules.
+
+### Added
+
+- **Skill-memory system** (chainlink #266): skills accumulate their own
+  learnings — `failure-mode` / `input-quirk` / `perf-caveat` /
+  `tip` / `success-pattern` atoms stored under a dedicated
+  `skill_learning` source type, isolated from general recall. Recall is
+  activation-ranked and injected at skill-load time for both poller and
+  non-poller skills; the write path adds a `saga_record_skill_learning`
+  tool plus synthesis-prompt guidance. Per-skill consolidation + dedup
+  keep one skill's lessons from bleeding into another's. Feedback is
+  agent-curated only (the per-turn auto-feedback ratchet was removed).
+  (#447, #453, #454, #455, #456, #459, #461)
+- **Per-skill refine/retire candidates** in the introspection report
+  (chainlink #267): a `SkillHealth` view surfaces low-success-rate,
+  negative-learning-heavy, and zero-usage skills as refine/retire
+  candidates. (#462)
+
+### Changed
+
+- **Structural splits**: CLI subcommands extracted to
+  `mimir/commands/` (#443, chainlink #240); the 2349-line feedback module
+  split into a `mimir/feedback/` subpackage (#437, #241); saga migrations
+  lifted to `mimir/saga/migrations.py` (#436, #242); shared bridge
+  supervisor helpers to `_supervisor.py` (#435, #246); dashboard HTML/JS
+  to sibling `.html` files (#438, #243).
+- **Triples query path vectorized** — the `query()`-path cosine scan is
+  now a single NumPy op (#464, chainlink #257).
+- **git_bootstrap pre-push staleness gate** on `/workspace/mimir` (#434,
+  chainlink #249).
+- **skill-creator** gained a test-gate step in its authoring checklist
+  (#468, chainlink #265).
+
+### Fixed
+
+- **Code-review sweep — 17 items** (chainlink #258 + #259): poller
+  subprocess stdout/stderr now byte-capped (#466); consolidate/dedup
+  candidate selection threads `reference_date` so historical-corpus bench
+  replays measure the lookback window against the data, not wall-clock;
+  `react()` resolves its default target from the history buffer and
+  surfaces declined reactions instead of reporting "ok"; the JSONL
+  snapshot tail-cap exposes `saturated` so time-windowed scans can detect
+  truncation; and the scheduler now mutates the APScheduler jobstore on
+  the event-loop thread (file IO stays in `to_thread`) rather than racing
+  dispatch from a worker thread. Plus config int/float coercion, minimax
+  host matching, ntfy timestamp normalization, and stderr redaction.
+  (#467, #469, #470, #471, #472, #473, #474, #475)
+- **history**: mimir's own outbound messages surface in Recent activity
+  again (#465, chainlink #270).
+- **triples**: expired triples are filtered by `valid_until` in both
+  search paths (#463, chainlink #257).
+- **oauth/saga**: 7-day confirm counter preserved across sub-bucket
+  overlap gaps (#457); `search_sessions` recency falls back to
+  `reflected_at`, undateable sessions rank last (#446) (chainlink #253).
+- **dispatcher**: idle-worker retirement pops `_workers` (#452, #255);
+  **shell_jobs** evict finished jobs after 1h to bound registry growth
+  (#451, #256); **turn_logger** `_trim_sync` first-trim crash (#444);
+  **quota_pause** clamps `extract_reset_at` to now + 7 days (#450).
+
+### Security
+
+- **SSRF gate on attachment downloads** — validate scheme + CDN host
+  before fetching (#449, chainlink #251, HIGH); don't follow redirects on
+  credentialed attachment downloads (#445, #252); tighten `.env` to
+  `0o600` after writing secrets (#448, #252).
+- **Destructive-action guardrail** wording clarified as an accident
+  deterrent (not a security boundary) (#471, chainlink #259).
+
+### Internal
+
+- Dedicated test coverage for `config`, `registry`, `saga_ops`, `server`,
+  and `templates` (chainlink #247: #439, #440, #441, #442); smoke test
+  runs via `sys.executable`; longmemeval skip guard fixed (#458).
+- `.mailmap`: final agent-identity remaps make the display layer
+  (`%aE`/`%aN` + GitHub UI) free of anthropic/employer/hostname
+  addresses (closes chainlink #176).
+
+## [0.1.3] — 2026-05-27
+
+25 commits since v0.1.2 — biggest single release in the agent-behavior
+space yet. Two **CLI capabilities** for skill-catalog management
+(`mimir skills update --apply`, `mimir skills install --configure`),
+the **social-cli rabbit-hole fix** (Muninn's reported failure mode),
+the **pre-merge `CHANGES_REQUESTED` gate** that closes the auto-merge
+race, two new **dead-man alarms** (scheduler-wedge + cost-runaway),
+and a new **`DESIGN.md` sibling-doc convention** for developer-facing
+skill prose. Two pre-OSS-style refactors (`.modified` → `.differs`,
+seam annotations split out of `SKILL.md`) and a batch of new algedonic
+renderers round out the release.
+
+### Added
+
+- **`mimir skills update --apply` flag** (#396, chainlink #208): turns the
+  drift-detection dry-run into an actual updater. Writes a backup of every
+  `differs` file to `.pre-update-backup/<UTC-timestamp>/<rel>` before
+  overwriting, so locally-edited files are recoverable. `--force` also
+  removes extra files (local additions). Backup failure aborts the
+  overwrite for that file rather than proceeding with no safety net.
+  Exit code 1 when any file fails to copy or extras were skipped — safe
+  for CI / automation use.
+- **`mimir skills install --configure` flag** (#387, chainlink #127):
+  interactive env-var setup at install time. The CLI walks the skill's
+  declared required env vars (`env_required` in `pollers.json`) and
+  prompts the operator to fill them in, writing the result to the
+  skill's `state/.env`.
+- **`mimir skills update` (dry-run drift detection)** (#390, chainlink #207):
+  baseline of the apply flow — compares each installed optional skill
+  against the source tree, prints 4-category drift output (`differs`,
+  `added in source`, `extra in installed`, orphaned). Exits 1 on any
+  drift (CI-friendly).
+- **Social-cli thread depth surfacing + `thread.py` deeper-fetch script**
+  (#395): poller events now include a rendered `threadContext` block
+  showing the 5-ancestor parent chain Bluesky already provides via
+  `getPostThread(parentHeight=5)`, with explicit `(you)` markers on the
+  agent's own contributions and a count in the header
+  (`thread (4 prior posts, 2 from you)`). Two new event extras:
+  `thread_depth` and `agent_replies_in_thread`. The bundled `thread.py`
+  helper fetches up to 100 ancestors + replies on demand using the
+  operator's existing AT-proto creds — for cases past the 5-deep slice.
+  Addresses the reported "rabbit-hole replies" failure mode.
+- **Pre-merge `CHANGES_REQUESTED` gate** (#394, chainlink #217): bundled
+  rule in `mimir/skills/github/SKILL.md` instructs the agent to fetch
+  the current review state with one jq query before invoking
+  `gh pr merge`, refuse if any reviewer is in `CHANGES_REQUESTED`, and
+  post a `gh pr comment` explaining the block. Auto-surfaces on any
+  `gh *` Bash invocation. Closes the auto-merge-on-first-approve race
+  (chainlink #214); structured event emission for blocked merges is
+  tracked in chainlink #218.
+- **Scheduler-wedge dead-man alarm** (#382, chainlink #66): ntfy push
+  when heartbeats are silent for `interval × safety_factor` —
+  derived from the heartbeat schedule, so disabling heartbeats also
+  disables the alarm (no false-positive when intentionally off).
+- **Cost-runaway dead-man alarm** (#379, chainlink #66): ntfy push when
+  hourly spend crosses a configurable threshold (default $50/hr).
+  Paired with the wedge alarm; both share the `MIMIR_NTFY_*` env
+  surface.
+- **`pr_merge_blocked_by_changes_requested` algedonic event** (#391,
+  chainlink #214): event-type registration + renderer in `feedback.py`
+  for the merge-refusal case. Emission currently requires bash-callable
+  `mimir feedback emit` CLI (tracked in chainlink #218); the renderer
+  is in place so the observability lands when the emit path ships.
+- **Phase 3 resolve CLI for reflection proposals** (#383, chainlink #205):
+  `mimir reflection resolve <id> --accept|--reject` with audit log.
+- **`list-pending` CLI + per-channel pending-proposals digest** (#380,
+  #381, chainlinks #203 / #204): inspection + Phase-2 digest delivery
+  to the operator channel.
+- **`env_required` field on pollers** (#385, chainlink #108): pollers
+  declare required env keys; missing keys fail loudly at registration
+  rather than silently no-op'ing on first run.
+- **`feedback mark-resolved` CLI** (#373, chainlinks #198/#199): mark
+  incidents as resolved via the CLI, with robust timestamp comparison
+  so silenced events stay silent across restarts.
+- **Resolved-incident filter** (#372, chainlink #197): feedback block
+  hides events from incidents the operator has marked resolved.
+- **`SKILL.md` frontmatter parse-error algedonic** (#377, chainlink #201):
+  malformed SKILL.md emits `skill_frontmatter_malformed` so the operator
+  sees the parse failure on the next turn.
+
+### Changed
+
+- **`SkillDriftResult.modified` → `.differs`** (#393, chainlink #216):
+  attribute + CLI output label renamed from `modified:` to
+  `differs from source:`. The old label conflated "source changed
+  upstream" with "operator hand-edited locally"; the neutral framing
+  flags the ambiguity that `--apply` has to manage. Lands before #396
+  so the safety story is consistent.
+- **Memory-skill impl seams moved to `DESIGN.md` sibling** (#388):
+  the 12 visibility tiers in `mimir/skills/memory/SKILL.md` no longer
+  carry `_→ file.py:fn()_` impl-seam annotations in-line; those live
+  in a new `mimir/skills/memory/DESIGN.md` developer-reference file.
+  Agent reads SKILL.md without paying per-turn token cost for
+  developer cross-refs; developers still get the same navigability via
+  the sibling. Drift prevention is preserved via a structural test
+  pinning the tier count on both files.
+- **`DESIGN.md` convention documented** (#389, chainlink #215): a new
+  section in `mimir/skills/skill-creator/SKILL.md` documents the
+  sibling-doc pattern, when to use it, the pointer-blockquote shape
+  for SKILL.md, and the recommended per-skill conformance test.
+  Opt-in; bar is ≥100 lines of developer-facing prose.
+- **`skill_resolver._strip_frontmatter` dedup** (#386, chainlink #212):
+  removed the duplicate parser; both paths now go through `skill_md`.
+  Resolves a longstanding "two parsers, two answers" hazard.
+- **Memory-skill visibility tier annotations cross-linked** (#384,
+  chainlink #110): each of the 12 tiers in `SKILL.md` now has an
+  explicit code-path cross-reference; the test pins the count and
+  the `_→` annotation per tier.
+- **CHANGELOG blocks for schema version constants** (#374, chainlinks
+  #195/#194/#103): every schema-version constant carries a leading
+  CHANGELOG block documenting prior versions + the rationale for the
+  current value.
+- **`.mailmap` extended to remap sensitive git author emails** (#375,
+  chainlink #176): prior commit authorship under work-domain emails
+  re-mapped to a personal address for the OSS history.
+
+### Fixed
+
+- **`skill_outcomes` boundary-based attribution** (#378, chainlink #200):
+  the success-criteria fallback path now uses Approach C
+  (turn-boundary-based) attribution, matching the primary path's
+  semantics. Closes a class of false-negative test failures where the
+  outcome was attributed to the wrong tool call.
+- **Weather skill `SKILL.md` invocation-form clarity** (#392): drops the
+  misleading filesystem-path parenthetical that caused a downstream
+  agent to try `python3 mimir/skills/weather/scripts/get_weather.py` (which
+  only works from a source checkout) and report "not installed" when
+  in fact the script was installed (just reachable only via
+  `python3 -m mimir.skills.weather.scripts.get_weather`). Adds an explicit
+  install-verification one-liner and documents the `--help` footgun
+  (the script doesn't use argparse, so `--help` becomes a city query).
+- **Poller circuit-breaker renderers** (#369, chainlink #196): more
+  informative algedonic strings for the circuit events (already shipped
+  in v0.1.2 but the renderer wording was refined here).
+
+## [0.1.2] — 2026-05-26
+
+23 commits since v0.1.1, dominated by **agent-behavior + observability**
+work — a wait-on-pending guard for `bash_async` (with wrapper-invariance
+follow-up), a poller circuit-breaker, expanded algedonic event coverage,
+plus a fix for the weather skill path-resolution and a turn-viewer scroll
+bug. Also a structural cleanup pass (saga relocated under `benchmarks/`,
+stale docs pruned, license attribution corrected).
+
+### Added
+
+- **Per-channel `bash_async` wait-on-pending guard** (#356, chainlink #189):
+  refuses respawns when a same-intent job is already running on the same
+  channel. Strips leading `export` and `VAR=val` tokens so env-export
+  retry variants map to the same intent. Catches the failure mode where
+  the agent spawns N parallel async jobs for the same operation when one
+  was already in flight.
+- **Wrapper-invariant `bash_async` guard** (#371, chainlink #192): extends
+  the above to also strip `/bin/bash -c '…'` wrappers, `cd /path && …`
+  chains, and absolute-path executables (`/usr/bin/node` → `node`). Adds
+  a URI-target secondary key — same `at://X` / `https://X` in two
+  commands triggers the guard even when executables differ. Closes the
+  command-wrapper escalation sub-pattern.
+- **Algedonic event on `bash_async` refusal** (#370, chainlink #193):
+  emits `bash_async_refused_same_intent` when the guard fires, surfaced
+  in `feedback.py`'s algedonic block. Closes the observability gap left
+  by the original guard (refusals were tool-string-only, invisible to
+  dashboards).
+- **Poller circuit-breaker** (#365, chainlink #94): suspends a poller for
+  5 minutes after 3 consecutive failures. Emits `poller_circuit_tripped`
+  (once at transition) + `poller_circuit_open` (each suppressed run with
+  `remaining_seconds`). Auto-resets on first clean run after backoff
+  expires.
+- **Circuit-breaker algedonic renderers** (#369, chainlink #196):
+  informative `feedback.py` renderers for the new circuit events.
+  `poller_circuit_open` deduplicates per-poller within a backoff window
+  (omits `remaining_seconds` from the rendered string so 5 suppressed
+  runs collapse to ONE entry with a count).
+- **Per-channel memory injection** (#343, chainlink #187 — landed in
+  v0.1.2 as the channel-memory load was wired post-v0.1.1 cut): turn
+  prompts now auto-load `memory/channels/<channel_id>/*.md`.
+- **`pollers.json` schema version field** (#360, chainlink #91):
+  `POLLER_MANIFEST_SCHEMA_VERSION = 1`. Absent → v1 (backwards-compat);
+  unknown values warn and parse best-effort.
+- **`poller.env` deny-list warning** (#361, chainlink #95): emits
+  `poller_env_secret_reintroduced` when a `poller.env` key matches
+  `*_API_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD` / `MIMIR_*`.
+  Value is NOT logged in the event payload.
+- **`recipient_name` extraction** (#363, chainlink #96): commitments
+  extraction now surfaces a recipient identity. Threads through
+  `dedupe_key` so "remind Alice about X" and "remind Bob about X" no
+  longer collapse to the same commitment record.
+- **GitHub poller commit subjects** (#362, chainlink #92): `pr_synchronize`
+  events now include up to 3 commit subjects via the `/repos/.../compare`
+  endpoint. Graceful degradation on API failure.
+- **Skill-catalog schema marker** (#359, chainlink #103): generated
+  `skills-catalog.md` starts with `<!-- catalog-schema: v1 -->`.
+  Column-stability contract documented in `render_catalog()`.
+- **Auto-regenerate `skills-catalog.md` on memory flush** (#366,
+  chainlink #109): closes a drift gap — catalog feeds every-turn prompt,
+  shouldn't lag SKILL.md edits.
+- **Skill-catalog `--strict` exit code + stderr warnings** (#358,
+  chainlink #105): malformed SKILL.md parse errors now emit a clear
+  stderr warning + `--strict` exits non-zero for CI gating.
+- **`<!-- desc: -->` conformance** (#357, chainlink #102): parametrized
+  test enforces the first-body-line convention across all 27 bundled
+  SKILL.md files.
+
+### Changed
+
+- **Saga relocated to `benchmarks/saga/`** (#352): the top-level `saga/`
+  workspace package (LongMemEval bench harness, not the runtime memory
+  backend) moved under `benchmarks/` to make the runtime-vs-bench split
+  legible. Imports unchanged (package name is still `saga`); the bench
+  shell's `config.py` path-resolution still works via the
+  `parents[3]`-walk. Hand-edits to update path references in 9 files
+  (FEEDBACK-LOOPS.md, SPEC.md, README.md, CONTRIBUTING.md, runner.py,
+  score.py, etc.).
+- **README + `saga/LICENSE` attribution corrected** (#350): the
+  runtime/bench-shell conflation was untangled in the README; the
+  dual-copyright (Jaden Schwab + Jason Carreira) was removed — the
+  rewrite cleared all of Jaden's MSAM code from both the runtime and
+  the bench shell, so the prior attribution was inaccurate.
+- **`scaffold-docker` defaults `MIMIR_WEB_HOST=0.0.0.0`** (#348):
+  generated `compose.yml` bakes the inside-container bind so the
+  loopback default doesn't silently break the docker port-forward.
+  Host exposure stays loopback-only via the `127.0.0.1:<port>` binding
+  in `ports:`.
+- **`docs/` pruning** (#351): 8 stale planning docs deleted (close-out
+  of pre-OSS review backlog, v0.4/v0.5 historical roadmaps, abandoned
+  spec docs). 4 KEEP specs got status banner refreshes from "filed /
+  not started" → "shipped" where the feature actually landed.
+
+### Fixed
+
+- **Weather skill path resolution** (#368): `SKILL.md` now invokes via
+  `python3 -m mimir.skills.weather.scripts.get_weather` instead of the broken
+  relative path `python3 skills/weather/scripts/get_weather.py`. The latter
+  didn't resolve from the shell-tool's cwd; agents had been guessing
+  path variants for days with 0/7 successful invocations on muninn.
+- **Turn-viewer inner-scroll preservation** (#367): the 5s poll's
+  `innerHTML` replace destroys + rebuilds every `.event-bdy` scrollable
+  box (reasoning, tool_call, tool_result, saga), resetting each
+  `scrollTop` to 0. Long reasoning blocks were impossible to read past
+  the 360px window. Captures + restores scroll positions on each poll.
+- **`asyncio` strong-ref discipline at 3 fire-and-forget sites** (#349,
+  chainlink #118): `loop.create_task(...)` without a retained reference
+  can be GC'd before completion. `scheduler._on_job_missed`,
+  `scheduler._dispatch_invalid_manifest_events`, and
+  `budget_gate._emit_event_sync` now hold their tasks in module/instance
+  sets with `task.add_done_callback(set.discard)` for cleanup.
+- **Commitments `store.add` per-record exception isolation** (#353,
+  chainlink #98): pinned with a regression test — when `store.add`
+  raises for one record in a batch, the loop continues to attempt the
+  remaining records.
+- **Commitments large-store warning** (#364, chainlink #106):
+  `current_state()` now warns when the JSONL replay count exceeds 500
+  events. Per-instance flag prevents duplicate warnings across repeated
+  calls in the same poller sweep.
+- **Commitments `due_window_hint` ISO 8601 with non-UTC offset** (review
+  follow-up via #346): test pin added in the v0.1.1 → v0.1.2 cycle for
+  the non-UTC case (e.g. `-05:00` EST).
+- **`commitments_due_check_error` + `saga_consolidate_error` tracebacks**
+  (#346): both events now include `traceback=traceback.format_exc()` for
+  operator diagnosis without trawling container logs.
+- **Skill-md folded-scalar parser**: pre-existing in v0.1.1 (#347).
+- **Integration test skips cleanly without claude CLI auth** (#354,
+  chainlink #191): `_claude_sdk_can_invoke()` probes whether the CLI
+  can complete an API call; if not, the integration test SKIPS with a
+  clear message instead of failing with a misleading empty-events
+  assertion.
+- **Mock companion for the integration test** (#355): two new mock-based
+  tests pin the hook-pairing contract even when the integration test
+  skips (CI without OAuth keychain, fresh contributors).
+
+[Unreleased]: https://github.com/jasoncarreira/mimir/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.3
+[0.2.2]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.2
+[0.2.1]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.1
+[0.2.0]: https://github.com/jasoncarreira/mimir/releases/tag/v0.2.0
+[0.1.3]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.3
+[0.1.2]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.2
+
+## [0.1.1] — 2026-05-25
+
+First post-release fix sweep — 13 PRs since v0.1.0, mostly addressing
+notable code-review findings (chainlinks #97, #99, #104, #181-#187) plus
+two feature additions for fresh-install ergonomics.
+
+### Added
+
+- **Channel memory injection** (#343, chainlink #187): per-turn prompts
+  now auto-inject `memory/channels/<channel_id>/*.md` so the agent has
+  operator / channel-specific context (preferences, names, patterns)
+  without an explicit tool call. Synthetic channels (`scheduler:*`,
+  `poller:*`) and channels with no memory files are graceful no-ops.
+  8 KB cap with visible truncation note.
+- **scaffold-docker `--mode=pypi`** (#336, closes #332): generates a
+  Dockerfile that installs `mimir-agent` from PyPI at image-build time
+  into a user-owned venv. No source clone, no `uv sync` at boot. Plays
+  cleanly with the pending-update flow. Use `--mode=workspace` (default)
+  for the legacy clone-on-boot shape.
+
+### Changed
+
+- **scaffold-docker compose.yml defaults `MIMIR_WEB_HOST=0.0.0.0`** (#348):
+  inside-container bind must be 0.0.0.0 so docker's port-forward
+  reaches the app. Host exposure stays loopback-only via the
+  `127.0.0.1:<host_port>` binding in `ports:`; `MIMIR_API_KEY` gates
+  the endpoint either way.
+- **Sync mimir source defaults with deployed policy** (#337): pulls in
+  refinements to `06-action-boundaries.md` and `60-filing-rules.md`
+  from operator usage.
+
+### Fixed
+
+- **scheduler**: `commitments_due_check_error` and `saga_consolidate_error`
+  events now include a `traceback` field so operators can diagnose
+  failures without trawling container logs (#345, #346 follow-up).
+- **commitments**: `due_window_hint` strings (ISO 8601, including
+  non-UTC offsets) now parse into `due_window_start_unix` correctly
+  rather than being dropped (#344, chainlink #97).
+- **saga.forget**: `agent_id` and `min_retrievals` parameters now thread
+  through `SagaStore.forget()` to `forget_by_criteria()` instead of
+  being silently dropped (#342, chainlink #182). `contribution_threshold`
+  and `contradiction_threshold` log a warning when set on the in-process
+  path (NYI; HTTP path forwards server-side) (#346 follow-up).
+- **saga**: `PRAGMA foreign_keys` toggle moved out of `executescript()`
+  where it was silently a no-op due to SQLite parsing rules (#338,
+  chainlink #186).
+- **budget**: `quota_recovered` events no longer silently dropped when
+  emitted from `asyncio.to_thread` callsites (#339, chainlink #184).
+- **rate-limits**: `record_sync` now uses atomic write + `threading.Lock`
+  to prevent file corruption under concurrent updates (#340, chainlink
+  #181).
+- **loop detector**: sliding-window detection now catches A,B,A,B
+  alternation patterns (#341, chainlink #183).
+- **skill_md parser**: unindented continuation lines inside `key: >` /
+  `key: |` folded-scalar blocks now raise `ValueError` instead of
+  silently swallowing subsequent keys (#347, chainlink #104).
+
+[0.1.1]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.1
+
+## [0.1.0] — 2026-05-24
+
+Initial public release. `pip install mimir-agent`.
+
+### Added
+
+- Memory-centric agent harness built on deepagents / LangGraph.
+- Saga in-process memory backend with embedding + triple retrieval.
+- Skill registry under `mimir/skills/` (markdown-defined workflows).
+- Per-channel cron scheduler with homeostat (plan-window + cost-rate
+  suppression) under `mimir/scheduler.py`.
+- Bridges for Discord, Slack, Bluesky, web chat, and benchmark stdout.
+- Reflection + double-loop learning skill.
+- Predictions and calibration tracking.
+- PyPI version-check daily cron (`mimir_update_available` algedonic event).
+- `mimir setup`, `mimir run`, `mimir update` CLI subcommands.
+
+[0.1.0]: https://github.com/jasoncarreira/mimir/releases/tag/v0.1.0

@@ -1,0 +1,31 @@
+name = "cultivate"
+version = "0.9.11"
+license = "BUSL-1.1"
+requires_mimir = "==0.9.11"
+themes = ["skins/squashmerge.json"]
+
+[cli]
+cultivate = true
+worklink = false
+opencode-bootstrap = false
+
+[frontend]
+api_major = 1
+module = "frontend/cultivate.v1.js"
+css = "frontend/cultivate.v1.css"
+
+[defaults]
+version = "0.9.11"
+skills = [
+  "defaults/skills/chainlink-orchestrator",
+  "defaults/skills/worklink-tool-pins",
+]
+
+[optional]
+skills = [
+  { path = "defaults/skills/github-poller", forge = "github" },
+  { path = "defaults/skills/github-ci-watch", forge = "github" },
+  { path = "defaults/skills/github", forge = "github" },
+  { path = "defaults/skills/review", forge = "github" },
+  { path = "defaults/skills/tracker-poller" },
+]

@@ -1,0 +1,228 @@
+"""LangChain tool wrapping mimir.saga.SagaStore for the PoC.
+
+Direct translation of the saga_query MCP tool to LangChain's @tool
+decorator. The function body remains essentially identical — we still
+call SagaStore.query and render its response via _format_saga_payload.
+
+Surface change: the @tool decorator from langchain_core takes a
+docstring + type hints; deepagents picks these up via the standard
+LangChain Tool introspection (no custom registry, no MCP server).
+"""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+from pathlib import Path
+
+from langchain.tools import ToolRuntime
+from langchain_core.tools import tool
+
+from mimir.models import AuthContext
+from mimir.models import Integrity, SourceLabel
+from mimir.saga.client import SagaStore
+from mimir.sagatools import _format_saga_payload, _provenance_tag
+
+
+# The PoC uses a single SagaStore instance per-process. Production
+# would wire this via the agent's context_schema or a closure; for the
+# smoke we set it via _set_memory_client() before agent invocation.
+_MEMORY_STATE: dict[str, SagaStore | None] = {"client": None}
+
+
+def set_memory_client(client: SagaStore | None) -> None:
+    """Inject the SagaStore instance the tool will query against."""
+    _MEMORY_STATE["client"] = client
+
+
+def _memory_source(
+    auth_context: AuthContext | None, item: dict, *, atom: dict | None = None,
+) -> SourceLabel:
+    """Label a SAGA result using only the client's per-atom IFC integrity."""
+    from mimir.access_control import protected_result_source
+
+    source = protected_result_source(
+        auth_context,
+        principal=atom.get("owner_principal") if atom is not None else item.get("owner_principal"),
+        domain="saga",
+        resource_id=f"atom:{atom['id']}" if atom is not None else item.get("resource_id"),
+        bridge_instance="saga",
+        sensitivity="private",
+    )
+    integrity = item.get("integrity")
+    # A missing or unknown report retains protected_result_source's untrusted
+    # active-ingest default. Never infer trust from the domain or atom row.
+    if integrity not in Integrity._value2member_map_:
+        integrity = Integrity.UNTRUSTED
+    return replace(source, integrity=integrity)
+
+
+def _publish_memory_provenance(payload: dict, auth_context: AuthContext | None) -> None:
+    """Publish the client's authorized atom sources, failing closed on missing metadata."""
+    from mimir.access_control import publish_protected_result
+
+    metadata = payload.get("_ifc_sources")
+    items = [item for item in metadata if isinstance(item, dict)] if isinstance(metadata, list) else []
+    by_id = {item.get("resource_id"): item for item in items
+             if isinstance(item.get("resource_id"), str)}
+    # If provenance is absent (or incomplete), returned content still counts as
+    # untrusted ingest. Display rows cannot attest to their own integrity.
+    rows = (payload.get("atoms") or []) + (payload.get("observations") or []) + (payload.get("raws") or [])
+    ids = {f"atom:{row['id']}" for row in rows if isinstance(row, dict) and row.get("id")}
+    ids.update(f"atom:{row['source_atom_id']}" for row in payload.get("triples", [])
+               if isinstance(row, dict) and row.get("source_atom_id"))
+    for resource_id in ids - by_id.keys():
+        items.append({"resource_id": resource_id})
+    publish_protected_result(tuple(_memory_source(auth_context, item) for item in items))
+
+
+@tool
+async def memory_query(
+    query: str,
+    top_k: int = 12,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Search the user's persistent memory for atoms relevant to the query.
+
+    Returns a structured block containing observations (synthesized from
+    multiple turns), raw chat history excerpts, and structured triples
+    (subject, predicate, object) facts. Prefer raw evidence for specific
+    dates / names / numbers / direct quotes; observations for patterns.
+
+    This is SEMANTIC search. If you already know the atom ids you want
+    (e.g. ids cited in an observation), use ``memory_get`` to load them by
+    id in one call — don't pass ids here and don't fan out one query per id.
+
+    Args:
+        query: Natural-language query for retrieval.
+        top_k: Max raw atoms to return (default 12). Observations are
+            additionally surfaced when relevant.
+
+    Returns:
+        Formatted memory block — atoms + observations + triples — or
+        "(no atoms)" if no relevant memories exist.
+    """
+    client = _MEMORY_STATE["client"]
+    if client is None:
+        return "memory_query failed: no SagaStore configured"
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+
+    try:
+        payload = await client.query(query, top_k=top_k, auth_context=auth_context)
+    except Exception as exc:
+        return f"memory_query failed: {exc}"
+    _publish_memory_provenance(payload, auth_context)
+    return _format_saga_payload(payload)
+
+
+# memory_get shows MORE content than the semantic-recall display cap — the
+# whole point is to read the atom to judge it — but still bounded so loading
+# a large set can't blow the context window.
+_GET_CONTENT_CAP = 2000
+
+
+def _format_get_atoms(payload: dict) -> str:
+    """Render a memory_get result: one bullet per atom WITH its id (so the
+    agent can map each result back to the id it asked for and judge it),
+    plus a trailing note listing any ids that weren't found."""
+    atoms = payload.get("atoms") or []
+    missing = payload.get("missing") or []
+    lines: list[str] = []
+    for a in atoms:
+        label = a.get("memory_type") or a.get("stream") or "raw"
+        content = (a.get("content") or "").strip().replace("\n", " ")
+        if len(content) > _GET_CONTENT_CAP:
+            content = content[:_GET_CONTENT_CAP] + "…"
+        lines.append(
+            f"- [{a.get('id')}] [{label}]{_provenance_tag(a)} {content}"
+        )
+    body = "\n".join(lines) if lines else "(no atoms found)"
+    if missing:
+        body += (
+            "\n\n(not found — deleted, unknown, or out of scope: "
+            f"{', '.join(missing)})"
+        )
+    return body
+
+
+@tool
+async def memory_get(
+    atom_ids: list[str],
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Load specific memory atoms by their exact id — a batch by-id lookup.
+
+    Use this when you ALREADY know the atom ids you want (e.g. ids cited in
+    an observation, or listed in the session-boundary "atoms cited" block)
+    and just need their content. This is an exact-key load, NOT semantic
+    search: pass ids, not natural-language queries (use ``memory_query`` to
+    search), and pass ALL the ids in ONE call — never fan out one query per id.
+
+    Unlike ``memory_query``, this fires no access events: a by-id load is
+    fetching atoms you already know about (often to judge their usefulness),
+    so it must not reinforce their activation.
+
+    Args:
+        atom_ids: saga atom ids to load.
+
+    Returns:
+        One line per atom (``[id] [type] content``), plus a note listing any
+        ids that weren't found (deleted, unknown, or out of your scope).
+        "(no atoms found)" if none of the ids resolved.
+    """
+    from mimir.access_control import (
+        get_trusted_service_from_auth_context,
+        publish_protected_result,
+    )
+    from .refusals import ToolPolicyRefusal
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else None
+    )
+    service = get_trusted_service_from_auth_context(auth_context)
+    synthesis = service is not None and service.authority_profile == "session-boundary"
+
+    def fail(message: str) -> str:
+        if synthesis:
+            raise ToolPolicyRefusal(message)
+        return message
+
+    client = _MEMORY_STATE["client"]
+    if client is None:
+        return fail("memory_get failed: no SagaStore configured")
+    if not isinstance(atom_ids, list) or not all(
+        isinstance(a, str) for a in atom_ids
+    ):
+        return fail("memory_get failed: atom_ids must be a list of id strings")
+    ids = [a for a in atom_ids if a]
+    if not ids:
+        return fail("memory_get failed: atom_ids is empty")
+
+    try:
+        payload = await client.get_atoms(ids, auth_context=auth_context)
+    except Exception as exc:  # noqa: BLE001 — SagaError surfaces via str
+        if synthesis:
+            raise ToolPolicyRefusal("memory_get failed: memory unavailable") from exc
+        return f"memory_get failed: {exc}"
+    if synthesis:
+        atoms = payload.get("atoms") or []
+        # Atom rows no longer carry integrity. Check the server-owned IFC
+        # provenance instead, retaining the whole-batch fail-closed boundary.
+        metadata = payload.get("_ifc_sources")
+        sources = {source.get("resource_id"): source for source in metadata
+                   if isinstance(source, dict)} if isinstance(metadata, list) else {}
+        labels = tuple(_memory_source(
+            auth_context, sources.get(f"atom:{atom['id']}", {}), atom=atom,
+        ) for atom in atoms)
+        if any(source.integrity != Integrity.TRUSTED for source in labels):
+            raise ToolPolicyRefusal("memory_get failed: synthesis requires trusted memory atoms")
+        publish_protected_result(labels)
+        return _format_get_atoms(payload)
+    _publish_memory_provenance(payload, auth_context)
+    return _format_get_atoms(payload)

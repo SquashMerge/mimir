@@ -1,0 +1,1650 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any
+
+import pytest
+
+pytest.importorskip("mimir_cultivate")
+
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.feature_factory import (
+    FACTORY_COMMANDS,
+    FACTORY_PUBLISHING_IDENTITY_ENV,
+    FACTORY_VERSION,
+    FactoryContractError,
+    FeatureFactoryBackend,
+    epic_run_id,
+    parse_factory_status,
+    probe_factory_capabilities,
+    resolve_factory_entrypoint,
+    _DEFAULT_FACTORY_MAX_RETRIES,
+    _MAX_FACTORY_MAX_RETRIES,
+    _factory_max_retries,
+    _run_bounded,
+)
+from mimir_cultivate.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
+
+
+def status_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "run_id": "1551",
+        "issue_key": "1551",
+        "valid": True,
+        "sandbox_path": "/tmp/operator",
+        "status": "running",
+        "mode": "autonomous",
+        "max_retries": 5,
+        "publishing_identity": "mimir-carreira",
+        "branch": "epic/1551",
+        "pr_base": "main",
+        "pr_draft": False,
+        "lock": "fresh",
+        "dead_lock": False,
+        "lock_session": "session-1",
+        "gates": {
+            "brief": {
+                "status": "approved",
+                "at": None,
+                "artifact": None,
+                "reviewed_head": None,
+            },
+        },
+        "steps": [
+            {"agent": "brief", "status": "completed", "attempts": 1},
+            {"agent": "implementation", "status": "running", "attempts": 1},
+        ],
+        "slices": [
+            {
+                "id": "factory-070-migration", "status": "pending", "attempts": 0,
+                "extra_attempts": 0, "retry_limit": 5,
+            },
+        ],
+        "retry_extensions": [],
+        "validator": None,
+        "pr_url": None,
+        "terminal_result": None,
+        "park_snapshot": None,
+        "next": "implementation",
+        "next_action": {"kind": "step", "subject": "implementation"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def package_entrypoint(tmp_path: Path) -> Path:
+    modules = tmp_path / "lib" / "node_modules"
+    feature = modules / "feature-factory"
+    adapter = modules / "opencode-feature-factory"
+    (feature / "bin").mkdir(parents=True)
+    adapter.mkdir(parents=True)
+    entrypoint = feature / "bin" / "factory.js"
+    entrypoint.write_text("", encoding="utf-8")
+    (feature / "package.json").write_text(
+        json.dumps({"name": "feature-factory", "version": FACTORY_VERSION}),
+        encoding="utf-8",
+    )
+    (adapter / "package.json").write_text(
+        json.dumps({"name": "opencode-feature-factory", "version": FACTORY_VERSION}),
+        encoding="utf-8",
+    )
+    return entrypoint
+
+
+def test_snapshot_uses_attempt_bound_control_and_operator_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate.worklink import worker_client
+
+    sandbox = tmp_path / "operator" / ".factory-sandboxes" / "chainlink-700"
+    sandbox.mkdir(parents=True)
+    launcher = package_entrypoint(tmp_path)
+    calls: list[tuple[Path, list[str]]] = []
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (sandbox.parent.parent, 700, 1))
+
+    def control(path: Path, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append((path, argv))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    backend = FeatureFactoryBackend(entrypoint=str(launcher))
+    backend.snapshot("chainlink-700", sandbox=sandbox, launcher=launcher)
+    assert calls == [(
+        sandbox,
+        ["node", str(launcher), "snapshot", "chainlink-700", "--repo", str(tmp_path / "operator")],
+    )]
+    assert str(sandbox) not in calls[0][1]
+
+
+@pytest.mark.parametrize("sandbox_name", ["other-run", "sandbox"])
+def test_snapshot_refuses_unbound_sandbox(
+    tmp_path: Path, sandbox_name: str,
+) -> None:
+    sandbox = tmp_path / ".factory-sandboxes" / sandbox_name
+    backend = FeatureFactoryBackend(runner=lambda *args, **kw: pytest.fail("snapshot launched"))
+    with pytest.raises(FactoryContractError, match="requires this run's sandbox path"):
+        backend.snapshot("chainlink-700", sandbox=sandbox, launcher="/unused")
+
+
+def test_snapshot_refuses_wrong_sandbox_parent(tmp_path: Path) -> None:
+    backend = FeatureFactoryBackend(runner=lambda *args, **kw: pytest.fail("snapshot launched"))
+    with pytest.raises(FactoryContractError, match="requires this run's sandbox path"):
+        backend.snapshot(
+            "chainlink-700", sandbox=tmp_path / "other-dir" / "chainlink-700",
+            launcher="/unused",
+        )
+
+
+def structured_status_payload() -> dict[str, Any]:
+    # Release shape including Gate 3's commit binding, not a live probe.
+    return status_payload(
+        steps=[{"agent": "spec-writer", "status": "blocked", "attempts": 2}],
+        slices=[{
+            "id": "be-x", "status": "merged", "attempts": 5,
+            "extra_attempts": 2, "retry_limit": 7,
+        }],
+        gates={"story": {
+            "status": "approved", "at": "2026-09-17T00:00:00Z",
+            "artifact": "story.md", "reviewed_head": "abc123",
+        }},
+        validator={"verdict": "GO", "report": "validator.md", "reviewed_head": "abc123", "loops": 2},
+        next_action={"kind": "gate", "subject": "pre_pr"},
+    )
+
+
+# Validator rows exactly as `factory status --json` prints them on 0.12.1, captured
+# from the published CLI against run.json validator records it accepted as valid.
+# 0.12.1 adds `override` to every non-null validator, null unless an operator ran
+# `factory override-validator` on a NO-GO.
+_HEAD_0121 = "7e23159fbf0b672e575144586918b4930d7d0210"
+_VALIDATOR_0121 = {
+    "go": {
+        "verdict": "GO", "report": "reviews/implementation-validator.json",
+        "reviewed_head": _HEAD_0121, "loops": 0, "override": None,
+    },
+    "nogo": {
+        "verdict": "NO-GO", "report": "reviews/implementation-validator.json",
+        "reviewed_head": _HEAD_0121, "loops": 0, "override": None,
+    },
+    "override": {
+        "verdict": "NO-GO", "report": "reviews/implementation-validator.json",
+        "reviewed_head": _HEAD_0121, "loops": 0,
+        "override": {
+            "reviewed_head": _HEAD_0121,
+            "reason": "AC4 finding judged non-blocking by operator",
+            "session": "operator-20261023",
+            "at": "2026-10-23T14:00:00.000Z",
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_VALIDATOR_0121))
+def test_status_accepts_0121_validator_override_shapes(shape: str) -> None:
+    payload = status_payload(validator=_VALIDATOR_0121[shape])
+
+    status = parse_factory_status(json.dumps(payload).encode())
+
+    assert status.validator == _VALIDATOR_0121[shape]
+    assert status.to_json()["validator"] == _VALIDATOR_0121[shape]
+    assert parse_factory_status(status.to_json()) == status
+
+
+def test_status_keeps_pre_0121_validator_rows_without_override() -> None:
+    row = structured_status_payload()["validator"]
+    assert "override" not in row
+
+    status = parse_factory_status(status_payload(validator=row))
+
+    assert status.validator == row
+    assert "override" not in status.to_json()["validator"]
+
+
+def _override_row(**changes: Any) -> dict[str, Any]:
+    row = json.loads(json.dumps(_VALIDATOR_0121["override"]))
+    for key, value in changes.items():
+        if key.startswith("override_"):
+            member = key.removeprefix("override_")
+            if value is _DROP:
+                del row["override"][member]
+            else:
+                row["override"][member] = value
+        else:
+            row[key] = value
+    return row
+
+
+_DROP = object()
+
+
+@pytest.mark.parametrize("row, message", [
+    (_override_row(verdict="GO"), "requires a NO-GO"),
+    (_override_row(verdict="GO-WITH-NITS"), "requires a NO-GO"),
+    (_override_row(override_reviewed_head="0" * 40), "must name the verdict's reviewed_head"),
+    (_override_row(override_reason=_DROP), "must be an object with"),
+    (_override_row(override_extra="x"), "must be an object with"),
+    (_override_row(override_reason="   "), "nonblank"),
+    (_override_row(override_session=7), "nonblank"),
+    (_override_row(override="operator said so"), "must be an object with"),
+])
+def test_status_rejects_malformed_validator_override(row: dict[str, Any], message: str) -> None:
+    with pytest.raises(FactoryContractError, match=message):
+        parse_factory_status(status_payload(validator=row))
+
+
+@pytest.mark.parametrize("wire", ["mapping", "text", "bytes"])
+def test_status_089_live_failure_regression(wire: str) -> None:
+    payload = structured_status_payload()
+    encoded = json.dumps(payload)
+    status = parse_factory_status(
+        payload if wire == "mapping" else encoded if wire == "text" else encoded.encode()
+    )
+    for field in ("steps", "slices", "gates", "validator", "next_action"):
+        assert status.to_json()[field] == payload[field]
+    assert parse_factory_status(status.to_json()) == status
+
+
+def test_status_accepts_0102_slice_fields_and_top_level_retry_extensions() -> None:
+    payload = structured_status_payload()
+
+    status = parse_factory_status(payload)
+
+    assert status.slices == ({
+        "id": "be-x", "status": "merged", "attempts": 5,
+        "extra_attempts": 2, "retry_limit": 7,
+    },)
+
+
+def test_status_accepts_pending_remediation_slice_on_existing_schema() -> None:
+    remediation = {
+        "id": "remediation-1", "status": "pending", "attempts": 0,
+        "extra_attempts": 0, "retry_limit": 5,
+    }
+    next_action = {"kind": "dispatch-slice", "subject": "remediation-1"}
+    payload = status_payload(
+        slices=[structured_status_payload()["slices"][0], remediation],
+        next_action=next_action,
+    )
+
+    status = parse_factory_status(payload)
+
+    assert status.slices is not None
+    assert status.slices[1] == remediation
+    assert status.next_action == next_action
+    assert status.to_json()["slices"][1] == remediation
+    assert status.to_json()["next_action"] == next_action
+    assert parse_factory_status(status.to_json()) == status
+
+
+_STRUCTURED_ROWS = {
+    "steps": structured_status_payload()["steps"][0],
+    "slices": structured_status_payload()["slices"][0],
+    "gates": structured_status_payload()["gates"]["story"],
+    "validator": structured_status_payload()["validator"],
+    "next_action": structured_status_payload()["next_action"],
+}
+_ROW_MEMBERS = [(field, member) for field, row in _STRUCTURED_ROWS.items() for member in row]
+_TEXT_MEMBERS = [
+    (field, member) for field, member in _ROW_MEMBERS
+    if isinstance(_STRUCTURED_ROWS[field][member], str)
+]
+
+
+def row_payload(field: str, row: object) -> dict[str, Any]:
+    value = [row] if field in {"steps", "slices"} else {"story": row} if field == "gates" else row
+    return structured_status_payload() | {field: value}
+
+
+@pytest.mark.parametrize(("field", "member"), _ROW_MEMBERS)
+def test_status_requires_every_structured_member(field: str, member: str) -> None:
+    row = dict(_STRUCTURED_ROWS[field])
+    del row[member]
+    with pytest.raises(FactoryContractError, match=rf"{field}\.{member} missing"):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize("field", _STRUCTURED_ROWS)
+@pytest.mark.parametrize("row", ["approved", [], False, 1])
+def test_status_rejects_nonobject_rows(field: str, row: object) -> None:
+    with pytest.raises(FactoryContractError, match=field):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize(("field", "member"), _TEXT_MEMBERS)
+@pytest.mark.parametrize(
+    "value", ["", " ", 7, "a\x00b", "\u00e9" * 8193, "\ud800"],
+    ids=["empty", "blank", "nonstring", "nul", "oversized-utf8", "surrogate"],
+)
+def test_status_bounds_every_structured_text_member(field: str, member: str, value: object) -> None:
+    row = _STRUCTURED_ROWS[field] | {member: value}
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize(("field", "member"), [
+    ("steps", "attempts"),
+    ("slices", "attempts"),
+    ("slices", "extra_attempts"),
+    ("slices", "retry_limit"),
+    ("validator", "loops"),
+])
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2", None])
+def test_status_requires_nonnegative_integer_counts(field: str, member: str, value: object) -> None:
+    with pytest.raises(FactoryContractError, match=rf"{field}\.{member}"):
+        parse_factory_status(row_payload(field, _STRUCTURED_ROWS[field] | {member: value}))
+
+
+@pytest.mark.parametrize("field", _STRUCTURED_ROWS)
+def test_status_rejects_unknown_row_members(field: str) -> None:
+    with pytest.raises(FactoryContractError, match=rf"{field}\.unexpected"):
+        parse_factory_status(row_payload(field, _STRUCTURED_ROWS[field] | {"unexpected": "value"}))
+
+
+def test_status_rejects_unknown_0102_slice_member() -> None:
+    row = _STRUCTURED_ROWS["slices"] | {"future_attempts": 1}
+    with pytest.raises(FactoryContractError, match=r"slices\.future_attempts is unknown"):
+        parse_factory_status(row_payload("slices", row))
+
+
+@pytest.mark.parametrize("field", ["steps", "slices", "gates"])
+def test_status_structured_collection_limits(field: str) -> None:
+    row = _STRUCTURED_ROWS[field]
+    value = {str(i): row for i in range(1000)} if field == "gates" else [row] * 1000
+    parse_factory_status(structured_status_payload() | {field: value})
+    if field == "gates":
+        value["overflow"] = row
+    else:
+        value.append(row)
+    with pytest.raises(FactoryContractError, match="cardinality|bounded"):
+        parse_factory_status(structured_status_payload() | {field: value})
+
+
+@pytest.mark.parametrize("field", ["steps", "slices", "gates"])
+@pytest.mark.parametrize("value", ["retired", 1, False, ()])
+def test_status_requires_structured_collections(field: str, value: object) -> None:
+    with pytest.raises(FactoryContractError, match=field):
+        parse_factory_status(structured_status_payload() | {field: value})
+
+
+@pytest.mark.parametrize(
+    "key", ["", " ", "a\x00b", "\u00e9" * 8193, "\ud800"],
+    ids=["empty", "blank", "nul", "oversized-utf8", "surrogate"],
+)
+def test_status_bounds_gate_names(key: str) -> None:
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(structured_status_payload() | {"gates": {key: _STRUCTURED_ROWS["gates"]}})
+
+
+@pytest.mark.parametrize(("field", "members"), [
+    ("steps", ("agent", "status")), ("slices", ("id", "status")),
+    ("gates", ("at", "artifact")), ("validator", ("report", "reviewed_head")),
+    ("next_action", ("subject",)),
+])
+def test_status_bounds_combined_row_size(field: str, members: tuple[str, ...]) -> None:
+    row = _STRUCTURED_ROWS[field] | {member: "a" * (16384 // len(members)) for member in members}
+    with pytest.raises(FactoryContractError, match=rf"{field} row exceeds size limit"):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize(("kind", "subject"), [
+    ("terminal", "completed"), ("gate", "story"), ("step", "spec-writer"),
+    ("observe-slice", "be-x"), ("blocked-slice", "be-x"), ("dispatch-slice", "be-x"),
+    ("seed-slices", None), ("pr", None), ("complete", None),
+])
+def test_status_retains_next_action_without_classifying(kind: str, subject: str | None) -> None:
+    status = parse_factory_status(status_payload(next_action={"kind": kind, "subject": subject}))
+    assert status.next_action == {"kind": kind, "subject": subject}
+    assert not status.is_terminal
+    assert not status.is_parked
+
+
+def test_status_rejects_unknown_next_action_kind() -> None:
+    with pytest.raises(FactoryContractError, match=r"next_action\.kind"):
+        parse_factory_status(status_payload(next_action={"kind": "unknown", "subject": None}))
+
+
+@pytest.mark.parametrize("wire", ["mapping", "text", "bytes"])
+def test_status_preserves_total_payload_bound(wire: str) -> None:
+    payload = structured_status_payload() | {"padding": "x" * (1024 * 1024)}
+    text = json.dumps(payload)
+    with pytest.raises(FactoryContractError, match="bounds"):
+        parse_factory_status(payload if wire == "mapping" else text if wire == "text" else text.encode())
+
+
+def test_status_rejects_invalid_utf8_inside_structured_row() -> None:
+    payload = json.dumps(structured_status_payload()).encode().replace(b"spec-writer", b"spec-\xff")
+    with pytest.raises(FactoryContractError, match="UTF-8"):
+        parse_factory_status(payload)
+
+
+@pytest.mark.parametrize("payload", [b"\xff", "\ud800"])
+def test_status_rejects_invalid_wire_utf8(payload: bytes | str) -> None:
+    with pytest.raises(FactoryContractError, match="UTF-8"):
+        parse_factory_status(payload)
+
+
+def test_status_preserves_payload_nesting_bound() -> None:
+    nested: object = "value"
+    for _ in range(33):
+        nested = {"nested": nested}
+    with pytest.raises(FactoryContractError, match="nesting limit"):
+        parse_factory_status(structured_status_payload() | {"future_metadata": nested})
+
+
+@pytest.mark.parametrize(("field", "member"), [
+    ("steps", "agent"), ("steps", "status"), ("slices", "id"), ("slices", "status"),
+    ("gates", "status"), ("validator", "verdict"), ("next_action", "kind"),
+])
+def test_status_requires_nonnull_row_text(field: str, member: str) -> None:
+    with pytest.raises(FactoryContractError, match=rf"{field}\.{member}"):
+        parse_factory_status(row_payload(field, _STRUCTURED_ROWS[field] | {member: None}))
+
+
+def test_status_contract_preserves_optional_next_and_opaque_terminal_result() -> None:
+    without_next = status_payload(status="needs-human", terminal_result={"reason": "do not route"})
+    without_next.pop("next")
+    status = parse_factory_status(json.dumps(without_next))
+    assert status.is_parked
+    assert not status.is_terminal
+    assert status.next is None
+    assert status.next_present is False
+    assert status.terminal_result == {"reason": "do not route"}
+    with pytest.raises(FactoryContractError, match="next action"):
+        status.require_recovery_next()
+
+
+def test_status_contract_preserves_nullable_fields_and_opaque_terminal_result() -> None:
+    status = parse_factory_status(
+        status_payload(
+            issue_key=None,
+            pr_base=None,
+            lock_session=None,
+            validator=None,
+            terminal_result={"reason": "opaque"},
+        )
+    )
+    assert status.issue_key is None
+    assert status.pr_base is None
+    assert status.lock_session is None
+    assert status.pr_url is None
+    assert status.validator is None
+    assert status.terminal_result == {"reason": "opaque"}
+    assert parse_factory_status(status.to_json()) == status
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param({}, None, id="absent-pre-083"),
+        pytest.param({"park_snapshot": None}, None, id="null"),
+        pytest.param(
+            {"park_snapshot": "/operator/.factory/.parked/1551"},
+            "/operator/.factory/.parked/1551",
+            id="published-path",
+        ),
+    ],
+)
+def test_status_contract_preserves_optional_park_snapshot(
+    payload: dict[str, object], expected: str | None
+) -> None:
+    fixture = status_payload(**payload)
+    if "park_snapshot" not in payload:
+        fixture.pop("park_snapshot")
+    status = parse_factory_status(fixture)
+
+    assert status.park_snapshot == expected
+    assert parse_factory_status(status.to_json()) == status
+
+
+def test_status_parses_recorded_gate_pre_pr_validator_verdict() -> None:
+    payload = json.dumps(
+        {
+            "run_id": "chainlink-1337",
+            "issue_key": "1337",
+            "valid": True,
+            "sandbox_path": "/tmp/feature-factory/chainlink-1337",
+            "status": "running",
+            "mode": "autonomous",
+            "max_retries": 5,
+            "publishing_identity": "mimir-carreira",
+            "branch": "epic/chainlink-1337",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": "fresh",
+            "dead_lock": False,
+            "lock_session": "attempt-9",
+            "gates": {
+                name: {
+                    "status": gate_status,
+                    "at": None,
+                    "artifact": None,
+                    "reviewed_head": None,
+                }
+                for name, gate_status in (
+                    ("story", "approved"),
+                    ("brief", "approved"),
+                    ("pre_pr", "pending"),
+                )
+            },
+            "steps": [
+                {"agent": agent, "status": "completed", "attempts": 1}
+                for agent in ("story", "brief", "slices", "validator")
+            ],
+            "slices": [
+                {
+                    "id": f"slice-{index}", "status": "completed", "attempts": 1,
+                    "extra_attempts": 0, "retry_limit": 5,
+                }
+                for index in range(1, 8)
+            ],
+            "validator": {
+                "verdict": "GO",
+                "report": None,
+                "reviewed_head": None,
+                "loops": 1,
+            },
+            "pr_url": None,
+            "terminal_result": None,
+            "park_snapshot": None,
+            "next": "gate:pre_pr",
+            "next_action": {"kind": "gate", "subject": "pre_pr"},
+        }
+    )
+
+    status = parse_factory_status(payload)
+
+    assert status.validator == {
+        "verdict": "GO", "report": None, "reviewed_head": None, "loops": 1,
+    }
+    assert status.next == "gate:pre_pr"
+    assert len(status.slices or ()) == 7
+    assert parse_factory_status(status.to_json()) == status
+
+
+@pytest.mark.parametrize("verdict", ["GO", "GO-WITH-NITS", "NO-GO"])
+def test_status_accepts_documented_validator_verdicts(verdict: str) -> None:
+    validator = {
+        "verdict": verdict, "report": None, "reviewed_head": None, "loops": 1,
+    }
+    assert parse_factory_status(status_payload(validator=validator)).validator == validator
+
+
+def test_status_accepts_null_validator_before_validation() -> None:
+    assert parse_factory_status(status_payload(validator=None)).validator is None
+
+
+def test_status_rejects_unknown_validator_verdict() -> None:
+    with pytest.raises(FactoryContractError, match="validator"):
+        parse_factory_status(status_payload(validator={
+            "verdict": "APPROVED", "report": None, "reviewed_head": None, "loops": 1,
+        }))
+
+
+@pytest.mark.parametrize("terminal", ["completed", "blocked", "partial"])
+def test_top_level_terminal_statuses(terminal: str) -> None:
+    assert parse_factory_status(status_payload(status=terminal)).is_terminal
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("valid", "true"),
+        ("issue_key", 1551),
+        ("pr_base", 1551),
+        ("steps", [{"status": "running"}]),
+        ("slices", [""]),
+        ("lock", {"status": "fresh"}),
+        ("lock_session", 4),
+        ("pr_url", 4),
+        ("park_snapshot", 4),
+        ("next", " "),
+    ],
+)
+def test_status_rejects_wrong_field_types(field: str, value: object) -> None:
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(status_payload(**{field: value}))
+
+
+@pytest.mark.parametrize("value", ["value", [], True, 1])
+def test_status_rejects_non_object_terminal_result(value: object) -> None:
+    with pytest.raises(FactoryContractError, match="terminal_result must be an object"):
+        parse_factory_status(status_payload(terminal_result=value))
+
+
+@pytest.mark.parametrize("value", [{}, [], True, 1])
+def test_status_rejects_invalid_validator_types(value: object) -> None:
+    with pytest.raises(FactoryContractError, match="validator"):
+        parse_factory_status(status_payload(validator=value))
+
+
+def test_status_accepts_additive_top_level_fields_after_payload_validation() -> None:
+    status = parse_factory_status(
+        status_payload(
+            workflow="/tmp/factory/1551/WORKFLOW.md",
+            future_status_metadata={"generation": 2},
+        )
+    )
+    assert status.run_id == "1551"
+    assert status.status == "running"
+
+    with pytest.raises(FactoryContractError, match="finite JSON"):
+        parse_factory_status(
+            status_payload(future_status_metadata={"value": float("nan")})
+        )
+
+
+@pytest.mark.parametrize("field", ["run_id", "valid", "sandbox_path"])
+def test_status_rejects_missing_guaranteed_fields(field: str) -> None:
+    missing = status_payload()
+    missing.pop(field)
+    with pytest.raises(FactoryContractError, match=f"missing field: {field}"):
+        parse_factory_status(missing)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "issue_key",
+        "status",
+        "mode",
+        "branch",
+        "pr_base",
+        "pr_draft",
+        "lock",
+        "dead_lock",
+        "lock_session",
+        "gates",
+        "steps",
+        "slices",
+        "validator",
+        "pr_url",
+        "terminal_result",
+        "park_snapshot",
+        "next",
+    ],
+)
+def test_status_accepts_each_lifecycle_projection_omitted(field: str) -> None:
+    payload = status_payload()
+    payload.pop(field, None)
+
+    status = parse_factory_status(payload)
+
+    assert getattr(status, field, None) is None
+
+
+def test_status_parses_072_pre_manifest_diagnostic_shape() -> None:
+    status = parse_factory_status(
+        {
+            "run_id": "1551",
+            "valid": False,
+            "sandbox_path": "/tmp/operator",
+            "error": "run.json does not exist",
+        }
+    )
+
+    assert status.valid is False
+    assert status.branch is None
+    assert status.status is None
+
+
+def test_status_rejects_trailing_json_and_nul() -> None:
+    with pytest.raises(FactoryContractError, match="one JSON object"):
+        parse_factory_status(json.dumps(status_payload()) + "\n{}")
+    with pytest.raises(FactoryContractError, match="bounds"):
+        parse_factory_status(json.dumps(status_payload()) + "\x00")
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_status_rejects_nonfinite_json_constants(constant: str) -> None:
+    payload = json.dumps(status_payload()).replace(
+        '"valid": true',
+        f'"valid": {constant}',
+    )
+    with pytest.raises(FactoryContractError, match="one JSON object"):
+        parse_factory_status(payload)
+
+
+def test_status_rejects_nonfinite_mapping_and_cardinality() -> None:
+    with pytest.raises(FactoryContractError, match="finite JSON"):
+        parse_factory_status(status_payload(gates={"value": float("nan")}))
+    with pytest.raises(FactoryContractError, match="cardinality"):
+        parse_factory_status(status_payload(gates={str(index): index for index in range(1001)}))
+    with pytest.raises(FactoryContractError, match="cardinality"):
+        parse_factory_status(status_payload(steps=["step"] * 1001))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xff",
+        b"{}\x00",
+        b"{" + b" " * (1024 * 1024) + b"}",
+    ],
+)
+def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(payload)
+
+
+def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
+    assert FACTORY_VERSION == "0.12.1"
+    with pytest.raises(FactoryContractError, match="absolute"):
+        resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
+
+
+def test_admit_rejects_nonexistent_entrypoint(tmp_path: Path) -> None:
+    with pytest.raises(FactoryContractError, match="does not exist"):
+        FeatureFactoryBackend(entrypoint=str(tmp_path / "factory.js")).admit()
+
+
+@pytest.mark.parametrize(
+    ("package", "expected_name"),
+    [
+        ("feature-factory", "feature-factory"),
+        ("opencode-feature-factory", "opencode-feature-factory"),
+    ],
+)
+def test_admit_rejects_either_package_version_mismatch(
+    tmp_path: Path,
+    package: str,
+    expected_name: str,
+) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    manifest = entrypoint.parents[2] / package / "package.json"
+    manifest.write_text(
+        json.dumps({"name": expected_name, "version": "0.10.11"}),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(tuple(args))
+        raise AssertionError("capability probe must not run for a mismatched installation")
+
+    with pytest.raises(
+        FactoryContractError,
+        match=rf"requires {expected_name}@{re.escape(FACTORY_VERSION)}",
+    ):
+        FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner).admit()
+    assert calls == []
+
+
+def test_capability_probe_matrix_uses_exact_seventeen_nonmutating_commands(
+    tmp_path: Path,
+) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(tuple(args))
+        command = args[2]
+        if command == "__mimir_unknown_command_probe__":
+            diagnostic = f"unknown command {command}"
+        else:
+            diagnostic = f"usage: factory {command}\nmissing required argument for {command}"
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic.encode())
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    assert backend.admit() == entrypoint.resolve()
+    assert len(FACTORY_COMMANDS) == 17
+    assert [call[2:] for call in calls[1:]] == [argv for _, argv in FACTORY_COMMANDS]
+    assert calls[0][2:] == ("__mimir_unknown_command_probe__",)
+
+
+def test_capability_probe_accepts_recorded_072_diagnostics(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    recorded = {
+        "status": "a <run-id> is required",
+        "heartbeat": "a <run-id> is required",
+        "slices-seed": "a <run-id> is required",
+        "terminal": "status must be one of completed | blocked | partial | needs-human",
+        "slice": "status must be one of pending | running | completed | blocked",
+        "gate": "gate must be one of story | brief | pre_pr",
+    }
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        command = args[2]
+        if command == "__mimir_unknown_command_probe__":
+            diagnostic = f"unknown command {command}"
+        else:
+            diagnostic = recorded.get(command, f"usage: factory {command}\nmissing argument")
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic.encode())
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    assert backend.admit() == entrypoint.resolve()
+
+
+def test_capability_probe_isolated_execution_contract(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    observed: list[dict[str, Any]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        observed.append({"args": tuple(args), **kwargs})
+        command = args[2]
+        diagnostic = (
+            f"unknown command {command}"
+            if command == "__mimir_unknown_command_probe__"
+            else f"usage: factory {command}\nmissing required argument"
+        )
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic.encode())
+
+    probe_factory_capabilities(entrypoint, runner=runner)
+    forbidden = {"--version", "--help", "help", "cancel", "factory", "feature-factory"}
+    assert len(observed) == 18
+    for call in observed:
+        assert call["args"][:2] == ("node", str(entrypoint))
+        assert not forbidden.intersection(call["args"][2:])
+        assert call["stdin"] is subprocess.DEVNULL
+        assert call["shell"] is False
+        assert call["start_new_session"] is True
+        assert call["timeout"] == 5
+        assert call["cwd"].name == "repo"
+        assert set(call["env"]) == {
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+        }
+
+
+@pytest.mark.parametrize("mode", ["timeout", "oversize", "invalid_utf8", "mutation"])
+def test_capability_probe_rejects_execution_hazards(tmp_path: Path, mode: str) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired(args, 5)
+        if mode == "mutation":
+            (Path(kwargs["cwd"]) / "mutated").write_text("bad", encoding="utf-8")
+        command = args[2]
+        if command == "__mimir_unknown_command_probe__":
+            diagnostic = f"unknown command {command}".encode()
+        elif mode == "oversize":
+            diagnostic = b"usage: " + command.encode() + b"\n" + b"x" * (64 * 1024)
+        elif mode == "invalid_utf8":
+            diagnostic = f"usage: {command} missing argument".encode() + b"\xff"
+        else:
+            diagnostic = f"usage: {command} missing argument".encode()
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic)
+
+    with pytest.raises(FactoryContractError):
+        probe_factory_capabilities(entrypoint, runner=runner)
+
+
+def test_bounded_runner_stops_oversize_output_during_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = []
+    popen = subprocess.Popen
+
+    def launch(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    try:
+        with pytest.raises(FactoryContractError, match="output exceeds bounds"):
+            _run_bounded(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
+                cwd=tmp_path,
+                env={"PATH": os.environ.get("PATH", "")},
+                # Overflow, not startup speed, is the oracle. The whole-test
+                # pytest-timeout ceiling remains active if execution wedges.
+                timeout=None,
+                output_limit=1024,
+            )
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["zero", "signal", "unknown", "empty", "nul", "unknown_prefix"],
+)
+def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        command = args[2]
+        if command == "__mimir_unknown_command_probe__":
+            return subprocess.CompletedProcess(
+                args, 2, stdout=b"", stderr=f"unknown command {command}".encode()
+            )
+        if mode == "zero":
+            return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if mode == "signal":
+            return subprocess.CompletedProcess(args, -9, stdout=b"", stderr=b"")
+        if mode == "unknown":
+            detail = f"unknown command {command}".encode()
+        elif mode == "empty":
+            detail = b""
+        elif mode == "nul":
+            detail = f"usage: {command}\x00".encode()
+        elif mode == "unknown_prefix":
+            detail = f"unknown command {command}\nusage: {command} missing argument".encode()
+        else:
+            raise AssertionError(mode)
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=detail)
+
+    with pytest.raises(FactoryContractError):
+        probe_factory_capabilities(entrypoint, runner=runner)
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, 5),
+        ("", 5),
+        ("0", 5),
+        ("-1", 5),
+        ("+1", 5),
+        ("1.0", 5),
+        ("1e2", 5),
+        (" 1", 5),
+        ("1 ", 5),
+        ("١", 5),
+        ("９", 5),
+        ("9007199254740992", 5),
+        ("9" * 10_000, 5),
+        ("1", 1),
+        ("42", 42),
+        ("00042", 42),
+        ("0" * 10_000 + "1", 1),
+        ("9007199254740991", 9_007_199_254_740_991),
+    ],
+)
+def test_factory_max_retries_accepts_only_bounded_ascii_decimal(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    expected: int,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
+
+    assert _DEFAULT_FACTORY_MAX_RETRIES == 5
+    assert _MAX_FACTORY_MAX_RETRIES == 9_007_199_254_740_991
+    assert _factory_max_retries() == expected
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(None, 5), ("17", 17)])
+def test_opencode_launch_argv_has_exact_staged_factory_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    expected: int,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+    if configured is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored by the host feature workflow",
+        rules=None,
+        timeout_s=43200,
+        env={
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1551", "title": "epic", "body": "build"}
+            )
+        },
+        transcript_root=tmp_path,
+    )
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        order,
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="epic/1551",
+        test_command="uv run pytest -q",
+    )
+    assert tuple(spec.local_argv or ()) == (
+        "opencode",
+        "run",
+        "--log-level",
+        "DEBUG",
+        "--print-logs",
+        "-m",
+        "openai/gpt-5.6-luna",
+        "--dir",
+        str(tmp_path),
+        "--command",
+        "feature",
+        f" --autonomous --max-retries {expected} chainlink-1551",
+    )
+    payload = (spec.local_argv or ())[-1]
+    assert payload.startswith(" ") and not payload.startswith("  ")
+    assert "--autonomous" in payload.split()
+    assert "--auto" not in payload.split()
+    assert "--base" not in payload.split()
+    assert "--pr-base" not in payload.split()
+    assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
+    assert spec.backend_config["model_diverged"] is False
+    assert spec.backend_config["run_id"] == "chainlink-1551"
+    assert epic_run_id(1551) == "chainlink-1551"
+
+
+def test_factory_launch_rejects_work_item_run_id_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored",
+        rules=None,
+        timeout_s=43200,
+        env={
+            "MIMIR_MODEL_SPEC": "codex-plus:gpt-5.6-luna",
+            "MIMIR_WORK_ITEM_JSON": '{"run_id":"chainlink-1552"}',
+        },
+    )
+
+    with pytest.raises(FactoryContractError, match="work item run_id does not match"):
+        FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+            order,
+            attempt=1,
+            repo_url="https://github.com/owner/repo.git",
+            base_ref="main",
+            branch="feature/chainlink-1551",
+            test_command="uv run pytest -q",
+        )
+
+
+@pytest.mark.parametrize("issue_id", [0, -1, True])
+def test_epic_run_id_rejects_ids_without_a_valid_canonical_shape(issue_id: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        epic_run_id(issue_id)
+
+
+def test_opencode_launch_refuses_unresolvable_model_before_launch(
+    tmp_path: Path,
+) -> None:
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored",
+        rules=None,
+        timeout_s=43200,
+        env={"MIMIR_MODEL_SPEC": ""},
+    )
+
+    with pytest.raises(
+        FactoryContractError,
+        match="^feature_factory_opencode_resolution_failed:config_provider_selection$",
+    ):
+        FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+            order,
+            attempt=1,
+            repo_url="https://github.com/owner/repo.git",
+            base_ref="main",
+            branch="epic/1551",
+            test_command="uv run pytest -q",
+        )
+
+
+def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "operator"
+    sandbox.mkdir()
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append((tuple(args), kwargs))
+        if args[2] == "status":
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps(
+                    status_payload(sandbox_path=str(sandbox), next="implementation")
+                ).encode(),
+                stderr=b"",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    status = backend.resume(
+        "1551",
+        session="session-1",
+        sandbox=sandbox,
+        launcher=entrypoint,
+    )
+    backend.heartbeat(
+        "1551", session="session-1", sandbox=sandbox, launcher=entrypoint
+    )
+    backend.lock(
+        "1551",
+        "steal",
+        session="session-1",
+        sandbox=sandbox,
+        launcher=entrypoint,
+    )
+    backend.lock(
+        "1551", "release", session="session-1", sandbox=sandbox, launcher=entrypoint,
+    )
+    backend.terminal(
+        "1551",
+        "needs-human",
+        reason="budget exhausted; resume to continue",
+        sandbox=sandbox,
+        launcher=entrypoint,
+    )
+    assert status.status == "running"
+    assert [args[2:] for args, _ in calls] == [
+        ("resume", "1551", "--session", "session-1", "--repo", str(sandbox)),
+        ("status", "1551", "--repo", str(sandbox), "--json"),
+        ("heartbeat", "1551", "--session", "session-1", "--repo", str(sandbox)),
+        ("lock", "1551", "steal", "--session", "session-1", "--repo", str(sandbox)),
+        ("lock", "1551", "release", "--session", "session-1", "--repo", str(sandbox)),
+        (
+            "terminal",
+            "1551",
+            "needs-human",
+            "--reason",
+            "budget exhausted; resume to continue",
+            "--repo",
+            str(sandbox),
+        ),
+    ]
+    assert all(args[:2] == ("node", str(entrypoint.resolve())) for args, _ in calls)
+    assert all("cwd" not in kwargs for _, kwargs in calls)
+
+
+def test_synced_base_status_reads_through_controls_and_retained_record(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "operator"
+    sandbox.mkdir()
+    base_syncs = [{
+        "merge_commit": "a" * 40,
+        "previous_head": "b" * 40,
+        "base": "c" * 40,
+        "previous_base": "d" * 40,
+        "reason": "base fix for bootstrap",
+        "at": "2026-10-06T12:00:00Z",
+    }]
+    payload = status_payload(sandbox_path=str(sandbox), base_syncs=base_syncs)
+    seen: list[str] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        seen.append(args[2])
+        return subprocess.CompletedProcess(
+            args, 0,
+            stdout=json.dumps(payload).encode() if args[2] == "status" else b"",
+            stderr=b"",
+        )
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    status = backend.status("1551", sandbox=sandbox, launcher=entrypoint)
+    resumed = backend.resume(
+        "1551", session="session-1", sandbox=sandbox, launcher=entrypoint,
+    )
+    backend.heartbeat("1551", session="session-1", sandbox=sandbox, launcher=entrypoint)
+    backend.lock("1551", "steal", session="session-1", sandbox=sandbox, launcher=entrypoint)
+    assert seen == ["status", "resume", "status", "heartbeat", "lock"]
+    assert resumed == status
+
+    # The retained Worklink envelope is strict, but its cached factory status
+    # passes through the same additive top-level status parser.
+    record = FactoryRunRecord.from_json({
+        "version": 2,
+        "run_id": "1551", "issue_id": 1551, "attempt": 1,
+        "repository": "owner/repo", "base_ref": "main", "branch": "epic/1551",
+        "launcher": str(entrypoint), "sandbox": str(sandbox),
+        "session": "session-1", "handle": None, "status": payload,
+        "observed_at": None, "controller_phase": "parked",
+        "controller_error": None, "transcript": None,
+    })
+    assert record.status == status
+    save_factory_record(tmp_path, record)
+    assert load_factory_record(tmp_path, "1551") == record
+
+
+@pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
+def test_recovery_launch_binds_opencode_to_factory_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambient_model: str
+) -> None:
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", ambient_model)
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    order = WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="resume",
+        rules=None,
+        timeout_s=43200,
+        env={},
+    )
+
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        order,
+        attempt=1,
+        repo_url=str(tmp_path),
+        base_ref="main",
+        branch="feature/chainlink-1551",
+        test_command="pytest -q",
+        session="session-1",
+    )
+
+    argv = tuple(spec.local_argv or ())
+    assert argv[argv.index("--session") + 1] == "session-1"
+
+
+@pytest.mark.parametrize("session", [None, "session-1"])
+@pytest.mark.parametrize("run_id", ["chainlink-1947", "1947"])
+def test_factory_request_bytes_are_the_bare_run_id_after_leading_options(
+    tmp_path: Path, session: str | None, run_id: str,
+) -> None:
+    argv = FeatureFactoryBackend.opencode_argv(
+        tmp_path, run_id, "openai/model", session=session,
+    )
+    # This pins the byte-level adapter boundary; it is NOT an execution of
+    # the external adapter's parser or a proof of resumed-driver context.
+    assert argv[-3:-1] == ("--command", "feature")
+    assert argv[-1] == f" --autonomous --max-retries 5 {run_id}"
+
+
+@pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
+def test_recovery_launch_uses_retained_legacy_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambient_model: str
+) -> None:
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", ambient_model)
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    order = WorkOrder(1551, tmp_path, "resume", None, 43200, env={})
+
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        order,
+        attempt=1,
+        repo_url=str(tmp_path),
+        base_ref="main",
+        branch="epic/1551",
+        test_command="pytest -q",
+        session="session-1",
+        run_id="1551",
+    )
+
+    assert (spec.local_argv or ())[-1] == " --autonomous --max-retries 5 1551"
+
+
+def test_status_before_sandbox_creation_returns_not_ready(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "not-created"
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert not sandbox.exists()
+        assert "cwd" not in kwargs
+        assert args[2:] == ["status", "1551", "--repo", str(sandbox), "--json"]
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=json.dumps(
+                {
+                    "run_id": "1551",
+                    "valid": False,
+                    "sandbox_path": str(sandbox),
+                    "error": "run.json does not exist",
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+    status = FeatureFactoryBackend(
+        entrypoint=str(entrypoint), runner=runner
+    ).status("1551", sandbox=sandbox, launcher=entrypoint)
+
+    assert status.valid is False
+    assert status.sandbox_path == str(sandbox)
+
+
+def test_status_spawn_failure_remains_infrastructure_error(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "not-created"
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError("node executable is unavailable")
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    with pytest.raises(FileNotFoundError, match="node executable is unavailable"):
+        backend.status("1551", sandbox=sandbox, launcher=entrypoint)
+
+
+def test_status_control_rejects_malformed_trailing_and_nonfinite_output(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "operator"
+    sandbox.mkdir()
+
+    for output in (
+        b"not-json",
+        json.dumps(status_payload(sandbox_path=str(sandbox))).encode() + b"{}",
+        json.dumps(status_payload(sandbox_path=str(sandbox))).replace(
+            '"valid": true',
+            '"valid": NaN',
+        ).encode(),
+    ):
+        backend = FeatureFactoryBackend(
+            entrypoint=str(entrypoint),
+            runner=lambda args, _output=output, **kwargs: subprocess.CompletedProcess(
+                args, 0, stdout=_output, stderr=b""
+            ),
+        )
+        with pytest.raises(FactoryContractError):
+            backend.status("1551", sandbox=sandbox, launcher=entrypoint)
+
+
+def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
+    root = Path(__file__).parent.parent
+    consumers = (
+        "plugins/cultivate/mimir_cultivate/worklink/orchestrator.py",
+        "plugins/cultivate/mimir_cultivate/worklink/autonomy.py",
+        "plugins/cultivate/mimir_cultivate/worklink/continuation.py",
+        "plugins/cultivate/mimir_cultivate/worklink/control.py",
+        "plugins/cultivate/mimir_cultivate/worklink/run_state.py",
+        "plugins/cultivate/mimir_cultivate/worklink/factory_state.py",
+        "plugins/cultivate/mimir_cultivate/worklink/checkout.py",
+        "plugins/cultivate/mimir_cultivate/worklink/backends/feature_factory.py",
+        "plugins/cultivate/mimir_cultivate/commands.py",
+        "plugins/cultivate/mimir_cultivate/server.py",
+        "mimir/web_ui.py",
+        "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py",
+    )
+    forbidden = (
+        '".opencode" / "factory"',
+        "run.json",
+        "FactoryRunMetadata",
+        "primary_factory",
+        "has_concurrent_factory_session",
+    )
+    assert len(consumers) == 12
+    for relative in consumers:
+        source = (root / relative).read_text(encoding="utf-8")
+        assert all(token not in source for token in forbidden), relative
+
+
+def test_control_environment_forwards_the_factory_publishing_identity(monkeypatch) -> None:
+    """Factory CONTROL commands (status/resume/heartbeat/lock) receive the variable.
+
+    This is the ``_control`` path only. The launch that publishes builds its
+    environment from ``WorkSpec.env`` instead -- see
+    ``test_launch_child_environment_carries_the_publishing_identity``.
+
+    feature-factory 0.8.0+ reads the declared identity from the inherited
+    `FACTORY_PUBLISHING_IDENTITY` value and checks it against `gh api /user`.
+    The mimir repository publishes from two accounts -- a
+    maintainer's checkout as ``jasoncarreira``, mimirbot as ``mimir-carreira`` --
+    so the deployment, not the tracked file, has to select it.
+
+    Without the allowlist entry the deployment exports the variable and the driver
+    never sees it. The symptom is a Gate 1 park naming the FILE's identity, which
+    reads as a misconfiguration rather than a stripped variable -- so assert the
+    forwarding rather than trusting that exporting it is enough.
+    """
+    from mimir_cultivate.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    assert _control_environment().get("FACTORY_PUBLISHING_IDENTITY") == "mimir-carreira"
+
+
+def test_control_environment_still_drops_unlisted_variables(monkeypatch) -> None:
+    """The allowlist stays an allowlist -- adding one name must not open it up."""
+    from mimir_cultivate.worklink.backends.feature_factory import _control_environment
+
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
+    monkeypatch.setenv("SOME_UNRELATED_SECRET", "must-not-leak")
+    env = _control_environment()
+    assert "SOME_UNRELATED_SECRET" not in env
+    assert "FACTORY_PUBLISHING_IDENTITY" in env
+
+
+class _FakeLaunchProcess:
+    """Minimal asyncio process stand-in for capturing a launch environment."""
+
+    def __init__(self) -> None:
+        self.returncode = 0
+        self.killed = False
+        self.stdout = None
+        self.stderr = None
+
+    async def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _own_opencode_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the inputs ``work_spec`` resolves the opencode invocation from.
+
+    Without this the model/auth resolution reads whatever the developer's machine
+    happens to have. A real ``~/.local/share/opencode/auth.json`` makes these tests
+    pass locally and fail everywhere else with
+    ``feature_factory_opencode_resolution_failed`` -- which is exactly what happened.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+
+
+def _factory_order(tmp_path: Path, identity: str) -> WorkOrder:
+    return WorkOrder(
+        issue_id=1551,
+        checkout=tmp_path,
+        prompt="ignored by the host feature workflow",
+        rules=None,
+        timeout_s=43200,
+        env={
+            "MIMIR_WORK_ITEM_JSON": json.dumps(
+                {"run_id": "chainlink-1551", "title": "epic", "body": "build"}
+            ),
+            FACTORY_PUBLISHING_IDENTITY_ENV: identity,
+        },
+        transcript_root=tmp_path,
+    )
+
+
+def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch spec, not just the control env, must carry the identity.
+
+    The factory child publishes at Gate 1 and compares its declared identity against
+    ``gh api /user``. It is launched from ``WorkSpec.env``; ``_control_environment``
+    only serves ``status``/``resume``/``heartbeat``/``lock``, so asserting there
+    exercises the wrong process boundary.
+    """
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        _factory_order(tmp_path, "mimir-carreira"),
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="epic/1551",
+        test_command="uv run pytest -q",
+    )
+
+    assert spec.env[FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+
+
+@pytest.mark.asyncio
+async def test_launch_child_environment_carries_the_publishing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End of the chain: the value reaches the actual child process environment.
+
+    ``_local_child_env()`` is an allowlist that admits neither ``FACTORY_`` nor the
+    exact name, so this passes only because ``WorkSpec.env`` is merged over it. Stub
+    the allowlist to empty so the assertion cannot be satisfied by inheritance.
+    """
+    _own_opencode_resolution(tmp_path, monkeypatch)
+    from types import SimpleNamespace
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+
+    captured: dict[str, dict[str, str]] = {}
+
+    async def fake_exec(args, capability, env, projections, **kwargs):
+        captured["env"] = env
+        capability._contained_started(SimpleNamespace(pid=None))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.execute_contained", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        _factory_order(tmp_path, "mimir-carreira"),
+        attempt=1,
+        repo_url="https://github.com/owner/repo.git",
+        base_ref="main",
+        branch="epic/1551",
+        test_command="uv run pytest -q",
+    )
+    # The contained executor is mocked; production accounts are not a test input.
+    compute = LocalSubprocessComputeBackend(_worker_client=object())
+    handle = await compute.launch(spec)
+    try:
+        await compute.wait(handle, 30)
+        assert captured["env"][FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+    finally:
+        await compute.cleanup(handle)
+
+
+@pytest.mark.parametrize(
+    ("configured", "reason_fragment"),
+    [
+        ("eight", "not an ASCII decimal integer"),
+        ("8 ", "not an ASCII decimal integer"),
+        ("0", "zero"),
+        ("9007199254740992", "above the maximum"),
+    ],
+)
+def test_unusable_factory_retry_budget_warns_instead_of_degrading_silently(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    configured: str,
+    reason_fragment: str,
+) -> None:
+    """A budget the operator SET but this cannot use must not fall back quietly.
+
+    The value is frozen into run state at ``factory init``, so a silent fallback
+    is not discoverable until a slice exhausts the wrong budget — by which point
+    the run cannot be corrected. This cost a container recreate, a sandbox
+    deletion and four build attempts on chainlink #1762 before anyone noticed,
+    because every check short of the live launch argv reported the intended value.
+    """
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.backends.feature_factory"):
+        assert _factory_max_retries() == _DEFAULT_FACTORY_MAX_RETRIES
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("MIMIR_FACTORY_MAX_RETRIES" in m for m in messages), caplog.text
+    assert any(reason_fragment in m for m in messages), caplog.text
+
+
+def test_absent_factory_retry_budget_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unset is the ordinary case and must stay quiet.
+
+    This is the discriminating half: a warning that fires on every resolution
+    would satisfy the test above while telling an operator nothing.
+    """
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.backends.feature_factory"):
+        assert _factory_max_retries() == _DEFAULT_FACTORY_MAX_RETRIES
+    assert not caplog.records, caplog.text
+
+
+def test_usable_factory_retry_budget_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", "8")
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.backends.feature_factory"):
+        assert _factory_max_retries() == 8
+    assert not caplog.records, caplog.text
+
+
+@pytest.mark.parametrize(
+    ("detail", "contended"),
+    [
+        ("timed out waiting for run.json lock at /w/.factory/chainlink-7/run-json.lock", True),
+        ("factory control exited 1", False),
+        ("run.json is malformed", False),
+    ],
+)
+@pytest.mark.parametrize("command", ["status", "heartbeat"])
+def test_control_classifies_only_the_run_lock_timeout_as_contention(
+    monkeypatch, tmp_path: Path, detail: str, contended: bool, command: str,
+) -> None:
+    """status and heartbeat wait 1s on a lock a live driver holds for whole transitions."""
+    from mimir_cultivate.worklink.backends.feature_factory import (
+        FactoryContractError,
+        FactoryRunLockContended,
+    )
+
+    def refused(self, launcher, args, *, sandbox):
+        assert args[0] == command
+        raise FactoryContractError(detail)
+
+    monkeypatch.setattr(FeatureFactoryBackend, "_control", refused)
+    backend = FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js")
+    with pytest.raises(FactoryContractError) as raised:
+        if command == "status":
+            backend.status("chainlink-7", sandbox=tmp_path, launcher="/opt/factory/bin/factory.js")
+        else:
+            backend.heartbeat(
+                "chainlink-7", session="s", sandbox=tmp_path,
+                launcher="/opt/factory/bin/factory.js",
+            )
+    assert isinstance(raised.value, FactoryRunLockContended) is contended
+    assert str(raised.value) == detail

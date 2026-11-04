@@ -1,0 +1,526 @@
+"""Tests for mimir/templates.py — saga session-end synthesis prompt (chainlink #247).
+
+templates.py drives every saga session-end summarization. A regression
+here silently breaks the synthesis prompt — invisible until weeks later
+when SAGA recall starts producing weird results. Per chainlink #247 this
+was the most concerning zero-coverage module; this file pins:
+
+- load_template: default fallback, operator override, unreadable-file fallback
+- _output_preview: empty, short, long (truncation + char-count suffix), whitespace collapse
+- _turn_summary_lines: empty window, single/multi turn, tool-call counting
+  (typed events vs untyped-fallback), cost formatting, atom citation
+- _atom_feedback_lines: empty, single atom, multi-turn citation, insertion order
+- _session_has_atoms: zero-atom (storage-only) vs cited
+- render_saga_session_end: lean-vs-full selection, placeholder completeness,
+  operator override for both variants
+"""
+from __future__ import annotations
+
+from pathlib import Path
+import re
+
+import pytest
+
+from mimir import access_control
+from mimir.templates import (
+    SAGA_SESSION_END_DEFAULT,
+    SAGA_SESSION_END_LEAN_DEFAULT,
+    _atom_feedback_lines,
+    _output_preview,
+    _session_has_atoms,
+    _turn_summary_lines,
+    load_template,
+    render_saga_session_end,
+)
+
+
+# ─── load_template ──────────────────────────────────────────────────
+
+
+class TestLoadTemplate:
+    def test_none_prompts_dir_returns_default(self) -> None:
+        assert load_template("foo", "DEFAULT", None) == "DEFAULT"
+
+    def test_missing_file_returns_default(self, tmp_path: Path) -> None:
+        assert load_template("foo", "DEFAULT", tmp_path) == "DEFAULT"
+
+    def test_present_file_overrides_default(self, tmp_path: Path) -> None:
+        (tmp_path / "foo.md").write_text("OPERATOR OVERRIDE", encoding="utf-8")
+        assert load_template("foo", "DEFAULT", tmp_path) == "OPERATOR OVERRIDE"
+
+    def test_unreadable_file_falls_back_to_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A read error (e.g. permission denied) logs + falls back rather
+        than crashing the synthesis turn."""
+        target = tmp_path / "foo.md"
+        target.write_text("X", encoding="utf-8")
+
+        def _boom(*_a, **_kw):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "read_text", _boom)
+        assert load_template("foo", "DEFAULT", tmp_path) == "DEFAULT"
+
+
+# ─── _output_preview ────────────────────────────────────────────────
+
+
+class TestOutputPreview:
+    def test_empty_returns_placeholder(self) -> None:
+        assert _output_preview("") == "(empty)"
+
+    def test_short_unchanged(self) -> None:
+        assert _output_preview("hello world") == "hello world"
+
+    def test_whitespace_collapsed_to_single_line(self) -> None:
+        assert _output_preview("a\n\nb   c\td") == "a b c d"
+
+    def test_long_truncated_with_char_count(self) -> None:
+        # The "(N chars total)" suffix reports len(output) — the ORIGINAL
+        # length — not len(flat) after whitespace collapse. This input has
+        # no whitespace so the two coincide; see
+        # test_long_count_is_original_not_collapsed_length for the case
+        # where they differ.
+        text = "x" * 500
+        result = _output_preview(text)
+        assert result.startswith("x" * 200)
+        assert "(500 chars total)" in result
+        assert "…" in result
+
+    def test_long_count_is_original_not_collapsed_length(self) -> None:
+        """The char-count suffix reports the original output length, not the
+        whitespace-collapsed preview length — so an agent reading the
+        preview knows the true size of what mimir_get_turn would return."""
+        # 300 "x" + 300 spaces = 600 original chars; collapse drops the
+        # run of spaces, but the suffix must still say 600.
+        text = ("x" * 300) + (" " * 300)
+        result = _output_preview(text)
+        assert "(600 chars total)" in result
+
+    def test_exactly_at_cap_not_truncated(self) -> None:
+        text = "y" * 200
+        result = _output_preview(text)
+        assert result == text
+        assert "chars total" not in result
+
+
+# ─── _turn_summary_lines ────────────────────────────────────────────
+
+
+class TestTurnSummaryLines:
+    def test_empty_window(self) -> None:
+        assert _turn_summary_lines([]) == "(no turns recorded for this session)"
+
+    def test_single_turn_shape(self) -> None:
+        turns = [{
+            "turn_id": "abc123",
+            "trigger": "user_message",
+            "total_cost_usd": 0.0123,
+            "events": [{"type": "tool_call", "name": "Read"}],
+            "saga_atom_ids": ["atom-1"],
+            "output": "did a thing",
+        }]
+        out = _turn_summary_lines(turns)
+        assert "turn abc123" in out
+        assert "user_message" in out
+        assert "$0.012" in out
+        assert "1 tool calls" in out
+        assert "atoms: atom-1" in out
+        assert "output: did a thing" in out
+
+    def test_unknown_cost_renders_question_mark(self) -> None:
+        turns = [{"turn_id": "t", "trigger": "x", "events": [], "output": ""}]
+        out = _turn_summary_lines(turns)
+        assert "$?" in out
+
+    def test_zero_cost_renders_dollar_zero_not_question_mark(self) -> None:
+        """0.0 is falsy but a real cost — the source uses
+        ``isinstance(cost, (int, float))`` rather than a truthy check, so a
+        genuinely-free turn must render ``$0.000``, not ``$?``. Pins the
+        not-falsy-check (the footgun the isinstance guard avoids)."""
+        turns = [{
+            "turn_id": "t", "trigger": "x", "total_cost_usd": 0.0,
+            "events": [], "output": "o",
+        }]
+        out = _turn_summary_lines(turns)
+        assert "$0.000" in out
+        assert "$?" not in out
+
+    def test_no_atoms_renders_none(self) -> None:
+        turns = [{"turn_id": "t", "trigger": "x", "events": [], "output": "o"}]
+        out = _turn_summary_lines(turns)
+        assert "atoms: (none)" in out
+
+    def test_tool_call_count_uses_typed_events(self) -> None:
+        turns = [{
+            "turn_id": "t", "trigger": "x",
+            "events": [
+                {"type": "tool_call", "name": "Read"},
+                {"type": "tool_call", "name": "Write"},
+                {"type": "text", "content": "..."},  # not a tool call
+            ],
+            "output": "o",
+        }]
+        out = _turn_summary_lines(turns)
+        assert "2 tool calls" in out
+
+    def test_tool_call_count_fallback_for_untyped_events(self) -> None:
+        """Older fixtures whose events have no `type` key fall back to the
+        raw event count — pins the back-compat branch."""
+        turns = [{
+            "turn_id": "t", "trigger": "x",
+            "events": [{"foo": 1}, {"bar": 2}, {"baz": 3}],
+            "output": "o",
+        }]
+        out = _turn_summary_lines(turns)
+        assert "3 tool calls" in out
+
+    def test_multi_turn_one_line_each(self) -> None:
+        turns = [
+            {"turn_id": "t1", "trigger": "a", "events": [], "output": "o1"},
+            {"turn_id": "t2", "trigger": "b", "events": [], "output": "o2"},
+        ]
+        out = _turn_summary_lines(turns)
+        assert "turn t1" in out
+        assert "turn t2" in out
+
+    def test_injected_inputs_surfaced(self) -> None:
+        """chainlink #376: mid-turn folded messages appear in the
+        synthesis-visible summary so session-end synthesis sees them. Entries
+        are {t_ms, text} (PR 4)."""
+        turns = [{
+            "turn_id": "t", "trigger": "user_message",
+            "events": [], "output": "ok",
+            "injected_inputs": [
+                {"t_ms": 1200, "text": "[mid-turn message from alice]\nalso check staging"},
+                {"t_ms": 3400, "text": "[mid-turn message from alice]\nand prod"},
+            ],
+        }]
+        out = _turn_summary_lines(turns)
+        assert "injected mid-turn (2)" in out
+        assert "also check staging" in out
+        assert "and prod" in out
+
+    def test_injected_inputs_tolerates_legacy_strings(self) -> None:
+        """PR-3-era records stored bare strings; the summary must still render."""
+        turns = [{
+            "turn_id": "t", "trigger": "user_message", "events": [], "output": "o",
+            "injected_inputs": ["a bare legacy string"],
+        }]
+        out = _turn_summary_lines(turns)
+        assert "injected mid-turn (1)" in out
+        assert "a bare legacy string" in out
+
+    def test_no_injected_line_when_absent(self) -> None:
+        turns = [{"turn_id": "t", "trigger": "x", "events": [], "output": "o"}]
+        out = _turn_summary_lines(turns)
+        assert "injected mid-turn" not in out
+
+
+# ─── _atom_feedback_lines ───────────────────────────────────────────
+
+
+class TestAtomFeedbackLines:
+    def test_empty_window(self) -> None:
+        assert _atom_feedback_lines([]) == "(no atoms cited in this session)"
+
+    def test_no_atoms_cited(self) -> None:
+        turns = [{"turn_id": "t", "saga_atom_ids": []}]
+        assert _atom_feedback_lines(turns) == "(no atoms cited in this session)"
+
+    def test_single_atom_single_turn(self) -> None:
+        turns = [{"turn_id": "t1", "saga_atom_ids": ["atom-A"]}]
+        out = _atom_feedback_lines(turns)
+        assert "atom-A: cited in turn(s) t1" in out
+
+    def test_atom_cited_in_multiple_turns(self) -> None:
+        turns = [
+            {"turn_id": "t1", "saga_atom_ids": ["atom-A"]},
+            {"turn_id": "t2", "saga_atom_ids": ["atom-A"]},
+        ]
+        out = _atom_feedback_lines(turns)
+        assert "atom-A: cited in turn(s) t1, t2" in out
+
+    def test_insertion_order_preserved(self) -> None:
+        """Stable order across re-renders: atoms appear in first-citing-turn
+        order, not sorted."""
+        turns = [
+            {"turn_id": "t1", "saga_atom_ids": ["zzz", "aaa"]},
+            {"turn_id": "t2", "saga_atom_ids": ["mmm"]},
+        ]
+        out = _atom_feedback_lines(turns)
+        lines = out.split("\n")
+        assert lines[0].startswith("- zzz")
+        assert lines[1].startswith("- aaa")
+        assert lines[2].startswith("- mmm")
+
+
+# ─── _session_has_atoms ─────────────────────────────────────────────
+
+
+class TestSessionHasAtoms:
+    def test_empty_window_false(self) -> None:
+        assert _session_has_atoms([]) is False
+
+    def test_storage_only_session_false(self) -> None:
+        """A turn that stored atoms but cited none registers as zero —
+        lean path fires (chainlink #7 semantics)."""
+        turns = [{"turn_id": "t", "saga_atom_ids": []}]
+        assert _session_has_atoms(turns) is False
+
+    def test_cited_atoms_true(self) -> None:
+        turns = [
+            {"turn_id": "t1", "saga_atom_ids": []},
+            {"turn_id": "t2", "saga_atom_ids": ["atom-X"]},
+        ]
+        assert _session_has_atoms(turns) is True
+
+
+# ─── render_saga_session_end ────────────────────────────────────────
+
+
+class TestRenderSagaSessionEnd:
+    def _turns_with_atoms(self) -> list[dict]:
+        return [{
+            "turn_id": "t1", "trigger": "user_message",
+            "total_cost_usd": 0.05,
+            "events": [{"type": "tool_call", "name": "saga_query"}],
+            "saga_atom_ids": ["atom-1"],
+            "output": "answered",
+        }]
+
+    def _turns_no_atoms(self) -> list[dict]:
+        return [{
+            "turn_id": "t1", "trigger": "scheduled_tick",
+            "events": [], "saga_atom_ids": [], "output": "tick",
+        }]
+
+    def test_full_variant_when_atoms_cited(self) -> None:
+        out = render_saga_session_end(
+            channel_id="chan-1",
+            saga_session_id="saga-1",
+            idle_minutes=10,
+            turns_window=self._turns_with_atoms(),
+            prompts_dir=None,
+        )
+        # Full template carries the atoms-cited block.
+        assert "chan-1" in out
+        assert "saga-1" in out
+        assert "10" in out
+        assert "atom-1" in out
+        # No unrendered placeholders.
+        assert "{channel_id}" not in out
+        assert "{atom_feedback_block}" not in out
+        assert "{turn_summary_block}" not in out
+
+    def test_lean_variant_when_no_atoms(self) -> None:
+        out = render_saga_session_end(
+            channel_id="chan-2",
+            saga_session_id="saga-2",
+            idle_minutes=5,
+            turns_window=self._turns_no_atoms(),
+            prompts_dir=None,
+        )
+        assert "chan-2" in out
+        assert "saga-2" in out
+        # Lean template has no atom_feedback_block slot — and it must not
+        # leak an unrendered placeholder.
+        assert "{atom_feedback_block}" not in out
+        assert "{turn_summary_block}" not in out
+
+    def test_operator_override_full_variant(self, tmp_path: Path) -> None:
+        (tmp_path / "saga_session_end.md").write_text(
+            "OVERRIDE chan={channel_id} atoms={atom_feedback_block}",
+            encoding="utf-8",
+        )
+        out = render_saga_session_end(
+            channel_id="c", saga_session_id="s", idle_minutes=1,
+            turns_window=self._turns_with_atoms(),
+            prompts_dir=tmp_path,
+        )
+        assert out.startswith("OVERRIDE chan=c atoms=")
+        assert "atom-1" in out
+
+    def test_operator_override_lean_variant(self, tmp_path: Path) -> None:
+        (tmp_path / "saga_session_end_lean.md").write_text(
+            "LEAN OVERRIDE chan={channel_id} turns={turn_summary_block}",
+            encoding="utf-8",
+        )
+        out = render_saga_session_end(
+            channel_id="c", saga_session_id="s", idle_minutes=1,
+            turns_window=self._turns_no_atoms(),
+            prompts_dir=tmp_path,
+        )
+        assert out.startswith("LEAN OVERRIDE chan=c turns=")
+
+    def test_default_templates_have_matching_placeholders(self) -> None:
+        """Guard: the bundled defaults must only reference placeholders
+        render_saga_session_end supplies. A typo'd ``{atom_feedback_block}``
+        in the lean default (which gets no such kwarg) would KeyError every
+        no-atom session — exactly the silent-breakage class this chainlink
+        was filed for."""
+        # Full default may use atom_feedback_block; lean must NOT.
+        assert "{atom_feedback_block}" in SAGA_SESSION_END_DEFAULT
+        assert "{atom_feedback_block}" not in SAGA_SESSION_END_LEAN_DEFAULT
+        # Both share these.
+        for tmpl in (SAGA_SESSION_END_DEFAULT, SAGA_SESSION_END_LEAN_DEFAULT):
+            assert "{channel_id}" in tmpl
+            assert "{saga_session_id}" in tmpl
+            assert "{idle_minutes}" in tmpl
+            assert "{available_tools}" in tmpl
+            assert "{turn_summary_block}" in tmpl
+
+    def test_default_templates_include_session_summary_confabulation_guardrails(self) -> None:
+        """chainlink #730: synthesis summaries feed future prompts, so the
+        default prompt must explicitly guard against laundering invented rule
+        names or stale artifact-status claims into later turns."""
+        for tmpl in (SAGA_SESSION_END_DEFAULT, SAGA_SESSION_END_LEAN_DEFAULT):
+            assert "anti-confabulation" in tmpl
+            assert "formal rule / pattern / heuristic names" in tmpl
+            assert "durable source" in tmpl
+            assert "artifact-status claims" in tmpl
+            assert "canonical source" in tmpl
+            assert "[verify before quoting]" in tmpl
+            assert "`closed_since` is only for refs you confirmed resolved" in tmpl
+
+    def test_rendered_synthesis_only_requests_available_tools_and_new_files(self) -> None:
+        for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
+            prompt = render_saga_session_end(
+                channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
+                turns_window=turns, prompts_dir=None,
+            )
+            allowed = access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"]
+            tool_names = set(access_control._TOOL_FLOW_MAP) | set(
+                access_control.TRIGGER_CAPABILITY_TIERS
+            )
+            named_tools = set(re.findall(
+                r"\b(?:" + "|".join(map(re.escape, sorted(tool_names, key=len, reverse=True))) + r")\b",
+                prompt,
+            ))
+            assert named_tools == allowed
+            listed_tools = re.search(
+                r"Available tools for this session-boundary turn \(from its capability set\):\n"
+                r"((?:- `[^`]+`\n)+)", prompt,
+            )
+            assert listed_tools is not None
+            assert re.findall(r"^- `([^`]+)`$", listed_tools[1], re.MULTILINE) == sorted(allowed)
+            assert "File reads, directory listings, memory search, todo tools, and commitment" in prompt
+            assert "tools are not available in this turn" in prompt
+            assert "create new files" in prompt
+            assert "cannot overwrite existing files" in prompt
+            assert "memory/learnings-inbox/<YYYY-MM-DD>-<turn_id>-<n>.md" in prompt
+            assert "learnings-pending/" not in prompt
+            assert "learnings-pending.md" not in prompt
+            assert not re.search(r"\b(?:edit|append|overwrite) (?:files?|it|to)\b", prompt)
+
+    def test_rendered_defaults_verify_only_known_ids_and_defer_file_checks(self) -> None:
+        for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
+            prompt = render_saga_session_end(
+                channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
+                turns_window=turns, prompts_dir=None,
+            )
+            guidance = prompt.split("Before calling `saga_end_session`", 1)[1].split(
+                "Synthesize and call:", 1,
+            )[0]
+            assert "`memory_get` or `mimir_get_turn`" in guidance
+            assert "already present in this session context" in guidance
+            assert "[verify before quoting]" in guidance
+            assert not any(path in guidance for path in (
+                "memory/core/", "memory/issues/", "state/wiki/",
+            ))
+            assert not re.search(
+                r"\b(?:read|list|search|verify)\s+`(?:memory/core/|memory/issues/|state/wiki/)",
+                prompt, re.I,
+            )
+            assert not re.search(
+                r"\b(?:read_file|file_search|memory_query|write_todos|commitment_\w+)\b",
+                prompt,
+            )
+
+    def test_rendered_tool_list_follows_registered_capabilities(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.plugins.core import register_core_tools
+        from mimir.plugins.registry import PolicyRegistry
+        from mimir.tool_descriptors import ResultOriginKind
+
+        registry = PolicyRegistry()
+        register_core_tools(registry)
+        registrar = registry.registrar("template-test")
+        registrar.register_capability("new_boundary_tool")
+        registrar.register_tool(
+            name="new_boundary_tool", policy_only=True, flow="neither",
+            tier="scope-contained", operation_class="open",
+            result_domain="template-test", result_origin=ResultOriginKind.NONE,
+            sink_category=None, sink_destination=None,
+            sink_target_extractor=None, sink_payload_extractor=None,
+            writes_code_or_state=False, profiles=(), read_backend=False,
+        )
+        registrar.add_to_profile("session-boundary", "new_boundary_tool")
+        registered = registry.freeze().authority_profiles["session-boundary"]
+        monkeypatch.setattr(access_control, "TRIGGER_AUTHORITY_PROFILES", registry.authority_profiles)
+        assert "new_boundary_tool" in registered
+        with pytest.raises(TypeError):
+            access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"] = (
+                registered | {"unregistered_tool"}
+            )
+        for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
+            prompt = render_saga_session_end(
+                channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
+                turns_window=turns, prompts_dir=None,
+            )
+            assert "- `new_boundary_tool`\n" in prompt
+            assert all(f"- `{tool}`\n" in prompt for tool in registered)
+
+
+# ─── chainlink #388: malformed operator template must not crash synthesis ──
+
+
+def test_render_saga_session_end_survives_malformed_operator_template(tmp_path):
+    """chainlink #388: an operator override with a stray brace (e.g. a pasted
+    JSON example) makes str.format raise; render must fall back to the bundled
+    default instead of crashing the session-end turn."""
+    from mimir.templates import render_saga_session_end
+
+    turns = [{
+        "turn_id": "t1", "trigger": "user_message", "events": [],
+        "output": "did a thing", "saga_atom_ids": ["a" * 16],  # full-template path
+    }]
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    # Stray { } an operator might paste — raises KeyError/ValueError in .format.
+    (prompts_dir / "saga_session_end.md").write_text(
+        'Summarize. Example payload: {"key": "value"} and also {bogus_field}.\n'
+        "channel={channel_id} session={saga_session_id} idle={idle_minutes}"
+    )
+
+    # Must not raise.
+    out = render_saga_session_end(
+        channel_id="c1", saga_session_id="s1", idle_minutes=10,
+        turns_window=turns, prompts_dir=prompts_dir,
+    )
+    # Fell back to the bundled default (renders the real values), and did NOT
+    # use the malformed override.
+    assert "c1" in out and "s1" in out
+    assert "bogus_field" not in out
+
+
+def test_render_saga_session_end_uses_valid_operator_template(tmp_path):
+    """Sanity: a well-formed operator override is still honored (the #388 guard
+    only kicks in on a format error)."""
+    from mimir.templates import render_saga_session_end
+
+    turns = [{"turn_id": "t1", "trigger": "user_message", "events": [],
+              "output": "x", "saga_atom_ids": ["a" * 16]}]
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "saga_session_end.md").write_text(
+        "OPERATOR-OVERRIDE channel={channel_id} session={saga_session_id} "
+        "idle={idle_minutes}\n{turn_summary_block}\n{atom_feedback_block}"
+    )
+    out = render_saga_session_end(
+        channel_id="c1", saga_session_id="s1", idle_minutes=10,
+        turns_window=turns, prompts_dir=prompts_dir,
+    )
+    assert "OPERATOR-OVERRIDE" in out and "c1" in out

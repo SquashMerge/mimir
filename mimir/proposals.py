@@ -1,0 +1,1668 @@
+"""Open & finalize change proposals for protected files as PRs (chainlink #337/#339/#344).
+
+The agent cannot write live ``memory/core/*`` or ``prompts/*`` (the write
+guard blocks core memory at runtime; prompts aren't a writable dir). To change
+either, it opens a *proposal*: a throwaway ``git worktree`` of the home repo,
+checked out under the gitignored ``scratch/`` workspace, where it edits those
+files with its normal file tools — add, edit, delete, move, any number of
+files across both surfaces. Submitting commits the changes (secret-scanned,
+credential-redacted), pushes the branch, and opens one PR. The operator
+reviews the diff and merges; live files update only after the merge (the
+per-turn ``git pull --rebase`` apply path, #340). **Merge is the approval.**
+
+The proposable surfaces are :data:`PROPOSAL_SURFACES` (``memory/core`` and
+``prompts``) — both git-tracked in the home repo, both protected from live
+agent writes.
+
+Why ``scratch/``: it's already a writable root AND gitignored (config.py,
+chainlink #299) — so the agent's Read/Edit/Write reach the worktree, the core
+write-guard doesn't fire (the path isn't ``home/memory/core``), and
+``git_tracking``'s per-turn ``git add -A`` skips it. ``scratch/`` is only
+*implicitly* ignored on older homes via the allowlist's ``*``; because ``!*/``
+re-includes directories, a worktree (an embedded repo) there can still be
+grabbed by ``git add -A`` (the chainlink #299 breakage). :func:`open_proposal`
+self-heals that by ensuring ``scratch/`` is explicitly ignored, and refuses if
+it can't be — so the proposal flow never leaves an embedded-repo hazard.
+
+Sync by design; async callers (the agent tools) wrap in ``asyncio.to_thread``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import posixpath
+import re
+import shutil
+import time
+from urllib.parse import urlparse
+import yaml
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Literal, Mapping
+
+# Reuse the hardened helpers rather than reimplement: ``_redact`` is the shared
+# token scrubber (git_tracking imports it too), ``_run`` the uniform 30s-timeout
+# subprocess wrapper. One redactor is the point — core diffs must not leak creds.
+from .event_logger import log_event_sync
+from .git_bootstrap import _redact, _run
+from .outbound_privacy import findings_require_refusal, scan_outbound
+from .social_outbox import load_outbox, validate_outbox
+
+#: Protected surfaces a proposal can change, relative to the home / repo root.
+#: Both are git-tracked and blocked from live agent writes (memory/core via the
+#: runtime read-only gate, prompts by not being a writable dir).
+PROPOSAL_SURFACES: tuple[Path, ...] = (Path("memory") / "core", Path("prompts"))
+#: Where proposal worktrees live — under the gitignored scratch workspace.
+PROPOSALS_REL = Path("scratch") / "proposals"
+
+#: Named proposal lanes. The agent lane is the existing manual/operator-facing
+#: proposal flow; the upgrade lane is reserved for version-triggered default syncs.
+AGENT_PROPOSAL_LANE = "agent"
+UPGRADE_PROPOSAL_LANE = "upgrade"
+POLLER_PROPOSAL_LANE = "poller"
+POLLER_PROPOSAL_SURFACES = (Path("state/wiki"),)
+PROPOSAL_LANES = (AGENT_PROPOSAL_LANE, UPGRADE_PROPOSAL_LANE, POLLER_PROPOSAL_LANE)
+#: Remote branch prefixes owned by the protected-file proposal workflow.
+PROPOSAL_BRANCH_PREFIXES = ("proposal/", "upgrade/")
+REVISION_STATE_REL = Path("state") / "proposal-revisions.json"
+#: Git conflict markers must never be submitted as protected-surface content.
+CONFLICT_MARKER_RE = re.compile(r"^(?:<<<<<<<|=======$|>>>>>>>)", re.MULTILINE)
+
+#: ``(home, branch, base, title, body) -> pr_url | None`` — injectable so tests
+#: exercise the git mechanics without a real GitHub.
+PrOpener = Callable[[Path, str, str, str, str], "str | None"]
+ProposalPrState = Literal["open", "merged", "closed", "no_pr"]
+
+
+class ProposalPrError(RuntimeError):
+    """The proposal branch was pushed, but the pull request was not opened."""
+
+
+@dataclass(frozen=True)
+class PollerProposalScope:
+    """Trusted owner/turn identity plus untrusted model-supplied source attribution."""
+
+    owner: str
+    turn_id: str
+    source: str
+    origin_ref: str
+    surface: str = "wiki"
+    revision_branch: str | None = None
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"poller:[a-z0-9][a-z0-9_-]*", self.owner):
+            raise ValueError("owner must be canonical poller:<name> with a strict slug")
+        for field in ("turn_id", "source", "origin_ref"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"poller {field} must be nonempty")
+        if self.surface not in ("wiki", "social-outbox"):
+            raise ValueError("unsupported poller proposal surface")
+        if self.revision_branch is not None and not re.fullmatch(
+            rf"poller/{self.owner.removeprefix('poller:')}/[a-z0-9_-]+", self.revision_branch
+        ):
+            raise ValueError("revision branch must belong to the exact poller")
+        if self.revision_branch is not None and (
+            (self.revision_branch.endswith("/social-outbox")) != (self.surface == "social-outbox")
+        ):
+            raise ValueError("revision branch surface mismatch")
+
+    @property
+    def surface_root(self) -> Path:
+        return (Path("state/wiki") if self.surface == "wiki" else
+                Path("state/social-outbox") / self.owner.removeprefix("poller:"))
+
+
+def poller_branch_name(poller: PollerProposalScope) -> str:
+    """Deterministic branch keyed by owner and the exact, unsanitized turn ID."""
+    if poller.revision_branch is not None:
+        return poller.revision_branch
+    if poller.surface == "social-outbox":
+        return f"poller/{poller.owner.removeprefix('poller:')}/social-outbox"
+    slug = re.sub(r"[^a-z0-9_-]+", "-", poller.turn_id.lower()).strip("-")[:40] or "turn"
+    digest = hashlib.sha256(poller.turn_id.encode()).hexdigest()[:24]
+    return f"poller/{poller.owner.removeprefix('poller:')}/{slug}-{digest}"
+
+
+def poller_worktree_path(home: Path, poller: PollerProposalScope) -> Path:
+    """Return the exact worktree namespace for this poller turn."""
+    return Path(home).resolve() / PROPOSALS_REL / poller_branch_name(poller)
+
+
+def _validate_poller(lane: str | None, poller: PollerProposalScope | None,
+                     branch: str | None = None) -> None:
+    if lane == POLLER_PROPOSAL_LANE and poller is None:
+        raise ValueError("poller lane requires poller scope")
+    if poller is not None:
+        if lane not in (None, POLLER_PROPOSAL_LANE):
+            raise ValueError("poller scope cannot be used in another lane")
+        if branch is not None and branch != poller_branch_name(poller):
+            raise ValueError("branch does not match exact poller scope")
+
+
+def normalize_lane(lane: str | None) -> str:
+    """Return a supported proposal lane name, raising ``ValueError`` if invalid."""
+    value = (lane or AGENT_PROPOSAL_LANE).strip().lower()
+    if value not in PROPOSAL_LANES:
+        allowed = ", ".join(PROPOSAL_LANES)
+        raise ValueError(f"unsupported proposal lane {lane!r}; expected one of: {allowed}")
+    return value
+
+
+def default_branch_name(
+    label: str = "proposal", *, ts: int | None = None, lane: str = AGENT_PROPOSAL_LANE
+) -> str:
+    """Derive a unique proposal branch for ``lane``.
+
+    Agent-lane branches keep the historical ``proposal/<slug>-<unix-ts>`` shape;
+    upgrade-lane branches use ``upgrade/<slug>-<unix-ts>`` so the lane is visible
+    in GitHub and never collides with manual proposals. ``ts`` is injectable for
+    deterministic tests; production callers leave it None to stamp with the
+    current time.
+    """
+    lane = normalize_lane(lane)
+    _validate_poller(lane, None)
+    prefix = "upgrade" if lane == UPGRADE_PROPOSAL_LANE else "proposal"
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:40].rstrip("-")
+    if slug == "proposal" and lane != AGENT_PROPOSAL_LANE:
+        slug = prefix
+    stamp = ts if ts is not None else int(time.time())
+    return f"{prefix}/{slug or prefix}-{stamp}"
+
+
+@dataclass
+class OpenResult:
+    """Outcome of opening a proposal. On success ``worktree`` is the dir the
+    agent edits (its ``memory/core/`` and ``prompts/`` hold the proposable
+    files)."""
+
+    ok: bool
+    branch: str | None
+    worktree: Path | None
+    #: None on success; else "no_remote" | "exists" | "error".
+    reason: str | None = None
+    detail: str | None = None
+
+
+@dataclass
+class ProposalResult:
+    """Outcome of submitting (finalizing) a proposal."""
+
+    ok: bool
+    branch: str | None
+    pushed: bool
+    pr_url: str | None
+    #: None on full success; else "no_open" | "no_changes" | "secret" |
+    #: "conflict_marker" | "name" | "pr_open" | "error".
+    reason: str | None
+    detail: str | None = None
+    reused_pr: bool = False
+
+
+@dataclass
+class ProposalCleanupRecord:
+    """One proposal-branch cleanup decision.
+
+    ``action`` is ``"deleted"`` when the branch/worktree was removed, otherwise
+    ``"skipped"`` with a reason. The branch tip is recorded for auditability.
+    """
+
+    branch: str
+    tip: str | None
+    action: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProposalRevision:
+    number: int
+    url: str
+    branch: str
+    lane: str
+    review_id: int
+    reviewer: str
+    repo: str
+    surface: str = ""
+    # Older same-head reviews included in this single revision turn.
+    related_review_ids: tuple[int, ...] = ()
+
+
+def _forge_json(home: Path, args: list[str]) -> object | None:
+    """Use the home's origin via gh's cwd; unknown/malformed responses fail closed."""
+    try:
+        result = _run(["gh", *args], cwd=home, capture=True)
+        if result.returncode != 0:
+            return None
+        if "--paginate" not in args:
+            return json.loads(result.stdout)
+        # gh api --paginate prints one JSON array per page, not one array
+        # spanning all pages. Decode each page without losing old reviews.
+        raw = result.stdout or ""
+        decoder = json.JSONDecoder()
+        rows = []
+        while raw.strip():
+            page, length = decoder.raw_decode(raw.lstrip())
+            if not isinstance(page, list):
+                return None
+            rows.extend(page)
+            raw = raw.lstrip()[length:]
+        return rows
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _revision_state(home: Path) -> dict[str, dict[str, object]]:
+    path = home / REVISION_STATE_REL
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and all(isinstance(v, dict) for v in data.values()):
+            return data
+    except (OSError, ValueError):
+        pass
+    raise ValueError("proposal revision state unavailable; refusing to dispatch")
+
+
+def _save_revision_state(home: Path, state: dict[str, dict[str, object]]) -> None:
+    path = home / REVISION_STATE_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _revision_lane(branch: str) -> tuple[str, str] | None:
+    if branch.startswith("proposal/"):
+        return "agent", ""
+    if branch.startswith("upgrade/"):
+        return "upgrade", ""
+    match = re.fullmatch(r"poller/([a-z0-9][a-z0-9_-]*)/([a-z0-9_-]+)", branch)
+    if match:
+        return "poller", "social-outbox" if match[2] == "social-outbox" else "wiki"
+    return None
+
+
+def _collaborator(home: Path, repo: str, login: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+        return False
+    permission = _forge_json(home, ["api", f"repos/{repo}/collaborators/{login}/permission"])
+    return isinstance(permission, dict) and permission.get("permission") in {"admin", "maintain", "write"}
+
+
+def _review_details(
+    home: Path, revision: ProposalRevision, *,
+    on_untrusted: Callable[[int, object], None] | None = None,
+) -> tuple[str, list[str]] | None:
+    """Recheck authorization and current-head status immediately before model ingress."""
+    pr = _forge_json(home, ["pr", "view", str(revision.number), "--json", "state,headRefName,headRefOid,isCrossRepository,files"])
+    if (not isinstance(pr, dict) or pr.get("state") != "OPEN" or
+        pr.get("headRefName") != revision.branch or pr.get("isCrossRepository") is not False):
+        return None
+    # gh pr view reviews does not guarantee the review id. Use the API record.
+    reviews = _forge_json(home, ["api", f"repos/{revision.repo}/pulls/{revision.number}/reviews", "--paginate"])
+    if not isinstance(reviews, list):
+        return None
+    review = next((r for r in reviews if isinstance(r, dict) and r.get("id") == revision.review_id), None)
+    if not isinstance(review, dict) or review.get("state") != "CHANGES_REQUESTED" or review.get("commit_id") != pr.get("headRefOid"):
+        return None
+    if any(isinstance(r, dict) and r.get("state") == "APPROVED"
+           for r in reviews[reviews.index(review) + 1:]):
+        return None
+    login = (review.get("user") or {}).get("login") if isinstance(review.get("user"), dict) else None
+    if login != revision.reviewer or not _collaborator(home, revision.repo, revision.reviewer):
+        return None
+    comments = _forge_json(home, ["api", f"repos/{revision.repo}/pulls/{revision.number}/reviews/{revision.review_id}/comments", "--paginate"])
+    if not isinstance(comments, list) or not isinstance(pr.get("files"), list):
+        return None
+    lines = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            return None
+        author = comment.get("user")
+        commenter = author.get("login") if isinstance(author, dict) else None
+        if not isinstance(commenter, str) or not _collaborator(home, revision.repo, commenter):
+            new = _log_untrusted_review(home, revision.number, comment.get("id"), kind="review_comment")
+            if new and on_untrusted is not None:
+                on_untrusted(revision.number, comment.get("id"))
+            continue
+        lines.append(f"- {comment.get('path')}:{comment.get('line') or comment.get('original_line')}: {comment.get('body') or ''}")
+    files = [f.get("path") for f in pr["files"] if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    if len(files) != len(pr["files"]):
+        return None
+    return (str(review.get("body") or "") + "\n" + "\n".join(lines)), files
+
+
+def _forge_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
+
+
+def _follow_up_comments(
+    home: Path, revision: ProposalRevision, reviews: list[object],
+    own_login: str, swept_at: datetime, *,
+    on_untrusted: Callable[[int, object], None] | None = None,
+) -> str | None:
+    """Collect only collaborator comments in this review group's time window."""
+    def unavailable(reason: str) -> None:
+        # Content-free diagnostics: never log the unusable third-party payload.
+        try:
+            log_event_sync("proposal_revision_feedback_unavailable",
+                           pr_number=revision.number, reason=reason)
+        except Exception:
+            pass
+        return None
+
+    ids = {revision.review_id, *revision.related_review_ids}
+    included = [r for r in reviews if isinstance(r, dict) and r.get("id") in ids]
+    if len(included) != len(ids):
+        return unavailable("missing_grouped_review")
+    submitted = [_forge_timestamp(r.get("submitted_at")) for r in included]
+    if any(stamp is None for stamp in submitted):
+        return unavailable("invalid_review_timestamp")
+    oldest = min(submitted)
+    conversation = _forge_json(home, ["api", f"repos/{revision.repo}/issues/{revision.number}/comments", "--paginate"])
+    inline = _forge_json(home, ["api", f"repos/{revision.repo}/pulls/{revision.number}/comments", "--paginate"])
+    if not isinstance(conversation, list) or not isinstance(inline, list):
+        return unavailable("invalid_comment_page")
+    kept: list[tuple[datetime, int, str]] = []
+    for source, comments in (("conversation", conversation), ("inline", inline)):
+        for comment in comments:
+            if not isinstance(comment, dict):
+                return unavailable("invalid_comment_item")
+            author = comment.get("user")
+            login = author.get("login") if isinstance(author, dict) else None
+            if not isinstance(login, str) or not login or login.casefold() == "ghost":
+                continue
+            if login.casefold() == own_login.casefold():
+                continue
+            stamp = _forge_timestamp(comment.get("created_at"))
+            if stamp is not None and not (oldest <= stamp < swept_at):
+                continue
+            review_id = comment.get("pull_request_review_id") if source == "inline" else None
+            if isinstance(review_id, int) and review_id in ids:
+                continue
+            cid, body = comment.get("id"), comment.get("body")
+            if not _collaborator(home, revision.repo, login):
+                kind = "issue_comment" if source == "conversation" else "review_comment"
+                new = _log_untrusted_review(home, revision.number, cid, kind=kind)
+                if new and on_untrusted is not None:
+                    on_untrusted(revision.number, cid)
+                continue
+            # Only included collaborator comments need a complete renderable shape.
+            if stamp is None:
+                return unavailable("invalid_comment_timestamp")
+            if (not isinstance(cid, int) or isinstance(cid, bool) or
+                not isinstance(body, str) or
+                (review_id is not None and (not isinstance(review_id, int) or isinstance(review_id, bool)))):
+                return unavailable("invalid_comment_shape")
+            location = ""
+            if source == "inline":
+                path = comment.get("path")
+                if not isinstance(path, str) or not path:
+                    return unavailable("invalid_comment_path")
+                if comment.get("subject_type") == "file":
+                    location = f" {path}"
+                else:
+                    line = comment.get("line") or comment.get("original_line")
+                    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+                        return unavailable("invalid_comment_line")
+                    location = f" {path}:{line}"
+            text = body[:4000] + ("\n[truncated]" if len(body) > 4000 else "")
+            kept.append((stamp, cid, f"- {login} at {stamp.isoformat()}{location}: {text}"))
+    kept.sort(key=lambda item: (item[0], item[1]))
+    return ("\n\nFollow-up comments from collaborators (newest last):\n" +
+            "\n".join(item[2] for item in kept[-20:])) if kept else ""
+
+
+def _log_untrusted_review(
+    home: Path, number: int, review_id: object, *,
+    kind: Literal["review", "issue_comment", "review_comment"] = "review",
+) -> bool:
+    if not isinstance(review_id, int) or isinstance(review_id, bool):
+        return False
+    state = _revision_state(home)
+    entry = state.setdefault(str(number), {"reviews": [], "alerted": False})
+    seen = entry.setdefault("untrusted", [])
+    key = f"{kind}:{review_id}"
+    # Legacy bare IDs have ambiguous provenance; do not let them hide a notice
+    # from a different GitHub ID space. New notices deduplicate by kind.
+    if key in seen:
+        return False
+    seen.append(key)
+    _save_revision_state(home, state)
+    try:
+        log_event_sync("proposal_review_untrusted", pr_number=number,
+                       review_id=review_id, feedback_kind=kind)
+    except Exception:
+        pass
+    return True
+
+
+def pending_proposal_revisions(
+    home: Path, *, on_untrusted: Callable[[int, object], None] | None = None,
+) -> list[tuple[ProposalRevision, str, list[str]]]:
+    """Inspect open home PRs; no third-party review text escapes this boundary."""
+    home = Path(home).resolve()
+    swept_at = datetime.now(timezone.utc)
+    repo_data = _forge_json(home, ["repo", "view", "--json", "nameWithOwner"])
+    if not isinstance(repo_data, dict) or not isinstance(repo_data.get("nameWithOwner"), str):
+        return []
+    repo = repo_data["nameWithOwner"]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        return []
+    origin = _git(["remote", "get-url", "origin"], cwd=home)
+    if origin.returncode != 0 or not re.fullmatch(
+        rf"(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:){re.escape(repo)}(?:\.git)?\s*",
+        (origin.stdout or "").strip(), flags=re.IGNORECASE,
+    ):
+        return []
+    self_data = _forge_json(home, ["api", "user"])
+    own_login = self_data.get("login") if isinstance(self_data, dict) else None
+    if not isinstance(own_login, str) or not own_login:
+        return []
+    prs = _forge_json(home, ["pr", "list", "--state", "open", "--limit", "1000", "--json", "number,url,headRefName,headRefOid,isCrossRepository,state"])
+    if not isinstance(prs, list):
+        return []
+    state = _revision_state(home)
+    pending = []
+    for pr in prs:
+        if not isinstance(pr, dict) or pr.get("state") != "OPEN" or pr.get("isCrossRepository") is not False:
+            continue
+        number, branch, url, head = (pr.get(k) for k in ("number", "headRefName", "url", "headRefOid"))
+        if not isinstance(number, int) or isinstance(number, bool) or not isinstance(branch, str) or not isinstance(url, str) or not re.fullmatch(r"[0-9a-f]{40}", str(head)):
+            continue
+        lane = _revision_lane(branch)
+        if lane is None or urlparse(url).netloc != "github.com" or urlparse(url).path != f"/{repo}/pull/{number}":
+            continue
+        reviews = _forge_json(home, ["api", f"repos/{repo}/pulls/{number}/reviews", "--paginate"])
+        if not isinstance(reviews, list):
+            continue
+        record = state.get(str(number), {})
+        done = record.get("reviews", [])
+        handled = record.get("handled_reviews", [])
+        if not isinstance(done, list) or not isinstance(handled, list):
+            continue
+        # Collect same-head feedback into one turn, newest first. Persist all
+        # included IDs only after enqueue, charging a single revision slot.
+        qualifying = []
+        for review in reversed(reviews):
+            if not isinstance(review, dict) or review.get("commit_id") != head:
+                continue
+            if review.get("state") == "APPROVED":
+                break
+            if review.get("state") != "CHANGES_REQUESTED":
+                continue
+            rid = review.get("id")
+            author = review.get("user")
+            login = author.get("login") if isinstance(author, dict) else None
+            if not isinstance(rid, int) or not isinstance(login, str) or login.casefold() == own_login.casefold():
+                continue
+            if not _collaborator(home, repo, login):
+                new = _log_untrusted_review(home, number, rid)
+                if new and on_untrusted is not None:
+                    on_untrusted(number, rid)
+                continue
+            if rid in done or rid in handled:
+                continue
+            revision = ProposalRevision(number, url, branch, lane[0], rid, login, repo, lane[1])
+            details = _review_details(home, revision, on_untrusted=on_untrusted)
+            if details is not None:
+                qualifying.append((revision, *details))
+        if qualifying:
+            from dataclasses import replace
+
+            newest, body, files = qualifying[0]
+            older_ids = tuple(item[0].review_id for item in qualifying[1:])
+            for older, older_body, _ in qualifying[1:]:
+                body += f"\n\nReview #{older.review_id} by {older.reviewer}:\n{older_body}"
+            grouped = replace(newest, related_review_ids=older_ids)
+            follow_up = _follow_up_comments(home, grouped, reviews, own_login, swept_at,
+                                            on_untrusted=on_untrusted)
+            if follow_up is not None:
+                pending.append((grouped, body + follow_up, files))
+    return pending
+
+
+def revision_dispatch_allowed(home: Path, revision: ProposalRevision) -> tuple[bool, bool]:
+    """Return (allowed, newly capped) without exposing review content."""
+    state = _revision_state(home)
+    entry = state.setdefault(str(revision.number), {"reviews": [], "alerted": False})
+    done = entry["reviews"]
+    if revision.review_id in done or revision.review_id in entry.get("handled_reviews", []):
+        return False, False
+    if len(done) >= 3:
+        if not entry.get("alerted"):
+            entry["alerted"] = True
+            _save_revision_state(home, state)
+            try:
+                log_event_sync("proposal_revision_limit", pr_number=revision.number, pr_url=revision.url)
+            except RuntimeError:
+                pass  # CLI/tests may have no initialized logger.
+            return False, True
+        return False, False
+    return True, False
+
+
+def record_revision_dispatch(home: Path, revision: ProposalRevision) -> bool:
+    """Durably claim an accepted event; recheck dedup before writing."""
+    allowed, _ = revision_dispatch_allowed(home, revision)
+    if not allowed:
+        return False
+    state = _revision_state(home)
+    entry = state.setdefault(str(revision.number), {"reviews": [], "alerted": False})
+    done = entry["reviews"]
+    done.append(revision.review_id)
+    handled = entry.setdefault("handled_reviews", [])
+    for rid in (revision.review_id, *revision.related_review_ids):
+        if rid not in handled:
+            handled.append(rid)
+    _save_revision_state(home, state)
+    return True
+
+
+def _git(args: list[str], cwd: Path):
+    return _run(["git", *args], cwd=cwd, capture=True)
+
+
+def _has_origin_remote(home: Path) -> bool:
+    res = _git(["remote", "get-url", "origin"], cwd=home)
+    return res.returncode == 0 and bool((res.stdout or "").strip())
+
+
+def _rolling_pr(home: Path, branch: str) -> tuple[ProposalPrState | None, str | None]:
+    """Ask the forge for the current head; unknown state must never create a PR."""
+    state = _proposal_branch_pr_state(home, branch)
+    if state != "open":
+        return state, None
+    res = _run(
+        ["gh", "pr", "list", "--state", "open", "--head", branch,
+         "--json", "number,state,url", "--limit", "1"],
+        cwd=home, capture=True,
+    )
+    try:
+        prs = json.loads(res.stdout or "[]") if res.returncode == 0 else []
+        if len(prs) == 1 and prs[0].get("state") == "OPEN" and isinstance(prs[0].get("url"), str) and prs[0]["url"]:
+            return "open", prs[0]["url"]
+    except (TypeError, ValueError, KeyError):
+        pass
+    return None, None
+
+
+def _scan_for_secrets(text: str) -> bool:
+    """True if ``text`` contains a token-shaped secret (per the shared
+    ``_redact`` patterns). A deployment-independent fast-fail before push; the
+    pre-commit secret-scan hook is the authoritative commit-time backstop."""
+    return bool(text) and _redact(text) != text
+
+
+def _staged_conflict_marker_paths(worktree: Path, *, fail_closed: bool = False) -> list[str]:
+    """Return staged protected-surface files containing git conflict markers.
+
+    The upgrade/defaults reconciliation flow can intentionally write conflict
+    blocks into the proposal worktree for the agent to resolve. Submission is
+    the safety boundary: any remaining ``<<<<<<<`` / ``=======`` / ``>>>>>>>``
+    line means the merge was not actually resolved, so fail closed before the
+    corrupt prompt/core file can be committed and pushed.
+    """
+    paths = _git(["diff", "--cached", "--name-only"], cwd=worktree)
+    if fail_closed and paths.returncode != 0:
+        raise RuntimeError("git conflict-marker path check failed")
+    marked: list[str] = []
+    for line in (paths.stdout or "").splitlines():
+        rel = line.strip()
+        if not rel:
+            continue
+        path = worktree / rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if CONFLICT_MARKER_RE.search(text):
+            marked.append(rel)
+    return marked
+
+
+def _proposals_dir(home: Path, *, lane: str | None = None) -> Path:
+    root = (home / PROPOSALS_REL).resolve()
+    if lane is None:
+        return root
+    return root / normalize_lane(lane)
+
+
+def _lane_for_worktree(home: Path, worktree: Path) -> str | None:
+    """Infer a proposal lane from a worktree path under ``scratch/proposals``.
+
+    Pre-lane proposal worktrees lived directly under ``scratch/proposals/``;
+    treat those as the agent lane so an in-flight proposal survives an upgrade.
+    """
+    root = _proposals_dir(home)
+    try:
+        rel = worktree.relative_to(root)
+    except ValueError:
+        return None
+    if not rel.parts:
+        return None
+    candidate = rel.parts[0]
+    return candidate if candidate in PROPOSAL_LANES else AGENT_PROPOSAL_LANE
+
+
+def _worktree_dir(home: Path, branch: str, *, lane: str = AGENT_PROPOSAL_LANE) -> Path:
+    # "/" isn't legal in a dir name; the branch is recovered from git, not the
+    # dir name, so the sanitized form is just for a readable path.
+    return _proposals_dir(home, lane=lane) / branch.replace("/", "_")
+
+
+def list_open_proposals(home: Path, *, lane: str | None = None,
+                        poller: PollerProposalScope | None = None) -> list[tuple[str, Path]]:
+    """``(branch, worktree_path)`` for each open proposal worktree.
+
+    With ``lane`` omitted, returns proposals from all supported lanes under
+    ``scratch/proposals/<lane>/``. With ``lane`` set, filters to that lane. Parsed
+    from ``git worktree list`` so crash-orphaned paths disappear after prune.
+    """
+    home = Path(home).resolve()
+    lane = normalize_lane(lane) if lane is not None else None
+    _validate_poller(lane, poller)
+    pdir = _proposals_dir(home)
+    res = _git(["worktree", "list", "--porcelain"], cwd=home)
+    if res.returncode != 0:
+        raise RuntimeError(_redact(f"git worktree list failed: {res.stderr or ''}"))
+    out: list[tuple[str, Path]] = []
+    cur_path: Path | None = None
+    for line in (res.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            cur_path = Path(line[len("worktree "):]).resolve()
+        elif line.startswith("branch ") and cur_path is not None:
+            name = line[len("branch "):].strip().replace("refs/heads/", "", 1)
+            if pdir == cur_path or pdir in cur_path.parents:
+                inferred_lane = _lane_for_worktree(home, cur_path)
+                if inferred_lane and (lane is None or inferred_lane == lane):
+                    if poller is None or (
+                        name == poller_branch_name(poller)
+                        and cur_path == poller_worktree_path(home, poller)
+                    ):
+                        out.append((name, cur_path))
+            cur_path = None
+        elif not line.strip():
+            cur_path = None
+    return out
+
+
+def _ensure_scratch_ignored(home: Path) -> str | None:
+    """Guarantee a worktree under ``scratch/`` is git-ignored (else the home's
+    per-turn ``git add -A`` grabs it as an embedded repo — chainlink #299).
+
+    NOTE: ``git check-ignore`` is NOT a reliable probe here. On the allowlist
+    ``*`` + ``!*/`` style, check-ignore reports a *file* path under scratch/ as
+    ignored (matched by ``*``) while ``!*/`` still re-includes the *directory*
+    — so an embedded repo is grabbed regardless. The robust fix is an explicit
+    ``scratch/`` directory ignore, which the empirical probe (chainlink #299)
+    confirmed neutralizes the hazard. So: ensure such a line exists, appending
+    it if absent. Returns an error string only if .gitignore can't be accessed.
+    """
+    gitignore = home / ".gitignore"
+    try:
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    except OSError as exc:
+        return f"could not read .gitignore: {exc}"
+    if any(
+        line.strip() in ("scratch/", "/scratch/", "scratch")
+        for line in existing.splitlines()
+    ):
+        return None
+    if _untrusted_proposal_turn():
+        return "scratch ignore requires trusted operator setup before opening a proposal"
+    try:
+        with gitignore.open("a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write(
+                "\n# Change-proposal worktrees live under "
+                "scratch/proposals/; ignore scratch/ explicitly so the\n"
+                "# per-turn `git add -A` doesn't grab them as embedded repos "
+                "(chainlink #299/#339).\nscratch/\n"
+            )
+    except OSError as exc:
+        return f"could not update .gitignore: {exc}"
+    return None
+
+
+def open_proposal(
+    home: Path,
+    *,
+    base: str = "main",
+    branch: str | None = None,
+    lane: str = AGENT_PROPOSAL_LANE,
+    poller: PollerProposalScope | None = None,
+    revision: ProposalRevision | None = None,
+) -> OpenResult:
+    """Open a change proposal in ``lane``.
+
+    Each lane permits one open proposal at a time. Agent-lane worktrees live
+    under ``scratch/proposals/agent/``; upgrade-lane worktrees live under
+    ``scratch/proposals/upgrade/``.
+    """
+    home = Path(home).resolve()
+    lane = normalize_lane(lane)
+    _validate_poller(lane, poller, branch)
+    if revision is not None and (
+        revision.lane != lane or (poller is not None and
+        (poller_branch_name(poller) != revision.branch or poller.surface != revision.surface))
+        or (poller is None and (branch is not None and branch != revision.branch))
+    ):
+        raise ValueError("revision scope does not match proposal")
+    if revision is not None:
+        branch = revision.branch
+        if _review_details(home, revision) is None:
+            return OpenResult(False, branch, None, "error", "review no longer applies to current PR head")
+    if not _has_origin_remote(home):
+        return OpenResult(
+            ok=False, branch=None, worktree=None, reason="no_remote",
+            detail=(
+                "no origin remote — core memory is seeded at setup (scaffold), "
+                "not via PR, until a remote exists"
+            ),
+        )
+    _git(["worktree", "prune"], cwd=home)  # clear crash-orphaned worktrees
+    existing = list_open_proposals(home, lane=lane, poller=poller)
+    if existing:
+        b, w = existing[0]
+        return OpenResult(
+            ok=False, branch=b, worktree=w, reason="exists",
+            detail=(
+                f"a {lane} proposal is already open ({b}); inspect it with "
+                "proposal_diff, then submit it or abandon it"
+            ),
+        )
+    ignore_err = _ensure_scratch_ignored(home)
+    if ignore_err:
+        return OpenResult(ok=False, branch=None, worktree=None, reason="error", detail=ignore_err)
+    fetch = _git(["fetch", "origin", revision.branch if revision else base], cwd=home)
+    if fetch.returncode != 0:
+        return OpenResult(
+            ok=False, branch=None, worktree=None, reason="error",
+            detail=_redact(f"git fetch origin {base} failed: {(fetch.stderr or '').strip()}"),
+        )
+    branch = poller_branch_name(poller) if poller else branch or default_branch_name(lane=lane)
+    start_ref = f"origin/{revision.branch}" if revision else f"origin/{base}"
+    if poller and poller.surface == "social-outbox" and revision is None:
+        pr_state, _ = _rolling_pr(home, branch)
+        if pr_state is None:
+            return OpenResult(False, branch, None, "error", "rolling PR state unavailable")
+        if pr_state == "open":
+            fetched = _git(["fetch", "origin", branch], cwd=home)
+            if fetched.returncode != 0:
+                return OpenResult(False, branch, None, "error", "rolling branch fetch failed")
+            start_ref = f"origin/{branch}"
+        # A closed or merged PR's remote head must not become the next draft.
+        _git(["branch", "-D", branch], cwd=home)
+    wt = poller_worktree_path(home, poller) if poller else _worktree_dir(home, branch, lane=lane)
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    if revision is not None:
+        _git(["branch", "-D", branch], cwd=home)
+    add = _git(
+        ["worktree", "add", "--no-checkout", "-b", branch, str(wt), start_ref],
+        cwd=home,
+    )
+    if add.returncode != 0:
+        return OpenResult(
+            ok=False, branch=branch, worktree=None, reason="error",
+            detail=_redact(f"git worktree add failed: {(add.stderr or '').strip()}"),
+        )
+    # Sparse-checkout just the proposable surfaces so the worktree stays small
+    # and the agent only sees what it can change (submit stages them regardless).
+    # Cone mode also materializes top-level files, which is harmless.
+    surfaces = [s.as_posix() for s in ((poller.surface_root,) if poller else PROPOSAL_SURFACES)]
+    for step in (["sparse-checkout", "set", "--cone", *surfaces], ["checkout"]):
+        r = _git(step, cwd=wt)
+        if r.returncode != 0:
+            _cleanup_worktree(home, wt, branch)
+            return OpenResult(
+                ok=False, branch=branch, worktree=None, reason="error",
+                detail=_redact(f"git {' '.join(step)} failed: {(r.stderr or '').strip()}"),
+            )
+    return OpenResult(ok=True, branch=branch, worktree=wt, reason=None)
+
+
+def _default_open_pr(home: Path, branch: str, base: str, title: str, body: str) -> str | None:
+    """Open a PR via the ``gh`` CLI or raise with the failing-step detail."""
+    if shutil.which("gh") is None:
+        raise ProposalPrError("gh pr create failed: gh executable is unavailable")
+    res = _run(
+        ["gh", "pr", "create", "--base", base, "--head", branch,
+         "--title", title, "--body", body],
+        cwd=home, capture=True,
+    )
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "no error output").strip()
+        raise ProposalPrError(_redact(f"gh pr create failed: {detail}"))
+    lines = [ln for ln in (res.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        raise ProposalPrError("gh pr create failed: command returned no pull-request URL")
+    return lines[-1].strip()
+
+
+def _cleanup_worktree(home: Path, worktree: Path, branch: str) -> None:
+    """Detach the worktree and drop the local branch. The pushed commit, the
+    remote branch, and any PR survive independently of the local ref."""
+    _git(["worktree", "remove", "--force", str(worktree)], cwd=home)
+    if Path(worktree).exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+    _git(["worktree", "prune"], cwd=home)
+    _git(["branch", "-D", branch], cwd=home)
+
+
+def _check_poller_surface(worktree: Path, surface: Path = Path("state/wiki")) -> str | None:
+    """Inspect both index and disk, without rename folding or ignore exclusions."""
+    def checked(args: list[str]) -> str:
+        result = _git(args, cwd=worktree)
+        if result.returncode != 0:
+            raise RuntimeError(_redact(f"git {args[0]} failed: {result.stderr or ''}"))
+        return result.stdout or ""
+
+    def inside(path: str) -> bool:
+        return path.startswith(surface.as_posix() + "/") and ".." not in Path(path).parts
+
+    for args in (
+        ["diff", "--cached", "--no-renames", "--name-only", "-z"],
+        ["diff", "--no-renames", "--name-only", "-z"],
+        # No --exclude-standard: ignored files are part of the submit boundary.
+        # Git itself excludes the worktree's .git administrative pointer.
+        ["ls-files", "--others", "-z"],
+    ):
+        for path in checked(args).split("\0"):
+            if path and not inside(path):
+                return _redact(f"outside_surface: {path}")
+
+    links: dict[str, str] = {}
+    for entry in checked(["ls-files", "--stage", "-z"]).split("\0"):
+        if not entry:
+            continue
+        metadata, path = entry.split("\t", 1)
+        mode, oid, stage = metadata.split()
+        if inside(path) and mode == "120000":
+            links[path] = checked(["cat-file", "blob", oid])
+        if inside(path) and (stage != "0" or mode not in ("100644", "100755", "120000")):
+            return _redact(f"outside_surface: unsupported index entry {path}")
+    for path, target in links.items():
+        seen = {path}
+        while True:
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+            if not inside(target):
+                return _redact(f"outside_surface: symlink {path}")
+            # Follow staged links, including directory components, not just disk links.
+            prefix = next((p for p in links if target == p or target.startswith(p + "/")), None)
+            if prefix is None:
+                if not (worktree / target).resolve().is_relative_to(worktree / surface):
+                    return _redact(f"outside_surface: symlink {path}")
+                break
+            if prefix in seen:
+                return _redact(f"outside_surface: cyclic symlink {path}")
+            seen.add(prefix)
+            path, target = prefix, links[prefix] + target[len(prefix):]
+    return None
+
+
+def _valid_outbox(text: str) -> bool:
+    try:
+        doc = load_outbox(text)
+    except (yaml.YAMLError, ValueError, TypeError):
+        return False
+    return not validate_outbox(doc)
+
+
+def _check_outbox_files(worktree: Path, surface: Path | None = None) -> str | None:
+    """Scan staged content, or the complete surface after importing a new base."""
+    if surface is None:
+        res = _git(["diff", "--cached", "--diff-filter=ACMT", "--name-only", "-z"], cwd=worktree)
+        if res.returncode != 0:
+            return "error"
+        paths = list(filter(None, (res.stdout or "").split("\0")))
+    else:
+        try:
+            paths = [str(path.relative_to(worktree))
+                     for path in (worktree / surface).rglob("*") if path.is_file()]
+        except OSError:
+            return "error"
+    for rel in paths:
+        try:
+            text = (worktree / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return "error"
+        findings = scan_outbound((text,), tool="submit_proposal", sink_category="network")
+        if findings_require_refusal(findings):
+            return "privacy"
+        if not _valid_outbox(text):
+            return "schema"
+    return None
+
+
+def _check_outbox_names(worktree: Path, surface: Path) -> tuple[str, str] | None:
+    """Validate staged additions/modifications; deletions can clean up legacy names."""
+    res = _git(["diff", "--cached", "--no-renames", "--diff-filter=ACMT",
+                "--name-only", "-z"], cwd=worktree)
+    if res.returncode != 0:
+        return "error", "outbox name check failed"
+    pattern = f"{surface.as_posix()}/outbox-*.yaml"
+    for rel in filter(None, (res.stdout or "").split("\0")):
+        path = Path(rel)
+        if path.parent != surface or not re.fullmatch(r"outbox-.+\.yaml", path.name):
+            return "name", f"{rel} must match {pattern} (outbox- + one or more chars + .yaml)"
+    return None
+
+
+def _untrusted_proposal_turn() -> bool:
+    from ._context import get_current_turn
+    from .access_control import _turn_has_untrusted_active_ingest
+
+    turn = get_current_turn()
+    return bool(turn is not None and _turn_has_untrusted_active_ingest(
+        getattr(turn, "auth_context", None), getattr(turn, "ifc_labels", None),
+    ))
+
+
+_UNTRUSTED_PROPOSAL_NOTE = (
+    "Untrusted-origin proposal: requires operator review and must never auto-merge."
+)
+
+
+def _check_proposal_index(worktree: Path, surfaces: tuple[Path, ...]) -> str | None:
+    """Validate every staged entry, including pre-staged code/config and renames."""
+    result = _git(["diff", "--cached", "--no-renames", "--name-only", "-z"], cwd=worktree)
+    entries = _git(["ls-files", "--stage", "-z"], cwd=worktree)
+    if result.returncode or entries.returncode:
+        return "proposal index unavailable"
+    changed = set((result.stdout or "").split("\0")) - {""}
+    for path in changed:
+        if not any(path.startswith(s.as_posix() + "/") for s in surfaces):
+            return "proposal contains changes outside permitted surfaces"
+        if Path(path).suffix.lower() != ".md":
+            return "proposal contains code or config"
+    for entry in (entries.stdout or "").split("\0"):
+        if not entry:
+            continue
+        metadata, path = entry.split("\t", 1)
+        mode, _, stage = metadata.split()
+        if path in changed and (stage != "0" or mode != "100644"):
+            return "proposal contains non-regular or executable content"
+    return None
+
+
+def finalize_proposal(
+    home: Path,
+    *,
+    title: str,
+    rationale: str,
+    base: str = "main",
+    branch: str | None = None,
+    lane: str = AGENT_PROPOSAL_LANE,
+    poller: PollerProposalScope | None = None,
+    open_pr: PrOpener | None = None,
+    revision: ProposalRevision | None = None,
+) -> ProposalResult:
+    """Commit the open proposal's changes (memory/core + prompts), push, and PR.
+
+    Stages **only** the proposable surfaces (so stray edits elsewhere in the
+    worktree never reach the PR), scans the staged diff for secrets, commits
+    with a redacted message, pushes, opens the PR, and tears down the worktree.
+    On a recoverable miss (no changes, secret found) the worktree is left
+    intact so the agent can fix and resubmit.
+    """
+    home = Path(home).resolve()
+    lane = normalize_lane(lane)
+    _validate_poller(lane, poller, branch)
+    if revision is not None and (
+        lane != revision.lane or (branch is not None and branch != revision.branch)
+        or (poller is not None and (poller_branch_name(poller) != revision.branch or poller.surface != revision.surface))
+    ):
+        raise ValueError("revision scope does not match proposal")
+    if revision is not None:
+        branch = revision.branch
+        if _review_details(home, revision) is None:
+            return ProposalResult(False, branch, False, None, "error", "review no longer applies to current PR head")
+    opens = list_open_proposals(home, lane=lane, poller=poller)
+    if not opens:
+        return ProposalResult(
+            ok=False, branch=None, pushed=False, pr_url=None, reason="no_open",
+            detail=f"no open {lane} proposal — open one first",
+        )
+    if branch is not None:
+        match = [(b, w) for b, w in opens if b == branch]
+        if not match:
+            return ProposalResult(
+                ok=False, branch=branch, pushed=False, pr_url=None, reason="no_open",
+                detail=f"no open proposal named {branch!r}",
+            )
+        branch, wt = match[0]
+    else:
+        branch, wt = opens[0]
+
+    if poller:
+        try:
+            outside = _check_poller_surface(wt, poller.surface_root)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
+        if outside:
+            return ProposalResult(False, branch, False, None, "outside_surface", outside)
+    surfaces = (poller.surface_root,) if poller else PROPOSAL_SURFACES
+    add = _git(["add", *[s.as_posix() for s in surfaces]], cwd=wt)
+    if poller and add.returncode != 0:
+        return ProposalResult(False, branch, False, None, "error", _redact(add.stderr or "git add failed"))
+    if poller:
+        try:
+            outside = _check_poller_surface(wt, poller.surface_root)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
+        if outside:
+            return ProposalResult(False, branch, False, None, "outside_surface", outside)
+    staged = _git(["diff", "--cached", "--name-only"], cwd=wt)
+    if poller and staged.returncode != 0:
+        return ProposalResult(False, branch, False, None, "error", "git staged diff failed")
+    if not (staged.stdout or "").strip():
+        return ProposalResult(
+            ok=False, branch=branch, pushed=False, pr_url=None, reason="no_changes",
+            detail=f"no changes under {', '.join(map(str, surfaces))} to propose",
+        )
+
+    untrusted_origin = _untrusted_proposal_turn() or poller is not None
+    if not (poller and poller.surface == "social-outbox"):
+        outside = _check_proposal_index(wt, surfaces)
+        if outside:
+            return ProposalResult(False, branch, False, None, "outside_surface", outside)
+
+    if poller and poller.surface == "social-outbox":
+        name_failure = _check_outbox_names(wt, poller.surface_root)
+        if name_failure:
+            return ProposalResult(False, branch, False, None, *name_failure)
+        failure = _check_outbox_files(wt)
+        if failure:
+            return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed")
+
+    try:
+        conflict_marked = _staged_conflict_marker_paths(wt, fail_closed=poller is not None)
+    except (RuntimeError, OSError) as exc:
+        return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
+    if conflict_marked:
+        paths = ", ".join(conflict_marked[:5])
+        suffix = "" if len(conflict_marked) <= 5 else f" (+{len(conflict_marked) - 5} more)"
+        return ProposalResult(
+            ok=False, branch=branch, pushed=False, pr_url=None, reason="conflict_marker",
+            detail=(
+                "proposed content still contains git conflict markers "
+                f"(^<<<<<<<, ^=======, or ^>>>>>>>): {paths}{suffix}; resolve them before submitting"
+            ),
+        )
+
+    diff = _git(["diff", "--cached", "-U0"], cwd=wt)
+    if poller and diff.returncode != 0:
+        return ProposalResult(False, branch, False, None, "error", "git staged diff failed")
+    added = "\n".join(
+        ln for ln in (diff.stdout or "").splitlines()
+        if ln.startswith("+") and not ln.startswith("+++")
+    )
+    if _scan_for_secrets(added):
+        return ProposalResult(
+            ok=False, branch=branch, pushed=False, pr_url=None, reason="secret",
+            detail="proposed content contains a secret-shaped token — remove it; proposed files must not hold credentials",
+        )
+
+    attribution = ""
+    if poller:
+        source = " ".join(poller.source.split())
+        if poller.surface == "social-outbox":
+            attribution = f"\n\nSubmission title: {title}"
+            title = f"[social outbox:{poller.owner.removeprefix('poller:')}] rolling outbox"
+        else:
+            title = f"[research {poller.owner}] {source}: {title}"
+        attribution = (
+            f"{attribution}\n\nUntrusted-ingest source (not verified): {source}\n"
+            f"Trusted origin_ref: {poller.origin_ref}\nTurn: {poller.turn_id}"
+        )
+    if untrusted_origin:
+        title = "[untrusted-origin] " + title.removeprefix("[untrusted-origin] ")
+        attribution += "\n\n" + _UNTRUSTED_PROPOSAL_NOTE
+    safe_title = _redact(title)
+    safe_rationale = _redact(rationale + attribution)
+    rolling_state: ProposalPrState | None = None
+    rolling_url: str | None = None
+    rebased = False
+    if poller and poller.surface == "social-outbox" and revision is None:
+        rolling_state, rolling_url = _rolling_pr(home, branch)
+        if rolling_state is None:
+            return ProposalResult(False, branch, False, None, "error", "rolling PR state unavailable")
+        fetched = _git(["fetch", "origin", base], cwd=wt)
+        if fetched.returncode != 0:
+            return ProposalResult(False, branch, False, None, "error", "base fetch failed")
+        # Rebase before committing the new addition, retaining staged content.
+        drift = _git(["merge-base", "--is-ancestor", f"origin/{base}", "HEAD"], cwd=wt)
+        if drift.returncode != 0:
+            rebased = True
+            if _git(["stash", "push", "--include-untracked"], cwd=wt).returncode != 0:
+                return ProposalResult(False, branch, False, None, "rolling_conflict", "cannot save draft before rebase")
+            rebase_result = _git(["rebase", f"origin/{base}"], cwd=wt)
+            if rebase_result.returncode != 0:
+                _git(["rebase", "--abort"], cwd=wt)
+                _git(["stash", "pop", "--index"], cwd=wt)
+                return ProposalResult(False, branch, False, None, "rolling_conflict", "rolling branch conflicts with base")
+            restored = _git(["stash", "pop", "--index"], cwd=wt)
+            if restored.returncode != 0:
+                return ProposalResult(False, branch, False, None, "rolling_conflict", "draft conflicts with rebased base")
+            # A successful pop --index restores the draft paths already checked
+            # above; base-imported paths are committed, not newly staged. No
+            # second staged-name check is needed. Content must still be scanned
+            # across the full surface because the rebase can import new blobs.
+            failure = _check_outbox_files(wt, poller.surface_root)
+            if failure:
+                return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed after rebase")
+    commit = _git(["commit", "-m", f"{safe_title}\n\n{safe_rationale}"], cwd=wt)
+    if commit.returncode != 0:
+        return ProposalResult(
+            ok=False, branch=branch, pushed=False, pr_url=None, reason="error",
+            detail=_redact(f"git commit failed: {(commit.stderr or '').strip()}"),
+        )
+    push_args = ["push", "-u", "origin", branch]
+    if poller and poller.surface == "social-outbox" and revision is None and (rolling_state != "open" or rebased):
+        old = _git(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=wt)
+        if old.returncode != 0:
+            return ProposalResult(False, branch, False, None, "error", "rolling head lookup failed")
+        sha = (old.stdout or "").split("\t", 1)[0].strip()
+        push_args.insert(1, f"--force-with-lease=refs/heads/{branch}:{sha}")
+    push = _git(push_args, cwd=wt)
+    if push.returncode != 0:
+        return ProposalResult(
+            ok=False, branch=branch, pushed=False, pr_url=None, reason="error",
+            detail=_redact(f"git push failed: {(push.stderr or '').strip()}"),
+        )
+
+    body = (
+        f"{safe_rationale}\n\n---\n"
+        f"Proposal lane: `{lane}`.\n"
+        "Proposed by the mimir change-proposal workflow (chainlink #337/#344/#348). "
+        "Approval = merge; live files update after the merge (#340)."
+    )
+    opener = open_pr or _default_open_pr
+    if revision is not None:
+        _cleanup_worktree(home, wt, branch)
+        # The commit is already on the reviewed branch. A failed comment or
+        # review request remains visible as an error rather than creating a PR.
+        comment = _run(["gh", "pr", "comment", str(revision.number), "--body", safe_rationale], cwd=home, capture=True)
+        request = _run(["gh", "api", "-X", "POST", f"repos/{revision.repo}/pulls/{revision.number}/requested_reviewers",
+                        "-f", f"reviewers[]={revision.reviewer}"], cwd=home, capture=True)
+        if comment.returncode or request.returncode:
+            return ProposalResult(False, branch, True, revision.url, "error", "revision pushed but comment or review request failed", reused_pr=True)
+        return ProposalResult(True, branch, True, revision.url, None, reused_pr=True)
+    if rolling_state == "open" and rolling_url:
+        _cleanup_worktree(home, wt, branch)
+        return ProposalResult(True, branch, True, rolling_url, None, reused_pr=True)
+    try:
+        pr_url = opener(home, branch, base, safe_title, body)
+    except ProposalPrError as exc:
+        pr_url = None
+        pr_error = str(exc)
+    else:
+        pr_error = "gh pr create failed: pull-request opener returned no URL"
+    _cleanup_worktree(home, wt, branch)
+    if pr_url:
+        return ProposalResult(ok=True, branch=branch, pushed=True, pr_url=pr_url, reason=None)
+    return ProposalResult(
+        ok=False, branch=branch, pushed=True, pr_url=None, reason="pr_open",
+        detail=pr_error,
+    )
+
+
+def proposal_discard_diffstat(worktree: Path) -> str:
+    """Describe staged, unstaged and untracked edits that force-removal would lose."""
+    status = _git(["status", "--porcelain=v1", "--untracked-files=all"], cwd=worktree)
+    if status.returncode != 0:
+        raise ValueError("cannot inspect proposal changes; refusing to abandon")
+    if not status.stdout.strip():
+        return ""
+    stat = _git(["diff", "HEAD", "--stat", "--no-ext-diff", "--no-textconv"], cwd=worktree)
+    if stat.returncode != 0:
+        raise ValueError("cannot inspect proposal diffstat; refusing to abandon")
+    untracked = [line[3:] for line in status.stdout.splitlines() if line.startswith("?? ")]
+    return ((stat.stdout or "").strip() + "\n" +
+            "\n".join(f"{name} | untracked" for name in untracked)).strip()
+
+
+def abandon_proposal(
+    home: Path, *, branch: str | None = None, lane: str = AGENT_PROPOSAL_LANE,
+    poller: PollerProposalScope | None = None, discard_changes: bool = False,
+    revision: ProposalRevision | None = None, reason: str = "",
+) -> bool:
+    """Discard an open proposal in ``lane`` (remove its worktree + local branch).
+
+    Returns True if one was found and removed, False if there was nothing open.
+    """
+    home = Path(home).resolve()
+    lane = normalize_lane(lane)
+    _validate_poller(lane, poller, branch)
+    if revision is not None and (revision.lane != lane or not reason.strip() or
+        (branch is not None and branch != revision.branch) or
+        (poller is not None and poller_branch_name(poller) != revision.branch)):
+        raise ValueError("revision scope/reason required to close the PR")
+    if revision is not None:
+        branch = revision.branch
+    opens = list_open_proposals(home, lane=lane, poller=poller)
+    if not opens:
+        return False
+    if branch is not None:
+        match = [(b, w) for b, w in opens if b == branch]
+        if not match:
+            return False
+        b, w = match[0]
+    else:
+        b, w = opens[0]
+    if proposal_discard_diffstat(w) and not discard_changes:
+        raise ValueError(
+            "abandon_proposal refused: proposal has staged, unstaged or untracked changes; "
+            "inspect with proposal_diff, then submit or pass discard_changes=true"
+        )
+    if revision is not None:
+        if _review_details(home, revision) is None:
+            raise ValueError("review no longer applies to current PR head")
+        result = _run(["gh", "pr", "close", str(revision.number), "--comment", _redact(reason)], cwd=home, capture=True)
+        if result.returncode != 0:
+            raise ValueError("could not close revision PR")
+    _cleanup_worktree(home, w, b)
+    return True
+
+
+
+def _is_proposal_branch(branch: str) -> bool:
+    return branch.startswith(PROPOSAL_BRANCH_PREFIXES)
+
+
+def _is_proposal_surface_path(path: str) -> bool:
+    rel = Path(path)
+    return any(
+        rel == surface or rel.is_relative_to(surface)
+        for surface in PROPOSAL_SURFACES
+    )
+
+
+def _remote_proposal_branches(home: Path) -> list[tuple[str, str | None]]:
+    """Return ``(branch, tip_sha)`` for remote proposal branches under origin."""
+    res = _git(
+        ["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/remotes/origin"],
+        cwd=home,
+    )
+    if res.returncode != 0:
+        return []
+    out: list[tuple[str, str | None]] = []
+    for line in (res.stdout or "").splitlines():
+        if not line.startswith("origin/"):
+            continue
+        rest = line[len("origin/"):]
+        try:
+            branch, tip = rest.rsplit(" ", 1)
+        except ValueError:
+            branch, tip = rest.strip(), None
+        if _is_proposal_branch(branch):
+            out.append((branch, tip or None))
+    return out
+
+
+def _proposal_branch_pr_state(home: Path, branch: str) -> ProposalPrState | None:
+    """Return the forge PR state for ``branch``; ``None`` when unknown.
+
+    Query open PRs separately so an older closed or merged PR cannot hide an
+    open PR for the same head through forge result ordering. Only after the
+    open-only query is authoritatively empty do we inspect a terminal PR.
+    """
+    if shutil.which("gh") is None:
+        return None
+
+    def query(state: Literal["open", "all"]) -> list[dict[str, object]] | None:
+        try:
+            res = _run(
+                [
+                    "gh", "pr", "list", "--state", state, "--head", branch,
+                    "--json", "number,state", "--limit", "1",
+                ],
+                cwd=home,
+                capture=True,
+            )
+        except OSError:
+            return None
+        if res.returncode != 0:
+            return None
+        try:
+            prs = json.loads(res.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+            return None
+        return prs
+
+    open_prs = query("open")
+    if open_prs is None:
+        return None
+    if open_prs:
+        pr = open_prs[0]
+        number = pr.get("number")
+        if (
+            isinstance(number, int)
+            and not isinstance(number, bool)
+            and pr.get("state") == "OPEN"
+        ):
+            return "open"
+        return None
+
+    prs = query("all")
+    if prs is None:
+        return None
+    if not prs:
+        return "no_pr"
+    pr = prs[0]
+    number = pr.get("number")
+    state = pr.get("state")
+    if isinstance(number, int) and not isinstance(number, bool) and state in {
+        "OPEN", "MERGED", "CLOSED",
+    }:
+        return state.lower()
+    return None
+
+
+def _blob_oid(home: Path, ref: str, path: str) -> str | None:
+    res = _git(["rev-parse", f"{ref}:{path}"], cwd=home)
+    if res.returncode != 0:
+        return None
+    value = (res.stdout or "").strip()
+    return value or None
+
+
+def merged_social_outbox_commit(
+    home: Path, poller: str, path: str, *, verified_text: str | None = None,
+    on_withheld: Callable[[str], None] | None = None,
+) -> str | None:
+    """Require forge evidence of an allowlisted merge of this exact file.
+
+    The local content-addressed tree is acceptable only at the commit oid
+    returned by the forge. A clean HEAD alone is not approval. The allowlist
+    authorizes a forge actor, not an independent human: a shared credential
+    cannot distinguish operator actions from agent actions. Unknown or empty
+    approver configuration and unknown forge evidence fail closed.
+    """
+    def refuse(reason: str) -> None:
+        if on_withheld is not None:
+            on_withheld(reason)
+        return None
+
+    configured = os.environ.get("MIMIR_SOCIAL_OUTBOX_APPROVERS", "").strip()
+    entries = [entry.strip() for entry in configured.split(",") if entry.strip()]
+    if not entries:
+        return refuse("no_approvers_configured")
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", entry) for entry in entries):
+        return refuse("invalid_approvers_configured")
+    approvers = {entry.casefold() for entry in entries}
+    if not (os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()):
+        return refuse("missing_forge_token")
+    try:
+        scope = PollerProposalScope(f"poller:{poller}", "dispatch", "dispatch", "dispatch",
+                                    "social-outbox")
+        if Path(path).parent != scope.surface_root:
+            return refuse("invalid_outbox_path")
+        last = _git(["log", "--first-parent", "--full-history", "-1", "--format=%H",
+                     "HEAD", "--", path], cwd=home)
+        commit = (last.stdout or "").strip()
+        if last.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return refuse("content_changed_after_merge")
+        result = _run(
+            ["gh", "pr", "list", "--state", "merged", "--head", poller_branch_name(scope),
+             "--json", "state,headRefName,mergeCommit,mergedBy", "--limit", "100"],
+            cwd=home, capture=True,
+        )
+        if result.returncode != 0:
+            return refuse("forge_unreachable")
+        prs = json.loads(result.stdout or "")
+        if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+            return refuse("malformed_forge_response")
+        approved = False
+        for pr in prs:
+            if (pr.get("state") != "MERGED"
+                    or pr.get("headRefName") != poller_branch_name(scope)
+                    or not isinstance(pr.get("mergeCommit"), dict)
+                    or pr["mergeCommit"].get("oid") != commit):
+                continue
+            merger = pr.get("mergedBy")
+            login = merger.get("login") if isinstance(merger, dict) else None
+            if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+                return refuse("malformed_forge_response")
+            if login.casefold() not in approvers:
+                return refuse("merger_not_approved")
+            approved = True
+        if not approved:
+            return refuse("no_qualifying_merged_pr")
+        blob = _blob_oid(home, "HEAD", path)
+        if blob is None or blob != _blob_oid(home, commit, path):
+            return refuse("content_changed_after_merge")
+        if verified_text is not None:
+            approved_content = _git(["show", f"{commit}:{path}"], cwd=home)
+            if approved_content.returncode != 0 or approved_content.stdout != verified_text:
+                return refuse("content_changed_after_merge")
+        return commit
+    except json.JSONDecodeError:
+        return refuse("malformed_forge_response")
+    except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+        return refuse("forge_unreachable")
+
+
+def _proposal_branch_content_is_on_main(
+    home: Path, branch: str, *, main_ref: str = "origin/main"
+) -> bool:
+    """True when ``origin/<branch>`` is merged or content-superseded by main.
+
+    Squash merges change commit SHAs, so ancestry alone is insufficient. For
+    proposal-owned branches, it is safe to compare only the protected proposal
+    surfaces: if every file the branch changed under ``memory/core`` or
+    ``prompts`` has the same blob on ``main_ref``, the proposal content is
+    already present (or superseded by identical content) and the branch can be
+    swept. Any non-proposal-surface change makes the branch ineligible.
+    """
+    remote_ref = f"origin/{branch}"
+    ancestor = _git(["merge-base", "--is-ancestor", remote_ref, main_ref], cwd=home)
+    if ancestor.returncode == 0:
+        return True
+    merge_base = _git(["merge-base", remote_ref, main_ref], cwd=home)
+    base = (merge_base.stdout or "").strip()
+    if merge_base.returncode != 0 or not base:
+        return False
+    changed = _git(["diff", "--name-only", base, remote_ref], cwd=home)
+    if changed.returncode != 0:
+        return False
+    paths = [p for p in (changed.stdout or "").splitlines() if p.strip()]
+    if not paths:
+        return True
+    for path in paths:
+        if not _is_proposal_surface_path(path):
+            return False
+        if _blob_oid(home, remote_ref, path) != _blob_oid(home, main_ref, path):
+            return False
+    return True
+
+
+def _remove_worktree_for_branch(home: Path, branch: str) -> None:
+    for open_branch, worktree in list_open_proposals(home):
+        if open_branch == branch:
+            _cleanup_worktree(home, worktree, branch)
+            return
+    _git(["branch", "-D", branch], cwd=home)
+
+
+def _log_proposal_cleanup(
+    record: ProposalCleanupRecord,
+    *,
+    previous_skip_reasons: Mapping[str, str] | None = None,
+) -> None:
+    if (
+        record.action == "skipped"
+        and previous_skip_reasons is not None
+        and previous_skip_reasons.get(record.branch) == record.reason
+    ):
+        return
+    event_type = (
+        "proposal_branch_cleaned"
+        if record.action == "deleted"
+        else "proposal_branch_cleanup_skipped"
+    )
+    try:
+        log_event_sync(
+            event_type,
+            branch=record.branch,
+            tip=record.tip,
+            reason=record.reason,
+        )
+    except Exception:
+        # Cleanup is best-effort audit sugar; absence of an initialized event
+        # logger in CLI/tests must not make branch cleanup fail.
+        pass
+
+
+def cleanup_resolved_proposal_branches(
+    home: Path,
+    *,
+    previous_skip_reasons: Mapping[str, str] | None = None,
+) -> list[ProposalCleanupRecord]:
+    """Delete remote/local proposal branches resolved by PR state or content.\n\n    Safety gates:\n    - only proposal-owned prefixes (``proposal/`` and ``upgrade/``),
+    - preserve branches with open PRs or unknown PR state,
+    - delete forge-confirmed merged or closed PR branches,
+    - with no PR, delete only when the branch is ancestry-merged or the protected-surface
+      content matches ``origin/main`` (legacy/superseded path),
+    - log every deletion with branch name + tip SHA for auditability.
+    """
+    home = Path(home).resolve()
+    if not _has_origin_remote(home):
+        return []
+    records: list[ProposalCleanupRecord] = []
+    # Avoid a network fetch on the per-turn hot path when there are no local
+    # proposal remote-tracking refs. An empty local view means there is nothing
+    # cleanup can safely act on; when a proposal ref exists, refresh/prune before
+    # making deletion decisions.
+    branches = _remote_proposal_branches(home)
+    if not branches:
+        return []
+    _git(["fetch", "--prune", "origin"], cwd=home)
+    for branch, tip in _remote_proposal_branches(home):
+        pr_state = _proposal_branch_pr_state(home, branch)
+        if pr_state == "open":
+            record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr")
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
+            records.append(record)
+            continue
+        if pr_state is None:
+            record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr_unknown")
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
+            records.append(record)
+            continue
+        if pr_state == "no_pr" and not _proposal_branch_content_is_on_main(home, branch):
+            record = ProposalCleanupRecord(branch, tip, "skipped", "content_not_on_main")
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
+            records.append(record)
+            continue
+        delete = _git(["push", "origin", "--delete", branch], cwd=home)
+        if delete.returncode != 0:
+            record = ProposalCleanupRecord(
+                branch,
+                tip,
+                "skipped",
+                _redact(f"delete_failed: {(delete.stderr or '').strip()}"),
+            )
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
+            records.append(record)
+            continue
+        _remove_worktree_for_branch(home, branch)
+        reason = (
+            "resolved_content_on_main"
+            if pr_state == "no_pr"
+            else f"resolved_pr_{pr_state}"
+        )
+        record = ProposalCleanupRecord(branch, tip, "deleted", reason)
+        _log_proposal_cleanup(record)
+        records.append(record)
+    return records
+
+
+def render_open_proposals_block(home: Path) -> str | None:
+    """Prompt nudge for any open change proposal(s), or None if none.
+
+    Surfaced near the feedback block every turn so the agent doesn't leave a
+    proposal dangling (#337/#339). Auto-clears the moment the worktree is gone
+    (submitted or abandoned) — which is why the nudge is driven off live state
+    rather than a per-turn event.
+    """
+    opens = list_open_proposals(home)
+    if not opens:
+        return None
+    home = Path(home).resolve()
+    lines: list[str] = []
+    for branch, worktree in opens:
+        try:
+            rel = worktree.relative_to(home)
+        except ValueError:
+            rel = worktree
+        lane = _lane_for_worktree(home, worktree) or "unknown"
+        if lane == POLLER_PROPOSAL_LANE:
+            lines.append(
+                f"- `{branch}` (lane `poller`): research proposal under `{rel}/state/wiki/`; "
+                "only its owning poller turn can submit or abandon it."
+            )
+            continue
+        args = "title, rationale" if lane == AGENT_PROPOSAL_LANE else f"title, rationale, lane='{lane}'"
+        abandon = "abandon_proposal" if lane == AGENT_PROPOSAL_LANE else f"abandon_proposal(lane='{lane}')"
+        lines.append(
+            f"- `{branch}` (lane `{lane}`): edit the files under `{rel}/memory/core/` or "
+            f"`{rel}/prompts/`, then `submit_proposal({args})` to open "
+            f"the PR — or `{abandon}` to discard."
+        )
+    return (
+        "You have an open change proposal in progress — don't leave it "
+        "hanging:\n" + "\n".join(lines)
+    )
+
+
+__all__ = (
+    "PollerProposalScope",
+    "poller_branch_name",
+    "poller_worktree_path",
+    "POLLER_PROPOSAL_LANE",
+    "POLLER_PROPOSAL_SURFACES",
+    "OpenResult",
+    "render_open_proposals_block",
+    "ProposalResult",
+    "ProposalPrError",
+    "ProposalCleanupRecord",
+    "cleanup_resolved_proposal_branches",
+    "open_proposal",
+    "finalize_proposal",
+    "abandon_proposal",
+    "list_open_proposals",
+    "default_branch_name",
+    "normalize_lane",
+    "PROPOSAL_SURFACES",
+    "PROPOSALS_REL",
+    "AGENT_PROPOSAL_LANE",
+    "UPGRADE_PROPOSAL_LANE",
+    "PROPOSAL_LANES",
+    "PROPOSAL_BRANCH_PREFIXES",
+)

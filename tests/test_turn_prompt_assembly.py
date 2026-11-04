@@ -1,0 +1,3546 @@
+"""Regression test for 181-H: per-turn prompt block assembly.
+
+Pre-181-H the deepagents-backed Agent shoved only ``event.content``
+(optionally prefixed with the SAGA recall block) into a
+``HumanMessage`` — completely bypassing the rich per-turn user-side
+prompt that the SDK path assembled: Recent activity, Recent feedback,
+Session summaries, Resource usage, Upcoming, Upcoming commitments,
+Self-state, etc.
+
+181-H ports ``_build_turn_prompt`` + its eight ``_assemble_*``
+helpers back from main. This test exercises them directly so a
+regression that drops any of the labeled section headers — or
+breaks the synthesis-turn branch — fails the suite instead of
+silently shipping an empty-block prompt to the model.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import json
+import inspect
+import os
+import re
+import sqlite3
+import threading
+import time
+from collections import Counter
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from mimir.access_control import (
+    ChannelResourceAdapter,
+    SinkGate,
+    build_scheduled_tick_service_principal,
+    ensure_turn_scratch,
+)
+from mimir.agent import (
+    Agent,
+    _REFLECTION_CHANNEL_ID,
+    _filter_session_turns,
+    _prompt_source_labels,
+    _turn_human_message,
+)
+from mimir.config import Config
+from mimir.feedback import FeedbackLog
+from mimir.history import MessageBuffer
+from mimir.index import IndexGenerator
+from mimir.models import (
+    AgentEvent,
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
+    PromptBlock,
+    SourceLabel,
+    TurnContext,
+)
+from mimir.saga.client import SagaStore
+from mimir.prompts import build_turn_prompt
+from mimir.plugins.core import policy_scope
+from mimir.plugins.registry import PolicyRegistry
+from mimir.turn_logger import TurnLogger
+
+
+def _make_agent(tmp_path: Path) -> Agent:
+    """Construct an Agent rooted at ``tmp_path``. Skips
+    ``_build_agent_if_needed`` — these tests drive
+    ``_build_turn_prompt`` directly without invoking the model.
+    """
+    os.environ["MIMIR_HOME"] = str(tmp_path)
+    cfg = Config.from_env()
+    (cfg.home / "logs").mkdir(parents=True, exist_ok=True)
+    return Agent(
+        config=cfg,
+        turn_logger=TurnLogger(cfg.turns_log),
+        message_buffer=MessageBuffer(history_path=cfg.home / "messages.jsonl"),
+        index_generator=IndexGenerator(cfg.home),
+    )
+
+
+def _make_ctx(event: AgentEvent, saga_session_id: str | None = None) -> TurnContext:
+    auth_context = AuthContext(
+        principal=event.author,
+        canonical_principal=event.author,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+    )
+    return TurnContext(
+        turn_id="turn-test",
+        session_id=event.channel_id or "default",
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        started_at=time.monotonic(),
+        saga_session_id=saga_session_id,
+        auth_context=auth_context,
+        ifc_labels=InformationFlowLabels().with_source(SourceLabel(
+            principal=event.author,
+            domain="channel",
+            resource_id=event.channel_id,
+            bridge_instance=event.source or "test",
+            sensitivity="private",
+            authorized_principals=(frozenset({event.author}) if event.author else frozenset()),
+        )),
+    )
+
+
+def _block(content: str) -> PromptBlock:
+    return PromptBlock(
+        content,
+        InformationFlowLabels().with_source(SourceLabel(
+            principal="operator",
+            domain="test",
+            resource_id="test:block",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"operator"}),
+            source_kind="protected_prompt",
+        )),
+    )
+
+
+def test_plugin_prompt_registry_section_inventory_is_closed() -> None:
+    from mimir.plugins.registry import _PROMPT_SECTIONS
+
+    source = ast.parse((Path(__file__).parents[1] / "mimir/prompts.py").read_text())
+    sections = [node.args[0].value for node in ast.walk(source)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_add_plugins" and node.args
+                and isinstance(node.args[0], ast.Constant)]
+    assert sections == [
+        "channel_memory", "feedback", "core_proposals", "session_summaries",
+        "usage", "upcoming", "commitments", "self_state",
+    ]
+    assert set(sections) == _PROMPT_SECTIONS
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_provider_refusal_budget_labels_and_order(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+    from mimir import core_blocks
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    ctx = _make_ctx(event)
+    admitted = tmp_path / "memory" / "allowed.md"
+    admitted.parent.mkdir()
+    admitted.write_text("é" * 20)
+    denied = tmp_path / "memory" / "denied.md"
+    denied.write_text("DENIED-SECRET")
+    monkeypatch.setattr(core_blocks, "_prompt_file_is_trusted", lambda home, path: path == admitted)
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    registry = PolicyRegistry()
+    calls = []
+
+    def render_a(auth, inbound, reader):
+        calls.append("a")
+        return reader(admitted)
+
+    def render_z(auth, inbound, reader):
+        calls.append("z")
+        reader(denied)
+        return "SHOULD-NOT-APPEAR"
+
+    registry.registrar("example").register_prompt_provider(
+        "zeta", "feedback", 128, lambda auth, inbound: True, render_z,
+    )
+    registry.registrar("example").register_prompt_provider(
+        "alpha", "feedback", 19, lambda auth, inbound: True, render_a,
+    )
+    registry.freeze()
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert calls == ["a", "z"]
+    assert "DENIED-SECRET" not in prompt and "SHOULD-NOT-APPEAR" not in prompt
+    assert "## Plugin: alpha\n\néé" in prompt
+    assert "…[truncated]" in prompt
+    assert len(prompt.split("## Plugin: alpha\n\n", 1)[1].split("\n\n", 1)[0].encode()) <= 19
+    plugin_sources = [source for source in ctx.ifc_labels.sources if source.domain == "alpha"]
+    assert len(plugin_sources) == 1
+    assert plugin_sources[0].resource_id == str(admitted)
+    assert plugin_sources[0].integrity == Integrity.TRUSTED
+    assert plugin_sources[0].integrity_effect.value == "informational"
+    assert events.count(("plugin_prompt_over_cap", {"provider": "alpha"})) == 1
+    assert events.count(("plugin_prompt_read_refused", {"provider": "zeta"})) == 1
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_dynamic_each_turn_static_stable_and_failure_isolated(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    registry = PolicyRegistry()
+    counter = {"dynamic": 0, "static": 0}
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append(kind))
+
+    def dynamic(auth, inbound, reader):
+        counter["dynamic"] += 1
+        return f"dynamic-{counter['dynamic']}"
+
+    def stable(auth, inbound, reader):
+        counter["static"] += 1
+        return f"stable-{counter['static']}"
+
+    def broken(auth, inbound, reader):
+        raise RuntimeError("secret error text")
+
+    registrar = registry.registrar("example")
+    registrar.register_prompt_provider("dynamic", "self_state", 100, lambda a, e: True, dynamic)
+    registrar.register_prompt_provider("stable", "self_state", 100, lambda a, e: True, stable, static=True)
+    registrar.register_prompt_provider("broken", "self_state", 100, lambda a, e: True, broken)
+    registry.freeze()
+    with policy_scope(registry):
+        first, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+        second, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+    assert first.index("Plugin: dynamic") < first.index("Plugin: stable")
+    assert "dynamic-1" in first and "dynamic-2" in second
+    assert "stable-1" in first and "stable-1" in second
+    assert counter == {"dynamic": 2, "static": 1}
+    assert "secret error text" not in first
+    assert events.count("plugin_prompt_failed") == 2
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_logger_failure_does_not_break_rendering(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    registrar.register_prompt_provider("large", "feedback", 16, lambda a, e: True,
+                                       lambda a, e, reader: "é" * 30)
+    registrar.register_prompt_provider("refused", "feedback", 80, lambda a, e: True,
+                                       lambda a, e, reader: reader(tmp_path / "absent.md"))
+    registrar.register_prompt_provider("broken", "feedback", 80, lambda a, e: True,
+                                       lambda a, e, reader: 1 / 0)
+    registry.freeze()
+    seen = []
+
+    def unavailable(kind, **fields):
+        seen.append((kind, fields))
+        raise RuntimeError("logger unavailable")
+
+    monkeypatch.setattr(agent_module, "log_event_sync", unavailable)
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+    assert "## Plugin: large" in prompt
+    assert "## Plugin: refused" not in prompt and "## Plugin: broken" not in prompt
+    assert [kind for kind, _ in seen] == [
+        "plugin_prompt_failed", "plugin_prompt_over_cap", "plugin_prompt_read_refused",
+    ]
+    assert all(set(fields) == {"provider"} for _, fields in seen)
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_over_cap_reported_once_per_provider_across_agents(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    # Distinct names keep the process-global receipt independent of other tests.
+    for name in ("once_dynamic", "once_static"):
+        registrar.register_prompt_provider(name, "feedback", 19, lambda a, e: True,
+                                           lambda a, e, reader: "é" * 30, static=name.endswith("static"))
+    registrar.register_prompt_provider("once_small", "feedback", 100, lambda a, e: True,
+                                       lambda a, e, reader: "short")
+    registry.freeze()
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    with policy_scope(registry):
+        first_agent = _make_agent(tmp_path / "first")
+        first, _ = await first_agent._build_turn_prompt(_make_ctx(event), event, None)
+        second, _ = await first_agent._build_turn_prompt(_make_ctx(event), event, None)
+        second_agent = _make_agent(tmp_path / "second")
+        third, _ = await second_agent._build_turn_prompt(_make_ctx(event), event, None)
+    for prompt in (first, second, third):
+        assert prompt.count("…[truncated]") == 2
+        assert "## Plugin: once_small\n\nshort" in prompt
+    assert events == [("plugin_prompt_over_cap", {"provider": "once_dynamic"}),
+                      ("plugin_prompt_over_cap", {"provider": "once_static"})]
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_real_reader_omits_refused_text(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    denied = tmp_path / "attachments" / "inbound" / "payload.md"
+    denied.parent.mkdir(parents=True)
+    denied.write_text("PRIVATE-REFUSED-CONTENT", encoding="utf-8")
+    trusted = tmp_path / "skills" / "example" / "SKILL.md"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text("TRUSTED-CONTENT", encoding="utf-8")
+    registry = PolicyRegistry()
+
+    def render(auth, inbound, reader):
+        allowed = reader(trusted)
+        try:
+            reader(denied)
+        except ValueError:
+            pass
+        return allowed + " PRIVATE-REFUSED-CONTENT"
+
+    registry.registrar("example").register_prompt_provider(
+        "reader", "feedback", 100, lambda a, e: True, render,
+    )
+    registry.freeze()
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    ctx = _make_ctx(event)
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert "TRUSTED-CONTENT" not in prompt
+    assert "PRIVATE-REFUSED-CONTENT" not in prompt
+    assert all(source.domain != "reader" for source in ctx.ifc_labels.sources)
+    assert events == [("plugin_prompt_read_refused", {"provider": "reader"})]
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_and_resend_nudge_receive_live_turn_plugin_state(tmp_path, monkeypatch) -> None:
+    from dataclasses import dataclass
+    from langchain_core.messages import AIMessage
+    import mimir.agent as agent_module
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    registrar.register_state_slot(State)
+    registry.freeze()
+    agent = _make_agent(tmp_path)
+    agent._config = replace(
+        agent._config,
+        plugin_manager=SimpleNamespace(policy=registry, plugins=()),
+        resend_nudge_channels=("web:",),
+    )
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    parent = {}
+    original_prompt = agent._build_turn_prompt
+
+    async def update_before_graph(ctx, inbound, *args, **kwargs):
+        parent["turn"] = ctx
+        parent["ingress"] = ctx.auth_context
+        ctx.set_plugin_state(registrar, State("updated"))
+        return await original_prompt(ctx, inbound, *args, **kwargs)
+
+    monkeypatch.setattr(agent, "_build_turn_prompt", update_before_graph)
+
+    class Graph:
+        def __init__(self):
+            self.contexts = []
+
+        async def astream(self, state, *, config, context, stream_mode):
+            self.contexts.append(context)
+            yield {"messages": state["messages"] + [AIMessage(content="model reply")]}
+
+    graph = Graph()
+
+    async def build_graph():
+        return graph
+
+    monkeypatch.setattr(agent, "_build_agent_if_needed", build_graph)
+
+    async def ignore_event(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(agent_module, "log_event", ignore_event)
+    monkeypatch.setattr(agent_module, "safe_log_event", ignore_event)
+    # This test controls the nudge separately, after the regular graph handoff.
+    agent._config = replace(agent._config, resend_nudge_channels=())
+    with policy_scope(registry):
+        record = await agent.run_turn(event)
+    assert record.error is None
+    assert len(graph.contexts) == 1
+    assert graph.contexts[0].plugin_state("example") == State("updated")
+    assert parent["ingress"].plugin_state("example") is None
+    assert parent["turn"].plugin_state("example") == State("updated")
+
+    other = _make_ctx(event)
+    assert other.plugin_state("example") is None
+    agent._config = replace(agent._config, resend_nudge_channels=("web:",))
+    monkeypatch.setattr(agent, "_harness_sink_allowed", lambda *args: True)
+
+    turn = parent["turn"]
+    turn.set_plugin_state(registrar, State("nudge"))
+    turn.delivered_channel_ids.clear()
+    await agent._maybe_resend_nudge(
+        graph, {}, turn, event, turn_id=turn.turn_id,
+        turn_is_interactive=True, messages=[], events=[], output="model reply",
+    )
+    assert len(graph.contexts) == 2
+    assert graph.contexts[1].plugin_state("example") == State("nudge")
+    assert graph.contexts[0].plugin_state("example") == State("updated")
+    assert graph.contexts[1] is not graph.contexts[0]
+    assert parent["ingress"].plugin_state("example") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("section,label", [
+    ("channel_memory", "Channel context"),
+    ("feedback", "Recent feedback signals"),
+    ("core_proposals", "Open change proposals"),
+    ("session_summaries", "Recent session summaries"),
+    ("usage", "Resource usage"),
+    ("upcoming", "Upcoming"),
+    ("commitments", "Upcoming commitments"),
+    ("self_state", "Self-state"),
+])
+async def test_plugin_prompt_inserts_after_each_fixed_section(
+    tmp_path, monkeypatch, section, label, present,
+) -> None:
+    from mimir import core_blocks, proposals
+    from mimir.history import Message
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    sections = (
+        ("channel_memory", "Channel context"),
+        ("feedback", "Recent feedback signals"),
+        ("core_proposals", "Open change proposals"),
+        ("session_summaries", "Recent session summaries"),
+        ("usage", "Resource usage"),
+        ("upcoming", "Upcoming"),
+        ("commitments", "Upcoming commitments"),
+        ("self_state", "Self-state"),
+    )
+    fixed = {name: f"FIXED-CONTENT:{name}" for name, _ in sections}
+    if not present:
+        fixed[section] = None
+
+    def fixed_block(name):
+        return _domain_block(fixed[name], name) if fixed[name] else None
+
+    ctx.turn_scratch_path = tmp_path / "scratch" / "turns" / ctx.turn_id
+    monkeypatch.setattr(core_blocks, "load_channel_memory", lambda *args: fixed["channel_memory"])
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *args: fixed_block("feedback"))
+    agent._config = replace(agent._config, feedback_limit_per_polarity=1)
+    monkeypatch.setattr(proposals, "render_open_proposals_block", lambda *args: fixed["core_proposals"])
+
+    async def summaries(**kwargs):
+        return fixed_block("session_summaries")
+
+    monkeypatch.setattr(agent, "_assemble_session_summaries", summaries)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *args: (fixed_block("usage"), []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *args: fixed_block("upcoming"))
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda **kwargs: fixed_block("commitments"))
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *args, **kwargs: fixed_block("self_state"))
+    recent = Message(
+        ts="2026-09-25T12:00:00+00:00", msg_id="prior", channel_id="web:one",
+        author="operator", author_display="Operator", kind="user",
+        content="NEXT-RECENT-CONTENT", source="web",
+    )
+    monkeypatch.setattr(agent, "_select_recent_activity", lambda *args: (
+        [recent], (_domain_block("NEXT-RECENT-CONTENT", "recent_activity"),),
+    ))
+    registry = PolicyRegistry()
+    calls = []
+
+    def render(name):
+        def callback(auth, inbound, reader):
+            calls.append(name)
+            return f"BODY-{name}"
+        return callback
+
+    registrar = registry.registrar("example")
+    for name in ("zeta", "alpha"):
+        registrar.register_prompt_provider(name, section, 80, lambda a, e: True, render(name))
+    registry.freeze()
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert calls == ["alpha", "zeta"]
+    plugin_start = prompt.index("## Plugin: alpha\n\nBODY-alpha")
+    assert plugin_start < prompt.index("## Plugin: zeta\n\nBODY-zeta")
+    target = f"## {label}\n\nFIXED-CONTENT:{section}"
+    assert (target in prompt) is present
+    if present:
+        assert prompt.index(target) < plugin_start
+    position = [name for name, _ in sections].index(section)
+    previous = (
+        f"## {sections[position - 1][1]}\n\nFIXED-CONTENT:{sections[position - 1][0]}"
+        if position else "## Current turn scratch"
+    )
+    following = (
+        f"## {sections[position + 1][1]}\n\nFIXED-CONTENT:{sections[position + 1][0]}"
+        if position < len(sections) - 1 else "## Recent activity\n\n"
+    )
+    assert prompt.index(previous) < plugin_start < prompt.index(following)
+
+    # use() must retain the same ordered provenance as the rendered fixed blocks.
+    # Recent activity is loaded ahead of the fixed sections, so it is not part of
+    # the eight-section use() order even though it renders after self-state.
+    fixed_domains = {name for name, _ in sections} | {"proposals"}
+    sources = [source for source in ctx.ifc_labels.sources
+               if source.domain in fixed_domains | {"alpha", "zeta"}]
+    expected_domains = []
+    for name, _ in sections:
+        if fixed[name]:
+            expected_domains.append("proposals" if name == "core_proposals" else name)
+        if name == section:
+            expected_domains.extend(("alpha", "zeta"))
+    assert [source.domain for source in sources] == expected_domains
+    assert [(source.resource_id, source.integrity, source.integrity_effect)
+            for source in sources if source.domain in {"alpha", "zeta"}] == [
+        (f"plugin:example:{name}", Integrity.TRUSTED, "informational")
+        for name in ("alpha", "zeta")
+    ]
+
+
+def _domain_block(content: str, domain: str) -> PromptBlock:
+    return PromptBlock(
+        content,
+        InformationFlowLabels().with_source(SourceLabel(
+            principal="operator",
+            domain=domain,
+            resource_id=f"test:{domain}",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"operator"}),
+            source_kind="protected_prompt",
+        )),
+    )
+
+
+def test_anthropic_turn_breakpoint_preserves_system_middleware_and_other_providers():
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.messages import SystemMessage
+    from langchain_anthropic.middleware.prompt_caching import _tag_system_message
+
+    prompt = "## Channel context\n\nnotes\n\n## Current message\n\n| event"
+    stable = "## Channel context\n\nnotes\n\n"
+    anthropic = ChatAnthropic(model="claude-sonnet-4-5", api_key="test-key")
+    message = _turn_human_message(prompt, stable, anthropic)
+    assert len(message.content_blocks) == 2
+    first, second = message.content_blocks
+    assert first == {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}
+    assert second == {"type": "text", "text": prompt[len(stable):]}
+    assert "".join(block["text"] for block in message.content_blocks) == prompt
+    # DeepAgents' existing middleware still owns the system-prompt breakpoint.
+    system = _tag_system_message(SystemMessage(content="system instructions"),
+                                 {"type": "ephemeral", "ttl": "5m"})
+    assert system.content_blocks[-1]["cache_control"]["type"] == "ephemeral"
+    for model in (FakeListChatModel(responses=["ok"]), None):
+        assert _turn_human_message(prompt, stable, model).content == prompt
+    assert _turn_human_message(prompt, "", anthropic).content == prompt
+    # Wrapping/prepending must never silently drop bytes at an unrelated offset.
+    for wrapped in ("wrapper\n" + prompt, "different prompt"):
+        assert _turn_human_message(wrapped, stable, anthropic).content == wrapped
+
+
+@pytest.mark.asyncio
+async def test_anthropic_request_cache_marker_budget_with_tool_followup(monkeypatch):
+    from deepagents import create_deep_agent
+    from deepagents.backends import StateBackend
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.tools import tool
+
+    payloads = []
+
+    @tool
+    def cache_probe() -> str:
+        """Return a fixed observation for the follow-up request."""
+        return "observed"
+
+    async def capture(self, payload):
+        # Capture at the API boundary, after DeepAgents and LangChain rendering.
+        import copy
+        payloads.append(copy.deepcopy(payload))
+        first = len(payloads) == 1
+        response = {
+            "id": f"msg-{len(payloads)}", "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": ([{"type": "tool_use", "id": "probe-1",
+                         "name": "cache_probe", "input": {}}] if first
+                        else [{"type": "text", "text": "done"}]),
+            "stop_reason": "tool_use" if first else "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+        }
+        from anthropic.types import Message
+        return SimpleNamespace(parse=lambda: Message.model_validate(response))
+
+    monkeypatch.setattr(ChatAnthropic, "_acreate", capture)
+    model = ChatAnthropic(model="claude-sonnet-4-5", api_key="test-key")
+    graph = create_deep_agent(
+        model=model, tools=[cache_probe], system_prompt="stable system instructions",
+        backend=StateBackend(),
+    )
+    stable = "## Skill: cache\n\nStable instructions\n\n"
+    prompt = stable + "## Current message\n\nrun cache_probe"
+    await graph.ainvoke({"messages": [_turn_human_message(prompt, stable, model)]})
+    assert len(payloads) == 2
+
+    def markers(value):
+        if isinstance(value, dict):
+            return int("cache_control" in value) + sum(markers(v) for v in value.values())
+        if isinstance(value, list):
+            return sum(map(markers, value))
+        return 0
+
+    for payload in payloads:
+        assert 1 <= markers(payload) <= 4
+        assert payload["cache_control"]["type"] == "ephemeral"
+        assert markers(payload["system"]) == 1
+        assert markers(payload["tools"]) == 1
+        turn = payload["messages"][0]
+        assert turn["role"] == "user"
+        assert markers(turn) == 1
+        assert turn["content"][0]["text"] == stable
+        assert turn["content"][0]["cache_control"]["type"] == "ephemeral"
+        assert "cache_control" not in turn["content"][1]
+    assert payloads[1]["messages"][-1]["content"][0]["type"] == "tool_result"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["ch-cache", "poller:cache"])
+async def test_agent_turns_keep_same_prefix_after_recent_activity_and_scratch_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str,
+) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    agent._config.recent_boundaries = 3
+    agent._config.access_control_enforced = True
+    channel_dir = tmp_path / "memory" / "channels" / channel
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("persistent channel context")
+    # Exercise the real skill resolver and trusted delivery/authority derivation.
+    skill = tmp_path / "skills" / "cache"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: cache\n---\nstable skill instructions")
+    (skill / "pollers.json").write_text(json.dumps({"pollers": [{"name": "cache"}]}))
+    agent._channels = SimpleNamespace(find=lambda channel: object())
+    authority = replace(build_trigger_service_principal(
+        canonical="cache-poller", trigger="poller", profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("read_file",),
+        creation_path="test",
+    ), configured_delivery_channel="slack-ops")
+    # Use the actual SAGA reader, summary renderer and JSONL turn counter.
+    # A constant summary stub hid the per-turn count/age churn in the old test.
+    from datetime import timedelta
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    boundary_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    _insert_session_boundary(
+        conn, session_id="cache-boundary", channel_id=channel,
+        summary="completed session", reflected_at=boundary_at.isoformat(),
+    )
+    conn.execute(
+        "INSERT INTO atoms "
+        "(id, content, content_hash, source_type, metadata, created_at, "
+        "owner_principal, visibility) VALUES "
+        "('cache-tip', 'stable learning', 'cache-tip-hash', 'skill_learning', ?, ?, "
+        "'service:cache-poller', 'public')",
+        (json.dumps({"skill": "cache", "kind": "tip"}), boundary_at.isoformat()),
+    )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._saga_store = SimpleNamespace(run_locked_read=lambda fn: fn(conn))
+    pairs = []
+    for number in (1, 2):
+        event = AgentEvent(
+            trigger="poller" if channel.startswith("poller:") else "user_message",
+            channel_id=channel, author="alice",
+            source="web", content=f"new event {number}",
+            extra={"event_ts_iso": f"2026-10-2{number}T12:00:00Z"},
+        )
+        ctx = _make_ctx(event)
+        if event.trigger == "poller":
+            ctx.auth_context = replace(
+                ctx.auth_context, principal=authority.canonical,
+                canonical_principal=authority.canonical, is_service=True,
+                service_authority=authority, enforcement_enabled=True,
+            )
+        ctx.turn_id = f"turn-{number}"
+        ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
+        prefix: list[str] = []
+        prompt, _ = await agent._build_turn_prompt(
+            ctx, event, saga_block=f"recall {number}",
+            stable_prefix_out=prefix,
+        )
+        pairs.append((prefix[0], prompt))
+        await agent._buffer.append(agent._buffer.make_message(
+            channel_id=channel, kind="user_message", content=f"recent {number}",
+            author="alice", msg_id=f"msg-{number}", source="web",
+        ))
+        with agent._config.turns_log.open("a") as log:
+            log.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "channel_id": channel, "turn_id": ctx.turn_id,
+            }) + "\n")
+        # Match the production writer's invalidation without sleeping for TTL.
+        agent._turns_snapshot.invalidate()
+    conn.close()
+    assert "0 turns this channel" in pairs[0][1]
+    assert "1 turn this channel" in pairs[1][1]
+    assert pairs[0][0] == pairs[1][0]
+    assert pairs[0][1].startswith(pairs[0][0])
+    assert pairs[1][1].startswith(pairs[1][0])
+    if channel.startswith("poller:"):
+        assert re.findall(r"(?m)^## (.+)$", pairs[0][0]) == [
+            "Trigger channel", "Delivery", "Autonomous trigger authority", "Skill: cache",
+            "Learnings from past runs",
+        ]
+        assert "stable skill instructions" in pairs[0][0]
+        assert "- [tip] stable learning" in pairs[0][0]
+        assert "slack-ops" in pairs[0][0]
+    else:
+        assert pairs[0][0] == "## Channel context\n\npersistent channel context\n\n"
+    assert "completed session" not in pairs[0][0]
+    assert "completed session" in pairs[0][1]
+    assert "recent 1" not in pairs[1][0]
+    if not channel.startswith("poller:"):
+        assert "recent 1" in pairs[1][1]
+    assert pairs[0][1][len(pairs[0][0]):] != pairs[1][1][len(pairs[1][0]):]
+
+
+@pytest.mark.asyncio
+async def test_reordering_preserves_mixed_turn_blocks_and_ifc_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.models import IntegrityEffect
+
+    agent = _make_agent(tmp_path)
+    channel_dir = tmp_path / "memory" / "channels" / "ch-mixed"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("stable channel facts")
+    recent = agent._buffer.make_message(
+        channel_id="ch-mixed", kind="user_message", content="untrusted recent",
+        author="alice", msg_id="prior", source="web", integrity=Integrity.UNTRUSTED,
+    )
+    await agent._buffer.append(recent)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_: _block("feedback"))
+    monkeypatch.setattr(agent, "_assemble_session_summaries",
+                        lambda **_: asyncio.sleep(0, result=_block("old summary")))
+    monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel",
+                        lambda *_args, **_kwargs: ("feed", "skill instructions"))
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-mixed", author="alice", source="web",
+        content="untrusted trigger", extra={"event_ts_iso": "2026-10-23T12:00:00Z"},
+    )
+    recall_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice", domain="saga", resource_id="atom:one",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), source_kind="auto_recall",
+        integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.INFORMATIONAL,
+    ))
+    auth = replace(_make_ctx(event).auth_context, roles=("admin",))
+    agent._config.feedback_limit_per_polarity = 1
+    # Eliminate ambient telemetry so the exact provenance expectation is fixed.
+    for assembler in ("_assemble_usage_block", "_assemble_upcoming_block",
+                      "_assemble_commitments_block", "_assemble_self_state_block"):
+        monkeypatch.setattr(agent, assembler, lambda *a, **kw: None)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *a: (None, []))
+    monkeypatch.setattr("mimir.proposals.render_open_proposals_block", lambda *a: None)
+    ctx = _make_ctx(event)
+    ctx.auth_context = auth
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
+    stable_text, _ = await agent._build_turn_prompt(
+        ctx, event, "untrusted recall", initial_auth_context=auth,
+        saga_labels=recall_labels,
+    )
+    stable_labels = ctx.ifc_labels
+    expected_sources = {
+        ctx_source for ctx_source in _make_ctx(event).ifc_labels.sources
+    } | {
+        _prompt_source_labels(
+            auth, domain="recent_activity", resource="message:prior",
+            channel_id="ch-mixed", principal="alice", bridge="web",
+            source_kind="recent_activity_user", self_authored=False,
+        ).sources[0],
+        _prompt_source_labels(
+            auth, domain="channel_memory", resource="memory/channels/ch-mixed",
+            channel_id="ch-mixed", bridge="web", self_authored=True,
+        ).sources[0],
+        _block("feedback").labels.sources[0],
+        recall_labels.sources[0],
+        _prompt_source_labels(
+            auth, domain="skills", resource="skill:feed", principal="alice",
+            self_authored=True,
+        ).sources[0],
+    }
+    assert set(stable_labels.sources) == expected_sources
+    assert stable_labels.labels == frozenset({"private"})
+    for heading in ("Channel context", "Recent session summaries", "Skill: feed",
+                    "Recent activity", "Possibly relevant memories (from SAGA)",
+                    "▶ Current message — respond to this", "Current turn scratch"):
+        assert f"## {heading}" in stable_text
+    assert "| untrusted trigger" in stable_text
+    assert "| untrusted recent" in stable_text
+
+
+@pytest.mark.asyncio
+async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.feedback_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-order", content="hello",
+        author="operator", source="web",
+        extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
+    auth = ctx.auth_context
+    blocks = {
+        name: _domain_block(name.upper(), name)
+        for name in (
+            "feedback", "proposals", "sessions", "usage", "upcoming",
+            "commitments", "self_state",
+        )
+    }
+
+    monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: "CHANNEL")
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_args: blocks["feedback"])
+    monkeypatch.setattr("mimir.proposals.render_open_proposals_block", lambda *_args: "PROPOSALS")
+    monkeypatch.setattr(
+        agent, "_assemble_session_summaries",
+        lambda **_kwargs: asyncio.sleep(0, result=blocks["sessions"]),
+    )
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *_args: (blocks["usage"], []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *_args: blocks["upcoming"])
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda **_kwargs: blocks["commitments"])
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *_args, **_kwargs: blocks["self_state"])
+    monkeypatch.setattr(
+        "mimir.skill_resolver.find_skill_for_channel",
+        lambda *_args, **_kwargs: ("ordered-skill", "SKILL"),
+    )
+
+    prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block="SAGA", initial_auth_context=auth,
+    )
+    expected = build_turn_prompt(
+        event,
+        recent_messages=[],
+        saga_block="SAGA",
+        recent_message_chars=agent._config.recent_message_chars,
+        resolver=agent._buffer.resolver,
+        feedback_block="FEEDBACK",
+        core_proposals_block="PROPOSALS",
+        session_summaries_block="SESSIONS",
+        usage_block="USAGE",
+        upcoming_block="UPCOMING",
+        commitments_block="COMMITMENTS",
+        self_state_block="SELF_STATE",
+        auto_skill_block=("ordered-skill", "SKILL"),
+        saga_session_id=ctx.saga_session_id,
+        channel_memory_block="CHANNEL",
+        turn_scratch_path=str(tmp_path / "scratch" / "turns" / ctx.turn_id),
+    )
+
+    assert prompt == expected
+    assert recent == []
+    assert [source.domain for source in ctx.ifc_labels.sources] == [
+        "channel", "channel_memory", "feedback", "proposals", "sessions",
+        "usage", "upcoming", "commitments", "self_state", "saga", "skills",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rendezvous needs six default-executor threads: run with at least two CPUs."""
+    agent = _make_agent(tmp_path)
+    agent._config.feedback_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-overlap", content="hello",
+        author="operator", source="web",
+        extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    from tests.timing import HANG_GUARD_SECONDS
+
+    lock = threading.Lock()
+    all_entered = threading.Event()
+    entered = 0
+    completed = 0
+
+    def enter():
+        nonlocal entered
+        with lock:
+            entered += 1
+            if entered == 7:
+                all_entered.set()
+
+    def complete():
+        nonlocal completed
+        with lock:
+            completed += 1
+
+    def slow_sync(*_args, **_kwargs):
+        enter()
+        # No loader can return before all seven have entered. Gathering just
+        # a subset then awaiting the rest serially cannot pass this rendezvous.
+        assert all_entered.wait(2 * HANG_GUARD_SECONDS)
+        complete()
+        return None
+
+    async def slow_async(**_kwargs):
+        enter()
+        while not all_entered.is_set():
+            await asyncio.sleep(0)
+        complete()
+        return None
+
+    monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: None)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", slow_sync)
+    monkeypatch.setattr("mimir.proposals.render_open_proposals_block", slow_sync)
+    monkeypatch.setattr(agent, "_assemble_session_summaries", slow_async)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *_args: (slow_sync(), []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *_args: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", slow_sync)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", slow_sync)
+    monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel", slow_sync)
+
+    try:
+        await asyncio.wait_for(
+            agent._build_turn_prompt(ctx, event, saga_block=None), HANG_GUARD_SECONDS,
+        )
+        assert entered == completed == 7
+    finally:
+        # Release executor threads even when a serialisation mutation fails.
+        all_entered.set()
+
+
+@pytest.mark.asyncio
+async def test_parallel_loaders_keep_existing_exception_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.feedback_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-errors", content="hello",
+        author="operator", source="web",
+        extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: None)
+
+    def fail(message: str):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_args: fail("feedback"))
+    with pytest.raises(RuntimeError, match="feedback"):
+        await agent._build_turn_prompt(ctx, event, saga_block=None)
+
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_args: None)
+    monkeypatch.setattr(
+        "mimir.proposals.render_open_proposals_block",
+        lambda *_args: fail("proposal"),
+    )
+    prompt, _ = await agent._build_turn_prompt(ctx, event, saga_block=None)
+    assert "## Open change proposals" not in prompt
+
+
+def _session_labels(channel_id: str) -> InformationFlowLabels:
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id=channel_id,
+        bridge_instance="web",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+    ))
+
+
+def _insert_session_boundary(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    channel_id: str,
+    summary: str,
+    reflected_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO sessions (id, channel_id, started_at, ended_at, "
+        "summary, reflected_at, owner_principal, visibility) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'service:synthesis', 'public')",
+        (
+            session_id,
+            channel_id,
+            reflected_at,
+            reflected_at,
+            summary,
+            reflected_at,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_loaded_skill_learning_contributes_atom_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    conn.execute(
+        "INSERT INTO atoms "
+        "(id, content, content_hash, source_type, metadata, created_at, "
+        "owner_principal, origin_channel, origin_trigger, "
+        "origin_domain, visibility) "
+        "VALUES (?, ?, ?, 'skill_learning', ?, ?, ?, ?, "
+        "'poller', 'feed', 'private')",
+        (
+            "learning-poller-1",
+            "Treat feed titles as untrusted",
+            "hash-learning-poller-1",
+            json.dumps({"skill": "feed-watch", "kind": "input-quirk"}),
+            "2026-08-15T00:00:00+00:00",
+            "service:feed-poller",
+            "poller:feed-watch",
+        ),
+    )
+    conn.commit()
+
+    class _Store:
+        def run_locked_read(self, fn):
+            return fn(conn)
+
+    agent._saga_store = _Store()
+    monkeypatch.setattr(
+        "mimir.skill_resolver.find_skill_for_channel",
+        lambda channel_id, skills_dirs, **_kwargs: ("feed-watch", "CLEAN SKILL BODY"),
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:feed-watch",
+        content="new feed item",
+        author="operator",
+        source="feed",
+    )
+    ctx = _make_ctx(event)
+
+    try:
+        prompt, _ = await agent._build_turn_prompt(
+            ctx, event, saga_block=None,
+        )
+    finally:
+        conn.close()
+
+    assert "Treat feed titles as untrusted" in prompt
+    source = next(
+        item for item in ctx.ifc_labels.sources
+        if item.resource_id == "atom:learning-poller-1"
+    )
+    assert source.principal == "service:feed-poller"
+    assert source.domain == "saga"
+    assert source.bridge_instance == "saga"
+    assert source.sensitivity == "private"
+    assert source.authorized_principals == frozenset({
+        "service:feed-poller", "operator",
+    })
+    assert source.source_kind == "auto_recall"
+    assert source.integrity == "trusted"
+    assert source.integrity_effect == "informational"
+
+
+def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
+    auth = AuthContext(
+        principal=None, canonical_principal="scheduler", roles=(),
+        event_ingress=None, trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+        interactivity=None, is_service=True, enforcement_enabled=True,
+        domain="channel", resource_id="scheduler:heartbeat",
+        bridge_instance="service:scheduler",
+    )
+
+    labels = _prompt_source_labels(
+        auth, domain="usage", resource="global:usage", principal="service:mimir",
+        self_authored=False,
+    )
+
+    assert {source.authorized_principals for source in labels.sources} == {
+        frozenset({"service:scheduler"})
+    }
+
+
+@pytest.mark.asyncio
+async def test_channel_less_untrusted_recent_activity_is_refused_at_sink(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-current", content="now",
+        author="alice", source="discord",
+    )
+    legacy = agent._buffer.make_message(
+        channel_id="", kind="user_message", content="legacy unbound message",
+        author="alice", msg_id="legacy-message", source="discord",
+        integrity=Integrity.UNTRUSTED,
+    )
+    await agent._buffer.append(legacy)
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-current",
+        interactivity=None, enforcement_enabled=True, domain="channel",
+        resource_id="ch-current", bridge_instance="discord",
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = auth
+
+    prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+
+    assert "legacy unbound message" not in prompt
+    assert legacy not in recent
+    assert all(
+        item.resource_id != "message:legacy-message"
+        for item in ctx.ifc_labels.sources
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_authored_framework_prompt_sources_remain_sink_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.identities import Identity
+
+    agent = _make_agent(tmp_path)
+    core_dir = tmp_path / "memory" / "core"
+    core_dir.mkdir(parents=True)
+    (core_dir / "00-identity.md").write_text("CORE IDENTITY SENTINEL")
+    channel_dir = tmp_path / "memory" / "channels" / "ch-current"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("CHANNEL MEMORY SENTINEL")
+
+    class _Resolver:
+        def resolve(self, author):
+            return "alice" if author == "alice-alias" else author
+
+        def all_identities(self):
+            return [Identity(
+                canonical="alice", display_name="Alice",
+                aliases=["alice-alias"],
+            )]
+
+        def display_name(self, author):
+            return "Alice" if self.resolve(author) == "alice" else None
+
+        def resolve_channel(self, channel_id):
+            return None
+
+    agent._buffer.resolver = _Resolver()
+    recent_message = agent._buffer.make_message(
+        channel_id="ch-current", kind="user_message",
+        content="trusted recent reply", author="alice-alias",
+        msg_id="trusted-message", source="discord", integrity=Integrity.TRUSTED,
+    )
+    await agent._buffer.append(recent_message)
+    monkeypatch.setattr(
+        "mimir.skill_resolver.find_skill_for_channel",
+        lambda channel_id, skills_dirs, **_kwargs: ("framework-skill", "SKILL SENTINEL"),
+    )
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-current", content="now",
+        author="alice", source="discord",
+    )
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-current",
+        interactivity=None, enforcement_enabled=True, domain="channel",
+        resource_id="ch-current", bridge_instance="discord",
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = auth
+
+    system_prompt = agent._build_system_prompt(emit_health_events=False)
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block="SAGA SENTINEL", initial_auth_context=auth,
+    )
+
+    assert "CORE IDENTITY SENTINEL" in system_prompt
+    for sentinel in (
+        "CHANNEL MEMORY SENTINEL", "SKILL SENTINEL", "SAGA SENTINEL",
+    ):
+        assert sentinel in turn_prompt
+    framework_domains = {"channel_memory", "identities", "saga", "skills"}
+    framework_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain in framework_domains
+    ]
+    assert {source.domain for source in framework_sources} == framework_domains
+    assert all(source.integrity == Integrity.TRUSTED for source in framework_sources)
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", event.channel_id, ctx.ifc_labels, sink_auth,
+        enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+def test_agent_system_prompt_guidance_tracks_enforcement_flag(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+
+    agent._config.access_control_enforced = False
+    assert "## Access-control enforcement" not in agent._build_system_prompt()
+
+    agent._config.access_control_enforced = True
+    prompt = agent._build_system_prompt()
+    assert "## Access-control enforcement" in prompt
+    assert "the gate enforces these rules regardless of model compliance" in prompt
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_authority_guidance_renders_only_under_enforcement(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import builtin_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    authority = builtin_trigger_service_principal("heartbeat", tmp_path)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="tick",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = AuthContext(
+        principal=authority.canonical,
+        canonical_principal=authority.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=True,
+    )
+
+    agent._config.access_control_enforced = True
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+    assert "## Autonomous trigger authority" in prompt
+    assert "profile: ``heartbeat``" in prompt
+    assert "``fetch_url`` may reach this profile's approved exact URLs and URL scopes" in prompt
+    assert "scoped URLs require a clean turn" in prompt
+
+    agent._config.access_control_enforced = False
+    shadow_prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+    assert "## Autonomous trigger authority" not in shadow_prompt
+
+
+@pytest.mark.asyncio
+async def test_delivery_uses_trusted_poller_configuration_in_shadow_mode(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    agent._channels = type("Channels", (), {"find": lambda self, channel: object()})()
+    authority = build_trigger_service_principal(
+        canonical="configured-poller",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=(),
+        creation_path="test",
+    )
+    authority = replace(
+        authority, configured_delivery_channel="slack-ops",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:configured",
+        content="new item",
+        extra={"deliver": "slack-forged"},
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = AuthContext(
+        principal=authority.canonical,
+        canonical_principal=authority.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=False,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+
+    assert "## Delivery" in prompt
+    assert "slack-ops" in prompt
+    assert "slack-forged" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_http_delivery_extra_is_not_rendered(tmp_path: Path) -> None:
+    from mimir.http_ingress import (
+        HTTP_EVENT_INGRESS_EXTRA_KEY,
+        HTTP_EVENT_INGRESS_EXTRA_VALUE,
+    )
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="web-alice",
+        content="summarize my recent messages",
+        author="alice",
+        extra={
+            "deliver": "slack-C0PRIVATE",
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        },
+    )
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+
+    assert "## Delivery" not in prompt
+    assert "slack-C0PRIVATE" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_poller_authority_guidance_matches_granted_capabilities(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    agent._config.access_control_enforced = True
+    authority = build_trigger_service_principal(
+        canonical="github-poller",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("read_file", "worklink_run"),
+        creation_path="test",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github",
+        content="new issue",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = AuthContext(
+        principal=authority.canonical,
+        canonical_principal=authority.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=True,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, initial_auth_context=auth,
+    )
+
+    assert "profile: ``github``; tier ``code-execution``" in prompt
+    assert "Available capabilities: ``read_file``, ``worklink_run``" in prompt
+    assert "``fetch_url`` is not available to this trigger" in prompt
+    assert "``web_search`` is not available to this trigger" in prompt
+
+
+# ─── User-message branch ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_turn_prompt_emits_labeled_sections(tmp_path: Path) -> None:
+    """The standard turn-prompt path renders the labeled section
+    headers that ``build_turn_prompt`` produces for the inputs it's
+    given. ``## Today's date`` is always present (per build_turn_prompt
+    contract). The current-event header — ``## Current event``
+    surrogate for the user-message branch — surfaces the inbound
+    body. The synthesis branch must NOT fire here.
+    """
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-1",
+        content="hello mimir",
+        author="user-1",
+    )
+    ctx = _make_ctx(event)
+    turn_prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block=None,
+    )
+    # The user-side body is in the prompt (proof we wired through
+    # build_turn_prompt rather than echoing event.content alone).
+    assert "hello mimir" in turn_prompt
+    # build_turn_prompt always emits ``## Today's date`` — it's the
+    # one header that's not conditional on optional block content.
+    assert "## Today's date" in turn_prompt
+    # Synthesis branch did NOT fire — the synthesis template is
+    # markedly different (its body starts with the saga_session
+    # summary scaffold, no event header).
+    assert "Mark each atom" not in turn_prompt  # synthesis-template phrase
+    # No recent messages in the freshly-instantiated buffer.
+    assert recent == []
+
+
+@pytest.mark.asyncio
+async def test_build_turn_prompt_surfaces_saga_block(
+    tmp_path: Path,
+) -> None:
+    """When the pre-message SAGA hook supplies a block, it appears in
+    the prompt under its canonical label.
+    Verifies the wiring from ``_run_turn_body`` → ``_build_turn_prompt``
+    actually threads those args through (181-H regression: pre-fix
+    they were discarded and only ``event.content`` made it through).
+    """
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-2",
+        content="what's the topic?",
+    )
+    ctx = _make_ctx(event)
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event,
+        saga_block="- atom-foo: prior fact",
+    )
+    assert "## Possibly relevant memories (from SAGA)" in turn_prompt
+    assert "atom-foo: prior fact" in turn_prompt
+    assert "## Subagent updates" not in turn_prompt
+
+
+# ─── Synthesis branch ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
+    tmp_path: Path,
+) -> None:
+    """``trigger='saga_session_end'`` must route through
+    ``_build_synthesis_prompt`` (which loads the saga_session_end
+    template), NOT the standard build_turn_prompt path."""
+    agent = _make_agent(tmp_path)
+    agent._config.turns_log.write_text(json.dumps({
+        "turn_id": "turn-session",
+        "ts": "2026-06-28T05:30:00+00:00",
+        "saga_session_id": "sess-xyz",
+        "channel_id": "ch-3",
+        "output": "session content",
+        "integrity": "trusted",
+    }))
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="ch-3",
+        content="(unused)",
+        extra={"saga_session_id": "sess-xyz"},
+        ifc_labels=_session_labels("ch-3"),
+    )
+    ctx = _make_ctx(event, saga_session_id="sess-xyz")
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
+    turn_prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block=None,
+    )
+    # The synthesis template carries the session id verbatim
+    # (placeholder ``{saga_session_id}`` is filled by render).
+    assert "sess-xyz" in turn_prompt
+    assert f"`{tmp_path}/scratch/turns/turn-test/`" in turn_prompt
+    # The standard-turn ``## Today's date`` header should NOT be
+    # present — synthesis uses its own scaffold.
+    assert "## Today's date" not in turn_prompt
+    # No recent list when synthesis branch fires.
+    assert recent == []
+    assert event.ifc_labels is not None
+    assert all(source in ctx.ifc_labels.sources for source in event.ifc_labels.sources)
+
+
+# ─── Direct synthesis prompt builder ────────────────────────────────
+
+
+def test_filter_session_turns_uses_turn_record_ts_for_window_break(
+    tmp_path: Path,
+) -> None:
+    """Session-window filtering must use turns.jsonl's canonical ``ts``
+    field. A regression that looks only for ``timestamp`` still returns the
+    matching records, but never hits the time-based break and scans the full
+    file tail on every synthesis turn.
+    """
+    turns_path = tmp_path / "turns.jsonl"
+    records = [
+        {
+            "turn_id": "too-old-match",
+            "ts": "2026-06-28T05:00:00+00:00",
+            "saga_session_id": "sess-1",
+            "channel_id": "ch-1",
+            "integrity": "trusted",
+        },
+        {
+            "turn_id": "old-nonmatch",
+            "ts": "2026-06-28T05:05:00+00:00",
+            "saga_session_id": "other",
+        },
+        {
+            "turn_id": "recent-match-1",
+            "ts": "2026-06-28T05:30:00+00:00",
+            "saga_session_id": "sess-1",
+            "channel_id": "ch-1",
+            "integrity": "trusted",
+        },
+        {
+            "turn_id": "recent-match-2",
+            "ts": "2026-06-28T05:31:00+00:00",
+            "saga_session_id": "sess-1",
+            "channel_id": "ch-1",
+            "integrity": "trusted",
+        },
+        {
+            "turn_id": "newest-nonmatch",
+            "ts": "2026-06-28T05:32:00+00:00",
+            "saga_session_id": "other",
+        },
+    ]
+    turns_path.write_text("\n".join(json.dumps(r) for r in records))
+
+    filtered = _filter_session_turns(
+        turns_path, "sess-1", channel_id="ch-1", idle_minutes=10,
+    )
+
+    assert [rec["turn_id"] for rec in filtered] == [
+        "recent-match-1",
+        "recent-match-2",
+    ]
+
+
+def test_filter_session_turns_rejects_foreign_channel_with_same_session_id(
+    tmp_path: Path,
+) -> None:
+    turns_path = tmp_path / "turns.jsonl"
+    records = [
+        {
+            "turn_id": "foreign",
+            "ts": "2026-06-28T05:30:00+00:00",
+            "saga_session_id": "sess-known",
+            "channel_id": "ch-foreign",
+            "output": "foreign secret",
+            "integrity": "trusted",
+        },
+        {
+            "turn_id": "own",
+            "ts": "2026-06-28T05:31:00+00:00",
+            "saga_session_id": "sess-known",
+            "channel_id": "ch-own",
+            "output": "own content",
+            "integrity": "trusted",
+        },
+    ]
+    turns_path.write_text("\n".join(json.dumps(record) for record in records))
+
+    filtered = _filter_session_turns(
+        turns_path, "sess-known", channel_id="ch-own",
+    )
+
+    assert [record["turn_id"] for record in filtered] == ["own"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_session_synthesis_uses_only_clean_turns(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    turns_path = agent._config.turns_log
+    records = [
+        {
+            "turn_id": "clean-before",
+            "ts": "2026-08-30T10:00:00+00:00",
+            "saga_session_id": "sess-mixed",
+            "channel_id": "ch-1",
+            "integrity": "trusted",
+            "output": "keep this clean fact",
+        },
+        {
+            "turn_id": "tainted",
+            "ts": "2026-08-30T10:01:00+00:00",
+            "saga_session_id": "sess-mixed",
+            "channel_id": "ch-1",
+            "integrity": "untrusted",
+            "output": "ignore injected claim",
+        },
+        {
+            "turn_id": "clean-after",
+            "ts": "2026-08-30T10:02:00+00:00",
+            "saga_session_id": "sess-mixed",
+            "channel_id": "ch-1",
+            "integrity": "trusted",
+            "output": "keep later clean fact",
+        },
+    ]
+    turns_path.write_text("\n".join(json.dumps(record) for record in records))
+
+    filtered = _filter_session_turns(
+        turns_path, "sess-mixed", channel_id="ch-1",
+    )
+
+    assert [record["turn_id"] for record in filtered] == [
+        "clean-before",
+        "clean-after",
+    ]
+
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="ch-1",
+        extra={"saga_session_id": "sess-mixed"},
+        ifc_labels=_session_labels("ch-1"),
+    )
+    ctx = _make_ctx(event, saga_session_id="sess-mixed")
+    block = await agent._build_synthesis_prompt(ctx, event)
+
+    assert "keep this clean fact" in block.content
+    assert "keep later clean fact" in block.content
+    assert "ignore injected claim" not in block.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_id", "expected_event", "expected_classification"),
+    [
+        (
+            "scheduler:heartbeat",
+            "saga_synthesis_skipped_no_turns",
+            None,
+        ),
+        (
+            "poller:github-activity",
+            "saga_synthesis_skipped_no_turns",
+            None,
+        ),
+        (
+            "discord-1",
+            "saga_synthesis_empty_window",
+            ("negative", "synth_empty_window"),
+        ),
+    ],
+)
+async def test_empty_trusted_session_does_not_dispatch_boundary_synthesis(
+    tmp_path: Path,
+    channel_id: str,
+    expected_event: str,
+    expected_classification: tuple[str, str] | None,
+) -> None:
+    from mimir.feedback import classify
+    from mimir.runtime import dispatch_session_synthesis
+
+    turns_path = tmp_path / "turns.jsonl"
+    turns_path.write_text(json.dumps({
+        "turn_id": "tainted",
+        "ts": "2026-08-30T10:00:00+00:00",
+        "saga_session_id": "sess-tainted",
+        "channel_id": channel_id,
+        "integrity": "untrusted",
+    }))
+    events: list[tuple[str, dict]] = []
+
+    class Dispatcher:
+        calls = 0
+
+        async def enqueue(self, _event):
+            self.calls += 1
+            return True
+
+    async def capture(event_type: str, **payload) -> None:
+        events.append((event_type, payload))
+
+    dispatcher = Dispatcher()
+    session = SimpleNamespace(
+        saga_session_id="sess-tainted",
+        channel_id=channel_id,
+        source_acl=None,
+    )
+    config = SimpleNamespace(
+        turns_log=turns_path,
+        saga_session_idle_minutes=10,
+    )
+
+    accepted = await dispatch_session_synthesis(
+        session,
+        config=config,
+        dispatcher=dispatcher,
+        log_event_fn=capture,
+    )
+
+    assert accepted is False
+    assert dispatcher.calls == 0
+    assert [event_type for event_type, _payload in events] == [expected_event]
+    assert classify(expected_event) == expected_classification
+
+
+@pytest.mark.asyncio
+async def test_build_synthesis_prompt_handles_empty_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the session has no recorded turns, ``_build_synthesis_prompt``
+    must still emit a valid synthesis prompt (the lean variant) rather
+    than crashing. Pre-181-H regression — _filter_session_turns
+    returning [] should produce a template render, not a KeyError.
+    """
+    from mimir.feedback import classify
+
+    events: list[tuple[str, dict]] = []
+
+    async def capture(event_type: str, **payload) -> None:
+        events.append((event_type, payload))
+
+    monkeypatch.setattr("mimir.agent.log_event", capture)
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="ch-empty",
+        extra={"saga_session_id": "sess-empty"},
+        ifc_labels=_session_labels("ch-empty"),
+    )
+    ctx = _make_ctx(event, saga_session_id="sess-empty")
+    rendered = await agent._build_synthesis_prompt(ctx, event)
+    await asyncio.gather(*tuple(agent._bg_tasks))
+    assert isinstance(rendered, PromptBlock)
+    assert "sess-empty" in rendered.content
+    assert rendered.content  # non-empty
+    assert rendered.labels == InformationFlowLabels()
+    assert [event_type for event_type, _payload in events] == [
+        "saga_synthesis_empty_window",
+    ]
+    assert events[0][1]["reason"] == (
+        "turns.jsonl rotated past this session's records"
+    )
+    assert classify(events[0][0]) == ("negative", "synth_empty_window")
+
+
+# ─── Full-block-stack regression coverage ───────────────────────────
+#
+# Every conditional block in ``build_turn_prompt`` has its own
+# labeled section header. If a future change drops one of the
+# kwargs from agent's ``_build_turn_prompt`` (or somebody removes a
+# ``_add_labeled`` line in prompts.py), we want a test that fails
+# specifically — naming the missing block — instead of a silent
+# behavior loss. These tests cover both sides:
+#
+#   * ``test_build_turn_prompt_function_emits_all_blocks_when_supplied``
+#     drives ``mimir.prompts.build_turn_prompt`` directly with every
+#     block populated. Catches dropped ``_add_labeled`` calls in
+#     prompts.py.
+#
+#   * ``test_agent_build_turn_prompt_threads_all_helper_outputs``
+#     monkey-patches every ``Agent._assemble_*`` helper to return a
+#     known sentinel, runs ``Agent._build_turn_prompt``, asserts
+#     each sentinel + its header surface. Catches the case where
+#     a helper is added but its return value never makes it into
+#     the build_turn_prompt() call — the exact regression Mimir's
+#     second review flagged.
+
+
+# Canonical labels emitted by ``build_turn_prompt`` for every
+# optional block. Order matches the implementation in prompts.py.
+# If one of these is removed (legitimate API change), update the
+# test in lockstep with the prompt's `_add_labeled` call site.
+_OPTIONAL_BLOCK_LABELS = (
+    "Known identities",
+    "Recent feedback signals",
+    "Recent session summaries",
+    "Resource usage",
+    "Upcoming",
+    "Upcoming commitments",
+    "Self-state",
+    "Recent activity",
+    "Possibly relevant memories (from SAGA)",
+)
+
+
+def test_build_turn_prompt_function_emits_all_blocks_when_supplied() -> None:
+    """Drive ``build_turn_prompt`` directly with every optional block
+    populated (and a resolver + recent_messages so the identity +
+    activity branches fire). Every canonical header must appear in
+    the rendered output.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from mimir.history import Message
+    from mimir.prompts import build_turn_prompt
+
+    from mimir.identities import Identity
+
+    class _StubResolver:
+        """Drop-in for IdentityResolver covering the four methods that
+        build_turn_prompt / MessageBuffer.assemble_recent_activity call:
+        ``resolve``, ``display_name``, ``all_identities``,
+        ``resolve_channel``. Concrete enough to drive both code paths
+        without filesystem setup."""
+
+        def __init__(self, identities: list[Identity]) -> None:
+            self._identities = {i.canonical: i for i in identities}
+            self._alias_to_canonical = {
+                alias: i.canonical
+                for i in identities for alias in (i.aliases or [])
+            }
+
+        def resolve(self, author: str | None) -> str | None:
+            if author is None:
+                return None
+            return self._alias_to_canonical.get(author, author)
+
+        def display_name(self, author: str | None) -> str | None:
+            if author is None:
+                return None
+            canonical = self._alias_to_canonical.get(author, author)
+            ident = self._identities.get(canonical)
+            return ident.display_name if ident else None
+
+        def all_identities(self) -> list[Identity]:
+            return list(self._identities.values())
+
+        def resolve_channel(self, channel_id):
+            return None
+
+    resolver_obj = _StubResolver([
+        Identity(
+            canonical="canon-1",
+            display_name="User One",
+            aliases=["user-id-1"],
+        ),
+    ])
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-coverage",
+        content="please summarize",
+        author="user-id-1",
+        author_id="user-id-1",
+        source_id="msg-1",
+    )
+    recent = [
+        Message(
+            ts=datetime.now(tz=timezone.utc).isoformat(),
+            msg_id="msg-0",
+            channel_id="ch-coverage",
+            author="user-id-1",
+            author_display="User One",
+            kind="user",
+            content="prior message",
+            source="discord",
+        ),
+    ]
+    rendered = build_turn_prompt(
+        event,
+        recent_messages=recent,
+        saga_block="- atom-x: saga-fact",
+        recent_message_chars=200,
+        resolver=resolver_obj,
+        feedback_block="recent feedback ledger",
+        session_summaries_block="recent boundaries summary",
+        usage_block="cost: $0.00 / 1h",
+        upcoming_block="next scheduled tick at +5m",
+        commitments_block="C-1 due Friday",
+        self_state_block="homeostat: green",
+        saga_session_id="sess-x",
+    )
+
+    # The always-on header is present.
+    assert "## Today's date" in rendered, "always-on date header missing"
+
+    # Every optional block fired its labeled section. Loop is the
+    # regression guard: a future change that drops any single
+    # `_add_labeled(...)` call in prompts.py will fail here with
+    # the specific label name in the assertion message.
+    for label in _OPTIONAL_BLOCK_LABELS:
+        assert f"## {label}" in rendered, (
+            f"build_turn_prompt dropped the {label!r} section even "
+            f"though its block argument was supplied. Check "
+            f"mimir/prompts.py:build_turn_prompt for a missing "
+            f"_add_labeled(\"{label}\", ...) call."
+        )
+
+    import inspect
+
+    assert "subagent_block" not in inspect.signature(build_turn_prompt).parameters
+
+
+def test_build_turn_prompt_directs_scratch_to_server_supplied_turn_path() -> None:
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(trigger="user_message", channel_id="ch", content="work")
+    rendered = build_turn_prompt(
+        event, turn_scratch_path="/mimir-home/scratch/turns/server-turn-id",
+    )
+
+    assert "## Current turn scratch" in rendered
+    assert "`/mimir-home/scratch/turns/server-turn-id/`" in rendered
+    assert "shared `scratch/` root" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger,channel_id,is_service,roles,visible",
+    [
+        ("poller", "poller:github-activity", True, (), False),
+        ("poller", "scheduler:heartbeat", True, (), False),
+        ("scheduled_tick", "scheduler:memory-hygiene", True, (), False),
+        ("scheduled_tick", "scheduler:heartbeat-extra", True, (), False),
+        ("scheduled_tick", "scheduler:heartbeat", True, (), True),
+        ("user_message", "web:operator", False, ("admin",), True),
+        ("user_message", "web:user", False, (), False),
+        ("poller", "poller:github-activity", False, ("admin",), False),
+    ],
+)
+async def test_usage_section_visibility_by_turn(
+    tmp_path, monkeypatch, trigger, channel_id, is_service, roles, visible,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    agent = _make_agent(tmp_path)
+    agent._config = replace(agent._config, usage_block_enabled=True)
+    body = "OpenAI seven_day: 80% used; on pace: 239% by reset"
+    monkeypatch.setattr(
+        "mimir.stats_block.assemble_stats_block",
+        lambda *args, **kwargs: SimpleNamespace(body=body, alert=None, off_pace=[]),
+    )
+    event = AgentEvent(trigger=trigger, channel_id=channel_id, content="Do the work")
+    auth = AuthContext(
+        principal="operator", canonical_principal="operator", roles=roles,
+        event_ingress=None, trigger=trigger, channel_id=channel_id,
+        interactivity=None, is_service=is_service,
+    )
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, initial_auth_context=auth,
+    )
+    assert ("## Resource usage" in prompt) is visible
+    assert (body in prompt) is visible
+
+
+@pytest.mark.parametrize("trigger,channel_id", [
+    ("poller", "poller:github-activity"),
+    ("scheduled_tick", "scheduler:memory-hygiene"),
+])
+@pytest.mark.parametrize("billing_mode,event_kind", [
+    ("pay-as-you-go", "cost_rate_alert"),
+    ("quota", "cost_rate_advisory"),
+])
+@pytest.mark.parametrize("cooling_down", [False, True])
+def test_hidden_usage_preserves_deferred_alerts(
+    tmp_path, monkeypatch, trigger, channel_id, billing_mode, event_kind, cooling_down,
+):
+    from unittest.mock import Mock, call
+    from mimir.billing import BillingMode
+    from mimir.usage_stats import CostRateAlert
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    agent = _make_agent(tmp_path)
+    agent._config = replace(
+        agent._config, usage_block_enabled=True, billing_mode=BillingMode(billing_mode),
+        cost_alert_cooldown_minutes=37,
+    )
+    monkeypatch.setattr(
+        "mimir.stats_block.assemble_stats_block",
+        lambda *args, **kwargs: SimpleNamespace(
+            body="live quota numbers",
+            alert=CostRateAlert("absolute_hourly_limit", 12.0, 10.0, None),
+            off_pace=[(
+                "openai:seven_day",
+                SimpleNamespace(utilization=0.8, resets_at="2026-09-15T00:00:00Z"),
+                SimpleNamespace(on_pace_utilization=2.39, hours_until_reset=12.0),
+            )],
+        ),
+    )
+    cooldown = Mock(return_value=cooling_down)
+    monkeypatch.setattr("mimir.agent.event_recently_emitted", cooldown)
+    auth = AuthContext(
+        principal="job", canonical_principal="job", roles=(), event_ingress=None,
+        trigger=trigger, channel_id=channel_id, interactivity=None, is_service=True,
+    )
+    block, deferred = agent._assemble_usage_block(auth)
+    assert block is None
+    assert cooldown.call_args_list == [
+        call(agent._config.events_log, kind, cooldown_minutes=37,
+             snapshot=agent._events_snapshot)
+        for kind in (event_kind, "rate_limit_off_pace")
+    ]
+    assert deferred == ([] if cooling_down else [
+        (event_kind, {
+            "reason": "absolute_hourly_limit", "rate_now_usd_per_hour": 12.0,
+            "threshold_usd_per_hour": 10.0, "baseline_usd_per_hour": None,
+        }),
+        ("rate_limit_off_pace", {
+            "rate_limit_type": "openai:seven_day", "utilization": 0.8,
+            "on_pace_utilization": 2.39, "hours_until_reset": 12.0,
+            "resets_at": "2026-09-15T00:00:00Z",
+        }),
+    ])
+
+
+@pytest.mark.asyncio
+async def test_agent_build_turn_prompt_threads_all_helper_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive ``Agent._build_turn_prompt`` with every ``_assemble_*``
+    helper monkey-patched to return a known sentinel. Each sentinel
+    must surface under its corresponding header in the assembled
+    turn prompt.
+
+    The pre-181-H regression was that the agent assembled a
+    HumanMessage from just ``event.content`` — the helpers ran but
+    their outputs were discarded. This test catches the same failure
+    mode at a finer granularity: if anyone drops a single kwarg from
+    the ``build_turn_prompt(...)`` call in ``_build_turn_prompt``,
+    we lose its sentinel and the assertion names which block
+    regressed.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from mimir.history import Message
+
+    agent = _make_agent(tmp_path)
+
+    # Seed a recent message so the buffer's `assemble_recent_activity`
+    # has something to return. The exact content doesn't matter — we
+    # check the labeled header, not the body — but we do need the
+    # ``Recent activity`` branch to fire.
+    seeded = Message(
+        ts=datetime.now(tz=timezone.utc).isoformat(),
+        msg_id="prior-1",
+        channel_id="ch-cover",
+        author="user-a",
+        author_display="User A",
+        kind="user",
+        content="seeded recent",
+        source="discord",
+    )
+    await agent._buffer.append(seeded)
+
+    # Patch every helper to return a recognizable sentinel.
+    # ``_assemble_usage_block`` returns a 2-tuple (block, deferred);
+    # the rest are scalar str | None.
+    monkeypatch.setattr(
+        agent, "_assemble_usage_block",
+        lambda auth_context: (_block("USAGE_SENTINEL"), []),
+    )
+    monkeypatch.setattr(
+        agent, "_assemble_upcoming_block",
+        lambda auth_context: _block("UPCOMING_SENTINEL"),
+    )
+    monkeypatch.setattr(
+        agent, "_assemble_commitments_block",
+        lambda channel_id, auth_context: _block("COMMITMENTS_SENTINEL"),
+    )
+    monkeypatch.setattr(
+        agent, "_assemble_self_state_block",
+        lambda auth_context, **_kw: _block("SELFSTATE_SENTINEL"),
+    )
+
+    async def _fake_session_summaries(*, channel_id, auth_context):
+        assert auth_context is admin_auth
+        return _block("SESSIONS_SENTINEL")
+
+    monkeypatch.setattr(
+        agent, "_assemble_session_summaries", _fake_session_summaries,
+    )
+    monkeypatch.setattr(
+        agent._feedback, "recent_prompt_block",
+        lambda auth_context: _block("FEEDBACK_SENTINEL"),
+    )
+
+    # Stub a resolver on the buffer so the identity branch fires.
+    from mimir.identities import Identity
+
+    class _StubResolver:
+        def __init__(self) -> None:
+            self._identities = {
+                "canon-x": Identity(
+                    canonical="canon-x",
+                    display_name="Cover User",
+                    aliases=["user-a"],
+                )
+            }
+            self._alias = {"user-a": "canon-x"}
+
+        def resolve(self, a):
+            return self._alias.get(a, a) if a is not None else None
+
+        def display_name(self, a):
+            c = self._alias.get(a, a) if a else None
+            return self._identities[c].display_name if c in self._identities else None
+
+        def all_identities(self):
+            return list(self._identities.values())
+
+        def resolve_channel(self, cid):
+            return None
+
+    monkeypatch.setattr(agent._buffer, "resolver", _StubResolver())
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-cover",
+        content="full-coverage input",
+        author="user-a",
+        author_id="user-a",
+        source_id="msg-now",
+    )
+    ctx = _make_ctx(event)
+    admin_auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-cover",
+        interactivity=None,
+    )
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event,
+        saga_block="SAGA_SENTINEL",
+        initial_auth_context=admin_auth,
+    )
+
+    # Each labeled section must be threaded with the helper's output.
+    # The list mirrors prompts.py's `_add_labeled` calls — keep in
+    # lockstep with _OPTIONAL_BLOCK_LABELS above.
+    expected_pairs = (
+        ("Known identities", "Cover User"),
+        ("Recent feedback signals", "FEEDBACK_SENTINEL"),
+        ("Recent session summaries", "SESSIONS_SENTINEL"),
+        ("Resource usage", "USAGE_SENTINEL"),
+        ("Upcoming", "UPCOMING_SENTINEL"),
+        ("Upcoming commitments", "COMMITMENTS_SENTINEL"),
+        ("Self-state", "SELFSTATE_SENTINEL"),
+        ("Recent activity", "seeded recent"),
+        ("Possibly relevant memories (from SAGA)", "SAGA_SENTINEL"),
+    )
+    missing: list[str] = []
+    for label, sentinel in expected_pairs:
+        header_present = f"## {label}" in turn_prompt
+        body_present = sentinel in turn_prompt
+        if not (header_present and body_present):
+            missing.append(
+                f"{label!r}: header={header_present}, body={body_present}"
+            )
+    assert not missing, (
+        "Agent._build_turn_prompt is failing to thread block content "
+        "into the prompt. Specific failures:\n  " + "\n  ".join(missing)
+        + "\nCheck the build_turn_prompt(...) keyword arguments "
+        "inside mimir/agent.py:_build_turn_prompt."
+    )
+
+    # The always-on header is always present — sanity check.
+    assert "## Today's date" in turn_prompt
+
+
+@pytest.mark.asyncio
+async def test_channel_memory_omits_for_principal_less_auth_context(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    channel_dir = tmp_path / "memory" / "channels" / "ch-ownerless"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("PRIVATE CHANNEL MEMORY")
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-ownerless", content="hello",
+        author=None, source="discord",
+    )
+    auth = AuthContext(
+        principal=None, canonical_principal=None, roles=(), event_ingress=None,
+        trigger="user_message", channel_id="ch-ownerless", interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None,
+        initial_auth_context=auth,
+    )
+
+    assert "PRIVATE CHANNEL MEMORY" not in prompt
+    assert "## Today's date" in prompt
+
+
+@pytest.mark.asyncio
+async def test_feedback_block_renders_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for chainlink #681.
+
+    ``FeedbackLog.recent_block`` can refresh and parse events/turns JSONL
+    snapshots. Prompt assembly must not do that synchronous file/CPU work
+    on the dispatcher event loop.
+    """
+    agent = _make_agent(tmp_path)
+    calls: list[str] = []
+
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda auth_context: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id, auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda auth_context, **_kw: None)
+
+    async def _none_summaries(*, channel_id, auth_context):
+        assert isinstance(auth_context, AuthContext)
+        return None
+
+    monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
+
+    def recent_block_stub(auth_context):
+        return _block("FEEDBACK_SENTINEL")
+
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", recent_block_stub)
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("mimir.agent.asyncio.to_thread", fake_to_thread)
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-feedback",
+        content="hello",
+        author="user-a",
+    )
+    turn_prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None,
+    )
+
+    assert "FEEDBACK_SENTINEL" in turn_prompt
+    assert "recent_block_stub" in calls
+
+
+@pytest.mark.asyncio
+async def test_ownerless_non_self_feedback_does_not_abort_prompt_assembly(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.turns_log.write_text(json.dumps({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "turn_id": "scheduled-turn",
+        "channel_id": "scheduler:heartbeat",
+        "result_is_error": True,
+    }) + "\n")
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-feedback",
+        content="hello",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=True,
+        bridge_instance="test",
+    )
+
+    turn_prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, initial_auth_context=auth,
+    )
+
+    assert "turn error: (no detail)" not in turn_prompt
+
+
+def test_recent_content_and_labels_are_selected_together(tmp_path: Path) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "discord-alice" else None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            if channel_id in {"discord-D1", "acp:session"} and principal == "alice":
+                return frozenset({"alice"})
+            return None
+
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    admitted = agent._buffer.make_message(
+        channel_id="discord-D1",
+        kind="user_message",
+        content="ADMITTED",
+        author="discord-alice",
+        msg_id="admitted",
+        source="discord",
+    )
+    excluded = agent._buffer.make_message(
+        channel_id="discord-guild",
+        kind="user_message",
+        content="EXCLUDED",
+        author="unknown",
+        msg_id="excluded",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(admitted)
+    agent._buffer._append_in_memory(excluded)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="acp:session",
+        author="discord-alice",
+        content="now",
+        source="acp",
+    )
+    auth = AuthContext(
+        principal="discord-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="acp:session",
+        interactivity=None,
+        audience_provider=Provider(),
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert recent == [admitted]
+    assert [block.content for block in blocks] == ["ADMITTED"]
+    assert len(blocks[0].labels.sources) == 1
+    source = blocks[0].labels.sources[0]
+    assert source.owner_attestation is not None
+    assert source.source_kind == "recent_activity_user"
+    assert source.resource_id == "discord-D1"
+
+
+def test_recent_activity_admission_omits_incompatible_sources_in_both_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "slack-alice" else None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            if channel_id == "slack-D-alice" and principal == "alice":
+                return frozenset({"alice"})
+            return None
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    candidate = agent._buffer.make_message(
+        channel_id="slack-D-alice",
+        kind="user_message",
+        content="CROSS-CHANNEL-CONTEXT",
+        author="slack-alice",
+        msg_id="cross-channel",
+        source="slack",
+    )
+    agent._buffer._append_in_memory(candidate)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-GROUP",
+        author="slack-alice",
+        content="now",
+        source="slack",
+    )
+    shadow_auth = AuthContext(
+        principal="slack-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+        bridge_instance="slack",
+        audience_provider=Provider(),
+    )
+
+    shadow_recent, shadow_blocks = agent._select_recent_activity(event, shadow_auth)
+    enforced_recent, enforced_blocks = agent._select_recent_activity(
+        event,
+        replace(shadow_auth, enforcement_enabled=True),
+    )
+
+    assert shadow_recent == []
+    assert shadow_blocks == ()
+    assert enforced_recent == []
+    assert enforced_blocks == ()
+    assert events == []
+
+
+def test_recent_activity_shadow_omits_without_logging_or_rechecking_sink_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "slack-alice" else None
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            return None
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    monkeypatch.setattr(
+        "mimir.agent.harness_sink_allowed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("recent-activity shadowing must not recheck the sink gate")
+        ),
+    )
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    candidate = agent._buffer.make_message(
+        channel_id="slack-D-alice",
+        kind="user_message",
+        content="CROSS-CHANNEL-CONTEXT",
+        author="slack-alice",
+        msg_id="cross-channel-predicate",
+        source="slack",
+    )
+    agent._buffer._append_in_memory(candidate)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-GROUP",
+        author="slack-alice",
+        content="now",
+        source="slack",
+    )
+    auth = AuthContext(
+        principal="slack-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+        bridge_instance="slack",
+        audience_provider=Provider(),
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+
+    assert recent == []
+    assert blocks == ()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_shadow_enforced_send_message_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import ToolRegistry
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "slack-alice" else None
+
+        def resolve(self, author):
+            return "alice" if author == "slack-alice" else author
+
+        def display_name(self, author):
+            return None
+
+        def all_identities(self):
+            return []
+
+        def resolve_channel(self, channel_id):
+            return None
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            if channel_id == "slack-D-alice" and principal == "alice":
+                return frozenset({"alice"})
+            return None
+
+    events = []
+
+    async def capture(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    for channel, content in (
+        ("slack-D-alice", "FOREIGN PRIVATE SENTINEL"),
+        ("slack-GROUP", "COMPATIBLE RECENT SENTINEL"),
+    ):
+        agent._buffer._append_in_memory(agent._buffer.make_message(
+            channel_id=channel, kind="user_message", content=content,
+            author="slack-alice", msg_id=channel, source="slack",
+        ))
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-GROUP", author="slack-alice",
+        content="reply here", source="slack",
+    )
+    results = []
+    for enforced in (False, True):
+        events.clear()
+        agent._config.access_control_enforced = enforced
+        auth = AuthContext(
+            principal="slack-alice", canonical_principal="alice", roles=("admin",),
+            event_ingress=None, trigger=event.trigger, channel_id=event.channel_id,
+            interactivity=None, enforcement_enabled=enforced, domain="channel",
+            resource_id=event.channel_id, bridge_instance="slack",
+            audience_provider=Provider(),
+        )
+        ctx = _make_ctx(event)
+        ctx.auth_context = auth
+        ctx.ifc_labels = InformationFlowLabels().with_source(SourceLabel(
+            principal="alice", domain="channel", resource_id=event.channel_id,
+            bridge_instance="slack", sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        ))
+        prompt, recent = await agent._build_turn_prompt(
+            ctx, event, saga_block=None, initial_auth_context=auth,
+        )
+        assert "FOREIGN PRIVATE SENTINEL" not in prompt
+        assert "COMPATIBLE RECENT SENTINEL" in prompt
+        assert [message.channel_id for message in recent] == ["slack-GROUP"]
+        sources = ctx.ifc_labels.sources
+        assert any(source.source_kind == "recent_activity_user" for source in sources)
+        assert all(source.resource_id != "slack-D-alice" for source in sources)
+        registry = ToolRegistry()
+        registry.enable_shadow_logging()
+        decision = registry.authorize_tool(
+            "send_message",
+            replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels)),
+            enforce=enforced, target_channel=event.channel_id,
+            ifc_labels=ctx.ifc_labels,
+            arguments={"channel_id": event.channel_id, "content": "reply"},
+        )
+        await asyncio.sleep(0)
+        census = Counter(
+            (kind, fields.get("reason")) for kind, fields in events
+            if kind in {"shadow_tool_decision", "sink_blocked"}
+        )
+        assert decision.allowed is True
+        assert decision.would_block is False
+        assert census == Counter()
+        results.append((
+            sources, decision.decision, decision.allowed, decision.would_block,
+            decision.reason, census,
+        ))
+    assert results[0] == results[1]
+
+
+def test_excluded_recent_messages_add_no_identity_or_recent_labels(
+    tmp_path: Path,
+) -> None:
+    class Resolver:
+        def identity(self, author):
+            return None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    excluded = agent._buffer.make_message(
+        channel_id="foreign",
+        kind="user_message",
+        content="FOREIGN",
+        author="canonical-looking",
+        msg_id="foreign",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(excluded)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="destination",
+        author="canonical-looking",
+        content="now",
+    )
+    auth = AuthContext(
+        principal="canonical-looking",
+        canonical_principal="canonical-looking",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination",
+        interactivity=None,
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert recent == []
+    assert blocks == ()
+
+
+def test_selection_and_sink_share_normalized_channel_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Resolver:
+        def identity(self, author):
+            raise AssertionError("same canonical channel must not resolve identity")
+
+        def resolve_channel(self, channel_id):
+            return {
+                "destination-alias": "shared-canonical",
+                "source-alias": "shared-canonical",
+            }.get(channel_id, channel_id)
+
+        def resolve(self, author):
+            raise AssertionError("eligibility must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("same canonical channel must not query audience")
+
+    resolver = Resolver()
+    monkeypatch.setattr(ChannelResourceAdapter, "_global_resolver", resolver)
+    agent = _make_agent(tmp_path)
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    message = agent._buffer.make_message(
+        channel_id="source-alias",
+        kind="assistant_message",
+        content="ALIASED-ASSISTANT",
+        source="discord",
+    )
+    anchor = agent._buffer.make_message(
+        channel_id="source-alias",
+        kind="user_message",
+        content="ALIASED-ANCHOR",
+        author="unknown-author",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(anchor)
+    agent._buffer._append_in_memory(message)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="destination-alias",
+        author="alice",
+        content="now",
+    )
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-alias",
+        interactivity=None,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="shared-canonical",
+        bridge_instance="acp",
+        audience_provider=Provider(),
+    )
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert {item.content for item in recent} == {
+        "ALIASED-ANCHOR", "ALIASED-ASSISTANT",
+    }
+    labels = InformationFlowLabels()
+    for block in blocks:
+        for source in block.labels.sources:
+            labels = labels.with_source(source)
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "destination-alias",
+        labels,
+        sink_auth,
+        enforce=True,
+    )
+    assert decision.allowed is True
+
+    agent._config.recent_per_channel = 0
+    disabled_recent, disabled_blocks = agent._select_recent_activity(event, auth)
+    assert disabled_recent == []
+    assert disabled_blocks == ()
+
+
+def test_channel_bearing_source_inventory_is_closed() -> None:
+    root = Path(__file__).parents[1] / "mimir"
+    categories = {
+        "AuthContext": "context_factory",
+        "OwnerAttestation": "attestation_factory",
+        "SourceLabel": "producer",
+        "derived": "producer",
+        "_prompt_source_labels": "producer",
+        "prompt_source_label": "producer",
+        "PromptBlock": "direct_block",
+        "use": "use_loader",
+        "recent_prompt_block": "feedback_loader",
+        "admit": "feedback_stream",
+        "assemble_recent_activity_candidates": "recent_loader",
+        "attest_owner": "attestation",
+        "_mint_owner_attestation": "attestation",
+        "_source_is_triggering_channel_compatible": "sink_predicate",
+        "create_auth_context": "context_boundary",
+        "ServerChannelAudienceProvider": "context_boundary",
+        "_event_to_stash": "recovery_call",
+        "_event_from_stash": "recovery_call",
+    }
+    observed: Counter[tuple[str, str, str, str]] = Counter()
+
+    def dotted(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = dotted(node.value)
+            return f"{parent}.{node.attr}" if parent else None
+        return None
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, relative: str) -> None:
+            self.relative = relative
+            self.stack: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self.stack.append(node.name)
+            if node.name in {
+                "_event_to_stash",
+                "_event_from_stash",
+                "_mint_owner_attestation",
+            }:
+                category = (
+                    "attestation_definition"
+                    if node.name == "_mint_owner_attestation"
+                    else "recovery_definition"
+                )
+                observed[(
+                    category,
+                    self.relative,
+                    ".".join(self.stack),
+                    node.name,
+                )] += 1
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            call = dotted(node.func)
+            terminal = call.rsplit(".", 1)[-1] if call else None
+            category = categories.get(terminal or "")
+            if call == "SourceLabel.from_record":
+                category = "producer"
+            if terminal == "admit" and self.relative != "mimir/feedback/__init__.py":
+                # ``admit`` is too common a method name to match on bare. The
+                # feedback stream's admission helper is the only channel-bearing
+                # one; mimir/worklink/orchestrator.py calls an unrelated
+                # ``selected.admit()`` to pick a factory launcher. Matching that
+                # would inventory it as a feedback stream, which is worse than
+                # not inventorying it at all.
+                category = None
+            if (
+                category is None
+                and self.relative == "mimir/acp/agent.py"
+                and self.stack[-1:] == ["_auth_context_for"]
+                and terminal == "replace"
+            ):
+                category = "context_rescope"
+            if category is not None and call is not None and self.stack:
+                observed[(
+                    category,
+                    self.relative,
+                    ".".join(self.stack),
+                    call,
+                )] += 1
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if node.attr == "recent_prompt_block" and self.stack:
+                attribute = dotted(node)
+                if attribute is not None:
+                    observed[(
+                        "feedback_loader",
+                        self.relative,
+                        ".".join(self.stack),
+                        attribute,
+                    )] += 1
+            self.generic_visit(node)
+
+    for path in root.rglob("*.py"):
+        relative = str(path.relative_to(root.parent))
+        Visitor(relative).visit(ast.parse(path.read_text(encoding="utf-8")))
+
+    expected = Counter({
+        ("attestation", "mimir/agent.py", "Agent._select_recent_activity", "attest_owner"): 1,
+        ("attestation", "mimir/channel_audience.py", "attest_owner", "_mint_owner_attestation"): 1,
+        ("attestation", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "attest_owner"): 1,
+        ("attestation_definition", "mimir/models.py", "_mint_owner_attestation", "_mint_owner_attestation"): 1,
+        ("attestation_factory", "mimir/models.py", "_mint_owner_attestation", "OwnerAttestation"): 1,
+        ("context_boundary", "mimir/access_control.py", "create_local_operator_auth_context", "create_auth_context"): 1,
+        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.__init__", "ServerChannelAudienceProvider"): 1,
+        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.authenticate", "create_auth_context"): 1,
+        ("context_boundary", "mimir/agent.py", "Agent.__init__", "ServerChannelAudienceProvider"): 1,
+        ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context"): 1,
+        ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context"): 1,
+        ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace"): 1,
+        ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext"): 1,
+        # Added on main while this branch was diverged: the saga_session_end
+        # synthesis path. The inventory is closed, so it must be declared.
+        ("direct_block", "mimir/agent.py", "Agent._build_synthesis_prompt", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_commitments_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_self_state_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_upcoming_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_usage_block", "PromptBlock"): 1,
+            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 5,
+            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._select_recent_activity", "PromptBlock"): 1,
+        ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock"): 1,
+        ("feedback_loader", "mimir/agent.py", "Agent._build_turn_prompt", "self._feedback.recent_prompt_block"): 1,
+        ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
+        ("producer", "mimir/access_control.py", "_acp_failed_tool_error_result", "SourceLabel"): 1,
+        ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
+        # Chainlink issues now have their own bounded read projection/source.
+        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 8,
+        ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_session_summaries", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_upcoming_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_usage_block", "_prompt_source_labels"): 1,
+            ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 6,
+            ("producer", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "_initialize_ifc_labels", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "_propagate_ifc_labels", "SourceLabel.derived"): 1,
+        ("producer", "mimir/agent.py", "_prompt_source_labels", "prompt_sources.prompt_source_label"): 1,
+        # Owner-authenticated fixed-text setup probe mints a trusted web source.
+        ("producer", "mimir/bridges/web_chat.py", "WebChatBridge._handle_operator_alert_check", "SourceLabel"): 1,
+        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel.from_record"): 1,
+        # Conversation-history read-back restores content-bound offload inputs.
+        ("producer", "mimir/_deepagents_summarization.py", "read_offload_labels", "SourceLabel.from_record"): 1,
+        ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
+            ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
+            ("producer", "mimir/scheduler.py", "Scheduler.add_proposal_revision_job.sweep", "SourceLabel"): 1,
+        ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
+        # Operator-declared shell output remains active ingest even after
+        # a successful bounded read.
+        ("producer", "mimir/tools/budget_gate.py", "_result_labels_for_call", "SourceLabel"): 1,
+        ("recent_loader", "mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"): 1,
+        ("recovery_call", "mimir/poller_recovery.py", "_restore_event", "_event_from_stash"): 1,
+        ("recovery_call", "mimir/poller_recovery.py", "stash_enqueued_event", "_event_to_stash"): 1,
+        ("recovery_definition", "mimir/poller_recovery.py", "_event_from_stash", "_event_from_stash"): 1,
+        ("recovery_definition", "mimir/poller_recovery.py", "_event_to_stash", "_event_to_stash"): 1,
+        ("sink_predicate", "mimir/access_control.py", "SinkGate._get_allowed_sinks", "_source_is_triggering_channel_compatible"): 2,
+        ("sink_predicate", "mimir/access_control.py", "_ifc_blocking_source", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/agent.py", "Agent._select_recent_activity", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible"): 1,
+        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use"): 8,
+        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt.use_plugins", "use"): 1,
+    })
+    assert observed == expected, (
+        f"unexpected channel-bearing sources: {observed - expected}; "
+        f"missing inventory entries: {expected - observed}"
+    )
+    provider = root.parent / "plugins/cultivate/mimir_cultivate/repository.py"
+    provider_sources: Counter[tuple[str, str, str, str]] = Counter()
+    Visitor("plugins/cultivate/mimir_cultivate/repository.py").visit(
+        ast.parse(provider.read_text(encoding="utf-8"))
+    )
+    provider_sources.update({
+        row: count for row, count in observed.items()
+        if row[1] == "plugins/cultivate/mimir_cultivate/repository.py"
+        and row[0] == "producer" and row[3] == "SourceLabel"
+    })
+    assert provider_sources == Counter({
+        ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
+         "_publish_retained_result", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
+         "_publish_attested_scope_result", "SourceLabel"): 1,
+    })
+    forge = root.parent / "plugins/cultivate/mimir_cultivate/forge.py"
+    Visitor("plugins/cultivate/mimir_cultivate/forge.py").visit(
+        ast.parse(forge.read_text(encoding="utf-8"))
+    )
+    forge_sources = Counter({
+        row: count for row, count in observed.items()
+        if row[1] == "plugins/cultivate/mimir_cultivate/forge.py"
+        and row[0] == "producer" and row[3] == "SourceLabel"
+    })
+    assert forge_sources == Counter({
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
+         "_publish_author_attestation", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
+         "_attest_ci_runs", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_list", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_spec", "SourceLabel"): 1,
+    })
+
+
+@pytest.mark.asyncio
+async def test_channel_less_non_allowlisted_valence_payload_is_not_admitted(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": "git_push_failed",
+        "reason": "RAW-OPERATIONAL-PAYLOAD",
+        "repository": "PRIVATE-REPOSITORY",
+    }
+    agent._config.events_log.write_text(
+        json.dumps(record) + "\n", encoding="utf-8",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+
+    assert agent._feedback.recent_prompt_block(auth) is None
+
+
+@pytest.mark.asyncio
+async def test_valence_transition_only_feedback_passes_real_use_guard(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    now = datetime.now(timezone.utc)
+    records = [
+        {
+            "timestamp": (now.replace(microsecond=100000)).isoformat(),
+            "type": "git_push_failed",
+            "reason": "non-fast-forward",
+            "attempt": 1,
+        },
+        {
+            "timestamp": (now.replace(microsecond=200000)).isoformat(),
+            "type": "git_push_ok",
+            "via": "retry",
+            "attempt": 2,
+        },
+    ]
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert "git push:" in prompt
+    assert "failed ×1" in prompt
+    assert "succeeded ×1" in prompt
+    assert "non-fast-forward" not in prompt
+    assert "retry" not in prompt
+    chain_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(chain_sources) == 2
+    assert all(source.source_kind == "feedback_chain" for source in chain_sources)
+    assert all(source.integrity == Integrity.UNTRUSTED for source in chain_sources)
+    assert all(source.is_complete for source in chain_sources)
+    assert {source.resource_id for source in chain_sources} == {"current"}
+    assert len({source.bridge_instance for source in chain_sources}) == 2
+
+
+@pytest.mark.asyncio
+async def test_cross_turn_loop_only_feedback_passes_real_use_guard(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    now = datetime.now(timezone.utc)
+    records = [
+        {
+            "timestamp": now.replace(microsecond=index * 100000).isoformat(),
+            "type": "send_message_sent",
+            "channel_id": "current",
+            "content_hash": "same-content",
+            "source": f"send-{index}",
+        }
+        for index in (1, 2, 3)
+    ]
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert "cross-turn send loop" in prompt
+    loop_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(loop_sources) == 3
+    assert all(source.is_complete for source in loop_sources)
+
+
+@pytest.mark.asyncio
+async def test_collapsed_and_capacity_dropped_feedback_keep_complete_provenance(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    now = datetime.now(timezone.utc)
+    records = []
+    kinds = ["git_push_failed", "git_push_ok"] * 4
+    for index, kind in enumerate(kinds, start=1):
+        records.append({
+            "timestamp": now.replace(microsecond=index * 10000).isoformat(),
+            "type": kind,
+            "reason": f"reason-{index}",
+            "attempt": index,
+        })
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    agent._feedback.default_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert "... (4 more)" in prompt
+    sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(sources) == len(records)
+    assert all(source.is_complete for source in sources)
+
+
+@pytest.mark.asyncio
+async def test_capacity_drop_window_passes_real_use_guard_with_all_labels(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._feedback.default_limit_per_polarity = 1
+    now = datetime.now(timezone.utc)
+    records = [
+        {
+            "timestamp": now.replace(microsecond=index * 100000).isoformat(),
+            "type": "tool_call_denied",
+            "channel_id": "current",
+            "owner_principal": "operator",
+            "tool": f"capacity-tool-{index}",
+            "reason": f"capacity-reason-{index}",
+            "source": f"capacity-source-{index}",
+        }
+        for index in (1, 2, 3)
+    ]
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert sum(f"capacity-tool-{index}" in prompt for index in (1, 2, 3)) == 1
+    sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(sources) == 3
+    assert all(source.is_complete for source in sources)
+
+
+@pytest.mark.asyncio
+async def test_session_summaries_counts_turns_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for chainlink #597.
+
+    ``JsonlSnapshot.records`` can tail and parse ``turns.jsonl`` when its
+    cache is stale. Prompt assembly must invoke the turn-count helper via
+    ``asyncio.to_thread`` so scheduled turns do not do that file/CPU work
+    on the event loop.
+    """
+    agent = _make_agent(tmp_path)
+
+    class _StubSaga:
+        async def recent_session_boundaries(
+            self, *, channel_id, count, auth_context,
+        ):
+            assert channel_id == "ch-1"
+            assert count == agent._config.recent_boundaries
+            assert auth_context is admin_auth
+            return [
+                {
+                    "ts": "2026-06-21T09:00:00+00:00",
+                    "channel_id": "ch-1",
+                    "summary": "older",
+                },
+                {
+                    "ts": "2026-06-21T10:00:00+00:00",
+                    "channel_id": "ch-1",
+                    "summary": "newer",
+                },
+            ]
+
+    agent._saga = _StubSaga()
+    admin_auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+    )
+    to_thread_calls: list[tuple[object, tuple, dict]] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("mimir.agent.asyncio.to_thread", fake_to_thread)
+
+    block = await agent._assemble_session_summaries(
+        channel_id="ch-1", auth_context=admin_auth,
+    )
+
+    assert block is not None
+    block = block.content
+    assert len(to_thread_calls) == 1
+    func, args, kwargs = to_thread_calls[0]
+    assert func.__name__ == "count_turns_since_many"
+    assert args == (agent._config.turns_log,)
+    assert kwargs["channel_id"] == "ch-1"
+    assert kwargs["since_timestamps"] == [
+        "2026-06-21T09:00:00+00:00",
+        "2026-06-21T10:00:00+00:00",
+    ]
+    snapshot_records = kwargs["snapshot_records"]
+    assert snapshot_records.__self__ is agent._turns_snapshot
+    assert snapshot_records.__func__ is agent._turns_snapshot.records.__func__
+
+
+def test_reflection_channel_id_matches_the_scheduler_channel(tmp_path: Path) -> None:
+    # The constant must equal the channel the scheduler synthesizes for the
+    # `reflect` job; if these drift, reflection silently reverts to
+    # channel-scoped summaries with no error.
+    auth = build_scheduled_tick_service_principal("reflect", tmp_path)
+
+    assert auth is not None
+    assert auth.channel_memory_directory == _REFLECTION_CHANNEL_ID
+
+
+@pytest.mark.asyncio
+async def test_reflection_turn_assembles_recent_cross_channel_sessions(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    _insert_session_boundary(
+        conn,
+        session_id="oldest",
+        channel_id="channel-old",
+        summary="oldest boundary excluded by configured count",
+        reflected_at="2026-07-01T08:00:00+00:00",
+    )
+    _insert_session_boundary(
+        conn,
+        session_id="middle",
+        channel_id="channel-alpha",
+        summary="recent alpha boundary",
+        reflected_at="2026-07-01T09:00:00+00:00",
+    )
+    _insert_session_boundary(
+        conn,
+        session_id="newest",
+        channel_id="channel-beta",
+        summary="recent beta boundary",
+        reflected_at="2026-07-01T10:00:00+00:00",
+    )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._config.recent_boundaries = 2
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id=_REFLECTION_CHANNEL_ID,
+        content="reflect",
+        author="service:scheduler",
+    )
+
+    try:
+        prompt, _ = await agent._build_turn_prompt(
+            _make_ctx(event), event, saga_block=None,
+        )
+    finally:
+        conn.close()
+
+    assert "recent alpha boundary" in prompt
+    assert "recent beta boundary" in prompt
+    assert "oldest boundary excluded by configured count" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_session_summaries_remain_channel_scoped(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    _insert_session_boundary(
+        conn,
+        session_id="own",
+        channel_id="channel-alpha",
+        summary="own channel boundary",
+        reflected_at="2026-07-01T09:00:00+00:00",
+    )
+    _insert_session_boundary(
+        conn,
+        session_id="other",
+        channel_id="channel-beta",
+        summary="other channel boundary",
+        reflected_at="2026-07-01T10:00:00+00:00",
+    )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._config.recent_boundaries = 5
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="channel-alpha",
+        content="hello",
+        author="user-a",
+    )
+
+    try:
+        prompt, _ = await agent._build_turn_prompt(
+            _make_ctx(event), event, saga_block=None,
+        )
+    finally:
+        conn.close()
+
+    assert "own channel boundary" in prompt
+    assert "other channel boundary" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_session_summary_assembly_is_authorization_scoped(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.access_control_enforced = True
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    rows = [
+        ("public", "public summary", "user:bob", "public"),
+        ("alice", "alice summary", "user:alice", "private"),
+        ("bob", "bob summary", "user:bob", "private"),
+        ("service", "service summary", "service:synthesis", "service"),
+    ]
+    for index, (session_id, summary, owner, visibility) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO sessions (id, channel_id, started_at, ended_at, "
+            "summary, reflected_at, owner_principal, visibility) "
+            "VALUES (?, 'ch-auth', '2026-07-01T00:00:00+00:00', ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                f"2026-07-01T00:0{index}:00+00:00",
+                summary,
+                f"2026-07-01T00:0{index}:00+00:00",
+                owner,
+                visibility,
+            ),
+        )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._config.recent_boundaries = len(rows)
+
+    admin_auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-auth",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    alice_auth = AuthContext(
+        principal="user:alice",
+        canonical_principal="user:alice",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-auth",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    try:
+        admin_source = await agent._assemble_session_summaries(
+            channel_id="ch-auth", auth_context=admin_auth,
+        )
+        alice_source = await agent._assemble_session_summaries(
+            channel_id="ch-auth", auth_context=alice_auth,
+        )
+    finally:
+        conn.close()
+
+    assert admin_source is not None
+    admin_block = admin_source.content
+    assert all(summary in admin_block for _, summary, _, _ in rows)
+    assert alice_source is not None
+    alice_block = alice_source.content
+    assert "public summary" in alice_block
+    assert "alice summary" in alice_block
+    assert "bob summary" not in alice_block
+    assert "service summary" not in alice_block
+    assert all(
+        "user:alice" in source.authorized_principals
+        for source in alice_source.labels.sources
+    )
+    assert all(
+        source.principal in source.authorized_principals
+        for source in alice_source.labels.sources
+    )
+
+
+@pytest.mark.asyncio
+async def test_commitment_prompt_labels_are_owned_by_record_principal(
+    tmp_path: Path,
+) -> None:
+    from mimir.commitments import CommitmentRecord, CommitmentsStore, make_commitment_id
+
+    agent = _make_agent(tmp_path)
+    agent._commitments = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await agent._commitments.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="ch-auth", text="alice reminder",
+        owner_principal="user:alice",
+    ))
+    auth = AuthContext(
+        principal="user:alice", canonical_principal="user:alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-auth",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = agent._assemble_commitments_block("ch-auth", auth)
+
+    assert block is not None
+    assert {source.principal for source in block.labels.sources} == {"user:alice"}
+    assert {source.authorized_principals for source in block.labels.sources} == {
+        frozenset({"user:alice"})
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inverse coverage: when every ``_assemble_*`` returns ``None``
+    (or empty), the corresponding labeled sections must NOT appear.
+    Prevents accidental rendering of empty-body blocks (which would
+    eat prompt cache and confuse the model).
+    """
+    agent = _make_agent(tmp_path)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda auth_context: (None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda channel_id, auth_context: None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda auth_context, **_kw: None)
+
+    async def _none_summaries(*, channel_id, auth_context):
+        assert isinstance(auth_context, AuthContext)
+        return None
+
+    monkeypatch.setattr(agent, "_assemble_session_summaries", _none_summaries)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda auth_context: None)
+
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-empty",
+        content="hello",
+        author="user-a",
+    )
+    ctx = _make_ctx(event)
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None,
+    )
+
+    # None of the optional headers should appear — they're conditional
+    # on truthy block content.
+    leaked: list[str] = []
+    for label in _OPTIONAL_BLOCK_LABELS:
+        if f"## {label}" in turn_prompt:
+            leaked.append(label)
+    assert not leaked, (
+        f"Empty/None helpers should suppress their labeled sections, "
+        f"but these still appeared in the prompt: {leaked}"
+    )
+
+    # The always-on header survives.
+    assert "## Today's date" in turn_prompt

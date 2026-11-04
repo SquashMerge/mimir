@@ -1,0 +1,996 @@
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
+import React, { Suspense } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  BrowserRouter,
+  Link,
+  Navigate,
+  NavLink,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useSearchParams
+} from "react-router-dom";
+import { AgentCharacter, characterStateFromLiveEvent, withComposerListening } from "./agent-character";
+import { createWebSession, deleteWebSession, restoreWebSession } from "./api";
+import { useBootstrap } from "./api/bootstrap";
+import { ChatRoute } from "./ChatRoute";
+import { useChatStore } from "./chatStore";
+import { clearChunkReloadMarkerAfterStart, isChunkLoadError, reloadOnceForStaleChunk } from "./chunkReload";
+import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
+import type { WebBootstrapData } from "./api/generated/contracts";
+import { getDashboardSurfaces, loadPluginBundles, visibleSurfaces, type DashboardSurface, type LoadedPlugins, type PluginRegistrationCache } from "./dashboardExtensions";
+import { getWhoami } from "./api/whoami";
+import { ApiError } from "./api/http";
+import { AdminRoute } from "./routes/AdminRoute";
+import { LiveEventsProvider, LiveEventsWarning, useLiveEvents } from "./live-events";
+import { SagaDashboard } from "./SagaDashboard";
+import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
+import { SchedulerRoute } from "./routes/SchedulerRoute";
+import { StateMemoryRoute } from "./routes/StateMemoryRoute";
+import { TurnsRoute } from "./routes/TurnsRoute";
+import { scrubSecretQueryParams, useRouteState } from "./routeState";
+import { SkinProvider, useSkin } from "./skins/SkinProvider";
+import type { AgentCharacterState, SkinId } from "./skins/types";
+import {
+  Badge,
+  Button,
+  DashboardHeader,
+  ErrorState,
+  LoadingState,
+  Panel,
+  TextInput
+} from "./ui";
+import { useUiState } from "./uiState";
+import "./styles.css";
+
+
+const queryClient = new QueryClient();
+
+interface AppErrorBoundaryProps {
+  children: React.ReactNode;
+  title: string;
+}
+
+interface AppErrorBoundaryState {
+  error: Error | null;
+  reloadRequested: boolean;
+}
+
+export class AppErrorBoundary extends React.Component<AppErrorBoundaryProps, AppErrorBoundaryState> {
+  state: AppErrorBoundaryState = { error: null, reloadRequested: false };
+
+  static getDerivedStateFromError(error: Error): Partial<AppErrorBoundaryState> {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error("Dashboard render failed", error);
+    if (isChunkLoadError(error) && reloadOnceForStaleChunk()) {
+      this.setState({ reloadRequested: true });
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="ui-state ui-state--error" role="alert">
+          <h1>{this.props.title}</h1>
+          <p>{this.state.error.message || "An unexpected render error occurred."}</p>
+          {isChunkLoadError(this.state.error) && !this.state.reloadRequested ? (
+            <>
+              <p>The dashboard was updated — reload to get the new version.</p>
+              <Button onClick={() => window.location.reload()}>Reload</Button>
+            </>
+          ) : null}
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+window.addEventListener("vite:preloadError", (event) => {
+  if (reloadOnceForStaleChunk()) event.preventDefault();
+});
+
+function ChunkReloadStarted() {
+  React.useEffect(clearChunkReloadMarkerAfterStart, []);
+  return null;
+}
+
+const LazyWikiRoute = React.lazy(async () => {
+  const module = await import("./routes/WikiRoute");
+  return { default: module.WikiRoute };
+});
+
+// Build-time mimir version from vite's define (vite.config). Guarded with typeof
+// so it's safe where the define isn't applied (e.g. vitest) — falls back to "".
+const APP_BUILD_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "";
+
+const scrubbedUrl = scrubSecretQueryParams();
+if (scrubbedUrl) {
+  window.history.replaceState(window.history.state, "", scrubbedUrl);
+}
+
+function appBasename() {
+  const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+  return base === "" ? "/" : base;
+}
+
+function useWhoami(enabled: boolean) {
+  return useQuery({
+    queryKey: ["whoami"],
+    queryFn: async () => {
+      const epoch = useUiState.getState().apiKeyEpoch;
+      try {
+        const result = await getWhoami();
+        if (useUiState.getState().apiKeyEpoch === epoch) {
+          useUiState.getState().confirmSessionCookie();
+        }
+        return result.data;
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401 &&
+            useUiState.getState().apiKeyPresent && useUiState.getState().apiKeyEpoch === epoch) {
+          useUiState.getState().setApiKeyRejected(true);
+        }
+        throw error;
+      }
+    },
+    // Don't call /api/v1/whoami until the user is signed in — a protected server
+    // with no key would otherwise issue an unauthenticated request pre-login.
+    enabled
+  });
+}
+
+// Whether the dashboard (and its authenticated clients) may run: the auth policy
+// must be known, and either the server is open or a key is stored. Bootstrap
+// itself is public, so it's allowed to load before this is true.
+function isSignedIn(
+  bootstrap: WebBootstrapData | undefined,
+  apiKeyPresent: boolean
+): boolean {
+  if (!bootstrap) return false;
+  return !bootstrap.auth.required || apiKeyPresent;
+}
+
+// Clears browser-scoped authenticated state when the key changes. React Query
+// data and module-level stores can otherwise keep rendering user A's data after
+// the browser switches to user B in the same page session (#594). Bootstrap is
+// refetched because authenticated responses include operator-facing UI data.
+export function resetBrowserSessionStateForApiKeyChange(
+  client: QueryClient,
+  navigate?: (to: string, options: { replace: boolean }) => void
+) {
+  client.removeQueries();
+  useChatStore.setState({ messages: [] });
+  useUiState.setState({
+    selectedChatMessageId: "",
+    composerActive: false,
+    collapsedRegions: {}
+  });
+  navigate?.("/chat", { replace: true });
+}
+
+// Exchanges/clears the API key cookie + flips the shared store flag (so AppFrame's login
+// gate + the header status react) + drops browser-scoped user data before the
+// dashboard reconnects with the new identity (#563, #594).
+function useSetApiKey() {
+  const client = useQueryClient();
+  const navigate = useNavigate();
+  const setApiKeyPresent = useUiState((state) => state.setApiKeyPresent);
+  return React.useCallback(
+    async (value: string) => {
+      const trimmed = value.trim();
+      if (trimmed) await createWebSession(trimmed);
+      else await deleteWebSession();
+      resetBrowserSessionStateForApiKeyChange(client, navigate);
+      setApiKeyPresent(Boolean(trimmed));
+      if (trimmed) useUiState.getState().setSessionCookiePending();
+      if (trimmed) void client.invalidateQueries({ queryKey: ["whoami"] });
+    },
+    [client, navigate, setApiKeyPresent]
+  );
+}
+
+function AuthPanel({ bootstrap, error, isError, isLoading }: {
+  bootstrap?: WebBootstrapData;
+  error: Error | null;
+  isError: boolean;
+  isLoading: boolean;
+}) {
+  const [entry, setEntry] = React.useState("");
+  const [sessionError, setSessionError] = React.useState("");
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  const setApiKey = useSetApiKey();
+  const requiresKey = bootstrap?.auth.required ?? false;
+  const signedIn = !requiresKey || apiKeyPresent;
+
+  const [override, setOverride] = React.useState<boolean | null>(null);
+  // github #571: keep the status box from dominating the header. Auto-expand
+  // only when there's something to act on (loading, bootstrap error, or a
+  // locked/login state); once the session is ready it collapses to a one-line
+  // indicator. The toggle lets the user pin it open or closed.
+  const autoExpand = isLoading || isError || !signedIn;
+  const expanded = override ?? autoExpand;
+
+  return (
+    <Panel
+      actions={
+        <>
+          <Badge tone={signedIn ? "success" : "warning"}>{signedIn ? "ready" : "locked"}</Badge>
+          <Button
+            aria-controls="auth-panel-body"
+            aria-expanded={expanded}
+            onClick={() => setOverride(!expanded)}
+            type="button"
+          >
+            {expanded ? "Hide" : "Details"}
+          </Button>
+        </>
+      }
+      aria-labelledby="auth-title"
+      className="app-status-card"
+      subtitle={
+        expanded
+          ? (isLoading
+              ? "Loading server auth policy."
+              : isError
+                ? `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`
+                : `${requiresKey ? "Protected" : "Local unauthenticated"} server on ${bootstrap?.server?.web_host || "default host"}.`)
+          : undefined
+      }
+      title={<span id="auth-title">Status</span>}
+    >
+      {expanded ? (
+        <div id="auth-panel-body">
+          {isLoading ? <LoadingState label="Loading auth policy" /> : null}
+          {isError ? (
+            <ErrorState title="Bootstrap failed">
+              {error instanceof Error ? error.message : String(error)}
+            </ErrorState>
+          ) : null}
+          {!isLoading && !isError && requiresKey ? (
+            <form
+              className="auth-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                 void setApiKey(entry).then(() => { setEntry(""); setSessionError(""); })
+                   .catch(() => setSessionError("Invalid API key"));
+              }}
+            >
+              <TextInput
+                aria-label="MIMIR_API_KEY"
+                autoComplete="off"
+                 placeholder={apiKeyPresent ? "Session active" : "MIMIR_API_KEY"}
+                type="password"
+                value={entry}
+                onChange={(event) => setEntry(event.target.value)}
+              />
+              <Button type="submit" variant="primary">Save</Button>
+               <Button type="button" onClick={() => void setApiKey("")}>Clear</Button>
+               {sessionError ? <span role="alert">{sessionError}</span> : null}
+            </form>
+          ) : null}
+          {!isLoading && !isError ? (
+            <dl className="facts-grid facts-grid--compact">
+               <div><dt>Browser session</dt><dd>{apiKeyPresent ? "active" : "inactive"}</dd></div>
+              <div><dt>Bind</dt><dd>{bootstrap?.server?.public_bind ? "public" : "localhost"}</dd></div>
+              <div><dt>Streams</dt><dd>{bootstrap?.stream_auth?.shape || "loading"}</dd></div>
+            </dl>
+          ) : null}
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
+function SkinPicker() {
+  const { availableSkins, selectedSkinId, setUserSkin, isSavingUserSkin } = useSkin();
+  return (
+    <label className="skin-picker">
+      <span>Skin</span>
+      <select
+        aria-label="Skin"
+        className="ui-input"
+        disabled={isSavingUserSkin}
+        value={selectedSkinId}
+        onChange={(event) => setUserSkin(event.target.value as SkinId)}
+      >
+        {availableSkins.map((skin) => (
+          <option key={skin.id} value={skin.id}>{skin.name}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function AppNavigation({ surfaces }: { surfaces: DashboardSurface[] }) {
+  return (
+    <nav aria-label="Application sections" className="app-nav">
+      {surfaces.map((surface) => (
+        <NavLink
+          className={({ isActive }) => `app-nav__link${isActive ? " app-nav__link--active" : ""}`}
+          key={surface.id}
+          data-testid={`nav-${surface.id}`}
+          to={surface.path}
+        >
+          <span>{surface.label}</span>
+          <small>{surface.detail}</small>
+        </NavLink>
+      ))}
+    </nav>
+  );
+}
+
+function RouteTabs({
+  surface,
+  activeTab
+}: {
+  surface: DashboardSurface;
+  activeTab: string;
+}) {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const tabsRef = React.useRef<Array<HTMLAnchorElement | null>>([]);
+  const panelId = `${surface.id}-${activeTab}-panel`;
+
+  function tabTarget(tab: string) {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", tab);
+    return { pathname: surface.path, search: `?${params.toString()}` };
+  }
+
+  function moveFocus(nextIndex: number) {
+    const normalized = (nextIndex + surface.tabs.length) % surface.tabs.length;
+    const tab = surface.tabs[normalized];
+    tabsRef.current[normalized]?.focus();
+    navigate(tabTarget(tab));
+  }
+
+  return (
+    <div className="app-tabs">
+      <div aria-label={`${surface.label} tabs`} className="ui-tabs__list" role="tablist">
+        {surface.tabs.map((tab, index) => {
+          const selected = activeTab === tab;
+          return (
+            <Link
+              aria-controls={panelId}
+              aria-selected={selected}
+              className="ui-tabs__tab"
+              id={`${surface.id}-${tab}-tab`}
+              key={tab}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowRight") {
+                  event.preventDefault();
+                  moveFocus(index + 1);
+                } else if (event.key === "ArrowLeft") {
+                  event.preventDefault();
+                  moveFocus(index - 1);
+                } else if (event.key === "Home") {
+                  event.preventDefault();
+                  moveFocus(0);
+                } else if (event.key === "End") {
+                  event.preventDefault();
+                  moveFocus(surface.tabs.length - 1);
+                }
+              }}
+              ref={(node) => {
+                tabsRef.current[index] = node;
+              }}
+              role="tab"
+              tabIndex={selected ? 0 : -1}
+              to={tabTarget(tab)}
+            >
+              {tab}
+            </Link>
+          );
+        })}
+      </div>
+      <section
+        aria-labelledby={`${surface.id}-${activeTab}-tab`}
+        className="ui-tabs__panel app-tab-panel"
+        id={panelId}
+        role="tabpanel"
+        tabIndex={0}
+      >
+        <RoutePlaceholder surface={surface} />
+      </section>
+    </div>
+  );
+}
+
+function UrlStateControls({ surface }: { surface: DashboardSurface }) {
+  const { selectedTurn, filter, target, update } = useRouteState(surface);
+
+  return (
+    <form
+      className="route-state-form"
+      key={`${surface.id}:${selectedTurn}:${filter}:${target}`}
+      onSubmit={(event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        update({
+          turn: String(form.get("turn") || ""),
+          filter: String(form.get("filter") || ""),
+          target: String(form.get("target") || "")
+        });
+      }}
+    >
+      <label>
+        <span>Turn</span>
+        <TextInput defaultValue={selectedTurn} name="turn" placeholder="turn id" />
+      </label>
+      <label>
+        <span>{surface.filterLabel}</span>
+        <TextInput defaultValue={filter} name="filter" placeholder="filter" />
+      </label>
+      <label>
+        <span>Target</span>
+        <TextInput defaultValue={target} name="target" placeholder="drilldown target" />
+      </label>
+      <div className="route-state-form__actions">
+        <Button type="submit" variant="primary">Apply</Button>
+        <Button type="button" onClick={() => update({ turn: "", filter: "", target: "" })}>
+          Clear
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function CollapsibleRegion({
+  id,
+  title,
+  children
+}: {
+  id: string;
+  title: string;
+  children: React.ReactNode;
+}) {
+  const collapsed = useUiState((state) => state.collapsedRegions[id] ?? false);
+  const toggle = useUiState((state) => state.toggleCollapsedRegion);
+  const contentId = `${id}-content`;
+
+  return (
+    <section className="collapsible-region">
+      <button
+        aria-controls={contentId}
+        aria-expanded={!collapsed}
+        className="collapsible-region__button"
+        onClick={() => toggle(id)}
+        type="button"
+      >
+        <span>{title}</span>
+        <span aria-hidden="true">{collapsed ? "+" : "-"}</span>
+      </button>
+      <div hidden={collapsed} id={contentId}>
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
+  const { activeTab, selectedTurn, filter, target } = useRouteState(surface);
+
+  return (
+    <div className="route-placeholder">
+      <p>
+        {surface.title} route frame is mounted. Dashboard-specific content is intentionally deferred to its page issue.
+      </p>
+      <dl className="facts-grid">
+        <div><dt>Active tab</dt><dd>{activeTab}</dd></div>
+        <div><dt>Selected turn</dt><dd>{selectedTurn || "none"}</dd></div>
+        <div><dt>Filter</dt><dd>{filter || "none"}</dd></div>
+        <div><dt>Target</dt><dd>{target || "none"}</dd></div>
+      </dl>
+    </div>
+  );
+}
+
+function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
+  const { activeTab } = useRouteState(surface);
+  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
+  const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
+
+  if (surface.id === "state-memory") {
+    return <StateMemoryRoute surface={surface} />;
+  }
+  if (surface.id === "chat") return <ChatRoute surface={surface} />;
+
+  const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
+
+  if (surface.id === "saga") {
+    return <SagaDashboard />;
+  }
+
+  return (
+    <>
+      <DashboardHeader eyebrow="Route shell" title={surface.title}>
+        <p>{surface.detail}</p>
+      </DashboardHeader>
+      <div className="content-layout">
+        <section aria-label={`${surface.label} main content`} className="content-layout__main">
+          <Panel
+            actions={
+              <Button
+                aria-expanded={detailsPanelOpen}
+                aria-controls="details-panel-host"
+                onClick={() => setDetailsPanelOpen(!detailsPanelOpen)}
+              >
+                Details
+              </Button>
+            }
+            title="Navigation state"
+            subtitle="Tab, filter, selected turn, and drilldown target are encoded in the URL."
+          >
+            <UrlStateControls surface={surface} />
+          </Panel>
+
+          <Panel title={`${surface.label} tabs`}>
+            <RouteTabs surface={surface} activeTab={normalizedTab} />
+          </Panel>
+
+          <CollapsibleRegion id={`${surface.id}-notes`} title="Route contract">
+            <p className="app-copy">
+              This shell owns layout, navigation, and shareable route state only. Page parity, live transport,
+              graph polish, and reusable primitive expansion remain outside this issue.
+            </p>
+          </CollapsibleRegion>
+        </section>
+        <aside
+          aria-label="Details panel"
+          className="content-layout__details"
+          hidden={!detailsPanelOpen}
+          id="details-panel-host"
+        >
+          <Panel title="Details host" subtitle="Reserved for route-owned drilldown panels.">
+            <RoutePlaceholder surface={surface} />
+          </Panel>
+        </aside>
+      </div>
+    </>
+  );
+}
+
+function AppStatus() {
+  const location = useLocation();
+  return (
+    <footer aria-live="polite" className="app-status">
+      <code className="app-status__route">{location.pathname}{location.search}</code>
+      <span className="app-status__tag">PROPERTY OF MIMIR OPS</span>
+    </footer>
+  );
+}
+
+function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = false }: {
+  bootstrap?: WebBootstrapData;
+  error: Error | null;
+  isError: boolean;
+  isLoading: boolean;
+  reauthenticate?: boolean;
+}) {
+  const [entry, setEntry] = React.useState("");
+  const [sessionError, setSessionError] = React.useState("");
+  const setApiKey = useSetApiKey();
+  const sessionCookieMissing = useUiState((state) => state.sessionCookieMissing);
+  const host = bootstrap?.server?.web_host || "this server";
+
+  return (
+    <div className="login-screen">
+      <div className="login-screen__card">
+        <p className="login-screen__brand">MIMIR://OPS</p>
+        {isLoading ? (
+          <p className="app-copy">Loading server auth policy…</p>
+        ) : isError ? (
+          <ErrorState title="Couldn't reach the server">
+            {error instanceof Error ? error.message : String(error)}
+          </ErrorState>
+        ) : (
+          <>
+            <p className="login-screen__subtitle">
+              {reauthenticate
+                ? sessionCookieMissing
+                  ? "Signed in, but your browser didn't keep the session cookie. Open mimir over HTTPS, or at http://localhost:<port> (for example through an SSH tunnel)."
+                  : "Your API key was rejected or revoked. Enter a valid key to re-authenticate."
+                : `Protected server on ${host}. Enter your API key to continue.`}
+            </p>
+            <form
+              className="login-screen__form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                 void setApiKey(entry).then(() => { setEntry(""); setSessionError(""); })
+                   .catch(() => setSessionError("Invalid API key"));
+              }}
+            >
+              <TextInput
+                aria-label="MIMIR_API_KEY"
+                autoComplete="off"
+                placeholder="MIMIR_API_KEY"
+                type="password"
+                value={entry}
+                onChange={(event) => setEntry(event.target.value)}
+              />
+              <Button disabled={!entry.trim()} type="submit" variant="primary">Sign in</Button>
+            </form>
+            {sessionError ? <p role="alert">{sessionError}</p> : null}
+            <p className="login-screen__hint">Your session uses an HttpOnly browser cookie.</p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Hardcoded until agent identity is configurable (chat composer notes, #578).
+const AGENT_NAME = "Mimir";
+
+const AGENT_STATE_LABELS: Record<AgentCharacterState, string> = {
+  idle: "Ready",
+  thinking: "Thinking",
+  typing: "Typing",
+  tool: "Working",
+  error: "Alert",
+  bored: "Idle",
+  listening: "Listening"
+};
+
+interface ShellProps {
+  surfaces: DashboardSurface[];
+  pendingSurfaces: DashboardSurface[];
+  plugins: LoadedPlugins;
+  isAdmin: boolean;
+  firstRoute: string;
+  agentState: AgentCharacterState;
+  bootstrap?: WebBootstrapData;
+  error: Error | null;
+  isError: boolean;
+  isLoading: boolean;
+}
+
+// Routed surfaces — identical across shells; only the surrounding chrome differs.
+function DashboardRouteElement({ surface, plugins, cultivateSelected }: {
+  surface: DashboardSurface;
+  plugins: LoadedPlugins;
+  cultivateSelected: boolean;
+}) {
+  const PluginPage = plugins.routes.find((route) => route.id === surface.id && route.path === surface.path)?.component;
+  const CultivatePullRequests = cultivateSelected
+    ? (window as Window & { mimirCultivate?: { PullRequests: React.ComponentType } }).mimirCultivate?.PullRequests
+    : undefined;
+  const content = PluginPage ? <PluginPage /> : surface.id === "saga"
+    ? <SagaDashboard />
+    : surface.id === "usage"
+      ? <UsageRoute />
+      : surface.id === "ops"
+        ? <OpsRoute PullRequests={CultivatePullRequests} />
+        : surface.id === "chainlink-board"
+          ? <ChainlinkBoardRoute />
+          : surface.id === "turns"
+            ? <TurnsRoute />
+              : surface.id === "admin-config"
+                ? <AdminRoute />
+                : surface.id === "scheduler"
+                  ? <SchedulerRoute />
+                  : surface.id === "wiki"
+                    ? (
+                      <Suspense fallback={<LoadingState label="Loading wiki" />}>
+                        <LazyWikiRoute surface={surface} />
+                      </Suspense>
+                    )
+                    : <SurfaceRoute surface={surface} />;
+  return <AppErrorBoundary title={`${surface.label} could not be rendered`}>{content}</AppErrorBoundary>;
+}
+
+function DashboardRoutes({ surfaces, firstRoute, plugins, pendingSurfaces }: {
+  surfaces: DashboardSurface[];
+  firstRoute: string;
+  plugins: LoadedPlugins;
+  pendingSurfaces: DashboardSurface[];
+}) {
+  const cultivateSelected = surfaces.some((surface) => surface.id === "cultivate-factory-runs" && surface.path === "/cultivate/factory-runs") &&
+    plugins.routes.some((route) => route.plugin === "cultivate" && route.id === "cultivate-factory-runs" && route.path === "/cultivate/factory-runs");
+  return (
+    <Routes>
+      <Route element={<Navigate replace to={firstRoute} />} path="/" />
+      {/*
+        Users / MCP servers now render as sub-tabs of the consolidated Admin
+        surface (their manifests are nav_hidden, so they are absent from
+        `surfaces` and get no route above). Keep their legacy paths working by
+        redirecting to the corresponding Admin sub-tab instead of falling
+        through to the "*" wildcard (which lands on Chat).
+      */}
+      <Route element={<Navigate replace to="/admin?tab=users" />} path="/admin/users" />
+      <Route element={<Navigate replace to="/admin?tab=mcp" />} path="/admin/mcp" />
+      {surfaces.map((surface) => (
+        <Route
+          element={<DashboardRouteElement surface={surface} plugins={plugins} cultivateSelected={cultivateSelected} />}
+          key={surface.id}
+          path={surface.path}
+        />
+      ))}
+      {pendingSurfaces.map((surface) => (
+        <Route
+          element={<LoadingState label={`Loading ${surface.label} plugin dashboard`} />}
+          key={surface.id}
+          path={surface.path}
+        />
+      ))}
+      <Route element={<Navigate replace to={firstRoute} />} path="*" />
+    </Routes>
+  );
+}
+
+function PluginNotices({ plugins, isAdmin }: { plugins: LoadedPlugins; isAdmin: boolean }) {
+  if (!isAdmin || !plugins.notices.length) return null;
+  return <div className="plugin-notices" data-testid="plugin-notices" role="status">
+    {plugins.notices.map((notice) => <p key={notice}>{notice}</p>)}
+  </div>;
+}
+
+// github #577: header strip over a horizontal tab bar (Neon Terminal / default).
+function TopNavShell({ surfaces, firstRoute, bootstrap, plugins, isAdmin, pendingSurfaces }: ShellProps) {
+  const buildVersion = bootstrap?.version || APP_BUILD_VERSION;
+  const setApiKey = useSetApiKey();
+  const requiresKey = bootstrap?.auth.required ?? false;
+  return (
+    <div className="app-frame">
+      <header className="app-header">
+        <Link className="app-brand" to="/chat">
+          <span className="app-brand__name">MIMIR://OPS</span>
+          {buildVersion ? (
+            <span className="app-brand__build">· BUILD {buildVersion}</span>
+          ) : null}
+        </Link>
+        <div className="app-header__status">
+          {/* On a protected server the status chip doubles as sign-out (clears
+              the stored key → login screen); open servers show it as a label. */}
+          {requiresKey ? (
+            <button
+              aria-label="Sign out"
+              className="app-status-chip"
+              onClick={() => setApiKey("")}
+              title="Sign out"
+              type="button"
+            >
+              READY
+            </button>
+          ) : (
+            <span className="app-status-chip">READY</span>
+          )}
+          <SkinPicker />
+          <span className="app-header__signal" aria-hidden="true">◇ MEM-LINKED · SIGNAL ▮▮▯ LOW</span>
+        </div>
+      </header>
+      <div className="app-topnav">
+        <AppNavigation surfaces={surfaces} />
+      </div>
+      <main className="app-main" id="main-content">
+        <LiveEventsWarning />
+        <PluginNotices plugins={plugins} isAdmin={isAdmin} />
+        <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} plugins={plugins} pendingSurfaces={pendingSurfaces} />
+      </main>
+      <AppStatus />
+    </div>
+  );
+}
+
+// Skin-driven sidebar console (Cosmic Nebula): a left rail holds the brand, the
+// agent character card, and a vertical nav; the server/status panel sits in a
+// bar above the routed content.
+function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isError, isLoading, plugins, isAdmin, pendingSurfaces }: ShellProps) {
+  const { skin } = useSkin();
+  const agentName = bootstrap?.ui?.agent_name || AGENT_NAME;
+  return (
+    <div className="app-frame app-frame--sidebar">
+      <aside className="app-sidebar">
+        <Link className="app-brand app-brand--stacked" to="/chat">
+          <span className="app-brand__eyebrow">Agent Console</span>
+          <span className="app-brand__name">{agentName}</span>
+        </Link>
+        <div className="agent-card">
+          <AgentCharacter className="agent-card__character" state={agentState} />
+          <div className="agent-card__meta">
+            <span className="agent-card__name">{agentName}</span>
+            <span className="agent-card__state">{AGENT_STATE_LABELS[agentState]}</span>
+          </div>
+        </div>
+        <SkinPicker />
+        <AppNavigation surfaces={surfaces} />
+        <p className="app-sidebar__version">{skin.id} · v{skin.version}</p>
+      </aside>
+      <div className="app-sidebar-main">
+        <div className="app-statusbar">
+          <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
+        </div>
+        <main className="app-main" id="main-content">
+          <LiveEventsWarning />
+          <PluginNotices plugins={plugins} isAdmin={isAdmin} />
+          <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} plugins={plugins} pendingSurfaces={pendingSurfaces} />
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function AppFrameContent() {
+  const liveEvents = useLiveEvents();
+  const { data: bootstrap, error, isError, isLoading } = useBootstrap();
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  const apiKeyRejected = useUiState((state) => state.apiKeyRejected);
+  React.useEffect(() => {
+    let active = true;
+    const epoch = useUiState.getState().apiKeyEpoch;
+    void restoreWebSession().then((present) => {
+      if (active && present && useUiState.getState().apiKeyEpoch === epoch) {
+        useUiState.getState().setApiKeyPresent(true);
+      }
+    });
+    return () => { active = false; };
+  }, []);
+  const signedIn = isSignedIn(bootstrap, apiKeyPresent);
+  // Gate identity on sign-in so a protected server doesn't fetch whoami pre-login.
+  const identity = useWhoami(signedIn);
+  const whoami = identity.data;
+  // Open/dev mode (auth not required) doesn't gate /api/v1/admin/ server-side,
+  // so surface admin sections there; in a gated server, hide them unless the
+  // resolved identity is an admin (server still 403s either way — this is UX).
+  const isAdmin = (whoami?.is_admin ?? false) || !(bootstrap?.auth.required ?? false);
+  const { skin } = useSkin();
+  const pluginRegistrations = React.useRef<PluginRegistrationCache>(new Map());
+  const [plugins, setPlugins] = React.useState<LoadedPlugins>({ routes: [], navEntries: [], notices: [] });
+  const [loadedBootstrap, setLoadedBootstrap] = React.useState<WebBootstrapData>();
+  const canLoadPlugins = signedIn && !apiKeyRejected && (!bootstrap?.auth.required || identity.isSuccess);
+  React.useEffect(() => {
+    setPlugins({ routes: [], navEntries: [], notices: [] });
+    setLoadedBootstrap(undefined);
+    if (!canLoadPlugins || !bootstrap?.plugin_bundles?.length) return;
+    const controller = new AbortController();
+    void loadPluginBundles(bootstrap.plugin_bundles, bootstrap.dashboard_extensions ?? [], skin.tokens,
+      setPlugins, controller.signal, undefined, pluginRegistrations.current).then(() => {
+        if (!controller.signal.aborted) setLoadedBootstrap(bootstrap);
+      }).catch((error) => console.error("Plugin dashboard loader failed", error));
+    return () => controller.abort();
+  }, [bootstrap, canLoadPlugins, skin.tokens]);
+  const pendingSurfaces = React.useMemo(() =>
+    canLoadPlugins && bootstrap?.plugin_bundles?.length && loadedBootstrap !== bootstrap
+      ? visibleSurfaces(getDashboardSurfaces((bootstrap.dashboard_extensions ?? []).filter((manifest) =>
+          Boolean(manifest.bundle) && !plugins.routes.some((route) => route.id === manifest.id)
+        )), isAdmin)
+      : [], [bootstrap, canLoadPlugins, isAdmin, loadedBootstrap, plugins.routes]);
+  const surfaces = React.useMemo(
+    () => (bootstrap
+      ? visibleSurfaces(getDashboardSurfaces((bootstrap.dashboard_extensions ?? []).filter((manifest) =>
+          manifest.id !== "factory-runs" && (!manifest.bundle || (plugins.routes.some((route) => route.id === manifest.id && route.path === manifest.route_path) &&
+            plugins.navEntries.some((entry) => entry.id === manifest.id)))
+        )).map((surface) => {
+          const entry = plugins.navEntries.find((nav) => nav.id === surface.id);
+          return entry ? { ...surface, label: entry.label, detail: entry.detail ?? surface.detail } : surface;
+        }), isAdmin)
+      : []),
+    [bootstrap, isAdmin, plugins]
+  );
+  const firstRoute = surfaces[0]?.path ?? "/chat";
+  // github #580: while the user is engaging the composer and the agent isn't
+  // already busy, the character "listens"; otherwise it follows the live stream.
+  const composerActive = useUiState((state) => state.composerActive);
+  const eventState =
+    liveEvents.status === "error"
+      ? "error"
+      : characterStateFromLiveEvent(liveEvents.lastEvent?.event);
+  const agentState = withComposerListening(eventState, composerActive);
+  // The active skin picks the shell layout (top-nav vs sidebar). useSkin runs
+  // before the gate's early return to keep hook order stable.
+
+  // Protected + not signed in (or still resolving the policy): show a focused
+  // login screen instead of a dashboard full of 401 error panels.
+  if (isLoading || isError || !signedIn || apiKeyRejected) {
+    return (
+      <LoginScreen
+        bootstrap={bootstrap}
+        error={error}
+        isError={isError}
+        isLoading={isLoading}
+        reauthenticate={apiKeyRejected}
+      />
+    );
+  }
+
+  // Do not let the wildcard redirect discard a deep link before its role is known.
+  if (bootstrap?.auth.required) {
+    if (identity.isPending) return <LoadingState label="Loading dashboard identity" />;
+    if (identity.isError) {
+      return (
+        <div>
+          <ErrorState title="Couldn't verify your identity">
+            Dashboard access could not be verified. Retry or sign in with a valid key.
+          </ErrorState>
+          <Button onClick={() => void identity.refetch()}>Retry</Button>
+          <AuthPanel bootstrap={bootstrap} error={null} isError={false} isLoading={false} />
+        </div>
+      );
+    }
+  }
+
+  const shellProps: ShellProps = {
+    surfaces,
+    pendingSurfaces,
+    plugins,
+    isAdmin,
+    firstRoute,
+    agentState,
+    bootstrap,
+    error,
+    isError,
+    isLoading
+  };
+  return skin.chrome.layout === "sidebar" ? (
+    <SidebarShell {...shellProps} />
+  ) : (
+    <TopNavShell {...shellProps} />
+  );
+}
+
+export function AppFrame() {
+  return (
+    <AppErrorBoundary title="The dashboard could not be rendered">
+      <AppFrameContent />
+    </AppErrorBoundary>
+  );
+}
+
+function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
+  const [searchParams] = useSearchParams();
+  const selectedTurnId = searchParams.get("turn") || null;
+  // Re-render on sign-in/out so the stream connects/reconnects with the new key.
+  const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  // chainlink #616: a switch between two valid keys keeps apiKeyPresent=true, so
+  // recompute the key off the epoch too — otherwise the live-events stream keeps
+  // the previous identity's key until the next drop/reconnect.
+  const apiKeyEpoch = useUiState((state) => state.apiKeyEpoch);
+  const apiKey = undefined;
+  // Shares AppFrame's bootstrap query; after login it carries authenticated UI data.
+  const { data: bootstrap } = useBootstrap();
+  const signedIn = isSignedIn(bootstrap, apiKeyPresent);
+
+  return (
+    <LiveEventsProvider
+      apiKey={apiKey}
+      // Don't open the authenticated SSE stream until signed in — otherwise a
+      // protected server fetches /api/v1/live-events while the login screen shows.
+      enabled={signedIn}
+      cachePolicy={{
+        aggregateQueryKeys: [["web-bootstrap"], ["turns"]],
+        selectedTurnId,
+        selectedTurnQueryKey: selectedTurnId ? ["turn", selectedTurnId] : undefined
+      }}
+      queryClient={queryClient}
+    >
+      {children}
+    </LiveEventsProvider>
+  );
+}
+
+// Guarded so importing this module in tests (jsdom, no #root) doesn't mount the
+// app; the browser bundle always has #root. AppFrame is exported for testing.
+const root = document.getElementById("root");
+if (root) {
+  createRoot(root).render(
+    <React.StrictMode>
+      <AppErrorBoundary title="The dashboard could not be started">
+        <QueryClientProvider client={queryClient}>
+          <SkinProvider>
+            <BrowserRouter basename={appBasename()}>
+              <RoutedLiveEventsProvider>
+                <AppFrame />
+                <ChunkReloadStarted />
+              </RoutedLiveEventsProvider>
+            </BrowserRouter>
+          </SkinProvider>
+        </QueryClientProvider>
+      </AppErrorBoundary>
+    </React.StrictMode>
+  );
+}

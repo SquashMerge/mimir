@@ -1,0 +1,622 @@
+"""Local web-chat bridge (SPEC §7.2.1).
+
+Registers two routes onto the shared aiohttp app:
+
+  POST /chat              — inbound message (JSON body)
+  GET  /chat/stream       — outbound SSE stream (one event per ``send`` call)
+
+Inbound payload:
+  {
+    "content":    "the message text",
+    "msg_id":     "client-side-id"    # optional
+  }
+
+The bridge calls ``dispatcher.enqueue(AgentEvent)`` directly — same path as
+every other inbound. Outbound SSE clients receive a JSON line per send:
+
+  data: {"channel_id": "web-x", "text": "...", "message_id": "..."}
+
+Channel ids: anything starting with ``web-`` routes here. Chat endpoints
+require a resolved per-user web identity and derive the channel from it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from aiohttp import web
+
+from ..chat_skills import (
+    CHAT_SKILL_EXTRA_KEY,
+    ChatSkillError,
+    ChatSkillInvocation,
+    ChatSkillRegistry,
+)
+from ..http_ingress import sanitize_http_extra
+from ..models import AgentEvent
+from ..web_channels import DEFAULT_WEB_CHANNEL, web_channel_for_identity
+from ..web_contracts import (
+    json_error,
+    json_success,
+    make_chat_message_event,
+    make_chat_reaction_event,
+)
+from .base import Bridge, SendResult
+
+log = logging.getLogger(__name__)
+
+EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
+
+DEFAULT_CHANNEL = DEFAULT_WEB_CHANNEL
+
+
+@dataclass(frozen=True)
+class _ChatRequestError:
+    status: int
+    legacy_error: str
+    legacy_detail: str | None = None
+    v1_code: str = "bad_request"
+    v1_message: str | None = None
+    v1_details: dict[str, Any] | None = None
+
+    def legacy_response(self) -> web.Response:
+        payload = {"error": self.legacy_error}
+        if self.legacy_detail is not None:
+            payload["detail"] = self.legacy_detail
+        return web.json_response(payload, status=self.status)
+
+    def v1_response(self) -> web.Response:
+        return json_error(
+            self.v1_code,
+            self.v1_message or self.legacy_detail or self.legacy_error,
+            status=self.status,
+            details=self.v1_details,
+        )
+
+
+@dataclass
+class _Subscriber:
+    queue: asyncio.Queue
+    allowed_channels: frozenset[str] | None = None
+    canonical: str | None = None
+
+
+def _web_channel_for(canonical: str) -> str:
+    """Per-user web channel id derived from an identity canonical.
+
+    Authenticated users' default-channel traffic routes to ``web-<canonical>``
+    so a user's conversation — their messages plus the agent's replies (which go
+    to the turn's channel) — segregates per user and history is scoped
+    naturally. The canonical is the unique per-user matching key, so normal
+    canonicals are used VERBATIM: slugifying them (lower-casing / collapsing
+    punctuation) could map two distinct canonicals onto one channel and leak
+    history across users. Reserved channel collisions are escaped by the shared
+    web-channel helper. Channel ids are arbitrary strings here (cf. ``slack-U…``
+    / ``discord-…``); downstream path derivation sanitizes them where needed
+    (e.g. saga session ids).
+    """
+    return web_channel_for_identity(canonical)
+
+
+def _chat_identity(request: web.Request):
+    """Return the resolved per-user chat identity or a route-level auth error.
+
+    The global web auth gate intentionally stays open for non-chat routes in
+    dev/open mode, but chat is per-user state and must never fall back to an
+    anonymous shared channel.
+    """
+    if request.get("auth_is_master"):
+        return None, _ChatRequestError(
+            status=403,
+            legacy_error="master_key_not_chat_identity",
+            legacy_detail="the admin master key cannot use chat; use a per-user key",
+            v1_code="master_key_not_chat_identity",
+            v1_message="the admin master key cannot use chat; use a per-user key",
+        )
+    identity = request.get("auth_identity")
+    if identity is None:
+        return None, _ChatRequestError(
+            status=401,
+            legacy_error="chat_login_required",
+            v1_code="chat_login_required",
+            v1_message="chat login required",
+        )
+    return identity, None
+
+
+def _sanitize_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
+    return sanitize_http_extra(extra)
+
+
+def _slash_command_error(parsed: ChatSkillError) -> _ChatRequestError:
+    if parsed.code in {"invalid_command", "invalid_skill_name"}:
+        return _ChatRequestError(
+            status=400,
+            legacy_error="invalid_slash_command",
+            legacy_detail=parsed.message,
+            v1_code="invalid_slash_command",
+            v1_message=parsed.message,
+        )
+    return _ChatRequestError(
+        status=400,
+        legacy_error="chat_skill_unavailable",
+        legacy_detail=parsed.message,
+        v1_code="chat_skill_unavailable",
+        v1_message=parsed.message,
+    )
+
+
+def _chat_skill_extra(invocation: ChatSkillInvocation) -> dict[str, str]:
+    return {
+        "name": invocation.name,
+        "command": invocation.command,
+        "args": invocation.args,
+        "raw": invocation.raw,
+    }
+
+
+SSE_HEARTBEAT_S = 15.0
+
+
+@dataclass
+class WebChatBridge(Bridge):
+    """In-process web bridge that fan-outs sends to all SSE subscribers.
+
+    Args:
+        enqueue: dispatcher's enqueue coroutine (set at construction; the
+            bridge has no other inbound machinery).
+        max_subscribers: cap per resolved canonical, including role-admins.
+            Master keys and unauthenticated callers cannot subscribe to chat.
+    """
+
+    enqueue: EnqueueFn
+    home: Path
+    chat_skill_registry: ChatSkillRegistry | None = None
+    max_subscribers: int = 8
+    _subscribers: list[_Subscriber] = field(default_factory=list, init=False)
+    _lock: asyncio.Lock | None = field(default=None, init=False)
+
+    prefixes = ("web-",)
+    name = "web"
+
+    async def connect(self) -> None:
+        return None
+
+    async def disconnect(self) -> None:
+        # Drain all subscribers so any open SSE connection sees EOF.
+        # CR2 (external I/O) fix: previously this iterated
+        # ``list(self._subscribers)`` without acquiring ``self._lock``,
+        # while subscribe/unsubscribe DO. A shutdown that races a new
+        # SSE client mid-subscribe could ``put_nowait(None)`` on a
+        # queue that was just removed, or miss a queue just appended.
+        # Acquiring the lock makes the snapshot consistent.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            try:
+                subscriber.queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+    async def send(
+        self,
+        channel_id: str,
+        text: str,
+        attachment_paths: list[Path] | None = None,
+        *,
+        final: bool = True,
+        reply_to_message_id: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+        message_id: str | None = None,
+    ) -> SendResult:
+        # chainlink #5: ``final`` is informational. The web stub fans
+        # each send out as its own SSE payload, so a plan-then-result
+        # turn naturally arrives as two events without further
+        # gating. No typing-indicator affordance to hold.
+        del final, reply_to_message_id, blocks
+        message_id = message_id or uuid.uuid4().hex[:12]
+        legacy_payload = {
+            "channel_id": channel_id,
+            "text": text,
+            "message_id": message_id,
+            "attachments": [str(p) for p in attachment_paths or []],
+        }
+        payload = make_chat_message_event(
+            channel_id=channel_id,
+            text=text,
+            message_id=message_id,
+            attachments=[str(p) for p in attachment_paths or []],
+        )
+        payload.update(legacy_payload)
+        # Fan out to every connected SSE subscriber. Lazy lock — set once we
+        # have an event loop.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            for subscriber in list(self._subscribers):
+                if (
+                    subscriber.allowed_channels is not None
+                    and channel_id not in subscriber.allowed_channels
+                ):
+                    continue
+                try:
+                    subscriber.queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    # Slow consumer; drop silently rather than block sends.
+                    pass
+        return SendResult(sent=True, message_id=message_id, chunks=1)
+
+    async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        # Reactions broadcast as a "react" event over the same SSE stream.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        payload = make_chat_reaction_event(
+            channel_id=channel_id,
+            message_id=message_id,
+            emoji=emoji,
+        )
+        payload["_event"] = "react"
+        async with self._lock:
+            for subscriber in list(self._subscribers):
+                if (
+                    subscriber.allowed_channels is not None
+                    and channel_id not in subscriber.allowed_channels
+                ):
+                    continue
+                try:
+                    subscriber.queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass
+        return True
+
+    # ---- HTTP route handlers ------------------------------------------
+
+    async def _build_inbound_event(
+        self,
+        request: web.Request,
+    ) -> tuple[AgentEvent | None, str | None, _ChatRequestError | None]:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return None, None, _ChatRequestError(
+                status=400,
+                legacy_error="invalid json",
+                v1_message="invalid json",
+            )
+        raw_content = body.get("content") or ""
+        content = raw_content.strip()
+        if not content:
+            return None, None, _ChatRequestError(
+                status=400,
+                legacy_error="content required",
+                v1_message="content required",
+            )
+        identity, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            return None, None, auth_error
+        assert identity is not None
+        channel_id = _web_channel_for(identity.canonical)
+        # #487: type-check, don't coerce — a truthy non-dict ``extra`` survives
+        # ``or {}`` and later ``event.extra.get(...)`` raises.
+        extra = body.get("extra")
+        if extra is not None and not isinstance(extra, dict):
+            return None, None, _ChatRequestError(
+                status=400,
+                legacy_error="extra must be an object",
+                v1_message="extra must be an object",
+            )
+        sanitized_extra = _sanitize_extra(extra)
+
+        registry = self.chat_skill_registry
+        if registry is not None and registry.enabled:
+            parsed = registry.resolve_post_content(raw_content)
+            if isinstance(parsed, ChatSkillError):
+                error = _slash_command_error(parsed)
+                if error.v1_code == "invalid_slash_command":
+                    log.info(
+                        "web chat slash command rejected: reason=invalid command=%s",
+                        parsed.command,
+                    )
+                else:
+                    log.info(
+                        "web chat slash command rejected: reason=unavailable command=%s allowlist_size=%d",
+                        parsed.command,
+                        len(registry.list_discoverable()),
+                    )
+                return None, None, error
+            if isinstance(parsed, ChatSkillInvocation):
+                sanitized_extra[CHAT_SKILL_EXTRA_KEY] = _chat_skill_extra(parsed)
+
+        # Trusted attribution (github #726): the author comes from the
+        # AUTHENTICATED per-user key, not the client body (which is spoofable).
+        # The admin master key is not a chat identity, and dev/open anonymous
+        # chat is rejected above, so no shared web-default channel is reachable.
+        # Web authentication has already resolved the durable key. Persist it
+        # as the matching key just like platform aliases on Discord/Slack;
+        # display text is mutable and non-unique, so it is rendering-only.
+        author = identity.canonical
+        author_display = identity.display_name or identity.canonical
+        author_id = identity.canonical
+
+        event = AgentEvent(
+            trigger="user_message",
+            channel_id=channel_id,
+            content=content,
+            author=author,
+            author_display=author_display,
+            author_id=author_id,
+            source_id=body.get("msg_id") or uuid.uuid4().hex[:12],
+            source="web",
+            extra=sanitized_extra,
+        )
+        return event, channel_id, None
+
+    async def fetch_history(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+    ) -> list:
+        """Reject unscoped history reads; the authenticated HTTP route owns them."""
+        del channel_id, limit, before
+        raise NotImplementedError(
+            "web bridge history is only available through the authenticated HTTP route"
+        )
+
+    def _log_chat_skill_accepted(self, event: AgentEvent) -> None:
+        invocation = event.extra.get(CHAT_SKILL_EXTRA_KEY)
+        if not isinstance(invocation, dict):
+            return
+        command = invocation.get("command")
+        name = invocation.get("name")
+        if not isinstance(command, str) or not isinstance(name, str):
+            return
+        log.info(
+            "web chat slash command accepted: command=%s skill=%s",
+            command,
+            name,
+        )
+
+    async def _handle_post(self, request: web.Request) -> web.Response:
+        event, channel_id, error = await self._build_inbound_event(request)
+        if error is not None:
+            return error.legacy_response()
+        assert event is not None and channel_id is not None
+        accepted = await self.enqueue(event)
+        if not accepted:
+            return web.json_response(
+                {"error": "queue_full_or_closed", "channel_id": channel_id},
+                status=503,
+            )
+        self._log_chat_skill_accepted(event)
+        return web.json_response({"ok": True, "channel_id": channel_id})
+
+    async def _handle_post_v1(self, request: web.Request) -> web.Response:
+        event, channel_id, error = await self._build_inbound_event(request)
+        if error is not None:
+            return error.v1_response()
+        assert event is not None and channel_id is not None
+        accepted = await self.enqueue(event)
+        if not accepted:
+            return json_error(
+                "queue_full_or_closed",
+                "queue full or closed",
+                status=503,
+                details={"channel_id": channel_id},
+            )
+        self._log_chat_skill_accepted(event)
+        return json_success({"channel_id": channel_id, "source_id": event.source_id})
+
+    def _allowed_stream_channels(self, request: web.Request) -> frozenset[str]:
+        identity = request.get("auth_identity")
+        assert identity is not None
+        return frozenset({_web_channel_for(identity.canonical)})
+
+    async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
+        from ..http_shutdown import HTTP_SHUTDOWN, queue_or_shutdown
+        shutdown = request.app.get(HTTP_SHUTDOWN)
+        identity, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            return auth_error.legacy_response()
+        assert identity is not None
+
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+
+        # Subscribe before prepare to reserve capacity under the lock. Otherwise
+        # concurrent connection attempts could all pass a separate len() check
+        # before any of them appended, overshooting the cap.
+        q: asyncio.Queue = asyncio.Queue(maxsize=128)
+        subscriber = _Subscriber(q, self._allowed_stream_channels(request), identity.canonical)
+        async with self._lock:
+            if sum(s.canonical == identity.canonical for s in self._subscribers) >= self.max_subscribers:
+                return web.Response(text="too many chat streams", status=429)
+            self._subscribers.append(subscriber)
+        if shutdown is not None:
+            shutdown.active_streams += 1
+
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                # Ask nginx-style reverse proxies not to buffer the SSE stream.
+                "X-Accel-Buffering": "no",
+                # No ``Access-Control-Allow-Origin: *`` (was set pre-PR
+                # #104). With the auth middleware now gating /chat/stream,
+                # a malicious cross-origin page can't open the stream
+                # without the key — but a wildcard ACAO would still
+                # allow a page that already has the key (e.g. via a
+                # phishing prompt that mimics the API-key dialog) to
+                # exfiltrate the live agent feed cross-origin. Same-
+                # origin only. Operators who want curl access from a
+                # different host can still hit the endpoint directly;
+                # CORS only restricts browsers.
+            },
+        )
+        try:
+            await resp.prepare(request)
+            while shutdown is None or not shutdown.event.is_set():
+                try:
+                    item = (
+                        await queue_or_shutdown(q, shutdown, SSE_HEARTBEAT_S)
+                        if shutdown is not None else
+                        await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_S)
+                    )
+                except asyncio.TimeoutError:
+                    if shutdown is not None and shutdown.event.is_set():
+                        break
+                    # Heartbeat keeps proxies from closing the connection.
+                    await resp.write(b": heartbeat\n\n")
+                    continue
+                if item is None:
+                    break
+                line = "data: " + json.dumps(item, ensure_ascii=False) + "\n\n"
+                await resp.write(line.encode("utf-8"))
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            if shutdown is not None:
+                shutdown.active_streams -= 1
+            async with self._lock:
+                if subscriber in self._subscribers:
+                    self._subscribers.remove(subscriber)
+        return resp
+
+    async def _handle_history(self, request: web.Request) -> web.Response:
+        """GET /api/v1/chat/history?channel_id=web-default&limit=50.
+
+        Restore the authenticated user's prior conversation (user + assistant
+        messages, oldest→newest) so re-opening the chat reloads it instead of
+        starting empty. The channel is derived from auth identity; client
+        channel_id query parameters are ignored.
+        """
+        from ..history import get_global_buffer
+
+        identity, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            return auth_error.v1_response()
+        assert identity is not None
+        channel_id = _web_channel_for(identity.canonical)
+        try:
+            limit = int(request.query.get("limit", "50"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+
+        buffer = get_global_buffer()
+        records = buffer.recent_in_channel(channel_id, limit) if buffer is not None else []
+        messages = [
+            {
+                "message_id": m.msg_id or "",
+                "role": "assistant" if m.kind == "assistant_message" else "user",
+                "channel_id": m.channel_id,
+                "author": m.author_display or m.author,
+                "text": m.content,
+                "ts": m.ts,
+            }
+            for m in records
+            if m.kind in ("user_message", "assistant_message")
+        ]
+        return json_success({"channel_id": channel_id, "messages": messages})
+
+    async def _handle_operator_alert_check(self, request: web.Request) -> web.Response:
+        """Owner-key-only fixed-text setup probe through the live alert tool."""
+        import time
+        from .._context import reset_current_turn, set_current_turn
+        from ..models import InformationFlowLabels, SourceLabel, TurnContext
+        from ..tools.operator_alert import _channel_registry, _config, operator_alert
+
+        identity, error = _chat_identity(request)
+        if error is not None:
+            return error.v1_response()
+        if identity is None or not identity.access.is_admin:
+            return json_error("forbidden", "admin web key required", status=403)
+        destination = (getattr(_config, "operator_alert_channel", "") or "").strip()
+        if not destination or (destination.startswith("web-") and destination != _web_channel_for(identity.canonical)):
+            return json_error("alert_bridge_unconnected", "alert destination unavailable", status=409)
+        bridge = _channel_registry.find(destination) if _channel_registry is not None else None
+        if bridge is None:
+            return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
+        if destination.startswith(("discord-", "slack-")):
+            try:
+                connected = await bridge.connection_state()
+            except Exception:
+                connected = None
+            if connected is not True:
+                return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal=identity.canonical, domain="channel", resource_id=_web_channel_for(identity.canonical),
+            bridge_instance="web", sensitivity="internal",
+            authorized_principals=frozenset({identity.canonical}), source_kind="channel",
+            integrity="trusted", integrity_effect="active_ingest",
+        ))
+        turn = TurnContext(turn_id="cultivate-setup-check", session_id=_web_channel_for(identity.canonical),
+                           trigger="user_message", channel_id=_web_channel_for(identity.canonical),
+                           started_at=time.monotonic(), ifc_labels=labels)
+        token = set_current_turn(turn)
+        try:
+            await operator_alert.coroutine(text="Cultivate setup: operator alerts enabled")
+        except Exception:
+            # Do not return bridge exception text (it can include credentials).
+            return json_error("alert_send_failed", "alert send failed", status=503)
+        finally:
+            reset_current_turn(token)
+        return json_success({"sent": True})
+
+    async def _handle_skills(self, request: web.Request) -> web.Response:
+        identity, auth_error = _chat_identity(request)
+        if auth_error is not None:
+            return auth_error.v1_response()
+        assert identity is not None
+
+        registry = self.chat_skill_registry
+        if registry is None or not registry.enabled:
+            log.info("web chat skill catalog served: enabled=false skills=0")
+            return json_success({"enabled": False, "skills": []})
+
+        discoverable = registry.list_discoverable()
+        log.info(
+            "web chat skill catalog served: enabled=true skills=%d",
+            len(discoverable),
+        )
+        return json_success(
+            {
+                "enabled": True,
+                "skills": [
+                    {
+                        "id": skill.name,
+                        "command": skill.command,
+                        "label": skill.label,
+                        "description": skill.description,
+                    }
+                    for skill in discoverable
+                ],
+            }
+        )
+
+    def register_routes(self, app: web.Application) -> None:
+        """Mount /chat (POST) + /chat/stream (GET) + history on the shared app."""
+        existing = {(r.method, r.resource.canonical) for r in app.router.routes()}
+        if ("POST", "/chat") not in existing:
+            app.router.add_post("/chat", self._handle_post)
+        if ("POST", "/api/v1/chat") not in existing:
+            app.router.add_post("/api/v1/chat", self._handle_post_v1)
+        if ("GET", "/api/v1/chat/skills") not in existing:
+            app.router.add_get("/api/v1/chat/skills", self._handle_skills)
+        if ("GET", "/api/v1/chat/history") not in existing:
+            app.router.add_get("/api/v1/chat/history", self._handle_history)
+        if ("POST", "/api/v1/chat/operator-alert-check") not in existing:
+            app.router.add_post("/api/v1/chat/operator-alert-check", self._handle_operator_alert_check)
+        if ("GET", "/chat/stream") not in existing:
+            app.router.add_get("/chat/stream", self._handle_stream)

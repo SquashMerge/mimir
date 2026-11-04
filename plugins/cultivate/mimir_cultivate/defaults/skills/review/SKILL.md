@@ -1,0 +1,266 @@
+---
+name: cultivate-review
+description: Review a pull request and POST the review to GitHub via `pr_submit_review` on service turns or `gh pr review` on interactive turns. Always submit after drafting.
+---
+
+<!-- desc: Review a pull request and submit via pr_submit_review or gh pr review. -->
+
+# Cultivate PR Review
+
+Read the diff, draft a verdict, and **submit via `pr_submit_review` on service
+turns or `gh pr review` on interactive operator turns**. The
+submission step is not optional — it is the definition of "done" for this
+skill.
+
+## Contract
+
+For coding-enabled server-bound poller and heartbeat turns, use the typed
+`repo_checkout`, `pr_metadata`, `pr_files`, `pr_diff`, `pr_file_content`, `pr_checks`, `pr_reviews`, `pr_comments`,
+and `pr_review_requests` tools instead of `gh`. Submit through
+`pr_submit_review` or `pr_inline_review_comment`. These tools intentionally have
+no repository or PR selector: the immutable event authority supplies the only
+target. The CLI workflow below applies only to an interactive operator turn
+without a bound repo/PR tool surface.
+`pr_metadata` includes the bounded PR body and `merged_at`. For live Chainlink
+issue context use `chainlink_issue_show(issue_id)`; for local changes use
+`repo_diff` rather than passing arbitrary revision ranges to `git diff` on a
+`repo_review` service turn.
+
+Use the repository named in the PR URL or triggering event; for configured
+watches, use the matching entry in `GITHUB_REPOS`. Replace `<owner>/<repo>`
+with that repository (`owner/repo` in examples).
+
+**Trigger**: Operator asks to review a PR; or the github-activity poller fires a
+`pr_opened` / `review_requested` event for a PR authored by someone other than
+the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
+
+**Requires**: PR number; on a service turn, `repo_checkout`, bound PR tools and `pr_diff` or
+`pr_files`; on an interactive CLI turn, authenticated `gh` and an accessible
+diff (`gh pr diff` or the file-list fallback).
+
+**Guarantees**:
+- A review is posted to GitHub (not just output to turn text) via the
+  authorized submission tool for the turn.
+- Verdict is one of APPROVE / REQUEST_CHANGES / COMMENT — never left unsubmitted.
+- Every blocking finding is anchored to a specific file + line in the diff.
+- Read `pr_checks` on the exact reviewed head before approval; approval requires
+  every check green. When `review_tests` is `targeted` or `none`, CI is the
+  full-suite evidence. With `targeted`, use `repo_test` with diff-related selectors
+  or a named suite for local reasoning; with `none`, do not run `repo_test`.
+  With `full`, the configured full local suite remains available.
+
+**Does not**: Merge PRs; modify source code directly; auto-resolve conversations;
+review PRs it authored (when `$MIMIR_GITHUB_SELF_LOGIN` matches the PR author,
+a different reviewer is needed).
+
+When the trigger is `poller:github-activity`, perform the review in the current
+turn. Do not call `approve_declassification`: the poller is subject to the taint
+gate and cannot approve release of its own inputs. Do not call
+`spawn_open_code` or another spawn tool: a review turn does not delegate into a
+coding process. A denied attempt is a working security boundary, not a reason to
+request either capability.
+
+## Step-by-step
+
+### Service turns: checkout → reads → review → cleanup
+
+1. Call `repo_checkout(repository, pull_request)` for the bound PR **before any
+   `pr_*` read**. This establishes the live lease needed by the plugin PR tools.
+   If a pre-checkout read is refused, call `repo_checkout` now and retry the read
+   in this same turn; do not repeat refused reads on later polls.
+2. Call `pr_metadata`, then `pr_diff` (or `pr_files`), `pr_checks` and
+   `pr_comments` as needed. Use `pr_file_content` for extended context at the
+   verified PR head. Follow the review and submission guidance below.
+3. Submit via `pr_submit_review` or `pr_inline_review_comment`, verify with
+   `pr_reviews`, and call `repo_cleanup(repository, pull_request)` when done to
+   revoke and remove the lease. Do not clean up before submission.
+
+### 1. Get PR context (CLI examples for interactive turns)
+
+On a poller or heartbeat turn, after checkout call `pr_metadata(repository, pull_request)`.
+Its body is bounded and author-attested; do not use `gh pr view --json body`.
+
+```bash
+gh pr view <num> --repo <owner>/<repo> --json number,title,body,author,baseRefName,headRefName,headRefOid,state,additions,deletions,changedFiles
+```
+
+Note the `headRefOid` (SHA) when comparing against a local checkout.
+
+### 2. Get the diff
+
+```bash
+gh pr diff <num> --repo <owner>/<repo>
+```
+
+The diff is the **authoritative source for what changed**. Read it carefully
+before reaching for local file reads.
+
+For PRs whose diff exceeds ~20k lines use the file-list fallback:
+
+```bash
+gh pr view <num> --repo <owner>/<repo> --json files
+```
+
+Filter the returned JSON yourself rather than with `--jq` (see the note below).
+
+> **`--jq` is not available on poller or scheduled turns.** The trusted-service
+> shell profiles do not admit it: `gh` evaluates the filter in-process and jq's
+> `env` builtin reads the process environment, so the option is a credential
+> read rather than an output formatter. Use `--json <fields>` and filter the
+> returned JSON yourself. Piped and bracketed filters were already refused on
+> those turns anyway, because `|`, `[` and `]` are shell metacharacters.
+
+
+### 3. Fetch source files only when necessary — and safely
+
+Use local `Read` only when you need extended context beyond what the diff
+shows (e.g., the full function surrounding a changed line, a test file
+you want to read in full). **Before calling `Read`, ask: "is this file
+on the currently-checked-out branch?"** If the PR branch is not checked
+out locally, the file may not exist or may show the wrong version.
+
+**Correct alternatives when the local checkout may be stale or on a
+different branch:**
+
+```bash
+gh pr diff <num> --repo <owner>/<repo>
+```
+
+On a poller turn after checkout, use `pr_diff` and, when extended context is needed, call
+`pr_file_content(repository, pull_request, path)` with a relative repository
+path. It reads one regular text file at the turn's verified PR head, even if the
+local checkout is stale or on another branch. The result may be truncated for
+large files. Do not substitute `gh api` or a
+shell fetch: they are outside the review profile.
+
+
+**If a local `Read` returns "file does not exist":** do NOT bail. Log it
+in your notes ("couldn't read <file> locally — reviewing from diff only")
+and continue. The diff has the change; local context is supplemental.
+
+This is the most common cause of review turns that draft but never submit.
+**A file-not-found error is never a reason to stop before submitting.**
+
+### 4. Draft the review
+
+Write a review that covers:
+
+- **Verdict** — approve, request changes, or comment (see submission flags
+  below). Choose based on correctness + blocking issues, not tone.
+- **Summary** — 2-4 sentence overview of what the PR does and whether the
+  approach is sound.
+- **Specific observations** — grouped by file or concern. Use the `> quote`
+  convention to anchor suggestions to specific lines.
+- **Test coverage note** — are the tests adequate? Are they testing
+  the right behavior?
+- **Non-blocking suggestions** — style, naming, minor structural notes.
+  Label them explicitly as non-blocking so they don't hold up merge.
+
+### 5. Submit — MANDATORY last step
+
+Approval is allowed only when the reviewed head has at least one check and
+every check run and commit status is complete and passing (`success`, `neutral`,
+or `skipped`). The submission tools enforce this on the exact head. While CI
+is pending, submit `COMMENTED` with the code findings and withhold approval;
+request changes immediately for blocking findings. A `pr_checks_completed`
+event is a CI follow-up, not a fresh review: if the head is unchanged and CI
+green, approve without a full re-review; if red, request changes naming failed
+checks and the first failing test or log excerpt. Infrastructure reruns are
+limited to one per head by the poller; after that, post a comment for the
+operator rather than requesting another rerun.
+
+Reserve budget for submission. Once you know the verdict, stop optional
+exploration and submit before doing long validation, repeated polling, or
+extra context reads. If the tool-call counter is visibly high (around 90+
+on a 120-call budget), keep roughly 10-15 calls for the required side
+effect (`pr_submit_review` or `gh pr review`), submission verification, and
+wrap-up. A review
+with perfect extra evidence that never reaches GitHub is worse than a
+bounded review that lands with an honest validation note.
+
+On a service turn, submit through `pr_submit_review` or
+`pr_inline_review_comment`, then verify via `pr_reviews`. The following CLI
+workflow is for interactive operator turns.
+
+Write the body to a file under the agent scratch root first, then submit it with
+`--body-file` when admitted by the shell profile: the profile
+execs one argv with `shell=False`, so a heredoc, a `$(...)` substitution, and an
+inline multi-line `--body` are all refused — the body is read from the file
+during authorization and never re-opened at execution.
+
+```bash
+# 1. Write the body (use the Write tool, or a single redirect-free command)
+#    to <scratch>/pr-<num>-review.md
+
+# 2. Submit exactly one of these, as a single command:
+gh pr review <num> --repo <owner>/<repo> --approve         --body-file <scratch>/pr-<num>-review.md
+gh pr review <num> --repo <owner>/<repo> --request-changes --body-file <scratch>/pr-<num>-review.md
+gh pr review <num> --repo <owner>/<repo> --comment         --body-file <scratch>/pr-<num>-review.md
+```
+
+The body file must resolve beneath the agent scratch root, be a regular file
+reached without traversing a symlink, and be at most 64 KiB.
+
+For a CLI submission with a single-argv shell profile, **do not use a heredoc,
+`$(...)`, or an inline multi-line `--body`**. Write the body to the scratch file
+and pass `--body-file`: because the file is read during authorization, `$`,
+backticks and multi-line text need no escaping at all.
+
+### 6. Confirm submission
+
+After an interactive `gh pr review` call completes:
+
+```bash
+gh pr view <num> --repo <owner>/<repo> --json reviews
+```
+
+Read the last entry of `reviews` from the returned JSON.
+
+Verify your GitHub login (`MIMIR_GITHUB_SELF_LOGIN`) appears in the reviews list.
+
+### 7. Operator ping (PRs not authored by you)
+
+For PRs authored by anyone other than you (`MIMIR_GITHUB_SELF_LOGIN`), fulfill commitment
+`c-5494103062`: send a message to the operator channel noting the PR number
+and your verdict.
+
+---
+
+## Non-negotiable rules
+
+1. **Always submit a review before ending the turn.** If the turn ends
+   with a drafted review in the output and no `pr_submit_review` or `gh pr review`
+   call in the tool sequence, the review was not submitted.
+
+2. **A failing tool call mid-review does not abort submission.** Recover:
+   note the failure in the review body, then submit anyway
+   with what you have.
+
+3. **Budget exhaustion is not allowed to eat the submission step.** After
+   the verdict is known, `pr_submit_review` or `gh pr review` plus confirmation
+   outranks optional extra reads, broad test runs, or repeated async-job polling. When near
+   the tool-call ceiling, submit first with the evidence already gathered.
+
+4. **Never use only turn output as the delivery mechanism.** The operator
+   reads GitHub, not `turns.jsonl`.
+
+---
+
+## Poller-triggered reviews
+
+When `/cultivate-review` fires from `poller:github-activity`, the trigger includes
+the PR number and repo. There is no human watching the turn output — the
+only way the review reaches the operator (and other contributors) is via
+`pr_submit_review`. Apply the typed-tool steps above; the poller context changes
+nothing about the submission requirement.
+
+---
+
+## Common failure modes
+
+| Symptom | Fix |
+|---|---|
+| `Read(tests/foo.py)` -> "file does not exist" | Skip Read, continue from diff, still submit |
+| `gh pr diff <num> --repo <owner>/<repo>` -> HTTP 406 "diff too large" | Use `gh pr view <num> --repo <owner>/<repo> --json files` (`gh api` is not admitted) |
+| `gh pr review` exits non-zero | Check `--help`; verify PR is open; retry once |
+| Review body contains backticks / `${}` | Nothing special — `--body-file` reads the file directly, so no shell expansion occurs |

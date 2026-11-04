@@ -1,0 +1,1919 @@
+"""``mimir setup`` and CLI argument plumbing."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import inspect
+import os
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from mimir.cli import _print_setup_report, main, setup_home
+
+
+CORE_COMMANDS = frozenset({
+    "setup", "run", "identities", "reflection", "memory",
+    "regenerate-api-key", "stats", "verify-cred", "verify-creds",
+    "viability-report", "verify-index", "rotate", "loops", "update",
+    "predictions", "wiki", "skills", "plugins", "scaffold-docker",
+    "commitments", "feedback", "reindex",
+    "migrate-memory", "saga-reembed", "saga-acl-inventory",
+    "saga-enforcement-replay", "saga-migrate-legacy-acl", "watchdog",
+    "notify-restart",
+})
+
+
+def test_closed_core_parser_dispatch_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every core parser has its own handler and no core dispatch chain remains."""
+    from mimir.plugins.cli_registry import CommandRegistry
+
+    source = ast.parse(inspect.getsource(main))
+    registry_nodes = [node for node in ast.walk(source) if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "core_commands"
+                              for target in node.targets)]
+    assert len(registry_nodes) == 1
+    declaration = registry_nodes[0].value
+    assert isinstance(declaration, ast.Dict)
+    assert {ast.literal_eval(key) for key in declaration.keys} == CORE_COMMANDS
+    assert len(declaration.keys) == len(CORE_COMMANDS)
+
+    for node in ast.walk(source):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        comparison = node.test
+        if isinstance(comparison.left, ast.Attribute) and comparison.left.attr == "command":
+            assert not any(isinstance(value, ast.Constant) and isinstance(value.value, str)
+                           for value in comparison.comparators), "legacy core dispatch chain"
+
+    parse_args = argparse.ArgumentParser.parse_args
+    parser_choices = {}
+
+    def capture_parsers(parser, *args, **kwargs):
+        sub = next(action for action in parser._actions
+                   if isinstance(action, argparse._SubParsersAction))
+        parser_choices.update(sub.choices)
+        return parse_args(parser, *args, **kwargs)
+
+    def verify(self, args):
+        commands = self.commands
+        assert set(commands) == set(parser_choices) == CORE_COMMANDS
+        for name, command in commands.items():
+            assert command.owner == "core"
+            assert command.configure(None) is parser_choices[name]
+            assert command.dispatch.__name__ == f"handle_{name.replace('-', '_')}"
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", capture_parsers)
+    monkeypatch.setattr(CommandRegistry, "dispatch", verify)
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    main(["plugins", "list"])
+
+
+CORE_DISPATCH_CASES = (
+    ("setup", ("setup", "--home", "{home}"), "mimir.cli.setup_home"),
+    ("run", ("run", "--home", "{home}"), "mimir.server.main"),
+    ("identities", ("identities", "list", "--home", "{home}"), "mimir.commands.identities.dispatch"),
+    ("reflection", ("reflection", "list-pending"), "mimir.commands.reflection.dispatch"),
+    ("memory", ("memory", "status", "--home", "{home}"), "mimir.commands.memory.dispatch"),
+    ("regenerate-api-key", ("regenerate-api-key", "--home", "{home}"), "mimir.cli.regenerate_api_key"),
+    ("stats", ("stats", "--home", "{home}", "--egress-shadow"), "mimir.cli._print_egress_shadow_report"),
+    ("verify-cred", ("verify-cred", "GITHUB_TOKEN"), "mimir.cred_verify.run_verify_cred_cmd"),
+    ("verify-creds", ("verify-creds", "--type", "A"), "mimir.cred_verify.run_verify_creds_cmd"),
+    ("viability-report", ("viability-report", "--home", "{home}", "--no-write"), "mimir.viability_metrics.run_viability_report_cmd"),
+    ("verify-index", ("verify-index", "--home", "{home}", "--db", "saga"), "mimir.index_integrity.run_verify_index_cmd"),
+    ("rotate", ("rotate", "--env", "GITHUB_TOKEN", "--from-file", "{home}/token.txt", "--no-recreate"), "mimir.cred_rotate.run_rotate"),
+    ("loops", ("loops", "--home", "{home}"), "mimir.loops_cmd.run_loops_cmd"),
+    ("update", ("update", "--check"), "mimir.commands.update.dispatch"),
+    ("predictions", ("predictions",), "mimir.skills.predictions.scripts.predictions_cli.run"),
+    ("wiki", ("wiki", "backlinks"), "mimir.wiki_backlinks.cmd_backlinks"),
+    ("skills", ("skills", "list"), "mimir.commands.skills.dispatch"),
+    ("scaffold-docker", ("scaffold-docker", "--home", "{home}"), "mimir.scaffold_docker.cmd"),
+    ("commitments", ("commitments", "list", "--home", "{home}"), "mimir.commitments.cli.dispatch"),
+    ("feedback", ("feedback", "emit", "test-event"), "mimir.commands.feedback.dispatch"),
+    ("reindex", ("reindex",), "mimir.reindex.dispatch"),
+    ("migrate-memory", ("migrate-memory", "--source", "{home}/source.db", "--dest", "{home}/dest.db"), "mimir.saga.migrate.migrate"),
+    ("saga-reembed", ("saga-reembed", "--home", "{home}", "--dry-run"), "mimir.runtime.resolve_saga_config"),
+    ("saga-acl-inventory", ("saga-acl-inventory", "--db", "{home}/saga.db"), "mimir.saga.acl_inventory.inventory_path"),
+    ("saga-enforcement-replay", ("saga-enforcement-replay", "--db", "{home}/saga.db", "--trace", "{home}/trace.jsonl", "--cutover", "2026-01-01T00:00:00Z"), "mimir.saga.enforcement_replay.analyze_paths"),
+    ("saga-migrate-legacy-acl", ("saga-migrate-legacy-acl", "--source", "{home}/saga.db", "--cutover", "2026-01-01T00:00:00Z"), "mimir.saga.legacy_acl_migration.migrate_copy"),
+    ("watchdog", ("watchdog", "--once", "--home", "{home}"), "mimir.liveness.run_watchdog"),
+    ("notify-restart", ("notify-restart", "--unit", "mimir.service"), "mimir.liveness.notify_service_event"),
+)
+
+
+@pytest.mark.parametrize("name,argv,target", CORE_DISPATCH_CASES,
+                         ids=[row[0] for row in CORE_DISPATCH_CASES])
+def test_core_command_reaches_handler(
+    name: str, argv: tuple[str, ...], target: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parse a valid command and prove real registry dispatch reaches its effect."""
+    assert {row[0] for row in CORE_DISPATCH_CASES} | {"plugins"} == CORE_COMMANDS
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("")
+    (tmp_path / "token.txt").write_text("replacement\n")
+
+    class HandlerReached(Exception):
+        pass
+
+    with patch(target, side_effect=HandlerReached) as handler:
+        with pytest.raises(HandlerReached):
+            main([part.replace("{home}", str(tmp_path)) for part in argv])
+    handler.assert_called_once()
+
+
+def test_plugins_list_reaches_metadata_handler(monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture) -> None:
+    from mimir.commands import plugins
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    with patch.object(plugins, "discover_plugins", return_value=()) as discover:
+        main(["plugins", "list"])
+    discover.assert_called_once_with(enable="")
+    assert capsys.readouterr().out == "No plugins installed.\n"
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_model_spec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep setup-route tests independent from deployment MIMIR_MODEL_SPEC."""
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_setup_preserves_existing_scaffold_files(tmp_path, monkeypatch, preexisting):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_GIT_TRACKING_ENABLED", "false")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "other-home"))
+    paths = (
+        "state/wiki/AGENTS.md", "state/wiki/index.md", "state/wiki/log.md",
+        "state/identities.yaml", "state/heartbeat-backlog.md",
+        "state/proposed-changes.md", "memory/issues/README.md",
+    )
+    unrelated = ("state/wiki/custom.md", "state/pollers/custom.json", "skills/custom/SKILL.md")
+    for rel in (*unrelated, *(paths if preexisting else ())):
+        path = home / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("custom content\n")
+
+    status = setup_home(home)
+
+    for rel in paths:
+        assert (rel in status["files_created"]) is not preexisting
+        assert (home / rel).is_file()
+        if preexisting:
+            assert (home / rel).read_text() == "custom content\n"
+    for rel in unrelated:
+        assert (home / rel).read_text() == "custom content\n"
+    assert not (home / ".mimir/file-integrity.json").exists()
+
+
+def test_setup_creates_home_layout(tmp_path: Path):
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    assert (home / "logs").is_dir()
+    assert (home / "memory" / "core").is_dir()
+    assert (home / "memory" / "channels").is_dir()
+    assert (home / "memory" / "issues").is_dir()
+    assert (home / "state").is_dir()
+    # Wiki layer + raw source store (Karpathy's LLM Wiki pattern).
+    assert (home / "state" / "raw").is_dir()
+    assert (home / "state" / "wiki" / "entities").is_dir()
+    assert (home / "state" / "wiki" / "concepts").is_dir()
+    assert (home / "state" / "wiki" / "topics").is_dir()
+    assert (home / "messages").is_dir()
+    assert (home / ".claude" / "agents").is_dir()
+    # Post-2026-05-22: bundled skills live under .mimir_builtin_skills/
+    # (read-only refresh target) and operator-installed skills under
+    # skills/ (tracked/writable). The legacy .claude/skills/ path is
+    # only created as a side-effect of legacy-migration, not by setup.
+    assert (home / ".mimir_builtin_skills").is_dir()
+    # Templates landed.
+    assert (home / ".env").is_file()
+    assert (home / "scheduler.yaml").is_file()
+    # Numeric prefix matches the convention used by the other core
+    # blocks (20-vsm-terms, 30-reflection-policy, 40-learned-behaviors,
+    # 50-heartbeat-patterns, 60-filing-rules). load_core renders in
+    # filename order, so identity reads first.
+    assert (home / "memory" / "core" / "00-identity.md").is_file()
+    # 06-action-boundaries seeds the tri-zone action-policy model
+    # (autonomous / escalate-first / prohibited). Pairs with the
+    # WriteGuardBackend's core-memory read-only gate.
+    assert (home / "memory" / "core" / "06-action-boundaries.md").is_file()
+    assert (home / "state" / "wiki" / "AGENTS.md").is_file()
+    assert (home / "state" / "wiki" / "index.md").is_file()
+    assert (home / "state" / "wiki" / "log.md").is_file()
+    # Default scheduled-task prompt templates seeded (heartbeat + reflect).
+    assert (home / "prompts" / "heartbeat.md").is_file()
+    assert (home / "prompts" / "reflect.md").is_file()
+    # Identity reconciliation starter (FUTURE_WORK §6.1).
+    identities_yaml = home / "state" / "identities.yaml"
+    assert identities_yaml.is_file()
+    body = identities_yaml.read_text()
+    # Schema example covers all the documented alias prefixes.
+    for hint in ("slack-", "discord-", "bsky:", "email:"):
+        assert hint in body, f"identities.yaml missing schema hint: {hint}"
+    # Empty by default — operator adds entries.
+    assert "people: []" in body
+    # Skills + subagents got seeded.
+    assert (home / ".mimir_builtin_skills" / "memory" / "SKILL.md").is_file()
+    assert (home / ".mimir_builtin_skills" / "wiki" / "SKILL.md").is_file()
+    # Status report covers what we did.
+    assert status["home"] == str(home.resolve())
+    assert "memory/core" in status["dirs_created"]
+    assert "state/wiki/entities" in status["dirs_created"]
+
+
+def test_setup_banner_reports_effective_env_model_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """chainlink #447: exported MIMIR_MODEL_SPEC beats <home>/.env defaults.
+
+    When it is set before setup, setup's status/banner must report THAT, or it
+    contradicts what the agent actually runs. (The mimirbot Codex cutover hit
+    exactly this: banner said anthropic while the agent ran codex-plus.)"""
+    from mimir.model_registry import PROVIDER_OPENAI
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.4")
+    status = setup_home(tmp_path / "agent")  # no --model passed
+    assert status["model_spec"] == "codex-plus:gpt-5.4"
+    assert status["provider_name"] == PROVIDER_OPENAI
+    assert status["billing_mode"] == "subscription"
+    assert status["model_spec_from_env"] is True
+    assert status["model_spec_from_home_env"] is False
+    # The --model/default route is still surfaced (banner note + the
+    # <home>/.env template scaffold).
+    assert status["setup_default_spec"] == "codex-plus:gpt-5.6-luna"
+
+
+def test_setup_banner_uses_default_route_without_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+):
+    """No MIMIR_MODEL_SPEC in the env → banner reports setup's
+    --model/default route (unchanged behavior)."""
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    status = setup_home(tmp_path / "agent")
+    assert status["model_spec"] == "codex-plus:gpt-5.6-luna"
+    assert status["model_spec_from_env"] is False
+    assert status["model_spec_from_home_env"] is False
+    assert status["setup_default_spec"] == status["model_spec"]
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert "model spec:    codex-plus:gpt-5.6-luna" in output
+    assert "↑ from" not in output
+    assert "setup --model/default would be:" not in output
+
+
+def test_setup_rerun_uses_home_model_for_status_and_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+):
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    env_path = home / ".env"
+    before = env_path.read_text()
+
+    status = setup_home(home, model=None, subscription=True)
+    assert status["model_spec"] == "claude-code:claude-sonnet-4-6"
+    assert status["provider_name"] == "anthropic-max"
+    assert status["billing_mode"] == "subscription"
+    assert "Anthropic" in status["monitor_status"]
+    assert status["model_spec_from_env"] is False
+    assert status["model_spec_from_home_env"] is True
+    assert status["setup_default_spec"] == "codex-plus:gpt-5.6-luna"
+    # The default route adds no new provider/monitor keys on this re-run.
+    keys = lambda body: {line.partition("=")[0] for line in body.splitlines()
+                         if line and not line.lstrip().startswith("#") and "=" in line}
+    assert keys(env_path.read_text()) == keys(before)
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert "model spec:    claude-code:claude-sonnet-4-6" in output
+    assert f"↑ from {home}/.env (existing value preserved; edit .env to change)" in output
+    assert "setup --model/default would be:" not in output
+
+
+@pytest.mark.parametrize(
+    "dotenv_value",
+    [
+        '"claude-code:claude-sonnet-4-6"',
+        "'claude-code:claude-sonnet-4-6'",
+        "claude-code:claude-sonnet-4-6  # chosen",
+    ],
+    ids=["double-quoted", "single-quoted", "inline-comment"],
+)
+def test_setup_rerun_parses_home_model_like_runtime(
+    tmp_path: Path, capsys: pytest.CaptureFixture, dotenv_value: str,
+):
+    from mimir.config import _load_home_dotenv
+
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    env_path = home / ".env"
+    before = env_path.read_text().replace(
+        "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n",
+        f"MIMIR_MODEL_SPEC={dotenv_value}\n",
+    ).replace("MIMIR_COST_HOURLY_LIMIT_USD=\n", "")
+    env_path.write_text(before)
+    # Exercise the actual runtime parser without leaking the loaded defaults
+    # into this or later tests' process environment.
+    with patch.dict(os.environ):
+        _load_home_dotenv(home)
+        runtime_spec = os.environ["MIMIR_MODEL_SPEC"]
+    assert runtime_spec == "claude-code:claude-sonnet-4-6"
+
+    status = setup_home(home, model=None)
+
+    assert status["model_spec"] == runtime_spec
+    assert status["provider_name"] == "anthropic-max"
+    assert status["billing_mode"] == "subscription"
+    assert status["model_spec_from_home_env"] is True
+    assert status["model_spec_from_env"] is False
+    assert "Anthropic" in status["monitor_status"]
+    after = env_path.read_text()
+    assert after == before  # No default-route provider or monitor injection.
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=" not in after
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert (
+        f"model spec:    {runtime_spec}   "
+        "(provider: anthropic-max; billing: subscription)"
+    ) in output
+    assert f"↑ from {home}/.env" in output
+
+
+def test_setup_rerun_injects_only_home_route_monitor_and_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    home = tmp_path / "agent"
+    setup_home(home, model="MiniMax-M2.7")
+    env_path = home / ".env"
+    before = env_path.read_text()
+    assert "MIMIR_QUOTA_POLL_ENABLED=" not in before
+    assert "ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic" in before
+
+    status = setup_home(home, subscription=True)
+    after = env_path.read_text()
+    assert status["model_spec"] == "anthropic:MiniMax-M2.7"
+    assert status["billing_mode"] == "api"
+    assert "cost monitoring" in status["monitor_status"]
+    assert "MIMIR_QUOTA_POLL_ENABLED=" not in after
+    assert "ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic" in after
+
+    # A different --model with provider env cannot fill the blank base URL
+    # of a home configured for claude-code.
+    claude_home = tmp_path / "claude"
+    setup_home(claude_home, model="claude-sonnet-4-6", subscription=True)
+    claude_env = claude_home / ".env"
+    claude_before = claude_env.read_text()
+    assert "ANTHROPIC_BASE_URL=\n" in claude_before
+    setup_home(claude_home, model="kimi-k2-0905-preview")
+    assert claude_env.read_text() == claude_before
+
+
+def test_setup_exported_model_wins_over_existing_home_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-4.1-mini")
+
+    status = setup_home(home, subscription=True)
+    assert status["model_spec"] == "openai:gpt-4.1-mini"
+    assert status["provider_name"] == "openai"
+    assert status["billing_mode"] == "api"
+    assert status["model_spec_from_env"] is True
+    assert status["model_spec_from_home_env"] is False
+    assert "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6" in (home / ".env").read_text()
+
+
+def test_setup_home_hint_shows_differing_explicit_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    status = setup_home(home, model="gpt-4.1-mini")
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert f"↑ from {home}/.env" in output
+    assert "(setup --model/default would be: openai:gpt-4.1-mini)" in output
+
+
+def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
+    home = tmp_path / "agent"
+    setup_home(home)
+    # User edits the .env to a minimal version (and includes their own keys).
+    user_env = (
+        "ANTHROPIC_API_KEY=user-key\n"
+        "MIMIR_API_KEY=user-token\n"
+    )
+    (home / ".env").write_text(user_env)
+    # User adds a custom skill at the operator-writable location.
+    custom = home / "skills" / "my-skill"
+    custom.mkdir(parents=True)
+    (custom / "SKILL.md").write_text("custom")
+    # Re-run setup — must not clobber existing values.
+    setup_home(home)
+    body = (home / ".env").read_text()
+    # Operator's set values must survive untouched.
+    assert "ANTHROPIC_API_KEY=user-key" in body
+    assert "MIMIR_API_KEY=user-token" in body
+    # Setup IS allowed to append missing keys that the agent needs
+    # (MIMIR_MODEL_SPEC, MIMIR_COST_HOURLY_LIMIT_USD for API-mode
+    # cost monitoring). Operators get a working agent on re-run
+    # rather than a silently-broken one that depends on env vars the
+    # template forgot to seed.
+    assert (custom / "SKILL.md").read_text() == "custom"
+
+
+def test_setup_writes_saga_toml(tmp_path: Path):
+    """v0.5 §2: setup writes a saga.toml with mimir-prod overrides."""
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    saga_toml = home / "saga.toml"
+    assert saga_toml.is_file()
+    assert "saga.toml" in (status["files_created"] or [])
+    body = saga_toml.read_text()
+    # mimir-prod overrides — contextual rewrite + two-tier + extraction on.
+    assert "enable_contextual_rewrite = true" in body
+    assert "enable_session_boundary_rrf = true" in body
+    assert "session_boundary_weight = 0.5" in body
+    assert "session_boundary_limit = 3" in body
+    assert "session_boundary_alpha = 0.7" in body
+    assert "session_boundary_atoms_per_session = 30" in body
+    assert "two_tier_enabled = true" in body
+    assert "enable_extraction = true" in body
+    # db_path lives under <home>/.mimir/.
+    assert str(home / ".mimir" / "saga.db") in body
+
+
+# ── --embedding preset tests (PR #144 review nit #4) ─────────────────
+
+
+
+def test_setup_saga_toml_retrieval_keys_are_all_read_by_saga(tmp_path: Path):
+    """Every [retrieval] key setup writes must be one SAGA's config knows.
+
+    `enable_missing_ref_pivot` was written from v0.5 (P30) on but never read
+    by anything, so it silently did nothing. Guard the class with SAGA's own
+    definition of a known key (the same set `_warn_unknown_keys` uses).
+    """
+    import tomllib
+
+    from mimir.saga._config_io import _DEFAULTS, _KNOWN_EXTRA_KEYS
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    written = tomllib.loads((home / "saga.toml").read_text())
+    known = set(_DEFAULTS["retrieval"]) | _KNOWN_EXTRA_KEYS.get("retrieval", set())
+    unknown = sorted(set(written.get("retrieval", {})) - known)
+    assert unknown == [], f"setup writes [retrieval] keys SAGA never reads: {unknown}"
+    assert "enable_missing_ref_pivot" not in written.get("retrieval", {})
+
+def test_setup_embedding_default_is_voyage(tmp_path: Path):
+    """Per the Phase 3 LongMemEval cross-bench result, voyage is the
+    new canonical default. Status dict records the chosen preset."""
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    assert status["embedding_preset"] == "voyage"
+    body = (home / "saga.toml").read_text()
+    assert 'provider = "voyage"' in body
+    assert 'model = "voyage-4-lite"' in body
+    assert 'api_key_env = "VOYAGE_API_KEY"' in body
+
+
+def test_setup_embedding_openai_preset(tmp_path: Path):
+    home = tmp_path / "agent"
+    status = setup_home(home, embedding="openai")
+    assert status["embedding_preset"] == "openai"
+    body = (home / "saga.toml").read_text()
+    assert 'provider = "openai"' in body
+    assert 'model = "text-embedding-3-small"' in body
+    assert 'api_key_env = "OPENAI_API_KEY"' in body
+
+
+def test_setup_embedding_fastembed_preset(tmp_path: Path):
+    """Local-only preset — no api_key_env, fully offline-capable."""
+    home = tmp_path / "agent"
+    status = setup_home(home, embedding="fastembed")
+    assert status["embedding_preset"] == "fastembed"
+    body = (home / "saga.toml").read_text()
+    assert 'provider = "onnx"' in body
+    assert 'model = "BAAI/bge-small-en-v1.5"' in body
+    # No api_key_env line — local provider doesn't need one.
+    assert "api_key_env" not in body.split("[llm]")[0]
+
+
+def test_setup_all_presets_write_auto_threshold_sentinel(tmp_path: Path):
+    """Regardless of preset, [consolidation] similarity_threshold should
+    be the "auto" sentinel — saga resolves per-provider at boot."""
+    from mimir.cli import EMBEDDING_PRESETS
+    for preset in EMBEDDING_PRESETS:
+        home = tmp_path / f"agent_{preset}"
+        setup_home(home, embedding=preset)
+        body = (home / "saga.toml").read_text()
+        assert 'similarity_threshold = "auto"' in body, \
+            f"preset {preset} missing auto-threshold sentinel"
+
+
+def test_setup_invalid_preset_raises(tmp_path: Path):
+    home = tmp_path / "agent"
+    with pytest.raises(ValueError, match="unknown embedding preset"):
+        setup_home(home, embedding="does-not-exist")
+
+
+def test_setup_writes_no_saga_credentials_or_endpoint(tmp_path: Path):
+    """saga runs in-process: setup writes no SAGA_API_KEY anywhere (not the
+    .env, not the git-tracked saga.toml — the dead, unread [server] api_key is
+    gone), and no longer emits the retired SAGA_ENDPOINT either."""
+    import re
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_text = (home / ".env").read_text()
+    saga_text = (home / "saga.toml").read_text()
+    assert re.search(r"^SAGA_API_KEY=\S", env_text, re.MULTILINE) is None
+    assert "SAGA_ENDPOINT" not in env_text
+    assert 'api_key = "' not in saga_text
+    assert "[server]" not in saga_text
+
+
+def test_setup_does_not_clobber_existing_saga_toml(tmp_path: Path):
+    """Operator edits to saga.toml are preserved on re-run."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    custom_body = "# operator-edited\n[storage]\ndb_path = \"/custom/path\"\n"
+    (home / "saga.toml").write_text(custom_body)
+    setup_home(home)
+    assert (home / "saga.toml").read_text() == custom_body
+
+
+def test_setup_env_template_lists_main_keys(tmp_path: Path):
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_text = (home / ".env").read_text()
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "DISCORD_TOKEN"):
+        assert key in env_text
+
+
+def test_setup_generates_api_key_on_first_run(tmp_path: Path):
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    env_text = (home / ".env").read_text()
+    line = next(l for l in env_text.splitlines() if l.startswith("MIMIR_API_KEY="))
+    value = line.split("=", 1)[1]
+    assert len(value) >= 30, f"expected ≥30-char token, got: {value!r}"
+    assert status.get("api_key_action") == "generated"
+
+
+def test_setup_preserves_existing_api_key(tmp_path: Path):
+    """Re-running setup mustn't rotate the key — operator may have
+    copied it into deployment configs."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    first = next(
+        l.split("=", 1)[1]
+        for l in (home / ".env").read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    status = setup_home(home)
+    second = next(
+        l.split("=", 1)[1]
+        for l in (home / ".env").read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    assert first == second
+    assert status.get("api_key_action") is None
+
+
+def test_setup_fills_in_blank_api_key(tmp_path: Path):
+    """If the operator wipes the key (or pulls a stale .env from git),
+    the next setup must fill it in — otherwise the server runs
+    unauthenticated."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    body = env_path.read_text()
+    blanked = "\n".join(
+        ("MIMIR_API_KEY=" if l.startswith("MIMIR_API_KEY=") else l)
+        for l in body.splitlines()
+    )
+    env_path.write_text(blanked + "\n")
+
+    status = setup_home(home)
+    line = next(
+        l for l in env_path.read_text().splitlines() if l.startswith("MIMIR_API_KEY=")
+    )
+    assert line.split("=", 1)[1] != ""
+    assert status.get("api_key_action") == "generated"
+
+
+def test_setup_env_is_owner_readable_only(tmp_path: Path):
+    """setup_home must create .env with mode 0o600 (not world-readable)."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    mode = (home / ".env").stat().st_mode & 0o777
+    assert mode == 0o600, f".env mode {oct(mode)} != 0o600"
+
+
+def test_setup_env_perms_tightened_on_rerun(tmp_path: Path):
+    """setup_home re-run must tighten an existing .env that had wide perms."""
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    env_path.chmod(0o644)  # simulate wide perms from a prior run or cp
+    setup_home(home)
+    mode = env_path.stat().st_mode & 0o777
+    assert mode == 0o600, f".env mode {oct(mode)} after re-run != 0o600"
+
+
+def test_regenerate_api_key_tightens_env_perms(tmp_path: Path):
+    """regenerate_api_key must tighten .env to 0o600 after rotating the key."""
+    from mimir.cli import regenerate_api_key
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    env_path.chmod(0o644)  # simulate wide perms
+    regenerate_api_key(home)
+    mode = env_path.stat().st_mode & 0o777
+    assert mode == 0o600, f".env mode {oct(mode)} after key rotation != 0o600"
+
+
+def test_regenerate_api_key_rotates_and_preserves_others(tmp_path: Path):
+    from mimir.cli import regenerate_api_key
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    before = next(
+        l.split("=", 1)[1]
+        for l in env_path.read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    new_key = regenerate_api_key(home)
+    after = env_path.read_text()
+    after_key = next(
+        l.split("=", 1)[1]
+        for l in after.splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    assert new_key == after_key
+    assert new_key != before
+    for unrelated in ("ANTHROPIC_API_KEY=", "MIMIR_WEB_PORT=", "OPENAI_API_KEY="):
+        assert unrelated in after
+
+
+def test_regenerate_api_key_cli_subcommand(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path / "agent"
+    setup_home(home)
+    capsys.readouterr()  # discard setup output
+    main(["regenerate-api-key", "--home", str(home)])
+    out = capsys.readouterr()
+    # Stdout is the new key alone (pipes cleanly).
+    new_key = out.out.strip()
+    assert len(new_key) >= 30
+    # Stderr carries the explanation.
+    assert "Wrote to" in out.err
+    # File matches stdout.
+    line = next(
+        l
+        for l in (home / ".env").read_text().splitlines()
+        if l.startswith("MIMIR_API_KEY=")
+    )
+    assert line.split("=", 1)[1] == new_key
+
+
+def test_regenerate_api_key_cli_errors_when_no_env(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    home.mkdir()
+    with pytest.raises(SystemExit) as exc_info:
+        main(["regenerate-api-key", "--home", str(home)])
+    assert exc_info.value.code == 1
+    assert "no .env" in capsys.readouterr().err
+
+
+def test_regenerate_api_key_refuses_process_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    before = env_path.read_text()
+    monkeypatch.setenv("MIMIR_API_KEY", "compose-key-still-in-force")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["regenerate-api-key", "--home", str(home)])
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "process environment" in output.err
+    assert "mimir rotate --env MIMIR_API_KEY" in output.err
+    assert env_path.read_text() == before
+
+
+def test_run_refuses_without_explicit_home(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+):
+    """`mimir run` must refuse to start (exit 1) when neither --home nor
+    MIMIR_HOME is set, rather than silently homing on the cwd."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run"])
+    assert exc_info.value.code == 1
+    assert "MIMIR_HOME is not set" in capsys.readouterr().err
+
+
+def test_run_proceeds_with_home_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """--home sets MIMIR_HOME and the server starts (mocked)."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    called: dict[str, bool] = {}
+    monkeypatch.setattr("mimir.server.main", lambda: called.setdefault("ran", True))
+    main(["run", "--home", str(tmp_path)])
+    assert called.get("ran") is True
+    assert os.environ["MIMIR_HOME"] == str(tmp_path.resolve())
+
+
+def test_run_proceeds_with_mimir_home_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """An explicit MIMIR_HOME (no --home) is accepted."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    called: dict[str, bool] = {}
+    monkeypatch.setattr("mimir.server.main", lambda: called.setdefault("ran", True))
+    main(["run"])
+    assert called.get("ran") is True
+
+
+def test_stats_cli_reports_no_turns_for_empty_home(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    setup_home(home)
+    capsys.readouterr()  # discard setup output
+    main(["stats", "--home", str(home)])
+    assert "no turns recorded" in capsys.readouterr().out
+
+
+def test_stats_cli_renders_recent_data(tmp_path: Path, capsys: pytest.CaptureFixture):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    turns = home / "logs" / "turns.jsonl"
+    turns.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(tz=timezone.utc)
+    rec = {
+        "ts": (now - timedelta(minutes=5)).isoformat(),
+        "total_cost_usd": 0.42,
+        "usage": {
+            "input_tokens": 1000,
+            "cache_read_input_tokens": 9000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 500,
+        },
+    }
+    turns.write_text(json.dumps(rec) + "\n")
+
+    capsys.readouterr()
+    main(["stats", "--home", str(home)])
+    out = capsys.readouterr().out
+    assert "Last turn:" in out
+    assert "Last 5h:" in out
+    assert "$0.42" in out
+    assert "cache hit 90%" in out
+
+
+def test_stats_egress_shadow_report_is_read_only_and_groups_fixture(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    import json
+
+    home = tmp_path / "agent"
+    logs = home / "logs"
+    logs.mkdir(parents=True)
+    events = logs / "events.jsonl"
+    records = [
+        {"type": "egress_veto_would_block", "timestamp": "2026-10-08T09:00:00+00:00",
+         "tool": "fetch_url", "destination_host": "old.example", "trigger": "poller",
+         "poller": "news", "reason": "egress_destination_not_approved"},
+        *[dict(type="egress_veto_would_block", timestamp="2026-10-09T10:00:00Z",
+               tool="fetch_url", destination_host="new.example", trigger="poller",
+               poller="news", reason="egress_destination_not_approved") for _ in range(2)],
+        {"type": "egress_veto_would_block", "timestamp": "2026-10-09T10:01:00Z",
+         "tool": "send_message", "destination_host": None, "trigger": "user_message",
+         "reason": "private_source_cross_channel"},
+        *[dict(type="egress_veto_would_block", timestamp="2026-10-09T10:01:00Z",
+               tool="send_message", destination_host=None, trigger="user_message",
+               reason="private_source_cross_channel", origin=origin)
+          for origin in ("harness", "tool_call")],
+        {"type": "tool_call", "timestamp": "2026-10-09T10:01:00Z"},
+    ]
+    events.write_text("\n".join(json.dumps(record) for record in records) + "\ninvalid\n")
+    before = events.read_bytes()
+    main(["stats", "--home", str(home), "--egress-shadow", "--since", "2026-10-09T09:00:00Z"])
+    out = capsys.readouterr().out
+    assert "2  tool=fetch_url host=new.example trigger=poller poller=news reason=egress_destination_not_approved" in out
+    for origin in ("-", "harness", "tool_call"):
+        assert ("1  tool=send_message host=- trigger=user_message poller=- "
+                f"reason=private_source_cross_channel origin={origin}") in out
+    assert "3  tool=send_message" not in out
+    assert "old.example" not in out
+    assert events.read_bytes() == before
+    assert sorted(str(path.relative_to(home)) for path in home.rglob("*")) == [
+        "logs", "logs/events.jsonl",
+    ]
+
+
+def test_stats_since_requires_egress_shadow(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["stats", "--since", "2026-10-09T00:00:00Z"])
+    assert exc.value.code == 2
+    assert "--since requires --egress-shadow" in capsys.readouterr().err
+
+
+def test_main_setup_subcommand_runs(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path / "agent"
+    main(["setup", "--home", str(home)])
+    assert (home / ".env").is_file()
+    out = capsys.readouterr().out
+    assert "mimir home ready at" in out
+    assert str(home.resolve()) in out
+
+
+def test_bare_setup_refuses_unrelated_git_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    repo = tmp_path / "source-checkout"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Operator Name")
+    git("config", "user.email", "operator@example.com")
+    (repo / "README.md").write_text("source repository\n")
+    git("add", "README.md")
+    git("commit", "-m", "initial")
+    git("checkout", "-b", "feature/keep-me")
+    git("remote", "add", "origin", "https://example.invalid/original.git")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\n# operator hook\n")
+    hook.chmod(0o755)
+    before_hook = hook.read_bytes()
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("MIMIR_STATE_REPO", "https://example.invalid/replacement.git")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-be-used")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["setup"])
+
+    assert exc_info.value.code == 1
+    assert "unrelated git repository" in capsys.readouterr().err
+    assert git("branch", "--show-current") == "feature/keep-me"
+    assert git("config", "user.name") == "Operator Name"
+    assert git("config", "user.email") == "operator@example.com"
+    assert git("remote", "get-url", "origin") == "https://example.invalid/original.git"
+    assert hook.read_bytes() == before_hook
+    assert not (repo / ".mimir").exists()
+
+
+def test_main_run_subcommand_exports_home_env(tmp_path: Path):
+    """``mimir run --home X`` sets ``MIMIR_HOME=X`` before launching the server."""
+    home = tmp_path / "agent"
+    home.mkdir()
+    captured: dict[str, str] = {}
+
+    def fake_run_server() -> None:
+        captured["MIMIR_HOME"] = os.environ.get("MIMIR_HOME", "")
+
+    with patch("mimir.server.main", new=fake_run_server):
+        main(["run", "--home", str(home)])
+
+    assert captured["MIMIR_HOME"] == str(home.resolve())
+
+
+def test_main_no_args_runs_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Bare ``mimir`` — no subcommand — defaults to running the server."""
+    # ``run`` refuses to start without --home or MIMIR_HOME. This test used to
+    # inherit MIMIR_HOME leaked by an earlier test in this file; set it here so
+    # the test passes in isolation too.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    called = {"yes": False}
+
+    def fake_run_server() -> None:
+        called["yes"] = True
+
+    with patch("mimir.server.main", new=fake_run_server):
+        main([])
+
+    assert called["yes"] is True
+
+
+def test_setup_rejects_non_directory_home(tmp_path: Path):
+    """``mimir setup --home <some-file>`` refuses to scaffold over a regular file."""
+    target = tmp_path / "not-a-dir"
+    target.write_text("i am a file, not a directory")
+    with pytest.raises(ValueError, match="not a directory"):
+        setup_home(target)
+    # The original file is untouched.
+    assert target.read_text() == "i am a file, not a directory"
+
+
+# ---- mimir identities {list,add,remove,resolve} ----------------------
+
+
+def test_identities_list_empty(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main(["identities", "list", "--home", str(home)])
+    out = capsys.readouterr().out
+    assert "(no identities defined)" in out
+
+
+def test_identities_add_creates_new_canonical(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+        "--display-name", "Alice Smith",
+        "--notes", "Eng team lead",
+    ])
+    out = capsys.readouterr().out
+    assert "added: alice ← slack-U05ALICE" in out
+
+    # File written; resolver picks it up.
+    yaml_path = home / "state" / "identities.yaml"
+    assert yaml_path.is_file()
+    body = yaml_path.read_text()
+    assert "alice" in body
+    assert "slack-U05ALICE" in body
+    assert "Alice Smith" in body
+    assert "Eng team lead" in body
+
+
+def test_identities_add_extends_existing(tmp_path: Path):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "discord-456789",
+    ])
+
+    from mimir.identities import IdentityResolver
+    r = IdentityResolver(home=home)
+    r.reload()
+    assert r.resolve("slack-U05ALICE") == "alice"
+    assert r.resolve("discord-456789") == "alice"
+    # Single canonical entry, two aliases.
+    identities = r.all_identities()
+    assert len(identities) == 1
+    assert set(identities[0].aliases) == {"slack-U05ALICE", "discord-456789"}
+
+
+def test_identities_add_rejects_alias_collision(tmp_path: Path, capsys: pytest.CaptureFixture):
+    """Adding an alias already claimed by a different canonical exits non-zero
+    with a clear error — last-wins works at load but the CLI surfaces the
+    conflict so the operator notices."""
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-shared",
+    ])
+    capsys.readouterr()  # drain
+    with pytest.raises(SystemExit) as exc_info:
+        main([
+            "identities", "add", "--home", str(home),
+            "--canonical", "bob",
+            "--alias", "slack-shared",
+        ])
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "already maps to canonical 'alice'" in err
+
+
+def test_identities_remove_alias(tmp_path: Path):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "discord-456",
+    ])
+    main([
+        "identities", "remove", "--home", str(home),
+        "--alias", "discord-456",
+    ])
+
+    from mimir.identities import IdentityResolver
+    r = IdentityResolver(home=home)
+    r.reload()
+    # Slack alias survives; discord alias is gone.
+    assert r.resolve("slack-U05ALICE") == "alice"
+    assert r.resolve("discord-456") == "discord-456"  # falls through
+
+
+def test_identities_remove_canonical(tmp_path: Path):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "bob",
+        "--alias", "slack-U07BOB",
+    ])
+    main([
+        "identities", "remove", "--home", str(home),
+        "--canonical", "alice",
+    ])
+
+    from mimir.identities import IdentityResolver
+    r = IdentityResolver(home=home)
+    r.reload()
+    # Alice gone entirely; bob unchanged.
+    assert r.resolve("slack-U05ALICE") == "slack-U05ALICE"
+    assert r.resolve("slack-U07BOB") == "bob"
+
+
+def test_identities_resolve_known(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+        "--display-name", "Alice Smith",
+    ])
+    capsys.readouterr()
+    main([
+        "identities", "resolve", "--home", str(home),
+        "slack-U05ALICE",
+    ])
+    out = capsys.readouterr().out
+    assert "slack-U05ALICE → alice" in out
+    assert "Alice Smith" in out
+
+
+def test_identities_resolve_unknown(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main(["identities", "resolve", "--home", str(home), "slack-UUNKNOWN"])
+    out = capsys.readouterr().out
+    assert "slack-UUNKNOWN" in out
+    assert "no identity record" in out
+
+
+def test_identities_list_after_adds(tmp_path: Path, capsys: pytest.CaptureFixture):
+    home = tmp_path
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "slack-U05ALICE",
+        "--display-name", "Alice Smith",
+    ])
+    main([
+        "identities", "add", "--home", str(home),
+        "--canonical", "alice",
+        "--alias", "discord-456",
+    ])
+    capsys.readouterr()
+    main(["identities", "list", "--home", str(home)])
+    out = capsys.readouterr().out
+    assert "alice" in out
+    assert "Alice Smith" in out
+    assert "slack-U05ALICE" in out
+    assert "discord-456" in out
+
+
+def test_identities_issue_key_is_additive(tmp_path: Path, capsys: pytest.CaptureFixture):
+    from mimir.identities import IdentityResolver, hash_web_key
+
+    keys = []
+    for options in ([], ["--label", "laptop"]):
+        main(["identities", "issue-key", "alice", "--home", str(tmp_path), *options])
+        out = capsys.readouterr().out
+        assert "existing web keys remain valid" in out
+        assert "now revoked" not in out
+        raw = next(line.split("│", 1)[1].strip() for line in out.splitlines() if "│" in line)
+        keys.append(raw)
+        assert out.count(raw) == 1
+
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    identity = resolver.identity("alice")
+    assert set(identity.web_key_labels.values()) == {"key-1", "laptop"}
+    assert len(identity.web_key_labels) == 2
+    assert identity.access.is_authorized
+    for raw in keys:
+        assert resolver.resolve_web_key(raw).canonical == "alice"
+        assert hash_web_key(raw) in identity.web_key_labels
+        assert raw not in (tmp_path / "state" / "identities.yaml").read_text()
+
+
+def test_identities_rotate_only_replaces_all_keys_preserving_roles(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import issue_web_key
+
+    old_keys = [
+        issue_web_key(tmp_path, "alice", roles=["user", "admin"], label=label)
+        for label in ("desktop", "phone")
+    ]
+    main([
+        "identities", "issue-key", "alice", "--home", str(tmp_path),
+        "--rotate-only", "--label", "replacement",
+    ])
+    out = capsys.readouterr().out
+    assert "all previous web keys are now revoked" in out
+    assert "roles unchanged" in out
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    identity = resolver.identity("alice")
+    assert identity.access.is_admin
+    assert identity.access.is_authorized
+    assert list(identity.web_key_labels.values()) == ["replacement"]
+    for key in old_keys:
+        assert resolver.resolve_web_key(key) is None
+
+
+def test_identities_add_key_preserves_existing_access(tmp_path: Path, capsys):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import issue_web_key
+
+    original = issue_web_key(tmp_path, "alice", roles=["user", "admin"], label="web")
+    main(["identities", "issue-key", "alice", "--home", str(tmp_path), "--label", "acp"])
+    out = capsys.readouterr().out
+    added = next(line.split("│", 1)[1].strip() for line in out.splitlines() if "│" in line)
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    for key in (original, added):
+        assert resolver.resolve_web_key(key).access.roles == ("user", "admin")
+
+
+@pytest.mark.parametrize("label", [None, "desktop"])
+def test_identities_revoke_key_label_or_all(
+    tmp_path: Path, capsys: pytest.CaptureFixture, label: str | None,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import issue_web_key
+
+    desktop = issue_web_key(tmp_path, "alice", roles=["admin"], label="desktop")
+    phone = issue_web_key(tmp_path, "alice", label="phone")
+    options = ["--label", label] if label is not None else []
+    main(["identities", "revoke-key", "alice", "--home", str(tmp_path), *options])
+    out = capsys.readouterr().out
+    assert ("web key 'desktop'" if label else "all web keys") in out
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    assert resolver.resolve_web_key(desktop) is None
+    assert (resolver.resolve_web_key(phone) is not None) == (label is not None)
+    assert resolver.identity("alice").access.is_admin
+
+
+def test_identities_list_redacts_web_keys(tmp_path: Path, capsys: pytest.CaptureFixture):
+    import yaml
+
+    from mimir.identities import hash_web_key
+
+    legacy = hash_web_key("legacy-secret")
+    labelled = hash_web_key("labelled-secret")
+    stale = hash_web_key("revoked-secret")
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    path.write_text(yaml.safe_dump({"people": [
+        {
+            "canonical": "alice", "display_name": "Alice", "notes": "Operator",
+            "aliases": ["slack-U05ALICE", f" {legacy} ", labelled],
+            "web_key_labels": {labelled: "laptop", stale: "revoked-label"},
+        },
+        {"canonical": "bob", "aliases": ["discord-456"]},
+    ]}))
+    main(["identities", "list", "--home", str(tmp_path)])
+    out = capsys.readouterr().out
+    for visible in ("alice", "Alice", "Operator", "slack-U05ALICE", "discord-456", "legacy-1", "laptop", "web keys: (none)"):
+        assert visible in out
+    for secret in ("webkey:", legacy.split(":")[1], labelled.split(":")[1], stale.split(":")[1], "legacy-secret", "labelled-secret", "revoked-label"):
+        assert secret not in out
+
+
+@pytest.mark.parametrize("action", ["issue-key", "revoke-key"])
+def test_identities_key_help_documents_scope(action: str, capsys: pytest.CaptureFixture):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["identities", action, "--help"])
+    assert exc_info.value.code == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "--label" in out
+    if action == "issue-key":
+        assert "without revoking existing keys" in out
+        assert "replace all existing web keys" in out
+        assert "without changing roles" in out
+    else:
+        assert "omit to revoke all web keys" in out
+
+
+def test_print_setup_report_surfaces_credential_helper_fields(capsys):
+    """PR 4d added credentials_written + legacy_token_url_migrated to
+    BootstrapResult. The setup report must surface both so the operator
+    can see whether the credential helper was installed and whether a
+    legacy in-URL token was stripped during migration."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": True,
+            "legacy_token_url_migrated": True,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "credential helper installed" in out
+    assert "legacy in-URL token stripped" in out
+
+
+def test_print_setup_report_omits_credential_helper_lines_when_absent(capsys):
+    """When credentials_written / legacy_token_url_migrated are False
+    (existing repo, helper already in place, no migration needed) the
+    report should stay quiet about them — only positive actions print."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": False,
+            "legacy_token_url_migrated": False,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "credential helper" not in out
+    assert "legacy in-URL token" not in out
+
+
+def test_print_setup_report_surfaces_initial_push(capsys):
+    """PR 4e added initial_push to BootstrapResult. When True, the
+    report should mention that the remote main was created via the
+    initial ``git push -u``."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": True,
+            "cloned": False,
+            "pulled": False,
+            "pull_blocked": False,
+            "bootstrap_commit": True,
+            "gitignore_written": True,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": True,
+            "legacy_token_url_migrated": False,
+            "upstream_set": True,
+            "initial_push": True,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "initial push" in out
+    assert "created remote main" in out
+    # initial_push subsumes upstream_set — only the more specific
+    # phrase prints.
+    assert "upstream tracking set" not in out
+
+
+def test_print_setup_report_surfaces_upstream_set_without_push(capsys):
+    """When upstream_set is True but initial_push is False (case 2:
+    remote already had main, just set tracking), the report shows the
+    less specific phrase."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": True,
+            "legacy_token_url_migrated": False,
+            "upstream_set": True,
+            "initial_push": False,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "upstream tracking set" in out
+    assert "initial push" not in out
+
+
+def test_print_setup_report_omits_upstream_lines_when_absent(capsys):
+    """When upstream_set / initial_push are both False, neither phrase
+    appears (e.g. tracking already configured by an earlier run)."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "git_bootstrap": {
+            "initialized": False,
+            "cloned": False,
+            "pulled": True,
+            "pull_blocked": False,
+            "bootstrap_commit": False,
+            "gitignore_written": False,
+            "hook_written": True,
+            "remote_configured": True,
+            "credentials_written": False,
+            "legacy_token_url_migrated": False,
+            "upstream_set": False,
+            "initial_push": False,
+        },
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "upstream tracking" not in out
+    assert "initial push" not in out
+
+
+def test_print_setup_report_claude_code_operator_guidance(capsys):
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "model_spec": "claude-code:claude-sonnet-4-6",
+        "provider_name": "anthropic-max",
+        "billing_mode": "subscription",
+        "embedding_preset": "fastembed",
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "model adapter: pip install mimir-agent[claude-code]" in out
+    assert "claude setup-token" in out
+    assert "claude login" in out
+    assert "claude --version" in out
+    assert "claude -p 'ping'" in out
+    assert "do not" in out.lower()
+    assert "git+https" not in out
+
+
+def test_print_setup_report_does_not_claim_claude_code_blocks_enforcement(capsys):
+    """#910 (PR #1213) landed the AuthContext carrier and removed the startup
+    refusal, so claude-code IS usable with MIMIR_ACCESS_CONTROL_ENFORCED=true.
+
+    #1212 had added a setup-time warning saying the opposite. It was true when
+    written and false two hours later; this asserts the claim is gone rather
+    than merely that some warning text changed, so the stale advice cannot
+    quietly return.
+    """
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "model_spec": "claude-code:claude-sonnet-4-6",
+        "provider_name": "anthropic-max",
+        "billing_mode": "subscription",
+        "embedding_preset": "fastembed",
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "model adapter: pip install mimir-agent[claude-code]" in out
+    assert "MIMIR_ACCESS_CONTROL_ENFORCED" not in out
+    assert "#910" not in out
+
+
+
+
+# ─── --model flag (auto-routing via model_registry) ─────────────────────
+
+
+def test_setup_default_model_routes_to_codex_plus(tmp_path: Path):
+    """No ``--model`` → the shipped default spec, written into the fresh
+    home. This is the SAME spec ``Config.from_env`` falls back to, so a
+    setup-created home and a never-setup home run the same model."""
+    home = tmp_path / "h"
+    status = setup_home(home)
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=codex-plus:gpt-5.6-luna" in env
+    assert status["model_spec"] == "codex-plus:gpt-5.6-luna"
+    assert status["provider_name"] == "openai"
+    assert status["billing_mode"] == "subscription"
+
+    from mimir.config import DEFAULT_MODEL_SPEC
+    assert status["model_spec"] == DEFAULT_MODEL_SPEC
+
+
+def test_setup_max_oauth_routes_claude_to_claude_code(tmp_path: Path):
+    """``--subscription`` still opts INTO the Max OAuth path for operators
+    with active Max plans — but it now needs an explicit Claude ``--model``,
+    because the default spec is already a subscription route."""
+    home = tmp_path / "h"
+    status = setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6" in env
+    assert status["model_spec"] == "claude-code:claude-sonnet-4-6"
+    assert status["provider_name"] == "anthropic-max"
+    assert status["billing_mode"] == "subscription"
+
+
+def test_setup_bare_subscription_flag_keeps_default(tmp_path: Path):
+    """Behavior change worth pinning: with a subscription-backed default,
+    a bare ``--subscription`` no longer flips to claude-code. It used to
+    yield ``claude-code:claude-sonnet-4-6``; now the pre-qualified default
+    passes straight through, which also keeps it enforcement-compatible."""
+    home = tmp_path / "h"
+    status = setup_home(home, subscription=True)
+    assert status["model_spec"] == "codex-plus:gpt-5.6-luna"
+    assert status["billing_mode"] == "subscription"
+
+
+def test_setup_minimax_model_injects_anthropic_compat_base_url(tmp_path: Path):
+    home = tmp_path / "h"
+    status = setup_home(home, model="MiniMax-M2.7")
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=anthropic:MiniMax-M2.7" in env
+    assert "ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic" in env
+    assert status["provider_name"] == "minimax"
+    assert status["billing_mode"] == "api"
+
+
+def test_setup_kimi_model_injects_moonshot_base_url(tmp_path: Path):
+    home = tmp_path / "h"
+    status = setup_home(home, model="kimi-k2-0905-preview")
+    env = (home / ".env").read_text()
+    assert "ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic" in env
+    assert status["provider_name"] == "moonshot"
+
+
+def test_setup_openai_model_no_base_url_override(tmp_path: Path):
+    home = tmp_path / "h"
+    status = setup_home(home, model="gpt-4.1-mini")
+    env = (home / ".env").read_text()
+    assert "MIMIR_MODEL_SPEC=openai:gpt-4.1-mini" in env
+    assert status["provider_name"] == "openai"
+
+
+def test_setup_model_preserves_operator_value_on_rerun(tmp_path: Path):
+    """Idempotent — operator's manual MIMIR_MODEL_SPEC edit survives
+    a re-run with the original ``--model``."""
+    home = tmp_path / "h"
+    setup_home(home, model="claude-sonnet-4-6")
+    env_path = home / ".env"
+    body = env_path.read_text().replace(
+        "MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6",
+        "MIMIR_MODEL_SPEC=openai:gpt-5-nano",
+    )
+    env_path.write_text(body)
+    setup_home(home, model="claude-sonnet-4-6")
+    final = env_path.read_text()
+    assert "MIMIR_MODEL_SPEC=openai:gpt-5-nano" in final
+    assert "MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6" not in final
+
+
+# ─── usage-monitor auto-wiring (no --quota flag needed) ─────────────────
+
+
+def test_setup_api_route_writes_cost_ceiling(tmp_path: Path):
+    """API-mode routes get the default ``MIMIR_COST_HOURLY_LIMIT_USD``
+    written automatically (no --quota flag needed). Spike-ratio check
+    is always-on by default in cost_tracking.py — this gives operators
+    a sensible alert threshold so unexpected $/hr spikes fire."""
+    home = tmp_path / "h"
+    status = setup_home(home, model="MiniMax-M2.7")
+    env = (home / ".env").read_text()
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=5.0" in env
+    assert "cost monitoring" in status["monitor_status"]
+
+
+def test_setup_subscription_route_writes_quota_poll_flag(tmp_path: Path):
+    """Subscription-mode routes get ``MIMIR_QUOTA_POLL_ENABLED=1`` so
+    the runtime registers the OAuth usage poller at boot."""
+    home = tmp_path / "h"
+    status = setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    env = (home / ".env").read_text()
+    assert "MIMIR_QUOTA_POLL_ENABLED=1" in env
+    assert "quota poller" in status["monitor_status"]
+
+    # The default route is subscription billing too, so it must also write
+    # the flag (its monitor label is Codex-specific rather than the
+    # Anthropic "quota poller" wording).
+    home2 = tmp_path / "h2"
+    setup_home(home2)
+    assert "MIMIR_QUOTA_POLL_ENABLED=1" in (home2 / ".env").read_text()
+
+
+def test_setup_preserves_operator_monitor_override_on_rerun(tmp_path: Path):
+    """Operator manually set MIMIR_COST_HOURLY_LIMIT_USD=25.0 to a
+    higher ceiling. A re-run mustn't clobber that operator value."""
+    home = tmp_path / "h"
+    setup_home(home, model="claude-sonnet-4-6")
+    env_path = home / ".env"
+    body = env_path.read_text().replace(
+        "MIMIR_COST_HOURLY_LIMIT_USD=5.0",
+        "MIMIR_COST_HOURLY_LIMIT_USD=25.0",
+    )
+    env_path.write_text(body)
+    setup_home(home, model="claude-sonnet-4-6")
+    final = env_path.read_text()
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=25.0" in final
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=5.0" not in final
+
+
+def test_setup_overrides_zero_default_to_active_ceiling(tmp_path: Path):
+    """The .env template ships with ``MIMIR_COST_HOURLY_LIMIT_USD=`` empty.
+    Setup treats empty / 0 / 0.0 as "not set" and writes the active
+    default — otherwise operators would have to manually bump it from
+    zero (which disables the alert)."""
+    home = tmp_path / "h"
+    # Empty .env (post-template) has MIMIR_COST_HOURLY_LIMIT_USD= empty.
+    setup_home(home, model="claude-sonnet-4-6")
+    env = (home / ".env").read_text()
+    # Setup wrote the active default.
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=5.0" in env
+
+
+# ─── dead-env removal sanity ────────────────────────────────────────────
+
+
+def test_setup_does_not_write_dead_MIMIR_MODEL_env_var(tmp_path: Path):
+    """``MIMIR_MODEL`` is SDK-era; deepagents path reads only
+    ``MIMIR_MODEL_SPEC``. The .env template used to write
+    ``MIMIR_MODEL=claude-opus-4-7`` which silently confused operators
+    (the value didn't do anything). Make sure it's gone."""
+    home = tmp_path / "h"
+    setup_home(home)
+    env = (home / ".env").read_text()
+    for line in env.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("MIMIR_MODEL=") and not stripped.startswith(
+            "MIMIR_MODEL_SPEC"
+        ):
+            pytest.fail(f"unexpected dead env line: {stripped!r}")
+
+
+# ---------------------------------------------------------------------------
+# ``mimir feedback mark-resolved`` CLI (chainlink #198)
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402 — already imported by helpers above; fine here
+
+
+def _run_feedback_cmd(argv: list[str]) -> int:
+    """Call ``main(argv)``; return the SystemExit code (0 on success)."""
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    return exc_info.value.code
+
+
+def test_feedback_mark_resolved_writes_jsonl(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir feedback mark-resolved`` appends a valid JSONL rule and
+    prints a confirmation."""
+    incidents = tmp_path / "resolved-incidents.jsonl"
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "error",
+            "--pattern", "langchain-claude-code",
+            "--reason", "start.sh now installs the package",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "marked resolved" in captured.out
+    assert incidents.exists()
+    rules = [json.loads(line) for line in incidents.read_text().splitlines() if line.strip()]
+    assert len(rules) == 1
+    assert rules[0]["event_type"] == "error"
+    assert rules[0]["pattern"] == "langchain-claude-code"
+    assert rules[0]["reason"] == "start.sh now installs the package"
+    assert "resolved_at" in rules[0]
+
+
+def test_feedback_mark_resolved_custom_resolved_at(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--resolved-at`` stores the supplied (normalised) timestamp."""
+    _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "error",
+            "--pattern", "",
+            "--reason", "test fix",
+            "--resolved-at", "2026-05-25T12:00:00",
+            "--home", str(tmp_path),
+        ]
+    )
+    incidents = tmp_path / "resolved-incidents.jsonl"
+    rules = [json.loads(l) for l in incidents.read_text().splitlines() if l.strip()]
+    # Naive stamp should be stored as UTC-aware
+    assert rules[0]["resolved_at"] == "2026-05-25T12:00:00+00:00"
+
+
+def test_feedback_mark_resolved_invalid_resolved_at_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A non-ISO --resolved-at exits with code 1 and doesn't write."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "error",
+            "--reason", "test",
+            "--resolved-at", "not-a-date",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    assert not (tmp_path / "resolved-incidents.jsonl").exists()
+
+
+def test_feedback_mark_resolved_dry_run_no_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--dry-run`` prints preview but does not write the file."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "*",
+            "--reason", "test",
+            "--dry-run",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "dry-run" in captured.out
+    assert not (tmp_path / "resolved-incidents.jsonl").exists()
+
+
+def test_feedback_mark_resolved_unknown_type_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """An unknown --type emits a warning but still writes the rule."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "mark-resolved",
+            "--type", "totally_unknown_event",
+            "--reason", "test",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower() or "warning" in captured.out.lower()
+    incidents = tmp_path / "resolved-incidents.jsonl"
+    assert incidents.exists()
+
+
+# ``mimir feedback emit`` CLI (chainlink #218)
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_emit_writes_event_to_jsonl(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir feedback emit`` appends one valid JSON record to events.jsonl."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "pr_merge_blocked_by_changes_requested",
+            "pr=42",
+            "author=mimir-bot",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "emitted" in captured.out
+    assert "pr_merge_blocked_by_changes_requested" in captured.out
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert events_path.exists()
+    records = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["type"] == "pr_merge_blocked_by_changes_requested"
+    assert rec["pr"] == "42"
+    assert rec["author"] == "mimir-bot"
+    assert rec["session_id"] == "cli"
+    assert "timestamp" in rec
+
+
+def test_feedback_emit_no_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``mimir feedback emit`` works with no KEY=VALUE pairs."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "git_push_ok",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    events_path = tmp_path / "logs" / "events.jsonl"
+    records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert len(records) == 1
+    assert records[0]["type"] == "git_push_ok"
+    # No extra keys beyond the standard envelope fields
+    assert "pr" not in records[0]
+
+
+def test_feedback_emit_invalid_pair_exits_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A KEY=VALUE pair missing '=' exits with code 1 and writes nothing."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "git_push_ok",
+            "bad-pair",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "error" in captured.err.lower()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+def test_feedback_emit_unknown_type_warns_but_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """An unrecognised event type emits a warning but still writes the event."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "totally_custom_event_type",
+            "key=val",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower()
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert events_path.exists()
+    records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert records[0]["type"] == "totally_custom_event_type"
+    assert records[0]["key"] == "[REDACTED]"
+
+
+def test_feedback_emit_json_values_parses_structured_data(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--json-values`` JSON-parses each value so lists and ints are stored
+    as proper JSON types, not strings."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "pr_merge_blocked_by_changes_requested",
+            'blocking_reviewers=["jasoncarreira"]',
+            "pr=42",
+            "--json-values",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    events_path = tmp_path / "logs" / "events.jsonl"
+    records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["blocking_reviewers"] == ["jasoncarreira"]  # list, not string
+    assert rec["pr"] == 42  # int, not string
+
+
+def test_feedback_emit_json_values_rejects_malformed_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--json-values`` exits 1 and prints an error when a value is not valid JSON.
+
+    Silently falling back to a string would hide bugs, so we reject explicitly.
+    """
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "pr_merge_blocked_by_changes_requested",
+            "blocking_reviewers=jasoncarreira,bob",  # not JSON
+            "--json-values",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "json-values" in captured.err.lower() or "json" in captured.err.lower()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+def test_feedback_emit_without_json_values_stores_strings(
+    tmp_path: Path,
+) -> None:
+    """Without ``--json-values``, values are stored as plain strings (backwards compat)."""
+    rc = _run_feedback_cmd(
+        [
+            "feedback",
+            "emit",
+            "pr_merge_blocked_by_changes_requested",
+            "pr=42",
+            "--home", str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    events_path = tmp_path / "logs" / "events.jsonl"
+    records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    # Without --json-values, "42" stays a string
+    assert records[0]["pr"] == "42"
+
+
+def test_notify_restart_cli_dispatches(monkeypatch):
+    """`mimir notify-restart` wires --unit/--detail through to
+    notify_service_event and runs it (systemd OnFailure= hook path)."""
+    import mimir.liveness as liveness
+
+    recorded: dict = {}
+
+    async def fake_notify(*, unit=None, detail=None, _post=None):
+        recorded["unit"] = unit
+        recorded["detail"] = detail
+
+    monkeypatch.setattr(liveness, "notify_service_event", fake_notify)
+    main(["notify-restart", "--unit", "mimir.service", "--detail", "exit 137"])
+    assert recorded == {"unit": "mimir.service", "detail": "exit 137"}

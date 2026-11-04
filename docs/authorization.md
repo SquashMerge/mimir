@@ -1,0 +1,1426 @@
+# Authorization reference
+
+This is the authoritative operator and contributor reference for Mimir's
+requester-resource authorization system. It describes the implementation in
+`mimir/access_control.py`, the frozen carrier in `mimir/models.py`, SAGA
+ownership in `mimir/saga/ownership.py`, and the tool boundary in
+`mimir/tools/budget_gate.py`.
+
+Authorization ships in compatibility (shadow) mode **except for ACP**, which
+deliberately creates turns with `enforce=True` in `mimir/acp/agent.py` as an
+enforced canary. Other surfaces use the global setting, defaulting to shadow
+decisions. ACP requires an admin identity, so it skips non-admin protected-read
+filtering; test read-policy changes through a non-admin, non-ACP turn instead.
+See [ACP's experimental limits](acp.md#experimental-status) when diagnosing
+ACP-only refusals. Do not enable global enforcement for a deployment until the [enablement runbook](#enablement-runbook)
+has been completed. The earlier
+[requester/resource policy](security/requester-resource-authorization.md) is a
+design and adversarial-review artifact; where its historical status notes differ
+from this document, this reference and current code control.
+
+## Model
+
+Mimir authorizes a concrete request, not a tool name in isolation. The effective
+decision includes:
+
+```text
+(requester, ingress provenance, operation, tool provenance, arguments,
+ resource ownership, information-flow labels, destination)
+```
+
+The model is not a policy enforcement point. Prompt text, tool arguments,
+`session_id`, source names, trigger strings, ContextVars, and active-turn lookup
+cannot confer authority.
+
+### Human principals and tiers
+
+Human identity and roles come from `<MIMIR_HOME>/state/identities.yaml` through
+`IdentityResolver`. Access metadata belongs to the canonical identity, so all
+of that person's platform aliases receive the same role snapshot.
+
+```yaml
+people:
+  - canonical: alice
+    aliases: [slack-U123, discord-456]
+    access:
+      roles: [user, admin]
+```
+
+- A regular requester has `user` or `admin`. This admits USER-tier inbound use
+  and operations that are open or pass a resource adapter.
+- An administrator has `admin`. This also admits ADMIN-tier actions and
+  `ADMIN_REQUIRED` operations.
+- Missing access metadata, an empty/malformed role list, and an unknown identity
+  grant no human-user authority when enforcement is enabled.
+- `service` and `is_service` identity metadata do not by themselves admit an
+  external caller as a human user or as a trusted internal service.
+
+`authorize_inbound()` and `authorize_action()` return structured
+`AccessDecision` values. With enforcement off, they retain the reason that would
+have denied the request but return `LEGACY_ALLOWED`; with enforcement on, the
+same missing, unknown, unallowlisted, or non-admin request is denied.
+
+### Frozen server-created `AuthContext`
+
+`AuthContext` is a frozen dataclass in `mimir/models.py`. `create_auth_context()`
+in `mimir/access_control.py` creates it before model execution and snapshots:
+
+- raw and canonical principal;
+- roles;
+- server-owned ingress provenance and trigger;
+- triggering channel and server-computed interactivity;
+- policy version and enforcement state;
+- trusted-service status;
+- immutable information-flow labels.
+
+LangGraph carries this exact object in `ToolCallRequest.runtime.context`.
+`_auth_context_from_request()` in `mimir/tools/budget_gate.py` accepts only an
+actual `AuthContext`, not a duck-typed object. SAGA tool handlers repeat the
+exact-carrier check as defense in depth. A missing or malformed carrier grants
+no non-open authority under enforcement.
+
+Client-supplied identity is never trusted as this carrier. In particular, a
+model cannot select authority with a `session_id`, and a concurrent turn cannot
+borrow authority through a ContextVar or a "single active turn" heuristic.
+Reloading identities after turn creation also cannot widen that turn's frozen
+role snapshot.
+
+### Mid-turn injection
+
+Dispatcher mid-turn injection and startup queue draining require a known incoming
+identity whose canonical principal matches the running turn's frozen `AuthContext`.
+Same-principal aliases may inject; different principals, unknown identities,
+missing carriers, and generic HTTP ingress cannot. This guard is always on,
+including in shadow mode. Refused injections remain queued for a fresh turn with
+their own authorization context; a mismatched startup message is also a FIFO
+boundary for later messages.
+
+Channel membership and IFC `authorized_principals` are data-access facts, not
+authenticated requester identity. Folding text does not replace the running
+turn's principal or roles, so allowing another channel member to inject would let
+their instructions execute with the running requester's authority. Operator
+approval replies are subject to the same principal check before consent is
+recorded; a different operator cannot inject into another requester's turn.
+
+### HTTP ingress marker
+
+Generic `POST /event` authenticates transport, not a named requester. The server
+removes any client-provided marker and stamps
+`extra["_mimir_event_ingress"] = "http_event"`; it does not copy a client
+`service_principal` or IFC carrier. `create_auth_context()` snapshots that value
+as `event_ingress`.
+
+Every non-`OPEN` tool operation from this generic HTTP ingress is denied by the
+live tool gate even when global enforcement is off. Forging an admin author or
+a registered service trigger does not widen authority. Authenticated web chat
+is different: it resolves a server-owned per-user key to a canonical identity
+and is not treated as generic `/event` ingress. The shared master
+`MIMIR_API_KEY` is API/transport authority, not a web-chat identity.
+
+### Trusted service principals
+
+Autonomous scheduler, poller, synthesis, and upgrade turns do not become admins.
+They use separate `ServicePrincipal` entries keyed by a server-owned trigger.
+Internal event constructors set the expected `service_principal`, and
+`create_auth_context()` recognizes it only when the trigger, canonical service
+name, and absence of HTTP ingress all agree.
+
+`get_trusted_service_from_auth_context()` rechecks authority at use time. Its
+trust check requires all of the following:
+
+- `event_ingress is None`;
+- `is_service is True`;
+- `trigger` is a registered service trigger;
+- `canonical_principal` exactly matches that trigger's registered canonical
+  service.
+
+This is the service two-factor invariant: a service assertion (`is_service` and
+registered trigger) is insufficient without the canonical match, and neither
+is accepted from any marked ingress. A trigger string, `is_service`, an identity
+role, or a canonical name alone grants nothing.
+
+## Operation decisions
+
+`OperationCatalog` in `mimir/access_control.py` produces an
+`OperationDecision` for each tool call. The catalog contains explicit built-in
+sets and adapter hooks; the final model-bound tool inventory in `ToolRegistry`
+is observational and does not grant authority.
+
+Resolution order is:
+
+1. An exact custom registration from `register_operation()`.
+2. Adapter hooks in registration order (currently channel, then MCP).
+3. The exact built-in `OPEN` set.
+4. The exact built-in `ADMIN_REQUIRED` set.
+5. Protected built-in aliases.
+6. Namespaced/suffixed forms of an admin-required operation.
+7. `UNKNOWN`.
+
+The current operation lists live in `OperationCatalog._OPEN_OPERATIONS`,
+`_ADMIN_REQUIRED_OPERATIONS`, and `_ADMIN_BUILTIN_TOOL_NAMES`. Refer to those
+sets rather than duplicating them in deployment policy: they are the executable
+catalog. Protected metadata operations are also pinned by tests so that global
+channel, schedule, and shell-job metadata cannot become open accidentally.
+
+### Decision tiers
+
+| Decision | Meaning | Enforcement off | Enforcement on |
+|---|---|---|---|
+| `OPEN` | The general tool middleware imposes no admin or resource-adapter gate. Some open operations perform mandatory ownership checks inside their handler or storage query. | Allowed by general middleware; leaf checks still apply. | Allowed by general middleware; leaf checks still apply. |
+| `ADMIN_REQUIRED` | Requires an `admin` role or an exact trusted-service capability with all mapped domain/sink constraints. | Ordinary failures are allowed and emitted as `shadow_tool_decision`; a valid service grant is also marked shadow. Generic HTTP remains denied. | Denied without admin or a valid service grant. |
+| `RESOURCE_SCOPED` | Arguments identify resources and a concrete adapter must authorize them. | Adapter failures are shadow-allowed; generic resource-scoped calls without an evaluator are shadow-allowed. Generic HTTP remains denied. | The channel adapter enforces same-scope access. Any other resource-scoped call without a concrete evaluator is denied. |
+| `UNKNOWN` | No catalog or adapter classification exists. It is never implicitly open. | Shadow-allowed for ordinary non-HTTP callers. | Denied. An exact trusted-service capability is the narrow exception. |
+
+`BudgetGateMiddleware` enables shadow logging. Tool decisions include stable
+fields such as operation, tier, reason, service principal, enforcement state,
+and whether the result was a shadow decision. Prohibited-action and budget
+guards are separate controls and remain active when authorization enforcement
+is off.
+
+## Trusted-service capability matrix
+
+The matrix is `_TRUSTED_SERVICE_PRINCIPALS` in `mimir/access_control.py`. Each
+entry has exact operation grants (`capabilities`), a read-domain allowlist
+(`readable_domains`), an active-sink allowlist (`sink_destinations`), trigger,
+and a documented server creation path. Runtime tool registration cannot add a
+service capability.
+
+Capabilities grant a trusted service access to matching `ADMIN_REQUIRED`
+operations and provide the narrow service exception for `UNKNOWN`; they are not
+a complete deny-by-default inventory for `OPEN` or resource-scoped operations.
+Open calls still follow their handler/storage checks, and resource-scoped calls
+follow their adapter. Service sink bypass remains separately constrained by
+declared destinations.
+
+The matrix currently contains:
+
+| Principal | Trigger | Declared creation path | Capabilities |
+|---|---|---|---|
+| `scheduler` | `scheduled_tick` | `mimir.scheduler.Scheduler._fire_job` | `shell_exec`, `bash_async`, shell-job reads, all three spawn operations, `task`, `saga_forget`, file read/search/write/edit operations, proposal operations, `worklink_run`, and turn reads |
+| `poller` | `poller` | `mimir.pollers.run_poller` | `shell_exec`, `bash_async`, all three spawn operations, `task`, file read/search/write/edit operations, proposal operations, `worklink_run`, turn reads, `send_message`, and `list_channels` |
+| `synthesis` | `saga_session_end` | `mimir.server._on_session_idle` | `saga_end_session`, `saga_mark_contributions`, `saga_feedback`, `saga_record_skill_learning`, `memory_get`, `memory_store`, turn reads, and file read/search/write/edit operations |
+| `system` | `upgrade` | `mimir.defaults_upgrade.enqueue_upgrade_prompt_turns` | `shell_exec`, `bash_async`, file read/search/write/edit operations, proposal operations, `add_schedule`, `set_schedule_priority`, `list_schedules`, and `send_message` |
+
+The file operation groups above mean the exact synchronous/asynchronous names
+present in the matrix (`read_file`/`aread`, `ls`/`als`, `glob`/`aglob`, and
+`grep`/`agrep`); `file_search` is included for scheduler and poller. "Turn
+reads" means `get_turn` and `mimir_get_turn`. The exact tuple remains the source
+of truth when changing the matrix.
+
+The scheduler entry currently declares `Scheduler._fire_job`; the live producer
+is `Scheduler._fire` in `mimir/scheduler.py`. The declared string is audit
+metadata rather than an executable binding; service trust is established by the
+trigger/canonical/ingress checks described above.
+
+| Principal | `readable_domains` | `sink_destinations` |
+|---|---|---|
+| `scheduler` | `configured_inputs`, `filesystem`, `turn_history`, `shell_jobs` | `configured_channel`, `filesystem`, `shell_process`, `spawn_process`, `proposal`, `saga`, `worklink` |
+| `poller` | `poller_payload`, `filesystem`, `turn_history`, `channel_metadata` | `configured_channel`, `filesystem`, `shell_process`, `spawn_process`, `proposal`, `worklink`, `message` |
+| `synthesis` | `session`, `saga`, `filesystem`, `turn_history` | `session_boundary`, `saga`, `filesystem` |
+| `system` | `defaults`, `proposal`, `filesystem`, `schedule_metadata` | `operator_alert`, `filesystem`, `shell_process`, `proposal`, `scheduler`, `message` |
+
+`_OPERATION_READABLE_DOMAIN` maps operations to protected read domains.
+`TOOL_DESCRIPTORS` in `mimir/tool_descriptors.py` carries each operation's sink
+destination alongside its other authorization and information-flow facts.
+`service_can_invoke_operation()` requires the exact capability and every mapped
+domain and sink. This function is authoritative for service execution of
+admin-gated operations and for the trusted-service exception to `UNKNOWN`.
+`can_write_saga()` separately requires a canonical SAGA mutation and then either
+an admin or the same exact service capability check; SAGA handlers call it
+again, so bypassing general middleware does not bypass memory-integrity
+authorization.
+
+### Enable-time completeness gate
+
+`_capability_matrix_errors()` verifies that:
+
+- all required service triggers exist and each entry declares its own trigger;
+- every required entry has nonempty capabilities, readable domains, and sink
+  destinations;
+- every capability with a mapped read domain or sink declares it;
+- every canonical SAGA mutation has a sink mapping, is not `OPEN`, and is
+  explicitly `ADMIN_REQUIRED`.
+
+`assert_capability_matrix_complete()` raises `CapabilityMatrixError` when any
+check fails. `resolve_access_control_enforcement()` runs this assertion whenever
+enforcement is requested, so an incomplete matrix blocks startup.
+`check_capability_matrix_complete()` and `get_capability_matrix_report()` are
+available for preflight and audit.
+
+This gate is deliberately narrower than a full operation inventory: it does not
+prove that every runtime tool or every service capability is cataloged. Unknown
+operations still fail closed under enforcement, but they run in shadow mode and
+an exact service capability can authorize one. Contributors must therefore add
+catalog and inventory tests as described in [How to extend](#how-to-extend), not
+treat a passing matrix assertion as complete operation coverage.
+
+## Resource adapters
+
+An `OperationDecision.RESOURCE_SCOPED` label is not itself an authorization
+predicate. A concrete adapter must resolve model arguments to server-known
+resources and reject missing, ambiguous, wildcard, mixed-owner, or unknown
+resources. Without a runtime evaluator, resource-scoped operations deny under
+enforcement.
+
+### Channels
+
+`ChannelResourceAdapter` classifies `send_message`, `react`, and
+`fetch_channel_history` as resource-scoped. It compares the target with the
+server-carried triggering channel after server-side channel alias resolution.
+An omitted target means the triggering channel, matching tool runtime behavior.
+
+- Same canonical channel is allowed for a regular requester.
+- A different or unknown channel requires admin.
+- A missing triggering channel fails closed under enforcement.
+- Channel names and targets supplied by the model do not replace the triggering
+  channel in `AuthContext`.
+
+IFC is still evaluated separately. Admin authorization for a cross-channel
+operation does not erase taint or make the destination IFC-compatible.
+
+### MCP
+
+`MCPResourceAdapter` is a provenance-aware classification extension point for
+`mcp_` tools. It uses in-process `MCPProvenance`, not the display name alone, to
+carry a generated server-config id, transport and endpoint label, non-secret
+config digest, schema digest, original name, adapter name/version, approval
+version, and policy version.
+
+Missing or tombstoned provenance, an absent adapter, version/policy mismatch,
+adapter failure, or an invalid adapter result becomes `ADMIN_REQUIRED`. A
+matching registered classifier may return `OPEN`, `RESOURCE_SCOPED`, or
+`ADMIN_REQUIRED`, after which production role and service evaluation occurs
+through `ToolRegistry.authorize_tool()`.
+
+The current production assembly does not register a classifier or run the
+provided drift/stale-policy helpers, so configured MCP tools currently resolve
+to `ADMIN_REQUIRED`. The classifier call receives the tool name and authorization
+context, not model arguments; therefore the current substrate cannot safely
+authorize an argument-dependent `RESOURCE_SCOPED` MCP call. Adapter registration,
+argument-aware runtime evaluation, durable approval identity, and automatic
+drift tombstoning/startup checks are extension obligations, not currently wired
+production behavior. The lower-level `authorize_mcp_tool()` helper is also not a
+substitute for the full registry path.
+
+## SAGA ownership
+
+`mimir/saga/ownership.py` defines row-level authorization for atoms, sessions,
+observations, triples, and world state. Ownership is independent of tool-tier
+authorization and IFC.
+
+`Ownership` records:
+
+- `owner_principal`: canonical user or `service:<canonical>` owner;
+- `origin_channel`: source channel/session;
+- `origin_domain`: resource namespace;
+- `visibility`: `public`, `private`, `service`, or `legacy_admin`;
+- provenance metadata.
+
+Unproven and migrated data defaults to owner/visibility `legacy_admin`.
+Derived ACLs use `intersect_acl()`: mixed owners/domains, missing provenance,
+unknown visibility, or any legacy ambiguity collapses to the fail-closed
+`legacy_admin` ACL.
+
+`get_authorization_scope()` accepts only an actual `AuthContext`; a caller-made
+`AuthorizationScope` is a query value, not authority. `authorization_predicate()`
+and its session/triple variants produce parameterized SQL predicates so content
+and existence are filtered before ranking or rendering:
+
+- missing context reads only `public` rows;
+- regular users read public rows and rows they own;
+- admins read all rows;
+- regular services read public, service-owned, and declared-domain rows;
+- the four trusted platform/maintenance services read the internal corpus
+  without becoming admins.
+
+Broad platform-service reads are intentional and are contained by derived ACL
+intersection and IFC on outputs. They do not widen SAGA mutation authority:
+destructive mutation scope is independently limited by admin status, exact
+service owner/domain scope, and `can_write_saga()`.
+
+## Information flow and sinks
+
+Row/read authorization answers whether data may enter a turn. IFC answers where
+data accumulated by that turn may leave.
+
+`InformationFlowLabels` in `mimir/models.py` carries monotonic sensitivity
+labels (`private`, `confidential`, `internal`, `public`) and source channels.
+Labels are initialized before the first model call from inbound/folded messages,
+history, attachments, continuations, and preloaded server context. Automatic
+memory, session, skill, file, and other prompt injection is conservatively
+tainted `private`. Labels propagate into delegated/forked work, continuations,
+and resumed turns. Summarizing or transforming content cannot remove them.
+The only way to let labelled data reach an otherwise blocked sink is the
+audited, admin-approved `approve_declassification` flow. The declassification
+capability grants one use of a specific sink category and destination on the
+live turn; it does not strip the source or sensitivity labels. For a network
+sink, the approved destination additionally persists as an exact approved URL
+for the rest of the server-owned session.
+
+`TOOL_DESCRIPTORS` in `mimir/tool_descriptors.py` is the per-tool source of
+truth for authorization and information-flow metadata. Each immutable
+`ToolDescriptor` can carry the sink category, sink target extractor, sink
+destination, fetch-authorization kind, result origin, git-operation-result flag,
+IFC-delegation flag, and budget-exemption flag. Its `SinkCategory` values
+classify channel egress, MCP, HTTP, network, shell, spawn, notification, and
+file destinations. A descriptor with a sink category must declare a target
+extractor; use `None` only to opt out explicitly. `validate_tool_descriptors()`
+enforces that invariant at module import. `SinkGate.check_sink_flow()`:
+
+- fails closed on a missing label carrier, unknown category, unknown label, or
+  missing destination when enforcement is active;
+- permits unlabeled data only for a known category and nonempty destination;
+- permits ordinary labeled same-channel flow only when every source channel
+  resolves to the triggering channel;
+- does not let an ordinary admin bypass IFC;
+- permits a trusted service only for compatible declared active-sink
+  destinations; poller payloads cannot use that bypass for shell, spawn, or file
+  sinks.
+
+The sink check runs before a model-invoked egress tool. Harness-owned final-text
+delivery and activity-panel post/edit paths invoke the same sink check at the
+final boundary and obey the configured enforcement mode. SAGA
+ownership does not currently generate field-level IFC labels; after authorized
+recall, injected prompt context receives the conservative turn-level taint.
+
+### Outbound content privacy
+
+Before an authorized external-sink write executes, Mimir also scans the outbound
+content selected by the tool's `sink_payload_extractor`. This check is independent
+of turn taint and `MIMIR_ACCESS_CONTROL_ENFORCED`:
+
+- Credential-shaped content uses `read_policy.text_contains_secret`, including
+  PEM private keys, and is always refused.
+- Exact operator terms from `<MIMIR_HOME>/private-terms.txt` are matched
+  case-insensitively with normalized whitespace. Terms containing at least seven
+  digits also match separator-free forms. They emit `shadow_tool_decision` by
+  default and are refused when `MIMIR_OUTBOUND_PRIVACY_ENFORCE` is true.
+- When `MIMIR_OUTBOUND_PII_JEV` is true and `JEV_KEY` is set, locally clean text
+  of at least 20 characters is sent to `https://api.typesafe.ai/v1/systemone`
+  for PII classification. Mimir sends only the first 4000 characters and the
+  fixed classification question; TypeSafe therefore sees that outbound text as
+  part of the operator's explicit opt-in. The model is pinned to `jev-1.13.0`,
+  the request has a three-second timeout, and every request or response failure
+  fails open with value-free telemetry. Scores at least 0.5 shadow by default
+  and are refused under `MIMIR_OUTBOUND_PRIVACY_ENFORCE`.
+
+Refusals and events identify only the detector. Local findings include match
+length and a short HMAC-SHA-256 prefix; Jev findings include the score and the
+same keyed prefix. The per-install 32-byte key is created on first use at
+`<MIMIR_HOME>/.outbound-privacy-key` with mode 0600. If it cannot be created or
+read, findings omit the fingerprint rather than falling back to an unkeyed hash
+or failing the scan. Findings never include the matched value. Context metadata
+is passed through `redaction.redact_payload`. The key and private-term file are
+protected from agent and trusted-service read tools; the term file is re-read
+when its mtime changes and is optional.
+
+External categories (`NETWORK`, `HTTP_WEBHOOK`, `EXTERNAL_MCP`, `NOTIFICATION`,
+`CROSS_CHANNEL`, and `FORGE`) must explicitly declare a
+`sink_payload_extractor`; `None` is an intentional operator-owned or deferred
+opt-out. `send_message` extracts text only when its target differs from the
+triggering channel and from the exactly normalized configured operator alert
+channel. An unset alert channel grants no additional exemption. GitHub text is
+scanned for `issue_comment`, `pr_comment`, `pr_edit_body`,
+`pr_inline_review_comment`, and `pr_submit_review` bodies and `repo_commit`
+messages; operations without model-authored published text, such as `repo_push`
+and `pr_rerequest_review`, remain explicit opt-outs. External declared shell
+commands likewise require `payload_args`, naming the argv options whose values
+are scanned.
+
+On a tainted turn, `fetch_url` may also pass the taint gate for an exact HTTPS
+URL copied from external-origin untrusted active-ingest text in that same turn.
+The server extracts and normalizes those URLs only from successful
+`web_search` result entries (never the echoed query), the body bytes written by
+`fetch_url` during that exact call, typed PR/repository reads, and untrusted
+poller trigger payloads. Reads under agent-writable roots — including the fetch
+cache — shell/process/Hands/REPL output, failures and refusal text, trusted
+content, and model-supplied tool arguments never contribute. Self-authored
+PR/comment/review text is not excluded: it has already crossed the forge egress
+boundary, so admitting the same bytes later creates no new exposure. The server
+keeps at most 1000
+URLs in non-persisted turn state and records an admission as
+`taint_gate_exempt:verbatim_ingest_url`. This is not destination authority: the
+URL must still match the service's `approved_urls` policy or another existing
+fetch adapter, and every redirect hop must independently be an exact approved or
+approved-and-ingested URL. `http://` URLs, userinfo, and explicit ports do not
+populate the set. A new turn starts with an empty set.
+
+### Egress veto shadow telemetry (#1903)
+
+After untrusted active ingest, the proposed egress veto is measured **only**:
+`fetch_url` outside verbatim-ingest URLs and approved fetch URLs (including poller
+`approved_urls`), `web_search` outside its fixed URL, `webhook`/`http_request`
+outside `MIMIR_EGRESS_APPROVED_URLS`, and cross-channel/DM `send_message` carrying
+private-source labels without a sink approval or declassification. Same-channel
+replies and clean turns do not generate a would-block. This telemetry does not
+refuse a call or change any existing shadow/enforced decision.
+
+Each `egress_veto_would_block` event includes the tool, sink category, trigger,
+service principal/poller, destination **host only** for URLs, missed exemption,
+reason, untrusted source metadata and whether the actual decision allowed it.
+The `origin` field distinguishes model `tool_call` egress from `harness` delivery;
+opaque repository source IDs retain their `#pull/N@sha` attribution. Destination
+hosts are IDNA-normalised, falling back to the raw host on encoding errors.
+To review counts by tool, host, trigger/poller, reason and origin without writing
+to the agent home, run `mimir stats --home <home> --egress-shadow` (optionally
+`--since 2026-10-09T00:00:00Z`). Historical events without an origin are grouped
+under `origin=-`; `--since` without `--egress-shadow` is an error. Arming an actual
+veto requires a separate operator decision.
+
+### Ingest acknowledgement
+
+Only a human operator can acknowledge ingest: in ACP through the daemon's
+**Clear / Keep** permission request; in authenticated Discord, Slack or web
+chat through the server's `trust trust-xxxx` / `keep trust-xxxx` reply. The
+model has no clear tool. The reply is bound to an authenticated non-service
+admin, its originating channel and one pending request ID. Pollers, schedules,
+generic HTTP events and service identities cannot clear or receive a notice.
+The acknowledgement requires a durable `ifc_ingest_taint_cleared` audit event
+with only fixed-taxonomy source counts; Keep writes a separate declined event.
+
+Clear covers the reviewed untrusted ingest snapshot for that ACP session or
+chat channel and operator, including the running turn. Trusted arrivals while
+the human decides do not expire the request; any new untrusted arrival does,
+including a fresh read of an already reviewed source. Only the human
+acknowledgement persists between turns: labels, sensitivities, audience ACLs,
+egress grants and sink capabilities remain per-turn. Acknowledgements cover at
+most 1,024 sources and expire after one idle hour; chat retains at most 256
+channel/operator cells (oldest idle cell evicted first). ACP cells also end with
+the session. Reaching the source cap fails closed and needs a new session or
+idle expiry. Labels remain append-only within the turn and still restrict
+sensitivity and audiences. The previously vetoed call is not replayed; retry it
+explicitly. New untrusted sources re-taint. ACP also advances the
+proxy ingest boundary, invalidating existing `allow_session` Hands grants;
+the next Hands call still needs a fresh human response. This is separate from
+egress `approve_declassification` and does not itself grant execution permission.
+
+## Configuration
+
+The exhaustive environment-variable contract is
+[`docs/configuration.md`](configuration.md). The settings below are the subset
+that directly configures authorization, identity admission, or an authorization
+boundary.
+
+### Enforcement and identity
+
+| Setting | Default | Authorization effect |
+|---|---|---|
+| `MIMIR_ACCESS_CONTROL_ENFORCED` | `false` | Primary switch. False is compatibility/shadow mode; true enforces inbound identity, operation, resource, and IFC decisions. Generic HTTP non-open ingress and the always-on boundaries listed below remain fail-closed when false. Boolean parsing accepts `1/true/yes/on/y` and `0/false/no/off/n`; unset, empty, or invalid values resolve to the safe shipped default (`false`, with a warning for invalid input). |
+| `MIMIR_MODEL_SPEC` | `codex-plus:gpt-5.6-luna` | Selects the model provider. The shipped default is enforcement-compatible. Claude Code subprocess hooks receive the exact per-invocation authorization context through a server-owned opaque carrier, so `claude-code:*` is also compatible with enforcement. |
+| `<MIMIR_HOME>/state/identities.yaml` | generated with no people | Canonical aliases and human roles. `user` admits normal inbound use; `admin` also admits admin-required operations. This is a policy file, not an environment variable. |
+| `MIMIR_CROSS_PLATFORM_PULL` | `true` | Controls cross-platform recent-context pull. It does **not** isolate authorization roles: aliases still resolve to one canonical identity and role snapshot when false. |
+
+An unknown sender in a **1:1** Discord DM or Slack IM receives a one-time
+pairing code (valid for one hour). Group DMs, including Slack MPIMs, never
+receive codes. Ask the sender for the code and run `mimir identities approve-pairing
+--code <CODE>`; codes are issued at most once per ten minutes per person, except
+that a failed send permits immediate reissue on the sender's next message.
+Queued codes get a fresh one-hour TTL immediately before delivery; superseded
+codes are not sent. Identity changes and the approval lockout share a sibling
+file lock across the server and CLI processes. Five wrong codes lock code
+approval for one hour. The existing
+`mimir identities approve-pairing <identity>` remains available independently of
+the lockout. Add `--admin` for both `user` and `admin`. The identities populator
+may add aliases and metadata but preserves operator-managed access fields.
+
+Admins can also review pending Discord and Slack pairings in the admin Users page:
+Approve grants `user`, Grant admin requires confirmation and grants `user` plus
+`admin`, and Reject blocks subsequent contact from reopening the pairing. The
+page shows the request ID and metadata, never the DM code or its hash. When an
+operator alert channel is configured, an authenticated admin may reply there
+with `approve pair-xxxx` or `decline pair-xxxx`; chat approval grants `user`
+only. IDs expire after seven days for chat replies, but the page and CLI still
+work. No model tool can approve or reject pairings.
+
+Pairing digests in the operator alert channel list the request ID for chat
+approval, `/app/admin/users` for dashboard review, and CLI approval by canonical
+identity (or, for 1:1 DMs, by the code supplied privately by the sender). The
+digest never includes the code. When intake is enforced (`MIMIR_ACCESS_CONTROL_ENFORCED`
+or `MIMIR_OPEN_BRIDGE=false`) and a Discord or Slack bridge is enabled, configure
+`MIMIR_OPERATOR_ALERT_CHANNEL` so pending requests are surfaced. Without it, the
+server warns at startup and logs each new pending request as unrouted; review
+pending identities at `/app/admin/users` or with `mimir identities list`.
+
+### Denied-user handling
+
+#### Unknown senders
+
+The operator can edit `state/identities.yaml` alongside `people:` and `channels:`:
+
+```yaml
+intake:
+  unknown_senders:
+    default: {dm: pair, channel: pair}
+    discord: {dm: pair, channel: ignore}
+    slack: {dm: decline, channel: decline}
+  decline_text: "Sorry, I only talk to approved users."
+```
+
+Missing settings default to `pair` for both deliveries. `pair` records a pending
+request, notifies the operator, and sends a pairing code only in a 1:1 DM; it
+never replies in a public channel. `ignore` records no pairing and sends no
+reply, but adds one digest notice per sender per process. `decline` records no
+pairing and sends the fixed refusal at most once per sender per process, paced
+by the global DM auto-reply worker. In public channels Discord sends a private
+DM and Slack sends an ephemeral message visible only to that user. Delivery
+failures never cause a public response. Email always ignores denials. The file
+hot-reloads; malformed settings fall back to the defaults without changing
+roles. These three options correspond to Hermes' `unauthorized_dm_behavior`
+`pair`, `ignore`, and `decline`; they only handle denials, never grant access.
+
+Only the operator can change this file; model file tools cannot write it.
+
+#### Discord role admission
+
+Optionally admit members holding a specified role in a specified Discord guild:
+
+```yaml
+intake:
+  discord_role_admission:
+    enabled: true
+    grants:
+      - {guild_id: "111", role_id: "222"}
+```
+
+This is off by default; only literal `true` enables it. Only holders of a
+configured role in its matching guild are admitted, always as `user`, never
+`admin`. Membership is re-checked on every message: removing the Discord role,
+disabling the feature, or removing the grant revokes a bridge-managed identity
+on its next message. Operator-approved identities remain untouched. DMs and
+webhooks carry no guild-member roles and cannot use this admission path.
+Slack user groups are not covered by this Discord-only option. While an entry
+has `access.source: discord_role`, its stored grant cannot authorize messages
+from Slack, web, or other non-Discord sources, even through an added alias.
+An explicit operator approval (including pairing-code approval) takes ownership
+by removing `source`, `granted_by`, and `revoked_at`; later role loss cannot
+undo that approval. Identity grant/revoke writes run off the event loop.
+
+| Setting | Default | Authorization effect |
+|---|---|---|
+| `MIMIR_PAIRING_PENDING_MAX` | `100` | Caps newly recorded pending identities. `0` rejects new pending identities; a negative value disables the cap. |
+| `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | `1.0` | Coalesces operator pairing notifications; clamped to zero or greater. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | `true` | Sends a best-effort pairing code to a denied DM sender; it does not grant access. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | `30.0` | Global DM response interval, clamped to zero or greater. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is \`{code}\` (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM response template; `{code}` is replaced, or a code line is appended if absent. |
+| `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message; enforced Discord/Slack intake warns at startup. |
+| `MIMIR_IDENTITIES_POPULATE_CRON` | empty | Enables identity alias/metadata discovery. It does not grant roles. |
+
+### HTTP identity and transport
+
+| Setting | Default | Authorization effect |
+|---|---|---|
+| `MIMIR_API_KEY` | empty | Master API transport and route-admin key. It is not a named chat principal and cannot make generic `/event` non-open calls authoritative. Per-user web keys are hashed aliases in `identities.yaml` and use that identity's roles. |
+| `MIMIR_WEB_HOST` | `127.0.0.1` | A non-loopback bind requires `MIMIR_API_KEY` or startup refuses. |
+| `MIMIR_ALLOW_UNAUTHENTICATED` | `false` | Suppresses the empty-key localhost warning only. It does not disable authorization or permit a keyless non-loopback bind. |
+
+### Protected resource and sink surface
+
+These settings do not grant a requester role. They change which resources or
+egress paths exist and therefore must be reviewed with the catalog/adapters:
+
+- `MIMIR_FOLDERS` and `MIMIR_FILE_TOOL_ROOTS` constrain
+  filesystem reachability; they do not replace operation authorization.
+- `MIMIR_MCP_SERVERS_JSON` and `MIMIR_MCP_SERVERS_PATH` add external tools.
+  Missing or unapproved provenance remains admin-required.
+- `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS`, `MIMIR_RESEND_NUDGE_CHANNELS`, and
+  `MIMIR_ACTIVITY_PANEL_CHANNELS` enable harness egress that remains subject to
+  the final IFC sink gate.
+- `MIMIR_MIDTURN_INJECTION_CHANNELS` opts channels into folding messages into
+  a running turn. Because folded instructions use that turn's authority, the
+  principal guard requires a known identity matching its frozen requester;
+  channel membership alone is insufficient.
+- `MIMIR_ATTACHMENTS_MAX_BYTES` limits inbound attachment data; it does not
+  establish requester authority.
+- `MIMIR_CHAT_SKILLS_ENABLED` and `MIMIR_CHAT_SKILL_ALLOWLIST` change the
+  chat-visible operation surface; they do not bypass the operation catalog.
+
+### Code-owned policy
+
+There is no environment override for the operation catalog, service capability
+matrix, resource adapters, SAGA ownership predicates, or sink map. They live in:
+
+- `mimir/access_control.py`: catalog, adapters, matrix, domain/sink mappings,
+  `SinkGate`, and enable-time assertions;
+- `mimir/mcp_client.py`: MCP provenance and adapter registrations;
+- `mimir/saga/ownership.py`: row ownership, scopes, SQL predicates, and ACL
+  intersection;
+- `mimir/models.py`: frozen `AuthContext` and IFC carriers;
+- `mimir/tools/budget_gate.py`: exact runtime-carrier extraction and live tool
+  middleware.
+
+### Repository review and remediation (#1050)
+
+The `repo_review` shell profile retains hardened local inspection, not a second
+repository/forge write API. Shell Git writes (including fetch, checkout, stage,
+commit, merge, rebase, and push) and **all `gh` invocations**, including read-only
+forms, are refused before execution. This boundary applies in shadow and enforced
+mode; neither a PR scope nor a shell-command declaration restores those forms.
+It does not remove controller-internal Git/forge execution or change other shell
+profiles and Worklink executor allowlists.
+
+Retained local Git inspection is argv-bound and root-confined, with executable
+pinning and helper/config neutralization: hooks, fsmonitor, external diff,
+textconv, filters, credentials, protocols, pager, and optional locks cannot turn
+an inspection into a write or helper launch. Profile admission alone is not enough;
+the final hardened argv is the execution artifact.
+
+Use typed `repo_*` and `pr_*` tools for repository mutations and forge reads and
+writes. Their authority comes from a server-issued immutable `RepoPRActionScope`
+and `RepoReviewState`, binding the canonical repository, PR, observed head/base,
+allowed actions, and publication destination. Checkout and local mutation use the
+active controller-issued lease for that same scope, not a model-selected working
+directory or the live source checkout. Model arguments cannot widen the scope,
+replace the remote/ref, or refresh a stale snapshot; typed push must refuse stale
+authority before publication. Review scopes and remediation scopes retain their
+distinct action grants.
+
+#### Foreign-author review scope (#1599)
+
+`pr_review_others` is an explicit scope-acceptance capability at tier
+`scoped-with-provenance`, not a tool or a publication grant. The `github` and
+`custom` profiles allow an operator-owned poller manifest to declare it; profile
+selection and `pr_metadata` do not imply it. The shipped `github-activity`
+manifest explicitly grants it. It is absent from heartbeat's profile, which is
+used as a full built-in grant rather than only a manifest allowlist.
+
+`can_resolve_forge_review_scope()` keeps the stages separate:
+
+- `stored`: authenticated operator user turns, trusted pollers with `pr_metadata`,
+  and trusted scheduled ticks in the heartbeat review-scope profile may reuse scope.
+- `fetch`: only those operator turns and trusted pollers with `pr_metadata` may
+  perform provisional live discovery. `pr_review_others` does not grant fetch.
+- `accept`: operator behavior is unchanged. A trusted poller still needs
+  `pr_metadata` and a nonempty configured `self_login`; the PR author must match
+  that login unless the poller explicitly has `pr_review_others`. Scheduled ticks
+  remain unable to accept newly discovered scope, even with that capability.
+
+Ingress, service assertion, and canonical-identity trust checks still apply.
+The capability does not bypass configured-repository, snapshot, fork, lease,
+action, or publication checks in the forge/controller path, and does not grant
+remediation authority. Read tools and `pr_submit_review` still require their own
+capabilities. This is a deliberate single-operator trust decision: granting it
+allows Mimir to approve another author's PR, but does not permit merging. The
+forge tool surface has no merge or push verb; merging requires separate operator
+action.
+
+Successful live foreign-author discovery under this grant emits
+`forge_review_others_scope_resolved` once, before caching the resolution. Its
+payload contains only `repository`, `pull_request`, `capability`, and the resolved
+`author`, never credentials, diff content, or a review body. Reusing that
+resolution does not emit another event.
+
+The live parity canary is a reviewer-owned **BEFORE MERGE** gate, not a build
+blocker. Records live in Chainlink #1050 comments mirrored in the PR body; the
+[reviewer procedure](internal/repo-pr-parity-canary.md#1050-reviewer-procedure)
+defines the required evidence. The supplied human remediation record reports
+scope `a1b1248a5809...`, head `cf9d4f9045dbd6c2...`, and owner `mimir-carreira` on
+`jasoncarreira/mimir#1847`, using
+`repo_test -> repo_diff -> repo_commit -> repo_push -> pr_comment -> repo_cleanup -> pr_checks -> pr_rerequest_review`.
+
+It reports one comment, one push, one review re-request, and pre-execution refusal
+of shell Git writes and `gh`.
+
+`pr_job_log(repository, pull_request, job_id, run_id=None)` requires an explicit
+`pr_job_log` service capability and an existing exact PR scope granting
+`repo.inspect`. Neither `pr_checks`, `pr_metadata`, `fetch_url`, nor selecting the
+GitHub authority profile grants it. The shipped `github-activity` and
+`github-ci-watch` manifests explicitly grant it. This tool does not discover new
+PR authority. Selectors must be positive integers, not strings or booleans.
+The GitHub adapter independently checks the job ID, run ID, repository, and
+scoped head SHA before capture, and requires a completed run and completed
+failing job. Missing jobs, unfinished runs, authentication failures, and
+out-of-scope targets produce distinct errors. Metadata uses the adapter's bounded
+REST transport; log capture uses authenticated `gh` via shared disk-spooled
+capture. Returned excerpts are selected, redacted and byte-bounded, but remain
+untrusted repository source content, never instructions or new authority.
+The reviewer completed the remaining steps on
+2026-09-07 (Chainlink #1050, "Reviewer gate record, part 2" and its correction):
+a review-scope cycle on `jasoncarreira/mimir#1841` with exactly one submitted
+review pinned to the lease head (GitHub review 5125541381 at `c75f7ad29`);
+provider receipts paired to the audit records on the same scope and head for
+every write (commit `e470f81b` with parent `cf9d4f90`, comment 5563439034,
+review re-request 30658296097); zero would-block shadow decisions on any write
+tool in either cycle; the stale-head push refusal established from the
+recorded-snapshot path (`tests/test_pr_checkout_lease.py::test_expired_lease_refuses_resume_after_pr_head_moves`
+and `::test_pr_checkout_lease_fails_closed_on_moved_head`) without mutating a live
+PR; and scenario totals with no mismatch categories.
+
+### Configured project tests
+
+`MIMIR_PROJECT_TEST_COMMAND` provides a configured project-test path for service
+shell profiles **other than `repo_review`**. That profile returns on admission or
+refusal before configured tests or declared commands are consulted; neither
+mechanism can restore shell test execution there. Remediation uses typed
+`repo_test` instead.
+
+The setting is deployment/process configuration, not a repository file or model
+argument. Its JSON object has exactly `argv` and `cwd` keys, fixing the complete
+command prefix and project working directory. Requests must match that prefix;
+there is no built-in pytest/npm runner or option allowlist, and
+`npm ci --ignore-scripts` has no repo-review exception. Different deployments can
+select an installed JavaScript, Rust, Go, or Python test runner without changing
+a shell profile.
+
+The model can append zero to 32 relative test paths or selectors. Each is ASCII,
+at most 256 characters, the combined selector payload is at most 4,096 bytes,
+and traversal, absolute paths, option-shaped values, response files, shell
+metacharacters, and a model-supplied `--` separator are refused. A separator or
+runner option needed by the project belongs in the fixed operator argv.
+
+The configured executable must be an absolute executable regular file, not a
+symlink, and must remain outside every service-writable root. The configured
+working directory must resolve inside `MIMIR_FILE_TOOL_ROOTS`; a model-supplied
+`cwd` cannot replace it. Direct interpreter/shell commands are invalid even in
+this setting, and ordinary `python -c`, `node -e`, `ruby -e`, `sh -c`, and
+equivalent service requests remain outside every profile.
+
+The shell compatibility path runs configured tests only through synchronous
+`shell_exec`, directly with `shell=False`. `bash_async` refuses them as
+`project_test_async_refused`, keeping
+the existing 60-second wall-clock bound. Expiry returns the named
+`project_test_timeout` refusal; returned stdout and stderr are capped at 4,000
+and 2,000 characters respectively. With the setting unset, this path adds no
+test command to any profile. Setting it never grants tests to `repo_review`.
+
+Remediation turns use the narrower `repo_test` capability. Its command comes
+from the same deployment's `worklink.yaml` `defaults.test_command`; the model
+supplies no command, flags, environment, or working directory. Optional
+selectors must name existing non-symlink paths inside the named authorized PR
+after canonical resolution. Test output is captured under hard byte limits,
+credential-shaped values and controller paths are redacted, and nonzero suites
+return `tests_failed` rather than a shell error. Granting `repo_test` therefore
+grants execution of the operator-configured test command, not arbitrary shell
+access. See the
+[`worklink.yaml` operator reference](configuration.md#worklink-yaml) for its
+default, supported command syntax, and non-Python examples.
+
+### Always-on post-ingest code and live-state vetoes
+
+Regardless of the enforcement switch or trigger, untrusted active ingest blocks
+model tool calls that directly write code or live state (#1937): `repo_stage`,
+`repo_commit`, `repo_merge`, `repo_rebase`, `repo_revert`, `repo_push`, `repo_test`,
+`hands_edit`, `hands_shell`, `hands_python`, and SAGA mutation tools. File writes
+(including async variants) are blocked except to resolved descendants of
+`MIMIR_HOME/scratch/`; symlinks or traversal into live state are not exempt.
+A clean attested checkout does not override this turn-level decision, including
+retained Worklink remediation. ACP hands calls refuse before requesting client
+permission; this change does not clear taint or alter the proxy grant cache.
+
+The write veto has no grant path: model-callable `approve_declassification`
+retains its egress-only meaning and cannot unlock file writes, repository
+publication or `repo_test`. Neither exact-destination nor category approvals
+bypass this veto. Operator-only unlocking is a separate follow-up (#1942);
+until then, use a proposal or ask for a fresh clean turn. Reads, discard/abort
+operations, forge text tools and `send_message` retain their independent
+authorization decisions.
+
+Use scratch and gated operator-reviewed proposals (`open_proposal`,
+`submit_proposal`, or `memory_propose`) instead of live writes. Untrusted-origin
+proposal PRs carry an `[untrusted-origin]` title prefix and a fixed review note,
+must never auto-merge, and submission checks the whole staged index for changes
+outside the permitted surfaces, including code/config. Live loaders reject
+scratch-backed sources, even through aliases; automatic semantic persistence
+must not bypass gated tools.
+
+The veto is enforced at the model tool-call boundary, not on shared server
+persistence backends. Continuation sidecars, summarization offload, retrieval
+statistics and audit logs remain functional after untrusted ingest.
+
+### Contained repository-code execution
+
+`repo_test` runs its configured command in a disposable snapshot of the active
+PR lease. Only that snapshot is admitted and normalized for the contained
+worker; the active lease remains controller-owned and available for later
+staging, commit, and push.
+
+`spawn_open_code` seeds a fresh server-issued checkout from an admitted Git
+worktree and runs OpenCode only in that checkout. The supplied `cwd` selects the
+seed and is never the worker's working directory. Credential-like tracked,
+untracked, or ignored seed entries cause provisioning to be refused rather than
+copied.
+
+Both surfaces use a server-issued worker HOME. Provider configuration and OAuth
+or API authentication cross the boundary only as projection bytes into fixed
+worker-local files; controller credential paths and values are not worker
+environment variables. If worker containment cannot be established, both
+surfaces fail closed: `repo_test` reports `test_containment_unavailable` and
+emits `repo_test_containment_refused`, while `spawn_open_code` reports
+`containment_unavailable` and emits `spawn_open_code_containment_refused`.
+
+OpenCode output may include a bounded binary patch proposal. It returns a
+relative artifact handle. The worker changes only its disposable checkout.
+Applying the proposal to an operator tree is a separate trusted action and is
+never performed by the contained identity.
+
+These guarantees are limited to the two named execution paths, their issued
+checkouts, worker identity, credential projection, collected output, and
+proposal boundary. They do not make other code-execution paths contained or
+protect an admitted seed from code the operator already approved.
+
+### Worklink And Factory Runs
+
+With the Cultivate plugin selected, poller-dispatched Worklink OpenCode builds
+use the `worklink` uid in a group-writable checkout under `/workspace/.worklink`.
+Core-only deployments have no `worklink` identity or Worklink paths. This prevents generated
+code from writing the source repository checkout as the agent user. It is not a
+sandbox, does not provide cross-run isolation, and is explicitly not credential
+isolation: the virtiofs home mount remains readable across guest identities
+(#1435).
+
+Feature-factory workloads also use the existing root-owned Worklink executor,
+through its distinct `launch_factory` entry point and the same validated
+path-addressed checkout. The executor drops all real, effective, and saved uids
+and gids to the configured `worklink` identity before executing the factory.
+Descendants inherit that identity, including processes that create a new session.
+There is no agent-user fallback when the executor or checkout is unavailable.
+Factory publishing inputs have their own environment contract; the per-leaf
+OpenCode contract is unchanged. Factory status and capability probes are still
+controller operations, not workload launches. This is identity containment, not
+cross-run or credential isolation, and does not guarantee reaping detached
+descendants after a run finishes.
+
+### Surfaces that still execute as the agent user
+
+Factory status and capability probes remain trusted controller operations.
+The identity guarantees above apply to workload execution, not every subprocess
+the agent starts.
+
+### Declared shell commands per job
+
+A scheduled job or poller outside the `repo_review` shell profile may declare
+the shell commands it needs, **additively on top of** its shell profile.
+`repo_review` returns before declarations are consulted, on both admission and
+refusal; `shell_commands` cannot widen its hardened local Git inspection surface
+or restore Git writes, `gh`, package installation, or shell tests.
+mimir ships no catalogue of the CLIs a deployment
+might install, so teaching one job about a deployment-specific tool needs no
+mimir release and does not widen a profile every other job on the host shares.
+
+Declare them where the job is already defined. In `<home>/scheduler.yaml`, per
+named job:
+
+```yaml
+- name: morning-briefing
+  prompt_file: morning-briefing.md
+  cron: 0 8 * * *
+  shell_commands:
+    - exec: gog
+      path: /usr/local/bin/gog
+      subcommands:
+        - [gmail, search]
+        - [calendar, events]
+      options: ["--account", "--json", "--from", "--to"]
+      pass_env: [GOG_HOME, GOG_KEYRING_PASSWORD]
+```
+
+Here `shell_commands[].pass_env` supplies the matched scheduled command with
+the named variables from the **daemon's environment**. Provision their values
+in the daemon's deployment environment, not in `scheduler.yaml`; the declaration
+only selects names and cannot create missing values. This is distinct from a
+poller manifest's top-level `pass_env`, which configures the poller process.
+The field rules and output-redaction limits below apply to both scheduler and
+poller agent-shell declarations.
+
+A scheduled job may also select a built-in scheduler authority profile with
+`authority_profile`. If omitted, the job retains the shared `scheduled_tick`
+profile. Profile names are validated when `scheduler.yaml` is loaded; an unknown
+name disables that record rather than silently falling back. For example, the
+heartbeat schedule declares its existing authority without changing its cron:
+
+```yaml
+- name: heartbeat
+  prompt_file: heartbeat.md
+  cron: 0 * * * *
+  authority_profile: heartbeat
+```
+
+The record's `cron` remains the source for both firing cadence and the heartbeat
+staleness threshold. Removing the record or leaving its cron empty intentionally
+disables that staleness check.
+
+In a poller manifest, inside the existing `authority` block:
+
+```json
+"authority": {
+  "profile": "custom",
+  "tier": "scoped-with-provenance",
+  "capabilities": ["shell_exec", "bash_jobs_list", "bash_job_output"],
+  "scoped_roots": ["state"],
+  "shell_commands": [
+    {"exec": "acli", "path": "/usr/local/bin/acli",
+     "subcommands": [["jira", "workitem", "search"]],
+     "options": ["--jql", "--json"],
+     "pass_env": ["ACLI_CONFIG_DIR", "ACLI_EMAIL", "ACLI_SITE", "ACLI_TOKEN"]}
+  ]
+}
+```
+
+Both files are operator-owned. No service principal can write either: a poller's
+`scoped_roots` vocabulary is closed to `state` and `wiki:<slug>`, and
+`<home>/scheduler.yaml` is outside every configured writable folder. That is what
+makes a declaration an authority grant rather than a self-grant.
+
+Research pollers can also declare `open_proposal`, `submit_proposal`, and
+`abandon_proposal` at tier `scoped-with-provenance` or higher. Those grants select
+a wiki-only proposal lane, never a live wiki write. Such pollers may declare only
+their own `state` root; the trusted runtime grants their exact active proposal
+worktree separately. See [Proposal PRs](proposals.md) for the manifest and
+draft-then-propose workflow.
+
+#### Field rules
+
+The catalogue of tools is yours; the **shape** of a declaration is enforced in
+code and cannot be relaxed by configuration.
+
+| field | rule |
+|---|---|
+| `exec` | bare command name, no path separators. Matched against `argv[0]`. |
+| `path` | absolute, must exist, must be a regular executable file. Resolved (symlinks followed) and then **required to be outside every agent-writable root**. Becomes the pinned executable — PATH never selects the binary. |
+| `subcommands` | list of non-empty token lists, matched as a positional prefix against `argv[1:]`. Required unless `script` is given. |
+| `options` | allowlist. An option outside it is refused; there is no wildcard. Both `--opt value` and `--opt=value` are accepted for a listed long option. |
+| `script` | **required** for an interpreter, optional otherwise. Same absolute / resolved / outside-writable-roots rule as `path`. When present it is pinned as the first operand. |
+| `pass_env` | Optional list of exact environment variable names (`[A-Za-z_][A-Za-z0-9_]*`), never values, prefixes, or wildcards. Copies only present parent variables into the matched child's minimal environment. |
+
+`pass_env` belongs to one declaration, not an executable name. Two pinned
+`python3` scripts can receive different credentials. The first matching declaration
+wins, just as for argv admission; grants are not merged. Missing variables are
+omitted, leaving credential errors to the executable. Omitting `pass_env` retains
+the existing environment behavior, including `gh`'s `GITHUB_TOKEN`, isolated
+`GH_CONFIG_DIR`, and identity confirmation. These are core behavior, with or
+without a selected plugin: the token is bound to `MIMIR_GITHUB_SELF_LOGIN` on
+the first call and every later call is refused if the token changes.
+
+Process-control names are reserved: `PATH`, `MIMIR_MODEL_SPEC`, `BASH_ENV`, `ENV`,
+and names beginning with `LD_`, `DYLD_`, `PYTHON`, `GIT_`, or `GH_` cannot be
+declared. These must not undo executable isolation or the GitHub identity check.
+`service_shell_env_passthrough` events contain passed names only. Exact nonempty
+forwarded values are masked from stdout/stderr before truncation, tool results,
+and async output capture. This is not a sandbox against an operator-installed
+program deliberately encoding or transmitting its own credentials.
+
+Poller `authority.shell_commands[].pass_env` uses this same mechanism for agent
+shell calls. The existing top-level poller `pass_env` still controls the poller
+process itself, not all children invoked by the resulting agent turn.
+
+Operands are unrestricted once the subcommand prefix and options match — a Gmail
+query or a JQL string is a value, and the argv is executed with `shell=False`.
+
+#### Why a bare binary is inexpressible
+
+`subcommands` cannot be empty, because for most CLIs the subcommand *is* the
+security boundary:
+
+```
+gog gmail search ...   read
+gog gmail send ...     write
+```
+
+Both are the same executable. A declaration naming only `gog` would grant both,
+so the table is mandatory and mutating verbs are excluded by simply not listing
+them. There is no denylist to keep in sync.
+
+#### Interpreters
+
+`python3`, `sh`, `bash`, `node`, `env`, `perl`, `ruby` and similar may be declared
+**only** with a pinned `script`:
+
+```yaml
+    - exec: python3
+      path: /usr/local/bin/python3
+      script: /mimir-home/scripts/process_conditional_todos.py
+      options: []
+```
+
+The danger of an interpreter is *arbitrary* code, not code. A script the running
+agent cannot rewrite is equivalent to a binary the operator installed, so the
+script must resolve outside every agent-writable root. `-c`, `-e`, `-m` and `-`
+are refused on any declaration, interpreter or not — they source code from argv
+or stdin, which would make the pin meaningless.
+
+Classification follows the **resolved binary** as well as the declared name, so
+`exec: gog` with `path: /usr/bin/python3` is still treated as an interpreter.
+
+#### What is agent-writable
+
+The check unions the `rw` entries of `Config.folders` under home with external
+`MIMIR_FILE_TOOL_ROOTS` `:rw` routes and rw repository roots. With the shipped
+defaults that means `state/`, `memory/`, `conversation_history/`, `attachments/`,
+`scratch/` and **`skills/`** are writable — so a script bundled inside a skill is
+correctly refused.
+
+`<home>/scripts/` is not a configured folder at all and is therefore already
+unwritable, which makes it the natural home for a pinned script. The home root
+itself is *not* treated as writable; only its `rw` folders are.
+
+#### Interaction with the profile and the capability gate
+
+Two gates run in sequence, and a declaration only affects the second:
+
+1. **Capability** — is `shell_exec` in the principal's capability set? A manifest
+   declaring `shell_commands` without `shell_exec` is rejected at load, because
+   the grants would be silently inert.
+2. **Shell profile** — is this argv admitted? Except for `repo_review`, declarations
+   are consulted here in addition to the profile's own allowlist. The profile is
+   never replaced; `repo_review` admits or refuses before this mechanism runs.
+
+The argv binding is unchanged: no pipes, redirection, command substitution,
+heredocs or separators, under any declaration. A grant widens *which commands*
+are admitted, never *how* they may be composed.
+
+#### Failure modes
+
+A malformed declaration fails closed and loudly, but the two sites check at
+different moments:
+
+- **Pollers validate at load.** A manifest whose declaration is invalid leaves
+  the poller **not registered** — the failure is visible when the manifest is
+  read, before the poller ever runs.
+- **Scheduled jobs validate at fire time.** `scheduler.yaml` is parsed without
+  the deployment context the path checks need, so the raw declaration is carried
+  on the job and validated immediately before the job fires. An invalid one stops
+  the job firing rather than silently downgrading it to the shared principal — it
+  would otherwise fail every command it was configured to run, with the reason
+  nowhere near the cause.
+
+That means a bad scheduler declaration is not reported at startup; it is reported
+the first time the job is due, in the scheduler log. A shape that cannot be
+parsed at all (`shell_commands: {}`, `shell_commands: ""`) is treated the same
+way as a bad path — the job does not fire. An explicit empty list is valid and
+means "declare nothing"; the job runs under the shared principal.
+
+Denials are attributed: `declared_command_mismatch` means the job declared
+commands and none matched, distinct from `profile_allowlist`, which means the
+profile refused it and no declaration applied.
+
+## How to extend
+
+### Add an operation
+
+1. Identify the exact stable runtime tool name and all aliases/namespaced forms.
+2. Add it to exactly one executable policy path: the built-in `OPEN` or
+   `ADMIN_REQUIRED` set, or an adapter hook that can return
+   `RESOURCE_SCOPED`. Use `register_operation()` only for deliberately dynamic
+   policy with equivalent startup/tests.
+3. Treat `OPEN` as a security claim about the general middleware. If the
+   operation accepts a protected selector or mutation, put an exact-carrier and
+   ownership predicate in the handler/storage path and test it independently.
+   Never use `OPEN` for an operation whose safety depends only on model guidance.
+4. If it reads a protected domain, add the operation to
+   `_OPERATION_READABLE_DOMAIN`. Add or update its `ToolDescriptor` in
+   `mimir/tool_descriptors.py` for per-tool authorization and information-flow
+   facts: sink category, target extractor, sink payload extractor, sink destination,
+   fetch-authorization kind, result origin, git-operation-result flag,
+   IFC-delegation flag, and budget-exemption flag. A sink category requires a
+   declared target extractor. Every external sink also requires a declared
+   `sink_payload_extractor`; use `None` only as an explicit opt-out.
+   `validate_tool_descriptors()` enforces this at import.
+5. If it is an egress path, declare the exact `SinkCategory`, concrete target
+   extractor, and sink destination in `TOOL_DESCRIPTORS`, then pass the
+   extracted destination to `SinkGate`. Harness-owned egress must check at its
+   final send/edit boundary, not only model middleware.
+6. Add catalog tests for the exact name and aliases, enforcement-on deny/allow,
+   enforcement-off shadow behavior, missing `AuthContext`, generic HTTP ingress,
+   and any resource arguments. Assemble the relevant final model tool surface in
+   a test and assert the new name and aliases resolve to the intended non-UNKNOWN
+   tier; there is no repository-wide inventory-to-catalog assertion today.
+7. Run `_capability_matrix_errors()` tests and the full suite. For a SAGA
+   mutation, also add it to `_SAGA_MUTATION_OPERATIONS`, keep it explicitly
+   `ADMIN_REQUIRED`, add a sink mapping, call `can_write_saga()` inside the
+   handler, and test owner/domain mutation scope.
+
+Do not rely on `UNKNOWN` as the intended classification. It fails closed only
+after enforcement is enabled and is shadow-allowed before then. A test asserting
+`get_operation_catalog().get_decision(name)` is the intended non-`UNKNOWN` tier
+is the completeness obligation that prevents a newly shipped operation from
+remaining uncataloged silently.
+
+### Add a trusted service or capability
+
+1. Add a distinct `ServicePrincipal` keyed by a stable server-owned trigger,
+   with canonical name, exact operation capabilities, readable domains, sink
+   destinations, and creation path.
+2. Have only the internal producer set `AgentEvent.service_principal` to the
+   canonical value. Never infer service authority from a trigger or missing
+   author alone.
+3. If the service is mandatory for an enforcement-enabled deployment, add its
+   trigger to `_REQUIRED_SERVICE_PRINCIPALS`. If its assigned work demonstrably
+   requires broad SAGA recall, declare `saga_full_corpus_read=True` on that
+   principal. A trigger name never supplies this authority.
+4. For each capability, add/read the domain and sink mappings that reflect its
+   data flow, then grant those exact values in the service entry. Do not add a
+   capability merely to exploit the service exception for `UNKNOWN`; catalog
+   the operation and assert the intended decision.
+5. For SAGA writes, update the canonical mutation set and preserve both the
+   tool-handler `can_write_saga()` check and row owner/domain scope.
+6. Test wrong canonical identity, wrong/unregistered trigger, `is_service=False`,
+   any non-`None` ingress, missing domain/sink, forbidden capabilities, IFC, and
+   concurrent turns. Assert `assert_capability_matrix_complete()` passes.
+
+### SAGA trusted-service read inventory
+
+This inventory records the services that received full-corpus reads before
+chainlink #1116 narrowed the grant. `access_events` records atom and source but
+not the reader principal, so there are no principal-attributed historical reads;
+the evidence below is the executable path and assigned workflow.
+
+| Principal | Trigger | Demonstrated SAGA/corpus work | Declared scope |
+| --- | --- | --- | --- |
+| `scheduler` | `scheduled_tick` | Runs the weekly `reflect` cross-session audit, whose prompt inspects SAGA retrieval evidence and atom hygiene. The same principal also runs ordinary configured ticks. | Full corpus, retained for reflection. |
+| `heartbeat` | `scheduled_tick` | Reads core memory, active-work files, and channel-scoped recent summaries. Its prompt explicitly assigns cross-session and SAGA hygiene to reflection. | Owned/public plus declared domains. |
+| `synthesis` | `saga_session_end` | The server-created session-boundary turn loads and synthesizes SAGA/session evidence and emits ACL-intersected outputs. | Full corpus, retained for session synthesis. |
+| `system` | `upgrade` | Reconciles defaults/proposal files and runs version prompts that inspect files or schedules; current prompts do not query SAGA. | Owned/public plus declared domains. |
+| `poller:worklink-ready-queue` | `poller` | Processes the Worklink ready queue using its GitHub/worklink and state capabilities. | Owned/public plus declared domains. |
+| `poller:github-activity` | `poller` | Processes configured GitHub activity using repository and PR capabilities. | Owned/public plus declared domains. |
+| `poller:github-ci-watch` | `poller` | Watches GitHub CI and repository state. | Owned/public plus declared domains. |
+| `poller:dependency-advisory-watch` | `poller` | Scans dependency lockfiles and OSV advisories. | Owned/public plus declared domains. |
+| `poller:gmail-inbox` | `poller` | Processes Gmail payloads and its state directory. | Owned/public plus declared domains. |
+| `poller:social-cli-notifications` | `poller` | Processes social notification payloads and its state directory. | Owned/public plus declared domains. |
+| `poller:social-cli-feed` | `poller` | Processes social feed payloads and its state directory. | Owned/public plus declared domains. |
+| `poller:worklink-tool-pins` | `poller` | Checks Worklink tool pins and its state directory. | Owned/public plus declared domains. |
+
+Installed custom pollers are an open-ended set of per-instance principals. Their
+manifest capabilities derive readable domains, but neither a `poller` trigger
+nor a capability implies full-corpus SAGA read. The nightly consolidation
+callable remains cross-corpus: it invokes `SagaStore.consolidate()` directly,
+partitions candidates by ACL scope, and does not use trigger-derived read scope.
+
+### Add a resource adapter
+
+1. Define the resource identity and ownership/ACL predicate using canonical,
+   server-resolved data. Document which arguments are selectors and which
+   server fields establish authority.
+2. Implement a classification hook that returns `None` for unrelated tools and
+   a deliberate `OperationDecision` for its own calls. Register it in a stable
+   order on the global catalog.
+3. Implement runtime argument authorization. A bare `RESOURCE_SCOPED` result or
+   stored `ResourceScope` metadata is not generically evaluated by
+   `ToolRegistry`; wire the evaluator into the live authorization path as the
+   channel adapter is wired today.
+4. Fail closed on absent adapters, parse failures, missing/unknown resources,
+   wildcards, aliases that do not resolve, and mixed-resource batches. Preserve
+   stable provenance for external systems.
+5. Add same-scope, cross-scope, omitted/explicit target, alias, unknown,
+   wildcard/batch, admin, service, HTTP, shadow, enforcement, and IFC tests.
+
+For MCP, also version the adapter and policy, bind it to durable provenance,
+thread concrete model arguments to the runtime evaluator, and wire and test
+schema/name/config drift, tombstoning, and startup stale-policy reporting. The
+current MCP classifier API alone is not sufficient for argument-dependent
+resource authorization.
+
+## Enablement runbook
+
+Enforcement remains default-off and review-gated. A passing startup preflight is
+necessary but not sufficient for production enablement.
+
+### 1. Establish readiness
+
+- Complete the planned adversarial-review/hardening rounds, including the
+  current #912-#920 series, until repeated reviews produce diminishing findings
+  and no unresolved HIGH or MEDIUM authorization findings.
+- Require the standing `tests / pytest-enforced` CI job to pass on the exact
+  revision to deploy. It runs the full suite with enforcement on and deliberately
+  leaves `MIMIR_MODEL_SPEC` unset, exercising the shipped
+  `codex-plus:gpt-5.6-luna` default. A green run means "nothing failed"; it does
+  not by itself prove that enforcement-sensitive paths ran. The executable guard
+  `tests/test_env_isolation.py::test_no_test_is_skipped_because_enforcement_is_on`
+  keeps that result from decaying into "nothing ran" by rejecting tests skipped
+  because enforcement is on.
+- Require the ordinary unenforced suite to pass as well. Review any local tools,
+  MCP adapters, bridges, harness egress, service triggers, and persisted SAGA or
+  commitment migrations that are not represented by upstream tests.
+- Confirm `state/identities.yaml` has deliberate canonical aliases and `user` or
+  `admin` roles for every expected human requester. Back it up and inspect
+  malformed/duplicate identities.
+- Audit `get_capability_matrix_report()` against every deployed scheduler,
+  poller, synthesis, and upgrade workflow. Confirm required operations, domains,
+  sinks, and internal creation paths, not just that the tuples are nonempty.
+- Confirm protected legacy data and derived ACL behavior are acceptable. Current
+  trusted platform services intentionally retain broad internal SAGA read scope;
+  verify their outputs remain owner/ACL-intersected and IFC-gated.
+
+Evidence measured on 2026-07-27 for the current enablement revision:
+
+- the enforced full suite with explicit
+  `MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6` completed with 0 failures and 16
+  skips;
+- the enforced full suite with `MIMIR_MODEL_SPEC` unset, matching the standing CI
+  job and shipped default, completed with 0 failures and 16 skips;
+- the unenforced full suite also had 16 skips, so skip parity confirms that the
+  enforced results were not made green by enforcement-specific skipping;
+- the live deployment's `state/identities.yaml` contained canonical principal
+  `jason` with both `user` and `admin` roles; and
+- the live deployment's `saga.db` `atoms` table contained `owner_principal`,
+  `origin_domain`, and `visibility`.
+
+Treat these as recorded evidence, not permanent facts. Immediately before the
+operator-controlled flip, re-verify the two deployment preconditions:
+
+```bash
+uv run python - <<'PY'
+import os
+from pathlib import Path
+
+import yaml
+
+path = Path(os.environ["MIMIR_HOME"]) / "state" / "identities.yaml"
+people = yaml.safe_load(path.read_text(encoding="utf-8")).get("people", [])
+principals_with_admin = [
+    person.get("canonical")
+    for person in people
+    if "admin" in ((person.get("access") or {}).get("roles") or [])
+]
+assert principals_with_admin, (
+    f"{path}: no deliberate admin identity found; "
+    f"configured principals={[person.get('canonical') for person in people]}"
+)
+print(f"{path}: admin identities verified: {principals_with_admin}")
+PY
+```
+
+The admin principal is deployment-specific. This check deliberately verifies the
+required role rather than assuming a particular canonical name.
+
+```bash
+uv run python - <<'PY'
+import os
+import sqlite3
+from contextlib import closing
+from pathlib import Path
+
+path = Path(os.environ["MIMIR_HOME"]) / ".mimir" / "saga.db"
+with closing(sqlite3.connect(path)) as connection:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(atoms)")}
+required = {"owner_principal", "origin_domain", "visibility"}
+assert required <= columns, sorted(required - columns)
+print(f"{path}: atoms ownership columns verified")
+PY
+```
+
+### 2. Validate in shadow first
+
+Keep `MIMIR_ACCESS_CONTROL_ENFORCED=false` through representative interactive,
+scheduled, poller, synthesis, upgrade, web-chat, and generic `/event` traffic.
+Inspect structured inbound decisions and `shadow_tool_decision` events for:
+
+- legitimate users resolving as unknown/unallowlisted or to the wrong canonical
+  identity;
+- expected tools classified `UNKNOWN`, unexpectedly admin-required, or
+  resource-scoped without an evaluator;
+- missing/malformed `AuthContext` on normal, MCP, delegated, or forked paths;
+- trusted services failing canonical/trigger/ingress checks or lacking a
+  capability, readable domain, or sink;
+- same-channel requests resolving cross-channel;
+- IFC blocks caused by unknown sinks, missing targets, mixed source channels, or
+  protected prompt/tool data reaching an active sink.
+
+Count `shadow_tool_decision` records with `would_block: true` as projected
+enforcement denials. Records with `would_block: false` are projected permits;
+legacy records without the field are unclassifiable and must not be inferred
+from `allowed` or `reason`.
+
+Each shadow record also has `target` and `requested_target` with deliberately
+different trust levels. `target` is the server-resolved destination used for
+audit classification. `requested_target` is UNVALIDATED caller input retained
+only to diagnose a refusal; it is never used by policy or authorization logic.
+The requested value is secret-scrubbed and truncated to 1,024 characters.
+`requested_target: null` explicitly means the operation had no caller-supplied
+target. In particular, `admin_required` records always include the field, using
+`null` for targetless administrative operations.
+
+Count `hard_boundary_denied` separately as actions that did not happen. These
+records can be unioned with shadow decisions for workflow-impact analysis, but
+must not be included in projected-enforcement totals. Their `boundary` and
+machine-readable `reason` identify the refusal, while `target`, `trigger`, and
+`service_principal` identify the affected workflow; targets are secret-scrubbed.
+
+The enforcement-independent denial inventory is:
+
+- generic HTTP ingress invoking a non-open operation (`http_event_ingress`);
+- final trusted-service shell argv binding (`service_shell_argv_binding`);
+- missing or invalid maintenance executable pins (`maintenance_pinned_executable`);
+- protected direct and collection reads for non-admin, non-service callers
+  (`protected_read_policy`);
+- writes outside configured writable roots and mutations routed to read-only
+  backends (`filesystem_write_guard`, `readonly_filesystem`);
+- the prohibited-action guardrail (`prohibited_action_guard`); and
+- exhausted per-turn tool-call budgets (`tool_call_budget`).
+
+An incomplete capability matrix emits the same event shape under
+`capability_matrix_preflight`; startup is refused when enforcement was requested.
+MCP classifier failures, middleware read-scope decisions, and final harness IFC
+egress remain ordinary enforcement decisions: with enforcement off they proceed
+and emit shadow/would-block evidence rather than a hard denial.
+
+#### 2026-07-27 low-count residue classification (#1017)
+
+The 15:21-21:07 shadow pass contained 11 decisions outside the larger classes.
+They are deliberately recorded here so a later audit does not treat a quiet log
+as a reason to widen authority:
+
+| Events | Classification | Evidence and disposition |
+|---|---|---|
+| 4 `system` `shell_exec` / `service_sink_destination_denied` | **(c) Already fixed** | All four came from the one-shot 0.7.0 reconciliation and stopped after 15:22:20. #1011/#1220 added `<home>/scratch` to the static service write roots. `test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized` replays `git -C <scratch proposal> ...` through fresh enforced and shadow decisions, asserting admission and `would_block == false`. Compound `cd X && ...` remains intentionally inadmissible. The shipped upgrade prompt now names the admitted single-argv form so a future live reconciliation does not replay the stale command shape. No scope or capability was widened here. |
+| 3 `poller:github-activity` `approve_declassification` / `admin_required` | **(b) Correct denial; behavior change** | A review poller consumes taint-gated PR content. Letting it approve its own declassification would erase the independent admin decision and turn prompt injection into its own release authority. The `github` profile omits this capability. Trigger and review-skill guidance now say to stop attempting it; no grant was added. |
+| 3 `send_message`/`react` / `ifc_label_blocked:same_channel` (`system`, poller, and principal-less interactive) | **(a) Genuine over-taint gap, folded into #1016** | The sink gate already permits every known sensitivity label when all accumulated sources are complete and destination-compatible (`test_every_known_label_can_flow_to_compatible_same_channel`). These events instead carried unrelated or incomplete untrusted provenance, including a turn with no principal, matching #1016's session-boundary/derived-input over-taint rather than a messaging capability gap. IFC derivation is therefore owned and verified by #1016; this leaf makes no duplicate gate change. |
+
+For the (c) row, the fresh shadow replay is empty for the documented legitimate
+`git -C` action. A future live reconciliation should confirm the same; a quiet
+interval with no upgrade turn is not equivalent evidence. The old compound form
+must still be denied if requested.
+
+### 3. Pass startup preflights
+
+No model-provider change is required before enablement. The shipped
+`codex-plus:gpt-5.6-luna` default supports enforcement, and Claude Code
+subprocess hooks carry the exact per-invocation authorization context through a
+server-owned opaque carrier. There is no live provider-compatibility startup
+exception. Do not pin `MIMIR_MODEL_SPEC` in the enforced CI job: leaving it unset
+is what continuously validates the configuration a fresh install receives.
+
+In a staging process with the same environment and policy files, perform the
+operator-controlled enforcement trial. Startup must complete without
+`CapabilityMatrixError`; do not bypass this check. Exercise at least one allowed
+and one denied request for each human tier, resource adapter, service principal,
+and configured external tool.
+
+### 4. Enable and monitor
+
+Roll out with a fast rollback path to `MIMIR_ACCESS_CONTROL_ENFORCED=false`.
+Watch denial reasons and workflow outcomes, especially:
+
+- inbound `missing_author`, `unknown_author`, `user_not_allowlisted`, and
+  `admin_required` decisions;
+- tool `missing_auth_context`, `unknown_operation`, `admin_required`,
+  `resource_scoped`, `cross_channel_scope`, and HTTP-ingress denials;
+- MCP missing/tombstoned/unclassified provenance;
+- capability-matrix startup failures and service capability/domain/sink denials;
+- SAGA rows unexpectedly filtered or mutation scope rejecting required work;
+- `missing_ifc_labels`, `unknown_sink_category`, `unknown_sink_destination`, and
+  `ifc_label_blocked:*` outcomes;
+- scheduled/poller/synthesis/upgrade jobs that run but lose required reads,
+  writes, or egress.
+
+Do not fix an operational denial by making a broad operation `OPEN`, assigning
+`admin` to an external service, accepting a client identity field, or adding a
+blanket service capability. Correct the identity mapping, catalog entry,
+resource predicate, carrier propagation, or narrow capability and rerun shadow
+and adversarial tests.
+
+## Verification map
+
+The primary executable specifications are:
+
+- `tests/test_access_control.py`: ingress, frozen carrier, HTTP trust boundary,
+  concurrency, and audits;
+- `tests/test_tool_registry.py`: catalog, service matrix, startup/provider gate,
+  shadow behavior, and service trust checks;
+- `tests/test_channel_resource_adapter.py`: argument-aware channel scope;
+- `tests/test_mcp_client.py`: MCP provenance, adapters, and drift;
+- `tests/test_saga_read_authorization.py`,
+  `tests/test_saga_mutation_authorization.py`, and
+  `tests/test_saga_write_provenance.py`: ownership and SAGA defense in depth;
+- `tests/test_information_flow.py`: source labels, propagation, declassification,
+  and model/harness sink gates;
+- `tests/test_config_env_bool.py` and `tests/test_config_docs_complete.py`:
+  enforcement parsing/preflight and the exhaustive configuration-doc contract.

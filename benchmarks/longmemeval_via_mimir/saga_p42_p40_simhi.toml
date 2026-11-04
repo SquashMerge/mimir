@@ -1,0 +1,92 @@
+# Integration bench: P30 + P42 (triples in response) + P40 (no endorsed
+#                    pull-in) + similarity rolled back to 0.80.
+#
+# Same baseline as saga_p42_p47_simhi.toml (P42 triples + 0.80 similarity
+# + P47 consolidation-v2 baked in unconditionally + P48 canonical vocab
+# baked in unconditionally), with the single delta:
+#
+#   - enable_endorsed_atom_pull_in = false  → P40 boost-only mode.
+#
+# Hypothesis: combining P42's triples lift with P40's pull-in disable
+# preserves multi-session recall (which p47 regressed) while keeping
+# the session-scoped wins from consolidation-v2. The bench pair
+# (this vs saga_p42_p47_simhi.toml) isolates exactly the endorsed-
+# pull-in trade-off because every other knob is identical.
+#
+# Pair: saga_p42_p47_simhi.toml.
+
+[storage]
+db_path = "saga.db"
+metrics_db_path = "saga_metrics.db"
+token_budget_ceiling = 100000000
+auto_compact_threshold_pct = 99
+refuse_threshold_pct = 100
+db_busy_timeout_ms = 5000
+
+[embedding]
+provider = "openai"
+url = "https://api.openai.com/v1/embeddings"
+model = "text-embedding-3-small"
+dimensions = 1536
+api_key_env = "OPENAI_API_KEY"
+
+[llm]
+provider = "openai_compat"
+url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-5.4-nano"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+
+[retrieval]
+enable_contextual_rewrite = true
+two_tier_enabled = true
+enable_confidence_gating = true
+default_min_confidence_tier = "low"
+enable_triple_augment_v2 = false
+enable_subatom_beam = false
+# P42: surface top-N triples as a third response block.
+include_triples_in_response = true
+response_triples_top_k = 5
+# P40: drop the out-of-pool endorsed-atom pull-in. Boost for in-pool
+# endorsed atoms still applies.
+enable_endorsed_atom_pull_in = false
+
+[retrieval_v2]
+enable_query_expansion = true
+
+[triples]
+enable_extraction = true
+
+[consolidation]
+enabled = true
+enable_llm = true
+# P34 rollback: 0.80 was the canonical pre-P34 value; 0.75 regressed
+# multi-session in p47-sonnet.
+similarity_threshold = 0.80
+
+[benchmark]
+enable_session_boundaries = false
+enable_mark_contributions = false
+
+[compression]
+enable_subatom = false
+enable_fact_dedup = false
+enable_synthesis = false
+
+[annotation]
+use_llm = false
+
+[prediction]
+enabled = false
+
+[world_model]
+enabled = false
+
+[decay]
+enabled = false
+
+[atoms]
+auto_resolve_supersedes_on_write = false
+
+[server]
+api_key = ""

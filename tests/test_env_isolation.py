@@ -1,0 +1,408 @@
+"""Process-environment isolation between tests, and the enforcement-skip guard.
+
+Two invariants live here, both prerequisites for running the suite with
+``MIMIR_ACCESS_CONTROL_ENFORCED=1`` in CI:
+
+1. Loading a home ``.env`` must not leak keys into ``os.environ`` past the test
+   that loaded it (``tests/conftest.py::_isolate_process_env``).
+2. No test may be skipped *because* enforcement is on — otherwise the enforced
+   CI job stays green while the paths it exists to cover quietly stop running.
+3. A host-only setting that overrides a value the suite asserts on must be
+   cleared for the session (``tests/conftest.py::_clear_host_mimir_environment``),
+   so the suite's result does not depend on the deployment it runs inside.
+4. The env the poller framework injects into a child process must be cleared too.
+   ``STATE_DIR`` is a write target, so inheriting it makes the suite mutate the
+   live poller store rather than merely read the wrong value.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+from mimir.config import _load_home_dotenv
+
+
+def test_default_import_does_not_load_otel_sdk_from_mimir():
+    """Mimir must not require its optional exporter during server import."""
+    root = Path(__file__).resolve().parents[1]
+    code = """
+import builtins
+import inspect
+original = builtins.__import__
+owned_imports = []
+def guarded(name, *args, **kwargs):
+    caller = inspect.currentframe().f_back.f_globals.get('__name__', '')
+    if name.startswith(('opentelemetry.sdk', 'opentelemetry.exporter')):
+        if caller.startswith('mimir.'):
+            owned_imports.append(name)
+        raise ImportError('optional SDK unavailable')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+import mimir.server
+import mimir.runtime
+assert not owned_imports, owned_imports
+"""
+    result = subprocess.run([sys.executable, "-c", code], cwd=root,
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_missing_otel_extra_disables_tracing_in_fresh_process():
+    root = Path(__file__).resolve().parents[1]
+    code = """
+import builtins
+import logging
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name.startswith(('opentelemetry.sdk', 'opentelemetry.exporter')):
+        raise ImportError('missing optional SDK')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+from mimir.tracing import TraceController
+records = []
+class Log:
+    def warning(self, message): records.append(message)
+assert TraceController.create(enabled=True, endpoint='http://localhost:4318/', logger=Log()) is None
+assert len(records) == 1 and 'localhost' not in records[0]
+"""
+    result = subprocess.run([sys.executable, "-c", code], cwd=root,
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+_CANARY = "MIMIR_TEST_DOTENV_LEAK_CANARY"
+_ENFORCEMENT_FLAG = "MIMIR_ACCESS_CONTROL_ENFORCED"
+_LONGMEMEVAL_SMOKE = "tests/test_longmemeval_via_memory_smoke.py"
+_LONGMEMEVAL_NODE_IDS = {
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_parser_defaults_to_boundary_rrf_adoption_settings",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_parser_preserves_boundary_ablation_flags",
+    f"{_LONGMEMEVAL_SMOKE}::test_session_boundary_rrf_pathway_searches_sessions_and_expands_atoms",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_completes_one_question[shadow]",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_completes_one_question[enforced]",
+    f"{_LONGMEMEVAL_SMOKE}::test_session_boundary_rrf_lane_keeps_summaries_out_of_reader",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_no_consolidate_path",
+    f"{_LONGMEMEVAL_SMOKE}::test_generated_session_boundaries_persist_real_sessions",
+    f"{_LONGMEMEVAL_SMOKE}::test_capture_reader_prompt_writes_debug_without_bloating_metrics",
+}
+
+
+# ── 1. dotenv leakage ────────────────────────────────────────────────
+#
+# These two run in definition order (no pytest-randomly in the dep set), which
+# is what makes the pair a valid probe: the first deliberately leaks, and the
+# second observes whether the autouse fixture cleaned up. Without the fixture
+# the second test FAILS — that is the regression this file guards.
+
+
+def test_dotenv_load_puts_keys_in_the_process_env(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch):
+    """The hazard itself: ``_load_home_dotenv`` mutates ``os.environ``.
+
+    This is correct runtime behavior, not a bug — asserted here so the pair
+    below is meaningful. If this ever stops being true, the isolation fixture
+    is guarding nothing and the second test would pass vacuously.
+    """
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text(f"{_CANARY}=leaked\n", encoding="utf-8")
+
+    assert _CANARY not in os.environ
+    loaded = _load_home_dotenv(tmp_path)
+
+    assert _CANARY in loaded
+    assert os.environ[_CANARY] == "leaked"
+
+
+def test_dotenv_keys_do_not_survive_into_the_next_test():
+    """The invariant: the previous test's leaked key is gone.
+
+    ``monkeypatch`` cannot restore this — python-dotenv set it underneath, not
+    through monkeypatch — so this passes only because of the conftest
+    ``_isolate_process_env`` fixture.
+    """
+    assert _CANARY not in os.environ, (
+        f"{_CANARY} leaked out of the previous test; the _isolate_process_env "
+        "autouse fixture in tests/conftest.py is missing or broken"
+    )
+
+
+def test_update_approval_teardown_does_not_leak_home_to_shell_tests(tmp_path: Path):
+    """Run the approval cases first on one worker, then their leak consumers.
+
+    xdist can otherwise put the producer and consumers on different workers,
+    hiding the build-agent-before-setenv teardown regression.
+    """
+    from tests.nested_pytest import pytest_command
+
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        pytest_command(
+            tmp_path, "-q", "-n", "0", "-p", "no:randomly",
+            "tests/test_agent.py::test_update_reply_after_requesting_turn_ends_never_invokes_model",
+            "tests/test_github_review_guard.py",
+            "tests/test_budget_gate_and_alias.py",
+            "tests/test_operator_alert.py",
+            "tests/test_outbound_privacy.py",
+        ),
+        cwd=root, capture_output=True, text=True, check=False, timeout=120,
+    )
+    assert result.returncode == 0, (
+        "approval teardown leaked MIMIR_HOME or an affected regression failed:\n"
+        + result.stdout + result.stderr
+    )
+    assert "passed" in result.stdout, "child pytest did not report executed tests"
+
+
+# ── 2. no enforcement-keyed skips ────────────────────────────────────
+
+
+def _enforcement_tainted_names(tree: ast.AST) -> set[str]:
+    """Module-level names whose value derives from the enforcement flag.
+
+    Catches the indirection that actually occurred: a module constant reads the
+    env var, and the ``skipif`` condition references the constant rather than
+    the flag, so a plain string search for the flag next to ``skipif`` misses it.
+    """
+    tainted: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if _ENFORCEMENT_FLAG not in ast.dump(node.value):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                tainted.add(target.id)
+    return tainted
+
+
+def _skipif_conditions(tree: ast.AST) -> list[ast.expr]:
+    """Every ``pytest.mark.skipif(...)`` condition expression in the module,
+    whether applied as a decorator or bound to a module-level marker name."""
+    conditions: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name == "skipif" and node.args:
+            conditions.append(node.args[0])
+    return conditions
+
+
+def test_no_test_is_skipped_because_enforcement_is_on():
+    """A green enforced CI run must mean "nothing failed", not "nothing ran".
+
+    #1001 shipped four ``skipif(enforcement)`` markers as an accepted interim;
+    the enforced suite was green at 20 skips while those paths went unexercised
+    until #910 landed the carrier and deleted them. Absent this guard, the
+    cheapest fix for any future enforced failure is another skip, and the job
+    rots while staying green.
+
+    If you genuinely need one, delete this test in the same PR and say why —
+    the point is that it costs an argument, not that it is impossible.
+    """
+    offenders: list[str] = []
+    for path in sorted(Path(__file__).parent.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - unreadable test file
+            continue
+        source = path.read_text(encoding="utf-8")
+        if _ENFORCEMENT_FLAG not in source:
+            continue
+        tainted = _enforcement_tainted_names(tree)
+        for condition in _skipif_conditions(tree):
+            dumped = ast.dump(condition)
+            references_flag = _ENFORCEMENT_FLAG in dumped
+            references_tainted = any(
+                isinstance(sub, ast.Name) and sub.id in tainted
+                for sub in ast.walk(condition)
+            )
+            if references_flag or references_tainted:
+                offenders.append(f"{path.name}:{condition.lineno}")
+
+    assert not offenders, (
+        "tests skipped on the enforcement flag: " + ", ".join(offenders)
+    )
+
+
+def test_longmemeval_memory_smoke_cases_are_collected():
+    """Fail if the optional bench dependency silently skips pipeline coverage."""
+    root = Path(__file__).parent.parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:randomly",
+            _LONGMEMEVAL_SMOKE,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    collected = {
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.startswith(f"{_LONGMEMEVAL_SMOKE}::")
+    }
+
+    assert result.returncode == 0, (
+        "child pytest could not run the collection probe; LongMemEval "
+        "collection was not evaluated:\n" + result.stdout + result.stderr
+    )
+    assert collected == _LONGMEMEVAL_NODE_IDS, (
+        "LongMemEval via_memory collection changed:\n"
+        f"missing: {sorted(_LONGMEMEVAL_NODE_IDS - collected)}\n"
+        f"unexpected: {sorted(collected - _LONGMEMEVAL_NODE_IDS)}"
+    )
+
+
+# ── 3. host-only overrides must not change the suite's result ─────────
+
+_PUBLISHING_IDENTITY = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
+
+
+def _assert_session_fixture_clears(
+    name: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the session fixture without starting a nested pytest run."""
+    from tests.conftest import _clear_host_mimir_environment
+
+    monkeypatch.setenv(name, value)
+    fixture = _clear_host_mimir_environment.__wrapped__()
+    next(fixture)
+    try:
+        assert name not in os.environ
+    finally:
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+
+def test_declared_publishing_identity_tests_ignore_the_host_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The suite must pass with the deployment's publishing identity exported.
+
+    ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` overrides the ``publishing_identity``
+    a checkout declares in ``.factory.json``. The tests that assert on the
+    declared value therefore read the deployment's value instead whenever it is
+    set, which is why this ran green in CI -- where it is unset -- and failed
+    inside mimirbot, where ``compose.env`` sets it. The worklink test gate went
+    red on every build, so ``review_ready`` stayed false and no build reached
+    the commit step or published a PR.
+
+    Exercise the clearing fixture with the variable present rather than running
+    another pytest suite. The old nested suite could fail during child startup
+    under host load and incorrectly report that the variable leaked.
+    """
+    _assert_session_fixture_clears(
+        _PUBLISHING_IDENTITY, "deployment-owner", monkeypatch
+    )
+
+
+def test_selected_cultivate_survives_host_environment_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not turn selected-provider coverage into a core-only test run."""
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.discovery import enabled_plugins
+    from tests.conftest import _clear_host_mimir_environment
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    fixture = _clear_host_mimir_environment.__wrapped__()
+    next(fixture)
+    try:
+        assert os.environ["MIMIR_PLUGINS"] == "cultivate"
+        assert any(candidate.name == "cultivate" for candidate in enabled_plugins())
+    finally:
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+
+def test_retired_flag_alone_does_not_import_or_activate_cultivate() -> None:
+    """A fresh core process ignores the old flag even if the package is installed."""
+    env = {**os.environ, "MIMIR_PLUGINS": "", "MIMIR_CODING_ENABLED": "true"}
+    child = subprocess.run(
+        [sys.executable, "-c", "from mimir.plugins.discovery import enabled_plugins\n"
+         "import sys\n"
+         "assert not enabled_plugins()\n"
+         "assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.') "
+         "for name in sys.modules)\n"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+
+
+# ── 4. poller-injected env must not reach the suite ───────────────────
+
+def test_conftest_clears_every_poller_injected_env_key() -> None:
+    """``conftest._POLLER_INJECTED_ENV`` must stay in step with its source of truth.
+
+    ``mimir.pollers._POLLER_INJECTED_ENV_KEYS`` is the authoritative set of names
+    the poller framework injects into a poller's child process. A name added
+    there and not here would silently start leaking into the suite, so this fails
+    the moment the two drift.
+    """
+    from mimir.pollers import _POLLER_INJECTED_ENV_KEYS
+
+    from tests.conftest import _POLLER_INJECTED_ENV
+
+    assert _POLLER_INJECTED_ENV_KEYS <= _POLLER_INJECTED_ENV, (
+        "poller-injected env keys missing from the clearing fixture: "
+        f"{sorted(_POLLER_INJECTED_ENV_KEYS - _POLLER_INJECTED_ENV)}"
+    )
+
+
+def test_suite_does_not_write_dispatch_failures_into_an_inherited_state_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A test must not write into the poller store it happens to inherit.
+
+    ``_record_run_failure`` formerly took its destination from
+    ``os.environ["STATE_DIR"]`` rather than from the ``home`` it was passed, and
+    ``test_postclaim_failure_emits_same_failure_event`` drives it with
+    ``autonomous=True``. Inside mimirbot the worklink gate runs this suite as a
+    child of a poller, so that test wrote a fabricated failure record --
+    ``issue 441``, ``attempt 2``, ``"backend exploded api_key=[REDACTED]"`` -- into
+    the live ``worklink-ready-queue`` store, against an issue that is closed.
+
+    The test passes either way, which is why nothing surfaced it. The property
+    worth asserting is that the store stays untouched.
+    """
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Worklink incident store requires selected Cultivate")
+
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir
+    from mimir_cultivate.worklink import orchestrator
+
+    probe = tmp_path / "inherited-state"
+    probe.mkdir()
+    home = tmp_path / "test-home"
+    monkeypatch.setattr(orchestrator, "_log_event", lambda *_args, **_kwargs: None)
+
+    _assert_session_fixture_clears("STATE_DIR", str(probe), monkeypatch)
+    incident = orchestrator._record_run_failure(
+        home=home,
+        issue_id=441,
+        attempt=2,
+        error="backend exploded api_key=secret",
+        exit_status=1,
+        autonomous=True,
+    )
+
+    assert incident is not None
+    written = sorted(child.name for child in probe.iterdir())
+    assert written == [], f"suite wrote into an inherited STATE_DIR: {written}"
+    assert dispatch_failure_state_dir(home).is_dir(), "failure path was not exercised"

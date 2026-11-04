@@ -1,0 +1,4833 @@
+"""Per-turn tool-call budget enforcement.
+
+The SDK build gated tool calls via a ``PreToolUse`` HookMatcher that
+checked ``TurnContext.tool_call_count`` against
+``ctx.tool_call_budget`` before allowing each invocation. The hook ran
+on EVERY tool call, including the SDK's built-in tools (read/write/bash).
+
+Post-181 the deepagents agent has a langchain ``AgentMiddleware`` layer
+that intercepts every tool invocation via ``wrap_tool_call`` /
+``awrap_tool_call``. That's the right level — built-ins included.
+
+Prior implementation (replaced 2026-05-23): we monkey-patched each
+mimir tool's ``coroutine``/``func`` via ``apply_budget_gate`` and
+added the list to ``create_deep_agent(tools=...)``. That missed
+deepagents' built-in tools (``shell_exec``, ``read_file``,
+``write_file``, ``glob``, ``edit_file``, ``write_todos``) which are
+added by deepagents internally and never went through the mimir
+tools list. Production heartbeats hit 142 tool_calls vs a budget of
+120 with zero budget events firing — the gap that motivated this
+rewrite.
+
+Soft + hard semantics (unchanged):
+
+* Below ``soft_threshold = max(1, int(budget * 0.75))``: silent.
+* At soft threshold: log a one-time-per-turn
+  ``tool_call_budget_soft_warning`` event. The tool still runs.
+* At or above ``hard_threshold = budget``: refuse the call,
+  return a ``ToolMessage`` with the denial text, emit
+  ``tool_call_budget_denied``.
+
+A ``budget`` of 0 disables enforcement entirely (matches the SDK
+contract — operators set ``MIMIR_TOOL_CALL_BUDGET=0`` for benchmarks
+that need uncapped exploration).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import fcntl
+import inspect
+import json
+import logging
+import os
+import re
+import secrets
+import shlex
+import stat
+import time
+from collections.abc import Mapping, Sequence
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from types import UnionType
+from typing import Annotated, Any, Awaitable, Callable, Iterator, Union, get_args, get_origin
+
+from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import ToolException
+from langgraph.errors import GraphBubbleUp, NodeCancelledError, NodeTimeoutError
+from langgraph.types import Command
+import yaml
+
+from ..env import env_bool
+from ..event_logger import emit_event_background as _emit_event_sync
+from ..models import AuthContext, InformationFlowLabels, InformationFlowState
+from ..plugins.core import policy_membership, scoped_policy_call, selected_policy_registry
+from ..redaction import redact_text
+from ..tool_descriptors import (
+    FetchAuthorizationKind,
+    ResultOriginKind,
+    get_tool_descriptor,
+)
+from .refusals import ToolPolicyRefusal
+from ..http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
+from ..access_control import (
+    AccessTier,
+    OperationDecision,
+    OPERATOR_SHELL_PROFILE,
+    OperatorShellBinding,
+    SinkCategory,
+    ToolAuthorization,
+    approve_live_declassification,
+    approved_fetch_urls,
+    fetch_url_is_approved,
+    classify_protected_result,
+    configured_project_test_cwd,
+    get_tool_registry,
+    get_trusted_service_from_auth_context,
+    ingested_fetch_urls,
+    normalize_sink_destination,
+    parse_service_shell_argv_with_diagnostics,
+    record_external_ingested_urls,
+    resolve_repository_review_state,
+    ServicePrincipal,
+    ServiceShellBindingRule,
+    _OPERATOR_SHELL_BINDING_ISSUER,
+    _declared_command_execution_argv,
+    _issue_operator_shell_binding,
+    _live_untrusted_active_ingest,
+    _operator_can_invoke_admin_shell,
+    _operator_git_execution_argv_with_diagnostics,
+    _operator_read_execution_argv_with_diagnostics,
+    _project_test_execution_argv,
+    _resolve_file_tool_target,
+    _resolve_operator_bounded_cwd,
+    _resolve_operator_declared_cwd,
+    _validated_operator_shell_argv_artifact,
+    service_filesystem_read_roots,
+    service_shell_argv_for_log,
+)
+from .client_provider import (
+    MIMIR_HANDS_V1,
+    ClientAuthorizedHostExecution,
+    PermissionDecision,
+    PermissionEligibility,
+    client_authorized_host_execution_metadata,
+    client_authorized_host_execution_matches,
+    get_turn_capability_context,
+    issue_client_authorized_host_execution,
+    validate_hands_wrapper_arguments,
+)
+from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
+
+log = logging.getLogger(__name__)
+
+_pr_acquisition_lock: ContextVar[tuple[Path, int] | None] = ContextVar(
+    "pr_checkout_host_acquisition_lock", default=None,
+)
+
+
+def lock_pr_checkout_acquisition_root() -> tuple[Path, int]:
+    """Lock the server-configured lease root before the checkout handler starts."""
+    value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+    if not value or not Path(value).is_absolute():
+        raise RuntimeError("MIMIR_PR_CHECKOUT_LEASE_ROOT must be an absolute path")
+    root = Path(value)
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    root = root.resolve(strict=True)
+    fd = os.open(root, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return root, fd
+
+
+@contextmanager
+def bind_pr_checkout_acquisition(root: Path, fd: int) -> Iterator[Path]:
+    """Keep an acquired root lock on this dispatch through result observation."""
+    try:
+        token = _pr_acquisition_lock.set((root, fd))
+        try:
+            yield root
+        finally:
+            _pr_acquisition_lock.reset(token)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def hold_pr_checkout_acquisition() -> Iterator[Path]:
+    with bind_pr_checkout_acquisition(*lock_pr_checkout_acquisition_root()) as root:
+        yield root
+
+
+def borrowed_pr_checkout_lock(root: Path) -> bool:
+    """Only the current host-held acquisition can reuse its exclusive lock."""
+    binding = _pr_acquisition_lock.get()
+    if binding is None:
+        return False
+    if binding[0] != root:
+        raise RuntimeError("PR checkout acquisition root changed during dispatch")
+    return binding[1] >= 0
+
+
+def _assert_observed_pr_checkout_lease(lease: Any) -> None:
+    """Validate the host-held lease identity against its recorded checkout."""
+    root = Path(lease.lease_root)
+    path = Path(lease.path)
+    if root.is_symlink() or path.is_symlink() or not lease.is_active:
+        raise RuntimeError("PR checkout lease is no longer live")
+    root = root.resolve(strict=True)
+    if path.parent.resolve(strict=True) != root or not path.is_dir():
+        raise RuntimeError("PR checkout lease path changed")
+    git_dir = path / ".git"
+    metadata = git_dir / "mimir-pr-checkout-lease.json"
+    if (
+        git_dir.is_symlink() or not git_dir.is_dir() or metadata.is_symlink()
+        or not metadata.is_file()
+        or (git_dir / "mimir-pr-checkout-lease-reclamation.json").exists()
+    ):
+        raise RuntimeError("PR checkout lease metadata is unavailable")
+    raw = json.loads(metadata.read_text(encoding="utf-8"))
+    expected = {
+        "canonical_repo": lease.canonical_repo,
+        "canonical_origin": lease.canonical_origin,
+        "scope_id": lease.scope_id,
+        "owner": lease.owner,
+        "recovery_id": lease.recovery_id,
+        "head_sha": lease.head_sha,
+        "expires_at": lease.expires_at.isoformat(),
+        "path": str(path),
+        "lease_root": str(root),
+        "pr_number": lease.pr_number,
+    }
+    if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("PR checkout lease identity changed")
+
+
+@contextmanager
+def _hold_observed_pr_checkout_lease(lease: Any) -> Iterator[None]:
+    root = Path(lease.lease_root)
+    if root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    fd = os.open(root.resolve(strict=True), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        _assert_observed_pr_checkout_lease(lease)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+def _plugin_tool(tool_name: str, policy: Any) -> Any:
+    selected = policy if policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    return registered if registered is not None and registered.owner != "core" else None
+
+
+def _descriptor_for_policy(tool_name: str, policy: Any = None) -> Any:
+    return get_tool_descriptor(tool_name, policy=policy)
+
+
+_STANDING_REVIEW_TOOLS = policy_membership("standing_review")
+_TOOL_EVENT_ARGUMENT_ALLOWLIST = (
+    "command",
+    "path",
+    "file_path",
+    "paths",
+    "pattern",
+    "channel_id",
+    "repository",
+    "pull_request",
+    "session_id",
+    "job_id",
+)
+_TOOL_EVENT_ARGUMENT_VALUE_LIMIT = 200
+_TOOL_EVENT_ERROR_LIMIT = 500
+_TOOL_EVENT_ELISION = "...[truncated]..."
+_GIT_OPERATION_RESULT_FIELDS = frozenset({"ok", "code", "stdout", "stderr"})
+_PROJECT_TEST_RESULT_FIELDS = frozenset({"ok", "code"})
+_SPAWN_OPEN_CODE_RESULT_FIELDS = frozenset({
+    "run_id", "status", "exit_code", "stdout", "result", "stderr",
+    "artifact_dir", "name", "proposal",
+})
+_SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
+    "artifact_unavailable", "configuration_refused", "authentication_refused",
+    "prompt_refused", "containment_unavailable", "timeout", "output_overflow",
+    "authentication_required", "failed", "proposal_unavailable",
+})
+_TYPED_ERROR_SIGNAL_TOOLS = policy_membership("typed_error_signal")
+_REMEDIATION_EFFECT_TOOLS = policy_membership("remediation_effect")
+
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def _resolve_standing_review(
+    tool_name: str,
+    auth_context: AuthContext | None,
+    arguments: Mapping[str, Any] | None,
+    *,
+    policy: Any = None,
+) -> str | None:
+    """Resolve safe review authority before resource and IFC authorization."""
+    if (
+        tool_name not in _STANDING_REVIEW_TOOLS
+        or auth_context is None
+        or not isinstance(arguments, Mapping)
+    ):
+        return None
+    retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    from ..access_control import _is_worklink_retained_checkout_service
+
+    if (
+        tool_name in policy_membership("retained_repo_tools")
+        and retained_scope is not None
+        and arguments.get("repository") == retained_scope.repository
+        and arguments.get("pull_request") == retained_scope.issue_id
+        and _is_worklink_retained_checkout_service(
+            get_trusted_service_from_auth_context(auth_context), auth_context=auth_context,
+        )
+    ):
+        return None
+    selected = policy if policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    hooks = selected.policy_consumer_hooks
+    if registered is not None and hooks is not None and registered.owner == hooks.owner:
+        resolve_review_state_for_context = hooks.resolve_review
+        revalidate_review_head_for_context = hooks.revalidate_head
+    elif registered is not None and registered.owner == getattr(selected, "_projected_owner", None):
+        return "repository review provider unavailable"
+    elif registered is not None and registered.owner != "core":
+        from ..access_control import resolve_registered_review_state
+
+        resolve_review_state_for_context = resolve_registered_review_state
+        if tool_name == "pr_submit_review":
+            return "repository review head validator unavailable"
+        revalidate_review_head_for_context = None
+    else:
+        return "repository review provider unavailable"
+
+    try:
+        resolve_review_state_for_context(
+            auth_context, arguments.get("repository"), arguments.get("pull_request"),
+        )
+        if tool_name == "pr_submit_review":
+            revalidate_review_head_for_context(
+                auth_context,
+                arguments.get("repository"),
+                arguments.get("pull_request"),
+            )
+    except ToolException as exc:
+        return str(exc)
+    return None
+
+
+# Exempt tools neither consume a slot nor get refused after the cap is hit.
+# The driving case is ``send_message``:
+# when the budget is exhausted the denial path tells the model to
+# "finish the turn", but the final assistant text does NOT auto-deliver
+# to channels (an explicit send_message call is the only delivery path
+# — see SPEC §7.1). Without exempting it, the agent would hit the cap,
+# get told to stop, but have no way to actually tell the operator. ``react``
+# is exempt for the same operator-facing-acknowledgement reason.
+def _auth_context_from_request(request: ToolCallRequest) -> AuthContext | None:
+    """Return the exact graph invocation's valid server-created auth carrier.
+
+    LangGraph constructs ``ToolCallRequest.runtime`` for the tool request being
+    executed.  Do not fall back to model arguments, active-turn registries, or
+    ContextVars here: none of those identify this exact request. Malformed
+    non-``None`` carriers are treated as missing so process-level enforcement
+    fails closed rather than trusting arbitrary lookalike objects.
+    """
+    runtime = getattr(request, "runtime", None)
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    return context if isinstance(context, AuthContext) else None
+
+
+_HTTP_EVENT_ADMIN_DENIAL_REASON = "http_event_author_untrusted"
+
+
+def _resolve_budget_state(ctx: Any | None = None) -> tuple[Any, int] | None:
+    """Return ``(ctx, budget)`` if a TurnContext with a non-zero
+    ``tool_call_budget`` is active. ``None`` means: no enforcement
+    (no active ctx, or budget=0). Avoids hard-coupling this module
+    to the import chain for tests."""
+    if ctx is None:
+        from .._context import get_current_turn
+        ctx = get_current_turn()
+    if ctx is None:
+        return None
+    budget = getattr(ctx, "tool_call_budget", 0) or 0
+    if budget <= 0:
+        return None
+    return ctx, int(budget)
+
+
+def _emit_hard_boundary_denied(
+    *,
+    tool: str,
+    boundary: str,
+    reason: str,
+    target: Any = None,
+    auth_context: AuthContext | None = None,
+    turn_context: Any | None = None,
+    event_fields: dict[str, Any] | None = None,
+) -> None:
+    """Record an action that an always-on boundary actually refused."""
+    active_turn = turn_context or _get_current_turn_context()
+    if active_turn is not None:
+        denials = getattr(active_turn, "hard_boundary_denials", None)
+        denial = {"tool": tool, "boundary": boundary, "reason": reason}
+        if isinstance(denials, list):
+            denials.append(denial)
+        else:
+            active_turn.hard_boundary_denials = [denial]
+    if auth_context is None and turn_context is not None:
+        candidate = getattr(turn_context, "auth_context", None)
+        auth_context = candidate if isinstance(candidate, AuthContext) else None
+    if auth_context is None:
+        candidate = getattr(active_turn, "auth_context", None)
+        auth_context = candidate if isinstance(candidate, AuthContext) else None
+
+    from ..redaction import redact_payload
+
+    service = get_trusted_service_from_auth_context(auth_context)
+    payload = {
+        "tool": tool,
+        "boundary": boundary,
+        "reason": reason,
+        # Pre-scrub for replaced emitters and other pre-persistence consumers.
+        "target": redact_payload(target),
+        "trigger": (
+            getattr(auth_context, "origin_trigger", None)
+            or getattr(auth_context, "trigger", None)
+            or getattr(turn_context, "trigger", None)
+        ),
+        "channel_id": getattr(auth_context, "channel_id", None),
+        "service_principal": service.canonical if service is not None else None,
+    }
+    if event_fields:
+        payload.update(redact_payload(event_fields))
+    _emit_event_sync(
+        "hard_boundary_denied",
+        **payload,
+    )
+
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def _record_tool_outcome(
+    tool_name: str,
+    *,
+    refused_reason: str = "",
+    operator_shell_audit: Mapping[str, str] | None = None,
+    policy: Any = None,
+) -> None:
+    """Attach server-observed remediation evidence to the active turn."""
+    if refused_reason:
+        if operator_shell_audit is not None:
+            _emit_hard_boundary_denied(
+                tool=tool_name,
+                boundary="operator_shell_policy",
+                reason="operator_shell_tool_refused",
+                target=None,
+                event_fields=dict(operator_shell_audit),
+            )
+            return
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="tool_policy",
+            reason=refused_reason[:240],
+        )
+        return
+    if tool_name == "unsupported_operation":
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="typed_action_set",
+            reason="unsupported_operation",
+        )
+        return
+    if tool_name not in _REMEDIATION_EFFECT_TOOLS:
+        return
+    active_turn = _get_current_turn_context()
+    effects = getattr(active_turn, "remediation_effects", None)
+    if isinstance(effects, list):
+        effects.append(tool_name)
+
+
+def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
+    return (
+        f"Tool-call budget exhausted: {count}/{budget} calls used "
+        f"this turn. ``{tool_name}`` was refused. ``send_message`` and "
+        f"``react`` remain available so you can still reply or "
+        f"acknowledge — use them to wrap up the turn rather than "
+        f"firing another tool."
+    )
+
+
+def _mark_budget_denied(ctx: Any, tool_name: str, count: int) -> None:
+    """Persist hard-denial markers on the active turn context."""
+    ctx.tool_call_budget_exhausted = True
+    ctx.tool_call_budget_denied_count = (
+        int(getattr(ctx, "tool_call_budget_denied_count", 0) or 0) + 1
+    )
+    denied_tools = getattr(ctx, "tool_call_budget_denied_tools", None)
+    if isinstance(denied_tools, list):
+        denied_tools.append(tool_name)
+    elif denied_tools is None:
+        ctx.tool_call_budget_denied_tools = [tool_name]
+    else:
+        ctx.tool_call_budget_denied_tools = [*denied_tools, tool_name]
+    if getattr(ctx, "tool_call_budget_first_denied_at_count", None) is None:
+        ctx.tool_call_budget_first_denied_at_count = count
+
+
+def _check_and_increment_or_deny(
+    tool_name: str,
+    ctx: Any | None = None,
+    *,
+    target: Any = None,
+    auth_context: AuthContext | None = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
+    policy: Any = None,
+) -> str | None:
+    """Returns a denial message (str) if the call should be refused,
+    or ``None`` if the call should proceed. Shared between the sync
+    and async middleware paths so the bookkeeping stays identical."""
+    # Exempt tools (send_message, react) bypass both the count
+    # increment AND the cap check. Free passage, no bookkeeping.
+    descriptor = _descriptor_for_policy(tool_name, policy)
+    if descriptor is not None and descriptor.budget_exempt:
+        return None
+    state = _resolve_budget_state(ctx)
+    if state is None:
+        return None
+    ctx, budget = state
+    count = getattr(ctx, "tool_call_count", 0) or 0
+    if count >= budget:
+        _mark_budget_denied(ctx, tool_name, count)
+        _emit_event_sync(
+            "tool_call_budget_denied",
+            tool=tool_name,
+            count=count,
+            budget=budget,
+            turn_id=getattr(ctx, "turn_id", None),
+            **(operator_shell_audit or {}),
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="tool_call_budget",
+            reason="tool_call_budget_exhausted",
+            target=None if operator_shell_audit is not None else target,
+            auth_context=auth_context,
+            turn_context=ctx,
+            event_fields=(
+                dict(operator_shell_audit)
+                if operator_shell_audit is not None
+                else None
+            ),
+        )
+        return _budget_denied_message(tool_name, count, budget)
+    new_count = count + 1
+    ctx.tool_call_count = new_count
+    soft = max(1, int(budget * 0.75))
+    if new_count >= soft and not getattr(
+        ctx, "_tool_call_soft_warning_emitted", False,
+    ):
+        ctx._tool_call_soft_warning_emitted = True
+        _emit_event_sync(
+            "tool_call_budget_soft_warning",
+            tool=tool_name,
+            count=new_count,
+            budget=budget,
+            soft_threshold=soft,
+            turn_id=getattr(ctx, "turn_id", None),
+            **(operator_shell_audit or {}),
+        )
+    return None
+
+
+def _tool_name_from_request(request: ToolCallRequest) -> str:
+    """Pull a usable name off the ToolCallRequest. ``request.tool``
+    is the BaseTool when registered, ``None`` for un-registered calls
+    (e.g. typos the model generates). The ``tool_call`` dict always
+    carries the name the model used."""
+    tc = getattr(request, "tool_call", None) or {}
+    return str(tc.get("name") or "<unknown>")
+
+
+def _tool_call_id(request: ToolCallRequest) -> str:
+    tc = getattr(request, "tool_call", None) or {}
+    return str(tc.get("id") or "")
+
+
+def _extract_sink_target(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None = None,
+    policy: Any = None,
+) -> str | None:
+    """Return the concrete operation destination for sink authorization.
+
+    Channel tools default an omitted/empty ``channel_id`` to the current turn's
+    channel. Mirror that server-owned resolution here so the gate authorizes an
+    implicit reply-to-trigger as same-scope rather than as a missing resource.
+    """
+    tc = getattr(request, "tool_call", None) or {}
+    args = tc.get("args") or {}
+    tool_name = _tool_name_from_request(request)
+    descriptor = _descriptor_for_policy(tool_name, policy)
+    extractor = descriptor.sink_target_extractor if descriptor is not None else None
+    if callable(extractor):
+        if policy is not None and _plugin_tool(tool_name, policy):
+            try:
+                targets = extractor(tool_name, args, auth_context)
+                return targets[0] if len(targets) == 1 else None
+            except (TypeError, ValueError, KeyError, IndexError):
+                return None
+        return extractor(tool_name, args, auth_context)[0]
+    if tool_name.startswith("mcp_"):
+        return tool_name
+    target = args.get("target") or args.get("destination")
+    return str(target) if target else None
+
+
+def _extract_sink_targets(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None = None,
+    policy: Any = None,
+) -> list[str | None]:
+    """Return every independently writable destination in a tool call."""
+    tool_name = _tool_name_from_request(request)
+    args = (getattr(request, "tool_call", None) or {}).get("args") or {}
+    descriptor = _descriptor_for_policy(tool_name, policy)
+    extractor = descriptor.sink_target_extractor if descriptor is not None else None
+    if callable(extractor):
+        if _plugin_tool(tool_name, policy) is not None:
+            try:
+                return list(extractor(tool_name, args, auth_context))
+            except (TypeError, ValueError, KeyError, IndexError):
+                return []
+        return list(extractor(tool_name, args, auth_context))
+    return [_extract_sink_target(request, auth_context, policy)]
+
+
+def _declared_shell_payloads(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> tuple[str, ...]:
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return ()
+    service = get_trusted_service_from_auth_context(auth_context)
+    declared = getattr(service, "declared_shell_commands", ()) if service is not None else ()
+    command = arguments.get("command")
+    if not declared or not isinstance(command, str):
+        return ()
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return ()
+
+    from ..access_control import _declared_command_execution_argv
+
+    for declaration in declared:
+        if not declaration.external_send:
+            continue
+        if _declared_command_execution_argv(argv, (declaration,)) is None:
+            continue
+        values: list[str] = []
+        for index, argument in enumerate(argv):
+            for option in declaration.payload_args:
+                if argument == option and index + 1 < len(argv):
+                    values.append(argv[index + 1])
+                elif argument.startswith(option + "="):
+                    values.append(argument[len(option) + 1:])
+        return tuple(values)
+    return ()
+
+
+_OUTBOX_DISPATCH_SCRIPTS = frozenset({"run-social-cli.sh"})
+_OUTBOX_SCAN_MAX_FILES = 200
+_OUTBOX_SCAN_MAX_BYTES = 8 * 1024 * 1024
+_OUTBOX_ARCHIVE_DIR = "outbox_archive"
+_OUTBOX_CONFIG_REASON = "outbound_outbox_config"
+_OUTBOX_UNSCANNABLE_REASON = "outbound_dispatch_unscannable"
+
+
+@dataclass(frozen=True)
+class _DispatchScanError:
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class _DispatchScanPlan:
+    paths: tuple[Path, ...]
+    platforms: tuple[str, ...]
+
+
+def _outbox_write_payloads(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> tuple[str, ...]:
+    if tool_name not in {"write_file", "edit_file", "replace_file", "multi_edit"}:
+        return ()
+    raw_path = arguments.get("file_path") or arguments.get("path")
+    if not isinstance(raw_path, str):
+        return ()
+    target = _resolve_file_tool_target(raw_path)
+    if target is None:
+        return ()
+    from ..outbound_privacy import is_outbox_path
+
+    if not is_outbox_path(target):
+        return ()
+    if tool_name in {"write_file", "replace_file"}:
+        value = arguments.get("content")
+        return (value,) if isinstance(value, str) else ()
+    if tool_name == "edit_file":
+        value = arguments.get("new_string")
+        return (value,) if isinstance(value, str) else ()
+    edits = arguments.get("edits")
+    if not isinstance(edits, Sequence) or isinstance(edits, (str, bytes, bytearray)):
+        return ()
+    return tuple(
+        value
+        for edit in edits
+        if isinstance(edit, Mapping)
+        if isinstance((value := edit.get("new_string")), str)
+    )
+
+
+def _outbox_control_write(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> bool:
+    if tool_name not in {"write_file", "edit_file", "replace_file", "multi_edit"}:
+        return False
+    raw_path = arguments.get("file_path") or arguments.get("path")
+    if not isinstance(raw_path, str):
+        return False
+    target = _resolve_file_tool_target(raw_path)
+    if target is None:
+        return False
+    from ..outbound_privacy import is_outbox_control_path
+
+    return is_outbox_control_path(target)
+
+
+def _literal_outbox_path(path: Path) -> Path:
+    """Return an absolute lexical path without following an outbox symlink."""
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def _social_dispatch_state_dir(
+    home: Path,
+    poller: str,
+    pass_env: tuple[str, ...],
+) -> tuple[tuple[Path, Path] | None, _DispatchScanError | None]:
+    """Resolve an explicit, confined social-cli stateDir or fail closed."""
+    poller_dir = _literal_outbox_path(home / "state" / "pollers" / poller)
+    inherited_steering = [
+        name for name in ("SOCIAL_CLI_STATE_DIR", "AGENT_ID")
+        if name in pass_env and name in os.environ
+    ]
+    if inherited_steering:
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch state is ambiguous because environment steering is set",
+        )
+
+    user_home = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+    config_paths = (poller_dir / "config.yaml", user_home / ".config/social-cli/config.yaml")
+    config: Mapping[str, Any] | None = None
+    for config_path in config_paths:
+        try:
+            if not config_path.exists():
+                continue
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, RuntimeError, yaml.YAMLError):
+            return None, _DispatchScanError(
+                _OUTBOX_CONFIG_REASON,
+                "social-cli dispatch configuration is unreadable or unparseable",
+            )
+        if not isinstance(loaded, Mapping):
+            return None, _DispatchScanError(
+                _OUTBOX_CONFIG_REASON,
+                "social-cli dispatch configuration is not a mapping",
+            )
+        config = loaded
+        break
+    if config is None:
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch requires an explicit stateDir",
+        )
+
+    state = config.get("state", {})
+    if not isinstance(state, Mapping):
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch state configuration is not a mapping",
+        )
+    configured = state.get("stateDir")
+    if not isinstance(configured, str) or not configured.strip():
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch requires an explicit stateDir",
+        )
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = poller_dir / candidate
+    try:
+        effective = candidate.resolve(strict=False)
+        expected = poller_dir.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch stateDir could not be resolved",
+        )
+    try:
+        effective.relative_to(expected)
+    except ValueError:
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch stateDir escapes its poller state directory",
+        )
+    return (poller_dir, effective), None
+
+
+def _dispatch_yaml_paths(
+    roots: tuple[Path, ...],
+) -> tuple[tuple[Path, ...] | None, _DispatchScanError | None]:
+    """Enumerate bounded YAML inputs without following directory symlinks."""
+    paths: dict[str, Path] = {}
+    walk_errors: list[OSError] = []
+
+    def remember_walk_error(error: OSError) -> None:
+        walk_errors.append(error)
+
+    for root in dict.fromkeys(roots):
+        try:
+            if not root.is_dir():
+                return None, _DispatchScanError(
+                    _OUTBOX_UNSCANNABLE_REASON,
+                    "a social-cli dispatch scan root is unreadable",
+                )
+            for directory, dirnames, filenames in os.walk(
+                root, topdown=True, onerror=remember_walk_error, followlinks=False,
+            ):
+                # social-cli only moves sent outboxes into outbox_archive/; dispatch
+                # never reads that write-only history back, so it is not outbound input.
+                dirnames[:] = [
+                    name for name in dirnames if name != _OUTBOX_ARCHIVE_DIR
+                ]
+                names = [
+                    name for name in (*dirnames, *filenames)
+                    if name.casefold().endswith((".yaml", ".yml"))
+                ]
+                for name in names:
+                    path = _literal_outbox_path(Path(directory) / name)
+                    paths.setdefault(str(path), path)
+                    if len(paths) > _OUTBOX_SCAN_MAX_FILES:
+                        return None, _DispatchScanError(
+                            _OUTBOX_UNSCANNABLE_REASON,
+                            "social-cli dispatch exceeds the YAML file scan limit",
+                        )
+        except (OSError, RuntimeError):
+            return None, _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "a social-cli dispatch scan root is unreadable",
+            )
+    if walk_errors:
+        return None, _DispatchScanError(
+            _OUTBOX_UNSCANNABLE_REASON,
+            "a social-cli dispatch scan root is unreadable",
+        )
+    return tuple(paths.values()), None
+
+
+def _declared_dispatch_scan_plan(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> _DispatchScanPlan | _DispatchScanError | None:
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return None
+    service = get_trusted_service_from_auth_context(auth_context)
+    declared = getattr(service, "declared_shell_commands", ()) if service is not None else ()
+    command = arguments.get("command")
+    if not declared or not isinstance(command, str):
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return None
+    for declaration in declared:
+        script = declaration.script
+        if (
+            script is None
+            or script.name not in _OUTBOX_DISPATCH_SCRIPTS
+            or len(argv) < 4
+            or argv[0] != declaration.executable
+        ):
+            continue
+        try:
+            script_matches = Path(argv[1]).resolve() == script
+        except (OSError, RuntimeError, ValueError):
+            script_matches = False
+        if not script_matches or argv[3] != "dispatch":
+            continue
+        poller = argv[2]
+        if re.fullmatch(r"social-cli-[A-Za-z0-9_-]+", poller) is None:
+            return _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "social-cli dispatch poller name is invalid",
+            )
+        suffix = argv[4:]
+        if not suffix:
+            platforms = ("all",)
+        elif (
+            len(suffix) == 2
+            and suffix[0] == "--platform"
+            and re.fullmatch(r"[A-Za-z0-9_-]+", suffix[1]) is not None
+        ):
+            platforms = (suffix[1],)
+        else:
+            return _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "social-cli dispatch arguments are not canonical",
+            )
+
+        roots, config_error = _social_dispatch_state_dir(
+            Path(home_value), poller, declaration.pass_env,
+        )
+        if config_error is not None or roots is None:
+            return config_error or _DispatchScanError(
+                _OUTBOX_CONFIG_REASON,
+                "social-cli dispatch configuration could not be resolved",
+            )
+        paths, scan_error = _dispatch_yaml_paths(roots)
+        if scan_error is not None or paths is None:
+            return scan_error or _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "social-cli dispatch files could not be enumerated",
+            )
+        return _DispatchScanPlan(paths=paths, platforms=platforms)
+    return None
+
+
+def _dispatch_outbox_payloads(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> tuple[tuple[str, ...], tuple[str, ...], _DispatchScanError | None]:
+    plan = _declared_dispatch_scan_plan(tool_name, arguments, auth_context)
+    if isinstance(plan, _DispatchScanError):
+        return (), (), plan
+    if plan is None:
+        return (), (), None
+    texts: list[str] = []
+    for path in plan.paths:
+        try:
+            mode = path.stat().st_mode
+            if not stat.S_ISREG(mode):
+                return (), (), _DispatchScanError(
+                    _OUTBOX_UNSCANNABLE_REASON,
+                    "a social-cli dispatch YAML path is not a regular file",
+                )
+            with path.open("rb") as handle:
+                raw = handle.read(_OUTBOX_SCAN_MAX_BYTES + 1)
+        except (OSError, RuntimeError):
+            return (), (), _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "a social-cli dispatch YAML file could not be read",
+            )
+        if len(raw) > _OUTBOX_SCAN_MAX_BYTES:
+            return (), (), _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "a social-cli dispatch YAML file exceeds the scan size limit",
+            )
+        texts.append(raw.decode("utf-8", errors="replace"))
+    return tuple(texts), plan.platforms, None
+
+
+_CLAUDE_CODE_MIMIR_TOOL_PREFIX = "mcp__langchain-tools__"
+_CLAUDE_CODE_NATIVE_PRIVACY_TOOLS = {
+    "WebFetch": "fetch_url",
+    "WebSearch": "web_search",
+    "Write": "write_file",
+    "Edit": "edit_file",
+    "MultiEdit": "multi_edit",
+}
+
+
+def _outbound_privacy_tool_name(tool_name: str) -> tuple[str, bool]:
+    """Return the descriptor name and whether this is a bridged Mimir tool."""
+    if tool_name.startswith(_CLAUDE_CODE_MIMIR_TOOL_PREFIX):
+        return tool_name.removeprefix(_CLAUDE_CODE_MIMIR_TOOL_PREFIX), True
+    return _CLAUDE_CODE_NATIVE_PRIVACY_TOOLS.get(tool_name, tool_name), False
+
+
+def _outbound_privacy_refusal(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+    *,
+    sink_category: SinkCategory | None = None,
+    include_jev: bool = True,
+    jev_candidates: list[str] | None = None,
+    findings_override: Sequence[Any] | None = None,
+    policy: Any = None,
+) -> str | None:
+    """Scan an external write and emit value-free shadow or denial evidence."""
+    descriptor_name, _ = _outbound_privacy_tool_name(tool_name)
+    descriptor = _descriptor_for_policy(descriptor_name, policy)
+    extractor = descriptor.sink_payload_extractor if descriptor is not None else None
+    texts: tuple[str, ...] = ()
+    if callable(extractor):
+        texts = extractor(descriptor_name, arguments, auth_context)
+    elif descriptor_name.startswith("mcp_"):
+        from ..tool_descriptors import _string_leaf_payload
+
+        texts = _string_leaf_payload(descriptor_name, arguments, auth_context)
+    texts = (*texts, *_declared_shell_payloads(descriptor_name, arguments, auth_context))
+    if _outbox_control_write(descriptor_name, arguments):
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason=_OUTBOX_CONFIG_REASON,
+            target=None,
+            auth_context=auth_context,
+            event_fields={"sink_category": SinkCategory.NETWORK.value},
+        )
+        return (
+            "Outbound privacy refused a model write to social-cli `config.yaml` "
+            "because it controls which outbox is dispatched."
+        )
+    outbox_write_texts = _outbox_write_payloads(descriptor_name, arguments)
+    dispatch_texts, dispatch_platforms, dispatch_error = _dispatch_outbox_payloads(
+        descriptor_name, arguments, auth_context,
+    )
+    if dispatch_error is not None:
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason=dispatch_error.reason,
+            target=None,
+            auth_context=auth_context,
+            event_fields={"sink_category": SinkCategory.NETWORK.value},
+        )
+        return f"Outbound privacy refused social-cli dispatch: {dispatch_error.detail}."
+    texts = (*texts, *outbox_write_texts, *dispatch_texts)
+    if not texts:
+        return None
+
+    category = (
+        SinkCategory.NETWORK
+        if outbox_write_texts or dispatch_texts
+        else sink_category or (
+            descriptor.sink_category if descriptor is not None else SinkCategory.EXTERNAL_MCP
+        )
+    )
+    from ..outbound_privacy import findings_require_refusal, scan_outbound
+
+    findings = (
+        list(findings_override)
+        if findings_override is not None
+        else scan_outbound(
+            texts,
+            tool=tool_name,
+            sink_category=category.value,
+            emit_event=_emit_event_sync,
+            include_jev=include_jev,
+            jev_candidates=jev_candidates,
+        )
+    )
+    if not findings:
+        return None
+    metadata = [{
+        "detector": finding.detector,
+        "kind": finding.kind,
+        **(
+            {"match_sha256": finding.match_sha256}
+            if finding.match_sha256 is not None else {}
+        ),
+        **(
+            {"match_length": finding.match_length}
+            if finding.detector != "pii"
+            else {}
+        ),
+        **({"score": finding.score} if finding.score is not None else {}),
+    } for finding in findings]
+    credential_match = any(finding.detector == "credential" for finding in findings)
+    private_match = any(finding.detector == "private_term" for finding in findings)
+    pii_match = any(finding.detector == "pii" for finding in findings)
+
+    if not findings_require_refusal(findings):
+        from ..redaction import redact_payload
+
+        detector = "private_term" if private_match else "pii"
+        _emit_event_sync("shadow_tool_decision", **redact_payload({
+            "operation": tool_name,
+            "tool": tool_name,
+            "reason": f"outbound_{detector}",
+            "sink_category": category.value,
+            "would_block": True,
+            "enforcement_enabled": False,
+            "findings": metadata,
+        }))
+        return None
+
+    detector = (
+        "credential" if credential_match else "private_term" if private_match else "pii"
+    )
+    reason = f"outbound_{detector}"
+    _emit_hard_boundary_denied(
+        tool=tool_name,
+        boundary="outbound_privacy",
+        reason=reason,
+        target=None,
+        auth_context=auth_context,
+        event_fields={"sink_category": category.value, "findings": metadata},
+    )
+    dispatch_target = (
+        f" social-cli dispatch for platform {', '.join(dispatch_platforms)}"
+        if dispatch_platforms
+        else f" `{tool_name}`"
+    )
+    return (
+        f"Outbound privacy refused{dispatch_target} because the {detector} detector "
+        "matched outbound content. Remove the sensitive value and retry."
+    )
+
+
+def _scan_outbound_jev(
+    texts: Sequence[str],
+) -> tuple[list[Any], tuple[str, ...]]:
+    """Run only the blocking Jev HTTP classification in a worker thread."""
+    from ..outbound_privacy import scan_jev_outbound
+
+    key = os.environ.get("JEV_KEY", "").strip()
+    return scan_jev_outbound(texts, key=key)
+
+
+def _emit_outbound_jev_events(failure_reasons: Sequence[str]) -> None:
+    for failure_reason in failure_reasons:
+        _emit_event_sync("outbound_pii_check_failed", reason=failure_reason)
+
+
+def _authorized_fetch_urls_for_tool(
+    tool_name: str,
+    auth_context: AuthContext | None,
+    target: str | None = None,
+    policy: Any = None,
+) -> frozenset[str] | None:
+    descriptor = _descriptor_for_policy(tool_name, policy)
+    kind = descriptor.fetch_authorization if descriptor else FetchAuthorizationKind.NONE
+    if kind is FetchAuthorizationKind.FETCH_URL:
+        approved = set(approved_fetch_urls(auth_context))
+        approved.update(
+            url for url in ingested_fetch_urls(auth_context)
+            if _plugin_tool(tool_name, policy) is not None
+            or fetch_url_is_approved(url, auth_context)
+        )
+        if target is not None and fetch_url_is_approved(target, auth_context):
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+            if normalized is not None:
+                approved.add(normalized)
+        return frozenset(approved)
+    if kind is FetchAuthorizationKind.WEB_SEARCH:
+        from ..access_control import _fixed_web_search_url
+
+        fixed_url = _fixed_web_search_url()
+        return frozenset({fixed_url}) if fixed_url is not None else frozenset()
+    return None
+
+
+# Compatibility alias for callers that only exercise channel operations.
+_extract_channel_from_args = _extract_sink_target
+
+
+# Internal execution arguments only this module may set. A model-supplied value
+# is stripped before authorization: ``mimir_direct_argv`` would choose what runs,
+# and ``mimir_shell_refusal`` would let a model author text that reads as a
+# server authorization verdict.
+_SERVER_ONLY_SHELL_ARGS = frozenset({
+    "mimir_direct_argv",
+    "mimir_shell_refusal",
+    "mimir_operator_shell_binding",
+    "mimir_operator_shell_profile",
+    "mimir_operator_shell_request_identity",
+})
+
+
+def _strip_server_only_shell_args(request: ToolCallRequest) -> ToolCallRequest:
+    tool_call = getattr(request, "tool_call", None) or {}
+    arguments = tool_call.get("args")
+    if not isinstance(arguments, dict) or not (_SERVER_ONLY_SHELL_ARGS & arguments.keys()):
+        return request
+    sanitized = dict(arguments)
+    for name in _SERVER_ONLY_SHELL_ARGS:
+        sanitized.pop(name, None)
+    return request.override(tool_call={**tool_call, "args": sanitized})
+
+
+def _hands_has_caller_reserved_arguments(
+    request: ToolCallRequest, tool_name: str,
+) -> bool:
+    arguments = (getattr(request, "tool_call", None) or {}).get("args")
+    return (
+        tool_name in {"hands_edit", "hands_shell", "hands_python"}
+        and isinstance(arguments, dict)
+        and bool(_SERVER_ONLY_SHELL_ARGS & arguments.keys())
+    )
+
+
+class OperatorShellPreparationOutcome(StrEnum):
+    BOUND = "bound"
+    SOFT_UNBOUND = "soft_unbound"
+    HARD_REFUSED = "hard_refused"
+
+
+_OPERATOR_SHELL_COMMAND_FAMILIES = frozenset({
+    "invalid_command",
+    "parser",
+    "project_test",
+    "profile_miss",
+    "chainlink",
+    "pwd",
+    "ls",
+    "wc",
+    "grep",
+    "jq",
+    "rg",
+    "git",
+})
+
+
+@dataclass(frozen=True)
+class _OperatorShellPreparation:
+    outcome: OperatorShellPreparationOutcome
+    binding: OperatorShellBinding | None
+    refusal: str | None
+    binding_rule: ServiceShellBindingRule | None
+    command_family: str
+    declaration: Any = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, OperatorShellPreparationOutcome):
+            raise ValueError("unknown operator shell preparation outcome")
+        if self.command_family not in _OPERATOR_SHELL_COMMAND_FAMILIES and self.declaration is None:
+            raise ValueError("unknown operator shell command family")
+        if self.outcome is OperatorShellPreparationOutcome.BOUND:
+            if (
+                not isinstance(self.binding, OperatorShellBinding)
+                or self.binding.profile != OPERATOR_SHELL_PROFILE
+                or self.binding.tool_name != "shell_exec"
+                or not self.binding.argv
+                or Path(self.binding.argv[0]).name != self.command_family
+                or self.refusal is not None
+                or self.binding_rule is not None
+            ):
+                raise ValueError("bound operator shell preparation requires one valid binding")
+        elif self.outcome not in {
+            OperatorShellPreparationOutcome.SOFT_UNBOUND,
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+        } or (
+            self.binding is not None
+            or not isinstance(self.refusal, str)
+            or not self.refusal
+            or not isinstance(self.binding_rule, ServiceShellBindingRule)
+        ):
+            raise ValueError("unbound operator shell preparation requires a fixed refusal")
+
+
+_OPERATOR_INVALID_COMMAND_REFUSAL = "operator shell command is invalid"
+_OPERATOR_PARSER_FAILURE_REFUSAL = "operator shell parser failed closed"
+_OPERATOR_CWD_FAILURE_REFUSAL = "operator shell cwd confinement failed"
+_OPERATOR_BINDING_FAILURE_REFUSAL = "operator shell binding failed closed"
+_OPERATOR_SHELL_HARD_REFUSAL = (
+    "shell_exec was refused before execution: operator shell preparation failed closed"
+)
+_OPERATOR_SHELL_BINDING_REFUSAL = (
+    "shell_exec was refused before execution: operator shell binding failed closed"
+)
+_OPERATOR_SHELL_LIVE_TAINT_REFUSAL = (
+    "shell_exec was refused before execution (ifc_label_blocked:shell_process): "
+    "operator shell fallback requires exactly untainted live IFC. "
+    "Use a single bounded command from the pinned operator family with no shell "
+    "metacharacters, or send the operator a message asking them to open a fresh user turn."
+)
+
+
+def _with_author_attestation_note(message: str, reason: str, ctx: Any | None) -> str:
+    """Decorate refusal prose without changing the decision or machine reason."""
+    if (
+        reason.startswith("ifc_label_blocked:")
+        and "GitHub author attestation was unavailable" not in message
+        and isinstance(ctx, AuthContext)
+        and getattr(ctx, "ifc_state", None) is not None
+        and ctx.ifc_state.author_attestation_was_unavailable()
+    ):
+        message += (
+            " GitHub author attestation was unavailable during this turn and is a possible "
+            "cause of the taint (for example, GitHub could not be reached). This is not "
+            "a measured non-collaborator verdict; the read still failed closed."
+        )
+    return message
+
+
+def _operator_shell_live_taint_refusal(ctx: Any | None) -> str:
+    return _with_author_attestation_note(
+        _OPERATOR_SHELL_LIVE_TAINT_REFUSAL, "ifc_label_blocked:shell_process", ctx,
+    )
+
+
+def _operator_shell_recorded_refusal(
+    request: ToolCallRequest,
+    *,
+    record: bool = False,
+    audit: Mapping[str, str] | None = None,
+    refusal: str = _OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+) -> ToolMessage | None:
+    turn = _get_current_turn_context()
+    if turn is None or _tool_name_from_request(request) != "shell_exec":
+        return None
+    arguments = _validated_arguments(request)
+    if arguments is None:
+        return None
+    key = json.dumps(arguments, sort_keys=True)
+    # This deny-only cache belongs to the turn, not the reusable middleware.
+    refusals = getattr(turn, "_operator_shell_live_refusals", None)
+    if record:
+        if refusals is None:
+            refusals = {}
+            turn._operator_shell_live_refusals = refusals
+        refusals[key] = (refusal, audit)
+        return None
+    if refusals is None or key not in refusals:
+        return None
+    refusal, recorded_audit = refusals[key]
+    content = f"Repeat of an identical command refused in this turn. {refusal}"
+    _record_tool_outcome(
+        "shell_exec", refused_reason=refusal, operator_shell_audit=recorded_audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec", ok=False, error=content, denied=True,
+        operator_shell_audit=recorded_audit,
+    )
+    return ToolMessage(
+        content=content, tool_call_id=_tool_call_id(request),
+        name="shell_exec", status="error",
+    )
+
+
+def _operator_shell_unbound(
+    outcome: OperatorShellPreparationOutcome,
+    refusal: str,
+    binding_rule: ServiceShellBindingRule,
+    command_family: str,
+) -> _OperatorShellPreparation:
+    return _OperatorShellPreparation(
+        outcome=outcome,
+        binding=None,
+        refusal=refusal,
+        binding_rule=binding_rule,
+        command_family=(command_family if command_family in _OPERATOR_SHELL_COMMAND_FAMILIES
+                        else "profile_miss"),
+    )
+
+
+def _operator_shell_audit_summary(
+    preparation: _OperatorShellPreparation | None,
+) -> dict[str, str] | None:
+    if preparation is None:
+        return None
+    summary = {
+        "shell_profile": OPERATOR_SHELL_PROFILE,
+        "preparation_outcome": preparation.outcome.value,
+        "command_family": preparation.command_family,
+        "binding_rule": (
+            preparation.binding_rule.value
+            if preparation.binding_rule is not None
+            else "exact_argv_binding"
+        ),
+    }
+    if preparation.declaration is not None and preparation.binding is not None:
+        import shlex
+
+        argv = shlex.split(preparation.binding.command)[1:]
+        prefix = next((parts for parts in preparation.declaration.subcommands
+                       if tuple(argv[:len(parts)]) == parts), ())
+        option_argv = argv[:argv.index("--")] if "--" in argv else argv
+        labels = _current_ifc_labels(preparation.binding._auth_context_identity)
+        summary.update({
+            "declared_executable": preparation.declaration.executable,
+            "subcommand_path": " ".join(prefix),
+            "option_names": ",".join(sorted({part.split("=", 1)[0] for part in option_argv
+                                               if part.startswith("-")})),
+            "taint_source_domains": ",".join(sorted({source.domain for source in getattr(labels, "sources", ())
+                if getattr(source, "has_untrusted_active_ingest", False)})),
+        })
+    return summary
+
+
+def _operator_shell_hard_refusal(
+    request: ToolCallRequest,
+    preparation: _OperatorShellPreparation | None,
+    auth_context: AuthContext | None,
+) -> ToolMessage | None:
+    if (
+        preparation is None
+        or preparation.outcome is not OperatorShellPreparationOutcome.HARD_REFUSED
+    ):
+        return None
+    audit = _operator_shell_audit_summary(preparation)
+    assert audit is not None
+    _emit_hard_boundary_denied(
+        tool="shell_exec",
+        boundary="operator_shell_preparation",
+        reason="operator_shell_hard_refused",
+        target=None,
+        auth_context=auth_context,
+        event_fields=audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error=_OPERATOR_SHELL_HARD_REFUSAL,
+        denied=True,
+        operator_shell_audit=audit,
+    )
+    return ToolMessage(
+        content=_OPERATOR_SHELL_HARD_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name="shell_exec",
+        status="error",
+    )
+
+
+def _operator_shell_chainlink_mutation_refusal(
+    request: ToolCallRequest,
+    preparation: _OperatorShellPreparation | None,
+    auth_context: AuthContext | None,
+) -> ToolMessage | None:
+    if (
+        preparation is None
+        or preparation.outcome is not OperatorShellPreparationOutcome.BOUND
+        or preparation.binding is None
+        or not preparation.binding.chainlink_mutation
+        or _live_untrusted_active_ingest(
+            auth_context, _current_ifc_labels(auth_context),
+        ) is False
+    ):
+        return None
+    from ..access_control import _CHAINLINK_TAINT_REFUSAL
+
+    audit = _operator_shell_audit_summary(preparation)
+    assert audit is not None
+    _emit_hard_boundary_denied(
+        tool="shell_exec",
+        boundary="operator_shell_chainlink_mutation",
+        reason="chainlink_mutation_blocked_by_untrusted_ingest",
+        target=None,
+        auth_context=auth_context,
+        event_fields=audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        error=_CHAINLINK_TAINT_REFUSAL,
+        denied=True,
+        operator_shell_audit=audit,
+    )
+    return ToolMessage(
+        content=_CHAINLINK_TAINT_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name="shell_exec",
+        status="error",
+    )
+
+
+def _operator_shell_soft_live_refusal(
+    request: ToolCallRequest,
+    preparation: _OperatorShellPreparation | None,
+    auth_context: AuthContext | None,
+    *,
+    started: float,
+) -> ToolMessage | None:
+    if (
+        preparation is None
+        or preparation.outcome is not OperatorShellPreparationOutcome.SOFT_UNBOUND
+        or _live_untrusted_active_ingest(
+            auth_context, _current_ifc_labels(auth_context),
+        ) is False
+    ):
+        return None
+    audit = _operator_shell_audit_summary(preparation)
+    assert audit is not None
+    _record_tool_outcome(
+        "shell_exec",
+        refused_reason=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        operator_shell_audit=audit,
+    )
+    refusal = _operator_shell_live_taint_refusal(auth_context)
+    _operator_shell_recorded_refusal(request, record=True, audit=audit, refusal=refusal)
+    _emit_tool_call_sync(
+        "shell_exec",
+        ok=False,
+        duration_ms=(time.monotonic() - started) * 1000.0,
+        error=refusal,
+        denied=True,
+        operator_shell_audit=audit,
+    )
+    return ToolMessage(
+        content=refusal,
+        tool_call_id=_tool_call_id(request),
+        name="shell_exec",
+        status="error",
+    )
+
+
+def _operator_shell_execution_binding_matches(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None,
+    binding: OperatorShellBinding,
+) -> bool:
+    arguments = (getattr(request, "tool_call", None) or {}).get("args")
+    return (
+        isinstance(arguments, dict)
+        and binding._issuer is _OPERATOR_SHELL_BINDING_ISSUER
+        and binding.profile == OPERATOR_SHELL_PROFILE
+        and binding.tool_name == "shell_exec"
+        and binding._request_identity is request
+        and binding._auth_context_identity is auth_context
+        and binding.tool_call_id == _tool_call_id(request)
+        and binding.command == arguments.get("command")
+        and binding.requested_cwd == arguments.get("cwd")
+        and isinstance(binding.resolved_cwd, str)
+        and bool(binding.resolved_cwd)
+        and bool(binding.argv)
+    )
+
+
+def _prepare_operator_shell_execution(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+    ifc_labels: Any,
+) -> _OperatorShellPreparation | None:
+    if not _operator_can_invoke_admin_shell(tool_name, ifc_labels, auth_context):
+        return None
+    declared = ()
+    if (
+        "admin" in (getattr(auth_context, "roles", ()) or ())
+        and getattr(auth_context, "trigger", None) == "user_message"
+        and _live_untrusted_active_ingest(auth_context, ifc_labels) is True
+    ):
+        from ..scheduler import load_operator_shell_commands
+        from ..access_control import agent_writable_roots
+
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if home:
+            try:
+                declared = load_operator_shell_commands(
+                    Path(home) / "scheduler.yaml",
+                    writable_roots=agent_writable_roots(home),
+                )
+            except (OSError, ValueError):
+                return _operator_shell_unbound(
+                    OperatorShellPreparationOutcome.HARD_REFUSED,
+                    _OPERATOR_PARSER_FAILURE_REFUSAL,
+                    ServiceShellBindingRule.UNKNOWN_PROFILE, "parser",
+                )
+    arguments = (getattr(request, "tool_call", None) or {}).get("args")
+    if not isinstance(arguments, dict):
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_INVALID_COMMAND_REFUSAL,
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            "invalid_command",
+        )
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_INVALID_COMMAND_REFUSAL,
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            "invalid_command",
+        )
+    try:
+        parsed_argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
+            command,
+            OPERATOR_SHELL_PROFILE,
+            declared=declared,
+            service=None,
+            auth_context=None,
+            review_state=None,
+            allow_project_test=False,
+        )
+    except Exception:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_PARSER_FAILURE_REFUSAL,
+            ServiceShellBindingRule.UNKNOWN_PROFILE,
+            "parser",
+        )
+    if parsed_argv is None:
+        if binding_rule is None:
+            return _operator_shell_unbound(
+                OperatorShellPreparationOutcome.HARD_REFUSED,
+                _OPERATOR_PARSER_FAILURE_REFUSAL,
+                ServiceShellBindingRule.UNKNOWN_PROFILE,
+                "parser",
+            )
+        command_family = "profile_miss"
+        if binding_rule is ServiceShellBindingRule.PROFILE_ALLOWLIST:
+            try:
+                import shlex
+
+                candidate = shlex.split(command)
+                _test_argv, _test_reason, project_test_matched = (
+                    _project_test_execution_argv(candidate)
+                )
+            except (OSError, RuntimeError, ValueError):
+                project_test_matched = False
+            if project_test_matched:
+                return _operator_shell_unbound(
+                    OperatorShellPreparationOutcome.SOFT_UNBOUND,
+                    "operator project test is not eligible for binding",
+                    ServiceShellBindingRule.OPERATOR_PROJECT_TEST_EXCLUDED,
+                    "project_test",
+                )
+        soft_rules = {
+            ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+            ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING,
+            ServiceShellBindingRule.ARGV_EMPTY,
+            ServiceShellBindingRule.SHELL_HOME_EXPANSION,
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        }
+        return _operator_shell_unbound(
+            (
+                OperatorShellPreparationOutcome.SOFT_UNBOUND
+                if binding_rule in soft_rules
+                else OperatorShellPreparationOutcome.HARD_REFUSED
+            ),
+            refusal or _OPERATOR_PARSER_FAILURE_REFUSAL,
+            binding_rule,
+            command_family,
+        )
+
+    import shlex
+
+    original = shlex.split(command)
+    matched_declaration = next((entry for entry in declared
+        if _declared_command_execution_argv(original, (entry,)) == parsed_argv), None)
+    family = Path(parsed_argv[0]).name if parsed_argv else "parser"
+    if matched_declaration is None and (family not in _OPERATOR_SHELL_COMMAND_FAMILIES or family in {
+        "invalid_command", "parser", "project_test", "profile_miss",
+    }):
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_PARSER_FAILURE_REFUSAL,
+            ServiceShellBindingRule.UNKNOWN_PROFILE,
+            "parser",
+        )
+    requested_cwd = arguments.get("cwd")
+    resolved_cwd = (
+        _resolve_operator_declared_cwd() if matched_declaration is not None
+        else _resolve_operator_bounded_cwd(requested_cwd, git=family == "git")
+    )
+    if resolved_cwd is None:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_CWD_FAILURE_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_CWD_POLICY,
+            family,
+        )
+    final_argv = parsed_argv
+    if matched_declaration is not None:
+        pass  # Already pinned and validated as one declared argv.
+    elif family in {"ls", "wc", "grep", "jq", "rg"}:
+        final_argv, refusal, binding_rule = _operator_read_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=resolved_cwd,
+        )
+        if final_argv is None:
+            return _operator_shell_unbound(
+                (
+                    OperatorShellPreparationOutcome.SOFT_UNBOUND
+                    if binding_rule is ServiceShellBindingRule.OPERATOR_READER_EXCLUDED
+                    else OperatorShellPreparationOutcome.HARD_REFUSED
+                ),
+                refusal or _OPERATOR_BINDING_FAILURE_REFUSAL,
+                binding_rule or ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY,
+                family,
+            )
+    elif family == "git":
+        final_argv, refusal, binding_rule = _operator_git_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=resolved_cwd,
+        )
+        if final_argv is None:
+            soft = refusal == "operator shell Git form is not eligible for binding"
+            return _operator_shell_unbound(
+                (
+                    OperatorShellPreparationOutcome.SOFT_UNBOUND
+                    if soft
+                    else OperatorShellPreparationOutcome.HARD_REFUSED
+                ),
+                refusal or _OPERATOR_BINDING_FAILURE_REFUSAL,
+                binding_rule or ServiceShellBindingRule.OPERATOR_GIT_HARDENING,
+                family,
+            )
+    artifact = _validated_operator_shell_argv_artifact(
+        parsed_argv, final_argv, resolved_cwd=resolved_cwd,
+        **({"declaration": matched_declaration} if matched_declaration is not None else {}),
+    )
+    if artifact is None:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_BINDING_FAILURE_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH,
+            family,
+        )
+    binding = _issue_operator_shell_binding(
+        request_identity=request,
+        auth_context_identity=auth_context,
+        tool_call_id=_tool_call_id(request),
+        command=command,
+        requested_cwd=requested_cwd,
+        resolved_cwd=str(resolved_cwd),
+        argv_artifact=artifact,
+    )
+    if binding is None:
+        return _operator_shell_unbound(
+            OperatorShellPreparationOutcome.HARD_REFUSED,
+            _OPERATOR_BINDING_FAILURE_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_BINDING_MISMATCH,
+            family,
+        )
+    return _OperatorShellPreparation(
+        outcome=OperatorShellPreparationOutcome.BOUND,
+        binding=binding,
+        refusal=None,
+        binding_rule=None,
+        command_family=family,
+        declaration=matched_declaration,
+    )
+
+
+def _service_shell_refusal(request: ToolCallRequest) -> str | None:
+    """The server-authored refusal bound to this request, if it was refused."""
+    refusal = (request.tool_call.get("args") or {}).get("mimir_shell_refusal")
+    return refusal if isinstance(refusal, str) and refusal else None
+
+
+def _service_shell_refusal_guidance(
+    message: str, tool_name: str, service: ServicePrincipal | None,
+) -> str:
+    """Add recovery text only; never reinterpret an authorization decision."""
+    if tool_name != "shell_exec" or service is None:
+        return message
+    policy = service.sink_policy_for(tool_name)
+    operations = {
+        "scheduler_read_only": "bounded file inspection, read-only Git and Chainlink operations",
+        "maintenance": "bounded file/date inspection, read-only Git/GitHub and Chainlink operations",
+        "session_boundary": "bounded Chainlink operations and GitHub issue/PR views",
+        "repo_review": "hardened local read-only Git inspection bound to a server-owned PR state; use typed pr_* and repo_* tools for GitHub operations, checkout, tests and mutations",
+        "upgrade_workspace": "bounded file inspection, workspace Git, Chainlink and uv lock/sync operations",
+    }.get(policy.destination if policy is not None else "")
+    if operations and (
+        "trusted-service shell profile does not admit" in message
+        or "trusted-service shell profile never admits" in message
+    ):
+        message += f" Profile allows {operations}, subject to its option and scope limits."
+    if "filesystem operand" in message:
+        # Only principal-owned read roots, never the rejected operand or global
+        # configuration. Cap both count and bytes and preserve whole path names.
+        roots = service_filesystem_read_roots(service)
+        shown: list[str] = []
+        size = 0
+        for root in roots:
+            rendered = json.dumps(str(root), ensure_ascii=True)
+            if len(shown) == 8 or size + len(rendered) > 1024:
+                continue
+            shown.append(rendered)
+            size += len(rendered)
+        if shown:
+            qualifier = " (partial list)" if len(shown) < len(roots) else ""
+            message += f" Allowed read roots{qualifier}: {', '.join(shown)}; protected files remain withheld."
+    if "shell metacharacters" in message:
+        message += (
+            " Pipes, redirections and command chaining are not allowed on this turn;"
+            " a single plain command is available if the profile admits it."
+        )
+    return message + (
+        " Without shell, if exposed and authorized on this turn, use ls for directory listing,"
+        " read_file for file contents, and grep/glob for searching within allowed read roots."
+    )
+
+
+def _duplicate_review_result(request: ToolCallRequest, claim: Any) -> ToolMessage:
+    """Return and record the successful no-op without exposing review text."""
+    _emit_event_sync(
+        "github_review_duplicate_suppressed",
+        repo=claim.repo,
+        pr=claim.number,
+        head=claim.head,
+        reviewer=claim.reviewer,
+        review_state=claim.state,
+    )
+    return ToolMessage(
+        content=(
+            "GitHub review submission was not repeated: the existing "
+            f"{claim.state} review by {claim.reviewer} on exact head "
+            f"{claim.head} already satisfies this submission."
+        ),
+        tool_call_id=_tool_call_id(request),
+        name=_tool_name_from_request(request),
+        status="success",
+    )
+
+
+async def _claim_review_submission_async(claim: Callable[[], Any]) -> Any:
+    """Keep ownership of a thread-acquired claim when the caller is cancelled."""
+    task = asyncio.create_task(asyncio.to_thread(claim))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def release_late_claim(completed: asyncio.Task[Any]) -> None:
+            try:
+                late_claim = completed.result()
+            except BaseException:
+                return
+            if late_claim is not None:
+                late_claim.release()
+
+        task.add_done_callback(release_late_claim)
+        raise
+
+
+def _resolve_service_shell_cwd(
+    raw_cwd: object,
+    service: ServicePrincipal | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve an explicit service cwd within that principal's read roots."""
+    if raw_cwd is None:
+        # Keep cwd omitted. Direct service execution deliberately bypasses
+        # interactive per-session cwd; configured project/Chainlink commands
+        # are assigned their server-authorized cwd by their branches below.
+        return None, None
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip() or "\x00" in raw_cwd:
+        return None, "working directory must be a non-empty absolute path"
+    candidate = Path(raw_cwd)
+    if not candidate.is_absolute():
+        return None, "working directory must be a non-empty absolute path"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "working directory is not an accessible directory"
+    if not resolved.is_dir():
+        return None, "working directory is not an accessible directory"
+
+    # Deployment roots keep the ordinary file-tool cwd contract, while the
+    # principal's instance roots cover server-issued workspaces such as a bound
+    # repository checkout. Neither set widens the other principal: both are
+    # server-owned grants and the read-operand boundary applies the principal's
+    # narrower path/content veto before execution.
+    from ..read_policy import configured_non_admin_read_roots
+
+    roots: list[Path] = []
+    for root in (
+        *configured_non_admin_read_roots(),
+        *service_filesystem_read_roots(service),
+    ):
+        try:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_root.is_dir() and resolved_root not in roots:
+            roots.append(resolved_root)
+    if not any(resolved.is_relative_to(root) for root in roots):
+        return None, "working directory is outside the trusted service's authorized read roots"
+    return str(resolved), None
+
+
+def _resolve_chainlink_service_cwd() -> tuple[str | None, str | None]:
+    """Select an authorized cwd from which Chainlink can discover its tracker."""
+    from ..read_policy import configured_non_admin_read_roots
+
+    home_raw = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_raw:
+        return None, "the configured Chainlink tracker root is unavailable"
+    try:
+        home = Path(home_raw).resolve(strict=True)
+        tracker = (home / ".chainlink").resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "the configured Chainlink tracker root is unavailable"
+    if not home.is_dir() or not tracker.is_dir() or tracker != home / ".chainlink":
+        return None, "the configured Chainlink tracker root is unavailable"
+
+    for root in configured_non_admin_read_roots():
+        try:
+            resolved = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_dir() or not resolved.is_relative_to(home):
+            continue
+        candidate = resolved
+        shadowed = False
+        while candidate != home:
+            if (candidate / ".chainlink").is_dir():
+                shadowed = True
+                break
+            candidate = candidate.parent
+        if not shadowed and candidate == home:
+            return str(resolved), None
+    return None, (
+        "the Chainlink tracker cannot be reached from any authorized read root; "
+        "the home root remains intentionally excluded"
+    )
+
+
+def _request_for_authorized_execution(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+    *,
+    operator_shell_preparation: _OperatorShellPreparation | None = None,
+) -> ToolCallRequest:
+    """Bind trusted-service shell execution to the argv authorization checked.
+
+    Ordinary user/admin shell tools keep their documented full-shell surface.
+    A trusted service receives only the direct argv admitted by its operation-
+    specific sink policy; the handler never sees the original command string.
+    """
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    # Never trust a model-supplied internal execution override. Ordinary calls
+    # discard it; trusted-service calls below replace it with server-parsed argv
+    # and, on refusal, a server-authored explanation.
+    had_model_override = bool(_SERVER_ONLY_SHELL_ARGS & args.keys())
+    for server_only_key in _SERVER_ONLY_SHELL_ARGS:
+        args.pop(server_only_key, None)
+    sanitized_request = (
+        request.override(tool_call={**request.tool_call, "args": args})
+        if had_model_override
+        else request
+    )
+    if operator_shell_preparation is not None:
+        preparation = operator_shell_preparation
+        if preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND:
+            if _live_untrusted_active_ingest(
+                auth_context, _current_ifc_labels(auth_context),
+            ) is False:
+                return sanitized_request
+            args["mimir_shell_refusal"] = _OPERATOR_SHELL_LIVE_TAINT_REFUSAL
+            return sanitized_request.override(
+                tool_call={**sanitized_request.tool_call, "args": args},
+            )
+        binding = preparation.binding
+        if (
+            preparation.outcome is not OperatorShellPreparationOutcome.BOUND
+            or binding is None
+            or tool_name != "shell_exec"
+            or not _operator_shell_execution_binding_matches(
+                request, auth_context, binding,
+            )
+        ):
+            args["mimir_shell_refusal"] = _OPERATOR_SHELL_BINDING_REFUSAL
+            args["mimir_direct_argv"] = [
+                "/usr/bin/false", "operator shell binding failed closed",
+            ]
+            return sanitized_request.override(
+                tool_call={**sanitized_request.tool_call, "args": args},
+            )
+        args["cwd"] = binding.resolved_cwd
+        args["mimir_direct_argv"] = list(binding.argv)
+        return sanitized_request.override(
+            tool_call={**sanitized_request.tool_call, "args": args},
+        )
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return sanitized_request
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "shell_profile":
+        return sanitized_request
+    target = args.get("command")
+    if not isinstance(target, str):
+        return sanitized_request
+    if policy.destination == "repo_review":
+        review_state, state_refusal = resolve_repository_review_state(
+            auth_context, command=target, cwd=args.get("cwd"),
+        )
+        argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
+            target,
+            policy.destination,
+            review_state=review_state,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        )
+        if state_refusal is not None:
+            argv = None
+            refusal = state_refusal
+            binding_rule = ServiceShellBindingRule.REPOSITORY_REVIEW_STATE
+    else:
+        argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
+            target, policy.destination,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        )
+    if argv is None:
+        refused_argv, argv_truncated = service_shell_argv_for_log(target)
+        # The authorization adapter already admitted this call. Failing to bind
+        # a direct argv here must not fall back to the original ``bash -lc``
+        # surface if a config probe races, times out, or otherwise changes.
+        #
+        # Log under a distinct fingerprint so the cause stays greppable for an
+        # operator, naming the profile and stable rejecting rule. The command is
+        # represented only by the separately redacted argv used by the event.
+        log.error(
+            "service_shell_argv_binding_failed profile=%s binding_rule=%s",
+            policy.destination,
+            binding_rule,
+        )
+        # Record it for the audit stream: this boundary fails closed whether or
+        # not enforcement is on, so without an event the refusal is invisible to
+        # the enablement evidence (#1012).
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="service_shell_argv_binding",
+            reason="service_shell_argv_binding_failed",
+            target=None,
+            auth_context=auth_context,
+            event_fields={
+                "argv": refused_argv,
+                "argv_truncated": argv_truncated,
+                "shell_profile": policy.destination,
+                "binding_rule": binding_rule,
+            },
+        )
+        # ...and tell the CALLER why, in the tool result. Binding
+        # ``/usr/bin/false`` alone made every refusal look identical — it ignores
+        # its arguments, so the agent saw "exit 1, empty output" and could not
+        # distinguish a profile refusal from a broken binary or a dead runtime.
+        # It retried the same rejected shape, and diagnosed a stale deployment
+        # that was in fact current. The refusal is served from here without
+        # executing anything; the argv below stays as defense in depth, so a
+        # future refactor that drops this channel still fails closed rather than
+        # reaching a shell.
+        args["mimir_shell_refusal"] = _service_shell_refusal_guidance(
+            f"{tool_name} was refused before execution: {refusal} "
+            f"binding_rule={binding_rule.value if binding_rule is not None else 'unknown'}",
+            tool_name, service,
+        )
+        args["mimir_direct_argv"] = [
+            "/usr/bin/false",
+            "trusted-service shell argv binding failed closed",
+        ]
+        tool_call = {**request.tool_call, "args": args}
+        return request.override(tool_call=tool_call)
+    project_test_cwd = configured_project_test_cwd(argv)
+    if project_test_cwd is not None and tool_name == "bash_async":
+        args["mimir_shell_refusal"] = (
+            "bash_async was refused before execution: "
+            "project_test_async_refused; configured project tests use shell_exec "
+            "so their wall-clock and returned output stay bounded."
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    if project_test_cwd is not None:
+        resolved_cwd, cwd_refusal = project_test_cwd, None
+    elif Path(argv[0]).name == "chainlink":
+        resolved_cwd, cwd_refusal = _resolve_chainlink_service_cwd()
+    else:
+        resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(
+            args.get("cwd"), service,
+        )
+    if cwd_refusal is not None:
+        args["mimir_shell_refusal"] = _service_shell_refusal_guidance(
+            f"{tool_name} was refused before execution: {cwd_refusal}.",
+            tool_name, service,
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    confined_argv, confinement_refusal, confinement_rule = (
+        parse_service_shell_argv_with_diagnostics(
+            target,
+            policy.destination,
+            review_state=review_state if policy.destination == "repo_review" else None,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+            service=service,
+            auth_context=auth_context,
+            read_cwd=resolved_cwd,
+        )
+    )
+    if confined_argv is None:
+        args["mimir_shell_refusal"] = _service_shell_refusal_guidance(
+            f"{tool_name} was refused before execution: {confinement_refusal} "
+            f"binding_rule={confinement_rule.value if confinement_rule is not None else 'unknown'}",
+            tool_name, service,
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    argv = confined_argv
+    if resolved_cwd is not None:
+        args["cwd"] = resolved_cwd
+    args["mimir_direct_argv"] = argv
+    tool_call = {**request.tool_call, "args": args}
+    return request.override(tool_call=tool_call)
+
+
+def _request_with_resolved_service_write_path(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind a trigger-service file write to the path checked by authorization."""
+    if tool_name not in {"write_file", "edit_file", "replace_file"}:
+        return request
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "trigger_service_write_roots":
+        return request
+
+    from ..access_control import (
+        _target_within_active_pr_checkout_lease,
+        resolve_trigger_service_write_target,
+    )
+
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    argument_name = "file_path" if "file_path" in args else "path"
+    raw_path = args.get(argument_name)
+    if not isinstance(raw_path, str) or not raw_path:
+        return request
+    try:
+        review_state, _ = resolve_repository_review_state(
+            auth_context, path=raw_path,
+        )
+        if _target_within_active_pr_checkout_lease(raw_path, review_state):
+            args[argument_name] = str(Path(raw_path).resolve(strict=False))
+        else:
+            args[argument_name] = str(
+                resolve_trigger_service_write_target(
+                    raw_path, policy.destination, auth_context=auth_context,
+                )
+            )
+    except (OSError, RuntimeError, ValueError):
+        # Leave the original destination intact so the sink adapter denies it.
+        return request
+    return request.override(tool_call={**request.tool_call, "args": args})
+
+
+def _request_with_resolved_spawn_paths(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind service spawn execution to the paths checked by authorization."""
+    if tool_name != "spawn_open_code":
+        return request
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "spawn_workspace":
+        return request
+
+    from .._paths import PathOutsideHomeError
+    from ..access_control import resolve_configured_write_target
+
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    paths = ["cwd"]
+    if tool_name == "spawn_open_code":
+        paths.append("artifact_root")
+    try:
+        for name in paths:
+            raw_path = args.get(name)
+            if name == "cwd" and not raw_path:
+                raw_path = os.environ.get("MIMIR_HOME")
+            if raw_path:
+                args[name] = str(resolve_configured_write_target(str(raw_path)))
+    except (OSError, PathOutsideHomeError):
+        # Leave the original destination intact so the sink adapter denies it.
+        return request
+    return request.override(tool_call={**request.tool_call, "args": args})
+
+
+def _is_sequence_annotation(annotation: Any) -> bool:
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _is_sequence_annotation(get_args(annotation)[0])
+    if origin in (Union, UnionType):
+        return any(_is_sequence_annotation(item) for item in get_args(annotation))
+    candidate = origin or annotation
+    return (
+        isinstance(candidate, type)
+        and issubclass(candidate, Sequence)
+        and candidate not in (str, bytes, bytearray)
+    )
+
+
+def _record_argument_validation_failure(
+    exc: Exception, parameter_names: set[str],
+) -> None:
+    """Log validation structure without rendering argument values."""
+    try:
+        details: list[str] = []
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            try:
+                entries = errors(
+                    include_url=False, include_context=False, include_input=False,
+                )
+            except TypeError:
+                entries = errors()
+            for entry in entries:
+                location = next(
+                    (
+                        part for part in entry.get("loc", ())
+                        if isinstance(part, str) and part in parameter_names
+                    ),
+                    "<arguments>",
+                )
+                error_type = str(entry.get("type", "validation_error"))
+                if re.fullmatch(r"[A-Za-z0-9_.-]+", error_type) is None:
+                    error_type = "validation_error"
+                details.append(f"{location}: {error_type}")
+        reason = "; ".join(details) or "schema validation failed"
+        log.warning("tool argument validation failed: %s: %s", type(exc).__name__, reason)
+    except Exception:  # noqa: BLE001 - diagnostics must not affect authorization
+        pass
+
+
+def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
+    """Validate model-supplied arguments before authz, excluding injected fields."""
+    tool_call = getattr(request, "tool_call", None) or {}
+    arguments = tool_call.get("args", {})
+    if not isinstance(arguments, dict):
+        return None
+    tool_name = _tool_name_from_request(request)
+    if tool_name in {"hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"}:
+        return validate_hands_wrapper_arguments(tool_name, arguments)
+    tool = getattr(request, "tool", None)
+    schema = getattr(tool, "tool_call_schema", None)
+    if schema is None:
+        schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return dict(arguments)
+    normalized = dict(arguments)
+    for name, field in schema.model_fields.items():
+        value = normalized.get(name)
+        if (
+            _is_sequence_annotation(field.annotation)
+            and isinstance(value, Mapping)
+            and set(value) == {"item"}
+        ):
+            normalized[name] = value["item"]
+    try:
+        validated = schema.model_validate(normalized)
+    except Exception as exc:
+        _record_argument_validation_failure(exc, set(schema.model_fields))
+        return None
+    return validated.model_dump(exclude_unset=False)
+
+
+def _argument_validation_refusal(request: ToolCallRequest) -> str:
+    """Describe a schema refusal without rendering model-supplied values."""
+    tool_call = getattr(request, "tool_call", None) or {}
+    arguments = tool_call.get("args", {})
+    if not isinstance(arguments, dict):
+        return "Tool arguments must be an object. Fix the error and try again."
+    tool = getattr(request, "tool", None)
+    schema = getattr(tool, "tool_call_schema", None)
+    if schema is None:
+        schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return "Tool argument validation failed. Fix the error and try again."
+    try:
+        schema.model_validate(arguments)
+    except Exception as exc:
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            try:
+                entries = errors(
+                    include_url=False, include_context=False, include_input=False,
+                )
+            except TypeError:
+                entries = errors()
+            details = []
+            for entry in entries:
+                field = next(
+                    (part for part in entry.get("loc", ()) if isinstance(part, str)),
+                    "arguments",
+                )
+                reason = "Field required" if entry.get("type") == "missing" else "Invalid value"
+                details.append(f"{field}: {reason}")
+            if details:
+                return (
+                    f"Tool argument validation failed: {'; '.join(details)}. "
+                    "Fix the error and try again."
+                )
+    return "Tool argument validation failed. Fix the error and try again."
+
+
+def _get_current_turn_context() -> Any:
+    from .._context import get_current_turn
+
+    return get_current_turn()
+
+
+def _current_ifc_labels(auth_context: AuthContext | None) -> Any:
+    """Read live labels from this exact request, including fork-visible updates."""
+    if auth_context is None:
+        return None
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    if not callable(current):
+        return None
+    active_ctx = _get_current_turn_context()
+    if (
+        active_ctx is not None
+        and getattr(active_ctx, "auth_context", None) is not None
+        and getattr(active_ctx.auth_context, "ifc_state", None) is state
+    ):
+        labels = getattr(active_ctx, "ifc_labels", None)
+        if labels is not None:
+            try:
+                return current(labels)
+            except Exception:
+                log.exception("ifc_current_state_evaluation_failed")
+                return None
+    try:
+        return current(auth_context.ifc_labels)
+    except Exception:
+        log.exception("ifc_current_state_evaluation_failed")
+        return None
+
+
+def _result_text(result: Any) -> str | None:
+    if isinstance(result, ToolMessage):
+        content = result.content
+        return content if isinstance(content, str) else json.dumps(content, ensure_ascii=True)
+    if isinstance(result, Command):
+        update = getattr(result, "update", None)
+        messages = update.get("messages", ()) if isinstance(update, dict) else ()
+        parts = [text for message in messages if (text := _result_text(message))]
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def _web_search_external_result_text(result: Any) -> str | None:
+    """Return only remote Tavily result fields, never model-authored echoes."""
+    text = _result_text(result)
+    if text is None:
+        return None
+    try:
+        payload = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        return None
+    parts: list[str] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        for key in ("url", "snippet"):
+            value = item.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(parts) if parts else None
+
+
+def _external_result_text(
+    tool_name: str, labels: Any, result: Any, *, failed: bool, policy: Any = None,
+) -> str | None:
+    """Extract only server-attested external-origin result content."""
+    if failed or not getattr(labels, "has_untrusted_active_ingest", False):
+        return None
+    descriptor = _descriptor_for_policy(tool_name, policy)
+    if descriptor is None or not descriptor.result_origin & ResultOriginKind.EXTERNAL:
+        return None
+    if descriptor.result_origin & ResultOriginKind.WEB_SEARCH_FORMAT:
+        return _web_search_external_result_text(result)
+    return _result_text(result)
+
+
+def _fetched_body_url_recorder(
+    auth_context: AuthContext | None,
+) -> Callable[[str], None] | None:
+    """Bind successful fresh fetch bytes to this exact turn's URL state."""
+    if auth_context is None:
+        return None
+
+    def record(text: str) -> None:
+        record_external_ingested_urls(auth_context, text)
+
+    return record
+
+
+def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
+    """Monotonically taint the exact turn and rebind harness egress."""
+    if auth_context is None or added is None:
+        return
+    was_tainted = _live_untrusted_active_ingest(auth_context, auth_context.ifc_labels)
+    if isinstance(auth_context.ifc_state, InformationFlowState):
+        merged, _receipt = auth_context.ifc_state.merge_with_receipt(
+            added, fallback=auth_context.ifc_labels,
+            fresh_untrusted_ingest=getattr(added, "has_untrusted_active_ingest", False),
+        )
+    else:
+        merged = auth_context.ifc_state.merge(added, fallback=auth_context.ifc_labels)
+    if was_tainted is False and _live_untrusted_active_ingest(auth_context, merged) is True:
+        _offer_acp_ingest_trust(auth_context)
+    active_ctx = _get_current_turn_context()
+    if active_ctx is None:
+        return
+    active_auth = getattr(active_ctx, "auth_context", None)
+    if active_auth is not None and active_auth.ifc_state is not auth_context.ifc_state:
+        return
+    from dataclasses import replace
+
+    active_ctx.ifc_labels = merged
+    active_ctx.auth_context = replace(active_auth or auth_context, ifc_labels=merged)
+    emitter = getattr(active_ctx, "turn_event_emitter", None)
+    if emitter is not None:
+        emitter.bind_information_flow(merged, active_ctx.auth_context)
+
+
+def _offer_acp_ingest_trust(auth_context: AuthContext | None) -> None:
+    """Schedule a server-originated permission; no model argument chooses its outcome."""
+    from ..trust_approval import operator_ingest_allowed
+    from .client_provider import get_turn_capability_context
+
+    if not operator_ingest_allowed(auth_context, surface="acp"):
+        return
+    context = get_turn_capability_context()
+    broker = getattr(context, "permission_broker", None)
+    loop = getattr(broker, "permission_owner_loop", None)
+    if broker is None or loop is None or not loop.is_running():
+        return
+
+    def schedule() -> None:
+        if not broker._is_current():
+            return
+        task = loop.create_task(broker.offer_ingest_trust(auth_context))
+        broker.permission_tasks.add(task)
+        task.add_done_callback(broker.permission_tasks.discard)
+
+    loop.call_soon_threadsafe(schedule)
+
+
+def _merge_result_labels_from_result(
+    auth_context: AuthContext | None,
+    added: Any,
+    result: Any,
+    *,
+    tool_name: str,
+    failed: bool,
+    policy: Any = None,
+) -> None:
+    """Record URLs only from server-attested external result sources, then merge."""
+    if auth_context is not None and added is not None:
+        text = _external_result_text(tool_name, added, result, failed=failed, policy=policy)
+        if text is not None:
+            record_external_ingested_urls(auth_context, text)
+    _merge_result_labels(auth_context, added)
+
+
+def _result_labels_for_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    auth_context: AuthContext | None,
+    authorization: ToolAuthorization,
+    *,
+    result: Any = None,
+    provenance: Any = None,
+    policy_refusal: ToolPolicyRefusal | None = None,
+    failed: bool = False,
+    operator_declared_shell: bool = False,
+    retained_receipt: Any = None,
+) -> Any:
+    if not failed and tool_name == "repo_checkout" and auth_context is not None:
+        original_scope = authorization.repo_pr_action_scope
+        repository = arguments.get("repository")
+        pull_request = arguments.get("pull_request")
+        cache = auth_context.server_discovered_pr_states
+        discovered = cache.resolve(repository, pull_request) if (
+            cache is not None and isinstance(repository, str) and type(pull_request) is int
+        ) else None
+        state = discovered
+        if state is None and auth_context.repo_pr_scope_registry is not None:
+            state = auth_context.repo_pr_scope_registry.resolve(repository, pull_request)
+        current_scope = state.action_scope if state is not None else None
+        if (
+            original_scope is not None
+            and current_scope is not None
+            and original_scope.canonical_repo == current_scope.canonical_repo
+            and original_scope.pr_number == current_scope.pr_number
+        ):
+            # Checkout may revalidate a stale poller snapshot while it executes.
+            # Label the returned bytes with the scope that actually produced them.
+            from dataclasses import replace
+
+            authorization = replace(
+                authorization, repo_pr_action_scope=current_scope,
+            )
+    labels = classify_protected_result(
+        tool_name,
+        arguments,
+        auth_context,
+        authorization,
+        result=result,
+        provenance=provenance,
+        policy_refusal=policy_refusal,
+        failed=failed,
+        retained_receipt=retained_receipt,
+    )
+    if operator_declared_shell and labels is not None:
+        from dataclasses import replace
+
+        from ..models import SourceLabel
+
+        source = next((item for item in labels.sources if item.domain == "shell"), None)
+        if source is None:
+            principal = getattr(auth_context, "canonical_principal", None)
+            source = SourceLabel(
+                principal=principal, domain="shell", resource_id="shell_exec",
+                bridge_instance=getattr(auth_context, "bridge_instance", None),
+                sensitivity="internal", authorized_principals=(
+                    frozenset({principal}) if principal else frozenset()
+                ), source_kind="protected_tool", integrity="untrusted",
+                integrity_effect="active_ingest",
+            )
+        else:
+            source = replace(source, integrity_effect="active_ingest")
+        labels = labels.with_source(source)
+    return labels
+
+
+def _is_admin_sensitive_tool(
+    tool_name: str,
+    ctx: AuthContext | None = None,
+    target_channel: str | None = None,
+) -> bool:
+    """Return whether the live decision surface requires a privileged check."""
+    auth = get_tool_registry().authorize_tool(
+        tool_name,
+        ctx,
+        enforce=bool(ctx is not None and ctx.enforcement_enabled),
+        target_channel=target_channel,
+    )
+    return auth.required_tier.value == "admin" or not auth.allowed
+
+
+def _admin_denial_message(
+    tool_name: str,
+    reason: str | None,
+    detail: str | None = None,
+    *,
+    principal_is_admin: bool = False,
+    target: str | None = None,
+) -> str:
+    # A shell-profile refusal is a command-shape problem, not a privilege
+    # problem: no identity can run the command as written. Leading with
+    # "requires an admin identity" and appending the real cause gives two
+    # incompatible diagnoses and keeps pointing the caller at an identity
+    # change, which is the failure mode this exists to remove. So when a detail
+    # identifies the actual refusal, it replaces the admin wording rather than
+    # trailing it — and the enforced path then reads identically to the
+    # argv-binding path, which is the same refusal seen at a different gate.
+    if reason == "write_blocked_by_untrusted_ingest":
+        from ..access_control import _TAINTED_WRITE_REFUSAL
+        return _TAINTED_WRITE_REFUSAL
+    reason_text = f" ({reason})" if reason else ""
+    if detail:
+        return f"{tool_name} was refused before execution{reason_text}: {detail}"
+    if reason == "ifc_label_blocked:file" and target:
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        resolved = _resolve_file_tool_target(target)
+        if home and resolved is not None and any(
+            resolved.is_relative_to(Path(home).resolve() / root)
+            for root in ("memory", "state")
+        ):
+            return (
+                f"{tool_name} was refused before execution{reason_text}: "
+                "information-flow policy blocked this durable memory write. "
+                "Untrusted content must not be written to memory/ or state/ "
+                "(including state/wiki/). Ask the operator to open a fresh user "
+                "turn, or open a PR for content that belongs in the repository."
+            )
+    if reason and reason.startswith("ifc_label_blocked:"):
+        return (
+            f"{tool_name} was refused before execution{reason_text}: "
+            "information-flow policy blocked this call."
+        )
+    # An identity requirement the caller already satisfies cannot explain a denial.
+    if principal_is_admin:
+        return f"{tool_name} was refused before execution{reason_text}."
+    return (
+        f"{tool_name} requires an admin identity{reason_text}. "
+        "The tool call was refused before execution."
+    )
+
+
+def _env_access_control_enforced() -> bool:
+    return env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False)
+
+
+def _turn_has_http_event_ingress(ctx: Any) -> bool:
+    ingress = getattr(ctx, "event_ingress", None)
+    return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
+def _admin_identity_fields(ctx: Any | None) -> tuple[str | None, str | None, list[str]]:
+    if ctx is None:
+        return None, None, []
+
+    return (
+        getattr(ctx, "principal", None),
+        getattr(ctx, "canonical_principal", None),
+        list(getattr(ctx, "roles", ()) or ()),
+    )
+
+
+def _deny_admin_tool(
+    tool_name: str,
+    reason: str,
+    *,
+    ctx: Any | None,
+    enforcement_enabled: bool,
+    target: Any = None,
+    detail: str | None = None,
+) -> str:
+    author, canonical_author, roles = _admin_identity_fields(ctx)
+    _emit_event_sync(
+        "admin_tool_call_denied",
+        tool=tool_name,
+        allowed=False,
+        status="denied",
+        required_tier="admin",
+        denial_reason=reason,
+        author=author,
+        canonical_author=canonical_author,
+        roles=roles,
+        enforcement_enabled=enforcement_enabled,
+    )
+    _emit_event_sync(
+        "tool_call_denied",
+        tool=tool_name,
+        reason=reason,
+        required_tier="admin",
+        author=author,
+        canonical_author=canonical_author,
+    )
+    if reason == _HTTP_EVENT_ADMIN_DENIAL_REASON:
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="http_event_ingress",
+            reason=reason,
+            target=target,
+            auth_context=ctx if isinstance(ctx, AuthContext) else None,
+        )
+    # ``reason`` stays the machine key on both events; the prose detail is for
+    # the caller's tool result only, so the audit stream keeps grouping cleanly.
+    message = _admin_denial_message(
+        tool_name, reason, detail, principal_is_admin="admin" in roles,
+        target=target,
+    )
+    if reason == "write_blocked_by_untrusted_ingest":
+        from ..access_control import _tainted_write_sources
+
+        identifiers = _tainted_write_sources(ctx, _current_ifc_labels(ctx))
+        if identifiers["sources"]:
+            sources = ", ".join(
+                f"{source['domain']}: {source['resource_id']}"
+                for source in identifiers["sources"]
+            )
+            rest = identifiers["remaining_sources"]
+            message += f" Untrusted sources: {sources}"
+            message += f" (+{rest} more)" if rest else "."
+    service = get_trusted_service_from_auth_context(ctx) if isinstance(ctx, AuthContext) else None
+    if tool_name == "shell_exec" and service is not None and not detail:
+        message = f"shell_exec was refused before execution ({reason})."
+    message = _with_author_attestation_note(message, reason, ctx)
+    return _service_shell_refusal_guidance(message, tool_name, service)
+
+
+def _check_admin_authorized(
+    tool_name: str,
+    ctx: Any | None = None,
+    target_channel: str | None = None,
+    ifc_labels: Any = None,
+    mcp_tool: Any = None,
+    arguments: dict[str, Any] | None = None,
+    *,
+    operator_shell_binding: OperatorShellBinding | None = None,
+    operator_shell_refusal: str | None = None,
+    operator_shell_request_identity: Any = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
+    tool_call_id: str | None = None,
+) -> str | None:
+    _, denial = _authorize_tool_call(
+        tool_name,
+        ctx,
+        target_channel,
+        ifc_labels,
+        mcp_tool,
+        arguments,
+        operator_shell_binding=operator_shell_binding,
+        operator_shell_refusal=operator_shell_refusal,
+        operator_shell_request_identity=operator_shell_request_identity,
+        operator_shell_audit=operator_shell_audit,
+        tool_call_id=tool_call_id,
+    )
+    return denial
+
+
+def _authorize_tool_call(
+    tool_name: str,
+    ctx: Any | None = None,
+    target_channel: str | None = None,
+    ifc_labels: Any = None,
+    mcp_tool: Any = None,
+    arguments: dict[str, Any] | None = None,
+    *,
+    operator_shell_binding: OperatorShellBinding | None = None,
+    operator_shell_refusal: str | None = None,
+    operator_shell_request_identity: Any = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
+    tool_call_id: str | None = None,
+    client_authorized_host_execution: ClientAuthorizedHostExecution | None = None,
+    request_identity: Any = None,
+    policy: Any = None,
+) -> tuple[ToolAuthorization, str | None]:
+    """Return the exact authorization and any middleware denial text."""
+    enforce = (
+        bool(getattr(ctx, "enforcement_enabled", False))
+        if ctx is not None
+        else _env_access_control_enforced()
+    )
+    operator_parameters = {}
+    if operator_shell_request_identity is not None:
+        operator_parameters = {
+            "operator_shell_binding": operator_shell_binding,
+            "operator_shell_refusal": operator_shell_refusal,
+            "operator_shell_request_identity": operator_shell_request_identity,
+            "operator_shell_audit": operator_shell_audit,
+            "tool_call_id": tool_call_id,
+        }
+    client_parameters = {}
+    if client_authorized_host_execution is not None:
+        client_parameters = {
+            "client_authorized_host_execution": client_authorized_host_execution,
+            "request_identity": request_identity,
+        }
+    policy_parameters = {"policy": policy} if policy is not None else {}
+    auth = get_tool_registry().authorize_tool(
+        tool_name,
+        ctx,
+        enforce=enforce,
+        target_channel=target_channel,
+        ifc_labels=ifc_labels,
+        mcp_tool=mcp_tool,
+        arguments=arguments,
+        **policy_parameters,
+        **client_parameters,
+        **operator_parameters,
+    )
+    # Generic HTTP credentials authenticate transport only.  Check operation
+    # class before compatibility-mode shadow allowances: resource-scoped and
+    # unknown calls are non-open even when their shadow decision says allowed.
+    if (
+        ctx is not None
+        and _turn_has_http_event_ingress(ctx)
+        and auth.decision is not OperationDecision.OPEN
+    ):
+        return auth, _deny_admin_tool(
+            tool_name,
+            _HTTP_EVENT_ADMIN_DENIAL_REASON,
+            ctx=ctx,
+            enforcement_enabled=enforce,
+            target=target_channel,
+        )
+
+    privileged = auth.required_tier.value == "admin" or not auth.allowed
+    if not privileged:
+        return auth, None
+
+    if ctx is None and enforce:
+        return auth, _deny_admin_tool(
+            tool_name,
+            "missing_auth_context",
+            ctx=None,
+            enforcement_enabled=True,
+        )
+
+    if auth.allowed:
+        return auth, None
+    return auth, _deny_admin_tool(
+        tool_name,
+        auth.reason or "admin_required",
+        ctx=ctx,
+        enforcement_enabled=enforce,
+        detail=auth.refusal_detail,
+        target=target_channel or (arguments or {}).get("file_path") or (arguments or {}).get("path"),
+    )
+
+
+def _bounded_tool_event_error(error: str) -> str:
+    if len(error) <= _TOOL_EVENT_ERROR_LIMIT:
+        return error
+    remaining = _TOOL_EVENT_ERROR_LIMIT - len(_TOOL_EVENT_ELISION)
+    head_length = remaining // 2
+    return error[:head_length] + _TOOL_EVENT_ELISION + error[-(remaining - head_length):]
+
+
+def _tool_event_arguments(arguments: Mapping[str, Any] | None) -> dict[str, Any]:
+    if arguments is None:
+        return {}
+    from ..redaction import redact_payload
+
+    summary: dict[str, Any] = {}
+    for key in _TOOL_EVENT_ARGUMENT_ALLOWLIST:
+        if key not in arguments:
+            continue
+        value = redact_payload(arguments[key])
+        if isinstance(value, str):
+            summary[key] = value[:_TOOL_EVENT_ARGUMENT_VALUE_LIMIT]
+        elif value is None or isinstance(value, (bool, int, float)):
+            summary[key] = value
+        else:
+            summary[key] = str(value)[:_TOOL_EVENT_ARGUMENT_VALUE_LIMIT]
+    return summary
+
+
+def _emit_tool_call_sync(
+    tool_name: str,
+    *,
+    ok: bool,
+    duration_ms: float | None = None,
+    error: str | None = None,
+    denied: bool = False,
+    arguments: dict[str, Any] | None = None,
+    operator_shell_audit: Mapping[str, str] | None = None,
+    exception_class: str | None = None,
+) -> None:
+    payload = {"tool": tool_name, "ok": ok}
+    argument_summary = (
+        {} if operator_shell_audit is not None else _tool_event_arguments(arguments)
+    )
+    if operator_shell_audit is not None:
+        payload.update(operator_shell_audit)
+    if argument_summary:
+        payload["arguments"] = argument_summary
+    if duration_ms is not None:
+        payload["duration_ms"] = round(duration_ms, 3)
+    if error:
+        payload["error"] = (
+            "operator_shell_tool_error"
+            if operator_shell_audit is not None
+            else _bounded_tool_event_error(error)
+        )
+    if denied:
+        payload["denied"] = True
+    if exception_class is not None:
+        payload["exception_class"] = exception_class
+    _emit_event_sync("tool_call", **payload)
+    if operator_shell_audit is not None and "declared_executable" in operator_shell_audit:
+        _emit_event_sync(
+            "operator_declared_shell_exec",
+            executable=operator_shell_audit["declared_executable"],
+            subcommand_path=operator_shell_audit["subcommand_path"],
+            option_names=operator_shell_audit["option_names"],
+            taint_source_domains=operator_shell_audit["taint_source_domains"],
+            outcome="refused" if denied else "success" if ok else "error",
+        )
+    if not ok:
+        error_payload = {"tool": tool_name}
+        if operator_shell_audit is not None:
+            error_payload.update(operator_shell_audit)
+        if argument_summary:
+            error_payload["arguments"] = argument_summary
+        if error:
+            error_payload["error"] = (
+                "operator_shell_tool_error"
+                if operator_shell_audit is not None
+                else _bounded_tool_event_error(error)
+            )
+        if denied:
+            error_payload["denied"] = True
+        if exception_class is not None:
+            error_payload["exception_class"] = exception_class
+        # The companion ``tool_call(ok=false)`` event owns the dashboard's
+        # error numerator. Mark this branch as paired so consumers that read
+        # both event types don't double-count the same failed invocation.
+        error_payload["paired_tool_call"] = True
+        _emit_event_sync("tool_error", **error_payload)
+
+
+def _execute_declassification_action(
+    request: ToolCallRequest,
+    auth_context: AuthContext | None,
+    arguments: dict[str, Any] | None,
+) -> ToolMessage:
+    arguments = arguments or {}
+    turn = _get_current_turn_context()
+    approved, outcome = approve_live_declassification(
+        auth_context,
+        turn_id=getattr(turn, "turn_id", None),
+        sink_category=arguments.get("sink_category"),
+        destination=arguments.get("destination"),
+        reason=arguments.get("reason"),
+    )
+    content = (
+        "One-use declassification approved for the exact destination."
+        if approved
+        else f"approve_declassification denied: {outcome}"
+    )
+    _emit_tool_call_sync(
+        "approve_declassification",
+        ok=approved,
+        error=None if approved else content,
+        denied=not approved,
+    )
+    return ToolMessage(
+        content=content,
+        tool_call_id=_tool_call_id(request),
+        name="approve_declassification",
+        status="success" if approved else "error",
+    )
+
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def _returned_value_is_error(tool_name: str, content: Any, *, policy: Any = None) -> bool:
+    """Recognize required typed-result fields for tools not yet returning typed errors."""
+    text = content if isinstance(content, str) else str(content)
+    if tool_name not in _TYPED_ERROR_SIGNAL_TOOLS and text.startswith(
+        (f"{tool_name} failed", f"{tool_name} refused", f"{tool_name} timed out")
+    ):
+        return True
+    if tool_name == "worklink_resume" and text.startswith((
+        "worklink_resume shed:", "worklink_resume refused:", "worklink_resume failed:",
+    )):
+        return True
+
+    if tool_name == "spawn_open_code":
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(value, dict)
+            and _SPAWN_OPEN_CODE_RESULT_FIELDS.issubset(value)
+            and value.get("status") in _SPAWN_OPEN_CODE_ERROR_STATUSES
+        )
+
+    expected_fields: frozenset[str] | None = None
+    descriptor = _descriptor_for_policy(tool_name, policy)
+    if descriptor is not None and descriptor.git_operation_result:
+        expected_fields = _GIT_OPERATION_RESULT_FIELDS
+    elif tool_name == "repo_test":
+        expected_fields = _PROJECT_TEST_RESULT_FIELDS
+    if expected_fields is None:
+        return False
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(value, dict)
+        and expected_fields.issubset(value)
+        and value.get("ok") is False
+    )
+
+
+def _result_is_error(tool_name: str, result: ToolMessage | Command, *, policy: Any = None) -> bool:
+    if isinstance(result, ToolMessage):
+        return (
+            getattr(result, "status", None) == "error"
+            or _returned_value_is_error(tool_name, getattr(result, "content", ""), policy=policy)
+        )
+    update = getattr(result, "update", None)
+    messages = update.get("messages", ()) if isinstance(update, dict) else ()
+    return any(
+        isinstance(message, ToolMessage)
+        and (
+            getattr(message, "status", None) == "error"
+            or _returned_value_is_error(tool_name, getattr(message, "content", ""), policy=policy)
+        )
+        for message in messages
+    )
+
+
+def _result_error_text(result: ToolMessage | Command) -> str | None:
+    if not isinstance(result, ToolMessage):
+        return None
+    content = getattr(result, "content", "")
+    text = content if isinstance(content, str) else str(content)
+    return text[:500] if text else None
+
+
+def _tool_refusal_message(request: ToolCallRequest, tool_name: str, exc: ToolException) -> ToolMessage:
+    """Return an explicit tool refusal to the model without masking faults."""
+    return ToolMessage(
+        content=str(exc),
+        tool_call_id=_tool_call_id(request),
+        name=tool_name,
+        status="error",
+    )
+
+
+def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
+    """Return a prohibition message if this bash call is prohibited, else None."""
+    if not is_bash_tool(tool_name):
+        return None
+    tc = getattr(request, "tool_call", None) or {}
+    args = tc.get("args") if isinstance(tc, dict) else None
+    command = None
+    if isinstance(args, dict):
+        if tool_name == "hands_python":
+            command = args.get("code")
+        else:
+            command = next(
+                (args[name] for name in ("command", "cmd", "script") if name in args),
+                None,
+            )
+    if not isinstance(command, str) or not command.strip():
+        if tool_name == "hands_python":
+            return (
+                "PROHIBITED_ACTION: hands_python tool call has no non-empty string "
+                "code argument; refused because it cannot be screened"
+            )
+        return (
+            "PROHIBITED_ACTION: shell tool call has no non-empty string "
+            "command, cmd, or script argument; refused because it cannot be screened"
+        )
+    return check_prohibited_bash(command)
+
+
+_ACP_DELIVERY_INSTRUCTION = (
+    "Return the final answer through the ACP prompt response/update bridge; "
+    "send_message is unavailable on ACP turns."
+)
+_ACP_SEND_MESSAGE_REFUSAL = (
+    "send_message is unavailable on ACP turns; use the ACP bridge"
+)
+_INGEST_TRUST_CLEARED_INSTRUCTION = (
+    "The human operator cleared the reviewed untrusted ingest for this session. "
+    "The refused tool call was not executed; you may retry it explicitly."
+)
+_PERMISSION_REASON_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,200}\Z")
+
+
+def _tool_surface_name(tool: Any) -> str | None:
+    if isinstance(tool, dict):
+        name = tool.get("name")
+        if not isinstance(name, str):
+            function = tool.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+        return name if isinstance(name, str) else None
+    name = getattr(tool, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def _request_for_acp_model(request: Any) -> Any:
+    context = get_turn_capability_context()
+    if context is None or context.acp_delivery is not True:
+        return request
+    excluded = {"send_message"}
+    if context.profile_policy is not MIMIR_HANDS_V1:
+        excluded.update({"hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"})
+    tools = [
+        tool for tool in (getattr(request, "tools", None) or [])
+        if _tool_surface_name(tool) not in excluded
+    ]
+    system_message = getattr(request, "system_message", None)
+    if system_message is None:
+        from langchain_core.messages import SystemMessage
+
+        system_message = SystemMessage(content=_ACP_DELIVERY_INSTRUCTION)
+    else:
+        content = getattr(system_message, "content", "")
+        if isinstance(content, str):
+            content = f"{content}\n\n{_ACP_DELIVERY_INSTRUCTION}" if content else _ACP_DELIVERY_INSTRUCTION
+        elif isinstance(content, list):
+            content = [*content, {"type": "text", "text": _ACP_DELIVERY_INSTRUCTION}]
+        else:
+            from langchain_core.messages import SystemMessage
+
+            system_message = SystemMessage(content=_ACP_DELIVERY_INSTRUCTION)
+            content = None
+        if content is not None:
+            system_message = system_message.model_copy(update={"content": content})
+    return request.override(tools=tools, system_message=system_message)
+
+
+def _request_with_ingest_trust_notice(request: Any) -> Any:
+    """Tell the running model about a completed server-originated human decision."""
+    turn = _get_current_turn_context()
+    if turn is None or not getattr(turn, "trust_cleared_notice", False):
+        return request
+    auth = getattr(turn, "auth_context", None)
+    turn.trust_cleared_notice = False
+    if _live_untrusted_active_ingest(auth, getattr(turn, "ifc_labels", None)) is not False:
+        return request  # New ingest after the acknowledgement has re-tainted it.
+    from langchain_core.messages import SystemMessage
+
+    system_message = getattr(request, "system_message", None)
+    if system_message is None:
+        system_message = SystemMessage(content=_INGEST_TRUST_CLEARED_INSTRUCTION)
+    else:
+        content = system_message.content
+        if isinstance(content, str):
+            content = f"{content}\n\n{_INGEST_TRUST_CLEARED_INSTRUCTION}"
+        elif isinstance(content, list):
+            content = [*content, {"type": "text", "text": _INGEST_TRUST_CLEARED_INSTRUCTION}]
+        else:
+            return request
+        system_message = system_message.model_copy(update={"content": content})
+    return request.override(system_message=system_message)
+
+
+def _malformed_arguments_refusal(
+    request: ToolCallRequest, tool_name: str,
+) -> ToolMessage:
+    message = f"{tool_name} arguments are malformed"
+    _emit_tool_call_sync(tool_name, ok=False, error=message, denied=True)
+    return ToolMessage(
+        content=message,
+        tool_call_id=_tool_call_id(request),
+        name=tool_name,
+        status="error",
+    )
+
+
+def _acp_send_message_refusal(
+    request: ToolCallRequest, tool_name: str,
+) -> ToolMessage | None:
+    context = get_turn_capability_context()
+    if (
+        tool_name != "send_message"
+        or context is None
+        or context.acp_delivery is not True
+    ):
+        return None
+    _emit_tool_call_sync(
+        tool_name, ok=False, error=_ACP_SEND_MESSAGE_REFUSAL, denied=True,
+        arguments=_validated_arguments(request),
+    )
+    return ToolMessage(
+        content=_ACP_SEND_MESSAGE_REFUSAL,
+        tool_call_id=_tool_call_id(request),
+        name=tool_name,
+        status="error",
+    )
+
+
+def _admitted_admin_hands_candidate(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+    arguments: dict[str, Any] | None,
+) -> bool:
+    context = get_turn_capability_context()
+    policy = context.profile_policy.tool(tool_name) if context is not None and context.profile_policy is MIMIR_HANDS_V1 else None
+    lease = getattr(context, "lease", None)
+    return (
+        tool_name in {"hands_edit", "hands_shell", "hands_python"}
+        and isinstance(arguments, dict)
+        and auth_context is not None
+        and auth_context.enforcement_enabled is True
+        and not auth_context.is_service
+        and isinstance(auth_context.principal, str)
+        and bool(auth_context.principal)
+        and isinstance(auth_context.canonical_principal, str)
+        and bool(auth_context.canonical_principal)
+        and "admin" in (auth_context.roles or ())
+        and context is not None
+        and context.acp_delivery is True
+        and policy is not None
+        and policy.operation == "client_authorized_host_execution"
+        and policy.classification == "admin_required"
+        and policy.flow == "both"
+        and policy.sink in {"external_mcp", "shell_process"}
+        and context.provider is not None
+        and getattr(context.provider, "closed", False) is False
+        and context.permission_broker is not None
+        and callable(getattr(context.permission_broker, "request_permission", None))
+        and lease is not None
+        and getattr(lease, "closed", True) is False
+        and getattr(lease, "generation", None) == context.connection_generation
+        and getattr(lease, "epoch", None) == context.prompt_epoch
+        and bool(_tool_call_id(request))
+    )
+
+
+def _permission_eligibility(
+    request: ToolCallRequest,
+    tool_name: str,
+    authorization: ToolAuthorization,
+    arguments: dict[str, Any] | None,
+    host_execution: ClientAuthorizedHostExecution | None = None,
+) -> tuple[Any, PermissionEligibility, tuple[Any, ...]] | None:
+    # The hosted provider asks the editor about one exact path after routing.
+    # Wrapper permission would incorrectly create a reusable execution grant.
+    if tool_name == "hands_request_scope":
+        return None
+    context = get_turn_capability_context()
+    if context is None:
+        return None
+    requires_admin = (
+        authorization.required_tier is AccessTier.ADMIN
+        or tool_name in {"hands_edit", "hands_shell", "hands_python"}
+    )
+    if not requires_admin:
+        return None
+    lease = context.lease
+    checks = (
+        ("authorization verdict", (
+            ("enforcement_enabled", authorization.enforcement_enabled is True),
+            ("allowed", authorization.allowed is True),
+            ("is_shadow_decision", authorization.is_shadow_decision is False),
+            ("would_block", authorization.would_block is False),
+            ("decision", authorization.decision is OperationDecision.ADMIN_REQUIRED),
+            ("required_tier", authorization.required_tier is AccessTier.ADMIN),
+        )),
+        ("capability-context wiring", (
+            ("acp_delivery", context.acp_delivery is True),
+            ("profile_policy", context.profile_policy is MIMIR_HANDS_V1),
+            ("provider_present", context.provider is not None),
+            ("provider_open", getattr(context.provider, "closed", False) is False),
+            ("permission_broker_present", context.permission_broker is not None),
+            ("request_permission_callable", callable(
+                getattr(context.permission_broker, "request_permission", None)
+            )),
+        )),
+        ("lease currency", (
+            ("lease_present", lease is not None),
+            ("lease_open", getattr(lease, "closed", True) is False),
+            ("lease_generation", getattr(lease, "generation", None) == context.connection_generation),
+            ("lease_epoch", getattr(lease, "epoch", None) == context.prompt_epoch),
+        )),
+        ("argument shape", (
+            ("arguments_dict", isinstance(arguments, dict)),
+        )),
+    )
+    failures = [
+        f"{group} failed ({', '.join(name for name, passed in group_checks if not passed)})"
+        for group, group_checks in checks
+        if not all(passed for _, passed in group_checks)
+    ]
+    if failures:
+        if any(group == "authorization verdict" and not all(
+            passed for _, passed in group_checks
+        ) for group, group_checks in checks):
+            failures.append(_permission_authorization_diagnostic(authorization))
+        raise ToolException(
+            f"{tool_name} permission eligibility refused: {'; '.join(failures)}"
+        )
+    if host_execution is not None and not client_authorized_host_execution_matches(
+        host_execution,
+        request_identity=request,
+        auth_context_identity=_auth_context_from_request(request),
+        wrapper_name=tool_name,
+    ):
+        raise ToolException(
+            f"{tool_name} permission eligibility refused: trusted host execution missing or stale"
+        )
+    if (
+        host_execution is not None
+        and client_authorized_host_execution_metadata(host_execution) is None
+    ):
+        raise ToolException(
+            f"{tool_name} permission eligibility refused: live IFC state is indeterminate"
+        )
+    provider = context.provider
+    peer = getattr(provider, "peer", None)
+    transport = getattr(peer, "transport", None) if peer is not None else None
+    snapshot = (
+        context,
+        context.profile_policy,
+        provider,
+        context.permission_broker,
+        lease,
+        context.connection_generation,
+        context.prompt_epoch,
+        peer,
+        transport,
+    )
+    if not _permission_context_is_current(snapshot):
+        raise ToolException(_permission_snapshot_refusal(tool_name))
+    return context.permission_broker, PermissionEligibility(
+        tool_call_id=_tool_call_id(request),
+        title=tool_name,
+        kind="other",
+        arguments=arguments,
+        host_execution=host_execution,
+    ), snapshot
+
+
+def _permission_authorization_diagnostic(authorization: ToolAuthorization) -> str:
+    decision = authorization.decision
+    decision_value = decision.value if isinstance(decision, OperationDecision) else "[INVALID]"
+    reason = authorization.reason
+    if reason is None:
+        reason_value = "none"
+    elif isinstance(reason, str):
+        reason_value = redact_text(reason)
+        if not _PERMISSION_REASON_KEY_RE.fullmatch(reason_value):
+            reason_value = "[REDACTED]"
+    else:
+        reason_value = "[INVALID]"
+
+    def verdict(value: Any) -> str:
+        return str(value).lower() if isinstance(value, bool) else "[INVALID]"
+
+    return (
+        "authorization "
+        f"decision={decision_value} reason={reason_value} "
+        f"allowed={verdict(authorization.allowed)} "
+        f"would_block={verdict(authorization.would_block)}"
+    )
+
+
+def _permission_snapshot_refusal(tool_name: str) -> str:
+    return f"{tool_name} permission context snapshot was stale"
+
+
+def _permission_context_is_current(snapshot: tuple[Any, ...]) -> bool:
+    context, profile, provider, broker, lease, generation, epoch, peer, transport = snapshot
+    current = get_turn_capability_context()
+    current_peer = getattr(provider, "peer", None)
+    current_transport = getattr(current_peer, "transport", None) if current_peer is not None else None
+    if (
+        current is not context
+        or current.profile_policy is not profile
+        or current.provider is not provider
+        or current.permission_broker is not broker
+        or current.lease is not lease
+        or current.connection_generation != generation
+        or current.prompt_epoch != epoch
+        or current.acp_delivery is not True
+        or getattr(lease, "closed", True) is not False
+        or getattr(lease, "generation", None) != generation
+        or getattr(lease, "epoch", None) != epoch
+        or getattr(provider, "closed", False) is not False
+        or current_peer is not peer
+        or current_transport is not transport
+    ):
+        return False
+    for candidate in (peer, transport):
+        if candidate is not None and getattr(candidate, "closed", False) is not False:
+            return False
+        is_closing = getattr(candidate, "is_closing", None)
+        if callable(is_closing):
+            try:
+                if is_closing():
+                    return False
+            except Exception:
+                return False
+    is_current = getattr(broker, "_is_current", None)
+    if callable(is_current):
+        try:
+            if not is_current():
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _discard_permission_awaitable(awaitable: Any) -> None:
+    if isinstance(awaitable, asyncio.Future):
+        if awaitable.done():
+            return
+        loop = awaitable.get_loop()
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            awaitable.cancel()
+        elif loop.is_running() and not loop.is_closed():
+            loop.call_soon_threadsafe(awaitable.cancel)
+        elif not loop.is_closed():
+            awaitable.cancel()
+        return
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        close()
+    cancel = getattr(awaitable, "cancel", None)
+    if callable(cancel):
+        cancel()
+
+
+def _permission_denial_message(tool_name: str) -> str:
+    return f"{tool_name} permission was rejected by the operator before execution"
+
+
+def _permission_failure_message(tool_name: str, failure: str) -> str:
+    return f"{tool_name} permission request {failure}; execution denied"
+
+
+def _permission_not_requested_message(tool_name: str) -> str:
+    return f"{tool_name} permission request never reached an operator; execution denied"
+
+
+def _owner_loop_for_permission_broker(broker: Any) -> asyncio.AbstractEventLoop | None:
+    loop = getattr(broker, "permission_owner_loop", None)
+    if (
+        isinstance(loop, asyncio.AbstractEventLoop)
+        and loop.is_running()
+        and not loop.is_closed()
+    ):
+        return loop
+    for attribute in ("prompt_handler", "model_task", "exact_event_forwarder"):
+        task = getattr(broker, attribute, None)
+        if isinstance(task, asyncio.Task) and not task.done():
+            loop = task.get_loop()
+            if loop.is_running() and not loop.is_closed():
+                return loop
+    return None
+
+
+def _request_permission_sync(
+    request: ToolCallRequest,
+    tool_name: str,
+    authorization: ToolAuthorization,
+    arguments: dict[str, Any] | None,
+    host_execution: ClientAuthorizedHostExecution | None = None,
+) -> str | None:
+    try:
+        eligible = _permission_eligibility(
+            request, tool_name, authorization, arguments, host_execution,
+        )
+    except ToolException as exc:
+        return str(exc)
+    if eligible is None:
+        return None
+    broker, eligibility, snapshot = eligible
+    loop = _owner_loop_for_permission_broker(broker)
+    if loop is None:
+        return _permission_failure_message(tool_name, "has no live owner loop")
+    try:
+        if asyncio.get_running_loop() is loop:
+            return _permission_failure_message(tool_name, "would block its owner loop")
+    except RuntimeError:
+        pass
+    coroutine: Any = None
+    future: Any = None
+    try:
+        coroutine = broker.request_permission(eligibility)
+        if not inspect.iscoroutine(coroutine):
+            return _permission_failure_message(tool_name, "returned a non-coroutine")
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        # Human review lasts for the prompt lifetime; the broker owns teardown.
+        decision = future.result()
+        if decision in {PermissionDecision.ALLOW_ONCE, PermissionDecision.ALLOW_SESSION}:
+            if _permission_context_is_current(snapshot):
+                return None
+            return _permission_snapshot_refusal(tool_name)
+        if decision is PermissionDecision.REJECT_ONCE:
+            return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.NOT_REQUESTED:
+            return _permission_not_requested_message(tool_name)
+        if decision is PermissionDecision.CANCELLED:
+            return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
+        return _permission_failure_message(tool_name, "returned an invalid decision")
+    except concurrent.futures.TimeoutError:
+        return _permission_failure_message(tool_name, "timed out while waiting for the operator")
+    except (concurrent.futures.CancelledError, asyncio.CancelledError):
+        return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
+    except Exception:
+        return _permission_failure_message(tool_name, "failed")
+    finally:
+        if future is None:
+            _discard_permission_awaitable(coroutine)
+        else:
+            future.cancel()
+        coroutine = None
+
+
+async def _request_permission_async(
+    request: ToolCallRequest,
+    tool_name: str,
+    authorization: ToolAuthorization,
+    arguments: dict[str, Any] | None,
+    host_execution: ClientAuthorizedHostExecution | None = None,
+) -> str | None:
+    try:
+        eligible = _permission_eligibility(
+            request, tool_name, authorization, arguments, host_execution,
+        )
+    except ToolException as exc:
+        return str(exc)
+    if eligible is None:
+        return None
+    broker, eligibility, snapshot = eligible
+    awaitable: Any = None
+    task: asyncio.Task[Any] | None = None
+    propagate_cancellation = False
+    try:
+        awaitable = broker.request_permission(eligibility)
+        if not inspect.iscoroutine(awaitable):
+            return _permission_failure_message(tool_name, "returned a non-coroutine")
+        task = asyncio.create_task(awaitable)
+        # Match the thread-based path: only prompt teardown withdraws the wait.
+        decision = await task
+        if decision in {PermissionDecision.ALLOW_ONCE, PermissionDecision.ALLOW_SESSION}:
+            if _permission_context_is_current(snapshot):
+                return None
+            return _permission_snapshot_refusal(tool_name)
+        if decision is PermissionDecision.REJECT_ONCE:
+            return _permission_denial_message(tool_name)
+        if decision is PermissionDecision.NOT_REQUESTED:
+            return _permission_not_requested_message(tool_name)
+        if decision is PermissionDecision.CANCELLED:
+            return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
+        return _permission_failure_message(tool_name, "returned an invalid decision")
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        propagate_cancellation = current is not None and current.cancelling() > 0
+        if not propagate_cancellation:
+            return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
+    except TimeoutError:
+        return _permission_failure_message(tool_name, "timed out while waiting for the operator")
+    except Exception:
+        return _permission_failure_message(tool_name, "failed")
+    finally:
+        if task is None:
+            _discard_permission_awaitable(awaitable)
+        else:
+            task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+        awaitable = None
+    if propagate_cancellation:
+        raise asyncio.CancelledError
+    return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
+
+
+@dataclass(frozen=True)
+class _ToolCallReview:
+    request: ToolCallRequest
+    tool_name: str
+    auth_context: AuthContext | None
+    arguments: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _PreparedToolCall:
+    request: ToolCallRequest
+    execution_request: ToolCallRequest
+    tool_name: str
+    auth_context: AuthContext | None
+    arguments: dict[str, Any]
+    authorization: Any
+    operator_shell_preparation: _OperatorShellPreparation | None
+    operator_shell_audit: dict[str, Any] | None
+    host_execution: ClientAuthorizedHostExecution | None
+    started: float
+    policy: Any = None
+
+
+@dataclass
+class _ToolExecutionCapture:
+    execution_id: str = field(default_factory=lambda: secrets.token_hex(16))
+    review_claim: Any = None
+    direct_argv_token: Any = None
+    capture_token: Any = None
+    provenance: Any = None
+    read_refusal_token: Any = None
+    policy_refusal: ToolPolicyRefusal | None = None
+    fetch_token: Any = None
+    fetched_body_recorder_token: Any = None
+    retained_receipt: Any = None
+
+
+def _prepare_tool_call_review(
+    request: ToolCallRequest,
+) -> _ToolCallReview | ToolMessage:
+    tool_name = _tool_name_from_request(request)
+    send_message_refusal = _acp_send_message_refusal(request, tool_name)
+    if send_message_refusal is not None:
+        return send_message_refusal
+    if _hands_has_caller_reserved_arguments(request, tool_name):
+        return _malformed_arguments_refusal(request, tool_name)
+    auth_context = _auth_context_from_request(request)
+    request = _strip_server_only_shell_args(request)
+    repeated_refusal = _operator_shell_recorded_refusal(request)
+    if repeated_refusal is not None:
+        return repeated_refusal
+    request = _request_with_resolved_service_write_path(
+        request, tool_name, auth_context,
+    )
+    request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
+    arguments = _validated_arguments(request)
+    raw_arguments = (getattr(request, "tool_call", None) or {}).get("args", {})
+    if arguments is None and (
+        not isinstance(raw_arguments, dict) or tool_name.startswith("hands_")
+    ):
+        return _malformed_arguments_refusal(request, tool_name)
+    return _ToolCallReview(request, tool_name, auth_context, arguments)
+
+
+def _tool_call_refusal(
+    call: _ToolCallReview,
+    refusal: str,
+    *,
+    arguments: dict[str, Any] | None,
+    operator_shell_audit: dict[str, Any] | None = None,
+    record_outcome: bool = False,
+) -> ToolMessage:
+    if record_outcome:
+        _record_tool_outcome(call.tool_name, refused_reason=refusal)
+    _emit_tool_call_sync(
+        call.tool_name, ok=False, error=refusal, denied=True,
+        arguments=arguments, operator_shell_audit=operator_shell_audit,
+    )
+    return ToolMessage(
+        content=refusal, tool_call_id=_tool_call_id(call.request),
+        name=call.tool_name, status="error",
+    )
+
+
+def _prepare_tool_call_execution(
+    call: _ToolCallReview,
+    review_denial: str | None,
+    *,
+    include_jev: bool = True,
+    jev_candidates: list[str] | None = None,
+    policy: Any = None,
+) -> _PreparedToolCall | ToolMessage | Command:
+    request = call.request
+    tool_name = call.tool_name
+    auth_context = call.auth_context
+    arguments = call.arguments
+    if review_denial is not None:
+        return _tool_call_refusal(
+            call, review_denial, arguments=arguments, record_outcome=True,
+        )
+    if arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+        return _tool_call_refusal(
+            call, _argument_validation_refusal(request), arguments=None,
+            record_outcome=True,
+        )
+    target_channels = _extract_sink_targets(request, auth_context, policy)
+    if not target_channels:
+        target_channels = [None]
+    hands_candidate = _admitted_admin_hands_candidate(
+        request, tool_name, auth_context, arguments,
+    )
+    if tool_name in {"hands_edit", "hands_shell", "hands_python"} and not hands_candidate:
+        return _tool_call_refusal(
+            call,
+            f"{tool_name} requires an admitted admin ACP Hands principal",
+            arguments=arguments,
+        )
+    ifc_labels = _current_ifc_labels(auth_context)
+    if (tool_name in {"hands_edit", "hands_shell", "hands_python"}
+            and _live_untrusted_active_ingest(auth_context, ifc_labels) is True):
+        _offer_acp_ingest_trust(auth_context)
+    operator_shell_preparation = _prepare_operator_shell_execution(
+        request, tool_name, auth_context, ifc_labels,
+    )
+    operator_shell_audit = _operator_shell_audit_summary(operator_shell_preparation)
+
+    authorization = None
+    admin_denial = None
+    for target_channel in (() if hands_candidate else target_channels):
+        target_authorization, admin_denial = _authorize_tool_call(
+            tool_name,
+            auth_context,
+            target_channel,
+            ifc_labels,
+            getattr(request, "tool", None),
+            arguments,
+            policy=policy,
+            operator_shell_binding=(
+                operator_shell_preparation.binding
+                if operator_shell_preparation is not None
+                else None
+            ),
+            operator_shell_refusal=(
+                operator_shell_preparation.refusal
+                if operator_shell_preparation is not None
+                else None
+            ),
+            operator_shell_request_identity=(
+                request if operator_shell_preparation is not None else None
+            ),
+            operator_shell_audit=operator_shell_audit,
+            tool_call_id=(
+                _tool_call_id(request)
+                if operator_shell_preparation is not None
+                else None
+            ),
+        )
+        if authorization is None:
+            authorization = target_authorization
+        if admin_denial is not None:
+            break
+    hard_refusal = _operator_shell_hard_refusal(
+        request, operator_shell_preparation, auth_context,
+    )
+    if hard_refusal is not None:
+        return hard_refusal
+    mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+        request, operator_shell_preparation, auth_context,
+    )
+    if mutation_refusal is not None:
+        return mutation_refusal
+    if admin_denial is not None:
+        if (authorization is not None
+                and authorization.reason == "write_blocked_by_untrusted_ingest"):
+            _offer_acp_ingest_trust(auth_context)
+            from ..trust_approval import register_chat_request
+
+            request_id = register_chat_request(_get_current_turn_context(), auth_context)
+            if request_id is not None:
+                admin_denial += (f" A server-owned trust request ({request_id}) was posted; "
+                                 "the refused call was not executed. After trust, retry it explicitly.")
+        if (
+            operator_shell_preparation is not None
+            and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+            and authorization.reason == "ifc_label_blocked:shell_process"
+        ):
+            admin_denial = (
+                authorization.refusal_detail
+                if not auth_context.enforcement_enabled and authorization.refusal_detail
+                else _operator_shell_live_taint_refusal(auth_context)
+            )
+            admin_denial = _with_author_attestation_note(
+                admin_denial, "ifc_label_blocked:shell_process", auth_context,
+            ) if not auth_context.enforcement_enabled else admin_denial
+            _operator_shell_recorded_refusal(
+                request, record=True, audit=operator_shell_audit, refusal=admin_denial,
+            )
+        return _tool_call_refusal(
+            call, admin_denial, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+    registered = _plugin_tool(tool_name, policy)
+    if (registered is not None and registered.resource_scope == "repo_pr"
+            and (authorization is None or authorization.reason is not None
+                 or authorization.would_block or not authorization.allowed)):
+        _emit_hard_boundary_denied(
+            tool=tool_name, boundary="scoped_pr_grant",
+            reason=getattr(authorization, "reason", None) or "repo_pr_scope_denied",
+            auth_context=auth_context,
+        )
+        return _tool_call_refusal(
+            call, "scoped PR grant refused before execution", arguments=None,
+            record_outcome=True,
+        )
+    if arguments is None:
+        return _tool_call_refusal(
+            call, _argument_validation_refusal(request), arguments=None,
+            operator_shell_audit=operator_shell_audit, record_outcome=True,
+        )
+    registered = _plugin_tool(tool_name, policy)
+    if registered is not None and registered.descriptor is not None:
+        fetch_kind = registered.descriptor.fetch_authorization
+        if fetch_kind is not FetchAuthorizationKind.NONE:
+            target = _extract_sink_target(request, auth_context, policy)
+            allowed_urls = _authorized_fetch_urls_for_tool(
+                tool_name, auth_context, target, policy,
+            )
+            normalized = (
+                normalize_sink_destination(SinkCategory.NETWORK, target)
+                if isinstance(target, str) else None
+            )
+            if normalized is None or allowed_urls is None or normalized not in allowed_urls:
+                return _tool_call_refusal(
+                    call, "fetch destination is not approved", arguments=None,
+                    record_outcome=True,
+                )
+    if tool_name == "approve_declassification":
+        denial = _check_and_increment_or_deny(tool_name, policy=policy)
+        if denial is not None:
+            return _tool_call_refusal(call, denial, arguments=arguments)
+        return _execute_declassification_action(request, auth_context, arguments)
+
+    try:
+        privacy_refusal = _outbound_privacy_refusal(
+            tool_name,
+            arguments,
+            auth_context,
+            include_jev=include_jev,
+            jev_candidates=jev_candidates,
+            policy=policy,
+        )
+    except Exception as exc:
+        exception_type = type(exc).__name__
+        log.error(
+            "Outbound privacy internal error for %s: %s",
+            tool_name,
+            exception_type,
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason="outbound_privacy_internal_error",
+            target=None,
+            auth_context=auth_context,
+            event_fields={"exception_type": exception_type},
+        )
+        privacy_refusal = (
+            "Outbound privacy refused this tool call because the local content "
+            "check failed. Retry only after the scanner is healthy."
+        )
+    if privacy_refusal is not None:
+        return _tool_call_refusal(call, privacy_refusal, arguments=None)
+
+    selected = policy if policy is not None else selected_policy_registry()
+    validated_mcp = (
+        tool_name.startswith("mcp_") and getattr(request, "tool", None) is not None
+        and authorization is not None and authorization.decision is not OperationDecision.UNKNOWN
+        and not authorization.would_block
+    )
+    if tool_name not in selected.tools and not validated_mcp:
+        return _tool_call_refusal(
+            call, f"{tool_name} was refused before execution (unknown_operation).",
+            arguments=None, record_outcome=True,
+        )
+
+    # This is an accident deterrent, not a security boundary; see #259.
+    prohibition = _check_prohibited(tool_name, request)
+    if prohibition is not None:
+        _emit_event_sync(
+            "prohibited_action_blocked",
+            tool=tool_name,
+            reason=(
+                "prohibited_action"
+                if operator_shell_audit is not None
+                else prohibition[:200]
+            ),
+            **(operator_shell_audit or {}),
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="prohibited_action_guard",
+            reason="prohibited_action",
+            target=(
+                None
+                if operator_shell_audit is not None
+                else _extract_sink_target(request, auth_context, policy)
+            ),
+            auth_context=auth_context,
+            event_fields=(
+                dict(operator_shell_audit)
+                if operator_shell_audit is not None
+                else None
+            ),
+        )
+        return _tool_call_refusal(
+            call, prohibition, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+
+    host_execution = None
+    if hands_candidate:
+        host_execution = issue_client_authorized_host_execution(
+            request_identity=request,
+            auth_context_identity=auth_context,
+            wrapper_name=tool_name,
+            tainted=_live_untrusted_active_ingest(auth_context, ifc_labels) is True,
+        )
+        for target_channel in target_channels:
+            target_authorization, admin_denial = _authorize_tool_call(
+                tool_name,
+                auth_context,
+                target_channel,
+                ifc_labels,
+                getattr(request, "tool", None),
+                arguments,
+                client_authorized_host_execution=host_execution,
+                request_identity=request,
+            )
+            if authorization is None:
+                authorization = target_authorization
+            if admin_denial is not None:
+                break
+        if admin_denial is not None:
+            return _tool_call_refusal(call, admin_denial, arguments=arguments)
+
+    denial = _check_and_increment_or_deny(
+        tool_name,
+        target=_extract_sink_target(request, auth_context, policy),
+        auth_context=auth_context,
+        operator_shell_audit=operator_shell_audit,
+        policy=policy,
+    )
+    if denial is not None:
+        return _tool_call_refusal(
+            call, denial, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+
+    # Delegation inherits the monotonic IFC carrier only after all gates admit it.
+    active_ctx = _get_current_turn_context()
+    descriptor = _descriptor_for_policy(tool_name, policy)
+    if active_ctx is not None and descriptor is not None and descriptor.ifc_delegation:
+        from ..agent import _propagate_ifc_labels
+
+        propagated = _propagate_ifc_labels(
+            active_ctx.ifc_labels,
+            getattr(auth_context, "channel_id", None),
+            auth_context,
+            derived_by=tool_name,
+        )
+        _merge_result_labels(auth_context, propagated)
+    started = time.monotonic()
+    # A consumed one-time grant admits this exact open-shell call. Do not
+    # re-apply the operator's soft-unbound refusal after authorization.
+    approved_unbound = (
+        operator_shell_preparation is not None
+        and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+        and isinstance(authorization, ToolAuthorization)
+        and authorization.reason == "ifc_declassification_approved"
+        and not auth_context.enforcement_enabled
+    )
+    if approved_unbound:
+        operator_shell_preparation = None
+    execution_request = (
+        _request_for_authorized_execution(
+            request,
+            tool_name,
+            auth_context,
+            operator_shell_preparation=operator_shell_preparation,
+        )
+        if operator_shell_preparation is not None
+        else _request_for_authorized_execution(request, tool_name, auth_context)
+    )
+    service_shell_refusal = _service_shell_refusal(execution_request)
+    if service_shell_refusal is not None:
+        if service_shell_refusal == _OPERATOR_SHELL_LIVE_TAINT_REFUSAL:
+            service_shell_refusal = _operator_shell_live_taint_refusal(auth_context)
+            _operator_shell_recorded_refusal(
+                request, record=True, audit=operator_shell_audit,
+                refusal=service_shell_refusal,
+            )
+        _record_tool_outcome(
+            tool_name,
+            refused_reason=service_shell_refusal,
+            **(
+                {"operator_shell_audit": operator_shell_audit}
+                if operator_shell_audit is not None
+                else {}
+            ),
+        )
+        return _tool_call_refusal(
+            call, service_shell_refusal, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+    return _PreparedToolCall(
+        request=request,
+        execution_request=execution_request,
+        tool_name=tool_name,
+        auth_context=auth_context,
+        arguments=arguments,
+        authorization=authorization,
+        operator_shell_preparation=operator_shell_preparation,
+        operator_shell_audit=operator_shell_audit,
+        host_execution=host_execution,
+        started=started,
+        policy=policy,
+    )
+
+
+def _review_submission_for_call(call: _PreparedToolCall) -> Any:
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.review_submission(call.execution_request)
+    if getattr(selected, "_projected_owner", None) is not None and call.tool_name in {
+        "shell_exec", "bash_async", "Bash", "bash", "pr_submit_review",
+    }:
+        raise ToolException("selected review submission guard unavailable")
+    if call.tool_name not in {"shell_exec", "bash_async", "Bash", "bash", "pr_submit_review"}:
+        return None
+    if call.tool_name == "pr_submit_review":
+        return None
+    args = call.execution_request.tool_call.get("args") or {}
+    direct = args.get("mimir_direct_argv")
+    command = args.get("command")
+    possible_gh = (
+        isinstance(direct, list) and len(direct) >= 3
+        and isinstance(direct[0], str) and Path(direct[0]).name == "gh"
+        and direct[1:3] == ["pr", "review"]
+    ) or (
+        isinstance(command, str) and re.search(
+            r"(?:^|[\s;&|])(?:[^\s;&|]*/)?gh\s+pr\s+review(?:\s|$)", command,
+        ) is not None
+    )
+    if possible_gh:
+        raise ToolException("GitHub review submission guard unavailable")
+    return None
+
+
+def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any:
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.claim_review(spec)
+    if getattr(selected, "_projected_owner", None) is not None:
+        raise ToolException("selected review submission guard unavailable")
+    raise ToolException("GitHub review submission guard unavailable")
+
+
+def _begin_tool_execution(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+) -> ToolMessage | None:
+    mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+        call.request, call.operator_shell_preparation, call.auth_context,
+    )
+    if mutation_refusal is not None:
+        return mutation_refusal
+    direct_argv = call.execution_request.tool_call.get("args", {}).get(
+        "mimir_direct_argv"
+    )
+    operator_direct_argv = (
+        list(call.operator_shell_preparation.binding.argv)
+        if call.operator_shell_preparation is not None
+        and call.operator_shell_preparation.outcome is OperatorShellPreparationOutcome.BOUND
+        and call.operator_shell_preparation.binding is not None
+        else None
+    )
+    if operator_direct_argv is not None:
+        from ._shell_env import bind_direct_exec_argv
+
+        preparation = call.operator_shell_preparation
+        capture.direct_argv_token = bind_direct_exec_argv(
+            operator_direct_argv,
+            command=call.request.tool_call["args"].get("command", ""),
+            declared=((preparation.declaration,) if preparation.declaration is not None else ()),
+            operator_declared=preparation.declaration is not None,
+        )
+    elif call.tool_name in {"shell_exec", "bash_async"} and isinstance(direct_argv, list):
+        from ._shell_env import bind_direct_exec_argv
+
+        service = get_trusted_service_from_auth_context(call.auth_context)
+        capture.direct_argv_token = bind_direct_exec_argv(
+            direct_argv,
+            command=call.request.tool_call["args"].get("command", ""),
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        )
+    from ..access_control import begin_protected_result_capture
+
+    capture.capture_token = begin_protected_result_capture()
+    from ..read_policy import begin_read_policy_refusal_capture
+
+    capture.read_refusal_token = begin_read_policy_refusal_capture()
+    authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+        call.tool_name,
+        call.auth_context,
+        _extract_sink_target(call.request, call.auth_context, call.policy),
+        call.policy,
+    )
+    if authorized_fetch_urls is not None:
+        from .web import begin_authorized_fetch
+
+        capture.fetch_token = begin_authorized_fetch(authorized_fetch_urls)
+    descriptor = _descriptor_for_policy(call.tool_name, call.policy)
+    if (
+        descriptor is not None
+        and descriptor.fetch_authorization is FetchAuthorizationKind.FETCH_URL
+    ):
+        from .web import begin_fetched_body_recording
+
+        capture.fetched_body_recorder_token = begin_fetched_body_recording(
+            _fetched_body_url_recorder(call.auth_context),
+        )
+    if capture.review_claim is not None and capture.review_claim.duplicate:
+        return _duplicate_review_result(call.request, capture.review_claim)
+    return None
+
+
+def _permission_refusal(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+    refusal: str | None,
+) -> ToolMessage | None:
+    if refusal is None:
+        return None
+    if capture.review_claim is not None:
+        capture.review_claim.release()
+    _emit_tool_call_sync(
+        call.tool_name, ok=False, error=refusal, denied=True,
+        arguments=call.arguments,
+    )
+    return ToolMessage(
+        content=refusal, tool_call_id=_tool_call_id(call.request),
+        name=call.tool_name, status="error",
+    )
+
+
+def _soft_live_execution_refusal(call: _PreparedToolCall) -> ToolMessage | None:
+    return _operator_shell_soft_live_refusal(
+        call.request,
+        call.operator_shell_preparation,
+        call.auth_context,
+        started=call.started,
+    )
+
+
+def _finish_result_captures(
+    capture: _ToolExecutionCapture,
+    *,
+    keep_policy_refusal: bool,
+) -> None:
+    if capture.capture_token is not None:
+        from ..access_control import end_protected_result_capture
+
+        capture.provenance = end_protected_result_capture(capture.capture_token)
+        capture.capture_token = None
+    if capture.read_refusal_token is not None:
+        from ..read_policy import end_read_policy_refusal_capture
+
+        refusal = end_read_policy_refusal_capture(capture.read_refusal_token)
+        if keep_policy_refusal:
+            capture.policy_refusal = refusal
+        capture.read_refusal_token = None
+
+
+def _end_tool_execution(capture: _ToolExecutionCapture) -> None:
+    if capture.review_claim is not None:
+        capture.review_claim.release()
+    if capture.direct_argv_token is not None:
+        from ._shell_env import reset_direct_exec_argv
+
+        reset_direct_exec_argv(capture.direct_argv_token)
+    if capture.fetch_token is not None:
+        from .web import end_authorized_fetch
+
+        end_authorized_fetch(capture.fetch_token)
+    if capture.fetched_body_recorder_token is not None:
+        from .web import end_fetched_body_recording
+
+        end_fetched_body_recording(capture.fetched_body_recorder_token)
+    _finish_result_captures(capture, keep_policy_refusal=True)
+
+
+def _finish_tool_exception(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+    exc: Exception,
+) -> ToolMessage | None:
+    is_tool_refusal = isinstance(exc, ToolException)
+    _finish_result_captures(capture, keep_policy_refusal=is_tool_refusal)
+    if isinstance(exc, ToolPolicyRefusal):
+        _record_tool_outcome(
+            call.tool_name,
+            refused_reason=str(exc),
+            **(
+                {"operator_shell_audit": call.operator_shell_audit}
+                if call.operator_shell_audit is not None
+                else {}
+            ),
+        )
+        _merge_result_labels(call.auth_context, None)
+    elif is_tool_refusal:
+        result_labels = _result_labels_for_call(
+            call.tool_name,
+            call.arguments,
+            call.auth_context,
+            call.authorization,
+            result=exc,
+            provenance=capture.provenance,
+            failed=True,
+            operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
+        )
+        _merge_result_labels_from_result(
+            call.auth_context, result_labels, exc,
+            tool_name=call.tool_name, failed=True, policy=call.policy,
+        )
+    else:
+        result_labels = _result_labels_for_call(
+            call.tool_name,
+            call.arguments,
+            call.auth_context,
+            call.authorization,
+            provenance=capture.provenance,
+            failed=True,
+            operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
+        )
+        _merge_result_labels(call.auth_context, result_labels)
+    emit_kwargs: dict[str, Any] = {
+        "ok": False,
+        "duration_ms": (time.monotonic() - call.started) * 1000.0,
+        "error": str(exc),
+        "arguments": call.arguments,
+        "operator_shell_audit": call.operator_shell_audit,
+    }
+    if is_tool_refusal:
+        emit_kwargs["denied"] = True
+    _emit_tool_call_sync(call.tool_name, **emit_kwargs)
+    if is_tool_refusal:
+        return _tool_refusal_message(call.request, call.tool_name, exc)
+    return None
+
+
+def _finish_tool_result(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+    result: ToolMessage | Command,
+    *,
+    exception_class: str | None = None,
+) -> ToolMessage | Command:
+    is_error = _result_is_error(call.tool_name, result, policy=call.policy)
+    result_labels = _result_labels_for_call(
+        call.tool_name,
+        call.arguments,
+        call.auth_context,
+        call.authorization,
+        result=result,
+        provenance=capture.provenance,
+        policy_refusal=capture.policy_refusal,
+        failed=is_error,
+        retained_receipt=capture.retained_receipt,
+        operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
+    )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        return lease_refusal
+    _merge_result_labels_from_result(
+        call.auth_context, result_labels, result,
+        tool_name=call.tool_name, failed=is_error, policy=call.policy,
+    )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
+    _emit_tool_call_sync(
+        call.tool_name,
+        ok=not is_error,
+        duration_ms=(time.monotonic() - call.started) * 1000.0,
+        error=_result_error_text(result) if is_error else None,
+        arguments=call.arguments,
+        operator_shell_audit=call.operator_shell_audit,
+        exception_class=exception_class,
+    )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
+    if not is_error:
+        _record_tool_outcome(call.tool_name, policy=call.policy)
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
+    return result
+
+
+def _scoped_pr_checkout_call(call: _PreparedToolCall) -> bool:
+    registered = _plugin_tool(call.tool_name, call.policy)
+    protocol = (call.policy.scoped_actions.get(registered.owner)
+                if registered is not None and call.policy is not None else None)
+    return (
+        registered is not None and protocol is not None
+        and registered.resource_scope == "repo_pr"
+        and registered.typed_action is protocol.checkout_action
+        and (getattr(protocol, "checkout_tool", None) is None
+             or registered.name == protocol.checkout_tool)
+    )
+
+
+def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
+    """Revalidate turn authority and the owner's live lease after permission waits."""
+    registered = _plugin_tool(call.tool_name, call.policy)
+    if registered is None or registered.resource_scope != "repo_pr":
+        return None
+    from ..access_control import _is_registered_retained_scope
+
+    if _is_registered_retained_scope(call.authorization.repo_pr_action_scope):
+        if _retained_dispatch_scope(call) is not None:
+            return None
+        return _tool_call_refusal(
+            call, "retained factory scope refused before execution", arguments=None,
+            record_outcome=True,
+        )
+    from ..access_control import _valid_scoped_pr_grant
+
+    protocol = (call.policy.scoped_actions.get(registered.owner)
+                if call.policy is not None else None)
+    scope = getattr(call.authorization, "repo_pr_action_scope", None)
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (
+        discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+        if discovered is not None else None
+    )
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if (state is None or state.action_scope is not scope
+            or not _valid_scoped_pr_grant(
+                call.auth_context, registered.owner, registered.typed_action,
+                protocol, scope, state, tool_name=call.tool_name,
+            )):
+        _emit_hard_boundary_denied(
+            tool=call.tool_name, boundary="scoped_pr_grant",
+            reason="repo_pr_grant_denied", auth_context=call.auth_context,
+        )
+        return _tool_call_refusal(
+            call, "scoped PR grant refused before execution", arguments=None,
+            record_outcome=True,
+        )
+    return None
+
+
+def _retained_dispatch_scope(call: _PreparedToolCall) -> Any:
+    from ..access_control import _is_registered_retained_scope, _is_worklink_retained_checkout_service
+
+    scope = getattr(call.authorization, "repo_pr_action_scope", None)
+    registered = _plugin_tool(call.tool_name, call.policy)
+    service = get_trusted_service_from_auth_context(call.auth_context)
+    if (
+        not _is_registered_retained_scope(scope)
+        or scope is not getattr(call.auth_context, "retained_factory_scope", None)
+        or registered is None or "retained_repo_tools" not in registered.memberships
+        or registered.resource_scope != "repo_pr"
+        or not call.authorization.allowed
+        or call.authorization.would_block
+        or call.authorization.decision != OperationDecision.RESOURCE_SCOPED
+        or not _is_worklink_retained_checkout_service(service, auth_context=call.auth_context)
+        or call.arguments.get("repository") != scope.repository
+        or call.arguments.get("pull_request") != scope.issue_id
+    ):
+        return None
+    return scope
+
+
+@contextmanager
+def _retained_execution(call: _PreparedToolCall):
+    scope = _retained_dispatch_scope(call)
+    if scope is None:
+        yield None
+        return
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise ToolException("retained factory home unavailable")
+    selected_lease = getattr(call.policy, "retained_effect_lease", None)
+    if selected_lease is not None:
+        from ..access_control import _host_retained_invocation
+
+        owner, lease_callback, _runner = selected_lease
+        if owner != "cultivate":
+            raise ToolException("retained factory lease owner mismatch")
+        with lease_callback(Path(home), scope) as lease:
+            if lease.scope is not scope:
+                raise ToolException(lease.refusal_reason or "retained factory lease unavailable")
+            with _host_retained_invocation(scope, call.auth_context):
+                yield scope
+        return
+    raise ToolException("retained factory lease provider unavailable")
+
+
+def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCapture,
+                              scope: Any, result: Any) -> None:
+    if scope is None or not isinstance(result, ToolMessage):
+        return
+    content = result.content
+    if not isinstance(content, (str, bytes)):
+        return
+    if result.tool_call_id != _tool_call_id(call.request):
+        return
+    from ..access_control import _RetainedResultReceipt, _retained_checkout_binding
+
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    registered = _plugin_tool(call.tool_name, selected)
+    if registered is None or "retained_repo_tools" not in registered.memberships:
+        return
+    binding = _retained_checkout_binding(scope)
+    if binding is None:
+        return
+    head, lease_identity = binding
+    capture.retained_receipt = _RetainedResultReceipt(
+        call.tool_name, call.auth_context, scope, result,
+        _result_is_error(call.tool_name, result, policy=selected), selected,
+        execution_id=capture.execution_id, head=head,
+        lease_identity=lease_identity,
+    )
+
+
+def _consume_scoped_pr_checkout(call: _PreparedToolCall) -> object | None:
+    from ..access_control import consume_scoped_pr_checkout
+
+    scope = call.authorization.repo_pr_action_scope
+    registered = _plugin_tool(call.tool_name, call.policy)
+    return scope is not None and registered is not None and consume_scoped_pr_checkout(
+        call.auth_context, scope, registered.owner,
+    )
+
+
+def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: object) -> bool:
+    if _result_is_error(call.tool_name, result, policy=call.policy):
+        return True
+    from ..access_control import observe_scoped_pr_checkout
+
+    scope = call.authorization.repo_pr_action_scope
+    registered = _plugin_tool(call.tool_name, call.policy)
+    protocol = call.policy.scoped_actions.get(registered.owner) if registered is not None else None
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request")) if discovered is not None else None
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if state is not None and state.action_scope is not scope:
+        return False
+    if _stopped_pr_checkout_result(result) and state is not None and state.checkout_lease is None:
+        # Consuming the checkout grant is final; a stopped preflight issues no
+        # follow-on grants and must never be observed as an acquired lease.
+        return True
+    return scope is not None and state is not None and observe_scoped_pr_checkout(
+        call.auth_context, scope, state, token, registered.owner, protocol,
+    )
+
+
+def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
+    """Pin the live checkout through result classification, not just execution."""
+    if not call.tool_name.startswith("repo_") or call.tool_name == "repo_cleanup":
+        return
+    retained = getattr(call.auth_context, "retained_factory_scope", None)
+    if (retained is not None
+            and call.arguments.get("repository") == retained.repository
+            and call.arguments.get("pull_request") == retained.issue_id):
+        return
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None:
+        return
+    if call.tool_name == "repo_checkout":
+        stack.enter_context(hold_pr_checkout_acquisition())
+        return
+    registered = _plugin_tool(call.tool_name, call.policy)
+    if registered is not None and registered.resource_scope != "repo_pr":
+        return
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+             if discovered is not None else None)
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if state is None or state.action_scope is not scope:
+        raise ToolPolicyRefusal("scoped PR checkout state changed before dispatch")
+    lease = state.checkout_lease
+    if lease is None:
+        if registered is None:
+            return
+        raise ToolPolicyRefusal("scoped PR checkout lease is unavailable")
+    try:
+        stack.enter_context(_hold_observed_pr_checkout_lease(lease))
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ToolPolicyRefusal("scoped PR checkout lease is no longer live") from exc
+
+
+def _stopped_pr_checkout_result(result: Any) -> bool:
+    """Recognize the checkout tool's typed, non-error stop, not its prose."""
+    if not isinstance(result, ToolMessage) or result.status == "error" or not isinstance(result.content, str):
+        return False
+    try:
+        value = json.loads(result.content)
+    except ValueError:
+        return False
+    return (
+        isinstance(value, dict)
+        and set(value) == {"status", "message", "guidance"}
+        and value["status"] == "stopped"
+        and isinstance(value["message"], str) and bool(value["message"])
+        and isinstance(value["guidance"], str) and bool(value["guidance"])
+    )
+
+
+def _scoped_pr_lease_observation_refusal(
+    call: _PreparedToolCall, result: Any,
+) -> ToolMessage | None:
+    """Do not classify output against a lease that expired during execution."""
+    if call.tool_name == "repo_cleanup" or not call.tool_name.startswith("repo_"):
+        return None
+    retained = getattr(call.auth_context, "retained_factory_scope", None)
+    if (retained is not None
+            and call.arguments.get("repository") == retained.repository
+            and call.arguments.get("pull_request") == retained.issue_id):
+        return None
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None or (
+        call.tool_name == "repo_checkout"
+        and _result_is_error(call.tool_name, result, policy=call.policy)
+    ):
+        return None
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (
+        discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+        if discovered is not None else None
+    )
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if (
+        call.tool_name == "repo_checkout" and state is not None
+        and state.action_scope is scope and state.checkout_lease is None
+        and _stopped_pr_checkout_result(result)
+    ):
+        return None
+    if (
+        call.tool_name != "repo_checkout" and _plugin_tool(call.tool_name, call.policy) is None
+        and state is not None and state.checkout_lease is None
+    ):
+        # Core's pre-lease refusals are still classified by the core wrapper;
+        # there was no lease for this middleware invocation to hold or observe.
+        return None
+    try:
+        if state is None or state.action_scope is not scope or state.checkout_lease is None:
+            raise RuntimeError("scoped checkout state changed")
+        _assert_observed_pr_checkout_lease(state.checkout_lease)
+        if call.tool_name == "repo_checkout":
+            if Path(state.checkout_lease.lease_root) != Path(
+                os.environ["MIMIR_PR_CHECKOUT_LEASE_ROOT"]
+            ).resolve(strict=True):
+                raise RuntimeError("checkout root changed")
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            json.JSONDecodeError):
+        return _tool_call_refusal(
+            call, "scoped PR checkout lease expired or changed before observation",
+            arguments=None, record_outcome=True,
+        )
+    return None
+
+
+def _taint_expired_pr_result(call: _PreparedToolCall) -> None:
+    """Never leave a late-expired, already merged read as clean turn evidence."""
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None:
+        return
+    from ..access_control import protected_result_source
+
+    _merge_result_labels(call.auth_context, InformationFlowLabels().with_source(protected_result_source(
+        call.auth_context,
+        principal=scope.principal,
+        domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge",
+    )))
+
+
+async def _hold_scoped_pr_dispatch_async(call: _PreparedToolCall, stack: ExitStack) -> None:
+    """Acquire potentially contended root locks without blocking the event loop."""
+    if call.tool_name == "repo_checkout" and call.authorization.repo_pr_action_scope is not None:
+        lock = asyncio.create_task(asyncio.to_thread(lock_pr_checkout_acquisition_root))
+        try:
+            root, fd = await asyncio.shield(lock)
+        except asyncio.CancelledError:
+            # A canceled to_thread keeps running. Take ownership of its fd before
+            # propagating cancellation so no root lock survives this invocation.
+            root, fd = await lock
+            with bind_pr_checkout_acquisition(root, fd):
+                pass
+            raise
+        stack.enter_context(bind_pr_checkout_acquisition(root, fd))
+        return
+    acquisition = asyncio.create_task(
+        asyncio.to_thread(_hold_scoped_pr_dispatch, call, stack)
+    )
+    try:
+        await asyncio.shield(acquisition)
+    except asyncio.CancelledError:
+        await acquisition
+        raise
+
+
+def _task_failure_result(call: _PreparedToolCall, exc: Exception) -> ToolMessage | None:
+    """Keep ordinary subagent failures inside the parent graph, without exposing content."""
+    if call.tool_name != "task" or isinstance(
+        exc, (TimeoutError, GraphBubbleUp, NodeCancelledError, NodeTimeoutError)
+    ):
+        return None
+    from ..quota_pause import is_quota_exhaustion
+
+    if is_quota_exhaustion(exc):
+        return None
+    return ToolMessage(
+        content="Subagent task failed. The parent may continue or try another approach.",
+        tool_call_id=_tool_call_id(call.request),
+        name="task",
+        status="error",
+    )
+
+
+class BudgetGateMiddleware(AgentMiddleware):
+    """Intercept model and tool calls at their exact LangGraph boundaries."""
+
+    def __init__(self, policy: Any = None) -> None:
+        self._policy = policy
+        get_tool_registry().enable_shadow_logging()
+
+    @staticmethod
+    def _available_after_budget(request: Any) -> Any:
+        """Stop advertising spent tools on the next model step.
+
+        Exempt reply tools remain callable; the execution gate still protects
+        stale or fabricated calls and parallel calls already in flight.
+        """
+        state = _resolve_budget_state()
+        if state is None:
+            return request
+        ctx, budget = state
+        if (getattr(ctx, "tool_call_count", 0) or 0) < budget:
+            return request
+        tools = [
+            tool for tool in request.tools
+            if (descriptor := get_tool_descriptor(
+                tool.get("name", "") if isinstance(tool, dict) else getattr(tool, "name", ""),
+            )) is not None and descriptor.budget_exempt
+        ]
+        return request.override(tools=tools)
+
+    def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        request = _request_for_acp_model(request)
+        request = _request_with_ingest_trust_notice(request)
+        request = self._available_after_budget(request)
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[[Any], Awaitable[Any]],
+    ) -> Any:
+        request = _request_for_acp_model(request)
+        request = _request_with_ingest_trust_notice(request)
+        request = self._available_after_budget(request)
+        get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
+        return await handler(request)
+
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command],
+    ) -> ToolMessage | Command:
+        review = _prepare_tool_call_review(request)
+        if isinstance(review, ToolMessage):
+            return review
+        review_denial = _resolve_standing_review(
+            review.tool_name, review.auth_context, review.arguments,
+            **({"policy": self._policy} if self._policy is not None else {}),
+        )
+        call = _prepare_tool_call_execution(review, review_denial, policy=self._policy)
+        if not isinstance(call, _PreparedToolCall):
+            return call
+        capture = _ToolExecutionCapture()
+        checkout_token = None
+        lease_stack = ExitStack()
+        capture_ended = False
+        exception_class = None
+        try:
+            review_spec = _review_submission_for_call(call)
+            if review_spec is not None:
+                capture.review_claim = _claim_review_submission_for_call(call, review_spec)
+            result = _begin_tool_execution(call, capture)
+            if result is None:
+                permission_denial = _request_permission_sync(
+                    call.request, call.tool_name, call.authorization,
+                    call.arguments, call.host_execution,
+                )
+                result = _permission_refusal(call, capture, permission_denial)
+            if result is None:
+                result = _soft_live_execution_refusal(call)
+            if result is None:
+                result = _scoped_pr_dispatch_refusal(call)
+            if result is None:
+                if _scoped_pr_checkout_call(call):
+                    checkout_token = _consume_scoped_pr_checkout(call)
+                    if checkout_token is None:
+                        return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
+                _hold_scoped_pr_dispatch(call, lease_stack)
+                with _retained_execution(call) as retained_scope:
+                    try:
+                        result = handler(call.execution_request)
+                    except ToolException:
+                        raise
+                    except Exception as exc:
+                        result = _task_failure_result(call, exc)
+                        if result is None:
+                            raise
+                        exception_class = type(exc).__name__[:120]
+                    if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
+                        _capture_retained_result(call, capture, retained_scope, result)
+                        _end_tool_execution(capture)
+                        capture_ended = True
+                        return _finish_tool_result(call, capture, result, exception_class=exception_class)
+                if retained_scope is not None:
+                    _capture_retained_result(call, capture, retained_scope, result)
+                lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+                if lease_refusal is not None:
+                    return lease_refusal
+                if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
+                    return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
+            _end_tool_execution(capture)
+            capture_ended = True
+            return _finish_tool_result(call, capture, result, exception_class=exception_class)
+        except ToolException as exc:
+            refusal = _finish_tool_exception(call, capture, exc)
+            if refusal is None:
+                raise RuntimeError(
+                    "ToolException did not produce a refusal result"
+                ) from exc
+            return refusal
+        except Exception as exc:
+            _finish_tool_exception(call, capture, exc)
+            raise
+        finally:
+            if not capture_ended:
+                _end_tool_execution(capture)
+            lease_stack.close()
+
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
+    ) -> ToolMessage | Command:
+        review = _prepare_tool_call_review(request)
+        if isinstance(review, ToolMessage):
+            return review
+        review_denial = await asyncio.to_thread(
+            _resolve_standing_review,
+            review.tool_name,
+            review.auth_context,
+            review.arguments,
+            **({"policy": self._policy} if self._policy is not None else {}),
+        )
+        jev_candidates: list[str] = []
+        call = _prepare_tool_call_execution(
+            review,
+            review_denial,
+            include_jev=False,
+            jev_candidates=jev_candidates,
+            policy=self._policy,
+        )
+        if not isinstance(call, _PreparedToolCall):
+            return call
+        from ..outbound_privacy import jev_detector_enabled
+
+        if jev_candidates and jev_detector_enabled():
+            try:
+                findings, failure_reasons = await asyncio.to_thread(
+                    _scan_outbound_jev,
+                    jev_candidates,
+                )
+                _emit_outbound_jev_events(failure_reasons)
+                privacy_refusal = (
+                    _outbound_privacy_refusal(
+                        call.tool_name,
+                        call.arguments,
+                        call.auth_context,
+                        include_jev=False,
+                        findings_override=findings,
+                        policy=self._policy,
+                    )
+                    if findings
+                    else None
+                )
+            except Exception as exc:
+                exception_type = type(exc).__name__
+                log.error(
+                    "Outbound privacy internal error for %s: %s",
+                    call.tool_name,
+                    exception_type,
+                )
+                _emit_hard_boundary_denied(
+                    tool=call.tool_name,
+                    boundary="outbound_privacy",
+                    reason="outbound_privacy_internal_error",
+                    target=None,
+                    auth_context=call.auth_context,
+                    event_fields={"exception_type": exception_type},
+                )
+                privacy_refusal = (
+                    "Outbound privacy refused this tool call because the local content "
+                    "check failed. Retry only after the scanner is healthy."
+                )
+            if privacy_refusal is not None:
+                return _tool_call_refusal(call, privacy_refusal, arguments=None)
+        capture = _ToolExecutionCapture()
+        checkout_token = None
+        lease_stack = ExitStack()
+        capture_ended = False
+        exception_class = None
+        try:
+            review_spec = _review_submission_for_call(call)
+            if review_spec is not None:
+                capture.review_claim = await _claim_review_submission_async(
+                    lambda: _claim_review_submission_for_call(call, review_spec)
+                )
+            result = _begin_tool_execution(call, capture)
+            if result is None:
+                permission_denial = await _request_permission_async(
+                    call.request, call.tool_name, call.authorization,
+                    call.arguments, call.host_execution,
+                )
+                result = _permission_refusal(call, capture, permission_denial)
+            if result is None:
+                result = _soft_live_execution_refusal(call)
+            if result is None:
+                result = _scoped_pr_dispatch_refusal(call)
+            if result is None:
+                if _scoped_pr_checkout_call(call):
+                    checkout_token = _consume_scoped_pr_checkout(call)
+                    if checkout_token is None:
+                        return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
+                await _hold_scoped_pr_dispatch_async(call, lease_stack)
+                with _retained_execution(call) as retained_scope:
+                    try:
+                        result = await handler(call.execution_request)
+                    except ToolException:
+                        raise
+                    except Exception as exc:
+                        result = _task_failure_result(call, exc)
+                        if result is None:
+                            raise
+                        exception_class = type(exc).__name__[:120]
+                    if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
+                        _capture_retained_result(call, capture, retained_scope, result)
+                        _end_tool_execution(capture)
+                        capture_ended = True
+                        return _finish_tool_result(call, capture, result, exception_class=exception_class)
+                if retained_scope is not None:
+                    _capture_retained_result(call, capture, retained_scope, result)
+                lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+                if lease_refusal is not None:
+                    return lease_refusal
+                if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
+                    return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
+            _end_tool_execution(capture)
+            capture_ended = True
+            return _finish_tool_result(call, capture, result, exception_class=exception_class)
+        except ToolException as exc:
+            refusal = _finish_tool_exception(call, capture, exc)
+            if refusal is None:
+                raise RuntimeError(
+                    "ToolException did not produce a refusal result"
+                ) from exc
+            return refusal
+        except Exception as exc:
+            _finish_tool_exception(call, capture, exc)
+            raise
+        finally:
+            if not capture_ended:
+                _end_tool_execution(capture)
+            lease_stack.close()

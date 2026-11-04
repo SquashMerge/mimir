@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import tomllib
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from jsonschema import FormatChecker
+from jsonschema.validators import validator_for
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DOCS = (ROOT / "docs/acp.md").read_text()
+EXPECTED_MANIFEST = {
+    "id": "mimir",
+    "name": "Mimir",
+    "version": "0.9.11",
+    "description": "Memory-centric AI agent accessible through the Agent Client Protocol.",
+    "repository": "https://github.com/SquashMerge/mimir",
+    "authors": ["Jason Carreira"],
+    "license": "MIT",
+    "distribution": {"uvx": {"package": "mimir-agent==0.9.11", "args": ["acp"]}},
+}
+EXPECTED_ICON = b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13V3l5 5 5-5v10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>\n'
+PROFILE_COMMANDS = [
+    "mimir acp profile add-local PROFILE --home /absolute/server/mimir-home",
+    "mimir acp profile add-ssh PROFILE --home /absolute/server/mimir-home \\",
+    "  --ssh-host host.example --ssh-user mimir --ssh-port 22 \\",
+    "  --identity-file /absolute/id_ed25519 --known-hosts-file /absolute/known_hosts",
+    "mimir acp profile set-timeout PROFILE 60",
+    "mimir acp profile list",
+    "mimir acp profile remove PROFILE",
+    "mimir acp credential add PROFILE",
+    "mimir acp credential replace PROFILE",
+    "mimir acp credential remove PROFILE",
+    "mimir acp credential list",
+    "mimir acp --profile PROFILE",
+]
+QUICK_START_CONSOLE = [
+    "MIMIR_HOME=/absolute/server/mimir-home MIMIR_ACP_ENABLED=true mimir run",
+    "mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin --label CLIENT_NAME",
+    "\n".join(
+        [
+            "mimir acp profile add-local PROFILE --home /absolute/server/mimir-home",
+            "mimir acp credential add PROFILE",
+            "mimir acp profile list",
+            "mimir acp credential list",
+            "command -v uvx",
+        ]
+    ),
+]
+QUICK_START_JETBRAINS = '{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.11","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}'
+
+
+def section(start: str, end: str) -> str:
+    return DOCS.split(start, 1)[1].split(end, 1)[0]
+
+
+def fenced(language: str) -> list[str]:
+    return re.findall(rf"```{language}\n(.*?)\n```", DOCS, re.DOTALL)
+
+
+def test_manifest_exact() -> None:
+    path = ROOT / "registry/mimir/agent.json"
+    manifest = json.loads(path.read_bytes())
+    assert manifest == EXPECTED_MANIFEST
+    assert path.parent.name == manifest["id"]
+    assert "authMethods" not in manifest
+    assert f"uvx {manifest['distribution']['uvx']['package']} {' '.join(manifest['distribution']['uvx']['args'])}" == "uvx mimir-agent==0.9.11 acp"
+
+
+def test_schema_digest_then_validation() -> None:
+    schema_bytes = (ROOT / "registry/schema/agent.schema.json").read_bytes()
+    assert hashlib.sha256(schema_bytes).hexdigest() == "2489443bf21d8211bcd046edeff5931eecca1ee219ffae4efde09e367c5b1236"
+    schema = json.loads(schema_bytes)
+    validator_class = validator_for(schema)
+    validator_class.check_schema(schema)
+    validator_class(schema, format_checker=FormatChecker()).validate(EXPECTED_MANIFEST)
+
+
+def test_schema_provenance_is_recorded_and_matches_the_vendored_bytes() -> None:
+    """The vendored schema records where its bytes came from, not just what they are.
+
+    Upstream serves this schema only from a moving ``latest`` CDN path -- versioned
+    paths 404, and ``agent.schema.json`` is absent from the ``agent-client-protocol``
+    repository at every tag (its ``schema-v*`` tags version the wire protocol schema,
+    not the registry entry schema). So no upstream revision identifies these bytes,
+    and ``immutable_revision`` is recorded as null on purpose rather than omitted.
+    """
+    provenance = json.loads((ROOT / "registry/schema/PROVENANCE.json").read_bytes())
+    schema_bytes = (ROOT / "registry/schema/agent.schema.json").read_bytes()
+
+    assert provenance["sha256"] == hashlib.sha256(schema_bytes).hexdigest()
+    assert provenance["source_url"] == json.loads(schema_bytes)["$id"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", provenance["retrieved_utc"])
+    assert provenance["registry_format_version"] == "1.0.0"
+
+    # Recorded as an explicit null with a stated reason, so a later reader cannot
+    # mistake a missing revision for an oversight.
+    assert "immutable_revision" in provenance
+    assert provenance["immutable_revision"] is None
+    assert provenance["immutable_revision_note"].strip()
+
+
+def test_docs_state_the_candidate_is_not_registry_eligible() -> None:
+    """The manifest omits authMethods, so the docs must say submission is blocked."""
+    assert "not registry-eligible" in DOCS
+    assert "authMethods" in DOCS
+    # Publication and smoke testing must not read as sufficient on their own.
+    assert "do not unlock submission" in DOCS
+    assert "registry/schema/PROVENANCE.json" in DOCS
+
+
+def test_icon_exact() -> None:
+    data = (ROOT / "registry/mimir/icon.svg").read_bytes()
+    assert data == EXPECTED_ICON
+    root = ET.fromstring(data)
+    assert root.attrib["width"] == root.attrib["height"] == "16"
+    assert root.attrib["viewBox"] == "0 0 16 16"
+    assert root.find("{http://www.w3.org/2000/svg}path").attrib["stroke"] == "currentColor"
+
+
+def test_metadata_lock_and_launch_shape() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    lock = tomllib.loads((ROOT / "uv.lock").read_text())
+    assert project["project"]["version"] == "0.9.11"
+    assert project["project"]["optional-dependencies"]["dev"].count("jsonschema==4.26.0") == 1
+    assert project["dependency-groups"]["dev"].count("jsonschema==4.26.0") == 1
+    assert "jsonschema==4.26.0" not in project["project"]["dependencies"]
+    assert project["project"]["scripts"]["mimir-agent"] == "mimir.entrypoint:main"
+    packaging_proof = (ROOT / "tests/test_acp_packaging.py").read_text()
+    installed_proof = (ROOT / ".github/assert_installed_acp.py").read_text()
+    assert '"mimir-agent": "mimir.entrypoint:main"' in packaging_proof
+    assert '"mimir-agent": "mimir.entrypoint:main"' in installed_proof
+    root = next(package for package in lock["package"] if package["name"] == "mimir-agent")
+    assert root["version"] == "0.9.11"
+    assert {item["name"]: item.get("specifier") for item in root["metadata"]["requires-dev"]["dev"]}["jsonschema"] == "==4.26.0"
+    pinned_extra = [item for item in root["metadata"]["requires-dist"] if item["name"] == "jsonschema"]
+    assert pinned_extra == [{"name": "jsonschema", "marker": "extra == 'dev'", "specifier": "==4.26.0"}]
+
+
+def test_topology_daemon_contract() -> None:
+    for text in [
+        "stock ACP client",
+        "local credential-aware `mimir acp` stdio proxy",
+        "public-key-authenticated SSH relay",
+        "owner-only daemon socket",
+        "One already-running `mimir run` daemon owns the brain",
+        "The proxy never creates a standalone runtime.",
+        "ACP is enabled only when `MIMIR_ACP_ENABLED` is explicitly truthy",
+        "`$MIMIR_HOME/.mimir/acp/daemon.sock`",
+        "mode `0700`",
+        "mode `0600`",
+        "UTF-8 JSONL ACP frames only",
+        "diagnostics go to stderr",
+    ]:
+        assert text in DOCS
+
+
+def test_timing_contract() -> None:
+    for text in ["bounded to 5 seconds", "bounded to 12 seconds", "no duration limit", "2, 1, and 1 seconds", "waits 1 second for SSH", "terminates and waits 2 seconds", "kills and waits 1 second"]:
+        assert text in DOCS
+
+
+def test_profile_commands_exact() -> None:
+    blocks = fenced("sh")
+    assert blocks == [
+        "\n".join(PROFILE_COMMANDS),
+        "mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin --label CLIENT_NAME",
+    ]
+    block = blocks[0]
+    assert block.splitlines() == PROFILE_COMMANDS
+    profile_text = section("## Profiles and credentials", "## SSH transport")
+    assert "`MIMIR_ACP_PROFILE` may select a non-secret profile name only; it must never contain a key." in profile_text
+    assert not {"--destination", "--remote-home", "--identity"} & set(re.findall(r"--[a-z-]+", block))
+
+
+def test_quick_start_recipe_and_outcome() -> None:
+    assert DOCS.index("## Quick start") < DOCS.index("## Architecture and daemon")
+    assert fenced("console") == QUICK_START_CONSOLE
+    assert fenced("jsonc") == [QUICK_START_JETBRAINS]
+    text = " ".join(section("## Quick start", "## Architecture and daemon").split())
+    for value in (
+        "Goal: connect an editor to an already-running Mimir daemon and get the first response",
+        "macOS or Linux client with a native OS credential store and `uvx` installed",
+        "matching `mimir-agent` artifact published or provisioned",
+        "initialized Mimir home and configured model",
+        "not evidence that the package is available from PyPI",
+        "Native Mimir file, shell, and memory tools operate on the daemon/server host",
+        "Mimir Hands operates on the editor/client host",
+        "selected editor project and with the local user's authority",
+        "Profiles, credentials, and editor configuration always belong on the client",
+        "Enter the issued key only at the secure credential-enrollment prompt",
+        "Never put it in argv or editor configuration",
+        "local checks only",
+        "do not contact the daemon or validate server credentials",
+        "GUI applications may not inherit the shell's `PATH`",
+        "absolute path printed by `command -v uvx`",
+        "editor lists Mimir, authentication completes, a session opens, Mimir answers a prompt",
+        "invoked tools render with semantic titles",
+    ):
+        assert value in text
+
+
+def test_credentials_auth_and_rotation() -> None:
+    text = section("## Profiles and credentials", "## SSH transport")
+    for value in [
+        "mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin",
+        "without echo",
+        "The raw key exists only in the client's native OS credential store under service `mimir.acp`; the server stores only its hash.",
+        "There is no plaintext or third-party fallback, and enrollment fails if no secure backend exists.",
+        "The raw key must never appear as an SSH password, in `sshpass` or PAM reuse, argv, an environment variable, editor JSON, profile JSON, or registry data.",
+        "`MIMIR_API_KEY` supplies transport/route authority and is not the ACP principal key",
+        "only `methodId`",
+        "protected upstream authenticate request",
+        "non-service admin identity",
+        "Validate enrollment by launching `mimir acp --profile PROFILE` from a stock client and completing its ordinary `authenticate` exchange.",
+        "There is no `credential validate` command or pre-activation validation protocol.",
+    ]:
+        assert value in text
+
+    ordered_rotation = [
+        "1. On the server, run `mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --rotate-only`. It immediately invalidates the old key and prints the new key once.",
+        "2. On the client, run `mimir acp credential replace PROFILE` and enter the new value.",
+        "3. Reconnect with `mimir acp --profile PROFILE`.",
+        "There is an expected outage between steps 1 and 2 and no rollback to the old key.",
+        "To recover, issue another key and replace the client value again.",
+        "To retire an identity, first run `mimir identities revoke-key --home /absolute/server/mimir-home CANONICAL` on the server, then `mimir acp credential remove PROFILE` on the client.",
+    ]
+    positions = [text.index(value) for value in ordered_rotation]
+    assert positions == sorted(positions)
+
+
+def test_ssh_policy_and_trust_boundary() -> None:
+    text = section("## SSH transport", "## Stock clients")
+    for value in [
+        "two independent proofs",
+        "SSH public key or certificate",
+        "`ssh -T`",
+        "batch mode",
+        "strict host-key verification",
+        "no forwarding, SSH agent, or TTY",
+        "mode `0600`",
+        "the known-hosts file must be owner-controlled and not group- or world-writable",
+        'restrict,command="mimir-agent acp relay --home /absolute/server/mimir-home"',
+        "optional defense in depth, not required product behavior",
+        "MOTD, banner, or shell rc output",
+        "client account and proxy",
+        "relay/daemon UID",
+        "root are trusted with ACP plaintext",
+        "Socket modes do not isolate",
+    ]:
+        assert value in text
+    assert all("StrictHostKeyChecking=no" not in block for language in ("sh", "json", "text", "console", "jsonc") for block in fenced(language))
+    assert "Never use `StrictHostKeyChecking=no`" in text
+
+
+def test_stock_client_examples_exact() -> None:
+    objects = [json.loads(value) for value in fenced("json")]
+    assert objects == [
+        {"default_mcp_settings": {"use_idea_mcp": False, "use_custom_mcp": False}, "agent_servers": {"mimir": {"command": "/absolute/path/to/uvx", "args": ["mimir-agent==0.9.11", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
+        {"agent_servers": {"mimir": {"type": "custom", "command": "uvx", "args": ["mimir-agent==0.9.11", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
+        {"acp.agents": {"mimir": {"command": "uvx", "args": ["mimir-agent==0.9.11", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
+    ]
+    text = section("## Stock clients", "## Connections")
+    for value in [
+        "macOS and Linux",
+        "Windows client support is deferred",
+        "`~/.jetbrains/acp.json`",
+        "display/id is `mimir`",
+        "ordinary IntelliJ MCP servers are not compatible with Mimir Hands",
+        "`formulahendry.acp-client` version `0.2.0`",
+        "`e7371659e3ac100db842b419b1361205a193032e`",
+        "Microsoft's native VS Code agent system uses AHP",
+        "measured 2026-08-09",
+    ]:
+        assert value in text
+
+
+def test_connection_session_replay_and_cancellation() -> None:
+    text = section("## Connections, sessions, and replay", "## Providers")
+    for value in [
+        "one active ACP connection per `MIMIR_HOME`",
+        "Only a newly authenticated connection",
+        "failed or partial authentication cannot evict",
+        "owner-bound UUIDv4",
+        "`session/load`",
+        "identities are fresh",
+        "default seven-day TTL",
+        "64 MiB limit",
+        "revalidates the provider",
+        "every durably prepared `session/update`",
+        "original sequence",
+        "including records already sent",
+        "tolerate duplicates",
+        "never re-executes effects",
+        "Pending requests and frames are not replayed",
+        "does not roll back completed effects",
+        "cancels and quarantines only that ACP generation",
+        "web UI, bridges, scheduler, unrelated work",
+    ]:
+        assert value in text
+
+    normalized = " ".join(text.split())
+    for value in [
+        "All chunks in one logical user prompt share one `messageId`",
+        "all agent chunks from one logical bridge send share another",
+        "assigned before journal preparation",
+        "live delivery and exact replay retain the stored value",
+        "Legacy journal entries without `messageId` remain valid and replay without an ID",
+        "does not backfill or reconstruct them",
+        "Decision: omit ACP session config options.",
+        "Do not advertise `configOptions` or add a `set_config_option` handler",
+        "Session modes also remain unadvertised",
+        "shared by sessions using the server runtime's core Agent",
+        "routing families, not an enumerable menu of supported model IDs",
+        "There is no model or policy-posture field",
+        "would require a versioned schema migration",
+        "A client selection must never grant authority or weaken server-side policy",
+        "server's configured model and authorization policy remain authoritative",
+        "`acp` package extra is intentionally retained as an empty compatibility extra",
+        "ACP's dependencies are already core dependencies",
+    ]:
+        assert value in normalized
+
+
+def test_hands_and_filesystem_contract() -> None:
+    text = section("## Providers, permissions, and filesystems", "## Troubleshooting")
+    for value in [
+        "`mcpServers` is missing or empty",
+        "locally hosted MCP-over-ACP provider named `mimir-hands`",
+        "`mimir.hands.v1` profile",
+        "`read`, `edit`, `shell`, `python`, and `request_scope`",
+        "session new, session load, and provider-list change",
+        "`allow_session` creates only an in-memory proxy grant",
+        "tainted call always prompts again",
+        "revoked on load, disconnect, generation replacement, or proxy exit",
+        "Native Mimir tools operate on the daemon host",
+        "Mimir Hands operates with the local client's user authority",
+        "`hands_read` and `hands_edit` are confined",
+        "This is lexical path confinement only",
+        "`fs` and `terminal` capabilities but never calls them",
+        "`additionalDirectories`",
+        "`hands_shell` and `hands_python` use OS-level filesystem confinement by default",
+        "a symlink inside the cwd pointing outside it is still followed",
+        "one lazy subprocess and in-memory namespace per canonical project directory",
+        "str(Path(cwd).resolve())",
+        "single session owner until release",
+        "Session load restores the daemon transcript, not Python state",
+        "namespace is never serialized",
+        "transient stdout/stderr capture files are unchanged",
+        "at most 8 project kernels",
+        "least recently used detached kernel",
+        "refuses a new project when all kernels are owned",
+        "Cancellation still kills an active execution",
+        "live-proxy-only",
+        "%kernels",
+        "%kernel kill",
+        "%kernel release",
+        "Restarting the proxy or respawning a worker loses all Python state",
+        "spawn-time set for equality, not subset membership",
+        "Any difference retires and respawns the worker",
+        "the operator is warned before approving that change",
+        "1,800 seconds of idle time",
+        "killed and reaped during cleanup",
+    ]:
+        assert value in text
+    assert "confinement work in #1593 has not landed" not in text
+    assert "there is no widening path yet" not in text
+
+
+def test_troubleshooting_contract() -> None:
+    text = section("## Troubleshooting", "this heading is absent")
+    for value in [
+        "`error: connection-failed`",
+        "Confirm the selected profile",
+        "`mimir run` is running",
+        "`MIMIR_ACP_ENABLED=true`",
+        "`<MIMIR_HOME>/.mimir/acp`",
+        "mode `0700`",
+        "`daemon.sock` must be mode `0600`",
+        "Start or restart `mimir run`",
+        "remote `mimir-agent` version is 0.9.11",
+        "noninteractive PATH",
+        "host-key entry matches",
+        "banner-free",
+    ]:
+        assert value in text
+
+
+def test_examples_do_not_leak_secrets_or_invent_commands() -> None:
+    examples = "\n".join(block for language in ("sh", "json", "text", "console", "jsonc") for block in fenced(language))
+    for forbidden in ["MIMIR_API_KEY", "--destination", "--remote-home", "sshpass", "credential validate", "StrictHostKeyChecking=no", "idea_mcp_allowed_tools"]:
+        assert forbidden not in examples
+    assert "launches a standalone runtime" not in DOCS
+    assert "proxy never creates a standalone runtime" in DOCS
+
+
+def test_docs_reject_affirmative_ide_and_arbitrary_mcp_claims() -> None:
+    prose = "\n".join(
+        re.sub(r"```.*?```", "", path.read_text(), flags=re.DOTALL)
+        for path in sorted((ROOT / "docs").rglob("*.md"))
+    )
+    claim_units = re.split(r"(?<=[.!?])\s+|[\r\n]+", prose)
+    negative_terms = re.compile(
+        r"\b(?:not|never|cannot|can't|unsupported|incompatible|disabled?|disables|rejected?|prohibited)\b"
+    )
+    relevant_claims = [
+        unit
+        for unit in claim_units
+        if (
+            "mcp" in unit.lower()
+            and any(name in unit.lower() for name in ("jetbrains", "intellij", "ide's integrated", "ide integrated"))
+        )
+        or bool(re.search(r"\barbitrary\b.{0,30}\b(?:providers?|servers?)\b", unit, re.IGNORECASE))
+    ]
+    assert relevant_claims
+    assert all(negative_terms.search(unit.lower()) for unit in relevant_claims)
+
+    affirmative_claim = re.compile(
+        r"(?:jetbrains|intellij|idea)\b[^.;\n]{0,80}\b"
+        r"(?:supports?|accepts?|admits?|allows?|enables?|is compatible with|works? with)\b"
+        r"|\barbitrary(?: mcp)? providers? (?:is|are) "
+        r"(?:supported|accepted|admitted|allowed|enabled|compatible)\b",
+        re.IGNORECASE,
+    )
+    assert not affirmative_claim.search(prose)
+
+
+def test_docs_bound_unconfined_fallback_to_explicit_session_risk_approval() -> None:
+    text = " ".join(section("### Hands execution scope", "this heading is absent").split())
+    for value in (
+        "Confinement is the default and remains mandatory when a backend is available",
+        "Only an unavailable platform or confinement backend can offer unconfined execution",
+        "A malformed profile, profile application error, or child runtime failure never triggers a downgrade",
+        "There is no automatic fallback or model-controlled opt-in flag",
+        "operator must explicitly accept the risk over `session/request_permission`",
+        "local proxy user's filesystem permissions",
+        "path-scope grants do NOT protect files in unconfined mode",
+        "separate from wrapper permissions, path grants, and taint acknowledgement",
+        "in-memory, session-only, never persisted",
+        "Without explicit acceptance, no child is spawned",
+        "Rejection is final for the session",
+        "Cancellation, timeout, malformed responses, stale replies",
+        "Risk prompts are bounded",
+        "risk prompt warns before consent that acceptance restarts any existing Python kernel",
+        "restart happens only after operator approval",
+        "does not retroactively confine already-running processes",
+        "Scope-query results report unconfined mode in their `message`",
+        "execution results report it in `stderr`",
+        "Filtered environment, safe stdin, output capture",
+        "without command text, file contents, or credentials",
+        "bounded JSON records to the local proxy's stderr",
+        "does not revoke paths from already-running detached processes",
+    ):
+        assert value in text
+    assert "always confined" not in text
+    assert "There is no unconfined fallback" not in text
+
+
+def test_experimental_warning_matches_shipped_execution_confinement_contract() -> None:
+    opening = " ".join(section("## Experimental status", "## Quick start").split())
+    for value in (
+        "macOS Seatbelt remains the only execution-confinement backend verified on real hardware.",
+        "run under OS-level filesystem confinement by default",
+        "mandatory wherever a backend is available",
+        "a confined child cannot follow a symlink out of the approved paths",
+        "macOS Seatbelt uses `sandbox-exec`",
+        "With an unavailable backend the tools run only after the operator explicitly accepts the unconfined risk",
+        "cwd and path-scope grants do not protect files",
+        "Linux AppArmor backend is merged",
+        "parser syntax is verified in Linux CI via #1601",
+        "real-hardware enforcement remains unverified",
+    ):
+        assert value in opening
+    assert "not shipped" not in opening.lower()
+    assert "execution is unconfined" not in opening.lower()
+    # Direct-file enforcement is separate from OS execution confinement.
+    assert "Hosted file access checks resolved targets." in opening
+    assert "refuse targets outside the session cwd unless explicitly scope-approved" in opening
+    assert "Edits must instead use the canonical absolute target path, even after approval" in opening
+    assert "Replacement symlinks cannot redirect access between validation and use" in opening
+    assert "follow in-cwd symlinks even when their targets are outside it" not in opening
+    status = "The Linux AppArmor backend is merged, and its parser syntax is verified in Linux CI via #1601; real-hardware enforcement remains unverified."
+    assert " ".join(DOCS.split()).count(status) == 2
+
+
+def test_docs_distinguish_revoked_risk_grant_from_operator_rejection() -> None:
+    risk = " ".join(section("#### Unavailable-backend risk approval", "#### Confined path requests").split())
+    for value in (
+        "Disconnecting any hosted MCP connection revokes the risk grant for its shared session",
+        "retires that session's Python kernel",
+        "Other connections to the same session do not keep the grant",
+        "one-risk-request limit and final request history survive this connection reset",
+        "Reconnecting therefore cannot request risk approval again, even if the operator previously accepted it",
+        "no active risk grant; this does not mean the operator rejected the earlier request",
+        "Start a new ACP session, or load a session as a new provider-session incarnation",
+        "request fresh operator approval and start a fresh Python namespace",
+        "With an available confinement backend, execution can continue confined after connection reset without risk approval",
+    ):
+        assert value in risk

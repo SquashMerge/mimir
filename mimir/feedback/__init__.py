@@ -1,0 +1,1151 @@
+"""v0.4 §2: algedonic surfacing — subpackage root.
+
+Surfaces recent self-feedback signals (errors, denials, loop hits;
+positive engagement) into the agent's turn prompt. Beer's framing:
+algedonic channel — pain/pleasure signals that bypass the regulatory
+hierarchy and feed back to S5. In mimir, that means the agent's own
+errors and successes get a guaranteed prompt slot independent of the
+inbound message context.
+
+Source of truth is ``logs/events.jsonl`` + ``logs/turns.jsonl`` — no
+parallel state to keep coherent. The reader scans tail-first, stops at
+the time window or the per-polarity cap, whichever hits first.
+
+This file is the package root; sub-modules hold the implementation:
+
+- ``_models`` — data classes (ValenceGroup, Run, AnnotatedRun, FeedbackSignal)
+- ``rules`` — _EVENT_RULES, _VALENCE_GROUPS, escalation helpers
+- ``runs`` — temporal run detection, chain-signal synthesis
+- ``renderers`` — _render_event_line and all kind-specific branches
+- ``cross_turn`` — cross-turn send-loop detection
+- ``resolved`` — resolved-incidents I/O
+
+All public names imported here for backward compatibility: callers that
+do ``from mimir.feedback import X`` continue to resolve unchanged.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Literal
+
+from .._jsonl_tail import tail_jsonl_records
+from ..jsonl_snapshot import (
+    JsonlSnapshot,
+    iter_snapshot_or_tail,
+    iter_window_records,
+)
+from ..models import (
+    AuthContext,
+    InformationFlowLabels,
+    PromptBlock,
+)
+from ..channel_audience import attest_owner
+from ..access_control import (
+    ChannelResourceAdapter,
+    _source_is_triggering_channel_compatible,
+)
+from .. import prompt_sources
+
+# --- Sub-module imports + backward-compat re-exports ---
+from ._models import (  # noqa: F401
+    Polarity,
+    ValenceGroup,
+    Run,
+    AnnotatedRun,
+    FeedbackSignal,
+)
+from .rules import (  # noqa: F401
+    _EVENT_RULES,
+    classify,
+    _ESCALATION_THRESHOLDS,
+    _ESCALATION_ONLY_EVENT_THRESHOLDS,
+    _AROUSAL_THRESHOLDS,
+    _VALENCE_GROUPS,
+    _FIRST_OCCURRENCE_ONLY_KINDS,
+    _POLARITY_DYNAMIC_KINDS,
+    _build_valence_groups,
+    _count_kinds_in_window,
+    _count_escalation_only_events_in_window,
+    _escalated_kinds_in_window,
+    _emit_new_escalations,
+    selected_feedback_extension,
+)
+from .runs import (  # noqa: F401
+    _compute_group_runs,
+    _annotate_transitions,
+    _format_run_segment,
+    _format_chain,
+    _synthesize_chain_signals,
+)
+from .renderers import (  # noqa: F401
+    CHANNEL_SCOPED_FREE_TEXT_KINDS,
+    _FIELD_MAX_LEN,
+    _CONTROL_CHARS_RE,
+    _sanitize_field,
+    _render_event_line,
+    _render_turn_error,
+)
+from .cross_turn import _detect_cross_turn_send_loops  # noqa: F401
+from ..session_boundary_log import _short_ts
+from .resolved import (  # noqa: F401
+    _load_resolved_incidents,
+    _parse_resolved_ts,
+    _is_event_resolved,
+)
+
+log = logging.getLogger(__name__)
+
+
+_AGENT_SELF_EVENT_KINDS = frozenset({
+    "algedonic_escalation",
+    "cross_turn_loop",
+    "cross_turn_send_duplicate",
+    "error",
+    "interactive_turn_no_send_message",
+    "loop_stop",
+    "loop_warn",
+    "send_message_loop_hard_stop",
+    "send_message_loop_warning",
+    "scheduler_invalid_cron",
+    "turn_error",
+    "wiki_backlinks_unhealthy",
+})
+_AGENT_SELF_CHANNEL_CARRIERS = frozenset({
+    "cross_turn_send_duplicate",
+    "send_message_loop_hard_stop",
+    "send_message_loop_warning",
+})
+_OWNER_ATTESTED_COMMITMENT_KINDS = frozenset({
+    "commitment_due",
+    "commitment_expired",
+    "commitment_snooze_pileup",
+})
+_DISCORD_REACTION_AUTHOR_RE = re.compile(r"discord-[0-9]+")
+_SLACK_REACTION_AUTHOR_RE = re.compile(r"slack-[UW][A-Z0-9]+")
+
+
+def _nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _reaction_author(record: dict) -> str | None:
+    bridge = record.get("bridge")
+    author = record.get("author")
+    if not isinstance(author, str):
+        return None
+    if bridge == "discord" and _DISCORD_REACTION_AUTHOR_RE.fullmatch(author):
+        return author
+    if bridge == "slack" and _SLACK_REACTION_AUTHOR_RE.fullmatch(author):
+        return author
+    return None
+
+
+def _owner_attested_feedback_evidence(
+    record: dict,
+    stream: str,
+) -> tuple[bool, str | None]:
+    kind = record.get("type")
+    if stream != "events":
+        return False, None
+    if kind == "react_received":
+        if "event_version" not in record:
+            if "owner_principal" in record:
+                return True, None
+            author = _reaction_author(record)
+            return True, author
+        if record.get("event_version") != "v1":
+            return True, None
+        if not _nonempty_string(record.get("owner_principal")):
+            return True, None
+        author = _reaction_author(record)
+        return True, author
+    if kind not in _OWNER_ATTESTED_COMMITMENT_KINDS:
+        return False, None
+    if "event_version" not in record:
+        return False, None
+    if record.get("event_version") != "v1":
+        return True, None
+    if (
+        not _nonempty_string(record.get("owner_principal"))
+        or record.get("ownership_provenance") != "extraction_acl"
+        or record.get("author") not in (None, "")
+    ):
+        return True, None
+    return True, record["owner_principal"]
+
+
+def _is_agent_self_record(record: dict) -> bool:
+    """Return whether a principal-less record is agent self-regulation data.
+
+    This is intentionally an explicit kind allowlist.  User-owned events such as
+    ``commitment_due`` can be principal-less in legacy logs and must not become
+    visible merely because ownership metadata is absent.
+    """
+    kind = record.get("type") or record.get("event_kind") or record.get("kind")
+    if not isinstance(kind, str):
+        # turns.jsonl records express ``turn_error`` structurally rather than
+        # carrying an event kind.
+        return isinstance(record.get("error"), str) and bool(record["error"])
+    if kind in _AGENT_SELF_EVENT_KINDS:
+        return True
+    extension = selected_feedback_extension()
+    return extension is not None and kind in extension.agent_self_events
+
+
+def _sanitize_agent_self_record(record: dict) -> dict:
+    """Remove user-scoped payloads from globally visible self-feedback."""
+    if _record_principal(record) is not None or not _is_agent_self_record(record):
+        return record
+    kind = record.get("type")
+    if kind == "error":
+        return {**record, "channel_id": None, "error": None, "message": None}
+    if kind in _AGENT_SELF_CHANNEL_CARRIERS:
+        return {**record, "channel_id": None}
+    if not isinstance(kind, str) and (record.get("error") or record.get("result_is_error")):
+        return {**record, "channel_id": None, "error": None}
+    return record
+
+
+class _RecordSnapshot:
+    """Immutable authorization-filtered view preserving saturation fallback."""
+
+    def __init__(
+        self,
+        records: list[dict],
+        *,
+        saturated: bool = False,
+        window_records: object = None,
+    ) -> None:
+        self._records = records
+        self._saturated = saturated
+        self._window_records = window_records
+
+    def records(self) -> list[dict]:
+        return self._records
+
+    @property
+    def saturated(self) -> bool:
+        return self._saturated
+
+    def iter_window_records(
+        self, path: Path, cutoff: str | datetime | None = None,
+        *, timestamp_key: str | tuple[str, str] | None = None,
+    ):
+        if not callable(self._window_records):
+            return iter(self._records)
+        return self._window_records(path, cutoff, timestamp_key=timestamp_key)
+
+
+def _record_principal(record: dict) -> str | None:
+    for key in ("owner_principal", "canonical_author", "principal", "author"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _is_privileged(auth_context: AuthContext) -> bool:
+    return auth_context.is_service or "admin" in auth_context.roles
+
+
+def _record_source_principal(record: dict, auth_context: AuthContext) -> str | None:
+    value = _record_principal(record)
+    if value and value == auth_context.principal and auth_context.canonical_principal:
+        return auth_context.canonical_principal
+    return value
+
+
+_QUOTA_RATIO_RE = re.compile(r"@\d+(?:\.\d+)?")
+_TOOL_BUDGET_RE = re.compile(r"\(\d+/\d+\)")
+_ESCALATION_RE = re.compile(
+    r"algedonic escalation: ([\w:-]+) crossed threshold "
+    r"\(\d+× ≥ \d+× in \d+h\)"
+)
+
+
+def _stable_feedback_fingerprint(sig: FeedbackSignal) -> tuple[str, str, str | None]:
+    """Return a display-dedup key that ignores incidental payload drift.
+
+    Exact line matching keeps unrelated payloads separate, but several feedback
+    families encode time-varying measurements (quota ratios, budget use, escalation
+    counts) in their rendered line. Those are the *same* operator signal across
+    the window: keep the newest representative line and count the whole
+    fingerprint group instead of spending multiple algedonic rows.
+    """
+    content = sig.content
+    if sig.kind in {"tick_suppressed", "poller_suppressed"}:
+        content = _QUOTA_RATIO_RE.sub("@<ratio>", content)
+    elif sig.kind == "tool_budget":
+        content = _TOOL_BUDGET_RE.sub("(<used>/<cap>)", content)
+    elif sig.kind == "algedonic_escalation":
+        match = _ESCALATION_RE.fullmatch(content)
+        if match:
+            content = f"algedonic escalation: {match.group(1)} crossed threshold"
+    return sig.kind, content, sig.channel_id
+
+
+def _collapse_feedback_signals(signals: list[FeedbackSignal]) -> list[FeedbackSignal]:
+    """Collapse equivalent recurring signals after rendering.
+
+    ``FeedbackLog.recent`` walks newest-first before sorting chain injections, so
+    sort first and keep the newest signal per stable fingerprint. Count becomes
+    the number of matching rendered signals in this window/fingerprint, except
+    when a kind-level arousal count is already larger.
+    """
+    if not signals:
+        return []
+    collapsed: dict[tuple[str, str, str | None], FeedbackSignal] = {}
+    counts: dict[tuple[str, str, str | None], int] = {}
+    for sig in sorted(signals, key=lambda s: s.ts, reverse=True):
+        key = _stable_feedback_fingerprint(sig)
+        counts[key] = counts.get(key, 0) + 1
+        if key not in collapsed:
+            collapsed[key] = sig
+    return sorted(
+        (
+            FeedbackSignal(
+                ts=sig.ts,
+                polarity=sig.polarity,
+                kind=sig.kind,
+                channel_id=sig.channel_id,
+                content=sig.content,
+                count=max(sig.count, counts[key]),
+            )
+            for key, sig in collapsed.items()
+        ),
+        key=lambda s: s.ts,
+        reverse=True,
+    )
+
+
+@dataclass(frozen=True)
+class _FeedbackSelection:
+    negatives: list[FeedbackSignal]
+    positives: list[FeedbackSignal]
+    labels: InformationFlowLabels
+
+
+@dataclass
+class FeedbackLog:
+    """Tails events.jsonl + turns.jsonl, surfaces recent feedback signals.
+
+    No persistent state of its own — every call to ``recent`` re-reads
+    the tail of both files (or a cached snapshot, if injected). Files
+    may not exist (fresh home, never logged) — handled gracefully.
+
+    ``events_snapshot`` / ``turns_snapshot`` (CR#10): when provided by
+    the constructing Agent, ``recent`` iterates the cached snapshot
+    instead of streaming the file each call. Falls back to direct tail
+    when None for back-compat with tests / direct-call paths.
+    """
+
+    events_path: Path
+    turns_path: Path
+    # Per-call defaults; overridable on the .recent / .recent_block calls.
+    default_window_hours: int = 24
+    default_limit_per_polarity: int = 5
+    events_snapshot: JsonlSnapshot | None = None
+    turns_snapshot: JsonlSnapshot | None = None
+    arousal_thresholds: dict[str, int] | None = None
+    # None → use the module-level _AROUSAL_THRESHOLDS. Override in tests
+    # (or operator config) to tune per-kind minimum-occurrence thresholds
+    # without monkeypatching. Passed as None by default so the live
+    # deployment uses the shared dict and changes to it propagate at
+    # import time.
+    escalation_thresholds: dict[str, int] | None = None
+    # None → use the module-level _ESCALATION_THRESHOLDS (Alg-3). Pass {} to
+    # disable escalation entirely (e.g. in tests that don't want side-effects
+    # from _emit_new_escalations writing to events.jsonl). Same propagation
+    # semantics as ``arousal_thresholds``.
+    resolved_incidents_path: Path | None = None
+    identity_resolver: object | None = None
+    cross_platform_pull: bool = True
+    # Path to ``resolved-incidents.jsonl`` (chainlink #197). Events matching
+    # an entry there are filtered from the feedback block until the rolling
+    # window naturally clears them. None → no filtering (default for tests /
+    # back-compat). The live agent wires this to
+    # ``config.home / "resolved-incidents.jsonl"``.
+
+    def recent(
+        self,
+        *,
+        window_hours: int | None = None,
+        limit_per_polarity: int | None = None,
+        auth_context: AuthContext | None = None,
+    ) -> tuple[list[FeedbackSignal], list[FeedbackSignal]]:
+        """Return (negative, positive), each reverse-chronological and
+        capped at ``limit_per_polarity``. Records older than
+        ``window_hours`` are dropped."""
+        if auth_context is not None and not isinstance(auth_context, AuthContext):
+            raise TypeError("feedback authorization requires the exact AuthContext")
+        event_snapshot = self.events_snapshot
+        turn_snapshot = self.turns_snapshot
+        if auth_context is not None:
+            event_snapshot = self._authorized_snapshot(
+                self.events_snapshot, self.events_path, auth_context,
+            )
+            turn_snapshot = self._authorized_snapshot(
+                self.turns_snapshot, self.turns_path, auth_context,
+            )
+
+        window_hours = window_hours if window_hours is not None else self.default_window_hours
+        extension = selected_feedback_extension()
+        valence_groups = dict(_VALENCE_GROUPS)
+        if extension is not None:
+            valence_groups.update(extension.valence_groups)
+        limit = (
+            limit_per_polarity
+            if limit_per_polarity is not None
+            else self.default_limit_per_polarity
+        )
+
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=window_hours)
+        cutoff_iso = cutoff.isoformat()
+
+        # Resolved-incident filter (chainlink #197): load rules once per
+        # recent() call. Events matching a rule are silently dropped from
+        # both polarities so stale-but-fixed errors don't re-surface.
+        resolved_rules = (
+            _load_resolved_incidents(self.resolved_incidents_path)
+            if self.resolved_incidents_path is not None
+            else []
+        )
+
+        # Arousal filter pre-pass (Beer Ch.7): count all rule-matched
+        # event-kind occurrences in the window before the display loop.
+        # Serves two purposes:
+        #   1. Threshold gate: kinds below their min_occurrences are
+        #      suppressed — only sustained patterns clear their filter.
+        #   2. Count display: FeedbackSignal.count > 1 renders as
+        #      "(×N in Xh)" so the agent can distinguish a one-off from
+        #      a recurring pattern without needing separate tool calls.
+        thresholds = (
+            self.arousal_thresholds
+            if self.arousal_thresholds is not None
+            else _AROUSAL_THRESHOLDS
+        )
+        kind_counts = _count_kinds_in_window(
+            event_snapshot, self.events_path, cutoff_iso
+        )
+
+        # Alg-3: emit algedonic_escalation events for negative kinds that
+        # crossed their threshold and haven't already been escalated in this
+        # 24h window.  Escalation is a WRITE side-effect (log_event_sync
+        # appends to events.jsonl) so callers that want side-effect-free
+        # behavior should pass escalation_thresholds={} on construction.
+        _esc_thresholds = (
+            self.escalation_thresholds
+            if self.escalation_thresholds is not None
+            else _ESCALATION_THRESHOLDS
+        )
+        if _esc_thresholds:
+            _already_escalated = _escalated_kinds_in_window(
+                event_snapshot, self.events_path, cutoff_iso
+            )
+            escalation_counts = dict(kind_counts)
+            for kind, count in _count_escalation_only_events_in_window(
+                event_snapshot, self.events_path, cutoff_iso
+            ).items():
+                escalation_counts[kind] = escalation_counts.get(kind, 0) + count
+            escalation_thresholds = dict(_esc_thresholds)
+            escalation_thresholds.update(
+                {
+                    kind: threshold
+                    for kind, threshold in _ESCALATION_ONLY_EVENT_THRESHOLDS.values()
+                }
+            )
+            _emit_new_escalations(
+                escalation_counts, _already_escalated, escalation_thresholds
+            )
+
+        # Temporal run detection (Alg-2 enhancement): scan for valence-group
+        # polarity transitions (recovery / degradation) and synthesize one
+        # chain FeedbackSignal per transitioning group.  chain_consumed_kinds
+        # is the set of rule-kind tags fully rendered by a chain — the main
+        # loop must skip those individual events so they don't duplicate.
+        # Chain signals are always-surface (bypass the per-polarity limit).
+        group_runs = _compute_group_runs(
+            event_snapshot, self.events_path, cutoff_iso, valence_groups
+        )
+        chain_signals, chain_consumed_kinds = _synthesize_chain_signals(
+            group_runs, valence_groups
+        )
+
+        negatives: list[FeedbackSignal] = []
+        positives: list[FeedbackSignal] = []
+        # Kinds whose first occurrence (most recent, since we walk
+        # tail-first) we've already added — subsequent occurrences are
+        # skipped. Stops weekly cron events from re-appearing on every
+        # heartbeat for 24h.
+        seen_first_only: set[str] = set()
+        # Per-polarity content-level dedup: if two distinct events
+        # would render to the same line text within the same polarity
+        # bucket, keep only the first (= most recent under tail-first
+        # iteration) and skip subsequent identical content. Catches
+        # the "tool_denied Read: path_outside_home × 3" case where
+        # kind-level dedup would over-collapse (Read and Write share
+        # rule_kind ``tool_denied`` but different rendered content);
+        # also handles any future event family where the (kind, args)
+        # tuple naturally produces colliding lines. Distinct payloads
+        # under the same kind (e.g. spawn job_ids, tool_denied with
+        # different reasons) keep their separate lines.
+        seen_content: dict[str, set[str]] = {"negative": set(), "positive": set()}
+        tool_budget_turn_ids: set[str] = set()
+
+        # 1) events.jsonl — known event-type rules.
+        for ev in iter_window_records(
+            event_snapshot, self.events_path, cutoff_iso, timestamp_key="timestamp",
+        ):
+            ts = ev.get("timestamp")
+            if not isinstance(ts, str) or ts < cutoff_iso:
+                # tail-first scan: as soon as a record predates the window
+                # we can stop; jsonl is appended in chronological order.
+                if isinstance(ts, str):
+                    break
+                continue
+            evtype = ev.get("type")
+            if evtype in {
+                "tool_call_budget_warning",
+                "tool_call_budget_denied",
+                "tool_call_budget_soft_warning",
+            } and isinstance(ev.get("turn_id"), str):
+                tool_budget_turn_ids.add(ev["turn_id"])
+            rule = classify(evtype)
+            if rule is None:
+                continue
+            # Resolved-incident filter: skip events covered by an operator-
+            # marked resolution rule.  Applied after the rule lookup (unknown
+            # event types are already dropped above) so we don't penalise the
+            # common case (no rules file → list is empty, no work done).
+            if resolved_rules and _is_event_resolved(ev, resolved_rules):
+                continue
+            polarity, kind = rule
+            # react_received carries its own polarity (positive/negative/
+            # neutral) classified per-emoji at bridge level. Use that
+            # over the default-positive rule mapping. ``"neutral"`` skips
+            # the event from both polarity buckets — surfaced via the
+            # generic line below if there's render space, otherwise
+            # silently dropped (it's informational, not pain/pleasure).
+            if evtype == "react_received":
+                ev_polarity = ev.get("polarity")
+                if ev_polarity in ("positive", "negative"):
+                    polarity = ev_polarity
+                elif ev_polarity == "neutral":
+                    continue
+            # Chain-consumed kinds: their events are fully rendered by a
+            # transition chain signal. Skip them in the individual-event
+            # path so they don't duplicate the chain line.
+            if kind in chain_consumed_kinds:
+                continue
+            # Arousal filter: suppress kinds below their minimum-occurrence
+            # threshold. Default threshold is 1 (always surface); raise in
+            # _AROUSAL_THRESHOLDS for kinds where single occurrence is noise.
+            min_occ = thresholds.get(kind, 1)
+            if kind_counts.get(kind, 0) < min_occ:
+                continue
+            # First-occurrence-only kinds: skip duplicates. Tail-first
+            # iteration means we keep the most recent.
+            if kind in _FIRST_OCCURRENCE_ONLY_KINDS or (extension is not None and kind in extension.first_only_kinds):
+                if kind in seen_first_only:
+                    continue
+                seen_first_only.add(kind)
+            content = _render_event_line(kind, ev)
+            # Content-level dedup: if a prior (more recent) event already
+            # produced this exact line text in this polarity bucket, skip —
+            # see ``seen_content`` comment above. Render cost is low and we're
+            # in tail-first iteration, so the *kept* item is the most recent.
+            #
+            # #496: record content BEFORE the display-capacity gate below, so
+            # the dedup set stays complete even when the bucket is full. Keeps
+            # the turns.jsonl pass (and any future emit path) from re-emitting
+            # a line identical to an in-window event we saw but had no room to
+            # display. Output is unchanged — only the dedup set is more complete.
+            polarity_bucket = seen_content[polarity]
+            if content in polarity_bucket:
+                continue
+            polarity_bucket.add(content)
+            target = negatives if polarity == "negative" else positives
+            if len(target) >= limit:
+                continue
+            target.append(
+                FeedbackSignal(
+                    ts=ts,
+                    polarity=polarity,
+                    kind=kind,
+                    channel_id=ev.get("channel_id"),
+                    content=content,
+                    count=kind_counts.get(kind, 1),
+                )
+            )
+            # Early exit when both sides full.
+            if len(negatives) >= limit and len(positives) >= limit:
+                break
+
+        # Inject chain signals (always-surface — they bypass the per-polarity
+        # limit).  Sort each bucket by ts descending so chain signals
+        # interleave correctly with individually-displayed events.
+        for sig in chain_signals:
+            if sig.polarity == "negative":
+                negatives.append(sig)
+            else:
+                positives.append(sig)
+        negatives.sort(key=lambda s: s.ts, reverse=True)
+        positives.sort(key=lambda s: s.ts, reverse=True)
+
+        # S2-2: cross-turn send_message loop detection.  Always-surface —
+        # a cross-turn flood is an acute S2 concern that bypasses the
+        # per-polarity limit.  Detection runs after the main events loop so
+        # it doesn't interfere with the within-turn loop_stop / loop_warn
+        # signals that the individual-event pass already handles.
+        for sig in _detect_cross_turn_send_loops(
+            event_snapshot, self.events_path, cutoff_iso
+        ):
+            negatives.append(sig)
+        if any(s.kind == "cross_turn_loop" for s in negatives):
+            negatives.sort(key=lambda s: s.ts, reverse=True)
+
+        # 2) turns.jsonl — error / result_is_error are turn-level negatives
+        # the events stream might not capture.  Capacity here is measured
+        # against only the limit-bounded event signals gathered above: chain
+        # signals and cross-turn loop signals intentionally bypass the
+        # per-polarity limit, so they must not starve crash/error records.
+        bounded_negative_count = sum(
+            1
+            for sig in negatives
+            if not sig.kind.endswith("_chain") and sig.kind != "cross_turn_loop"
+        )
+        if bounded_negative_count < limit:
+            for rec in iter_window_records(
+                turn_snapshot, self.turns_path, cutoff_iso, timestamp_key="ts",
+            ):
+                ts = rec.get("ts")
+                if not isinstance(ts, str) or ts < cutoff_iso:
+                    if isinstance(ts, str):
+                        break
+                    continue
+                has_error = rec.get("error") or rec.get("result_is_error")
+                if not has_error:
+                    continue
+                # Budget pressure already surfaces through the existing event
+                # rule. Do not add a second turn-level negative for the same
+                # exhausted turn merely because its result is now classified.
+                if (
+                    rec.get("result_subtype") == "tool_budget_exhausted"
+                    and rec.get("turn_id") in tool_budget_turn_ids
+                ):
+                    continue
+                if bounded_negative_count >= limit:
+                    break
+                content = _render_turn_error(rec)
+                # Same content-level dedup as the events loop above:
+                # skip turn-error signals whose rendered line text
+                # already appeared in the negative bucket.
+                if content in seen_content["negative"]:
+                    continue
+                seen_content["negative"].add(content)
+                negatives.append(
+                    FeedbackSignal(
+                        ts=ts,
+                        polarity="negative",
+                        kind="turn_error",
+                        channel_id=rec.get("channel_id"),
+                        content=content,
+                    )
+                )
+                bounded_negative_count += 1
+
+        return _collapse_feedback_signals(negatives), _collapse_feedback_signals(positives)
+
+    @staticmethod
+    def _record_authorized(record: dict, auth_context: AuthContext) -> bool:
+        if _is_privileged(auth_context):
+            return True
+        principal = auth_context.canonical_principal or auth_context.principal
+        channel_id = auth_context.channel_id
+        if not principal or not channel_id:
+            return False
+        # Agent-self signals are global self-regulation inputs, not user data.
+        # Keep the explicit kind gate independent of channel; do not generalize
+        # this to all principal-less records.
+        if _record_principal(record) is None and _is_agent_self_record(record):
+            return True
+        return (
+            record.get("channel_id") == channel_id
+            and _record_principal(record) in {principal, auth_context.principal}
+        )
+
+    @classmethod
+    def _authorized_records(
+        cls,
+        snapshot: JsonlSnapshot | None,
+        path: Path,
+        auth_context: AuthContext,
+    ) -> list[dict]:
+        # This scan has no time cutoff. Its sibling _authorized_snapshot
+        # preserves saturated window fallback through stream_filtered.
+        return [
+            _sanitize_agent_self_record(record)
+            for record in iter_snapshot_or_tail(snapshot, path)
+            if cls._record_authorized(record, auth_context)
+        ]
+
+    @classmethod
+    def _authorized_snapshot(
+        cls,
+        snapshot: JsonlSnapshot | None,
+        path: Path,
+        auth_context: AuthContext,
+    ) -> _RecordSnapshot:
+        records = cls._authorized_records(snapshot, path, auth_context)
+        saturated = bool(snapshot is not None and snapshot.saturated)
+
+        def stream_filtered(
+            window_path: Path, cutoff: str | datetime | None,
+            *, timestamp_key: str | tuple[str, str] | None = None,
+        ):
+            for record in iter_window_records(
+                snapshot, window_path, cutoff, timestamp_key=timestamp_key,
+            ):
+                if cls._record_authorized(record, auth_context):
+                    yield _sanitize_agent_self_record(record)
+
+        return _RecordSnapshot(
+            records,
+            saturated=saturated,
+            window_records=stream_filtered if saturated else None,
+        )
+
+    def recent_block(
+        self,
+        *,
+        window_hours: int | None = None,
+        limit_per_polarity: int | None = None,
+        auth_context: AuthContext | None = None,
+    ) -> str | None:
+        """Returns the rendered block (without the leading ``## `` header
+        — that's added by ``build_turn_prompt``), or ``None`` if both
+        polarities are empty (skip the section to avoid empty headers
+        in the prompt)."""
+        negatives, positives = self.recent(
+            window_hours=window_hours,
+            limit_per_polarity=limit_per_polarity,
+            auth_context=auth_context,
+        )
+        return render_feedback_block(
+            negatives,
+            positives,
+            window_hours=window_hours
+            if window_hours is not None
+            else self.default_window_hours,
+        )
+
+    def recent_prompt_block(self, auth_context: AuthContext) -> PromptBlock | None:
+        """Load authorized feedback and return content with record provenance."""
+        if not isinstance(auth_context, AuthContext):
+            raise TypeError("feedback prompt loading requires the exact AuthContext")
+        selection = self._select_prompt_recent(auth_context)
+        content = render_feedback_block(
+            selection.negatives,
+            selection.positives,
+            window_hours=self.default_window_hours,
+        )
+        if not content:
+            return None
+        return PromptBlock(content=content, labels=selection.labels)
+
+    def _select_prompt_recent(
+        self,
+        auth_context: AuthContext,
+    ) -> _FeedbackSelection:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(
+            hours=self.default_window_hours,
+        )
+        cutoff_iso = cutoff.isoformat()
+        labels = InformationFlowLabels()
+        requester = auth_context.canonical_principal or auth_context.principal
+        effective_requester = (
+            f"service:{auth_context.canonical_principal or auth_context.principal}"
+            if auth_context.is_service
+            and (auth_context.canonical_principal or auth_context.principal)
+            else requester
+        )
+        if not effective_requester:
+            return _FeedbackSelection([], [], labels)
+
+        admitted_events: list[dict] = []
+        admitted_turns: list[dict] = []
+        chain_inputs: list[tuple[dict, str]] = []
+        extension = selected_feedback_extension()
+        valence_groups = dict(_VALENCE_GROUPS)
+        if extension is not None:
+            valence_groups.update(extension.valence_groups)
+        chain_input_kinds = frozenset(
+            kind for group in valence_groups.values()
+            for kind in (*group.positive_kinds, *group.negative_kinds)
+        )
+        # Admission decides eligibility, not contribution. The arousal filter
+        # suppresses a whole kind whose occurrences stay below its threshold,
+        # and a suppressed kind contributes no line and no count to anything
+        # rendered -- so labelling it lets a record the model never saw veto a
+        # delivery every visible source is cleared for.
+        #
+        # Granularity is the signal kind, deliberately. A record dropped by the
+        # per-polarity cap, or collapsed into a duplicate run, still feeds the
+        # "(xN in 24h)" count on a rendered line of its own kind, so it did
+        # contribute and its provenance is retained.
+        sources_by_kind: dict[str, list[SourceLabel]] = {}
+
+        def admit(record: dict, stream: str) -> dict | None:
+            nonlocal labels
+            raw_owner = _record_principal(record)
+            channel = record.get("channel_id")
+            if not isinstance(channel, str) or not channel:
+                channel = None
+            classified = classify(record.get("type"))
+            agent_self = raw_owner is None and _is_agent_self_record(record)
+            same_channel = bool(
+                channel
+                and auth_context.channel_id
+                and channel == auth_context.channel_id
+            )
+            source_kind = "protected_prompt"
+            principal = effective_requester
+            acl = frozenset({effective_requester})
+            sanitized = record
+            owner_attested_shape, owner_evidence = (
+                _owner_attested_feedback_evidence(record, stream)
+            )
+
+            if agent_self:
+                source_kind = "agent_self"
+                sanitized = _sanitize_agent_self_record(record)
+            elif owner_attested_shape:
+                if owner_evidence is None or channel is None:
+                    return None
+                try:
+                    owner_attestation = attest_owner(
+                        self.identity_resolver,
+                        owner_evidence,
+                        channel,
+                    )
+                except Exception:
+                    return None
+                if owner_attestation is None:
+                    return None
+                principal = owner_attestation.canonical_principal
+                acl = frozenset({principal})
+                source_kind = "owner_attested_feedback"
+            elif raw_owner is not None:
+                identity = getattr(self.identity_resolver, "identity", None)
+                try:
+                    resolved_owner = identity(raw_owner) if callable(identity) else None
+                except Exception:
+                    return None
+                if resolved_owner is None:
+                    if (
+                        not same_channel
+                        or self.identity_resolver is not None
+                        or raw_owner not in {auth_context.principal, requester}
+                    ):
+                        return None
+                    canonical_owner = requester
+                else:
+                    canonical_owner = resolved_owner.canonical
+                if (
+                    not same_channel
+                    and not (
+                        self.cross_platform_pull
+                        and auth_context.cross_platform_pull
+                    )
+                    and raw_owner != auth_context.principal
+                ):
+                    return None
+                principal = canonical_owner
+                acl_values = {canonical_owner}
+                if _is_privileged(auth_context):
+                    acl_values.add(effective_requester)
+                acl = frozenset(acl_values)
+                if classified and classified[1] in CHANNEL_SCOPED_FREE_TEXT_KINDS:
+                    source_kind = "channel_scoped_feedback"
+            else:
+                if not (_is_privileged(auth_context) and same_channel):
+                    return None
+                source_kind = "channel_bound_unowned_feedback"
+
+            bridge = record.get("bridge") or record.get("source")
+            resource_key = (
+                record.get("id")
+                or record.get("turn_id")
+                or record.get("timestamp")
+                or record.get("ts")
+            )
+            source = prompt_sources.prompt_source_label(
+                auth_context,
+                principal=principal,
+                domain="feedback",
+                resource=f"{stream}:{resource_key}",
+                channel_id=channel,
+                bridge_instance=(
+                    bridge
+                    if isinstance(bridge, str) and bridge
+                    else auth_context.bridge_instance or "mimir"
+                ),
+                authorized_principals=acl,
+                source_kind=source_kind,
+                self_authored=agent_self,
+                owner_attestation=(
+                    owner_attestation
+                    if source_kind == "owner_attested_feedback"
+                    else None
+                ),
+            )
+            if not _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_requester,
+                triggering_principal=auth_context.principal,
+                resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                    auth_context.channel_id,
+                ),
+                audience_provider=auth_context.audience_provider,
+                cross_platform_pull=auth_context.cross_platform_pull,
+            ):
+                return None
+            signal_kind = (
+                "turn_error" if stream == "turns"
+                else classified[1] if classified
+                else None
+            )
+            if signal_kind is None:
+                # Admitted without a feedback classification: the loop-detection
+                # carriers (send_message_sent, cross_turn_send_duplicate) feed
+                # synthesized content rather than a signal of their own, so they
+                # keep contributing provenance.
+                labels = labels.with_source(source)
+            else:
+                sources_by_kind.setdefault(signal_kind, []).append(source)
+            return sanitized
+
+        for record in iter_window_records(
+            self.events_snapshot, self.events_path, cutoff_iso, timestamp_key="timestamp",
+        ):
+            timestamp = record.get("timestamp")
+            if not isinstance(timestamp, str) or timestamp < cutoff_iso:
+                if isinstance(timestamp, str):
+                    break
+                continue
+            event_type = record.get("type")
+            if classify(event_type) is None and event_type not in {
+                "send_message_sent",
+                "cross_turn_send_duplicate",
+            }:
+                continue
+            classified = classify(event_type)
+            if (
+                _record_principal(record) is None
+                and not record.get("channel_id")
+                and not _is_agent_self_record(record)
+                and classified is not None
+                and classified[1] in chain_input_kinds
+            ):
+                chain_inputs.append(({
+                    "timestamp": timestamp,
+                    "type": event_type,
+                }, f"events:{timestamp}"))
+                continue
+            selected = admit(record, "events")
+            if selected is not None:
+                admitted_events.append(selected)
+
+        for record in iter_window_records(
+            self.turns_snapshot, self.turns_path, cutoff_iso, timestamp_key="ts",
+        ):
+            timestamp = record.get("ts")
+            if not isinstance(timestamp, str) or timestamp < cutoff_iso:
+                if isinstance(timestamp, str):
+                    break
+                continue
+            if not (record.get("error") or record.get("result_is_error")):
+                continue
+            selected = admit(record, "turns")
+            if selected is not None:
+                admitted_turns.append(selected)
+
+        selected_log = replace(
+            self,
+            events_snapshot=_RecordSnapshot(admitted_events),
+            turns_snapshot=_RecordSnapshot(admitted_turns),
+        )
+        negatives, positives = selected_log.recent(auth_context=None)
+        rendered_kinds = {signal.kind for signal in (*negatives, *positives)}
+        for signal in (*negatives, *positives):
+            if not signal.kind.endswith("_chain"):
+                continue
+            group = valence_groups.get(signal.kind.removesuffix("_chain"))
+            if group is not None:
+                # The chain summarizes every run of this group, including
+                # records whose individual signals were consumed by the chain.
+                rendered_kinds.update(group.positive_kinds | group.negative_kinds)
+        for kind, kind_sources in sources_by_kind.items():
+            if kind not in rendered_kinds:
+                continue
+            for source in kind_sources:
+                labels = labels.with_source(source)
+        if chain_inputs:
+            chain_snapshot = _RecordSnapshot([record for record, _ in chain_inputs])
+            group_runs = _compute_group_runs(
+                chain_snapshot, self.events_path, cutoff_iso, valence_groups,
+            )
+            chain_signals, _ = _synthesize_chain_signals(
+                group_runs, valence_groups,
+            )
+            for signal in chain_signals:
+                group_key = signal.kind.removesuffix("_chain")
+                group = valence_groups[group_key]
+                group_kinds = group.positive_kinds | group.negative_kinds
+                sources = InformationFlowLabels()
+                for record, resource_key in chain_inputs:
+                    classified = classify(record.get("type"))
+                    if classified is None or classified[1] not in group_kinds:
+                        continue
+                    source = prompt_sources.prompt_source_label(
+                        auth_context,
+                        principal=effective_requester,
+                        domain="feedback",
+                        resource=resource_key,
+                        channel_id=auth_context.channel_id,
+                        bridge_instance=f"mimir-chain:{resource_key}",
+                        authorized_principals=frozenset({effective_requester}),
+                        source_kind="feedback_chain",
+                        self_authored=False,
+                    )
+                    if not _source_is_triggering_channel_compatible(
+                        source,
+                        effective_principal=effective_requester,
+                        triggering_principal=auth_context.principal,
+                        resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                            auth_context.channel_id,
+                        ),
+                        audience_provider=auth_context.audience_provider,
+                        cross_platform_pull=auth_context.cross_platform_pull,
+                    ):
+                        sources = InformationFlowLabels()
+                        break
+                    sources = sources.with_source(source)
+                if not sources.sources:
+                    continue
+                for source in sources.sources:
+                    labels = labels.with_source(source)
+                target = negatives if signal.polarity == "negative" else positives
+                target.append(signal)
+            negatives.sort(key=lambda signal: signal.ts, reverse=True)
+            positives.sort(key=lambda signal: signal.ts, reverse=True)
+        return _FeedbackSelection(negatives, positives, labels)
+
+
+# VSM: algedonic — bypass channel for self-feedback signals; surfaces
+#                  recent error / denial / loop / saga_feedback / react
+#                  events directly into the next turn's prompt without
+#                  the embed-and-retrieve detour.
+# loop_id: 2.1
+def render_feedback_block(
+    negatives: list[FeedbackSignal],
+    positives: list[FeedbackSignal],
+    *,
+    window_hours: int = 24,
+) -> str | None:
+    """Markdown body for the Recent feedback signals section. Returns
+    ``None`` when both lists are empty so the caller can skip rendering
+    the section header entirely."""
+    if not negatives and not positives:
+        return None
+    parts: list[str] = []
+    if negatives:
+        parts.append(f"Negative (last {window_hours}h):")
+        parts.extend(_format_lines(negatives, window_hours=window_hours))
+    if positives:
+        if parts:
+            parts.append("")  # blank line between subsections
+        parts.append(f"Positive (last {window_hours}h):")
+        parts.extend(_format_lines(positives, window_hours=window_hours))
+    return "\n".join(parts)
+
+
+def _format_lines(signals: list[FeedbackSignal], *, window_hours: int = 24) -> list[str]:
+    out: list[str] = []
+    for sig in signals:
+        # YYYY-MM-DDTHH:MM:SS+00:00 → "YYYY-MM-DD HH:MM" for compactness.
+        ts = _short_ts(sig.ts)
+        ch = f" [{sig.channel_id}]" if sig.channel_id else ""
+        # Arousal filter count display: "(×N in Xh)" when count > 1
+        # surfaces the "pattern vs one-off" distinction that Beer's
+        # arousal filter is meant to provide. A single occurrence renders
+        # with no suffix — no noise for genuinely discrete events.
+        # Exception: chain signals (kind ends with "_chain") already encode
+        # per-run counts inline ("succeeded ×20 → failed ×5 → ...") — a
+        # redundant total count suffix would be confusing and noisy.
+        if sig.kind.endswith("_chain"):
+            count_suffix = ""
+        else:
+            count_suffix = f" (×{sig.count} in {window_hours}h)" if sig.count > 1 else ""
+        out.append(f"- {ts} — {sig.content}{count_suffix}{ch}")
+    return out
+
+
+
+# Backwards-compatible alias for the streaming tail reader. Older code
+# in this module called ``_iter_jsonl_reverse``; new code should import
+# ``tail_jsonl_records`` directly.
+_iter_jsonl_reverse = tail_jsonl_records
+
+
+def pending_forget_candidates_count(
+    events_path: Path, *,
+    snapshot: JsonlSnapshot | None = None,
+) -> int | None:
+    """Return the count from the most recent ``saga_decay_ok`` event,
+    iff that event flagged >0 candidates AND no ``saga_forget_ok``
+    event has occurred since. Otherwise None — meaning the persistent
+    "forget candidates pending" line should not render.
+
+    The clear rule is intentionally binary on event presence, not on
+    counts: a saga_forget_ok event newer than the latest saga_decay_ok
+    clears the block regardless of how many atoms were actually
+    forgotten or how many fresh candidates exist. The next decay run
+    re-establishes the count if it's still non-zero. Per-call count
+    arithmetic is fragile (forget can be partial, ranges can shift)
+    so we don't try.
+
+    ``snapshot`` (CR#10) — iterate the cached snapshot when provided.
+    """
+    latest_decay_ts: str | None = None
+    latest_decay_count: int | None = None
+    latest_forget_ts: str | None = None
+    # This needs only the most recent matching events, which the capped tail
+    # preserves by construction; it is intentionally not a windowed scan.
+    for ev in iter_snapshot_or_tail(snapshot, events_path):
+        evtype = ev.get("type")
+        ts = ev.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        if evtype == "saga_decay_ok" and latest_decay_ts is None:
+            latest_decay_ts = ts
+            result = ev.get("result") or {}
+            if isinstance(result, dict):
+                cands = result.get("forgetting_candidates")
+                if isinstance(cands, (int, float)):
+                    latest_decay_count = int(cands)
+        elif evtype in ("saga_forget_ok", "saga_forget_reviewed") and latest_forget_ts is None:
+            latest_forget_ts = ts
+        if latest_decay_ts is not None and latest_forget_ts is not None:
+            break
+
+    if latest_decay_count is None or latest_decay_count <= 0:
+        return None
+    if latest_forget_ts is not None and latest_forget_ts > latest_decay_ts:
+        return None
+    return latest_decay_count

@@ -1,0 +1,607 @@
+"""Server-owned SAGA write provenance and concurrent-call isolation."""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from langchain.tools import ToolRuntime
+
+from mimir.access_control import (
+    CapabilityTier, ServicePrincipal, build_trigger_service_principal,
+    builtin_trigger_service_principal, create_auth_context,
+    SAGA_TAINT_REFUSAL, saga_mutation_taint_refusal,
+)
+from mimir.identities import IdentityResolver
+from mimir.models import (
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
+    SessionACL, SourceLabel,
+)
+from mimir.saga.client import SagaStore
+from mimir.tools import saga_ops
+from mimir.tools.memory import _MEMORY_STATE
+from mimir.tools.store import memory_store
+
+
+class _WriteStore:
+    def __init__(self) -> None:
+        self.atom_calls: list[dict[str, Any]] = []
+        self.session_calls: list[dict[str, Any]] = []
+
+    async def store(self, content: str, **kwargs: Any) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        self.atom_calls.append({"content": content, **kwargs})
+        return {"atom_id": f"atom-{len(self.atom_calls)}", "stored": True}
+
+    async def end_session(self, **kwargs: Any) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        self.session_calls.append(kwargs)
+        return {"session_summary_written": True}
+
+
+@pytest.fixture
+def write_store() -> _WriteStore:
+    store = _WriteStore()
+    previous = _MEMORY_STATE.get("client")
+    _MEMORY_STATE["client"] = store
+    yield store
+    _MEMORY_STATE["client"] = previous
+
+
+def _runtime(context: AuthContext, call_id: str) -> ToolRuntime[AuthContext]:
+    return ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id=call_id, store=None,
+    )
+
+
+def _resolver(tmp_path: Path) -> IdentityResolver:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    path = state / "identities.yaml"
+    path.write_text(
+        """people:
+  - canonical: alice
+    aliases: [discord-alice]
+    access: {roles: [user, admin]}
+  - canonical: bob
+    aliases: [slack-bob]
+    access: {roles: [user, admin]}
+  - canonical: regular
+    aliases: [discord-regular]
+    access: {roles: [user]}
+"""
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    return resolver
+
+
+def _user_context(tmp_path: Path, author: str, channel: str) -> AuthContext:
+    resolver = _resolver(tmp_path)
+    principal = resolver.resolve(author)
+    bridge = "discord" if channel.startswith("discord") else "slack"
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=principal, domain="channel", resource_id=channel,
+        bridge_instance=bridge, sensitivity="private",
+        authorized_principals=frozenset({principal}), integrity="trusted",
+    ))
+    return create_auth_context(
+        AgentEvent(
+            trigger="user_message", channel_id=channel, author=author,
+            source=bridge,
+        ),
+        resolver,
+        enforce=True,
+        ifc_labels=labels,
+    )
+
+
+def _service_context(
+    trigger: str, channel: str, *, authority: ServicePrincipal | None = None,
+) -> AuthContext:
+    principals = {
+        "scheduled_tick": "scheduler",
+        "poller": "poller",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }
+    canonical = authority.canonical if authority is not None else principals[trigger]
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=f"service:{canonical}", domain="service", resource_id=channel,
+        bridge_instance=canonical, sensitivity="internal",
+        authorized_principals=frozenset({f"service:{canonical}"}),
+        source_kind="service", integrity="trusted",
+        integrity_effect="informational",
+    ))
+    return create_auth_context(
+        AgentEvent(
+            trigger=trigger,
+            channel_id=channel,
+            service_principal=canonical,
+            service_authority=authority,
+        ),
+        enforce=True,
+        ifc_labels=labels,
+    )
+
+
+def _trusted_synthesis_labels(channel: str) -> InformationFlowLabels:
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal="service:synthesis", domain="service", resource_id=channel,
+        bridge_instance="synthesis", sensitivity="internal",
+        authorized_principals=frozenset({"service:synthesis"}),
+        source_kind="service", integrity="trusted",
+        integrity_effect="informational",
+    ))
+
+
+@pytest.mark.parametrize("case", [
+    "missing_context", "missing_state", "uncallable_current",
+    "evaluator_exception", "non_label", "empty_sources",
+])
+def test_saga_mutation_taint_refusal_fails_closed(case: str) -> None:
+    context = _service_context("saga_session_end", "synthesis:owned")
+
+    def current(fallback: Any) -> Any:
+        if case == "evaluator_exception":
+            raise RuntimeError("live state evaluation failed")
+        return SimpleNamespace(
+            sources=context.ifc_labels.sources, has_untrusted_active_ingest=False,
+        )
+
+    if case == "missing_context":
+        context = None
+    elif case == "missing_state":
+        context = replace(context, ifc_state=None)
+    elif case == "uncallable_current":
+        context = replace(context, ifc_state=SimpleNamespace(current=None))
+    elif case == "empty_sources":
+        labels = InformationFlowLabels()
+        context = replace(context, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels))
+    else:
+        context = replace(context, ifc_state=SimpleNamespace(current=current))
+
+    assert saga_mutation_taint_refusal(context) == SAGA_TAINT_REFUSAL
+
+
+@pytest.mark.asyncio
+async def test_memory_store_regular_user_is_rejected(
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    context = _user_context(tmp_path, "discord-regular", "discord-private")
+    out = await memory_store.ainvoke({
+        "content": "not allowed", "stream": "semantic",
+        "runtime": _runtime(context, "regular-store"),
+    })
+    assert "write access denied" in out
+    assert write_store.atom_calls == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_memory_writes_keep_runtime_owned_provenance(
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    alice = _user_context(tmp_path, "discord-alice", "discord-a")
+    bob = _user_context(tmp_path, "slack-bob", "slack-b")
+
+    await asyncio.gather(
+        memory_store.ainvoke({
+            "content": "alice fact", "stream": "semantic",
+            "session_id": "model-label-a",
+            "runtime": _runtime(alice, "alice-store"),
+        }),
+        memory_store.ainvoke({
+            "content": "bob fact", "stream": "semantic",
+            "session_id": "model-label-b",
+            "runtime": _runtime(bob, "bob-store"),
+        }),
+    )
+
+    by_content = {call["content"]: call for call in write_store.atom_calls}
+    assert by_content["alice fact"]["owner_principal"] == "alice"
+    assert by_content["alice fact"]["origin_channel"] == "discord-a"
+    assert by_content["alice fact"]["session_id"] == "model-label-a"
+    assert by_content["bob fact"]["owner_principal"] == "bob"
+    assert by_content["bob fact"]["origin_channel"] == "slack-b"
+    assert by_content["bob fact"]["session_id"] == "model-label-b"
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    ["scheduled_tick", "poller", "upgrade", "saga_session_end"],
+)
+@pytest.mark.asyncio
+async def test_service_without_memory_store_capability_is_denied(
+    trigger: str, write_store: _WriteStore,
+) -> None:
+    context = _service_context(trigger, f"{trigger}:owned")
+    out = await memory_store.ainvoke({
+        "content": trigger, "stream": "episodic",
+        "runtime": _runtime(context, f"{trigger}-store"),
+    })
+
+    assert "write access denied" in out
+    assert write_store.atom_calls == []
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_memory_store_preserves_service_provenance(
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    trigger = "scheduled_tick"
+    context = _service_context(
+        trigger, "scheduler:heartbeat",
+        authority=builtin_trigger_service_principal("heartbeat", tmp_path),
+    )
+    out = await memory_store.ainvoke({
+        "content": trigger, "stream": "episodic",
+        "runtime": _runtime(context, f"{trigger}-store"),
+    })
+
+    assert "stored" in out
+    call = write_store.atom_calls[-1]
+    assert call["owner_principal"] == "service:heartbeat"
+    assert call["origin_channel"] == "scheduler:heartbeat"
+    assert call["visibility"] == "service"
+    assert call["provenance"]["created_by"] == "service:heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_synthesis_memory_store_preserves_service_provenance(
+    write_store: _WriteStore,
+) -> None:
+    authority = build_trigger_service_principal(
+        canonical="synthesis",
+        trigger="saga_session_end",
+        profile="test-synthesis",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("memory_store",),
+        creation_path="test",
+    )
+    context = _service_context(
+        "saga_session_end", "synthesis:owned", authority=authority,
+    )
+    out = await memory_store.ainvoke({
+        "content": "synthesis fact", "stream": "episodic",
+        "runtime": _runtime(context, "synthesis-store"),
+    })
+
+    assert "stored" in out
+    call = write_store.atom_calls[-1]
+    assert call["owner_principal"] == "service:synthesis"
+    assert call["origin_channel"] == "synthesis:owned"
+    assert call["visibility"] == "service"
+    assert call["provenance"]["created_by"] == "service:synthesis"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("integrity_effect", "stored"),
+    [("informational", True), ("active_ingest", False)],
+)
+async def test_memory_store_uses_active_ingest_only_integrity_boundary(
+    integrity_effect: str, stored: bool,
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="memory", domain="saga", resource_id="atom:recall",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), integrity="untrusted",
+        integrity_effect=integrity_effect,
+    ))
+    context = replace(
+        context,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    from mimir.tools.refusals import ToolPolicyRefusal
+    if stored:
+        out = await memory_store.coroutine(
+            content="restated recalled fact", stream="semantic",
+            runtime=_runtime(context, f"{integrity_effect}-recall-store"),
+        )
+        assert "stored" in out
+    else:
+        with pytest.raises(ToolPolicyRefusal, match="tainted"):
+            await memory_store.coroutine(
+                content="restated recalled fact", stream="semantic",
+                runtime=_runtime(context, f"{integrity_effect}-recall-store"),
+            )
+    assert bool(write_store.atom_calls) is stored
+    if stored:
+        assert "integrity" not in write_store.atom_calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_memory_store_omits_integrity_when_all_sources_are_trusted(
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice", domain="channel", resource_id="discord-private",
+        bridge_instance="discord", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    ))
+    context = replace(
+        context,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    out = await memory_store.coroutine(
+        content="trusted operator fact", stream="semantic",
+        runtime=_runtime(context, "trusted-store"),
+    )
+
+    assert "stored" in out
+    assert "integrity" not in write_store.atom_calls[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skill_learning", [False, True])
+async def test_real_store_rejects_write_after_turn_becomes_tainted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_learning: bool,
+) -> None:
+    class StubProvider:
+        def embed(self, text: str, *, input_type: str = "passage") -> list[float]:
+            return [1.0, 2.0, 3.0, 4.0]
+
+        def dimensions(self) -> int:
+            return 4
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: StubProvider())
+    store = SagaStore(db_path=tmp_path / "tainted-turn.saga.db", embedding_dim=4)
+    monkeypatch.setitem(_MEMORY_STATE, "client", store)
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    tool = saga_ops.saga_record_skill_learning if skill_learning else memory_store
+    args = {"skill": "memory", "kind": "tip"} if skill_learning else {"stream": "semantic"}
+    try:
+        out = await tool.ainvoke({
+            **args, "content": "trusted operator fact",
+            "runtime": _runtime(context, "before-taint"),
+        })
+        assert "failed" not in out
+        conn = store._ensure_conn()
+        assert [row[0] for row in conn.execute("SELECT content FROM atoms")] == [
+            "trusted operator fact",
+        ]
+
+        context.ifc_state.merge(InformationFlowLabels().with_source(SourceLabel(
+            principal="web", domain="internet", resource_id="https://example.com",
+            bridge_instance="fetch", sensitivity="public",
+            authorized_principals=frozenset({"alice"}),
+            integrity="untrusted", integrity_effect="active_ingest",
+        )))
+        from mimir.tools.refusals import ToolPolicyRefusal
+        with pytest.raises(ToolPolicyRefusal, match="tainted"):
+            await tool.ainvoke({
+                **args, "content": "untrusted injected instruction",
+                "runtime": _runtime(context, "after-taint"),
+            })
+        assert [row[0] for row in conn.execute("SELECT content FROM atoms")] == [
+            "trusted operator fact",
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_store_empty_labels_are_refused(
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    labels = InformationFlowLabels()
+    context = replace(
+        context,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    from mimir.tools.refusals import ToolPolicyRefusal
+    with pytest.raises(ToolPolicyRefusal, match="tainted"):
+        await memory_store.coroutine(
+            content="missing provenance", stream="semantic",
+            runtime=_runtime(context, "empty-label-store"),
+        )
+    assert write_store.atom_calls == []
+
+
+@pytest.mark.asyncio
+async def test_research_poller_untrusted_write_is_refused(
+    write_store: _WriteStore,
+) -> None:
+    authority = build_trigger_service_principal(
+        canonical="poller:hn-ai",
+        trigger="poller",
+        profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("memory_store", "saga_feedback", "saga_mark_contributions"),
+        creation_path="test",
+    )
+    principal = "service:poller:hn-ai"
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=principal, domain="channel", resource_id="poller:hn-ai",
+        bridge_instance="poller", sensitivity="internal",
+        authorized_principals=frozenset({principal}), source_kind="service",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id="poller:hn-ai", source="poller",
+        source_id="poller:hn-ai:123:batch:0", service_principal=authority.canonical,
+        service_authority=authority, ifc_labels=labels,
+        extra={"poller_name": "hn-ai"},
+    ), enforce=True, ifc_labels=labels)
+
+    from mimir.tools.refusals import ToolPolicyRefusal
+    with pytest.raises(ToolPolicyRefusal, match="tainted"):
+        await memory_store.coroutine(
+            content="untrusted finding", stream="semantic",
+            runtime=_runtime(context, "poller-store"),
+        )
+    assert write_store.atom_calls == []
+    assert {"integrity", "origin_trigger", "origin_ref"}.isdisjoint(
+        memory_store.args_schema.model_fields
+    )
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_uses_runtime_not_model_session_for_authority(
+    write_store: _WriteStore,
+) -> None:
+    source_acl = SessionACL(
+        owner_principal="regular",
+        origin_channel="discord-synthesis",
+        origin_domain="discord",
+        visibility="private",
+        provenance_complete=True,
+    )
+    labels = _trusted_synthesis_labels("discord-synthesis")
+    context = create_auth_context(
+        AgentEvent(
+            trigger="saga_session_end",
+            channel_id="discord-synthesis",
+            service_principal="synthesis",
+            source_session_acl=source_acl,
+        ),
+        enforce=True,
+        ifc_labels=labels,
+    )
+    context = replace(context, saga_session_id="active-synthesis-session")
+    assert context.source_session_acl == source_acl
+    out = await saga_ops.saga_end_session.ainvoke({
+        "session_id": "active-synthesis-session", "summary": "done",
+        "runtime": _runtime(context, "synthesis-end"),
+    })
+    assert "ok" in out
+    call = write_store.session_calls[-1]
+    assert call["session_id"] == "active-synthesis-session"
+    assert call["owner_principal"] == "regular"
+    assert call["origin_channel"] == "discord-synthesis"
+    assert call["origin_domain"] == "discord"
+    assert call["visibility"] == "private"
+    assert call["provenance"]["created_by"] == "regular"
+    assert call["provenance"]["derived_by"] == "service:synthesis"
+
+
+@pytest.mark.parametrize("origin_domain", ["discord", "slack"])
+@pytest.mark.asyncio
+async def test_saga_end_session_real_store_accepts_inherited_ingress_acl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin_domain: str,
+) -> None:
+    class StubProvider:
+        def embed(self, text: str, *, input_type: str = "passage") -> list[float]:
+            return [1.0, 2.0, 3.0, 4.0]
+
+        def dimensions(self) -> int:
+            return 4
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: StubProvider())
+    store = SagaStore(db_path=tmp_path / "session-provenance.saga.db", embedding_dim=4)
+    previous = _MEMORY_STATE.get("client")
+    _MEMORY_STATE["client"] = store
+    try:
+        channel_id = f"{origin_domain}-synthesis"
+        session_id = f"{origin_domain}-active-session"
+        source_acl = SessionACL(
+            owner_principal="regular",
+            origin_channel=channel_id,
+            origin_domain=origin_domain,
+            visibility="private",
+            provenance_complete=True,
+        )
+        labels = _trusted_synthesis_labels(channel_id)
+        context = create_auth_context(
+            AgentEvent(
+                trigger="saga_session_end",
+                channel_id=channel_id,
+                service_principal="synthesis",
+                source_session_acl=source_acl,
+            ),
+            enforce=True,
+            ifc_labels=labels,
+        )
+        context = replace(context, saga_session_id=session_id)
+
+        out = await saga_ops.saga_end_session.ainvoke({
+            "session_id": session_id,
+            "summary": "done",
+            "runtime": _runtime(context, f"{origin_domain}-real-end"),
+        })
+
+        assert "saga_end_session ok" in out
+        row = store._ensure_conn().execute(
+            "SELECT owner_principal, origin_channel, origin_domain, visibility "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        assert tuple(row) == ("regular", channel_id, origin_domain, "private")
+        visible = await store.recent_session_boundaries(
+            channel_id=channel_id,
+            auth_context=AuthContext(
+                principal="regular",
+                canonical_principal="regular",
+                roles=("user",),
+                event_ingress=origin_domain,
+                trigger="user_message",
+                channel_id=channel_id,
+                interactivity=None,
+            ),
+        )
+        assert [boundary["session_id"] for boundary in visible] == [session_id]
+    finally:
+        _MEMORY_STATE["client"] = previous
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_saga_end_session_missing_or_mixed_source_acl_fails_closed(
+    write_store: _WriteStore,
+) -> None:
+    context = replace(
+        _service_context("saga_session_end", "discord-synthesis"),
+        saga_session_id="mixed-session",
+    )
+    out = await saga_ops.saga_end_session.ainvoke({
+        "session_id": "mixed-session", "summary": "done",
+        "runtime": _runtime(context, "mixed-end"),
+    })
+    assert "ok" in out
+    call = write_store.session_calls[-1]
+    assert call["owner_principal"] == "legacy_admin"
+    assert call["origin_domain"] is None
+    assert call["visibility"] == "legacy_admin"
+    assert call["provenance"] == {}
+
+
+@pytest.mark.asyncio
+async def test_http_trigger_spoof_does_not_gain_service_authority(
+    write_store: _WriteStore,
+) -> None:
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="http", domain="channel", resource_id="http-spoof",
+        bridge_instance="http", sensitivity="internal",
+        authorized_principals=frozenset({"http"}), integrity="trusted",
+    ))
+    context = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick", channel_id="http-spoof",
+            extra={"event_ingress": "http_event"},
+        ),
+        enforce=True,
+        ifc_labels=labels,
+    )
+    out = await memory_store.ainvoke({
+        "content": "spoof", "stream": "semantic",
+        "runtime": _runtime(context, "spoof-store"),
+    })
+    assert "write access denied" in out
+    assert write_store.atom_calls == []

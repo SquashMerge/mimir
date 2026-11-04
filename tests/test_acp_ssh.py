@@ -1,0 +1,844 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from mimir.acp.profiles import Profile, RemoteProfile
+from mimir.acp.proxy import ProxyRouter
+from mimir.acp.ssh import SSH_PATH, SshError, build_ssh_argv, child_environment, run_ssh_proxy, stop_child
+
+
+@pytest.fixture(autouse=True)
+def _child_exit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give a fake ``ssh`` child a loose hang guard to exit after its stdin closes.
+
+    The fake is a real Python process, and interpreter startup alone can exceed the production
+    1s grace on a loaded host, which surfaced as ``SSH child did not exit``. Tests that exercise
+    the grace itself, or whose child ignores EOF, set their own short value after this.
+    """
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 30.0)
+
+
+def remote_profile(tmp_path: Path) -> tuple[Profile, Path]:
+    ssh = tmp_path / "ssh"
+    ssh.write_text("")
+    ssh.chmod(0o755)
+    identity = tmp_path / "id"
+    identity.write_text("")
+    identity.chmod(0o600)
+    known = tmp_path / "known"
+    known.write_text("")
+    known.chmod(0o600)
+    profile = Profile("p", Path("/remote path"), RemoteProfile("example.com", "user", 2222, identity, known))
+    return profile, ssh
+
+
+def test_exact_argv_is_injection_safe_and_secret_free(tmp_path: Path) -> None:
+    profile, ssh = remote_profile(tmp_path)
+    argv = build_ssh_argv(profile, ssh)
+    assert argv == (
+        str(ssh), "-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no", "-o", "ChallengeResponseAuthentication=no",
+        "-o", "IdentitiesOnly=yes", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+        "-o", "ForwardX11Trusted=no", "-o", "PermitLocalCommand=no",
+        "-o", "ClearAllForwardings=yes", "-o", "ExitOnForwardFailure=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
+        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", "-o", "LogLevel=ERROR",
+        "-o", f"UserKnownHostsFile={profile.remote.known_hosts_file}", "-i", str(profile.remote.identity_file),
+        "-p", "2222", "--", "user@example.com", "mimir-agent acp relay --home '/remote path'",
+    )
+    assert "SECRET" not in str(argv)
+    assert "--timeout" not in argv[-1]
+
+
+def test_effective_ssh_configuration_disables_forwarding_and_local_commands(tmp_path: Path) -> None:
+    if not SSH_PATH.is_file():
+        pytest.skip("system SSH executable is not installed")
+    profile, _ = remote_profile(tmp_path)
+    argv = build_ssh_argv(profile)
+    result = subprocess.run(
+        (argv[0], "-G", *argv[1:]),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=child_environment({"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}),
+    )
+    effective = dict(line.split(maxsplit=1) for line in result.stdout.splitlines())
+    assert effective["forwardagent"] == "no"
+    assert effective["forwardx11"] == "no"
+    assert effective["forwardx11trusted"] == "no"
+    assert effective["permitlocalcommand"] == "no"
+
+
+def test_ssh_file_allowlist_and_argument_bounds(tmp_path: Path) -> None:
+    profile, ssh = remote_profile(tmp_path)
+    profile.remote.identity_file.chmod(0o640)
+    with pytest.raises(SshError, match="unsafe SSH file"):
+        build_ssh_argv(profile, ssh)
+    profile.remote.identity_file.chmod(0o600)
+    link = tmp_path / "link"
+    link.symlink_to(profile.remote.known_hosts_file)
+    unsafe = Profile("p", profile.home, RemoteProfile("example.com", "user", 22, profile.remote.identity_file, link))
+    with pytest.raises(SshError, match="unsafe SSH file"):
+        build_ssh_argv(unsafe, ssh)
+
+
+def test_child_environment_is_secret_and_profile_free() -> None:
+    allowed = {"PATH": "/usr/bin:/bin", "HOME": "/home/operator", "LANG": "C",
+               "LC_ALL": "C", "LC_CTYPE": "C", "TZ": "UTC", "TERM": "xterm"}
+    denied = dict.fromkeys(("SECRET", "PYTHONPATH", "PYTHONHOME", "SSH_AUTH_SOCK",
+                            "MIMIR_ACP_PROFILE", "MIMIR_KEY", "LD_PRELOAD",
+                            "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+                            "DYLD_LIBRARY_PATH", "BASH_ENV", "ENV", "FUTURE_VARIABLE"), "unsafe")
+    assert child_environment(allowed | denied) == allowed
+    assert child_environment({}) == {}
+
+
+class Reader:
+    async def read(self, size: int = -1) -> bytes:
+        return b""
+
+
+class Process:
+    def __init__(self, waits: list[object]) -> None:
+        self.stdout = Reader()
+        self.stdin = None
+        self.returncode = None
+        self.waits = iter(waits)
+        self.terminated = 0
+        self.killed = 0
+
+    async def wait(self) -> int:
+        value = next(self.waits)
+        if value == "block":
+            await asyncio.Future()
+        self.returncode = int(value)
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated += 1
+
+    def kill(self) -> None:
+        self.killed += 1
+
+
+@pytest.mark.asyncio
+async def test_stop_child_waits_then_terminates_and_kills(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.ssh.KILL_TIMEOUT", 0.01)
+    process = Process(["block", "block", 0])
+    await stop_child(process)
+    assert process.terminated == 1
+    assert process.killed == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_child_reports_finite_kill_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.ssh.KILL_TIMEOUT", 0.01)
+    process = Process(["block", "block", "block"])
+    with pytest.raises(SshError, match="did not stop"):
+        await stop_child(process)
+    assert process.terminated == process.killed == 1
+
+
+class Output:
+    def __init__(self, stream: io.BytesIO) -> None:
+        self.stream = stream
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.stream.write(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+def _fake_ssh(tmp_path: Path, body: str) -> Path:
+    executable = tmp_path / "ssh"
+    executable.write_text(f"#!{sys.executable}\n" + body)
+    executable.chmod(0o755)
+    return executable
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="real Seatbelt hosted shell")
+async def test_hosted_shell_allows_terminal_environment_but_strips_proxy_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ROUTER_LOCAL_VALUE", "local-secret")
+    monkeypatch.setenv("MIMIR_WEB_KEY", "environment-web-key")
+    monkeypatch.setenv("TERM", "mimir-test-terminal")
+    client_stream = io.BytesIO()
+    daemon_stream = io.BytesIO()
+    router = ProxyRouter(Output(client_stream), Output(daemon_stream), "raw-web-key")
+
+    def sent() -> list[dict[str, object]]:
+        return [json.loads(line) for line in daemon_stream.getvalue().splitlines()]
+
+    # Whole-protocol hang ceiling, including the real Seatbelt shell startup.
+    async with asyncio.timeout(120):
+        try:
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "new", "method": "session/new",
+                "params": {"cwd": str(tmp_path)},
+            })
+            server_id = sent()[-1]["params"]["mcpServers"][0]["serverId"]
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 1, "method": "mcp/connect",
+                "params": {"serverId": server_id},
+            })
+            connection_id = sent()[-1]["result"]["connectionId"]
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 2, "method": "mcp/message", "params": {
+                    "connectionId": connection_id, "method": "initialize", "params": {
+                        "protocolVersion": "2025-03-26", "capabilities": {},
+                        "clientInfo": {"name": "client", "version": "1"},
+                    },
+                },
+            })
+            await asyncio.sleep(0)
+            await router.route_daemon({
+                "jsonrpc": "2.0", "method": "mcp/message", "params": {
+                    "connectionId": connection_id,
+                    "method": "notifications/initialized",
+                    "params": {},
+                },
+            })
+            await router.route_daemon({"jsonrpc": "2.0", "id": "new", "result": {"sessionId": "s"}})
+            await router.route_daemon({
+                "jsonrpc": "2.0", "id": 3, "method": "mcp/message", "params": {
+                    "connectionId": connection_id, "method": "tools/call", "params": {
+                        "name": "shell",
+                        "arguments": {"command": "printf '%s:%s:%s' \"$TERM\" \"${ROUTER_LOCAL_VALUE-unset}\" \"${MIMIR_WEB_KEY-unset}\""},
+                    },
+                },
+            })
+            while sent()[-1].get("id") != 3:
+                await asyncio.sleep(0.01)
+            assert sent()[-1]["result"]["structuredContent"]["stdout"] == "mimir-test-terminal:unset:unset"
+            for secret in (b"raw-web-key", b"environment-web-key", b"local-secret"):
+                assert secret not in daemon_stream.getvalue()
+        finally:
+            await router.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_subprocess_pumps_without_first_output_timeout_and_sanitizes_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    observed = tmp_path / "observed.json"
+    ssh = _fake_ssh(tmp_path, f"OBSERVED = {str(observed)!r}\n" + """
+import json,os,sys,time
+with open(OBSERVED,'w') as stream: json.dump({'argv':sys.argv,'env':dict(os.environ)},stream)
+time.sleep(.08)
+for line in sys.stdin.buffer:
+ message=json.loads(line); assert message['params']['_meta']=={'mimir.webKey':'sentinel'}
+ sys.stdout.buffer.write(b'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n'); sys.stdout.buffer.flush()
+""")
+    reader = asyncio.StreamReader()
+    reader.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n')
+    reader.feed_eof()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    environment = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "OBSERVED": str(observed), "PYTHONPATH": "bad", "MIMIR_ACP_PROFILE": "remote", "BASH_ENV": "bad"}
+    await run_ssh_proxy(profile, "sentinel", output, _ssh_path=ssh, _environment=environment)
+    assert json.loads(output.getvalue())["result"] == {}
+    captured = json.loads(observed.read_text())
+    assert captured["argv"][-1] == "mimir-agent acp relay --home '/remote path'"
+    assert "PYTHONPATH" not in captured["env"] and "MIMIR_ACP_PROFILE" not in captured["env"]
+    assert "OBSERVED" not in captured["env"] and "BASH_ENV" not in captured["env"]
+    assert captured["env"]["PATH"] == environment["PATH"]
+    assert captured["env"]["HOME"] == environment["HOME"]
+    assert "sentinel" not in json.dumps(captured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("times_out", [False, True], ids=["default-bound", "spawn-timeout"])
+async def test_local_spawn_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    times_out: bool,
+) -> None:
+    from types import SimpleNamespace
+    from mimir.acp import ssh as ssh_module
+
+    spawn = AsyncMock(wraps=asyncio.create_subprocess_exec)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    budgets = []
+
+    async def delayed(*args, **kwargs):
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return await spawn(*args, **kwargs)
+
+    async def wait_for(awaitable, timeout):
+        if budgets:
+            return await asyncio.wait_for(awaitable, timeout)
+        budgets.append(timeout)
+        spawning = asyncio.create_task(awaitable)
+        try:
+            await entered.wait()
+            assert timeout == ssh_module.SPAWN_TIMEOUT
+            if times_out:
+                return await asyncio.wait_for(spawning, 0)
+            release.set()
+            return await spawning
+        finally:
+            spawning.cancel()
+            await asyncio.gather(spawning, return_exceptions=True)
+
+    monkeypatch.setattr(ssh_module, "asyncio", SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio)
+           if name not in {"wait_for", "create_subprocess_exec"}},
+        wait_for=wait_for, create_subprocess_exec=delayed,
+    ))
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, "raise SystemExit(0)\n")
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    stdio = AsyncMock(return_value=(reader, Output(output), transport))
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", stdio)
+
+    if times_out:
+        with pytest.raises(TimeoutError):
+            await run_ssh_proxy(profile, "secret", output, _ssh_path=ssh)
+        # Cancellation precedes the real spawn: no child or subprocess pipes exist.
+        assert cancelled.is_set()
+        spawn.assert_not_awaited()
+        stdio.assert_not_awaited()
+    else:
+        await run_ssh_proxy(profile, "secret", output, _ssh_path=ssh)
+        assert not cancelled.is_set()
+        spawn.assert_awaited_once()
+        stdio.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    base, _ = remote_profile(tmp_path)
+    profile = Profile(base.name, base.home, base.remote, timeout_seconds=23)
+    ssh = _fake_ssh(tmp_path, "raise SystemExit(0)\n")
+    reader = asyncio.StreamReader()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    observed: list[int] = []
+
+    async def route(
+        client_reader: object,
+        client_writer: object,
+        daemon_reader: object,
+        daemon_writer: object,
+        credential: str,
+        *,
+        timeout_seconds: int,
+        close_on_daemon_exit: bool,
+        signal_cleanup: object,
+    ) -> None:
+        assert callable(signal_cleanup)
+        router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": "new", "method": "session/new",
+            "params": {
+                "cwd": str(tmp_path),
+                "timeoutSeconds": 1,
+            },
+        })
+        hosted_session = next(iter(router._provider._sessions.values()))
+        observed.append(hosted_session.timeout_seconds)
+        await router.close()
+
+    monkeypatch.setattr(
+        "mimir.acp.ssh.open_stdio",
+        lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)),
+    )
+    monkeypatch.setattr("mimir.acp.ssh.run_router", route)
+    await run_ssh_proxy(
+        profile,
+        "secret",
+        output,
+        _ssh_path=ssh,
+        _environment={
+            "PATH": os.environ.get("PATH", ""),
+            "MIMIR_ACP_TIMEOUT": "1",
+        },
+    )
+    assert observed == [23]
+
+
+@pytest.mark.asyncio
+async def test_signal_does_not_hide_already_observed_ssh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedProcess:
+        returncode = 7
+        stdin = Output(io.BytesIO())
+        stdout = Reader()
+        stderr = Reader()
+        async def wait(self) -> int:
+            return 7
+        def kill(self) -> None:
+            pytest.fail("must not kill a child already observed as exited")
+
+    async def route(*args: object, signal_cleanup: object, **kwargs: object) -> None:
+        # Deterministic ordering: nonzero child status exists before signal
+        # cleanup, while the parent has not yet handled asyncio.wait's result.
+        signal_cleanup()
+
+    monkeypatch.setattr("mimir.acp.ssh.build_ssh_argv", lambda *args: ("unused",))
+    monkeypatch.setattr("mimir.acp.ssh.asyncio.create_subprocess_exec", AsyncMock(return_value=FailedProcess()))
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", AsyncMock(return_value=(
+        Reader(), Output(io.BytesIO()), type("Transport", (), {"close": lambda self: None})(),
+    )))
+    monkeypatch.setattr("mimir.acp.ssh.run_router", route)
+    with pytest.raises(SshError, match="SSH connection failed"):
+        await run_ssh_proxy(Profile("p", Path("/remote")), "secret", io.BytesIO())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_close", [False, True])
+async def test_ssh_signal_kills_owned_child_before_slow_teardown(slow_close: bool) -> None:
+    source = r'''
+import asyncio, io, os, signal, sys
+from pathlib import Path
+from types import SimpleNamespace
+from mimir.acp import bootstrap, profiles, proxy, ssh
+profiles.ProfileStore = lambda: SimpleNamespace(get=lambda name: SimpleNamespace(remote=True))
+profiles.selected_profile = lambda name: 'test'
+proxy.SIGNAL_EXIT_TIMEOUT = 0.5
+ssh.build_ssh_argv = lambda *args: (sys.executable, '-c', 'import time; time.sleep(60)')
+original_spawn = asyncio.create_subprocess_exec
+async def spawn(*args, **kwargs):
+    process = await original_spawn(*args, **kwargs)
+    output.write(f'child:{process.pid}\n'.encode()); output.flush()
+    return process
+ssh.asyncio.create_subprocess_exec = spawn
+class Reader:
+    async def read(self, size):
+        output.write(b'ready\n'); output.flush()
+        await asyncio.Future()
+async def stdio(target):
+    return Reader(), proxy._OutputWriter(io.BytesIO()), SimpleNamespace(close=lambda: None)
+ssh.open_stdio = stdio
+original_close = proxy.ProxyRouter.close
+async def close(self):
+    if sys.argv[1] == 'slow':
+        await asyncio.sleep(60)
+    await original_close(self)
+proxy.ProxyRouter.close = close
+async def remote(name, target):
+    global output
+    output = target
+    await ssh.run_ssh_proxy(SimpleNamespace(timeout_seconds=60), 'secret', target)
+ssh.run_remote_proxy = remote
+raise SystemExit(bootstrap.main([]))
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, "slow" if slow_close else "fast",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    child_pid = None
+    try:
+        # Whole-protocol hang ceiling, not a deadline for individual pipe reads.
+        async with asyncio.timeout(120):
+            line = await process.stdout.readline()
+            assert line.startswith(b"child:")
+            child_pid = int(line.split(b":")[1])
+            assert await process.stdout.readline() == b"ready\n"
+            import signal
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = await process.communicate()
+            assert process.returncode == 128 + signal.SIGTERM
+            assert (stdout, stderr) == (b"", b"")
+            # The real SSH stand-in is terminated and reaped, even when the router
+            # close cannot complete before the process-exit watchdog fires.
+            with pytest.raises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            child_pid = None
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_real_ssh_proxy_uses_local_router_and_preserves_foreign_daemon_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, """
+import json,sys
+auth=json.loads(sys.stdin.buffer.readline())
+assert auth['params']['_meta']=={'mimir.webKey':'secret'}
+session=json.loads(sys.stdin.buffer.readline())
+provider=session['params']['mcpServers']
+assert len(provider)==1 and provider[0]['name']=='mimir-hands'
+connect={'jsonrpc':'2.0','id':'connect','method':'mcp/connect','params':{'serverId':provider[0]['serverId']}}
+sys.stdout.buffer.write(json.dumps(connect,separators=(',',':')).encode()+b'\\n');sys.stdout.buffer.flush()
+connected=json.loads(sys.stdin.buffer.readline())
+assert connected['id']=='connect' and connected['result']['connectionId'].startswith('mimir-hosted-connection:')
+sys.stdout.buffer.write(b'{ "jsonrpc" : "2.0", "id" : 1, "result" : {"ok":true} }\\n')
+sys.stdout.buffer.write(b'{ "jsonrpc" : "2.0", "id" : 2, "result" : {"sessionId":"s"} }\\n')
+sys.stdout.buffer.flush()
+""")
+    reader = asyncio.StreamReader()
+    reader.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n')
+    reader.feed_data(json.dumps({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"cwd": str(tmp_path)}
+    }, separators=(",", ":")).encode() + b"\n")
+    reader.feed_eof()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    await run_ssh_proxy(
+        profile, "secret", output, _ssh_path=ssh,
+        _environment={"PATH": os.environ.get("PATH", "")},
+    )
+    assert output.getvalue() == (
+        b'{ "jsonrpc" : "2.0", "id" : 1, "result" : {"ok":true} }\n'
+        b'{ "jsonrpc" : "2.0", "id" : 2, "result" : {"sessionId":"s"} }\n'
+    )
+
+
+@pytest.mark.asyncio
+async def test_ssh_proxy_uses_local_session_grants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, """
+import json,sys
+session=json.loads(sys.stdin.buffer.readline())
+sys.stdout.buffer.write(b'{"jsonrpc":"2.0","id":"new","result":{"sessionId":"s"}}\\n');sys.stdout.buffer.flush()
+options=[
+ {'optionId':'allow_once','name':'Allow once','kind':'allow_once'},
+ {'optionId':'allow_session','name':'Allow for this session','kind':'allow_always'},
+ {'optionId':'reject_once','name':'Reject once','kind':'reject_once'},
+]
+def permission(request_id):
+ return {'jsonrpc':'2.0','id':request_id,'method':'session/request_permission','params':{
+  'sessionId':'s','toolCall':{'toolCallId':f'call-{request_id}','title':'hands_shell','kind':'other','status':'pending','rawInput':{'command':'true'}},
+  'options':options,'_meta':{'mimir.wrapper':'hands_shell'}}}
+sys.stdout.buffer.write(json.dumps(permission(7),separators=(',',':')).encode()+b'\\n');sys.stdout.buffer.flush()
+first=json.loads(sys.stdin.buffer.readline())
+assert first['id']==7 and first['result']['outcome']['optionId']=='allow_session'
+sys.stdout.buffer.write(json.dumps(permission('eight'),separators=(',',':')).encode()+b'\\n');sys.stdout.buffer.flush()
+second=json.loads(sys.stdin.buffer.readline())
+assert second['id']=='eight' and second['result']['outcome']['optionId']=='allow_once'
+""")
+    reader = asyncio.StreamReader()
+    reader.feed_data(json.dumps({
+        "jsonrpc": "2.0", "id": "new", "method": "session/new",
+        "params": {"cwd": str(tmp_path), "mcpServers": [{"type": "acp", "name": "other", "serverId": "foreign"}]},
+    }, separators=(",", ":")).encode() + b"\n")
+    output = io.BytesIO()
+
+    class PermissionOutput(Output):
+        def write(self, data: bytes) -> None:
+            super().write(data)
+            message = json.loads(data)
+            if message.get("method") == "session/request_permission":
+                reader.feed_data(json.dumps({
+                    "jsonrpc": "2.0", "id": message["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
+                }, separators=(",", ":")).encode() + b"\n")
+
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr(
+        "mimir.acp.ssh.open_stdio",
+        lambda target: asyncio.sleep(0, result=(reader, PermissionOutput(target), transport)),
+    )
+    await run_ssh_proxy(
+        profile, "secret", output, _ssh_path=ssh,
+        _environment={"PATH": os.environ.get("PATH", "")},
+    )
+    permission_frames = [
+        json.loads(line) for line in output.getvalue().splitlines()
+        if json.loads(line).get("method") == "session/request_permission"
+    ]
+    assert [message["id"] for message in permission_frames] == [7]
+
+
+@pytest.mark.asyncio
+async def test_actual_subprocess_failure_is_sanitized_and_reaped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, "import sys; sys.stderr.write('private-sentinel'); raise SystemExit(23)\n")
+    reader = asyncio.StreamReader()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    with pytest.raises(SshError, match="SSH connection failed") as raised:
+        await run_ssh_proxy(profile, "raw-secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", "")})
+    assert "private-sentinel" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_early_child_failure_cancels_open_client_stdin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, "raise SystemExit(19)\n")
+    reader = asyncio.StreamReader()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    # Whole-protocol hang ceiling, not a deadline for interpreter startup.
+    async with asyncio.timeout(120):
+        with pytest.raises(SshError, match="SSH connection failed"):
+            await run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", "")})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feed_auth", [False, True], ids=["idle-input", "queued-auth"])
+async def test_actual_subprocess_cancellation_terminates_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, feed_auth: bool,
+) -> None:
+    profile, _ = remote_profile(tmp_path)
+    # The child ignores EOF, so the grace before SIGTERM only delays the path under test.
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
+    marker = tmp_path / "terminated"
+    ssh = _fake_ssh(tmp_path, f"MARKER = {str(marker)!r}\n" + """
+import os,signal,sys,time
+def stop(*args):
+ with open(MARKER,'w') as stream: stream.write('terminated')
+ raise SystemExit(0)
+signal.signal(signal.SIGTERM,stop)
+with open(MARKER + '.ready','w') as stream: stream.write('ready')
+# Teardown closes stdin before sending SIGTERM. Stay alive on EOF, even if
+# cancellation beats delivery of the queued authentication request.
+while True: time.sleep(1)
+""")
+    reader = asyncio.StreamReader()
+    if feed_auth:
+        reader.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n')
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    parent_ready = asyncio.Event()
+    release_pipes = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    connect_read_pipe = loop.connect_read_pipe
+
+    async def delayed_pipe(*args, **kwargs):
+        result = await connect_read_pipe(*args, **kwargs)
+        # Hold real subprocess setup after fork, while the child can publish
+        # readiness. Cancelling here makes asyncio kill it without SIGTERM.
+        await release_pipes.wait()
+        return result
+
+    async def open_stdio(target):
+        # No yield: the proxy enters its cleanup-owning try/finally before
+        # the test can resume. Child readiness alone does not establish this.
+        parent_ready.set()
+        return reader, Output(target), transport
+
+    monkeypatch.setattr(loop, "connect_read_pipe", delayed_pipe)
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", open_stdio)
+    # Readiness and teardown share one whole-protocol hang ceiling.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)}))
+        try:
+            while not Path(str(marker) + ".ready").exists():
+                await asyncio.sleep(0.01)
+            release_pipes.set()
+            await asyncio.wait_for(parent_ready.wait(), 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert marker.read_text() == "terminated"
+        finally:
+            release_pipes.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler_delay", [0, 60], ids=["handler-returns", "handler-interrupted"])
+async def test_stubborn_child_is_killed_and_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, handler_delay: int,
+) -> None:
+    profile, _ = remote_profile(tmp_path)
+    marker = tmp_path / "child.json"
+    terminated = tmp_path / "terminated"
+    ssh = _fake_ssh(tmp_path, f"MARKER = {str(marker)!r}\nTERMINATED = {str(terminated)!r}\nHANDLER_DELAY = {handler_delay!r}\n" + """
+import json,os,signal,time
+def ignore(*args):
+ # Publish acknowledgement without truncating/re-writing the readiness JSON:
+ # SIGKILL may interrupt the handler at any instruction.
+ fd=os.open(TERMINATED,os.O_CREAT|os.O_WRONLY,0o600)
+ os.close(fd)
+ time.sleep(HANDLER_DELAY)
+signal.signal(signal.SIGTERM,ignore)
+with open(MARKER,'w') as stream: json.dump({'pid':os.getpid()},stream)
+while True: time.sleep(1)
+""")
+    reader = asyncio.StreamReader()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    parent_ready = asyncio.Event()
+
+    async def open_stdio(target):
+        # No yield after signalling: the proxy reaches its routing try/finally
+        # before the test can resume and cancel it.
+        parent_ready.set()
+        return reader, Output(target), transport
+
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", open_stdio)
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
+    # Keep the production SIGTERM grace period so the child can acknowledge
+    # the signal even on a loaded parallel CI runner.
+    # Readiness and teardown share one whole-protocol hang ceiling.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(
+            profile, "secret", output, _ssh_path=ssh,
+            _environment={
+                "PATH": os.environ.get("PATH", ""), "MARKER": str(marker),
+                "TERMINATED": str(terminated), "HANDLER_DELAY": str(handler_delay),
+            },
+        ))
+        try:
+            while True:
+                try:
+                    marker_data = json.loads(marker.read_text())
+                    break
+                except (OSError, json.JSONDecodeError):
+                    await asyncio.sleep(0.01)
+            pid = marker_data["pid"]
+            await parent_ready.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+            assert terminated.is_file()
+            assert json.loads(marker.read_text()) == marker_data
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_writer_cleanup_reaps_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, "import time; time.sleep(60)\n")
+    processes: list[asyncio.subprocess.Process] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def capture_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    closing = asyncio.Event()
+
+    class SlowOutput(Output):
+        async def drain(self) -> None:
+            closing.set()
+            await asyncio.Future()
+
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.asyncio.create_subprocess_exec", capture_spawn)
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", AsyncMock(return_value=(
+        Reader(), SlowOutput(output), transport,
+    )))
+    monkeypatch.setattr("mimir.acp.ssh.run_router", AsyncMock(side_effect=SshError("router failed")))
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
+    # Cleanup entry is downstream of spawn, so bound the whole protocol.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh))
+        try:
+            await closing.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+            assert processes[0].returncode is not None
+            with pytest.raises(ProcessLookupError):
+                os.kill(processes[0].pid, 0)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            for process in processes:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_unread_stdout_backpressure_cleanup_reaps_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    marker = tmp_path / "pid"
+    ssh = _fake_ssh(tmp_path, f"MARKER = {str(marker)!r}\n" + """
+import os,sys
+with open(MARKER,'w') as stream: stream.write(str(os.getpid()))
+chunk=b'{"jsonrpc":"2.0","method":"session/update","params":{}}\\n'
+while True:
+ sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+""")
+    reader = asyncio.StreamReader()
+    read_fd, write_fd = os.pipe()
+    output = os.fdopen(write_fd, "wb", buffering=0)
+    input_transport = type("Transport", (), {"close": lambda self: None})()
+    async def open_stdio(target: object) -> tuple[object, object, object]:
+        loop = asyncio.get_running_loop()
+        protocol = asyncio.streams.FlowControlMixin(loop=loop)
+        transport, _ = await loop.connect_write_pipe(lambda: protocol, target)
+        return reader, asyncio.StreamWriter(transport, protocol, None, loop), input_transport
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", open_stdio)
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
+    monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.05)
+    # Readiness and teardown share one whole-protocol hang ceiling.
+    async with asyncio.timeout(120):
+        task = asyncio.create_task(run_ssh_proxy(
+            profile, "secret", output, _ssh_path=ssh,
+            _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
+        ))
+        try:
+            while True:
+                try:
+                    pid = int(marker.read_text())
+                    break
+                except (OSError, ValueError):
+                    await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            os.close(read_fd)

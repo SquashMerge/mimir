@@ -1,0 +1,33 @@
+{
+  "pollers": [
+    {
+      "name": "gmail-inbox",
+      "command": "python3 scripts/poller.py",
+      "cron": "*/5 * * * *",
+      "batch_size": 5,
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "saga_full_corpus_read": true,
+        "capabilities": ["read_file", "ls", "glob", "grep", "write_file", "edit_file", "send_message", "operator_alert", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "scoped_roots": ["state"],
+        "shell_commands": [
+          {
+            "exec": "bash",
+            "path": "/usr/bin/bash",
+            "script": "/mimir-home/skills/gmail-poller/scripts/run-gog.sh",
+            "options": ["--account", "--max", "--json", "--no-input", "--full"],
+            "pass_env": ["GOG_ACCOUNT", "GOG_KEYRING_PASSWORD", "MIMIR_HOME", "STATE_DIR"]
+          }
+        ]
+      },
+      "pass_env": [
+        "GOG_ACCOUNT",
+        "MIMIR_GMAIL_QUERY",
+        "MIMIR_GMAIL_MAX_FETCH",
+        "MIMIR_HOME",
+        "JEV_KEY"
+      ]
+    }
+  ]
+}

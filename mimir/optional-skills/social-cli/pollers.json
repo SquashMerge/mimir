@@ -1,0 +1,57 @@
+{
+  "pollers": [
+    {
+      "name": "social-cli-notifications",
+      "command": "python3 scripts/poller.py",
+      "cron": "*/15 * * * *",
+      "batch_size": 3,
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "approved_urls": ["https://public.api.bsky.app/"],
+        "saga_full_corpus_read": true,
+        "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "open_proposal", "submit_proposal", "abandon_proposal"],
+        "scoped_roots": ["state"],
+        "proposal_surface": "social-outbox"
+      },
+      "pass_env": [
+        "MIMIR_SOURCE_DIR",
+        "MIMIR_SOCIAL_OUTBOX_APPROVERS",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "MIMIR_SOCIAL_PLATFORMS",
+        "MIMIR_SOCIAL_LIMIT",
+        "MIMIR_SOCIAL_USERS_DIR",
+        "SOCIAL_CLI_BIN",
+        "ATPROTO_HANDLE",
+        "ATPROTO_APP_PASSWORD"
+      ]
+    },
+    {
+      "name": "social-cli-feed",
+      "command": "python3 scripts/feed_poller.py",
+      "cron": "0 */2 * * *",
+      "batch_size": 10,
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "approved_urls": ["https://public.api.bsky.app/"],
+        "saga_full_corpus_read": true,
+        "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "open_proposal", "submit_proposal", "abandon_proposal"],
+        "scoped_roots": ["state"],
+        "proposal_surface": "social-outbox"
+      },
+      "pass_env": [
+        "MIMIR_SOURCE_DIR",
+        "MIMIR_SOCIAL_OUTBOX_APPROVERS",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "MIMIR_SOCIAL_PLATFORMS",
+        "MIMIR_SOCIAL_FEED_LIMIT",
+        "SOCIAL_CLI_BIN",
+        "ATPROTO_HANDLE",
+        "ATPROTO_APP_PASSWORD"
+      ]
+    }
+  ]
+}

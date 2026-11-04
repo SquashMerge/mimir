@@ -1,0 +1,1186 @@
+"""Framework-side recovery for poller turns lost or failed after enqueue.
+
+A poller fires events; each becomes an ``AgentEvent`` → an async turn.
+The poller advances its cursor at poll time, decoupled from the turn it
+triggers. If that turn dies (transient model 503, timeout, plain bug),
+the item is silently dropped — the cursor already moved on (#299).
+
+The github-poller closes this for *review requests* by reconciling
+against live GitHub state (``requested_reviewers``, #516). For pollers
+with **no live state to reconcile against** (gmail, github
+issue/comment turns) this module closes it generically via the event
+log:
+
+* At every accepted enqueue or scheduler headroom rejection, the framework
+  stashes the ``AgentEvent`` keyed by its ``source_id``. Headroom rejections
+  carry ``pending_enqueue`` and wait for budgeted delivery independently of
+  failed-turn recovery opt-in. They bypass the abandoned-turn TTL (#310), but
+  a separate 1,000-entry per-poller pending cap bounds growth. Overflow retires
+  the oldest pending entries with an operator-visible give-up signal.
+* Turn outcomes are logged with that ``source_id``
+  (``turn_failed`` / ``turn_completed``, #517). Each poll cycle the
+  framework reads outcomes since the last reconcile and, per stashed
+  event: **drops** it if its turn completed, **re-enqueues** it
+  (capped) if its turn failed, and emits a ``poller_turn_gave_up``
+  signal — negative algedonic via ``feedback.classify``'s ``*_gave_up``
+  rule (#515) — once the cap is hit. Deterministic tool-budget exhaustion
+  is classified as failed but is dropped without retry: replaying the same
+  item under the same budget would spend another full budget without
+  changing the limiting condition (#983; sizing/resumption live in #992/#994).
+
+Stashing and unclean-restart replay are enabled for every poller. Re-enqueueing
+an explicitly failed turn remains opt-in per poller via
+``recover_failed_turns`` in ``pollers.json``.
+
+State lives at ``<persist_dir>/.recovery.json`` so it survives container
+restarts (unlike the in-memory circuit-breaker state).
+
+Hardening (chainlink #305/#309/#310/#318/#329, 2026-06-01 review):
+* Re-enqueue respects ``enqueue()``'s accepted/False return and never
+  burns a wedge-guard attempt on a re-fire that didn't happen (#305).
+* The watermark advances only past FULLY-handled outcomes, to the
+  outcome's own timestamp — never wall-now — so an outcome written
+  between the read and the save isn't skipped (#309).
+* The in-flight stash is GC'd on a TTL so turns that vanished without an
+  outcome (mid-turn crash/restart) can't grow ``.recovery.json``
+  forever (#310).
+* State writes are atomic (#329); the give-up signal is best-effort and
+  never strands the entry (#318).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import random
+from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Mapping
+
+from ._atomic import atomic_write_json
+from ._jsonl_tail import tail_jsonl_records
+from .access_control import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY,
+    POLLER_RECOVERY_REPLAY_EXTRA_KEY,
+)
+from .event_logger import log_event
+from .models import AgentEvent, InformationFlowLabels, SourceLabel
+from .poller_hooks import TrustAttestor
+from .poller_tracker import TRACKER_EXTRA_KEYS, safe_actor
+
+log = logging.getLogger(__name__)
+
+#: Per-poller recovery state file, under the poller's persist_dir.
+RECOVERY_STATE_FILE = ".recovery.json"
+
+#: Max re-enqueue attempts for a failed poller turn before giving up.
+#: Mirrors github-poller's ``REVIEW_REQUEST_MAX_ATTEMPTS`` (#516) — same
+#: wedge-guard intent: a persistently-failing item can't re-fire forever.
+DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
+DEFAULT_TURN_TRANSIENT_RETRY_MAX = 5
+DEFAULT_TURN_TRANSIENT_RETRY_BASE_S = 120.0
+DEFAULT_TURN_TRANSIENT_RETRY_MAX_S = 1800.0
+
+
+def _transient_config() -> tuple[int, float, float]:
+    def number(key: str, default: int | float, integer: bool) -> int | float:
+        raw = os.environ.get(key, "")
+        try:
+            value = int(raw) if integer else float(raw)
+            if value < 0 or not math.isfinite(value):
+                raise ValueError(raw)
+            return value
+        except ValueError:
+            if raw:
+                log.warning("invalid %s=%r; using %s", key, raw, default)
+            return default
+
+    return (
+        int(number("MIMIR_TURN_TRANSIENT_RETRY_MAX", DEFAULT_TURN_TRANSIENT_RETRY_MAX, True)),
+        float(number("MIMIR_TURN_TRANSIENT_RETRY_BASE_S", DEFAULT_TURN_TRANSIENT_RETRY_BASE_S, False)),
+        float(number("MIMIR_TURN_TRANSIENT_RETRY_MAX_S", DEFAULT_TURN_TRANSIENT_RETRY_MAX_S, False)),
+    )
+
+
+def _transient_delay(attempt: int, base: float, cap: float, retry_after: Any) -> float:
+    raw = min(base * 2 ** (attempt - 1), cap)
+    delay = min(raw + random.uniform(0, raw * 0.5), cap)
+    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+        if math.isfinite(retry_after) and retry_after > 0:
+            delay = max(delay, retry_after)
+    return delay
+
+#: Bound head-of-line blocking independently of successful retry attempts.
+DEFAULT_MAX_DEFER_SECONDS = 15 * 60.0
+
+#: In-flight stash entries with no terminal outcome within this window are
+#: GC'd (#310). Covers turns that vanished — a mid-turn crash or container
+#: restart that never logged turn_failed/turn_completed — so the stash
+#: can't grow unbounded. Generous: an item still unresolved after two days
+#: is abandoned, not in-flight.
+DEFAULT_STASH_TTL_HOURS = 48.0
+
+#: Pending initial deliveries bypass the abandoned-turn TTL. Keep at most
+#: 1,000 per poller: over a day of a 5-batch/10-minute source outpacing
+#: 3 deliveries/hour (27 net/hour), while also bounding same-tick bursts.
+#: Prefer recent work on overflow; retirement emits poller_pending_gave_up.
+MAX_PENDING_ENQUEUE = 1000
+
+_TURN_OUTCOME_TYPES = ("turn_completed", "turn_failed")
+_UNCLEAN_RESTART_TYPE = "liveness_unclean_restart"
+
+
+def _is_live_state_poller(poller_name: str) -> bool:
+    return poller_name == "github-activity"
+
+
+# chainlink #316: writers stamp the event timestamp BEFORE acquiring the
+# append lock, so a record can land slightly out of append order relative to
+# its timestamp. The disorder is bounded by the lock-hold window (sub-ms in
+# practice); this grace margin is the slack ``_read_outcomes_since`` keeps
+# scanning past the cutoff so an out-of-order newer record just behind an
+# older one isn't missed by an early break.
+_OUTCOME_SCAN_GRACE_SECONDS = 5.0
+
+# Re-enqueue callback shape, matching ``run_poller``'s ``enqueue`` param.
+EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
+# ``None`` means the source could not determine relevance. Recovery must fail
+# open in that case so transient source/API failures cannot discard real work.
+RelevanceFn = Callable[[AgentEvent], Awaitable[bool | None]]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    return _utc_now().isoformat()
+
+
+def _parse_iso(ts: Any) -> datetime | None:
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def _state_path(persist_dir: Path) -> Path:
+    return persist_dir / RECOVERY_STATE_FILE
+
+
+def _load_state(persist_dir: Path) -> dict:
+    """Load ``{last_reconciled: iso, inflight: {source_id: {...}}}``.
+
+    A missing file returns an empty state. An unreadable or corrupt file also
+    returns a well-shaped state, but marks it read-only so callers can report
+    the failure without overwriting the original ledger.
+    """
+    p = _state_path(persist_dir)
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"last_reconciled": "", "inflight": {}}
+    except OSError as exc:
+        log.warning("poller recovery: state unreadable at %s: %s", p, exc)
+        return {
+            "last_reconciled": "", "inflight": {},
+            "_unreadable_path": str(p),
+        }
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning("poller recovery: state corrupt at %s: %s", p, exc)
+        return {
+            "last_reconciled": "", "inflight": {},
+            "_unreadable_path": str(p),
+        }
+    if isinstance(data, dict):
+        last = data.get("last_reconciled")
+        inflight = data.get("inflight")
+        if "inflight" in data and not isinstance(inflight, dict):
+            log.warning("poller recovery: inflight has invalid shape at %s", p)
+            return {
+                "last_reconciled": "", "inflight": {},
+                "_unreadable_path": str(p),
+            }
+        return {
+            # An invalid watermark is conservative: widening the next scan
+            # cannot discard stashed events, unlike coercing malformed inflight.
+            "last_reconciled": last if isinstance(last, str) else "",
+            "inflight": inflight if isinstance(inflight, dict) else {},
+        }
+    log.warning("poller recovery: state has invalid shape at %s", p)
+    return {
+        "last_reconciled": "", "inflight": {},
+        "_unreadable_path": str(p),
+    }
+
+
+def _save_state(persist_dir: Path, state: dict) -> None:
+    unreadable_path = state.get("_unreadable_path")
+    if unreadable_path:
+        log.warning(
+            "poller recovery: refusing to overwrite unreadable state at %s",
+            unreadable_path,
+        )
+        return
+    try:
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        # Atomic write (#329): a crash mid-write must not corrupt
+        # .recovery.json — atomic_write_json applies the fsync-file +
+        # fsync-parent invariant used across the other state stores.
+        atomic_write_json(_state_path(persist_dir), state)
+    except OSError as exc:  # best-effort — never break the poll cycle
+        log.warning("poller recovery: state save failed for %s: %s", persist_dir, exc)
+
+
+def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
+    """Return a JSON-native event payload without stringifying IFC sets."""
+    payload = asdict(replace(event, continuation_auth_context=None))
+    # Authority is never persisted in the poller-writable recovery file. The
+    # live scheduler reattaches its immutable manifest grant on re-enqueue.
+    payload.pop("service_authority", None)
+    labels = event.ifc_labels
+    if isinstance(labels, InformationFlowLabels):
+        payload["ifc_labels"] = {
+            "labels": sorted(labels.labels),
+            "source_channels": sorted(labels.source_channels),
+            "sources": [
+                {
+                    "principal": source.principal,
+                    "domain": source.domain,
+                    "domain_qualifier": source.domain_qualifier,
+                    "resource_id": source.resource_id,
+                    "bridge_instance": source.bridge_instance,
+                    "sensitivity": source.sensitivity,
+                    "authorized_principals": sorted(source.authorized_principals),
+                    "source_kind": source.source_kind,
+                    "integrity": source.integrity,
+                    "integrity_effect": source.integrity_effect,
+                }
+                for source in sorted(
+                    labels.sources,
+                    key=lambda source: (
+                        source.principal or "",
+                        source.domain or "",
+                        (source.domain_qualifier is not None, source.domain_qualifier or ""),
+                        source.resource_id or "",
+                        source.bridge_instance or "",
+                        source.sensitivity,
+                        source.source_kind,
+                    ),
+                )
+            ],
+            "created_at": labels.created_at,
+        }
+    return payload
+
+
+async def stash_enqueued_event(
+    persist_dir: Path,
+    event: AgentEvent,
+    *,
+    enqueued_at: str | None = None,
+    pending_enqueue: bool = False,
+) -> None:
+    """Record an enqueued poller ``AgentEvent`` as in-flight, keyed by its
+    ``source_id``, so a later failed turn can re-enqueue it.
+
+    The workload-sized recovery document read and atomic rewrite run off the
+    event loop; the in-memory state mutation remains on it. ``enqueued_at``
+    should be captured immediately before the accepted enqueue so an empty
+    reconciliation watermark has a safe lower scan bound.
+
+    ``pending_enqueue`` records a fresh event rejected by scheduler headroom.
+    Existing entries belong to reconciliation and must not be overwritten by
+    its budget callback. Pending delivery is independent of failed-turn opt-in.
+
+    No-op when the event has no ``source_id`` — without it the outcome event
+    can't be correlated back, so it isn't recoverable this way.
+    """
+    if not event.source_id:
+        return
+    state = await asyncio.to_thread(_load_state, persist_dir)
+    if pending_enqueue and event.source_id in state["inflight"]:
+        return
+    stashed_dt = _utc_now()
+    stashed_at = stashed_dt.isoformat()
+    state["inflight"][event.source_id] = {
+        "attempts": 0,
+        # First-seen timestamp drives the GC TTL (#310).
+        "stashed_at": stashed_at,
+        # Updated after every accepted retry. This identifies the particular
+        # enqueue whose in-memory queue may have been lost in a crash.
+        "enqueued_at": enqueued_at or stashed_at,
+        # Callers should capture enqueue time themselves. Retain a one-minute
+        # conservative scan fallback for direct API callers so a fast consumer
+        # cannot record its outcome just before this stash runs.
+        "scan_from": enqueued_at or (
+            stashed_dt - timedelta(minutes=1)
+        ).isoformat(),
+        "event": _event_to_stash(event),
+    }
+    if pending_enqueue:
+        state["inflight"][event.source_id]["pending_enqueue"] = True
+        await _bound_pending_enqueue(
+            state["inflight"], event.channel_id.removeprefix("poller:"),
+            event.channel_id,
+        )
+    await asyncio.to_thread(_save_state, persist_dir, state)
+
+
+async def _bound_pending_enqueue(
+    inflight: dict, poller_name: str, channel_id: str,
+) -> int:
+    """Retire oldest pending entries above the cap, never accepted deliveries.
+
+    Enforce at admission as well as reconciliation, including old oversized
+    ledgers. Aggregate overflow into one payload-free operator signal per call.
+    Like _emit_gave_up, logging is best-effort and cannot strand the ledger.
+    """
+    pending = [
+        source_id for source_id, entry in inflight.items()
+        if isinstance(entry, dict) and entry.get("pending_enqueue") is True
+    ]
+    excess = len(pending) - MAX_PENDING_ENQUEUE
+    if excess <= 0:
+        return 0
+
+    def first_seen(source_id: str) -> datetime:
+        dt = _parse_iso(inflight[source_id].get("stashed_at"))
+        # Malformed legacy timestamps are oldest, not immortal. Stable sorting
+        # preserves insertion order for equal timestamps (same-tick batches).
+        return dt if dt is not None and dt.tzinfo is not None else datetime.min.replace(
+            tzinfo=timezone.utc,
+        )
+
+    for source_id in sorted(pending, key=first_seen)[:excess]:
+        del inflight[source_id]
+    log.warning(
+        "poller recovery: pending cap exceeded poller=%s retired=%d cap=%d",
+        poller_name, excess, MAX_PENDING_ENQUEUE,
+    )
+    try:
+        await log_event(
+            "poller_pending_gave_up", poller=poller_name, channel_id=channel_id,
+            reason="pending_count_limit", retired=excess, limit=MAX_PENDING_ENQUEUE,
+            detail=f"{poller_name}: pending backlog exceeded {MAX_PENDING_ENQUEUE}; "
+                   f"retired {excess} oldest undelivered events",
+        )
+    except Exception as exc:  # noqa: BLE001 — match the #318 give-up contract
+        log.warning("poller recovery: pending give-up emit failed (%s)", type(exc).__name__)
+    return excess
+
+
+def _event_from_stash(d: Any) -> AgentEvent | None:
+    """Rebuild an ``AgentEvent`` from its stashed ``asdict`` form. Returns
+    None (logged) on a shape mismatch — a stale .recovery.json written by
+    an older mimir whose AgentEvent had different fields shouldn't crash
+    the poll cycle."""
+    if not isinstance(d, dict):
+        return None
+    try:
+        payload = dict(d)
+        payload.pop("audience_provider", None)
+        payload.pop("owner_attestation", None)
+        payload["continuation_auth_context"] = None
+        raw_labels = payload.get("ifc_labels")
+        if isinstance(raw_labels, dict):
+            raw_sources = raw_labels.get("sources") or ()
+            sources = tuple(
+                SourceLabel.from_record({
+                    "principal": source.get("principal"),
+                    "domain": source.get("domain"),
+                    "domain_qualifier": source.get("domain_qualifier"),
+                    "resource_id": source.get("resource_id"),
+                    "bridge_instance": source.get("bridge_instance"),
+                    "sensitivity": source.get("sensitivity", ""),
+                    "authorized_principals": source.get("authorized_principals"),
+                    "source_kind": source.get("source_kind", "channel"),
+                    "integrity": source.get("integrity", "untrusted"),
+                    "integrity_effect": source.get("integrity_effect", "active_ingest"),
+                })
+                for source in raw_sources
+                if isinstance(source, dict)
+            )
+            payload["ifc_labels"] = InformationFlowLabels(
+                labels=frozenset(raw_labels.get("labels") or ()),
+                source_channels=frozenset(raw_labels.get("source_channels") or ()),
+                sources=sources,
+                **(
+                    {"created_at": raw_labels["created_at"]}
+                    if isinstance(raw_labels.get("created_at"), (int, float))
+                    else {}
+                ),
+            )
+        return AgentEvent(**payload)
+    except (TypeError, ValueError) as exc:
+        log.warning("poller recovery: could not rebuild AgentEvent from stash: %s", exc)
+        return None
+
+
+def _gc_expired_inflight(
+    inflight: dict, ttl_hours: float, now_dt: datetime,
+) -> tuple[int, int]:
+    """Drop in-flight entries with no terminal outcome within ``ttl_hours``
+    — turns that vanished (mid-turn crash/restart) without logging
+    turn_failed/turn_completed, so ``.recovery.json`` can't grow unbounded
+    (#310). Returns ``(expired, dropped)``; malformed entries are schema drops,
+    not TTL expirations.
+
+    Backfills a missing/garbled ``stashed_at`` to now rather than GC-ing the
+    entry on sight, so entries stashed by a pre-#310 mimir get a fresh TTL.
+    """
+    cutoff_secs = ttl_hours * 3600.0
+    expired = 0
+    dropped = 0
+    for source_id in list(inflight.keys()):
+        entry = inflight.get(source_id)
+        if not isinstance(entry, dict):
+            del inflight[source_id]
+            dropped += 1
+            continue
+        if entry.get("pending_enqueue") is True:
+            continue  # Intentional budget waiting is not an abandoned turn.
+        dt = _parse_iso(entry.get("stashed_at"))
+        if dt is None:
+            entry["stashed_at"] = now_dt.isoformat()  # backfill; GC next window
+            continue
+        if (now_dt - dt).total_seconds() > cutoff_secs:
+            del inflight[source_id]
+            expired += 1
+    return expired, dropped
+
+
+def _read_outcomes_since(
+    events_path: Path, channel_id: str, since_iso: str,
+) -> list[dict]:
+    """Turn-outcome records (``turn_completed`` / ``turn_failed``) for
+    ``channel_id`` strictly newer than ``since_iso``, returned oldest-first.
+
+    ``tail_jsonl_records`` yields newest-first; we stop once we cross the
+    cutoff *by more than the disorder grace window* so this stays O(new
+    events) rather than O(whole log).
+
+    chainlink #316: writers stamp the timestamp before taking the append
+    lock, so a record can land slightly out of order near the cutoff. The
+    old code ``break``-ed on the first record at/under ``since_iso``, which
+    could drop an out-of-order newer record sitting just behind an older
+    one. We now keep scanning until a record is older than ``since_iso``
+    by more than ``_OUTCOME_SCAN_GRACE_SECONDS`` (skip-not-break inside the
+    window), so bounded disorder no longer leaks turns.
+    """
+    if not events_path.exists():
+        return []
+    since_dt = _parse_iso(since_iso) if since_iso else None
+    cutoff_floor = (
+        since_dt - timedelta(seconds=_OUTCOME_SCAN_GRACE_SECONDS)
+        if since_dt is not None
+        else None
+    )
+    out: list[dict] = []
+    try:
+        for rec in tail_jsonl_records(events_path):
+            ts = rec.get("timestamp")
+            if not isinstance(ts, str):
+                continue
+            if cutoff_floor is not None:
+                rec_dt = _parse_iso(ts)
+                if rec_dt is not None and rec_dt < cutoff_floor:
+                    break  # older than the cutoff by > the disorder window
+            if since_iso and ts <= since_iso:
+                continue  # at/under cutoff but within grace: not new, skip it
+            if rec.get("type") not in _TURN_OUTCOME_TYPES:
+                continue
+            if rec.get("channel_id") != channel_id:
+                continue
+            out.append(rec)
+    except OSError as exc:
+        log.warning("poller recovery: outcome read failed for %s: %s", events_path, exc)
+        return []
+    out.reverse()  # oldest-first so attempts increment in turn order
+    return out
+
+
+def _oldest_inflight_timestamp(inflight: dict) -> str:
+    """Earliest timestamp before which no stashed outcome can be relevant.
+
+    This supplies the initial cutoff when an old or newly-created recovery
+    document has no watermark. Every outcome for these entries must follow
+    its pre-enqueue timestamp, so stopping before it cannot lose recovery data.
+    """
+    timestamps: list[str] = []
+    for entry in inflight.values():
+        if not isinstance(entry, dict):
+            continue
+        for key in ("scan_from", "enqueued_at", "stashed_at"):
+            value = entry.get(key)
+            if isinstance(value, str) and _parse_iso(value) is not None:
+                timestamps.append(value)
+                break
+    return min(timestamps, default="")
+
+
+def _read_last_unclean_restart(events_path: Path, since_dt: datetime) -> str:
+    """Return the newest restart newer than the oldest relevant enqueue.
+
+    Use the outcome scanner's disorder grace, not a record cap: a busy log
+    must not hide a crash marker that can still require replay.
+    """
+    if not events_path.exists():
+        return ""
+    cutoff_floor = since_dt - timedelta(seconds=_OUTCOME_SCAN_GRACE_SECONDS)
+    try:
+        for rec in tail_jsonl_records(events_path):
+            ts = rec.get("timestamp")
+            rec_dt = _parse_iso(ts)
+            if rec_dt is None or rec_dt.tzinfo is None:
+                continue
+            if rec_dt < cutoff_floor:
+                break
+            if rec.get("type") == _UNCLEAN_RESTART_TYPE and rec_dt > since_dt:
+                return ts
+    except OSError as exc:
+        log.warning("poller recovery: restart marker read failed for %s: %s", events_path, exc)
+    return ""
+
+
+async def _reattest_tracker_event(
+    event: AgentEvent,
+    trust_attestor: TrustAttestor | None,
+    attestor_env: Mapping[str, str] | None,
+    attestation_redact: Callable[[str], str] | None,
+) -> bool:
+    """Re-attest a stashed tracker event; stashed trust claims are never authority.
+
+    Transient attestor unavailability also refuses: holding the stash would need
+    a new stash state, and a later attestation of stale content would not match.
+    """
+    items = event.extra.get("items") if isinstance(event.extra, dict) else None
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        return False
+    item = items[0]
+    reduced = {key: item[key] for key in TRACKER_EXTRA_KEYS if key in item}
+    items[0] = reduced
+    reduced.update(actor=None, author_is_trusted=False, tracker_attested=False)
+    if trust_attestor is None or attestation_redact is None:
+        return False
+    attestable = {key: reduced[key] for key in TRACKER_EXTRA_KEYS if key in reduced}
+    try:
+        att = await asyncio.to_thread(trust_attestor, attestable, dict(attestor_env or {}))
+        prompt = att.prompt.strip() if att.trusted is True and att.prompt is not None else None
+        if prompt is None or attestation_redact(prompt) != event.content:
+            return False
+        actor = safe_actor(att.actor)
+    except Exception as exc:  # noqa: BLE001 - attestation fails closed
+        log.warning("poller recovery: tracker attestation failed (%s)", type(exc).__name__)
+        return False
+    reduced.update(actor=actor, author_is_trusted=True, tracker_attested=True)
+    return True
+
+
+async def _restore_event(
+    entry: dict,
+    *,
+    poller_name: str,
+    channel_id: str,
+    service_principal: str | None,
+    service_authority: Any,
+    trust_source: str,
+    github_token: str,
+    github_self_login: str,
+    trust_attestor: TrustAttestor | None = None,
+    attestor_env: Mapping[str, str] | None = None,
+    attestation_redact: Callable[[str], str] | None = None,
+) -> AgentEvent | None:
+    """Rebuild a stashed event and re-attest its service integrity from live state."""
+    event = _event_from_stash(entry.get("event"))
+    if event is None:
+        return None
+    event.channel_id = channel_id
+    event.trigger = "poller"
+    event.source = "poller"
+    event.author = None
+    event.author_display = None
+    event.author_id = None
+    event.service_principal = service_principal
+    event.service_authority = service_authority
+    event.repo_pr_action_scope = None
+    event.continuation_auth_context = None
+    event.source_session_acl = None
+    trusted = trust_source == "trusted_system"
+    if trust_source == "tracker":
+        trusted = await _reattest_tracker_event(
+            event, trust_attestor, attestor_env, attestation_redact,
+        )
+        if not trusted:
+            return None
+    if trust_source == "github":
+        from .pollers import (
+            _GITHUB_ACTOR_EVENT_TYPES,
+            _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
+            _github_author_is_trusted,
+            _github_content_author,
+            _github_framework_trigger_is_trusted,
+        )
+
+        items = event.extra.get("items") if isinstance(event.extra, dict) else None
+        trusted = isinstance(items, list) and bool(items)
+        if trusted:
+            for item in items:
+                item_trusted = False
+                if isinstance(item, dict):
+                    repo = item.get("repo")
+                    event_type = item.get("event_type")
+                    try:
+                        if event_type in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES:
+                            item_trusted = await asyncio.to_thread(
+                                _github_framework_trigger_is_trusted,
+                                repo, item, github_token, github_self_login,
+                            )
+                        elif event_type in _GITHUB_ACTOR_EVENT_TYPES:
+                            # Clear stashed claims even if the live lookup raises.
+                            item["actor"] = None
+                            item["author_is_trusted"] = False
+                            author = await asyncio.to_thread(
+                                _github_content_author, repo, item, github_token,
+                            )
+                            item_trusted = await asyncio.to_thread(
+                                _github_author_is_trusted, repo, author, github_token,
+                            ) is True
+                            # Poller-writable actor and verdict claims are not authority.
+                            item["actor"] = author
+                            item["author_is_trusted"] = item_trusted
+                    except Exception as exc:  # noqa: BLE001 - attestation fails closed
+                        log.warning(
+                            "poller recovery: GitHub attestation failed (%s)",
+                            type(exc).__name__,
+                        )
+                trusted = trusted and item_trusted
+    if service_authority is not None and service_principal:
+        source_principal = f"service:{service_principal}"
+        event.ifc_labels = InformationFlowLabels().with_channel(
+            channel_id
+        ).with_source(SourceLabel(
+            principal=source_principal,
+            domain="channel",
+            domain_qualifier="poller_recovery",
+            resource_id=channel_id,
+            bridge_instance="poller",
+            sensitivity="internal",
+            authorized_principals=frozenset({source_principal}),
+            source_kind="service",
+            integrity="trusted" if trusted else "untrusted",
+        ))
+    if isinstance(event.extra, dict):
+        event.extra.pop(HTTP_EVENT_INGRESS_EXTRA_KEY, None)
+        event.extra.pop("channel_visibility", None)
+        event.extra.pop("bridge_instance", None)
+        event.extra["poller_name"] = poller_name
+        event.extra[POLLER_RECOVERY_REPLAY_EXTRA_KEY] = True
+    return event
+
+
+async def _emit_gave_up(poller_name: str, channel_id: str, entry: dict, source_id: str) -> None:
+    """Emit the one-shot wedge-guard signal. ``poller_turn_gave_up`` ends
+    in ``_gave_up`` so ``feedback.classify`` (#515) maps it to a negative
+    ``gave_up`` algedonic signal; ``detail`` gives the renderer a target."""
+    ev = entry.get("event") if isinstance(entry, dict) else None
+    extra = (ev or {}).get("extra") if isinstance(ev, dict) else None
+    items = extra.get("items") if isinstance(extra, dict) else None
+    detail = poller_name
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        ref = items[0].get("url") or items[0].get("repo") or items[0].get("event_type")
+        if ref:
+            more = f" +{len(items) - 1} more" if len(items) > 1 else ""
+            detail = f"{poller_name} ({ref}{more})"
+    await log_event(
+        "poller_turn_gave_up",
+        poller=poller_name,
+        channel_id=channel_id,
+        source_id=source_id,
+        attempts=int(entry.get("attempts", 0)) if isinstance(entry, dict) else 0,
+        detail=detail,
+        items=items,
+    )
+
+
+async def _is_stale(event: AgentEvent, relevance_check: RelevanceFn | None) -> bool:
+    """Return true only when the source authoritatively rejects the subject."""
+    if relevance_check is None:
+        return False
+    try:
+        return await relevance_check(event) is False
+    except Exception as exc:  # noqa: BLE001 - relevance failures must fail open
+        log.warning(
+            "poller recovery: relevance check failed open for %s: %s",
+            event.source_id,
+            exc,
+        )
+        return False
+
+
+async def reconcile_failed_turns(
+    *,
+    poller_name: str,
+    channel_id: str,
+    persist_dir: Path,
+    events_path: Path,
+    enqueue: EnqueueFn,
+    service_principal: str | None = None,
+    service_authority: Any = None,
+    trust_source: str = "external",
+    github_token: str = "",
+    github_self_login: str = "",
+    trust_attestor: TrustAttestor | None = None,
+    attestor_env: Mapping[str, str] | None = None,
+    attestation_redact: Callable[[str], str] | None = None,
+    recover_failed_turns: bool = True,
+    relevance_check: RelevanceFn | None = None,
+    max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
+    stash_ttl_hours: float = DEFAULT_STASH_TTL_HOURS,
+    max_defer_seconds: float = DEFAULT_MAX_DEFER_SECONDS,
+) -> dict:
+    """Reconcile in-flight poller events against recent turn outcomes.
+
+    For each turn-outcome event (since the last reconcile) whose
+    ``source_id`` is still in-flight:
+      * ``turn_completed`` → drop it for generic recovery; retain and charge it
+        for live-state pollers, which verify the external transition themselves.
+        A hard-boundary-refusal disposition remains exempt from that charge.
+      * ``turn_failed`` with ``result_subtype=tool_budget_exhausted`` →
+        drop it without retry. The failure is deterministic under an
+        unchanged budget, so replay would repeat partial work and spend
+        another full budget (#983; #992/#994 own sizing/resumption).
+      * other ``turn_failed`` → re-enqueue the stashed event, up to
+        ``max_attempts`` successful re-fires; once the cap is exceeded
+        emit ``poller_turn_gave_up`` and drop it (wedge guard).
+
+    Back-pressure (#305): a re-enqueue is only counted — and only burns a
+    wedge-guard attempt — when ``enqueue()`` returns True. If the channel
+    queue is full (False) or ``enqueue`` raises, the cycle stops without
+    advancing the watermark past that outcome, so it's retried next cycle
+    rather than silently re-dropped. Continued rejection for
+    ``max_defer_seconds`` retires only that source entry so permanent rejection
+    cannot strand all later outcomes (#1586). The timer survives restart and
+    resets on acceptance. Old ledgers start this timer on first rejection after
+    upgrade; outcomes already rotated away or skipped by an old watermark cannot
+    be recovered by this change (the existing stash TTL still applies).
+
+    Watermark (#309): advances only past FULLY-handled outcomes and to the
+    outcome's own timestamp — never wall-now — so an outcome written
+    between this read and the state save is picked up next cycle.
+
+    Before either replay path, an optional source-owned ``relevance_check`` can
+    reject a subject that is no longer actionable. ``False`` drops it as stale;
+    ``True`` or ``None`` preserves normal recovery. Exceptions also fail open.
+
+    Returns a ``{reenqueued, completed, gave_up, deferred, expired, dropped,
+    stale_dropped}`` summary (for the ``poller_recovery`` log event + tests).
+    Best-effort throughout — any I/O hiccup is logged and the poll cycle continues.
+    """
+    summary = {
+        "reenqueued": 0, "completed": 0, "gave_up": 0,
+        "deferred": 0, "expired": 0, "dropped": 0,
+        "stale_dropped": 0,
+        "unclean_reenqueued": 0,
+    }
+    state = await asyncio.to_thread(_load_state, persist_dir)
+    summary["state_unreadable"] = state.get("_unreadable_path", "")
+    inflight: dict = state["inflight"]
+    now_dt = _utc_now()
+    now_iso = now_dt.isoformat()
+    transient_max, transient_base, transient_cap = _transient_config()
+
+    # GC abandoned entries first so a vanished turn can't pin the stash
+    # forever (#310).
+    summary["expired"], summary["dropped"] = _gc_expired_inflight(
+        inflight, stash_ttl_hours, now_dt,
+    )
+
+    # Pending entries have a separate count ceiling, including legacy ledgers
+    # that grew before this bound existed. Run before any replay can defer.
+    summary["gave_up"] += await _bound_pending_enqueue(inflight, poller_name, channel_id)
+
+    # Fast path: nothing stashed → nothing to reconcile. Advance the
+    # watermark so the first real reconcile after events accrue doesn't
+    # rescan history (safe with no in-flight items: any future outcome has
+    # a future timestamp).
+    if not inflight:
+        state["last_reconciled"] = now_iso
+        await asyncio.to_thread(_save_state, persist_dir, state)
+        return summary
+
+    watermark = state.get("last_reconciled", "")
+    scan_cutoff = watermark or _oldest_inflight_timestamp(inflight)
+    outcomes = await asyncio.to_thread(
+        _read_outcomes_since, events_path, channel_id, scan_cutoff,
+    )
+    # Advance the watermark only past outcomes we FULLY handle (#309). On
+    # enqueue back-pressure we stop early and leave it before the un-handled
+    # outcome so it's retried (#305).
+    for rec in outcomes:
+        ts = rec.get("timestamp")
+        source_id = rec.get("source_id")
+        otype = rec.get("type")
+        if isinstance(source_id, str) and source_id in inflight:
+            entry = inflight[source_id]
+            if isinstance(ts, str):
+                entry["last_outcome_at"] = ts
+            if otype == "turn_completed":
+                summary["completed"] += 1
+                if rec.get("attempt_disposition") == "exempt_hard_refusal":
+                    # Successful turns can include denied tool calls. Preserve
+                    # the same attempt decision as the former failed event.
+                    reason = rec.get("attempt_reason")
+                    entry["outcome_disposition"] = "exempt_hard_refusal"
+                    entry["outcome_reason"] = (
+                        reason if isinstance(reason, str) else "hard_boundary_refusal"
+                    )
+                    entry["attempt_reasons"] = [entry["outcome_reason"]]
+                    entry["hard_refusals"] = rec.get("hard_refusals", [])
+                    if recover_failed_turns or not _is_live_state_poller(poller_name):
+                        del inflight[source_id]
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
+                if not recover_failed_turns and _is_live_state_poller(poller_name):
+                    # Live-state pollers decide success from the next external
+                    # snapshot. If the requested state transition did not occur,
+                    # a normal model completion is still a spent wedge attempt.
+                    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+                    entry["outcome_disposition"] = "charge"
+                    entry["attempt_reasons"] = [
+                        str(rec.get("attempt_reason") or "turn_completed_without_state_change")[:240]
+                    ]
+                else:
+                    del inflight[source_id]
+            elif otype == "turn_failed":
+                disposition = rec.get("attempt_disposition")
+                reason = rec.get("attempt_reason")
+                if disposition == "exempt_hard_refusal":
+                    # The framework, not the retried turn, owns this marker.
+                    # Keep it for live-state pollers so they can report the
+                    # refusal without charging their content-failure budget.
+                    entry["outcome_disposition"] = disposition
+                    entry["outcome_reason"] = (
+                        reason if isinstance(reason, str) else "hard_boundary_refusal"
+                    )
+                    entry["attempt_reasons"] = [entry["outcome_reason"]]
+                    entry["hard_refusals"] = rec.get("hard_refusals", [])
+                    if recover_failed_turns or not _is_live_state_poller(poller_name):
+                        del inflight[source_id]
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
+                # A tool-budget denial is not transient: the same event under
+                # the same configured budget will deterministically exhaust
+                # again, re-run partial side effects, and consume another full
+                # turn budget. Keep the failed classification for telemetry,
+                # but do not feed this subtype into generic poller recovery.
+                # Per-trigger sizing and durable resumption are tracked by
+                # #992/#994 respectively.
+                if rec.get("result_subtype") == "tool_budget_exhausted":
+                    del inflight[source_id]
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
+                if disposition == "transient_provider":
+                    transient_attempt = int(entry.get("transient_retries", 0)) + 1
+                    if transient_attempt <= transient_max:
+                        delay = _transient_delay(
+                            transient_attempt, transient_base, transient_cap,
+                            rec.get("retry_after_s"),
+                        )
+                        entry["transient_due_at"] = (now_dt + timedelta(seconds=delay)).isoformat()
+                        entry["transient_reason"] = reason if isinstance(reason, str) else "provider_error_transient"
+                        try:
+                            await log_event(
+                                "turn_transient_retry_scheduled", source_id=source_id,
+                                attempt=transient_attempt, delay_s=delay,
+                                reason=entry["transient_reason"],
+                            )
+                        except Exception as exc:  # noqa: BLE001 — ledger remains authoritative
+                            log.warning("poller recovery: transient schedule emit failed: %s", exc)
+                        if isinstance(ts, str):
+                            watermark = max(watermark, ts)
+                        continue
+                    try:
+                        await log_event(
+                            "turn_transient_retry_exhausted", source_id=source_id,
+                            attempt=transient_attempt,
+                            reason=reason if isinstance(reason, str) else "provider_error_transient",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("poller recovery: transient exhaustion emit failed: %s", exc)
+                    # Charge this failure through the original recovery path.
+                entry.pop("transient_due_at", None)
+                entry.pop("transient_reason", None)
+                if not recover_failed_turns:
+                    # Pollers with live-state reconciliation (notably GitHub
+                    # review requests) consume this durable count themselves.
+                    # The turn did start and fail even though generic recovery
+                    # will not re-enqueue it.
+                    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+                    entry["outcome_disposition"] = "charge"
+                    charged_reason = (
+                        reason if isinstance(reason, str) and reason
+                        else rec.get("result_subtype") or rec.get("error") or "turn_failed"
+                    )
+                    reasons = entry.setdefault("attempt_reasons", [])
+                    if isinstance(reasons, list):
+                        reasons.append(str(charged_reason)[:240])
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
+                attempts = int(entry.get("attempts", 0)) + 1
+                event = await _restore_event(
+                    entry,
+                    poller_name=poller_name,
+                    channel_id=channel_id,
+                    service_principal=service_principal,
+                    service_authority=service_authority,
+                    trust_source=trust_source,
+                    github_token=github_token,
+                    github_self_login=github_self_login,
+                    trust_attestor=trust_attestor,
+                    attestor_env=attestor_env,
+                    attestation_redact=attestation_redact,
+                )
+                if event is not None and await _is_stale(event, relevance_check):
+                    del inflight[source_id]
+                    summary["stale_dropped"] += 1
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
+                if attempts > max_attempts:
+                    # Wedge guard hit. Emit best-effort (#318): a log
+                    # failure must not strand the entry — we still give up.
+                    try:
+                        await _emit_gave_up(poller_name, channel_id, entry, source_id)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "poller recovery: gave_up emit failed for %s: %s",
+                            source_id, exc,
+                        )
+                    del inflight[source_id]
+                    summary["gave_up"] += 1
+                else:
+                    if event is None:
+                        # Unreconstructable stash (older schema) — drop so we
+                        # don't loop on it forever.
+                        del inflight[source_id]
+                        summary["dropped"] += 1
+                    else:
+                        try:
+                            accepted = await enqueue(event)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning(
+                                "poller recovery: re-enqueue raised (%s)",
+                                type(exc).__name__,
+                            )
+                            accepted = False
+                        if accepted:
+                            # Burn the wedge-guard attempt only on a real
+                            # re-fire (#305).
+                            entry["attempts"] = attempts
+                            entry["enqueued_at"] = _utc_now_iso()
+                            entry.pop("deferred_since", None)
+                            summary["reenqueued"] += 1
+                        else:
+                            deferred_dt = _parse_iso(entry.get("deferred_since"))
+                            if deferred_dt is None or deferred_dt.tzinfo is None:
+                                deferred_dt = now_dt
+                                entry["deferred_since"] = now_iso
+                            else:
+                                # No source payload, item refs, exception text,
+                                # or arbitrary ledger strings in diagnostics.
+                                watermark_dt = _parse_iso(watermark)
+                                log.warning(
+                                    "poller recovery: watermark stalled "
+                                    "poller=%s channel_id=%s watermark=%s elapsed_seconds=%.1f",
+                                    poller_name, channel_id,
+                                    watermark_dt.isoformat() if watermark_dt else "",
+                                    max(0.0, (now_dt - deferred_dt).total_seconds()),
+                                )
+                            if (now_dt - deferred_dt).total_seconds() >= max_defer_seconds:
+                                del inflight[source_id]
+                                summary["dropped"] += 1
+                                log.warning(
+                                    "poller recovery: deferred source retired "
+                                    "poller=%s channel_id=%s reason=enqueue_stall_timeout",
+                                    poller_name, channel_id,
+                                )
+                                if isinstance(ts, str):
+                                    watermark = max(watermark, ts)
+                                continue
+                            # Queue full / raised: defer. Stop WITHOUT
+                            # advancing the watermark past this outcome so
+                            # it's retried next cycle (#305).
+                            summary["deferred"] += 1
+                            break
+        if isinstance(ts, str):
+            # Outcomes are processed in append order, which the #316
+            # writer disorder can leave slightly out of timestamp order
+            # (chainlink #418). ``max`` so a late-appended OLDER record
+            # can't regress the watermark below an already-handled
+            # ``turn_failed`` — a regressed watermark re-reads that
+            # outcome next cycle and re-fires it, double-burning the
+            # wedge-guard attempt. Timestamps are uniform aware
+            # ``isoformat()`` strings, so lexicographic ``max`` orders
+            # them chronologically.
+            watermark = max(watermark, ts)
+
+    # Scheduled retries are durable, independent of the outcome watermark.
+    # Do not sleep inside a poll cycle or count an enqueue rejected by headroom.
+    for source_id, entry in list(inflight.items()):
+        if not isinstance(entry, dict):
+            continue
+        due_at = _parse_iso(entry.get("transient_due_at"))
+        if due_at is None or due_at.tzinfo is None or due_at > now_dt:
+            continue
+        event = await _restore_event(
+            entry, poller_name=poller_name, channel_id=channel_id,
+            service_principal=service_principal, service_authority=service_authority,
+            trust_source=trust_source, github_token=github_token,
+            github_self_login=github_self_login,
+            trust_attestor=trust_attestor, attestor_env=attestor_env,
+            attestation_redact=attestation_redact,
+        )
+        if event is None or await _is_stale(event, relevance_check):
+            del inflight[source_id]
+            summary["dropped" if event is None else "stale_dropped"] += 1
+            continue
+        try:
+            accepted = await enqueue(event)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("poller recovery: transient enqueue raised (%s)", type(exc).__name__)
+            accepted = False
+        if accepted:
+            entry["transient_retries"] = int(entry.get("transient_retries", 0)) + 1
+            entry.pop("transient_due_at", None)
+            entry.pop("transient_reason", None)
+            entry["enqueued_at"] = _utc_now_iso()
+            summary["reenqueued"] += 1
+        else:
+            summary["deferred"] += 1
+
+    # An accepted event whose latest enqueue predates the durable startup
+    # marker, with no outcome after that enqueue, was consumed from the poller
+    # but lost with the previous process's in-memory dispatcher queue. Replay it
+    # once for this marker. This is deliberately at-least-once: if the outcome
+    # record itself was lost in the same crash, a duplicate turn is preferable
+    # to silently losing a one-shot notification.
+    # Completed/live-state entries cannot need crash replay. Use latest enqueue,
+    # not scan_from (the original outcome bound), so retries move this bound
+    # forward. The outcome watermark is unsafe here: it may pass a marker whose
+    # replay was deferred. Keep that marker discoverable on the next cycle.
+    restart_enqueues = []
+    if not summary["deferred"]:
+        for entry in inflight.values():
+            enqueued_dt = _parse_iso(entry.get("enqueued_at") or entry.get("stashed_at"))
+            outcome_dt = _parse_iso(entry.get("last_outcome_at"))
+            if enqueued_dt is not None and (
+                outcome_dt is None or outcome_dt < enqueued_dt
+            ):
+                restart_enqueues.append(enqueued_dt)
+    restart_iso = (
+        await asyncio.to_thread(
+            _read_last_unclean_restart, events_path, min(restart_enqueues),
+        )
+        if restart_enqueues else ""
+    )
+    restart_dt = _parse_iso(restart_iso)
+    # Pending initial deliveries need neither a restart nor a failed outcome.
+    # Both paths use the same identity restore and budgeted enqueue callback.
+    if not summary["deferred"]:
+        for source_id in list(inflight):
+            entry = inflight.get(source_id)
+            if not isinstance(entry, dict):
+                continue
+            pending_enqueue = entry.get("pending_enqueue") is True
+            enqueued_iso = entry.get("enqueued_at") or entry.get("stashed_at")
+            enqueued_dt = _parse_iso(enqueued_iso)
+            outcome_dt = _parse_iso(entry.get("last_outcome_at"))
+            if not pending_enqueue and (
+                restart_dt is None
+                or enqueued_dt is None
+                or enqueued_dt >= restart_dt
+                or (outcome_dt is not None and outcome_dt >= enqueued_dt)
+                or entry.get("unclean_replayed_at") == restart_iso
+            ):
+                continue
+            attempts = int(entry.get("attempts", 0)) + 1
+            event = await _restore_event(
+                entry,
+                poller_name=poller_name,
+                channel_id=channel_id,
+                service_principal=service_principal,
+                service_authority=service_authority,
+                trust_source=trust_source,
+                github_token=github_token,
+                github_self_login=github_self_login,
+                trust_attestor=trust_attestor,
+                attestor_env=attestor_env,
+                attestation_redact=attestation_redact,
+            )
+            if event is not None and await _is_stale(event, relevance_check):
+                del inflight[source_id]
+                summary["stale_dropped"] += 1
+                continue
+            if not pending_enqueue and attempts > max_attempts:
+                try:
+                    await _emit_gave_up(poller_name, channel_id, entry, source_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "poller recovery: gave_up emit failed for %s: %s",
+                        source_id, exc,
+                    )
+                del inflight[source_id]
+                summary["gave_up"] += 1
+                continue
+            if event is None:
+                del inflight[source_id]
+                summary["dropped"] += 1
+                continue
+            enqueued_at = _utc_now_iso()
+            try:
+                accepted = await enqueue(event)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "poller recovery: unclean re-enqueue raised for %s: %s",
+                    source_id, exc,
+                )
+                accepted = False
+            if not accepted:
+                summary["deferred"] += 1
+                break
+            entry["enqueued_at"] = enqueued_at
+            if pending_enqueue:
+                entry.pop("pending_enqueue")
+                # Start the abandoned-turn TTL only after initial delivery.
+                entry["stashed_at"] = enqueued_at
+            else:
+                entry["attempts"] = attempts
+                entry["unclean_replayed_at"] = restart_iso
+                summary["unclean_reenqueued"] += 1
+            summary["reenqueued"] += 1
+
+    if summary["deferred"]:
+        # We stopped on back-pressure. Persist the watermark exactly where
+        # it is (before the deferred outcome) — do NOT fall back to now_iso,
+        # which would advance past the un-handled outcome and lose the retry
+        # (#305).
+        state["last_reconciled"] = watermark
+    else:
+        # No outcomes seen → keep advancing so we don't rescan history; any
+        # future outcome for an in-flight item has a later timestamp anyway.
+        state["last_reconciled"] = watermark or now_iso
+    await asyncio.to_thread(_save_state, persist_dir, state)
+    return summary

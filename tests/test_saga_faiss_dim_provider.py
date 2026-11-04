@@ -1,0 +1,319 @@
+"""Tests for the FAISS index dimension-resolution logic on a fresh DB
+(pre-OSS review item #14).
+
+The previous ``_ensure_index`` fallback was hardcoded to 1024 (Voyage
+default). An operator running with a non-Voyage embedding provider
+(OpenAI ``text-embedding-3-small`` at 1536, fastembed
+``BAAI/bge-small-en-v1.5`` at 384, etc.) would have their first
+``store()`` write a vector at the provider's dim into the embeddings
+table — but the FAISS index was built at 1024, so every subsequent
+incremental add silently dropped the vector. New users with
+non-Voyage providers got invisible memory.
+
+Fix: both indexes ask the configured provider for ``dimensions()`` unless
+an embedder dimension was explicitly injected, even with legacy stored rows.
+If no provider is
+available, returns None so the search falls back to FTS-only
+rather than building an index at a guessed dim.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+import pytest
+
+
+def _patch_provider(
+    monkeypatch: pytest.MonkeyPatch, *, dimensions: int, raises: bool = False
+) -> None:
+    """Stub ``saga.embeddings.get_provider()`` to return a provider with
+    the given ``dimensions``. ``raises=True`` makes ``get_provider``
+    raise — simulates an unconfigured / unloadable provider."""
+
+    class _StubProvider:
+        def embed(self, text: str, **kwargs):
+            return [1.0] * dimensions
+
+        def dimensions(self) -> int:
+            return dimensions
+
+    def _factory():
+        if raises:
+            raise RuntimeError("provider not configured")
+        return _StubProvider()
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", _factory)
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda s, k, d=None: {
+            ("embedding", "max_input_chars"): 2000,
+            ("embedding", "provider"): "stub",
+            ("embedding", "model"): f"stub-{dimensions}d",
+        }.get((s, k), d),
+    )
+
+
+# ─── empty DB + non-Voyage provider — the bug we're fixing ───────────
+
+
+@pytest.mark.parametrize(
+    "provider_dim, label",
+    [
+        (384, "fastembed BAAI/bge-small-en-v1.5"),
+        (1024, "voyage (old hardcoded default)"),
+        (1536, "OpenAI text-embedding-3-small"),
+        (3072, "OpenAI text-embedding-3-large"),
+    ],
+)
+def test_ensure_index_derives_dim_from_provider_on_empty_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_dim: int,
+    label: str,  # noqa: ARG001 — readable in test report
+) -> None:
+    """The atoms FAISS index built on a fresh DB uses the provider's
+    dimension, NOT a hardcoded fallback."""
+    _patch_provider(monkeypatch, dimensions=provider_dim)
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db")
+    conn = store._ensure_conn()
+
+    index = store._ensure_index(conn)
+    assert index is not None
+    assert index.dimension == provider_dim, (
+        f"expected provider dim {provider_dim} on empty DB; got "
+        f"{index.dimension}. The hardcoded-1024 fallback would have "
+        f"failed this test for every non-Voyage provider."
+    )
+
+
+# ─── empty DB + provider unavailable — graceful fallback ─────────────
+
+
+def test_ensure_index_returns_none_when_provider_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider can't be loaded AND DB is empty → ``_ensure_index``
+    returns None so search degrades to FTS-only. Better than
+    building an index at a guessed dim that would silently reject
+    every future store()."""
+    _patch_provider(monkeypatch, dimensions=384, raises=True)
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db")
+    conn = store._ensure_conn()
+
+    index = store._ensure_index(conn)
+    assert index is None
+    # A transient miss must remain retryable without restarting the store.
+    assert store._index_built is False
+
+
+# ─── populated DB never overrides the configured embedder ───────────
+
+
+def test_ensure_index_uses_provider_when_embeddings_exist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A homogeneous legacy database must not override the provider."""
+    _patch_provider(monkeypatch, dimensions=9999)
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db")
+    conn = store._ensure_conn()
+    # Insert a fake embedding row at dim=384.
+    import struct
+    vec_bytes = struct.pack("384f", *([0.0] * 384))
+    conn.execute(
+        "INSERT INTO atoms (id, content, content_hash, created_at) "
+        "VALUES ('a1', 'x', 'h1', '2026-01-01T00:00:00Z')"
+    )
+    conn.execute(
+        "INSERT INTO embeddings "
+        "(atom_id, vec, provider, model, dim, embedded_at) "
+        "VALUES ('a1', ?, 'p', 'm', 384, '2026-01-01T00:00:00Z')",
+        (vec_bytes,),
+    )
+    conn.commit()
+
+    index = store._ensure_index(conn)
+    assert index is not None
+    assert index.dimension == 9999
+    assert index.total_vectors == 0
+    assert index.dimension_mismatch_count == 1
+
+
+# ─── explicit embedder dimension is authoritative ───────────────────
+
+
+def test_ensure_index_explicit_embedder_dim_takes_precedence_over_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An injected embedder dimension is never inferred from stored rows."""
+    _patch_provider(monkeypatch, dimensions=9999)
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db", embedding_dim=4)
+    conn = store._ensure_conn()
+
+    import struct
+
+    conn.execute(
+        "INSERT INTO atoms (id, content, content_hash, created_at) "
+        "VALUES ('a1', 'x', 'h1', '2026-01-01T00:00:00Z')"
+    )
+    conn.execute(
+        "INSERT INTO embeddings "
+        "(atom_id, vec, provider, model, dim, embedded_at) "
+        "VALUES ('a1', ?, 'p', 'm', 8, '2026-01-01T00:00:00Z')",
+        (struct.pack("8f", *([0.0] * 8)),),
+    )
+    conn.commit()
+
+    index = store._ensure_index(conn)
+    assert index is not None
+    assert index.dimension == 4
+    assert index.dimension_mismatch_count == 1
+
+
+def test_sessions_first_cannot_change_atoms_index_dimension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_provider(monkeypatch, dimensions=8)
+
+    import struct
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db")
+    conn = store._ensure_conn()
+    for i in range(3):
+        atom_id = f"a{i}"
+        conn.execute(
+            "INSERT INTO atoms (id, content, content_hash, created_at) VALUES (?, ?, ?, ?)",
+            (atom_id, atom_id, f"h{i}", "2026-01-01T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO embeddings "
+            "(atom_id, vec, provider, model, dim, embedded_at) VALUES (?, ?, 'p', 'm', 8, ?)",
+            (atom_id, struct.pack("8f", *([float(i + 1)] * 8)), "2026-01-01T00:00:00Z"),
+        )
+    conn.execute(
+        "INSERT INTO sessions (id, started_at, embedding, embedding_dim) VALUES (?, ?, ?, ?)",
+        ("stale", "2026-01-01T00:00:00Z", struct.pack("4f", *([1.0] * 4)), 4),
+    )
+    conn.commit()
+
+    sessions_index = store._ensure_sessions_index(conn)
+    atoms_index = store._ensure_index(conn)
+
+    assert sessions_index is not None
+    assert sessions_index.dimension == 8
+    assert sessions_index.dimension_mismatch_count == 1
+    assert atoms_index is not None
+    assert atoms_index.dimension == 8
+    assert atoms_index.total_vectors == 3
+
+
+@pytest.mark.parametrize("index_kind", ["atoms", "sessions"])
+@pytest.mark.parametrize("provider_dim, expected_count", [(8, 3), (4, 1), (16, 0)])
+def test_mixed_dimensions_tolerate_index_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    index_kind: str,
+    provider_dim: int,
+    expected_count: int,
+) -> None:
+    _patch_provider(monkeypatch, dimensions=provider_dim)
+
+    import struct
+
+    from mimir.saga.client import SagaStore
+
+    store = SagaStore(db_path=tmp_path / "test.saga.db")
+    conn = store._ensure_conn()
+    if index_kind == "atoms":
+        for i, dim in enumerate((8, 8, 8, 4, 2)):
+            conn.execute(
+                "INSERT INTO atoms (id, content, content_hash, created_at) VALUES (?, ?, ?, ?)",
+                (f"a{i}", "x", f"h{i}", "2026-01-01T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO embeddings "
+                "(atom_id, vec, provider, model, dim, embedded_at) VALUES (?, ?, 'p', 'm', ?, ?)",
+                (f"a{i}", struct.pack(f"{dim}f", *([1.0] * dim)), dim, "2026-01-01T00:00:00Z"),
+            )
+        ensure = store._ensure_index
+    else:
+        for i, dim in enumerate((8, 8, 8, 4, 2)):
+            conn.execute(
+                "INSERT INTO sessions (id, started_at, embedding, embedding_dim) VALUES (?, ?, ?, ?)",
+                (f"s{i}", "2026-01-01T00:00:00Z", struct.pack(f"{dim}f", *([1.0] * dim)), dim),
+            )
+        ensure = store._ensure_sessions_index
+    conn.commit()
+
+    index = ensure(conn)
+    assert index.dimension == provider_dim
+    assert index.total_vectors == expected_count
+    assert index.dimension_mismatch_count == 5 - expected_count
+    matches = index.search([1.0] * provider_dim)
+    assert len(matches) == expected_count
+    assert ensure(conn) is index
+
+
+@pytest.mark.asyncio
+async def test_mixed_dimensions_query_returns_indexable_rows(tmp_path, monkeypatch):
+    import struct
+    from mimir.saga.client import SagaStore
+
+    _patch_provider(monkeypatch, dimensions=8)
+    store = SagaStore(db_path=tmp_path / "recall.db")
+    conn = store.connection()
+    for i, dim in enumerate((8, 8, 8, 4, 2)):
+        conn.execute(
+            "INSERT INTO atoms (id, content, content_hash, created_at) VALUES (?, ?, ?, ?)",
+            (f"a{i}", f"memory content {i}", f"h{i}", "2026-09-06T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO embeddings (atom_id, vec, provider, model, dim, embedded_at) "
+            "VALUES (?, ?, 'p', 'm', ?, '2026-09-06T00:00:00Z')",
+            (f"a{i}", struct.pack(f"{dim}f", *([1.0] * dim)), dim),
+        )
+    conn.commit()
+    # A lexical non-match proves the results actually came from vector recall.
+    result = await store.query("unrelated", enable_session_boundary_rrf=False)
+    assert {r["id"] for r in result["raws"]} == {"a0", "a1", "a2"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared_dim, encoded_dim", [(4, 4), (8, 4), (4, 8)])
+async def test_store_rejects_index_dimension_mismatch(
+    tmp_path, monkeypatch, declared_dim, encoded_dim,
+):
+    import struct
+    from mimir.saga.client import SagaStore
+
+    _patch_provider(monkeypatch, dimensions=8)
+    store = SagaStore(db_path=tmp_path / "store.db")
+    conn = store.connection()
+    index = store._ensure_index(conn)
+    with pytest.raises(ValueError, match="store embedding dimension mismatch"):
+        await store.store(
+            "must not persist",
+            precomputed_embedding=(struct.pack(f"{encoded_dim}f", *([1.] * encoded_dim)),
+                                   "p", "m", declared_dim),
+        )
+    assert conn.execute("SELECT count(*) FROM atoms").fetchone()[0] == 0
+    assert index.total_vectors == 0

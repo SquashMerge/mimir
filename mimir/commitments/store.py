@@ -1,0 +1,1110 @@
+"""Append-only JSONL store for commitments + replay-to-state.
+
+Lives at ``<home>/.mimir/commitments.jsonl`` so the indexer doesn't walk it
+as "knowledge" content.
+
+Trim policy is **status-aware**, not tail-bounded by line count:
+records whose current status is ``completed | dismissed | expired``
+AND whose terminal event is older than ``terminal_retention_days``
+(default 30) get dropped on ``trim()``. Active records
+(``pending | delivered | snoozed``) live forever — that's how a
+60-day commitment survives across multiple trim cycles.
+
+Concurrency: every writer takes a stable sidecar ``flock``. Maintenance
+prepares replacements without that lock, then validates the source and
+publishes under it; a changed source aborts maintenance, never an append.
+Lock acquisition is bounded; replays remain read-only and lock-free.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import copy_context
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Iterator, ParamSpec, TypeVar
+
+from mimir.models import AuthContext
+
+from .models import (
+    DEFAULT_SNOOZE_WINDOW_SECS,
+    EVENT_TO_TARGET_STATUS,
+    VALID_TRANSITIONS,
+    CommitmentOwnershipProvenance,
+    CommitmentRecord,
+    CommitmentStatus,
+    CommitmentVisibility,
+    make_commitment_id,
+    make_dedupe_key,
+)
+
+def commitment_fingerprint(record: CommitmentRecord) -> str:
+    """Bind approval to the complete observed record, including ownership/status."""
+    return hashlib.sha256(json.dumps(record.to_dict(), sort_keys=True).encode()).hexdigest()
+
+
+log = logging.getLogger(__name__)
+
+_STORE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="commitments")
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+async def run_store_io(func: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    """Run store work outside the loop and default pool, awaiting completion.
+
+    Cancellation is deferred until the worker finishes: callers holding a store
+    lock must not release it while a durable write is still in flight. Worker
+    failures (including writer-lock TimeoutError) propagate unchanged unless
+    cancellation was requested; then the retrieved failure is chained as the
+    cause of CancelledError so cancellation wins without losing diagnostics.
+    """
+    future = asyncio.get_running_loop().run_in_executor(
+        _STORE_EXECUTOR, copy_context().run, partial(func, *args, **kwargs),
+    )
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            # Retrieve the completed worker's failure below, before cancellation.
+            break
+    try:
+        result = future.result()
+    except BaseException as exc:
+        if cancelled:
+            raise asyncio.CancelledError from exc
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+# Number of days terminal records are retained before ``trim()`` drops them.
+DEFAULT_TERMINAL_RETENTION_DAYS = 30
+
+# Bound contention on the agent turn path, including a stopped lock holder.
+_WRITE_LOCK_TIMEOUT_SECS = 0.25
+
+
+#: Current schema version for every event appended to the JSONL.
+#: Stamped on every appended event under the ``v`` key so future
+#: schema changes (field rename, required-field add, event-type
+#: split) can be implemented as a versioned replay path without
+#: breaking deployments that already have events on disk.
+#:
+#: **Scope.** ``v`` versions the EVENT envelope — the top-level
+#: keys on each JSONL line (``type``, ``id``, ``ts``, ``v``, plus
+#: per-event-type payload keys like ``record`` / ``reason`` /
+#: ``until_unix``). It does NOT version the inner
+#: :class:`CommitmentRecord` field set carried under
+#: ``commitment_added``'s ``record`` key. A ``CommitmentRecord``
+#: field rename / add / drop is caught by the ``TypeError`` arm on
+#: ``**rec_data`` at :meth:`CommitmentsStore._apply_event` (the
+#: ``commitment_added`` branch), not the version gate — bump
+#: ``v`` only when the envelope itself changes.
+#:
+#: Replay treatment (see :meth:`CommitmentsStore._apply_event`):
+#:
+#: - ``v`` absent → treated as v1 (legacy events appended before
+#:   chainlink #82 sub #86 landed). The current event shape IS v1,
+#:   so this is the safe default.
+#: - ``v == 1`` → current shape; replay as-is.
+#: - ``v > 1`` → unknown major; log a warning and skip the event.
+#:   The next agent build that knows about that version will replay
+#:   it correctly.
+#:
+#: When evolving the schema:
+#:
+#: 1. Bump ``COMMITMENTS_JSONL_SCHEMA_VERSION``.
+#: 2. Add per-version handling in ``_apply_event`` (or a dispatch
+#:    table keyed on ``v``).
+#: 3. Land a migration test that asserts the new version replays
+#:    correctly AND that old (v < new) events still replay.
+COMMITMENTS_JSONL_SCHEMA_VERSION = 1
+
+
+
+#: Warn once (per process) when the JSONL event count exceeds this
+#: threshold.  Each lifecycle operation calls ``current_state()``
+#: which reads the whole file; at 5-min tick cadence, a chronic
+#: user accumulates events fast.  The warning surfaces the scaling
+#: smell early so the operator can run ``mimir commitments trim``
+#: before it becomes a latency issue.  Long-term fix: in-memory
+#: cache (chainlink #106).
+_LARGE_STORE_WARN_THRESHOLD = 500
+
+
+@dataclass(frozen=True)
+class CommitmentsReplay:
+    """One immutable store replay and its diagnostics.
+
+    Keeping diagnostics beside the records prevents a concurrent replay from
+    changing the metadata observed by the caller.
+    """
+
+    records: dict[str, CommitmentRecord]
+    corrupt_line_count: int = 0
+
+
+@dataclass
+class CommitmentsStore:
+    """Owns ``<path>`` — typically ``<home>/.mimir/commitments.jsonl``.
+
+    Each line is one lifecycle event. The ``commitment_added`` event
+    carries the full initial record under a ``record`` key; lifecycle
+    events (``_delivered`` / ``_completed`` / ``_snoozed`` / ...)
+    carry just the commitment id + delta fields.
+    """
+
+    path: Path
+    terminal_retention_days: int = DEFAULT_TERMINAL_RETENTION_DAYS
+    provenance_db_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._inflight_lifecycle_ids: set[str] = set()
+        # Guard: warn at most once per process instance to avoid log spam.
+        self._warned_large_store: bool = False
+
+    # ─── Appenders ──────────────────────────────────────────────────
+
+    @contextmanager
+    def _writer_lock(self) -> Iterator[None]:
+        # Never unlink this sidecar: the log inode changes on replacement.
+        # Closing the fd (including process death) releases flock automatically.
+        with self.path.with_suffix(self.path.suffix + ".lock").open("a") as lock:
+            deadline = time.monotonic() + _WRITE_LOCK_TIMEOUT_SECS
+            while True:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("commitments writer lock busy; retry")
+                    time.sleep(0.005)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def _rewrite_target(self) -> Iterator[Path]:
+        # Unique even for concurrent maintenance in the same process.
+        with tempfile.NamedTemporaryFile(
+            dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp",
+            delete=False,
+        ) as target:
+            tmp = Path(target.name)
+        try:
+            yield tmp
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _publish_rewrite(self, tmp: Path, before: os.stat_result) -> None:
+        with self._writer_lock():
+            after = self.path.stat()
+            # Appends grow the file; another rewrite changes its inode. Include
+            # nanosecond timestamps as well to reject other in-place changes.
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(before, field) != getattr(after, field) for field in fields):
+                raise BlockingIOError("commitments changed during rewrite; retry")
+            os.replace(tmp, self.path)
+
+    def _append_line_sync(self, event: dict[str, Any]) -> None:
+        """Durably append one complete JSONL record.
+
+        O_APPEND plus flush/fsync makes successful appends durable. Every writer
+        locks BEFORE opening the log, so it cannot append to a replaced inode.
+        Whole-file maintenance must use _publish_rewrite: only an unchanged
+        snapshot may replace this append-only, multi-process log. Preparation
+        and fsync of replacements never hold the writer lock.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._writer_lock(), self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def apply_proposed_closure_sync(
+        self, id: str, *, action: str, expected_fingerprint: str,
+        expected_owner: str | None, actor_principal: str,
+        approval_message_id: str | None, proposal_id: str,
+    ) -> bool:
+        """Server-only compare-and-append under the cross-process writer lock.
+
+        The caller attests an authenticated admin reply. The snapshot comparison
+        is deliberately inside the same lock as append, not a tool-side check.
+        """
+        if action not in {"complete", "dismiss"} or not actor_principal:
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._writer_lock():
+            record = self.current_state().get(id)
+            if (record is None or record.is_terminal() or record.sensitivity == "care"
+                    or record.owner_principal != expected_owner
+                    or commitment_fingerprint(record) != expected_fingerprint):
+                return False
+            target = (CommitmentStatus.COMPLETED.value if action == "complete"
+                      else CommitmentStatus.DISMISSED.value)
+            if not self._is_authorized(record, actor_principal, target_status=target,
+                                       actor_is_admin=True):
+                return False
+            event = {
+                "v": COMMITMENTS_JSONL_SCHEMA_VERSION,
+                "type": "commitment_completed" if action == "complete" else "commitment_dismissed",
+                "ts_unix": time.time(), "at_unix": time.time(), "id": id,
+                "message_id": approval_message_id,
+                "reason": f"Operator approved closure proposal {proposal_id}",
+                "approved_by": actor_principal, "proposal_id": proposal_id,
+            }
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(event) + "\n")
+                file.flush()
+                os.fsync(file.fileno())
+        return True
+
+    async def _append(self, event: dict[str, Any]) -> None:
+        # Stamp the schema version (chainlink #82 sub #86): every
+        # appended event carries ``"v": COMMITMENTS_JSONL_SCHEMA_VERSION``
+        # so a future schema change can be implemented as a versioned
+        # replay path. Callers must not pre-set ``v`` — _append is the
+        # single source of truth for the current version. Defensive
+        # overwrite handles a stray copy-paste in the lifecycle methods.
+        event = {**event, "v": COMMITMENTS_JSONL_SCHEMA_VERSION}
+        async with self._lock:
+            await run_store_io(self._append_line_sync, event)
+
+    async def add(self, record: CommitmentRecord) -> CommitmentRecord:
+        """Append ``commitment_added`` with the full initial record.
+
+        Caller can pre-populate ``id`` (idempotent re-extraction) or
+        let it default; ``created_at_unix`` defaults to now when 0.0.
+        The ``dedupe_key`` is auto-filled from
+        (owner_principal, channel_id, text, due_window_start_unix) when empty.
+        """
+        if not record.id:
+            record.id = make_commitment_id()
+        if not record.created_at_unix:
+            record.created_at_unix = time.time()
+        if not record.dedupe_key:
+            record.dedupe_key = make_dedupe_key(
+                channel_id=record.channel_id,
+                text=record.text,
+                due_window_start_unix=record.due_window_start_unix,
+                recipient_identity=record.recipient_identity,
+                owner_principal=record.owner_principal,
+            )
+        if not record.originating_channel:
+            record.originating_channel = record.channel_id
+        record.status = CommitmentStatus.PENDING.value
+        await self._append({
+            "type": "commitment_added",
+            "ts_unix": time.time(),
+            "id": record.id,
+            "record": record.to_dict(),
+        })
+        return record
+
+    def migrate_ownership(self) -> int:
+        """Backfill ownerless add events from authoritative SAGA sessions.
+
+        A row is trusted only when its exact ``saga_session_id`` resolves to a
+        complete ownership tuple. Missing databases, schemas, sessions, or ACL
+        columns fail closed to the reserved admin-only owner.
+
+        Concurrent writes abort with BlockingIOError; retry the migration.
+        Preparation is lock-free; only validation and publication exclude writers.
+        """
+        if not self.path.exists():
+            return 0
+        session_acls: dict[str, tuple[str, str, str, str]] = {}
+        if self.provenance_db_path is not None and self.provenance_db_path.is_file():
+            try:
+                conn = sqlite3.connect(
+                    f"file:{self.provenance_db_path}?mode=ro", uri=True,
+                )
+                try:
+                    rows = conn.execute(
+                        "SELECT id, owner_principal, origin_channel, "
+                        "origin_domain, visibility FROM sessions"
+                    ).fetchall()
+                finally:
+                    conn.close()
+                for session_id, owner, channel, domain, visibility in rows:
+                    if (
+                        isinstance(session_id, str)
+                        and isinstance(owner, str) and owner
+                        and owner != "legacy_admin"
+                        and isinstance(channel, str) and channel
+                        and isinstance(domain, str) and domain
+                        and visibility in {"public", "private", "service"}
+                    ):
+                        session_acls[session_id] = (
+                            owner, channel, domain, visibility,
+                        )
+            except (OSError, sqlite3.Error):
+                log.exception(
+                    "commitments: authoritative ownership lookup failed; "
+                    "ownerless rows will become admin-only"
+                )
+
+        changed = 0
+        rewritten: list[str] = []
+        before = self.path.stat()
+        with self.path.open("r", encoding="utf-8", newline="") as source:
+            for line in source:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    rewritten.append(line)
+                    continue
+                if isinstance(event, dict) and event.get("type") == "commitment_added":
+                    data = event.get("record")
+                    if isinstance(data, dict) and not data.get("owner_principal"):
+                        acl = session_acls.get(data.get("saga_session_id"))
+                        if acl is not None:
+                            owner, channel, domain, visibility = acl
+                            data["owner_principal"] = owner
+                            data["originating_channel"] = channel
+                            data["origin_domain"] = domain
+                            data["visibility"] = visibility
+                        else:
+                            data["owner_principal"] = "legacy_admin"
+                            data["originating_channel"] = None
+                            data["origin_domain"] = None
+                            data["visibility"] = CommitmentVisibility.SERVICE.value
+                            data["service_name"] = data.get("service_name") or "legacy"
+                        data["dedupe_key"] = make_dedupe_key(
+                            channel_id=data.get("channel_id"),
+                            text=data.get("text") or "",
+                            due_window_start_unix=data.get("due_window_start_unix"),
+                            recipient_identity=data.get("recipient_identity"),
+                            owner_principal=data["owner_principal"],
+                        )
+                        changed += 1
+                        ending = "\r\n" if line.endswith("\r\n") else (
+                            "\n" if line.endswith("\n") else ""
+                        )
+                        line = json.dumps(event, ensure_ascii=True, default=str) + ending
+                rewritten.append(line)
+        if changed:
+            with self._rewrite_target() as tmp:
+                with tmp.open("w", encoding="utf-8", newline="") as target:
+                    target.write("".join(rewritten))
+                    target.flush()
+                    os.fsync(target.fileno())
+                self._publish_rewrite(tmp, before)
+        return changed
+
+    def _can_apply(
+        self,
+        state: dict[str, CommitmentRecord],
+        id: str,
+        target_status: str,
+        *,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Pre-write transition check with authorization. PR #120 re-review N2.
+
+        Replay's ``VALID_TRANSITIONS`` guard already protects state
+        correctness — an invalid lifecycle event is rejected on read.
+        But without a pre-write check, the JSONL accumulates no-op
+        events and the CLI gives no feedback when an operator does
+        ``commitments complete <id>`` against an already-terminal
+        record. The caller supplies state replayed under the write lock;
+        this helper consults the adjacency and returns False (with a warning
+        log) on rejection. Public lifecycle methods consult it before append.
+
+        Authorization: recipient_principal does NOT grant mutation authority.
+        Owner mutations require an exact owner match (or admin). The trusted
+        commitment poller has a narrow exception for its own system lifecycle
+        transitions (deliver / expire), which sweep commitments across owners.
+
+        Returns True if the transition is valid and authorized; False
+        if the record is unknown, unauthorized, or the transition
+        violates ``VALID_TRANSITIONS``.
+        """
+        rec = state.get(id)
+        if rec is None:
+            log.warning(
+                "commitments: lifecycle write rejected — %s not found "
+                "(target %s)",
+                id, target_status,
+            )
+            return False
+        allowed = VALID_TRANSITIONS.get(rec.status, frozenset())
+        if target_status not in allowed:
+            log.warning(
+                "commitments: lifecycle write rejected — invalid "
+                "transition %s → %s for %s",
+                rec.status, target_status, id,
+            )
+            return False
+        if not self._is_authorized(
+            rec,
+            actor_principal,
+            target_status=target_status,
+            actor_is_admin=actor_is_admin,
+        ):
+            log.warning(
+                "commitments: lifecycle write rejected — unauthorized "
+                "mutation attempt on %s by %s (owner=%s)",
+                id, actor_principal, rec.owner_principal,
+            )
+            return False
+        return True
+
+    async def _append_transition(
+        self,
+        event: dict[str, Any],
+        target_status: str,
+        *,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Atomically validate and append one lifecycle transition."""
+        event = {**event, "v": COMMITMENTS_JSONL_SCHEMA_VERSION}
+        id = event["id"]
+        # Coalesce calls that overlap in this process. This preserves valid
+        # sequential redelivery while preventing one poll tick from recording
+        # the same delivery twice.
+        if id in self._inflight_lifecycle_ids:
+            return False
+        self._inflight_lifecycle_ids.add(id)
+        try:
+            async with self._lock:
+                state = await self.current_state_async()
+                if not self._can_apply(
+                    state,
+                    id,
+                    target_status,
+                    actor_principal=actor_principal,
+                    actor_is_admin=actor_is_admin,
+                ):
+                    return False
+                await run_store_io(self._append_line_sync, event)
+            return True
+        finally:
+            self._inflight_lifecycle_ids.remove(id)
+
+    def _is_authorized(
+        self,
+        record: CommitmentRecord,
+        actor_principal: str | None,
+        *,
+        target_status: str,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Check if the actor may apply one lifecycle transition.
+
+        Authorization rules (when actor_principal is provided):
+        - Admin actors can apply any valid transition
+        - The trusted commitment poller may deliver or expire any record; these
+          are system lifecycle transitions, not owner mutations
+        - Every other non-admin transition requires an exact owner match
+        - Ownerless records remain admin-only for owner mutations
+
+        If no actor_principal is provided, allow by default (backward compat).
+        Recipient identity does NOT grant mutation authority.
+        """
+        if actor_principal is None:
+            return True
+        if actor_is_admin:
+            return True
+        if (
+            actor_principal == "service:poller"
+            and target_status in {
+                CommitmentStatus.DELIVERED.value,
+                CommitmentStatus.EXPIRED.value,
+            }
+        ):
+            return True
+        return (
+            record.owner_principal is not None
+            and record.owner_principal != "legacy_admin"
+            and actor_principal == record.owner_principal
+        )
+
+    async def deliver(
+        self, id: str, *, actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Mark delivered (reminder fired). Bumps ``attempts``.
+
+        Returns True if the event was appended; False if the
+        transition was rejected (unknown id, terminal record, unauthorized)."""
+        return await self._append_transition(
+            {
+                "type": "commitment_delivered",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+            },
+            CommitmentStatus.DELIVERED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+
+    async def complete(
+        self,
+        id: str,
+        *,
+        message_id: str | None = None,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Mark completed (agent followed through). Terminal.
+
+        Returns True if the event was appended; False if the
+        transition was rejected or unauthorized."""
+        return await self._append_transition(
+            {
+                "type": "commitment_completed",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+                "message_id": message_id,
+            },
+            CommitmentStatus.COMPLETED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+
+    async def snooze(
+        self,
+        id: str,
+        *,
+        until_unix: float,
+        reason: str | None = None,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Push out to a later time. ``until_unix`` becomes the new
+        ``due_window_start_unix`` after replay (the original end stays
+        unless explicitly re-snoozed past it).
+
+        Returns True if the event was appended; False if the
+        transition was rejected or unauthorized."""
+        return await self._append_transition(
+            {
+                "type": "commitment_snoozed",
+                "ts_unix": time.time(),
+                "id": id,
+                "until_unix": until_unix,
+                "reason": reason,
+            },
+            CommitmentStatus.SNOOZED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+
+    async def dismiss(
+        self,
+        id: str,
+        *,
+        reason: str | None = None,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Drop as no longer relevant. Terminal.
+
+        Returns True if the event was appended; False if the
+        transition was rejected or unauthorized."""
+        return await self._append_transition(
+            {
+                "type": "commitment_dismissed",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+                "reason": reason,
+            },
+            CommitmentStatus.DISMISSED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+
+    async def expire(
+        self,
+        id: str,
+        *,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Mark expired (due_window_end passed without resolution).
+        Typically called from a poller, not by the agent. Terminal.
+
+        Returns True if the event was appended; False if the
+        transition was rejected or unauthorized."""
+        return await self._append_transition(
+            {
+                "type": "commitment_expired",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+            },
+            CommitmentStatus.EXPIRED.value,
+            actor_principal=actor_principal,
+            actor_is_admin=actor_is_admin,
+        )
+
+    async def alarm_pileup(self, id: str) -> bool:
+        """Record that a ``commitment_snooze_pileup`` algedonic event
+        was emitted for this record. PR #126 review #2: bumps
+        ``pileup_alarmed_at_unix`` so the poller's 24h cooldown
+        suppresses re-emission. Idempotent — calling again on an
+        already-alarmed record just updates the timestamp.
+
+        Annotational, not a status transition: ``VALID_TRANSITIONS``
+        isn't consulted; the record's status is untouched. Returns
+        True if appended, False on unknown id."""
+        if id not in await self.current_state_async():
+            log.warning(
+                "commitments: alarm_pileup for unknown id %s", id,
+            )
+            return False
+        await self._append({
+            "type": "commitment_pileup_alarmed",
+            "ts_unix": time.time(),
+            "id": id,
+            "at_unix": time.time(),
+        })
+        return True
+
+    # ─── Replay-to-state ────────────────────────────────────────────
+
+    async def replay_async(self) -> CommitmentsReplay:
+        """Replay on the dedicated store executor, including diagnostics."""
+        return await run_store_io(self.replay)
+
+    async def current_state_async(self) -> dict[str, CommitmentRecord]:
+        """Read current records without running the replay on the event loop."""
+        return await run_store_io(self.current_state)
+
+    def replay(self) -> CommitmentsReplay:
+        """Replay the JSONL and return records with immutable diagnostics."""
+        records: dict[str, CommitmentRecord] = {}
+        if not self.path.exists():
+            return CommitmentsReplay(records=records)
+        # JSONL is append-chronological; we read full-file (small,
+        # bounded by trim policy). tail-streaming the FULL file via
+        # ``tail_jsonl_records`` reverses order; use a forward scan.
+        event_count = 0
+        corrupt_line_count = 0
+        with self.path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                event_count += 1
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    corrupt_line_count += 1
+                    continue
+                self._apply_event(records, event)
+        if corrupt_line_count:
+            log.warning(
+                "commitments: skipped %d corrupt jsonl line(s)",
+                corrupt_line_count,
+            )
+        # Warn once when the store has grown large enough that per-call
+        # full-file replay (O(events) per ``_can_apply`` write) starts
+        # to matter. Run ``mimir commitments trim`` to prune terminal
+        # records and reset the count. Long-term fix: chainlink #106.
+        if event_count > _LARGE_STORE_WARN_THRESHOLD and not self._warned_large_store:
+            self._warned_large_store = True
+            log.warning(
+                "commitments: store has %d events (threshold %d) — "
+                "each lifecycle write replays the full file. "
+                "Run `mimir commitments trim` to prune terminal records. "
+                "Long-term fix: in-memory cache (chainlink #106).",
+                event_count,
+                _LARGE_STORE_WARN_THRESHOLD,
+            )
+        return CommitmentsReplay(
+            records=records,
+            corrupt_line_count=corrupt_line_count,
+        )
+
+    def current_state(self) -> dict[str, CommitmentRecord]:
+        """Read the JSONL, apply all events in order, return
+        ``id → CommitmentRecord``. Missing file → empty dict."""
+        return self.replay().records
+
+    @staticmethod
+    def _apply_event(
+        records: dict[str, CommitmentRecord], event: dict,
+    ) -> None:
+        # Schema version gate (chainlink #82 sub #86).
+        #
+        # - Absent ``v`` field → legacy event appended before the
+        #   version stamp landed; treat as v1 (current shape).
+        # - ``v`` present and known → replay as-is (current code path).
+        # - ``v`` greater than the version this build knows → log a
+        #   warning and skip. The next build that recognizes that
+        #   version will replay it correctly. We deliberately do NOT
+        #   silently down-grade — that risks lossy replay of events
+        #   the new schema considers load-bearing.
+        v = event.get("v", COMMITMENTS_JSONL_SCHEMA_VERSION)
+        try:
+            v_int = int(v)
+        except (TypeError, ValueError):
+            log.warning(
+                "commitments: skipping event with malformed v=%r", v,
+            )
+            return
+        if v_int > COMMITMENTS_JSONL_SCHEMA_VERSION:
+            log.warning(
+                "commitments: skipping event with future schema "
+                "v=%d (this build understands up to v=%d). Upgrade "
+                "to a build that knows this version to replay.",
+                v_int, COMMITMENTS_JSONL_SCHEMA_VERSION,
+            )
+            return
+        if v_int < 1:
+            # PR #137 review: ``int(0)`` / ``int(-1)`` succeed and would
+            # otherwise silently fall through to the v1 replay path.
+            # No legitimate writer produces these — flag them loud
+            # rather than silently degrading. Rounds out the defensive
+            # gate alongside the malformed and future-version arms.
+            log.warning(
+                "commitments: skipping event with non-positive schema "
+                "v=%d (versions start at 1)", v_int,
+            )
+            return
+        et = event.get("type")
+        rid = event.get("id")
+        if not et or not rid:
+            return
+        if et == "commitment_added":
+            # PR #120 review finding #2: a duplicate ``commitment_added``
+            # for an id already in records would wipe in-progress state
+            # (status, attempts, delivered_at) with the re-added baseline.
+            # First-write-wins — log + skip the duplicate.
+            if rid in records:
+                log.warning(
+                    "commitments: duplicate commitment_added for %s, "
+                    "keeping first (status=%s)",
+                    rid, records[rid].status,
+                )
+                return
+            rec_data = event.get("record") or {}
+            if isinstance(rec_data, dict):
+                rec_data = dict(rec_data)
+                raw_provenance = rec_data.get("ownership_provenance")
+                rec_data["ownership_provenance"] = (
+                    CommitmentOwnershipProvenance.EXTRACTION_ACL
+                    if raw_provenance
+                    == CommitmentOwnershipProvenance.EXTRACTION_ACL.value
+                    else None
+                )
+            try:
+                records[rid] = CommitmentRecord(**rec_data)
+            except TypeError as exc:
+                log.warning(
+                    "commitments: malformed commitment_added skipped: %s",
+                    exc,
+                )
+            return
+        rec = records.get(rid)
+        if rec is None:
+            # Lifecycle event for unknown id — log + skip (the add
+            # event may have been trimmed; ignoring is safer than
+            # crashing the replay).
+            log.debug("commitments: lifecycle event for unknown id %s", rid)
+            return
+        # PR #126 review #2: annotational events (no status change,
+        # just field update). Handle BEFORE the VALID_TRANSITIONS
+        # guard since they don't model a transition. Currently just
+        # ``commitment_pileup_alarmed`` — fires the 24h cooldown
+        # bookkeeping for the snooze-pileup poller.
+        if et == "commitment_pileup_alarmed":
+            rec.pileup_alarmed_at_unix = event.get("at_unix")
+            return
+        # PR #120 review finding #1: reject transitions not in the
+        # ``VALID_TRANSITIONS`` adjacency. The common case this
+        # defends against: a late ``commitment_expired`` from the
+        # Phase 2 expire-poller arriving after the agent has already
+        # ``commitment_completed`` the same id — without the guard
+        # the status flips and ``completion_message_id`` becomes a
+        # lie. Terminal records reject everything; the lifecycle
+        # invariant lives here in code, not just in prose.
+        target_status = EVENT_TO_TARGET_STATUS.get(et)
+        if target_status is None:
+            log.debug("commitments: unknown lifecycle event type %r", et)
+            return
+        allowed = VALID_TRANSITIONS.get(rec.status, frozenset())
+        if target_status not in allowed:
+            log.warning(
+                "commitments: invalid transition %s → %s for %s; "
+                "skipping (event type %s)",
+                rec.status, target_status, rid, et,
+            )
+            return
+        if et == "commitment_delivered":
+            rec.status = CommitmentStatus.DELIVERED.value
+            rec.delivered_at_unix = event.get("at_unix")
+            rec.attempts += 1
+        elif et == "commitment_completed":
+            rec.status = CommitmentStatus.COMPLETED.value
+            rec.completed_at_unix = event.get("at_unix")
+            rec.completion_message_id = event.get("message_id")
+        elif et == "commitment_snoozed":
+            rec.status = CommitmentStatus.SNOOZED.value
+            rec.snoozed_until_unix = event.get("until_unix")
+            rec.snooze_reason = event.get("reason")
+            # Phase 2b: bump per-record snooze counter. The poller
+            # uses this to detect commitments that keep getting
+            # punted (≥ threshold → ``commitment_snooze_pileup``).
+            rec.snooze_count += 1
+            # Slide the due window so the snoozed_until becomes the
+            # new "earliest deliver" anchor for surfacing logic.
+            # PR #120 review finding #3: also bump the end so a
+            # long snooze past the current end doesn't produce an
+            # inverted window (start > end). Match the CLI's
+            # default-end shape (start + 7d).
+            if event.get("until_unix") is not None:
+                rec.due_window_start_unix = event["until_unix"]
+                current_end = rec.due_window_end_unix or 0
+                min_end = event["until_unix"] + DEFAULT_SNOOZE_WINDOW_SECS
+                if current_end < min_end:
+                    rec.due_window_end_unix = min_end
+        elif et == "commitment_dismissed":
+            rec.status = CommitmentStatus.DISMISSED.value
+            rec.dismissed_at_unix = event.get("at_unix")
+            rec.dismiss_reason = event.get("reason")
+        elif et == "commitment_expired":
+            rec.status = CommitmentStatus.EXPIRED.value
+            rec.expired_at_unix = event.get("at_unix")
+
+    def list(
+        self,
+        *,
+        channel_id: str | None = None,
+        status: str | None = None,
+        include_unbound: bool = True,
+        actor_principal: str | None = None,
+        include_service: bool = False,
+        owner_principal: str | None = None,
+        actor_is_admin: bool = False,
+        auth_context: AuthContext | None = None,
+    ) -> list[CommitmentRecord]:
+        """Replay + filter.
+
+        - ``channel_id``: only commitments bound to this channel
+          (``record.channel_id == channel_id``). Combined with
+          ``include_unbound=True`` (default), unbound commitments
+          (``channel_id is None``) are also returned — matches the
+          design's "surface unbound everywhere" rule.
+        - ``status``: filter by current status. ``None`` returns all.
+        - ``actor_principal``: for access control (view filtering).
+        - ``owner_principal``: filter by ownership. If provided, returns
+          only commitments owned by this principal.
+        - ``include_service``: opt into service-visibility commitments when the
+          actor is also authorized for their owner. It never grants cross-owner
+          access. Default False.
+        Sorted by created_at_unix ascending."""
+        from ..access_control import can_review_commitments
+        review_read = can_review_commitments(auth_context) if auth_context is not None else False
+        if auth_context is not None:
+            if not isinstance(auth_context, AuthContext):
+                raise TypeError("commitment reads require the exact AuthContext")
+            actor_principal = (
+                auth_context.canonical_principal or auth_context.principal
+            )
+            actor_is_admin = "admin" in auth_context.roles
+            include_service = auth_context.is_service
+        state = self.current_state()
+        out: list[CommitmentRecord] = []
+        for rec in state.values():
+            if channel_id is not None:
+                ch_ok = rec.channel_id == channel_id
+                if not ch_ok and not (include_unbound and rec.channel_id is None):
+                    continue
+            if status is not None and rec.status != status:
+                continue
+            if owner_principal is not None and rec.owner_principal != owner_principal:
+                continue
+            if not review_read and not self._can_view(
+                rec, actor_principal, include_service,
+                actor_is_admin=actor_is_admin,
+            ):
+                continue
+            out.append(rec)
+        out.sort(key=lambda r: r.created_at_unix)
+        return out
+
+    def _can_view(
+        self,
+        record: CommitmentRecord,
+        actor_principal: str | None,
+        include_service: bool,
+        *,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Check if the actor can view this commitment.
+
+        Visibility rules for an authenticated actor:
+        - Admin: visible regardless of visibility level or owner
+        - Any actor: exact-owner records
+        - Anonymous/backward-compatible reads: public records
+        - Ownerless and cross-owner records: hidden from authenticated actors
+        - Ownerless service records: admin-only
+
+        ``include_service`` opts into the actor's own service-visibility records;
+        it never grants cross-owner access. Public is a legacy visibility label,
+        not an implicit grant to every authenticated service principal.
+        """
+        if actor_is_admin:
+            return True
+        if actor_principal is None:
+            return record.visibility == CommitmentVisibility.PUBLIC.value
+        if (
+            record.owner_principal == "legacy_admin"
+            or actor_principal != record.owner_principal
+        ):
+            return False
+        if record.visibility == CommitmentVisibility.SERVICE.value:
+            return include_service
+        return True
+
+    def find_by_dedupe_key(
+        self,
+        dedupe_key: str,
+        *,
+        owner_principal: str | None = None,
+    ) -> CommitmentRecord | None:
+        """Return the (non-terminal) commitment with this dedupe key,
+        or None. Used by the future extractor to skip re-adding the
+        same commitment surfaced in a later session.
+
+        When owner_principal is provided, only returns matches with the
+        same owner (enforces owner-inclusive dedupe)."""
+        state = self.current_state()
+        for rec in state.values():
+            if rec.dedupe_key == dedupe_key and not rec.is_terminal():
+                if owner_principal is not None and rec.owner_principal != owner_principal:
+                    continue
+                return rec
+        return None
+
+    # ─── Trim ───────────────────────────────────────────────────────
+
+    def find_trim_candidates(
+        self, *, now_unix: float | None = None,
+    ) -> list[tuple[str, CommitmentRecord]]:
+        """Return ``(id, record)`` pairs for terminal records whose
+        terminal event is older than ``terminal_retention_days``.
+
+        Single source of truth for the trim predicate. Used by both
+        ``trim()`` (to determine which ids to drop) and the CLI's
+        dry-run path (to preview what would be dropped). PR #120
+        re-review N1: keeping the definition here avoids drift if a
+        future change adds a new terminal status that updates only
+        one of the two paths.
+        """
+        if now_unix is None:
+            now_unix = time.time()
+        retention_secs = self.terminal_retention_days * 86400
+        out: list[tuple[str, CommitmentRecord]] = []
+        for rid, rec in self.current_state().items():
+            if not rec.is_terminal():
+                continue
+            terminal_at = next(
+                (
+                    value
+                    for value in (
+                        rec.completed_at_unix,
+                        rec.dismissed_at_unix,
+                        rec.expired_at_unix,
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            if terminal_at is None:
+                continue
+            if (now_unix - terminal_at) > retention_secs:
+                out.append((rid, rec))
+        return out
+
+    async def trim(self, *, now_unix: float | None = None) -> int:
+        """Rewrite the file dropping terminal records whose terminal
+        event is older than ``terminal_retention_days`` (default 30).
+
+        Active records (``pending``, ``delivered``, ``snoozed``) are
+        ALWAYS kept regardless of age — a 60-day pending commitment
+        survives every trim until it terminates.
+
+        Returns the number of records dropped. Uses atomic
+        rename (temp file + os.replace) so an interrupted trim never
+        leaves the store in a half-written state. Preparation does not exclude
+        sibling writers. If the source changes, raises BlockingIOError instead
+        of publishing a stale snapshot; callers may retry. Only validation and
+        publication hold the cross-process lock, with a bounded acquisition wait.
+        """
+        return await run_store_io(self._trim_sync, now_unix=now_unix)
+
+    def _trim_sync(self, *, now_unix: float | None = None) -> int:
+        if not self.path.exists():
+            return 0
+
+        # Validate from before the candidate replay, not just the copying pass.
+        before = self.path.stat()
+        candidates = self.find_trim_candidates(now_unix=now_unix)
+        drop_ids: set[str] = {rid for rid, _ in candidates}
+        if not drop_ids:
+            return 0
+
+        with self._rewrite_target() as tmp:
+            kept_lines = 0
+            dropped_events = 0
+            with self.path.open("r", encoding="utf-8") as src, \
+                 tmp.open("w", encoding="utf-8") as dst:
+                for line in src:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        event = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        # Pass-through unknown lines — don't drop data
+                        # we can't parse.
+                        dst.write(line)
+                        kept_lines += 1
+                        continue
+                    if event.get("id") in drop_ids:
+                        dropped_events += 1
+                        continue
+                    dst.write(line if line.endswith("\n") else line + "\n")
+                    kept_lines += 1
+                # PR #120 review finding #4a: flush + fsync the tmp
+                # file's contents to disk BEFORE the atomic rename.
+                # ``os.replace`` is atomic w.r.t. the directory entry,
+                # but if the host crashes after rename, the tmp file's
+                # contents may not be fully on disk yet — the original
+                # claim "interrupted trim never leaves the store
+                # half-written" needs this to hold. Page-cache → disk.
+                dst.flush()
+                os.fsync(dst.fileno())
+            self._publish_rewrite(tmp, before)
+        log.info(
+            "commitments trim: dropped %d records (%d events), kept %d lines",
+            len(drop_ids), dropped_events, kept_lines,
+        )
+        return len(drop_ids)

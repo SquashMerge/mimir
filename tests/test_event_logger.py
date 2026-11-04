@@ -1,0 +1,847 @@
+"""events.jsonl writer (SPEC §10.1)."""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import json
+import multiprocessing
+import os
+import threading
+from pathlib import Path
+
+import pytest
+from tests.timing import HANG_GUARD_SECONDS
+
+from mimir.event_logger import (
+    FEEDBACK_EVENT_VERSION,
+    EventLogger,
+    emit_event_background,
+    init_logger,
+    safe_log_event,
+)
+
+
+def _append_from_process(
+    path: Path,
+    observation,
+    retry: multiprocessing.synchronize.Event,
+) -> None:
+    import mimir.event_logger as event_logger
+    from types import SimpleNamespace
+
+    def observed_flock(fd, operation):
+        try:
+            return fcntl.flock(fd, operation)
+        except BlockingIOError:
+            observation.send("blocked")
+            # Keep the writer parked until the parent has observed contention
+            # and joined the trim, without spending the product retry budget.
+            retry.wait()
+            return fcntl.flock(fd, operation)
+
+    event_logger.fcntl = SimpleNamespace(
+        flock=observed_flock, LOCK_EX=fcntl.LOCK_EX,
+        LOCK_NB=fcntl.LOCK_NB, LOCK_UN=fcntl.LOCK_UN,
+    )
+    logger = EventLogger(path, session_id="detached")
+    logger.log_sync("detached_event", source="worklink")
+    observation.send("finished")
+
+
+@pytest.mark.asyncio
+async def test_log_appends_record_with_session_and_type(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+
+    await logger.log("app_started", home="/h")
+    await logger.log("tool_call", tool="echo", args={"text": "hi"}, turn_id="t1")
+
+    lines = [json.loads(l) for l in path.read_text().strip().splitlines()]
+    assert len(lines) == 2
+    assert lines[0]["type"] == "app_started"
+    assert lines[0]["session_id"] == "proc-1"
+    assert lines[0]["home"] == "/h"
+    assert "timestamp" in lines[0]
+    assert lines[1]["tool"] == "echo"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["log", "log_sync", "log_durable_sync"])
+@pytest.mark.parametrize("agent_id", [None, "framework-agent"])
+async def test_payload_cannot_shadow_record_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, method, agent_id,
+) -> None:
+    from mimir.feedback.rules import classify
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="framework-session", agent_id=agent_id)
+    timestamp = "2026-09-13T12:00:00+00:00"
+    monkeypatch.setattr("mimir.event_logger._utc_now_iso", lambda: timestamp)
+    payload = {
+        "type": "http_500",
+        "timestamp": "2020-01-01T00:00:00+00:00",
+        "session_id": "forged-session",
+        "agent_id": "forged-agent",
+        "poller": "demo",
+        "detail": {"message": "upstream unavailable", "token": "github_pat_11ABCDEFG_xyz0123"},
+    }
+    if method == "log":
+        await logger.log("poller_service_outage", **payload)
+    else:
+        await asyncio.to_thread(getattr(logger, method), "poller_service_outage", **payload)
+
+    record = json.loads(path.read_text())
+    assert record["type"] == "poller_service_outage"
+    assert record["timestamp"] == timestamp
+    assert record["session_id"] == "framework-session"
+    if agent_id is None:
+        assert "agent_id" not in record
+    else:
+        assert record["agent_id"] == agent_id
+    assert classify(record["type"]) == ("negative", "poller_service_outage")
+    assert record["poller"] == "demo"
+    assert record["detail"] == {"message": "upstream unavailable", "token": "[REDACTED]"}
+    assert payload["type"] == "http_500"
+    assert payload["detail"]["token"] == "github_pat_11ABCDEFG_xyz0123"
+    warnings = [r for r in caplog.records if "reserved record-header" in r.message]
+    assert len(warnings) == 1
+    assert warnings[0].levelname == "WARNING"
+    for key in ("type", "timestamp", "session_id", "agent_id"):
+        assert key in warnings[0].message
+    assert "forged" not in warnings[0].message
+    assert "github_pat" not in warnings[0].message
+
+
+def test_durable_log_fsyncs_new_file_and_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="proc-1")
+    fsynced: list[int] = []
+    monkeypatch.setattr("mimir.event_logger.os.fsync", lambda fd: fsynced.append(fd))
+
+    logger.log_durable_sync("startup_failed", phase="agent_runtime")
+
+    expected = 2 if hasattr(os, "O_DIRECTORY") else 1
+    assert len(fsynced) == expected
+
+
+def test_durable_log_after_nondurable_creation_fsyncs_file_and_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+    logger.log_sync("startup_progress", phase="agent_runtime")
+    fsynced: list[int] = []
+    monkeypatch.setattr("mimir.event_logger.os.fsync", lambda fd: fsynced.append(fd))
+
+    logger.log_durable_sync("startup_failed", phase="scheduler_start")
+
+    expected = 2 if hasattr(os, "O_DIRECTORY") else 1
+    assert len(fsynced) == expected
+
+
+def test_durable_log_propagates_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="proc-1")
+
+    def fail_fsync(fd: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("mimir.event_logger.os.fsync", fail_fsync)
+    with pytest.raises(OSError, match="fsync failed"):
+        logger.log_durable_sync("startup_failed", phase="scheduler_start")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_logs_do_not_interleave(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+
+    await asyncio.gather(*(logger.log("tool_call", i=i) for i in range(50)))
+
+    lines = path.read_text().strip().splitlines()
+    assert len(lines) == 50
+    parsed = [json.loads(l) for l in lines]
+    assert sorted(p["i"] for p in parsed) == list(range(50))
+
+
+@pytest.mark.asyncio
+async def test_max_events_trims(tmp_path: Path):
+    """With hysteresis, trim fires when over cap by ≥10% (rounded up to
+    at least 1 line). Between trims the file may sit between max and
+    max+10%. The most-recent events are always kept."""
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1", max_events=3)
+
+    for i in range(10):
+        await logger.log("tool_call", i=i)
+
+    parsed = [json.loads(l) for l in path.read_text().strip().splitlines()]
+    # cap=3, hysteresis=max(3//10, 1)=1 → trigger at >4 lines, trim to 3.
+    # The exact count at end depends on how many events landed since the
+    # last trim cycle, but it's always ≤ trigger threshold and the most
+    # recent events are preserved.
+    assert len(parsed) <= 4
+    # Recency invariant: whatever's left ends with the latest writes.
+    last_i = parsed[-1]["i"]
+    assert last_i == 9
+    # And the kept range is contiguous (no gaps from out-of-order trim).
+    indices = [p["i"] for p in parsed]
+    assert indices == list(range(indices[0], indices[0] + len(indices)))
+
+
+@pytest.mark.asyncio
+async def test_async_log_offloads_append_io_to_worker_thread(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+    loop_thread_id = None
+    append_thread_id = None
+    original_append = logger._append_record_sync
+
+    async def capture_loop_thread():
+        nonlocal loop_thread_id
+        import threading
+
+        loop_thread_id = threading.get_ident()
+
+    def wrapped_append(record):
+        nonlocal append_thread_id
+        import threading
+
+        append_thread_id = threading.get_ident()
+        original_append(record)
+
+    await capture_loop_thread()
+    logger._append_record_sync = wrapped_append
+
+    await logger.log("tool_call", i=1)
+
+    assert append_thread_id is not None
+    assert append_thread_id != loop_thread_id
+    assert json.loads(path.read_text().strip())["i"] == 1
+
+
+@pytest.mark.asyncio
+async def test_async_log_redaction_keeps_loop_responsive_under_logger_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.event_logger as event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="redaction-offloop")
+    lock = logger._ensure_lock()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    released = threading.Event()
+    observations = []
+    original_redact = event_logger.redact_payload
+
+    def slow_redact(payload):
+        # Only the event loop can release this simulated expensive redaction.
+        loop.call_soon_threadsafe(released.set)
+        responsive = released.wait(timeout=2.0)
+        observations.append((responsive, threading.get_ident(), lock.locked()))
+        return original_redact(payload)
+
+    monkeypatch.setattr(event_logger, "redact_payload", slow_redact)
+    try:
+        await asyncio.wait_for(
+            logger.log("tool_result", nested={"detail": "token=github_pat_11ABCDEFG_xyz0123"}),
+            timeout=5.0,
+        )
+    finally:
+        released.set()
+
+    assert len(observations) == 1
+    responsive, redaction_thread, lock_held = observations[0]
+    assert responsive, "redaction blocked the event-loop callback"
+    assert redaction_thread != loop_thread
+    assert lock_held, "redaction must remain inside the logger async lock"
+    record = json.loads(path.read_text())
+    assert record["nested"] == {"detail": "token=[REDACTED]"}
+    assert record["type"] == "tool_result"
+    assert record["session_id"] == "redaction-offloop"
+
+
+@pytest.mark.asyncio
+async def test_async_log_stamps_before_lock_and_worker_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.event_logger as event_logger
+    from mimir.background_io import run_in_pool
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="occurrence", agent_id="agent")
+    lock = logger._ensure_lock()
+    loop_thread = threading.get_ident()
+    now = "2026-09-12T10:00:00+00:00"
+    stamps = []
+    submitted = asyncio.Event()
+    release_worker = asyncio.Event()
+
+    def stamp():
+        stamps.append((now, threading.get_ident()))
+        return now
+
+    async def delayed_submission(pool, func, *args, **kwargs):
+        submitted.set()
+        await release_worker.wait()
+        return await run_in_pool(pool, func, *args, **kwargs)
+
+    monkeypatch.setattr(event_logger, "_utc_now_iso", stamp)
+    monkeypatch.setattr(event_logger, "run_in_pool", delayed_submission)
+    await lock.acquire()
+    task = asyncio.create_task(logger.log("queued", detail="safe"))
+    try:
+        await asyncio.sleep(0)  # log reaches the held lock without a worker.
+        assert stamps == [("2026-09-12T10:00:00+00:00", loop_thread)]
+        assert not submitted.is_set()
+        now = "2026-09-12T10:01:00+00:00"
+        lock.release()
+        await asyncio.wait_for(submitted.wait(), timeout=HANG_GUARD_SECONDS)
+        assert not path.exists()
+        now = "2026-09-12T10:02:00+00:00"
+    finally:
+        if lock.locked() and not submitted.is_set():
+            lock.release()
+        release_worker.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert stamps == [("2026-09-12T10:00:00+00:00", loop_thread)]
+    assert json.loads(path.read_text()) == {
+        "timestamp": "2026-09-12T10:00:00+00:00",
+        "type": "queued", "session_id": "occurrence", "agent_id": "agent",
+        "detail": "safe",
+    }
+
+
+def test_log_sync_does_not_mkdir_after_initialization(tmp_path: Path, monkeypatch):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+
+    def fail_mkdir(*args, **kwargs):
+        raise AssertionError("mkdir should not run on the hot append path")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    logger.log_sync("startup", ok=True)
+
+    assert json.loads(path.read_text().strip())["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_safe_log_event_writes_when_logger_is_initialized(tmp_path: Path):
+    """safe_log_event delegates to log_event when the logger is initialized."""
+    path = tmp_path / "events.jsonl"
+    init_logger(path, session_id="proc-safe")
+
+    await safe_log_event("test_event", key="value")
+
+    lines = [json.loads(l) for l in path.read_text().strip().splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["type"] == "test_event"
+    assert lines[0]["key"] == "[REDACTED]"
+
+
+@pytest.mark.asyncio
+async def test_safe_log_event_swallows_errors_when_logger_not_initialized():
+    """safe_log_event must not raise even if the global logger is not set up.
+
+    This is the core contract: monitoring side-channels must never crash
+    the primary work path regardless of logger state.
+    """
+    import mimir.event_logger as _el
+    original = _el._logger
+    try:
+        _el._logger = None  # force the "not initialized" path
+        # Should not raise — swallowed at DEBUG level
+        await safe_log_event("orphan_event", x=1)
+    finally:
+        _el._logger = original  # restore so other tests aren't affected
+
+
+@pytest.mark.asyncio
+async def test_emit_event_background_retains_task_until_completion(monkeypatch):
+    import mimir.event_logger as event_logger
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    spawned_task = None
+
+    async def blocking_safe_log_event(kind: str, **kwargs) -> None:
+        nonlocal spawned_task
+        spawned_task = asyncio.current_task()
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(event_logger, "safe_log_event", blocking_safe_log_event)
+    emit_event_background("tool_call_budget_denied", tool="bash", count=5)
+    await started.wait()
+
+    assert spawned_task in event_logger._background_event_tasks
+
+    release.set()
+    await spawned_task
+    await asyncio.sleep(0)
+    assert spawned_task not in event_logger._background_event_tasks
+
+
+def test_emit_event_background_drops_without_running_loop(monkeypatch, caplog):
+    import mimir.event_logger as event_logger
+
+    calls = []
+
+    async def capture_safe_log_event(kind: str, **kwargs) -> None:
+        calls.append((kind, kwargs))
+
+    monkeypatch.setattr(event_logger, "safe_log_event", capture_safe_log_event)
+    monkeypatch.setattr(
+        event_logger, "log_event_sync",
+        lambda *args, **kwargs: pytest.fail("event must not be queued"),
+    )
+    caplog.set_level("DEBUG", logger="mimir.event_logger")
+
+    emit_event_background("iteration_budget_reached", count=20, budget=20)
+
+    assert calls == []
+    assert "event iteration_budget_reached dropped: no running loop" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_emit_event_background_swallows_and_logs_logger_failure(
+    monkeypatch, caplog,
+):
+    import mimir.event_logger as event_logger
+
+    async def fail_log_event(kind: str, **kwargs) -> None:
+        raise RuntimeError("logger failed")
+
+    monkeypatch.setattr(event_logger, "log_event", fail_log_event)
+    caplog.set_level("DEBUG", logger="mimir.event_logger")
+
+    emit_event_background("iteration_budget_warning", count=18, budget=20)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert "log_event 'iteration_budget_warning' failed: logger failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_max_events_trim_eventually_lands_on_cap(tmp_path: Path):
+    """Over a long enough run, the file does come back to cap after a
+    trim cycle — verifies trim-back-to-max actually happens."""
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1", max_events=10)
+
+    for i in range(100):
+        await logger.log("tool_call", i=i)
+
+    lines = path.read_text().strip().splitlines()
+    # cap=10, hysteresis=max(10//10,1)=1 → trigger at >11 lines.
+    # Bound is between 10 (right after trim) and 11 (right before).
+    assert 10 <= len(lines) <= 11
+    parsed = [json.loads(l) for l in lines]
+    assert parsed[-1]["i"] == 99
+
+
+@pytest.mark.asyncio
+async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+    unprefixed_secret = "0123456789abcdef0123456789abcdef"
+
+    await logger.log(
+        "tool_error",
+        error="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def failed",
+        args={
+            "env": "ANTHROPIC_API_KEY=sk-ant-api03-AbCdEf12_3456-789xyz_long",
+            "nested": [
+                "token=github_pat_11ABCDEFG_xyz0123",
+                f"> X-API-Key: {unprefixed_secret}",
+                f"MIMIR_API_KEY: {unprefixed_secret}",
+                f'{{"VOYAGE_API_KEY": "pa-{unprefixed_secret}"}}',
+                "safe context",
+            ],
+        },
+    )
+
+    record = json.loads(path.read_text().strip())
+    serialized = json.dumps(record)
+    assert "eyJhbGciOiJIUzI1NiJ9" not in serialized
+    assert "sk-ant-api03-" not in serialized
+    assert "github_pat_" not in serialized
+    assert unprefixed_secret not in serialized
+    assert "pa-" + unprefixed_secret not in serialized
+    assert record["error"] == "Authorization: Bearer [REDACTED] failed"
+    assert record["args"]["nested"][0] == "token=[REDACTED]"
+    assert record["args"]["nested"][1] == "> X-API-Key: [REDACTED]"
+    assert record["args"]["nested"][2] == "MIMIR_API_KEY: [REDACTED]"
+    assert record["args"]["nested"][3] == '{"VOYAGE_API_KEY": "[REDACTED]"}'
+    assert record["args"]["nested"][4] == "safe context"
+
+
+@pytest.mark.asyncio
+async def test_feedback_v1_metadata_survives_redaction_and_jsonl_round_trip(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-feedback")
+    secret = "github_pat_11ABCDEFG_xyz0123"
+
+    await logger.log(
+        "react_received",
+        event_version=FEEDBACK_EVENT_VERSION,
+        owner_principal="alice",
+        detail=f"token={secret}",
+    )
+    logger.log_sync(
+        "react_received",
+        event_version=FEEDBACK_EVENT_VERSION,
+        owner_principal=None,
+        detail=f"token={secret}",
+    )
+    await asyncio.to_thread(logger.flush_sync)
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["event_version"] for record in records] == ["v1", "v1"]
+    assert [record["owner_principal"] for record in records] == ["alice", None]
+    assert [record["detail"] for record in records] == [
+        "token=[REDACTED]",
+        "token=[REDACTED]",
+    ]
+    assert secret not in path.read_text()
+
+async def test_part_a_log_payload_failures_never_reach_caller(tmp_path: Path):
+    class RaisingRepr:
+        def __str__(self) -> str:
+            raise ValueError("cannot stringify")
+
+        def __repr__(self) -> str:
+            raise ValueError("cannot represent")
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-bad-payload")
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    await logger.log("bad_repr", value=RaisingRepr())
+    await logger.log("cyclic", value=cyclic)
+
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_event_logger_redacts_yaml_block_scalars_without_erasing_context(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    secret = "s3cr3t" + "-event-block"
+    content = (
+        "ancestor:\n"
+        "  items:\n"
+        "    - password: &event_value !!str | # retained\n"
+        f"        {secret}-implicit\n"
+        "      sibling: keep-implicit-sibling\n"
+        "    - ? password\n"
+        "      : >-\n"
+        f"        {secret}-explicit\n"
+        "      sibling: keep-explicit-sibling\n"
+        "    - keep-following-item\n"
+        "  ancestor_sibling: keep-ancestor\n"
+    )
+
+    await EventLogger(path, session_id="proc-block").log("tool_result", content=content)
+
+    persisted = json.loads(path.read_text())["content"]
+    assert secret not in persisted
+    for context in (
+        "password: &event_value !!str | # retained",
+        "? password",
+        ": >-",
+        "sibling: keep-implicit-sibling",
+        "sibling: keep-explicit-sibling",
+        "- keep-following-item",
+        "ancestor:",
+        "ancestor_sibling: keep-ancestor",
+    ):
+        assert context in persisted
+
+
+def test_log_sync_redacts_token_shaped_values(tmp_path: Path):
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="proc-1")
+
+    logger.log_sync("startup", stderr="OPENAI_API_KEY=sk-proj_AbCdEfGh1234567890_ijKlMnOpQrSt")
+
+    record = json.loads(path.read_text().strip())
+    assert "sk-proj_" not in record["stderr"]
+    assert record["stderr"] == "OPENAI_API_KEY=[REDACTED]"
+
+
+@pytest.mark.timeout(30)
+def test_log_sync_holds_io_lock(tmp_path):
+    """chainlink #393: log_sync must acquire _io_lock so it can't write
+    concurrently with _trim_sync's tail-read+rename (which would lose the
+    record). Proof: while the test holds _io_lock, a log_sync on another thread
+    blocks; once released it proceeds and the record lands."""
+    import threading
+    from mimir.event_logger import EventLogger
+
+    logger = EventLogger(tmp_path / "events.jsonl", session_id="t")
+    done = threading.Event()
+    observed = threading.Event()
+    attempted = []
+    lock = logger._io_lock
+
+    class ObservedLock:
+        def __enter__(self):
+            acquired = lock.acquire(blocking=False)
+            attempted.append(acquired)
+            observed.set()
+            if not acquired:
+                lock.acquire()
+
+        def __exit__(self, *exc):
+            lock.release()
+
+    logger._io_lock = ObservedLock()
+
+    def append():
+        try:
+            logger.log_sync("evt_x")
+        finally:
+            done.set()
+            observed.set()  # Missing lock acquisition must fail, not time out.
+
+    lock.acquire()
+    thread = threading.Thread(target=append, daemon=True)
+    try:
+        thread.start()
+        observed.wait()
+        assert attempted == [False], "log_sync did not contend on _io_lock"
+        assert not done.is_set(), "log_sync did not respect _io_lock"
+    finally:
+        lock.release()
+        thread.join()
+
+    assert done.is_set(), "log_sync did not proceed after lock release"
+    assert '"type": "evt_x"' in (tmp_path / "events.jsonl").read_text()
+
+
+@pytest.mark.timeout(30)
+def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
+    """A detached writer waits for trim's rename and lands on the new inode."""
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="server", max_events=4)
+    for i in range(3):
+        logger.log_sync("server_event", i=i)
+
+    rename_reached = threading.Event()
+    allow_rename = threading.Event()
+    trim_finished = threading.Event()
+    original_rename = Path.rename
+
+    def paused_rename(source, target):
+        rename_reached.set()
+        allow_rename.wait()
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", paused_rename)
+
+    def trim():
+        logger._trim_sync()
+        trim_finished.set()
+
+    trim_thread = threading.Thread(target=trim, daemon=True)
+    trim_thread.start()
+    ctx = multiprocessing.get_context("spawn")
+    observation, sender = ctx.Pipe(duplex=False)
+    retry = ctx.Event()
+    process = ctx.Process(
+        target=_append_from_process,
+        args=(path, sender, retry),
+    )
+    try:
+        rename_reached.wait()
+        process.start()
+        sender.close()
+        assert observation.recv() == "blocked", "detached append bypassed trim's lock"
+    finally:
+        allow_rename.set()
+        trim_thread.join()
+        retry.set()
+        if process.pid is not None:
+            process.join(timeout=5.0)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+        sender.close()
+        observation.close()
+
+    assert trim_finished.is_set(), "trim did not finish"
+    assert process.exitcode == 0
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert any(record["type"] == "detached_event" for record in records)
+    assert len(records) <= logger._max_events
+
+
+def test_process_lock_timeout_degrades_to_append(tmp_path, monkeypatch, caplog):
+    """A stuck process lock cannot block an ordinary event indefinitely."""
+    import mimir.event_logger as event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="server")
+    monkeypatch.setattr(event_logger, "PROCESS_LOCK_TIMEOUT_SECONDS", 0.05)
+    clock = iter((100.0, 100.05))
+    monkeypatch.setattr(
+        event_logger.time, "monotonic", lambda: next(clock, 100.05),
+    )
+    logger._process_lock_path.touch()
+
+    with logger._process_lock_path.open("a", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.log_sync("lock_degraded")
+
+    assert json.loads(path.read_text())["type"] == "lock_degraded"
+    assert "process lock timed out" in caplog.text
+    assert "continuing with an unlocked append" in caplog.text
+
+
+def test_durable_process_lock_timeout_fails_instead_of_claiming_success(
+    tmp_path, monkeypatch, caplog,
+):
+    """A durable append must not race trim's rename by writing unlocked."""
+    import mimir.event_logger as event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = EventLogger(path, session_id="server")
+    monkeypatch.setattr(event_logger, "PROCESS_LOCK_TIMEOUT_SECONDS", 0.05)
+    logger._process_lock_path.touch()
+
+    with logger._process_lock_path.open("a", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(TimeoutError, match="durable append"):
+            logger.log_durable_sync("startup_failed", phase="agent_runtime")
+
+    assert not path.exists()
+    assert "process lock timed out" in caplog.text
+    assert "failing durable append" in caplog.text
+
+
+def _hold_process_lock(path, ready, release):
+    with path.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        ready.set()
+        release.wait(60)  # hang guard; the parent releases after 0.35s
+
+
+@pytest.mark.parametrize("contention", ["flock", "io_lock", "file_io"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["queued", "negative-control"])
+async def test_sync_logging_timer_latency(tmp_path, monkeypatch, contention, legacy):
+    """The negative control executes the old inline append, not a fake sleep caller."""
+    import time
+    import mimir.event_logger as event_logger
+
+    logger = EventLogger(tmp_path / "events.jsonl", "latency")
+    monkeypatch.setattr(event_logger, "_logger", logger)
+    process = None
+    release_timer = None
+    if contention == "flock":
+        ctx = multiprocessing.get_context("spawn")
+        ready, release = ctx.Event(), ctx.Event()
+        process = ctx.Process(
+            target=_hold_process_lock,
+            args=(logger._process_lock_path, ready, release),
+        )
+        process.start()
+        # Hang guard: a spawned interpreter can take >5s to start under load.
+        assert await asyncio.to_thread(ready.wait, 60)
+        unlock = release.set
+    elif contention == "io_lock":
+        logger._io_lock.acquire()
+        unlock = logger._io_lock.release
+    else:
+        original = logger._append_record_sync
+
+        def slow_append(record):
+            time.sleep(0.35)
+            original(record)
+
+        monkeypatch.setattr(logger, "_append_record_sync", slow_append)
+        unlock = None
+
+    async def timer():
+        start = asyncio.get_running_loop().time()
+        await asyncio.sleep(0.01)
+        return asyncio.get_running_loop().time() - start - 0.01
+
+    try:
+        timer_task = asyncio.create_task(timer())
+        await asyncio.sleep(0)  # Arm the timer before invoking the sync API.
+        if unlock is not None:
+            release_timer = threading.Timer(0.35, unlock)
+            release_timer.start()
+        if legacy:
+            # Exact pre-fix log_sync work: build record, then append inline.
+            logger._append_record_sync(logger._record("probe", {}))
+        else:
+            event_logger.log_event_sync("probe")
+        overshoot = await timer_task
+        if legacy:
+            assert overshoot >= 0.25, overshoot
+        else:
+            assert overshoot < 0.1, overshoot
+    finally:
+        if release_timer is not None:
+            await asyncio.to_thread(release_timer.join)
+        await asyncio.to_thread(logger.flush_sync)
+        if process is not None:
+            await asyncio.to_thread(process.join, 60)
+            assert process.exitcode == 0
+    assert json.loads(logger._path.read_text())["type"] == "probe"
+
+
+async def test_sync_queue_bounds_drops_and_fifo(tmp_path, monkeypatch, caplog):
+    import mimir.event_logger as event_logger
+
+    logger = EventLogger(tmp_path / "events.jsonl", "fifo")
+    await asyncio.to_thread(logger.flush_sync)
+    monkeypatch.setattr(event_logger, "_SYNC_SLOTS", threading.BoundedSemaphore(3))
+    logger._io_lock.acquire()
+    try:
+        for i in range(5):
+            logger.log_sync("queued", i=i)
+        assert logger.dropped_sync_records == 2
+        assert not logger._path.exists()
+    finally:
+        logger._io_lock.release()
+        await asyncio.to_thread(logger.flush_sync)
+    logger.log_sync("uncontended", i=5)
+    await asyncio.to_thread(logger.flush_sync)
+    # Non-loop completion still observes the same FIFO.
+    await asyncio.to_thread(logger.log_sync, "thread", i=6)
+    records = [json.loads(line) for line in logger._path.read_text().splitlines()]
+    assert [record["i"] for record in records] == [0, 1, 2, 5, 6]
+    assert "2 records dropped total" in caplog.text
+
+
+async def test_sync_queue_recovers_after_write_failure(tmp_path, monkeypatch, caplog):
+    logger = EventLogger(tmp_path / "events.jsonl", "failure")
+    original = logger._append_record_sync
+
+    def fail(record):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(logger, "_append_record_sync", fail)
+    logger.log_sync("failed")
+    await asyncio.to_thread(logger.flush_sync)
+    assert "disk unavailable" in caplog.text
+    monkeypatch.setattr(logger, "_append_record_sync", original)
+    logger.log_sync("recovered")
+    await asyncio.to_thread(logger.flush_sync)
+    assert json.loads(logger._path.read_text())["type"] == "recovered"

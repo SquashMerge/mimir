@@ -1,0 +1,1142 @@
+"""Bridge populator merger + scrapers (chainlink #40 Phase D / #44).
+
+The merger has the most surface area — idempotency, operator-set field
+preservation, fresh-file synthesis, malformed-input tolerance — and is
+covered exhaustively here. The scraper functions are tested with
+duck-typed mock clients (no live Discord/Slack imports required).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from textwrap import dedent
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+from mimir.event_logger import init_logger
+from mimir.identities import IdentityResolver
+from mimir.identities_populator import (
+    merge_into_yaml,
+    populate_all,
+    populate_from_discord,
+    populate_from_slack,
+)
+
+
+@pytest.fixture(autouse=True)
+def _logger(tmp_path: Path):
+    """PR #112 re-review fix: ``populate_from_slack`` now emits
+    ``populator_partial_pagination`` via ``log_event`` on the
+    broad-except branch. ``log_event`` requires the global event
+    logger to be initialized; without this fixture the broad-except
+    branch raises ``RuntimeError("event_logger not initialized")``
+    and the previously-soft test path becomes loud. Production startup
+    calls ``init_logger`` so this only matters for the suite."""
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    init_logger(
+        tmp_path / "logs" / "events.jsonl",
+        session_id="test-identities-populator",
+    )
+
+
+def _state_yaml(home: Path) -> Path:
+    return home / "state" / "identities.yaml"
+
+
+def _write(home: Path, body: str) -> None:
+    p = _state_yaml(home)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(dedent(body), encoding="utf-8")
+
+
+def _read_doc(home: Path) -> dict:
+    text = _state_yaml(home).read_text(encoding="utf-8")
+    return yaml.safe_load(text) or {}
+
+
+# ---------------------------------------------------------------------------
+# merge_into_yaml — fresh file, idempotency, operator-preservation.
+# ---------------------------------------------------------------------------
+
+
+def test_merge_into_fresh_yaml_creates_both_sections(tmp_path: Path):
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            {"aliases": ["discord-1"], "display_name": "Alice"},
+        ],
+        channels=[
+            {"canonical": "discord-1500", "display_name": "#general", "kind": "public"},
+        ],
+    )
+    assert counts["people_added"] == 1
+    assert counts["channels_added"] == 1
+    assert counts["people_updated"] == 0
+    assert counts["channels_updated"] == 0
+    doc = _read_doc(tmp_path)
+    person = next(p for p in doc["people"] if p["canonical"] == "discord-1")
+    assert "access" not in person
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    assert resolver.is_authorized("discord-1") is False
+    assert any(c["canonical"] == "discord-1500" for c in doc["channels"])
+
+
+def test_merge_idempotent_on_rerun(tmp_path: Path):
+    """Running the same populator output twice yields zero deltas the
+    second time — the headline idempotency contract."""
+    payload = {
+        "people": [{"aliases": ["discord-1"], "display_name": "Alice"}],
+        "channels": [
+            {
+                "canonical": "discord-1500",
+                "display_name": "#general",
+                "kind": "public",
+            }
+        ],
+    }
+    counts1 = merge_into_yaml(
+        tmp_path, people=payload["people"], channels=payload["channels"]
+    )
+    assert counts1["people_added"] == 1
+    counts2 = merge_into_yaml(
+        tmp_path, people=payload["people"], channels=payload["channels"]
+    )
+    assert counts2["people_added"] == 0
+    assert counts2["people_updated"] == 0
+    assert counts2["channels_added"] == 0
+    assert counts2["channels_updated"] == 0
+
+
+def test_merge_preserves_operator_set_display_name(tmp_path: Path):
+    """If the operator hand-edited a display_name to something different
+    from what the bridge reports, we never overwrite. (e.g. operator
+    sets canonical=jason, populator sees display_name=Jason Carreira; if
+    the operator changed display_name to 'jason' the populator value
+    must not clobber it.)"""
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: jason
+            display_name: jason
+            aliases:
+              - discord-100000000000000001
+            notes: Operator-set notes
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            {
+                "aliases": ["discord-100000000000000001"],
+                "display_name": "Jason Carreira",  # would-be overwrite
+                "notes": "Discord member",  # would-be overwrite
+            }
+        ],
+        channels=[],
+    )
+    # Same alias → matched; nothing to add/update because every field is
+    # already set.
+    assert counts["people_added"] == 0
+    assert counts["people_updated"] == 0
+    doc = _read_doc(tmp_path)
+    jason = next(p for p in doc["people"] if p["canonical"] == "jason")
+    assert jason["display_name"] == "jason"
+    assert jason["notes"] == "Operator-set notes"
+
+
+def test_merge_preserves_operator_authored_access_metadata(tmp_path: Path):
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: jason
+            aliases: [discord-100000000000000001]
+            access:
+              roles: [user, admin]
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            {
+                "aliases": ["discord-100000000000000001", "slack-U999"],
+                "display_name": "Jason",
+            }
+        ],
+        channels=[],
+    )
+    assert counts["people_updated"] == 1
+    doc = _read_doc(tmp_path)
+    jason = next(p for p in doc["people"] if p["canonical"] == "jason")
+    assert jason["access"] == {"roles": ["user", "admin"]}
+    assert "slack-U999" in jason["aliases"]
+
+    r = IdentityResolver(home=tmp_path)
+    r.reload()
+    assert r.access_dict("discord-100000000000000001") == {"roles": ["user", "admin"]}
+    assert r.access_dict("slack-U999") == {"roles": ["user", "admin"]}
+    assert r.is_authorized("slack-U999") is True
+
+
+def test_merge_fills_blank_fields_only(tmp_path: Path):
+    """Operator left display_name blank — the populator fills it in.
+    Other operator-set fields stay untouched."""
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: jason
+            aliases: [discord-100000000000000001]
+            notes: Operator-set notes
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            {
+                "aliases": ["discord-100000000000000001"],
+                "display_name": "Jason Carreira",
+                "notes": "Different notes",  # ignored — operator already set
+            }
+        ],
+        channels=[],
+    )
+    assert counts["people_updated"] == 1
+    doc = _read_doc(tmp_path)
+    jason = next(p for p in doc["people"] if p["canonical"] == "jason")
+    assert jason["display_name"] == "Jason Carreira"  # filled
+    assert jason["notes"] == "Operator-set notes"  # preserved
+
+
+def test_merge_adds_new_alias_to_existing_canonical(tmp_path: Path):
+    """Cross-platform identity merge — operator set jason with a discord
+    alias; populator brings in his slack alias. The new alias is added
+    without disturbing the canonical or display_name."""
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: jason
+            display_name: Jason Carreira
+            aliases: [discord-100000000000000001]
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            {
+                "aliases": ["discord-100000000000000001", "slack-U999"],
+                "display_name": "Jason C",
+            }
+        ],
+        channels=[],
+    )
+    assert counts["people_updated"] == 1
+    doc = _read_doc(tmp_path)
+    jason = next(p for p in doc["people"] if p["canonical"] == "jason")
+    assert "slack-U999" in jason["aliases"]
+    # Display name preserved.
+    assert jason["display_name"] == "Jason Carreira"
+
+
+def test_merge_channel_fills_only_blank_fields(tmp_path: Path):
+    _write(
+        tmp_path,
+        """\
+        channels:
+          - canonical: discord-1500
+            display_name: jason-mimir
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[],
+        channels=[
+            {
+                "canonical": "discord-1500",
+                "display_name": "#general",  # would-be overwrite
+                "kind": "public",  # not set — should fill
+                "notes": "Discord guild: mimir-test",  # not set — should fill
+            }
+        ],
+    )
+    assert counts["channels_updated"] == 1
+    doc = _read_doc(tmp_path)
+    ch = next(c for c in doc["channels"] if c["canonical"] == "discord-1500")
+    assert ch["display_name"] == "jason-mimir"  # preserved
+    assert ch["kind"] == "public"  # filled
+    assert ch["notes"] == "Discord guild: mimir-test"  # filled
+
+
+def test_merge_dry_run_does_not_write(tmp_path: Path):
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[{"aliases": ["discord-1"]}],
+        channels=[{"canonical": "discord-1500", "kind": "public"}],
+        dry_run=True,
+    )
+    assert counts["people_added"] == 1
+    assert counts["channels_added"] == 1
+    # File never written.
+    assert not _state_yaml(tmp_path).is_file()
+
+
+def test_merge_no_op_does_not_bump_mtime(tmp_path: Path):
+    """When nothing changes, the YAML file is left untouched (no mtime
+    flap that would trip a file-watch reloader)."""
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: jason
+            aliases: [discord-100000000000000001]
+        """,
+    )
+    yaml_path = _state_yaml(tmp_path)
+    original_mtime = yaml_path.stat().st_mtime_ns
+    # Sleep is fragile — just confirm the file content didn't change.
+    original_content = yaml_path.read_bytes()
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[{"aliases": ["discord-100000000000000001"]}],
+        channels=[],
+    )
+    assert counts["people_updated"] == 0
+    # Content identical; we don't strictly assert mtime equality (some
+    # filesystems update atime on read), only that bytes didn't change.
+    assert yaml_path.read_bytes() == original_content
+    # mtime sanity-check: re-stat shouldn't show a write.
+    assert yaml_path.stat().st_mtime_ns == original_mtime
+
+
+def test_merge_synthesizes_canonical_from_first_alias(tmp_path: Path):
+    """No canonical given — first alias doubles as canonical until the
+    operator merges cross-platform identities by hand."""
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[{"aliases": ["discord-12345"]}],
+        channels=[],
+    )
+    assert counts["people_added"] == 1
+    doc = _read_doc(tmp_path)
+    p = doc["people"][0]
+    assert p["canonical"] == "discord-12345"
+    assert p["aliases"] == ["discord-12345"]
+    assert "access" not in p
+
+
+def test_merge_skips_malformed_inputs(tmp_path: Path):
+    """Liberal-on-read posture mirrors IdentityResolver — bad rows
+    are dropped, valid rows still process."""
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[
+            "not a dict",  # type: ignore[list-item]
+            {"aliases": []},  # no aliases
+            {"aliases": [""]},  # empty alias
+            {"aliases": ["discord-good"]},
+        ],
+        channels=[
+            "not a dict",  # type: ignore[list-item]
+            {"canonical": ""},  # empty canonical
+            {"canonical": "discord-1500", "kind": "public"},
+        ],
+    )
+    assert counts["people_added"] == 1
+    assert counts["channels_added"] == 1
+
+
+def test_merge_strips_whitespace(tmp_path: Path):
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[{"aliases": ["  discord-1  "], "display_name": "  Alice  "}],
+        channels=[
+            {
+                "canonical": "  discord-1500  ",
+                "display_name": "  #general  ",
+                "kind": "public",
+            }
+        ],
+    )
+    assert counts["people_added"] == 1
+    assert counts["channels_added"] == 1
+    doc = _read_doc(tmp_path)
+    p = doc["people"][0]
+    assert p["aliases"] == ["discord-1"]
+    assert p["display_name"] == "Alice"
+    ch = doc["channels"][0]
+    assert ch["canonical"] == "discord-1500"
+    assert ch["display_name"] == "#general"
+
+
+def test_merge_preserves_existing_unrelated_entries(tmp_path: Path):
+    """Operator has alice + bob; populator brings in carol. Both
+    existing entries survive."""
+    _write(
+        tmp_path,
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-A]
+          - canonical: bob
+            aliases: [slack-B]
+        """,
+    )
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[{"aliases": ["slack-C"], "display_name": "Carol"}],
+        channels=[],
+    )
+    assert counts["people_added"] == 1
+    doc = _read_doc(tmp_path)
+    canonicals = {p["canonical"] for p in doc["people"]}
+    assert canonicals == {"alice", "bob", "slack-C"}
+
+
+def test_merge_preserves_top_of_file_comment_header(tmp_path: Path):
+    """Operator's schema doc header at the top of identities.yaml
+    survives a populator write — important because the canonical file
+    in /mimir-home carries multi-line schema documentation that an
+    operator (or future-me reading the file) relies on."""
+    header = (
+        "# Operator-managed identity reconciliation.\n"
+        "#\n"
+        "# Two parallel registries: people (alias → canonical) and\n"
+        "# channels (canonical → display_name + kind).\n"
+        "#\n"
+        "# DO NOT edit while the daily populator is running.\n"
+        "\n"
+    )
+    body = dedent(
+        """\
+        people:
+          - canonical: alice
+            aliases: [slack-A]
+        """
+    )
+    p = _state_yaml(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(header + body, encoding="utf-8")
+
+    # Run the populator with content that triggers a write (new alias
+    # on existing canonical → updated count > 0).
+    counts = merge_into_yaml(
+        tmp_path,
+        people=[{"canonical": "alice", "aliases": ["slack-A", "discord-1"]}],
+        channels=[],
+    )
+    assert counts["people_updated"] == 1
+
+    after = _state_yaml(tmp_path).read_text(encoding="utf-8")
+    # Header survives verbatim, in original position.
+    assert after.startswith(header), (
+        f"header dropped on write\n--- expected prefix ---\n{header}\n"
+        f"--- got ---\n{after[: len(header) + 80]}"
+    )
+    # Document body still parses + carries the merge.
+    assert yaml.safe_load(after)["people"][0]["aliases"] == ["slack-A", "discord-1"]
+
+
+def test_merge_idempotent_rerun_with_header_does_not_drop_it(tmp_path: Path):
+    """Second run is a no-op (no write), but if a third run *does*
+    write, the header from the first round-trip is still there. Guards
+    against subtle regression where the header gets dropped on the
+    first write but the no-op shortcut hides it from idempotency tests."""
+    header = "# load-bearing header line\n\n"
+    p = _state_yaml(tmp_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(header, encoding="utf-8")
+
+    # First run: writes (people_added=1).
+    merge_into_yaml(
+        tmp_path,
+        people=[{"canonical": "alice", "aliases": ["slack-A"]}],
+        channels=[],
+    )
+    assert _state_yaml(tmp_path).read_text().startswith(header)
+
+    # Second run with new alias on the same canonical: writes again.
+    merge_into_yaml(
+        tmp_path,
+        people=[{"canonical": "alice", "aliases": ["slack-A", "discord-1"]}],
+        channels=[],
+    )
+    assert _state_yaml(tmp_path).read_text().startswith(header)
+
+
+def test_merge_round_trips_through_identity_resolver(tmp_path: Path):
+    """End-to-end: merger output is a valid identities.yaml that the
+    IdentityResolver can load. Confirms the YAML shape matches the
+    loader's expectations."""
+    merge_into_yaml(
+        tmp_path,
+        people=[
+            {"aliases": ["discord-1"], "display_name": "Alice"},
+        ],
+        channels=[
+            {"canonical": "discord-1500", "display_name": "#general", "kind": "public"},
+        ],
+    )
+    r = IdentityResolver(home=tmp_path)
+    r.reload()
+    assert r.resolve("discord-1") == "discord-1"
+    assert r.display_name("discord-1") == "Alice"
+    assert r.channel_count() == 1
+    assert r.channel_display_name("discord-1500") == "#general"
+
+
+# ---------------------------------------------------------------------------
+# populate_from_discord — duck-typed Discord client.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_returns_members_and_channels():
+    member = SimpleNamespace(
+        id=12345, global_name=None, display_name="Alice", name="alice123"
+    )
+    text_channel = SimpleNamespace(id=1500, name="general")
+    guild = SimpleNamespace(
+        name="mimir-test", members=[member], text_channels=[text_channel]
+    )
+    client = SimpleNamespace(guilds=[guild], is_closed=lambda: False)
+    bridge = SimpleNamespace(_client=client)
+
+    people, channels = await populate_from_discord(bridge)
+    assert len(people) == 1
+    assert people[0]["canonical"] == "discord-12345"
+    assert people[0]["display_name"] == "Alice"
+    assert len(channels) == 1
+    assert channels[0]["canonical"] == "discord-1500"
+    assert channels[0]["display_name"] == "#general"
+    assert channels[0]["kind"] == "public"
+    assert "mimir-test" in channels[0]["notes"]
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_empty_when_disconnected():
+    bridge = SimpleNamespace(_client=None)
+    people, channels = await populate_from_discord(bridge)
+    assert people == []
+    assert channels == []
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_skips_member_without_id():
+    member = SimpleNamespace(id=None, name="ghost")
+    guild = SimpleNamespace(
+        name="g", members=[member], text_channels=[]
+    )
+    client = SimpleNamespace(guilds=[guild], is_closed=lambda: False)
+    bridge = SimpleNamespace(_client=client)
+    people, _ = await populate_from_discord(bridge)
+    assert people == []
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_prefers_global_name():
+    """``global_name`` is Discord's canonical display field (post-username
+    refresh); fall back to display_name → name."""
+    member = SimpleNamespace(
+        id=1, global_name="Alice Smith", display_name="al", name="alice"
+    )
+    guild = SimpleNamespace(name="g", members=[member], text_channels=[])
+    bridge = SimpleNamespace(
+        _client=SimpleNamespace(guilds=[guild], is_closed=lambda: False)
+    )
+    people, _ = await populate_from_discord(bridge)
+    assert people[0]["display_name"] == "Alice Smith"
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_marks_bot_accounts():
+    """Mirror Slack populator's bot annotation: when ``member.bot`` is
+    True, the entry gets ``notes: 'Discord bot account'``."""
+    human = SimpleNamespace(
+        id=1, global_name="Alice", display_name=None, name="alice", bot=False
+    )
+    bot = SimpleNamespace(
+        id=2, global_name="MimirBot", display_name=None, name="mimirbot",
+        bot=True,
+    )
+    guild = SimpleNamespace(
+        name="g", members=[human, bot], text_channels=[],
+    )
+    bridge = SimpleNamespace(
+        _client=SimpleNamespace(guilds=[guild], is_closed=lambda: False),
+    )
+    people, _ = await populate_from_discord(bridge)
+    assert len(people) == 2
+    by_canonical = {p["canonical"]: p for p in people}
+    assert "notes" not in by_canonical["discord-1"]
+    assert by_canonical["discord-2"]["notes"] == "Discord bot account"
+
+
+class _BoomMembers:
+    """Iterable that raises mid-iteration to simulate a discord.py
+    cache hiccup or transient error during member enumeration."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise RuntimeError("simulated discord cache miss")
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_swallows_per_guild_member_failure():
+    """A guild whose ``members`` raises mid-loop is logged and skipped;
+    other guilds in the list still contribute. Matches the Slack
+    populator's best-effort shape so half-failures don't block the
+    other half."""
+    bad_guild = SimpleNamespace(
+        name="bad", members=_BoomMembers(), text_channels=[],
+    )
+    good_member = SimpleNamespace(
+        id=99, global_name="Bob", display_name=None, name="bob",
+    )
+    good_channel = SimpleNamespace(id=200, name="general")
+    good_guild = SimpleNamespace(
+        name="good", members=[good_member], text_channels=[good_channel],
+    )
+    client = SimpleNamespace(
+        guilds=[bad_guild, good_guild], is_closed=lambda: False,
+    )
+    bridge = SimpleNamespace(_client=client)
+
+    # Should NOT raise — best-effort.
+    people, channels = await populate_from_discord(bridge)
+    # bad_guild contributed nothing; good_guild's member + channel landed.
+    assert len(people) == 1
+    assert people[0]["canonical"] == "discord-99"
+    assert len(channels) == 1
+    assert channels[0]["canonical"] == "discord-200"
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_swallows_per_guild_channel_failure():
+    """Per-guild text_channels iteration failure is logged + skipped;
+    members on the same guild still contribute."""
+    member = SimpleNamespace(
+        id=1, global_name="Alice", display_name=None, name="alice",
+    )
+
+    class _BadChannels:
+        def __iter__(self):
+            return self
+        def __next__(self):
+            raise RuntimeError("simulated channel-fetch failure")
+
+    guild = SimpleNamespace(
+        name="g", members=[member], text_channels=_BadChannels(),
+    )
+    bridge = SimpleNamespace(
+        _client=SimpleNamespace(guilds=[guild], is_closed=lambda: False),
+    )
+    people, channels = await populate_from_discord(bridge)
+    # Member iteration succeeded.
+    assert len(people) == 1
+    # Channel iteration failed mid-loop → no channels recorded.
+    assert channels == []
+
+
+@pytest.mark.asyncio
+async def test_populate_from_discord_swallows_guilds_enumeration_failure():
+    """Top-level ``client.guilds`` raising returns empty rather than
+    propagating to the orchestrator."""
+    class _BadClient:
+        @property
+        def guilds(self):
+            raise RuntimeError("simulated client.guilds failure")
+        def is_closed(self):
+            return False
+
+    bridge = SimpleNamespace(_client=_BadClient())
+    people, channels = await populate_from_discord(bridge)
+    assert people == []
+    assert channels == []
+
+
+# ---------------------------------------------------------------------------
+# populate_from_slack — duck-typed Slack AsyncWebClient.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSlackClient:
+    """Mock AsyncWebClient. Supports paginated users_list /
+    conversations_list and (optional) error injection."""
+
+    def __init__(
+        self,
+        users_pages: list[dict] | None = None,
+        channels_pages: list[dict] | None = None,
+        users_error: Exception | None = None,
+        channels_error: Exception | None = None,
+    ):
+        self.users_pages = users_pages or []
+        self.channels_pages = channels_pages or []
+        self.users_error = users_error
+        self.channels_error = channels_error
+        self.users_calls = 0
+        self.channels_calls = 0
+
+    async def users_list(self, **kwargs):
+        if self.users_error is not None:
+            raise self.users_error
+        idx = self.users_calls
+        self.users_calls += 1
+        if idx >= len(self.users_pages):
+            return {"members": [], "response_metadata": {"next_cursor": ""}}
+        return self.users_pages[idx]
+
+    async def conversations_list(self, **kwargs):
+        if self.channels_error is not None:
+            raise self.channels_error
+        idx = self.channels_calls
+        self.channels_calls += 1
+        if idx >= len(self.channels_pages):
+            return {"channels": [], "response_metadata": {"next_cursor": ""}}
+        return self.channels_pages[idx]
+
+
+@pytest.mark.asyncio
+async def test_populate_from_slack_returns_users_and_channels():
+    client = _FakeSlackClient(
+        users_pages=[
+            {
+                "members": [
+                    {
+                        "id": "U123",
+                        "real_name": "Alice",
+                        "profile": {"display_name": "alice"},
+                        "deleted": False,
+                    },
+                    {
+                        "id": "U456",
+                        "real_name": "Bot",
+                        "profile": {"display_name": ""},
+                        "is_bot": True,
+                    },
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        ],
+        channels_pages=[
+            {
+                "channels": [
+                    {
+                        "id": "C100",
+                        "name": "general",
+                        "topic": {"value": "team chatter"},
+                        "is_private": False,
+                    },
+                    {
+                        "id": "G200",
+                        "name": "private-eng",
+                        "is_private": True,
+                    },
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        ],
+    )
+    bridge = SimpleNamespace(_app=SimpleNamespace(client=client))
+    people, channels = await populate_from_slack(bridge)
+    assert {p["canonical"] for p in people} == {"slack-U123", "slack-U456"}
+    bot = next(p for p in people if p["canonical"] == "slack-U456")
+    assert bot["notes"] == "Slack bot account"
+    assert {c["canonical"] for c in channels} == {"slack-C100", "slack-G200"}
+    public = next(c for c in channels if c["canonical"] == "slack-C100")
+    assert public["kind"] == "public"
+    assert public["display_name"] == "#general"
+    assert "team chatter" in public["notes"]
+    private = next(c for c in channels if c["canonical"] == "slack-G200")
+    assert private["kind"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_populate_from_slack_paginates_via_cursor():
+    client = _FakeSlackClient(
+        users_pages=[
+            {
+                "members": [{"id": "U1", "name": "alice"}],
+                "response_metadata": {"next_cursor": "page2"},
+            },
+            {
+                "members": [{"id": "U2", "name": "bob"}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        ],
+    )
+    bridge = SimpleNamespace(_app=SimpleNamespace(client=client))
+    people, _ = await populate_from_slack(bridge)
+    # Both pages consumed.
+    assert {p["canonical"] for p in people} == {"slack-U1", "slack-U2"}
+    assert client.users_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_populate_from_slack_skips_deleted_users():
+    client = _FakeSlackClient(
+        users_pages=[
+            {
+                "members": [
+                    {"id": "U1", "name": "active"},
+                    {"id": "U2", "name": "ghost", "deleted": True},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+        ],
+    )
+    bridge = SimpleNamespace(_app=SimpleNamespace(client=client))
+    people, _ = await populate_from_slack(bridge)
+    assert {p["canonical"] for p in people} == {"slack-U1"}
+
+
+@pytest.mark.asyncio
+async def test_populate_from_slack_swallows_api_error():
+    """Permissions hiccup, network blip, or SDK-side unexpected response:
+    log + return empty for the failed half. Don't fail-loud — populator
+    runs are best-effort and the next scheduled run picks up where this
+    one left off. The OTHER half still tries (users error doesn't block
+    conversations)."""
+    client = _FakeSlackClient(
+        users_error=RuntimeError("missing_scope"),
+        channels_pages=[
+            {
+                "channels": [{"id": "C1", "name": "still-works"}],
+                "response_metadata": {"next_cursor": ""},
+            }
+        ],
+    )
+    bridge = SimpleNamespace(_app=SimpleNamespace(client=client))
+    people, channels = await populate_from_slack(bridge)
+    assert people == []  # users half failed
+    assert channels and channels[0]["canonical"] == "slack-C1"
+
+
+@pytest.mark.asyncio
+async def test_populate_from_slack_empty_when_no_app():
+    bridge = SimpleNamespace(_app=None)
+    people, channels = await populate_from_slack(bridge)
+    assert people == []
+    assert channels == []
+
+
+# ---------------------------------------------------------------------------
+# populate_all — orchestrator.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_populate_all_with_no_bridges_is_noop(tmp_path: Path):
+    counts = await populate_all(tmp_path)
+    assert counts["people_added"] == 0
+    assert counts["channels_added"] == 0
+
+
+@pytest.mark.asyncio
+async def test_populate_all_combines_discord_and_slack(tmp_path: Path):
+    discord_member = SimpleNamespace(
+        id=12345, global_name=None, display_name="Alice", name="alice"
+    )
+    discord_channel = SimpleNamespace(id=1500, name="general")
+    discord_bridge = SimpleNamespace(
+        _client=SimpleNamespace(
+            guilds=[
+                SimpleNamespace(
+                    name="g", members=[discord_member],
+                    text_channels=[discord_channel],
+                )
+            ],
+            is_closed=lambda: False,
+        )
+    )
+    slack_client = _FakeSlackClient(
+        users_pages=[
+            {
+                "members": [{"id": "U1", "real_name": "Bob"}],
+                "response_metadata": {"next_cursor": ""},
+            }
+        ],
+        channels_pages=[
+            {
+                "channels": [{"id": "C1", "name": "ops"}],
+                "response_metadata": {"next_cursor": ""},
+            }
+        ],
+    )
+    slack_bridge = SimpleNamespace(_app=SimpleNamespace(client=slack_client))
+
+    counts = await populate_all(
+        tmp_path,
+        discord_bridge=discord_bridge,
+        slack_bridge=slack_bridge,
+    )
+    assert counts["people_added"] == 2
+    assert counts["channels_added"] == 2
+    doc = _read_doc(tmp_path)
+    canonicals = {p["canonical"] for p in doc["people"]}
+    assert canonicals == {"discord-12345", "slack-U1"}
+
+
+@pytest.mark.asyncio
+async def test_populate_all_dry_run_does_not_write(tmp_path: Path):
+    discord_bridge = SimpleNamespace(
+        _client=SimpleNamespace(
+            guilds=[
+                SimpleNamespace(
+                    name="g",
+                    members=[
+                        SimpleNamespace(id=1, name="a", global_name="A", display_name="A")
+                    ],
+                    text_channels=[],
+                )
+            ],
+            is_closed=lambda: False,
+        )
+    )
+    counts = await populate_all(
+        tmp_path, discord_bridge=discord_bridge, dry_run=True
+    )
+    assert counts["people_added"] == 1
+    assert not _state_yaml(tmp_path).is_file()
+
+
+# Keep this explicit: deriving parameters from the inventory would silently
+# count a newly added writer as covered without giving it a real write case.
+_INTAKE_WRITERS = [
+    "_atomic_write_identities", "add_identity_alias", "remove_identity",
+    "issue_web_key", "revoke_web_key", "set_user_prefs", "capture_dm_channel",
+    "request_pairing_with_code", "prepare_pairing_code_delivery",
+    "approve_pairing", "reject_pairing", "approve_pairing_code", "merge_into_yaml",
+    "grant_role_admission", "revoke_role_admission",
+    "_seed_identities", "request_pairing_status",
+]
+
+
+def test_intake_writer_coverage_matches_reviewed_inventory():
+    from tests.test_identities_writers import _ALLOWED
+
+    inventoried = {writer for writers in _ALLOWED.values() for writer in writers}
+    # The status API is an additional public wrapper, not a direct write sink.
+    assert set(_INTAKE_WRITERS) == inventoried | {"request_pairing_status"}
+    assert len(_INTAKE_WRITERS) == len(set(_INTAKE_WRITERS))
+
+
+@pytest.mark.parametrize("writer", _INTAKE_WRITERS)
+def test_intake_survives_every_identities_writer(tmp_path, writer):
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
+    import yaml
+    from mimir import identities_populator as pop
+    from mimir.commands import setup
+
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    path = state / "identities.yaml"
+    intake = {
+        "unknown_senders": {
+            "default": {"dm": "pair", "channel": "ignore"},
+            "discord": {"dm": "decline"},
+            "slack": {"channel": "decline"},
+        },
+        "decline_text": "No thanks",
+        "discord_role_admission": {"enabled": True, "grants": [{"guild_id": "111", "role_id": "222"}]},
+    }
+    code = "ABCDEFGH"
+    salt = b"intake-test-salt"
+    doc = {
+        "people": [{
+            "canonical": "slack-U1",
+            "aliases": ["slack-U1", "webkey:" + "a" * 64],
+            "pairing": {
+                "status": "pending",
+                "code_salt": salt.hex(),
+                "code_hash": hashlib.sha256(salt + code.encode("ascii")).hexdigest(),
+                "code_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+            },
+        }],
+        "channels": [],
+        "intake": intake,
+    }
+    if writer == "revoke_role_admission":
+        doc["people"].append({"canonical": "discord-9", "aliases": ["discord-9"],
+                              "access": {"roles": ["user"], "source": "discord_role"}})
+    path.write_text(yaml.safe_dump(doc))
+    before = path.read_bytes()
+
+    if writer == "request_pairing_status":
+        assert pop.request_pairing_status(
+            tmp_path, "slack-U2", "slack", channel_id="dm-slack-D2", is_dm=True,
+        ) == "changed"
+    elif writer == "request_pairing_with_code":
+        status, minted = pop.request_pairing_with_code(
+            tmp_path, "slack-U2", "slack", channel_id="dm-slack-D2", is_dm=True,
+        )
+        assert status == "changed" and minted
+    elif writer == "approve_pairing":
+        assert pop.approve_pairing(tmp_path, "slack-U1")
+    elif writer == "reject_pairing":
+        assert pop.reject_pairing(tmp_path, "slack-U1")
+    elif writer == "approve_pairing_code":
+        assert pop.approve_pairing_code(tmp_path, code)
+    elif writer == "prepare_pairing_code_delivery":
+        assert pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", code)
+    elif writer == "issue_web_key":
+        assert pop.issue_web_key(tmp_path, "slack-U1", key_factory=lambda: "test-secret") == "test-secret"
+    elif writer == "revoke_web_key":
+        assert pop.revoke_web_key(tmp_path, "slack-U1")
+    elif writer == "capture_dm_channel":
+        assert pop.capture_dm_channel(tmp_path, "slack-U1", "slack", "dm-slack-D1")
+    elif writer == "grant_role_admission":
+        assert pop.grant_role_admission(tmp_path, "discord-8", "111", "222")[0]
+    elif writer == "revoke_role_admission":
+        assert pop.revoke_role_admission(tmp_path, "discord-9")[0]
+    elif writer == "set_user_prefs":
+        assert pop.set_user_prefs(tmp_path, "slack-U1", {"theme": "dark"})
+    elif writer == "add_identity_alias":
+        pop.add_identity_alias(tmp_path, "slack-U1", "discord-123")
+    elif writer == "remove_identity":
+        assert pop.remove_identity(tmp_path, None, "slack-U1") == "removed identity: slack-U1"
+    elif writer == "merge_into_yaml":
+        counts = pop.merge_into_yaml(
+            tmp_path, people=[{"canonical": "slack-U3", "aliases": ["slack-U3"]}], channels=[],
+        )
+        assert counts["people_added"] == 1
+    elif writer == "_atomic_write_identities":
+        doc["channels"].append({"canonical": "slack-C1"})
+        with pop._IDENTITIES_WRITE_LOCK:
+            pop._atomic_write_identities(path, "", doc)
+    else:
+        assert writer == "_seed_identities"
+        # Setup's writer is create-only; it must not replace existing intake.
+        assert not setup._seed_identities(tmp_path, "people: []\nchannels: []\n")
+        assert path.read_bytes() == before
+
+    # Every mutating fixture must really change the file: preservation on an
+    # early return/no-op is not evidence that the writer's round-trip is safe.
+    if writer != "_seed_identities":
+        assert path.read_bytes() != before
+    assert yaml.safe_load(path.read_text())["intake"] == intake
+
+
+def test_discord_role_writer_preserves_header_and_refuses_admin(tmp_path):
+    from mimir.identities_populator import grant_role_admission, revoke_role_admission
+    import yaml
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    path.write_text("# policy header\npeople: []\n")
+    with pytest.raises(ValueError, match="only grant user"):
+        grant_role_admission(tmp_path, "discord-1", "11", "22", roles=["admin"])
+    assert grant_role_admission(tmp_path, "discord-1", "11", "22") == (True, "discord-1")
+    text = path.read_text()
+    assert text.startswith("# policy header\n")
+    assert yaml.safe_load(text)["people"][0]["access"] == {
+        "roles": ["user"], "source": "discord_role",
+        "granted_by": {"guild_id": "11", "role_id": "22"},
+    }
+    assert grant_role_admission(tmp_path, "discord-1", "11", "22") == (False, "discord-1")
+    assert path.read_text() == text
+    assert revoke_role_admission(tmp_path, "discord-1") == (True, "discord-1")
+    revoked = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert revoked["roles"] == [] and revoked["revoked_at"]
+    assert revoke_role_admission(tmp_path, "discord-1") == (False, "discord-1")
+
+
+@pytest.mark.parametrize("writer", ["approve_pairing", "approve_pairing_code", "issue_web_key"])
+@pytest.mark.parametrize("revoked", [False, True])
+def test_operator_grant_paths_remove_discord_role_management(tmp_path, writer, revoked):
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+    from mimir import identities_populator as pop
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("people: []\n")
+    assert pop.grant_role_admission(tmp_path, "discord-9", "111", "222")[0]
+    if revoked:
+        assert pop.revoke_role_admission(tmp_path, "discord-9")[0]
+    doc = yaml.safe_load(path.read_text())
+    entry = doc["people"][0]
+    entry["access"]["operator_note"] = "preserve"
+    if writer == "approve_pairing_code":
+        code, salt = "ABCDEFGH", bytes(range(16))
+        entry["pairing"] = {
+            "status": "pending", "code_salt": salt.hex(),
+            "code_hash": hashlib.sha256(salt + code.encode("ascii")).hexdigest(),
+            "code_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+        }
+    path.write_text(yaml.safe_dump(doc))
+    if writer == "approve_pairing":
+        assert pop.approve_pairing(tmp_path, "discord-9")
+    elif writer == "approve_pairing_code":
+        assert pop.approve_pairing_code(tmp_path, code)
+    else:
+        assert pop.issue_web_key(tmp_path, "discord-9", roles=["user"], key_factory=lambda: "ownership-test")
+    access = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert access["roles"] == ["user"]
+    assert not {"source", "granted_by", "revoked_at"}.intersection(access)
+    if writer != "issue_web_key":
+        assert access["operator_note"] == "preserve"
+    before = path.read_bytes()
+    assert pop.revoke_role_admission(tmp_path, "discord-9") == (False, None)
+    assert pop.grant_role_admission(tmp_path, "discord-9", "111", "222") == (False, None)
+    assert path.read_bytes() == before
+
+
+def test_discord_role_writer_refuses_admin_with_optimization(tmp_path):
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", "\n".join([
+            "import sys",
+            "from pathlib import Path",
+            "from mimir.identities_populator import grant_role_admission",
+            "try:",
+            "    grant_role_admission(Path(sys.argv[1]), 'discord-9', '111', '222', roles=['admin'])",
+            "except ValueError:",
+            "    print('rejected')",
+            "else:",
+            "    raise RuntimeError('optimized interpreter accepted admin roles')",
+        ]), str(tmp_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "rejected"
+    assert not (tmp_path / "state" / "identities.yaml").exists()
+
+
+def test_discord_role_writer_never_modifies_operator_identity(tmp_path):
+    from mimir.identities_populator import grant_role_admission, revoke_role_admission
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    for access in ("{roles: [admin]}", "{roles: []}", "{roles: [user, admin], source: discord_role}"):
+        path.write_text(f"people: [{{canonical: ops, aliases: [discord-1], access: {access}}}]\n")
+        before = path.read_text()
+        assert grant_role_admission(tmp_path, "discord-1", "11", "22") == (False, None)
+        assert revoke_role_admission(tmp_path, "discord-1") == (False, None)
+        assert path.read_text() == before
+
+
+def test_discord_role_writer_repairs_managed_alias_and_regrants(tmp_path):
+    from mimir.identities_populator import grant_role_admission, revoke_role_admission
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    path.write_text("people: [{canonical: discord-9, aliases: [], access: {roles: [], source: discord_role, revoked_at: previous}}]\n")
+    assert grant_role_admission(tmp_path, "discord-9", "111", "222") == (True, "discord-9")
+    person = yaml.safe_load(path.read_text())["people"][0]
+    assert person["aliases"] == ["discord-9"]
+    assert person["access"]["roles"] == ["user"]
+    assert "revoked_at" not in person["access"]
+    assert revoke_role_admission(tmp_path, "discord-9")[0]
+    assert grant_role_admission(tmp_path, "discord-9", "111", "222")[0]

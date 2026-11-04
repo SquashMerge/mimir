@@ -1,0 +1,391 @@
+"""Skill seeding into <home>/.mimir_builtin_skills/ (SPEC §8.4)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import mimir.skill_defs as skill_defs
+from mimir import access_control
+
+from mimir.skill_defs import (
+    _bundled_skill_names,
+    installed_skill_names,
+    reject_escaping_symlinks,
+    seed_skills,
+)
+
+
+# ─── #500: escaping-symlink guard ──────────────────────────────────────
+
+
+def test_reject_escaping_symlinks_raises_on_escape(tmp_path: Path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "leak.txt").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink escaping"):
+        reject_escaping_symlinks(bundle)
+
+
+def test_reject_escaping_symlinks_allows_in_bundle_link(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "real.txt").write_text("ok")
+    (bundle / "alias.txt").symlink_to("real.txt")  # relative, stays inside
+    reject_escaping_symlinks(bundle)  # no raise
+
+
+def test_reject_escaping_symlinks_noop_without_symlinks(tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    (bundle / "sub").mkdir(parents=True)
+    (bundle / "sub" / "f.txt").write_text("x")
+    reject_escaping_symlinks(bundle)  # no raise
+
+
+def test_bundled_skills_include_expected_set():
+    names = set(_bundled_skill_names())
+    # Verbatim ports + the rewritten/adapted ones. Skills dropped from
+    # the bundle (because they were never loaded in production and the
+    # WHEN/WHY guidance fit better as in-prompt convention or didn't
+    # apply to mimir-the-agent's workload): ``mountaineering`` (open-
+    # strix climb pattern — bench-shaped, never used outside benchmarks);
+    # ``journal`` (per-turn checkpoint — superseded by turns.jsonl).
+    expected = {
+        "alert",  # v0.4 §6
+        "five-whys",
+        "introspection",
+        "long-running-jobs",
+        "memory",
+        "onboarding",
+        "pollers",
+        "skill-acquisition",
+        "skill-creator",
+        "view-attachment",
+        "wiki",
+    }
+    missing = expected - names
+    assert not missing, f"missing bundled skills: {missing}"
+
+
+def test_wiki_skill_is_domain_neutral():
+    """The wiki skill should NOT mention bench-specific domains. The whole
+    point is that it's general-purpose graph memory; benchmark guidance
+    belongs in the bench-task prompts, not the bundled skill."""
+    skill = (Path(__file__).parent.parent / "mimir" / "skills" / "wiki" / "SKILL.md").read_text()
+    body = skill.lower()
+    for bad in ("bluesky", "bsky", "bench-", "minimax"):
+        assert bad not in body, f"wiki skill leaks domain reference: {bad}"
+
+
+def test_memory_skill_references_wiki(tmp_path: Path):
+    seed_skills(tmp_path)
+    body = (tmp_path / ".mimir_builtin_skills" / "memory" / "SKILL.md").read_text()
+    assert "state/wiki" in body or "wiki skill" in body.lower(), (
+        "memory skill should point at the wiki layer for graph-shaped content"
+    )
+
+
+def test_memory_skill_visibility_tiers():
+    """Tier count (SKILL.md) and seam annotations (DESIGN.md) must stay in sync.
+
+    Tiers live in SKILL.md (operator/agent-facing); impl-seam annotations
+    live in the sibling DESIGN.md (developer-facing, not loaded by the
+    agent). Pinning both counts prevents silent drift: adding a tier to
+    SKILL.md without a matching seam in DESIGN.md (or vice versa)
+    fails loudly. (chainlink #110)
+    """
+    import re
+
+    skill_dir = Path(__file__).parent.parent / "mimir" / "skills" / "memory"
+    skill_path = skill_dir / "SKILL.md"
+    seams_path = skill_dir / "DESIGN.md"
+
+    body = skill_path.read_text()
+
+    # Extract the visibility section bounded by the "What gets seen"
+    # section header and the next H2.
+    section_match = re.search(
+        r"## What gets seen turn-to-turn(.*?)(?=\n## |\Z)",
+        body,
+        re.DOTALL,
+    )
+    assert section_match, "memory/SKILL.md must contain '## What gets seen turn-to-turn'"
+    section = section_match.group(1)
+
+    # SKILL.md: exactly tiers 1-12.
+    tier_lines = re.findall(r"^\s*(\d+)\.", section, re.MULTILINE)
+    tier_numbers = [int(n) for n in tier_lines]
+    assert tier_numbers == list(range(1, 13)), (
+        f"Expected tiers 1-12 in memory/SKILL.md, got {tier_numbers}. "
+        "Update this test if you intentionally add or remove a visibility tier."
+    )
+
+    # SKILL.md must NOT contain impl-seam annotations (moved to DESIGN.md).
+    skill_seam_count = body.count("_→ ")
+    assert skill_seam_count == 0, (
+        f"memory/SKILL.md contains {skill_seam_count} impl-seam annotation(s) (_→ ...). "
+        "These belong in DESIGN.md (developer reference), not SKILL.md."
+    )
+
+    # DESIGN.md: must exist and have ≥12 impl-seam annotations.
+    assert seams_path.exists(), (
+        "memory/DESIGN.md is missing. "
+        "Impl-seam annotations (code paths per tier) belong there, "
+        "not in SKILL.md (developer reference; not loaded by the agent)."
+    )
+    seams_body = seams_path.read_text()
+    seam_count = seams_body.count("_→ ")
+    assert seam_count >= 12, (
+        f"Expected ≥12 impl-seam annotations (_→ ...) in memory/DESIGN.md, "
+        f"found {seam_count}. Add a seam cross-reference for any new tier."
+    )
+
+
+def test_refresh_creates_builtin_skills(tmp_path: Path):
+    """Bundled skills land under ``<home>/.mimir_builtin_skills/``
+    on first refresh. Status is ``"refreshed"`` (always overwrite,
+    even on a fresh install)."""
+    out = seed_skills(tmp_path)
+    target = tmp_path / ".mimir_builtin_skills"
+    assert target.is_dir()
+    for name, status in out.items():
+        assert status == "refreshed", f"{name}: {status}"
+        assert (target / name / "SKILL.md").is_file()
+
+
+def test_refresh_overwrites_existing_content(tmp_path: Path):
+    """Unlike the pre-2026-05-22 seed_skills, refresh ALWAYS overwrites.
+    The bundle is read-only — there's no user-customization path in
+    place. Operator customization happens by installing under
+    ``<home>/skills/<name>/``, not by editing the bundle."""
+    target = tmp_path / ".mimir_builtin_skills" / "memory"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text("# stale content from before refresh\n")
+
+    out = seed_skills(tmp_path)
+    assert out["memory"] == "refreshed"
+    # Content was replaced with the canonical bundle.
+    body = (target / "SKILL.md").read_text()
+    assert "stale content from before refresh" not in body
+
+
+@pytest.mark.skipif(
+    not skill_defs.sys.platform.startswith("linux")
+    and skill_defs.sys.platform != "darwin",
+    reason="atomic directory exchange is supported on Linux and Darwin",
+)
+def test_refresh_atomically_exchanges_existing_directory(tmp_path: Path, monkeypatch):
+    target = tmp_path / ".mimir_builtin_skills" / "memory"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text("# old\n")
+    real_exchange = skill_defs._atomic_exchange_directories
+    exchanges = 0
+
+    def observing_exchange(staged: Path, destination: Path) -> None:
+        nonlocal exchanges
+        exchanges += 1
+        assert destination.is_dir()
+        assert (destination / "SKILL.md").read_text() == "# old\n"
+        real_exchange(staged, destination)
+        assert destination.is_dir()
+
+    monkeypatch.setattr(
+        skill_defs, "_atomic_exchange_directories", observing_exchange,
+    )
+    out = seed_skills(tmp_path)
+
+    assert out["memory"] == "refreshed"
+    assert exchanges >= 1
+    assert "# old" not in (target / "SKILL.md").read_text()
+
+
+def test_atomic_exchange_uses_darwin_rename_swap(tmp_path: Path, monkeypatch):
+    staged = tmp_path / "staged"
+    destination = tmp_path / "destination"
+    staged.mkdir()
+    destination.mkdir()
+    calls: list[tuple[bytes, bytes, int]] = []
+
+    class FakeRename:
+        argtypes = None
+        restype = None
+
+        def __call__(self, source: bytes, target: bytes, flags: int) -> int:
+            calls.append((source, target, flags))
+            return 0
+
+    class FakeLibC:
+        renamex_np = FakeRename()
+
+    monkeypatch.setattr(skill_defs.sys, "platform", "darwin")
+    monkeypatch.setattr(skill_defs.ctypes, "CDLL", lambda *args, **kwargs: FakeLibC())
+
+    skill_defs._atomic_exchange_directories(staged, destination)
+
+    assert calls == [
+        (skill_defs.os.fsencode(staged), skill_defs.os.fsencode(destination), 2),
+    ]
+
+
+def test_atomic_exchange_rejects_unsupported_platform(tmp_path: Path, monkeypatch):
+    staged = tmp_path / "staged"
+    destination = tmp_path / "destination"
+    staged.mkdir()
+    destination.mkdir()
+    monkeypatch.setattr(skill_defs.sys, "platform", "win32")
+
+    with pytest.raises(OSError, match="unsupported on win32"):
+        skill_defs._atomic_exchange_directories(staged, destination)
+
+
+def test_memory_skill_no_brand_leaks(tmp_path: Path):
+    seed_skills(tmp_path)
+    body = (tmp_path / ".mimir_builtin_skills" / "memory" / "SKILL.md").read_text()
+    # Adapted from open-strix-base; brand references should be gone.
+    assert "open_strix_builtin" not in body
+    assert "open-strix" not in body
+    # Mimir-specific surface should be present.
+    assert "memory/core/" in body
+    assert "saga_store" in body or "SAGA" in body or "memory_store" in body
+
+
+def test_refresh_recovers_poisoned_destination(tmp_path: Path):
+    """A pre-existing skill folder missing SKILL.md (a half-copy from a
+    crashed prior run) gets fully overwritten by the refresh. The
+    half-copy's stray files don't survive — refresh is rmtree-then-copy."""
+    target = tmp_path / ".mimir_builtin_skills" / "memory"
+    target.mkdir(parents=True)
+    (target / "stray.md").write_text("partial")
+
+    out = seed_skills(tmp_path)
+    assert out["memory"] == "refreshed"
+    assert (target / "SKILL.md").is_file()
+    assert not (target / "stray.md").exists(), "poisoned remnants should be gone"
+
+
+def test_seed_skills_cleans_up_tmp_from_prior_crash(tmp_path: Path):
+    """A leftover ``<name>.tmp`` from a crashed prior copy is wiped before
+    the next attempt."""
+    leftover = tmp_path / ".mimir_builtin_skills" / "memory.tmp"
+    leftover.mkdir(parents=True)
+    (leftover / "garbage.md").write_text("from a dead process")
+
+    seed_skills(tmp_path)
+    # The .tmp dir was either renamed into place (success) or wiped (error).
+    # Either way it shouldn't survive as ``<name>.tmp``.
+    assert not leftover.exists()
+    assert (tmp_path / ".mimir_builtin_skills" / "memory" / "SKILL.md").is_file()
+
+
+def test_installed_skill_names_includes_operator_installed_skills(tmp_path: Path):
+    """Operator-installed skills under ``<home>/skills/`` are picked
+    up by the ranker alongside the bundled ``.mimir_builtin_skills/``
+    entries. Per the post-2026-05-22 dual-location split, this is
+    the canonical "user adds a skill" surface — the bundled dir is
+    read-only and overwritten every boot, so anything an operator
+    writes there gets clobbered."""
+    seed_skills(tmp_path)
+    user_skill = tmp_path / "skills" / "my-custom-skill"
+    user_skill.mkdir(parents=True)
+    (user_skill / "SKILL.md").write_text("---\nname: my-custom-skill\n---\nbody")
+
+    names = installed_skill_names(tmp_path)
+    assert "my-custom-skill" in names
+    # Bundled set still present.
+    assert "memory" in names
+
+
+def test_installed_skill_names_falls_back_to_bundled_for_fresh_home(tmp_path: Path):
+    """No .claude/skills dir yet: fall back to the bundled set so a
+    fresh agent that hasn't run setup still gets a populated ranker."""
+    names = installed_skill_names(tmp_path)
+    assert "memory" in names
+    assert "onboarding" in names
+
+
+def test_installed_skill_names_skips_dirs_without_skill_md(tmp_path: Path):
+    """A directory without a SKILL.md is not a valid skill — skip it."""
+    skills = tmp_path / ".mimir_builtin_skills"
+    skills.mkdir(parents=True)
+    (skills / "broken").mkdir()  # no SKILL.md
+    names = installed_skill_names(tmp_path)
+    assert "broken" not in names
+
+
+@pytest.fixture
+def publication_bundle(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    package = tmp_path / "package"
+    source = package / "example"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("# Package documentation\n")
+    (source / "script.py").write_text("print('package')\n")
+    monkeypatch.setattr(skill_defs, "_BUNDLED_ROOT", package)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    metadata = home / ".mimir/file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text("{broken legacy ledger")
+    return home, source, metadata
+
+
+def test_refresh_ignores_legacy_ledger(publication_bundle):
+    home, source, metadata = publication_bundle
+    for version in ("first", "second"):
+        (source / "SKILL.md").write_text(version)
+        assert skill_defs.refresh_builtin_skills(home) == {"example": "refreshed"}
+        for name in ("SKILL.md", "script.py"):
+            target = home / ".mimir_builtin_skills/example" / name
+            assert target.read_bytes() == (source / name).read_bytes()
+            assert access_control._filesystem_result_integrity(None, str(target)) == (
+                "trusted", "informational",
+            )
+        assert metadata.read_text() == "{broken legacy ledger"
+
+
+def test_builtin_refresh_removes_deleted_package_files(publication_bundle):
+    home, source, metadata = publication_bundle
+    skill_defs.refresh_builtin_skills(home)
+    stray = home / ".mimir_builtin_skills/stray.md"
+    stray.write_text("unrecorded")
+    (source / "script.py").unlink()
+    skill_defs.refresh_builtin_skills(home)
+    assert stray.read_text() == "unrecorded"
+    assert metadata.read_text() == "{broken legacy ledger"
+    assert not (home / ".mimir_builtin_skills/example/script.py").exists()
+
+
+def test_failed_atomic_refresh_preserves_old_tree(publication_bundle, monkeypatch):
+    import shutil
+
+    home, source, metadata = publication_bundle
+    target = home / ".mimir_builtin_skills/example"
+    shutil.copytree(source, target)
+    old = (target / "SKILL.md").read_bytes()
+    (source / "SKILL.md").write_text("new package")
+
+    def fail(staged, destination):
+        assert destination.is_dir()
+        raise OSError("exchange unavailable")
+
+    monkeypatch.setattr(skill_defs, "_atomic_exchange_directories", fail)
+    assert skill_defs.refresh_builtin_skills(home) == {"example": "skipped"}
+    assert (target / "SKILL.md").read_bytes() == old
+    assert not target.with_name("example.tmp").exists()
+
+
+def test_builtin_refresh_does_not_follow_redirected_skill(publication_bundle):
+    import shutil
+
+    home, source, metadata = publication_bundle
+    outside = home / "docs/redirected"
+    shutil.copytree(source, outside)
+    root = home / ".mimir_builtin_skills"
+    root.mkdir()
+    (root / "example").symlink_to(outside, target_is_directory=True)
+    (source / "SKILL.md").write_text("new package")
+    assert skill_defs.refresh_builtin_skills(home) == {"example": "skipped"}
+    assert (outside / "SKILL.md").read_text() == "# Package documentation\n"

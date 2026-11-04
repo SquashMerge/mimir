@@ -1,0 +1,2502 @@
+"""Tests for ``mimir.git_tracking`` (PR 4a of MIMIR_HOME_GIT_TRACKING).
+
+Covers the post-turn commit + debounced push contract:
+- Empty-porcelain fast path: no commit, no push scheduled.
+- Disabled flag: full no-op.
+- Un-init'd home (no .git): silent skip.
+- Commits when changes present and schedules a debounced push.
+- Push failures swallowed → ``git_push_failed`` event emitted.
+- Debounce coalescing: 5 commits within the window produce 5 commits
+  and exactly 1 push.
+- Debounce reset: a new commit cancels the prior pending push.
+- ``commit_turn_changes`` swallows commit-stage errors → emits
+  ``git_commit_failed`` and skips push scheduling.
+- ``health.git_status_summary`` returns (count, top_paths) with
+  truncation suffix.
+
+Tests use real ``git`` against ``tmp_path`` repos so the
+subprocess-wrapper code path is exercised. A monkeypatched
+``DEBOUNCE_SECONDS`` keeps wall-clock dependence small (the spec uses
+60s; tests dial it to ~50ms).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from mimir import git_tracking, health
+from mimir.event_logger import init_logger
+
+
+# ─── fixtures ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_git_process(monkeypatch):
+    proc = Mock(pid=12345, returncode=None)
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.wait = AsyncMock(return_value=-9)
+    proc.kill_group = Mock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+    if os.name == "posix":
+        monkeypatch.setattr(os, "killpg", proc.kill_group)
+    else:
+        proc.kill = proc.kill_group
+    return proc
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process-group and pipe regression")
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+@pytest.mark.parametrize("parent_exited", [False, True], ids=["live-parent", "exited-parent"])
+async def test_git_group_drained_before_rebase_abort(
+    tmp_path, monkeypatch, cancel, parent_exited,
+):
+    import fcntl
+
+    spawn = asyncio.create_subprocess_exec
+    ready = asyncio.Event()
+    processes, child_pids, aborted = [], [], []
+    # Linux alone does not imply these optional CPython build capabilities.
+    # Restrict the capability simulation to the component under test. Removing
+    # os.pidfd_open globally breaks asyncio's already-selected pidfd watcher.
+    monkeypatch.setattr(git_tracking, "os", SimpleNamespace(
+        **{name: value for name, value in vars(os).items() if name != "pidfd_open"},
+    ))
+    monkeypatch.setattr(git_tracking, "signal", SimpleNamespace(
+        **{name: value for name, value in vars(signal).items() if name != "pidfd_send_signal"},
+    ))
+    monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 1.0)
+
+    def writer_released():
+        # The acknowledgement is written only after the child acquires this
+        # lock, which it never explicitly releases. Unlock proves it can no
+        # longer mutate the repository, not that it has reached zombie state.
+        with (tmp_path / "writer.lock").open("a") as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+
+    async def wait_writer_released():
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while not writer_released():
+            assert loop.time() < deadline, "child still holds writer.lock after cleanup"
+            await asyncio.sleep(0.001)
+
+    # Own the reader limit and observe its public transport state instead of
+    # guessing when asyncio's private StreamReader._paused flag will flip.
+    class ObservedReader(asyncio.StreamReader):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.received = 0
+            self.transport = None
+
+        def set_transport(self, transport):
+            super().set_transport(transport)
+            self.transport = transport
+
+        def feed_data(self, data):
+            super().feed_data(data)
+            self.received += len(data)
+
+        def saturated(self):
+            return self.received > 2048 and not self.transport.is_reading()
+
+        def diagnostic(self):
+            return (f"received={self.received}, "
+                    f"reading={self.transport.is_reading()}, eof={self.at_eof()}")
+
+    child_source = (
+        "import fcntl, os, time; from pathlib import Path; "
+        "guard = open('writer.lock', 'w'); "
+        "fcntl.flock(guard, fcntl.LOCK_EX); "
+        "Path('child.pid').write_text(str(os.getpid())); "
+        "os.write(1, b'x' * 1048576); time.sleep(300)"
+    )
+    parent_source = (
+        "import os, subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_source!r}]); "
+        + ("os._exit(0)" if parent_exited else
+           "os.write(2, b'y' * 1048576); time.sleep(300)")
+    )
+
+    setup_errors = []
+    monkeypatch.setattr(asyncio.streams, "StreamReader", ObservedReader)
+
+    async def git_process(*args, **kwargs):
+        try:
+            proc = await spawn(sys.executable, "-c", parent_source, limit=1024, **kwargs)
+            processes.append(proc)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 8
+            pid_file = tmp_path / "child.pid"
+            while not pid_file.exists() or not pid_file.read_text():
+                assert loop.time() < deadline, (
+                    f"child did not acknowledge writer.lock ownership; "
+                    f"parent_returncode={proc.returncode}; "
+                    f"stdout: {proc.stdout.diagnostic()}; "
+                    f"stderr: {proc.stderr.diagnostic()}"
+                )
+                await asyncio.sleep(0.001)
+            child_pids.append(int(pid_file.read_text()))
+            # A killed parent alone cannot close the child's inherited pipes.
+            # With a 1 KiB reader limit, >2 KiB received and a non-reading
+            # transport demonstrate backpressure without inspecting _paused.
+            while not proc.stdout.saturated() or (
+                proc.returncode is None if parent_exited else not proc.stderr.saturated()
+            ):
+                assert loop.time() < deadline, (
+                    f"pipe precondition not reached (parent_exited={parent_exited}, "
+                    f"parent_returncode={proc.returncode}); "
+                    f"stdout: {proc.stdout.diagnostic()}; "
+                    f"stderr: {proc.stderr.diagnostic()}"
+                )
+                await asyncio.sleep(0.001)
+            return proc
+        except Exception as exc:
+            setup_errors.append(exc)
+            raise
+        finally:
+            ready.set()
+
+    async def git(*args, **kwargs):
+        if args[0] == "pull":
+            return await git_tracking._git_once(
+                *args, cwd=tmp_path, timeout=60 if cancel else 0,
+            )
+        if args[:2] == ("rebase", "--abort"):
+            # Recovery must not start while the descendant can still write.
+            assert writer_released(), "rebase abort raced the child writer"
+            assert processes[0].returncode is not None
+            assert processes[0].stdout.at_eof()
+            assert processes[0].stderr.at_eof()
+            aborted.append(True)
+        return git_tracking.GitResult("", "")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", git_process)
+    monkeypatch.setattr(git_tracking, "_git", git)
+    monkeypatch.setattr(
+        git_tracking, "_reconcile_redundant_remote_changes", AsyncMock(return_value=False),
+    )
+    task = asyncio.create_task(git_tracking._sync_remote_before_push(
+        home=tmp_path, turn_id="group-cleanup", branch="main",
+    ))
+    try:
+        await asyncio.wait_for(ready.wait(), 10)
+        if setup_errors:
+            raise setup_errors[0]
+        if cancel:
+            task.cancel()
+        # A hang guard, not a process-startup or performance assertion. Do not
+        # use wait_for(task): cancellation-resistant cleanup could hang that too.
+        done, _ = await asyncio.wait([task], timeout=5)
+        assert task in done, "Git cleanup hung on inherited or paused pipes"
+        if parent_exited:
+            # The child deliberately outlives an already-reaped group leader.
+            # Its former numeric PID is not authority to signal a group. Bound
+            # the failed drain and refuse rebase recovery while the writer lives.
+            with pytest.raises(git_tracking.GitCleanupTimeout):
+                await task
+            assert aborted == []
+            assert not writer_released(), "exited-parent case lost its live writer"
+            return
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await task is False
+        assert aborted == [True]
+        await wait_writer_released()
+    finally:
+        # Also clean up the deliberately broken implementation in the red run.
+        # Only signal the test's acknowledged writer while it retains its lock;
+        # do not signal a numeric PID after observing its lifetime has ended.
+        for pid in child_pids:
+            if not writer_released():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        async def bounded_join(awaitable):
+            owned = asyncio.ensure_future(awaitable)
+            done, _ = await asyncio.wait([owned], timeout=2)
+            if not done:
+                owned.cancel()
+                owned.add_done_callback(git_tracking._consume_cleanup_result)
+            elif not owned.cancelled():
+                # Cleanup must not replace the original assertion/exception.
+                owned.exception()
+
+        for proc in processes:
+            if proc.returncode is None:
+                proc.kill()
+            await bounded_join(proc.communicate())
+            await bounded_join(proc.wait())
+        task.cancel()
+        await bounded_join(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("success", [False, True], ids=["superseded", "push-success"])
+async def test_git_worker_join_releases_home_lock(tmp_path, monkeypatch, success):
+    ready = asyncio.Event()
+    finished = []
+
+    async def worker():
+        ready.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            async with git_tracking._get_lock(tmp_path):
+                finished.append(True)
+
+    old = asyncio.create_task(worker())
+    key = git_tracking._home_key(tmp_path)
+    git_tracking._push_retry_tasks[key] = old
+    await ready.wait()
+    monkeypatch.setattr(git_tracking, "DEBOUNCE_SECONDS", 0 if success else 60)
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_current_branch", AsyncMock(return_value="main"))
+    monkeypatch.setattr(git_tracking, "_sync_remote_before_push", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_git", AsyncMock())
+    operation = git_tracking._debounced_push if success else git_tracking._schedule_debounced_push
+    task = asyncio.create_task(operation(home=tmp_path, turn_id="join"))
+    try:
+        done, _ = await asyncio.wait([task], timeout=5)
+        assert task in done, "worker cleanup is waiting on the joiner's home lock"
+        await task
+        assert finished == [True]
+    finally:
+        old.cancel()
+        await asyncio.gather(old, task, return_exceptions=True)
+        await git_tracking.cancel_pending_pushes()
+
+
+@pytest.mark.parametrize("registry_name", ["_pending_push_tasks", "_push_retry_tasks"])
+def test_cancel_pending_pushes_drops_closed_loop_tasks(monkeypatch, registry_name):
+    # Own the registries, not the surrounding pytest worker's ambient state.
+    monkeypatch.setattr(git_tracking, "_pending_push_tasks", {})
+    monkeypatch.setattr(git_tracking, "_push_retry_tasks", {})
+    registry = getattr(git_tracking, registry_name)
+
+    async def loop_a():
+        registry["stale-repo"] = asyncio.create_task(asyncio.Event().wait())
+
+    asyncio.run(loop_a())
+    assert registry["stale-repo"].get_loop().is_closed()
+
+    async def loop_b():
+        current = asyncio.create_task(asyncio.Event().wait())
+        registry["current-repo"] = current
+        await git_tracking.cancel_pending_pushes()
+        assert current.cancelled()
+
+    asyncio.run(loop_b())
+    assert git_tracking._pending_push_tasks == {}
+    assert git_tracking._push_retry_tasks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_name", ["_pending_push_tasks", "_push_retry_tasks"])
+async def test_cancel_pending_pushes_propagates_worker_errors(monkeypatch, registry_name):
+    monkeypatch.setattr(git_tracking, "_pending_push_tasks", {})
+    monkeypatch.setattr(git_tracking, "_push_retry_tasks", {})
+    started = asyncio.Event()
+    failure = RuntimeError("worker cleanup failed")
+
+    async def worker():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise failure
+
+    task = asyncio.create_task(worker())
+    getattr(git_tracking, registry_name)["repo"] = task
+    await started.wait()
+    with pytest.raises(ExceptionGroup, match="git push cleanup failed") as caught:
+        await git_tracking.cancel_pending_pushes()
+    assert caught.value.exceptions == (failure,)
+    assert task.done()
+    assert git_tracking._pending_push_tasks == {}
+    assert git_tracking._push_retry_tasks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blob", [False, True])
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, OSError, asyncio.TimeoutError])
+async def test_subprocess_failure_kills_and_reaps(tmp_path, fake_git_process, blob, failure):
+    proc = fake_git_process
+    proc.communicate.side_effect = [failure, (b"", b"")]
+    if blob and failure is not asyncio.CancelledError:
+        assert not await git_tracking._blob_equal(
+            home=tmp_path, left="HEAD", right="origin/main", path="a",
+        )
+    else:
+        with pytest.raises(failure):
+            if blob:
+                await git_tracking._blob_equal(
+                    home=tmp_path, left="HEAD", right="origin/main", path="a",
+                )
+            else:
+                await git_tracking._git_once("status", cwd=tmp_path, timeout=1)
+    if os.name == "posix":
+        proc.kill_group.assert_called_once_with(proc.pid, signal.SIGKILL)
+    else:
+        proc.kill_group.assert_called_once_with()
+    assert proc.communicate.await_count == 2
+    proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_git_never_signals_or_communicates_twice(
+    tmp_path, fake_git_process, returncode,
+):
+    proc = fake_git_process
+    proc.returncode = returncode
+    assert await git_tracking._git_bytes("status", cwd=tmp_path, timeout=1) == (
+        returncode, b"", b"",
+    )
+    proc.kill_group.assert_not_called()
+    proc.communicate.assert_awaited_once()
+    proc.wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaper_does_not_signal_reaped_pid(fake_git_process):
+    proc = fake_git_process
+    proc.returncode = 0
+    await git_tracking._reap_git_process(proc)
+    proc.kill_group.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deadline_survives_repeated_cancellation(monkeypatch, caplog):
+    monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 0.05)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant():
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+
+    owned = asyncio.create_task(resistant())
+    joiner = asyncio.create_task(git_tracking._finish_cleanup(owned))
+    await started.wait()
+
+    async def cancel_repeatedly():
+        while not joiner.done():
+            joiner.cancel()
+            await asyncio.sleep(0.005)
+
+    canceller = asyncio.create_task(cancel_repeatedly())
+    try:
+        done, _ = await asyncio.wait([joiner], timeout=1)
+        assert joiner in done, "cancellation reset or escaped the cleanup deadline"
+        with pytest.raises(git_tracking.GitCleanupTimeout):
+            await joiner
+        assert "Git cleanup did not join" in caplog.text
+        assert not owned.done()  # Bounded join does not pretend the work stopped.
+    finally:
+        release.set()
+        canceller.cancel()
+        await asyncio.gather(owned, canceller, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_is_not_hidden_by_outer_cancellation():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def cleanup():
+        started.set()
+        await release.wait()
+        raise git_tracking.GitCleanupTimeout("nested failure")
+
+    task = asyncio.create_task(git_tracking._finish_cleanup(cleanup()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(git_tracking.GitCleanupTimeout, match="nested failure"):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cleanup_propagates_cancellation_after_success(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def cleanup():
+        started.set()
+        await release.wait()
+        return 42
+
+    task = asyncio.create_task(git_tracking._finish_cleanup(cleanup()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pull_aborts_without_reconciling(tmp_path, monkeypatch):
+    async def git(*args, **kwargs):
+        if args[0] == "pull":
+            raise asyncio.CancelledError
+        return git_tracking.GitResult("", "")
+
+    command = AsyncMock(side_effect=git)
+    reconcile = AsyncMock()
+    monkeypatch.setattr(git_tracking, "_git", command)
+    monkeypatch.setattr(git_tracking, "_reconcile_redundant_remote_changes", reconcile)
+    with pytest.raises(asyncio.CancelledError):
+        await git_tracking._sync_remote_before_push(
+            home=tmp_path, turn_id="cancel", branch="main",
+        )
+    assert ("rebase", "--abort") in [call.args for call in command.await_args_list]
+    reconcile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("stage", ["sleep", "push"])
+async def test_push_worker_propagates_cancellation(tmp_path, monkeypatch, retry, stage):
+    monkeypatch.setattr(git_tracking, "DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_current_branch", AsyncMock(return_value="main"))
+    monkeypatch.setattr(git_tracking, "_sync_remote_before_push", AsyncMock(return_value=True))
+    monkeypatch.setattr(git_tracking, "_git", AsyncMock(side_effect=asyncio.CancelledError))
+    if stage == "sleep":
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock(side_effect=asyncio.CancelledError))
+    with pytest.raises(asyncio.CancelledError):
+        if retry:
+            await git_tracking._retry_push(home=tmp_path, delay=0, attempt=0, turn_id="cancel")
+        else:
+            await git_tracking._debounced_push(home=tmp_path, turn_id="cancel")
+    assert not git_tracking._push_retry_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blob", [False, True])
+async def test_cancel_reaps_real_child(tmp_path, monkeypatch, blob):
+    spawn = asyncio.create_subprocess_exec
+    ready = asyncio.Event()
+    processes = []
+
+    async def child(*args, **kwargs):
+        proc = await spawn(
+            sys.executable, "-c",
+            "import time; print('ready', flush=True); time.sleep(300)",
+            **kwargs,
+        )
+        processes.append(proc)
+        assert await proc.stdout.readline() == b"ready\n"
+        ready.set()
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", child)
+    operation = (
+        git_tracking._blob_equal(home=tmp_path, left="a", right="b", path="x")
+        if blob else git_tracking._git_once("status", cwd=tmp_path, timeout=60)
+    )
+    task = asyncio.create_task(operation)
+    try:
+        await ready.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert processes[0].returncode is not None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for proc in processes:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["drain", "wait"])
+async def test_repeated_cancel_waits_for_reaping(tmp_path, fake_git_process, stage):
+    reaping, release = asyncio.Event(), asyncio.Event()
+    proc = fake_git_process
+    proc.communicate.side_effect = [asyncio.CancelledError, (b"", b"")]
+
+    async def wait():
+        reaping.set()
+        await release.wait()
+        proc.returncode = -9
+
+    if stage == "drain":
+        async def communicate():
+            if not proc.kill_group.called:
+                raise asyncio.CancelledError
+            await wait()
+            return b"", b""
+
+        proc.communicate.side_effect = communicate
+    else:
+        proc.wait = AsyncMock(side_effect=wait)
+    task = asyncio.create_task(git_tracking._git_once("status", cwd=tmp_path, timeout=1))
+    try:
+        # On the broken implementation the task exits without ever entering wait().
+        entered = asyncio.create_task(reaping.wait())
+        await asyncio.wait([task, entered], return_when=asyncio.FIRST_COMPLETED)
+        assert reaping.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert proc.returncode == -9
+    finally:
+        release.set()
+        entered.cancel()
+        await asyncio.gather(task, entered, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_spawn_reaps_result(tmp_path, monkeypatch, fake_git_process):
+    spawning, release = asyncio.Event(), asyncio.Event()
+    proc = fake_git_process
+
+    async def spawn(*args, **kwargs):
+        spawning.set()
+        await release.wait()
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    task = asyncio.create_task(git_tracking._git_once("status", cwd=tmp_path, timeout=1))
+    try:
+        await spawning.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        proc.kill_group.assert_called_once()
+        proc.communicate.assert_awaited_once()
+        proc.wait.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_blob_show_timeout_is_bounded(tmp_path, monkeypatch, fake_git_process):
+    proc = fake_git_process
+    monkeypatch.setattr(git_tracking, "COMMAND_TIMEOUT_SECONDS", 0)
+    assert not await git_tracking._blob_equal(
+        home=tmp_path, left="a", right="b", path="x",
+    )
+    proc.kill_group.assert_called_once()
+    proc.communicate.assert_awaited_once()
+    proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, git_tracking.GitError])
+async def test_cancellation_during_abort_finishes_recovery(tmp_path, monkeypatch, failure):
+    aborting, release = asyncio.Event(), asyncio.Event()
+    recovered = []
+
+    async def git(*args, **kwargs):
+        if args[0] == "pull":
+            if failure is asyncio.CancelledError:
+                raise failure()
+            raise failure(1, "conflict", args)
+        if args[:2] == ("rebase", "--abort"):
+            aborting.set()
+            await release.wait()
+            recovered.append(True)
+        return git_tracking.GitResult("", "")
+
+    monkeypatch.setattr(git_tracking, "_git", git)
+    task = asyncio.create_task(git_tracking._sync_remote_before_push(
+        home=tmp_path, turn_id="cancel", branch="main",
+    ))
+    entered = asyncio.create_task(aborting.wait())
+    try:
+        await asyncio.wait([task, entered], return_when=asyncio.FIRST_COMPLETED)
+        assert aborting.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert recovered == [True]
+    finally:
+        release.set()
+        entered.cancel()
+        await asyncio.gather(task, entered, return_exceptions=True)
+
+
+@pytest.fixture(autouse=True)
+def _logger(tmp_path: Path) -> None:
+    """events.jsonl is a module-level singleton; init it per-test."""
+    (tmp_path / "logs").mkdir()
+    init_logger(tmp_path / "logs" / "events.jsonl", session_id="test-git")
+
+
+@pytest.fixture(autouse=True)
+def _reset_module() -> None:
+    """git_tracking has module-level debounce coordination — reset."""
+    git_tracking.reset_module_state()
+    yield
+    git_tracking.reset_module_state()
+
+
+@pytest.fixture
+def home_repo(tmp_path: Path) -> Path:
+    """A bare-bones git repo standing in for /mimir-home. Configured
+    so commits land cleanly in CI (no signing, identity in env)."""
+    home = tmp_path / "mimir-home"
+    home.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"], cwd=home, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=home, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=home, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "commit.gpgsign", "false"], cwd=home, check=True,
+    )
+    # Land an initial commit so HEAD exists.
+    (home / "README.md").write_text("seed\n")
+    subprocess.run(["git", "add", "README.md"], cwd=home, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "seed"], cwd=home, check=True,
+    )
+    return home
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pre_staged", [False, True])
+async def test_auto_commit_excludes_new_and_tracked_social_outboxes(home_repo, pre_staged):
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=home_repo, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    root = home_repo / "state/social-outbox/feed"
+    root.mkdir(parents=True)
+    approved = root / "outbox-approved.yaml"
+    approved.write_text("approved\n")
+    git("add", "-A")
+    git("commit", "-qm", "operator merged outbox")
+    approved.write_text("unreviewed edit\n")
+    new = root / "outbox-new.yaml"
+    new.write_text("unreviewed new file\n")
+    if pre_staged:
+        git("add", "-A")
+    (home_repo / "README.md").write_text("ordinary turn change\n")
+    assert await git_tracking._stage_and_commit(turn_id="outbox", trigger="test", home=home_repo)
+    assert git("show", "HEAD:state/social-outbox/feed/outbox-approved.yaml") == "approved"
+    assert git("show", "HEAD:README.md") == "ordinary turn change"
+    assert "outbox-new.yaml" not in git("ls-tree", "-r", "--name-only", "HEAD")
+    assert approved.read_text() == "unreviewed edit\n" and new.read_text() == "unreviewed new file\n"
+    assert git("diff", "--cached", "--name-only") == ""
+
+
+def _events_log(tmp_path: Path) -> Path:
+    return tmp_path / "logs" / "events.jsonl"
+
+
+def _read_events(tmp_path: Path) -> list[dict[str, Any]]:
+    log = _events_log(tmp_path)
+    if not log.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in log.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def _short_debounce(
+    monkeypatch: pytest.MonkeyPatch, seconds: float = 0.05,
+) -> None:
+    """Compress the 60s spec window to something test-friendly."""
+    monkeypatch.setattr(git_tracking, "DEBOUNCE_SECONDS", seconds)
+
+
+@pytest.fixture
+def retry_gate(monkeypatch: pytest.MonkeyPatch):
+    """Hold each real retry until its owner explicitly releases it."""
+    entered = asyncio.Queue()
+    real_retry = git_tracking._retry_push
+
+    async def gated_retry(**kwargs: Any) -> None:
+        release = asyncio.Event()
+        entered.put_nowait(release)
+        await release.wait()
+        await real_retry(**{**kwargs, "delay": 0.0})
+
+    monkeypatch.setattr(git_tracking, "_retry_push", gated_retry)
+    return entered
+
+
+# Task/event joins below share pytest's 300s whole-test hang ceiling. Real Git
+# startup is not a per-stage timing assertion.
+
+
+# ─── disabled-flag and missing-repo paths ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_disabled_flag_is_full_noop(home_repo: Path, tmp_path: Path) -> None:
+    # Make a tracked-eligible change; we should still NOT see a commit.
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("dirty\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=False,
+    )
+    log = subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    )
+    assert log.stdout.strip().count("\n") == 0  # only the seed commit
+    assert _read_events(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_uninit_home_silent_skip(tmp_path: Path) -> None:
+    # No .git directory — PR 4a may run before mimir setup landed.
+    home = tmp_path / "fresh-home"
+    home.mkdir()
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+    # Silent: no events, no .git created.
+    assert _read_events(tmp_path) == []
+    assert not (home / ".git").exists()
+
+
+# ─── empty-porcelain fast path ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_empty_porcelain_no_commit_no_push(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _short_debounce(monkeypatch)
+    pre = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+    post = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    assert pre == post  # no new commit
+    # And critically: no push was scheduled (tracked via module state).
+    assert git_tracking._pending_push_task is None
+    # Wait past debounce just to make sure nothing fires asynchronously.
+    await asyncio.sleep(0.1)
+    assert _read_events(tmp_path) == []
+
+
+# ─── commit + push happy path ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_commit_and_schedule_push(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _short_debounce(monkeypatch, 0.05)
+    # PR 4b: ``_debounced_push`` skips silently when no remote is
+    # configured. We want to see the push *attempt* fail here, so add
+    # a remote pointing to a nonexistent path — push will then attempt
+    # the dial and surface a GitError → git_push_failed event.
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    # Commit landed.
+    log = subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert log.count("\n") == 2  # seed + new commit
+    assert "turn t1 (user_message)" in subprocess.run(
+        ["git", "log", "-1", "--format=%B"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout
+
+    # Wait for the debounced push to fire and fail (no remote set).
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+    events = _read_events(tmp_path)
+    push_failures = [e for e in events if e["type"] == "git_push_failed"]
+    assert len(push_failures) == 1
+    assert push_failures[0]["turn_id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_commit_holds_per_home_lock_during_stage_and_commit(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#482: the ``git add -A`` / ``commit`` critical section runs under the
+    per-home lock, so concurrent turns sharing the repo can't race the index."""
+    _short_debounce(monkeypatch, 0.01)
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+
+    lock = git_tracking._get_lock(home_repo)
+    orig_git = git_tracking._git
+    locked_during: dict[str, bool] = {}
+
+    async def spy_git(*args: str, **kwargs: Any) -> Any:
+        sub = args[0] if args else ""
+        if sub in ("add", "commit"):
+            locked_during[sub] = lock.locked()
+        return await orig_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", spy_git)
+    await git_tracking.commit_turn_changes(
+        turn_id="t-lock", trigger="user_message", home=home_repo, enabled=True,
+    )
+    # The stage + commit ran while the per-home lock was held...
+    assert locked_during.get("add") is True
+    assert locked_during.get("commit") is True
+    # ...and the lock is released afterward (no leak; the push runs unlocked).
+    assert lock.locked() is False
+    if git_tracking._pending_push_task is not None:
+        git_tracking._pending_push_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_retry_push_holds_per_home_lock_during_remote_sync(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#692 review: the retry push path runs ``_sync_remote_before_push`` (pull
+    --rebase + reset/add/commit reconcile) under the per-home lock too, so a
+    retry waking mid-turn can't race a live-turn commit's index/HEAD writes."""
+    lock = git_tracking._get_lock(home_repo)
+    locked_during_sync: dict[str, bool] = {}
+
+    async def spy_sync(*, home: Path, turn_id: str, branch: str | None) -> bool:
+        locked_during_sync["held"] = lock.locked()
+        return True
+
+    async def fake_has_origin(home: Path) -> bool:
+        return True
+
+    orig_git = git_tracking._git
+
+    async def spy_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "push":
+            return ""  # no-op the network push (no real remote in this test)
+        return await orig_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_sync_remote_before_push", spy_sync)
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", fake_has_origin)
+    monkeypatch.setattr(git_tracking, "_git", spy_git)
+
+    await git_tracking._retry_push(
+        home=home_repo, delay=0.0, attempt=0, turn_id="t-retry",
+    )
+
+    # The remote sync ran while the per-home lock was held...
+    assert locked_during_sync.get("held") is True
+    # ...and the lock is released afterward.
+    assert lock.locked() is False
+
+
+# ─── pull --rebase before push (#340) ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_debounced_push_pulls_rebase_before_push(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#340: the debounced push pulls --rebase first, so a merged PR (e.g. an
+    approved core-memory change) flows into the live home before we push."""
+    _short_debounce(monkeypatch, 0.05)
+    upstream = tmp_path / "up.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
+
+    calls: list[tuple[str, ...]] = []
+    real_git = git_tracking._git
+
+    async def recording_git(*args: str, **kwargs: Any) -> Any:
+        calls.append(args)
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", recording_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    seq = [" ".join(a) for a in calls]
+    pull_idx = next(i for i, s in enumerate(seq) if s.startswith("pull --rebase"))
+    push_idx = next(
+        i for i, s in enumerate(seq)
+        if s == "push" or s.startswith("push origin HEAD:")
+    )
+    assert pull_idx < push_idx
+    events = _read_events(tmp_path)
+    failures = [
+        e for e in events
+        if e["type"] in ("git_push_failed", "git_pull_blocked")
+    ]
+    assert not failures
+    assert [e for e in events if e["type"] == "git_push_ok"]
+
+
+@pytest.mark.asyncio
+async def test_debounced_push_aborts_rebase_and_skips_push_on_pull_failure(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If pull --rebase fails (e.g. a conflict), abort to leave the tree clean,
+    log git_pull_blocked, and skip the push this cycle (a later one catches up)."""
+    _short_debounce(monkeypatch, 0.05)
+    upstream = tmp_path / "up.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
+
+    calls: list[tuple[str, ...]] = []
+    real_git = git_tracking._git
+
+    async def flaky_git(*args: str, **kwargs: Any) -> Any:
+        calls.append(args)
+        if args[:2] == ("pull", "--rebase"):
+            raise git_tracking.GitError(1, "simulated rebase conflict", args, stdout="")
+        if args[:2] == ("rebase", "--abort"):
+            # Pretend a rebase was in progress and got aborted → conflict path
+            # (rebase --abort succeeding is how the code detects a real conflict).
+            return git_tracking.GitResult(stdout="", stderr="")
+        if len(args) >= 3 and args[0] == "diff" and args[1] == "--name-only":
+            # Non-proposal-surface remote change: not safe for the #368
+            # redundant/superseded-proposal reconciliation path.
+            return git_tracking.GitResult(stdout="memory/conflict.md\n", stderr="")
+        if args[:2] == ("reset", "--soft"):
+            raise git_tracking.GitError(
+                1, "simulated unsafe reconcile", args, stdout=""
+            )
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", flaky_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "y.md").write_text("hi\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t2", trigger="user_message", home=home_repo, enabled=True,
+    )
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    # Let the retry task that was scheduled for the blocked pull shut down before
+    # inspecting the call log; this test is about the debounced push cycle, not
+    # the later retry path.
+    for task in list(git_tracking._push_retry_tasks.values()):
+        if task is not None and not task.done():
+            task.cancel()
+    await asyncio.sleep(0)
+
+    seq = [" ".join(a) for a in calls]
+    first_abort_idx = seq.index("rebase --abort")
+    before_retry = seq[: first_abort_idx + 1]
+    assert any(s.startswith("pull --rebase") for s in before_retry)
+    # cleaned up the half-applied rebase, then skipped push for this cycle.
+    assert "rebase --abort" in before_retry
+    pushed = any(
+        s == "push" or s.startswith("push origin HEAD:")
+        for s in before_retry
+    )
+    assert not pushed
+    blocked = [e for e in _read_events(tmp_path) if e["type"] == "git_pull_blocked"]
+    assert blocked and blocked[0]["turn_id"] == "t2"
+
+
+# ─── debounce coalescing ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_debounce_coalesces_burst_to_single_push(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Five rapid commits produce five commits but one completed push task.
+
+    A controlled worker owns its release event, so the assertion measures the
+    component's cancellation behavior rather than scheduler or Git subprocess
+    timing.  Separate push-path tests cover the real worker.
+    """
+    release_push = asyncio.Event()
+    completed_pushes: list[tuple[str, Path]] = []
+
+    async def controlled_push(*, turn_id: str, home: Path) -> None:
+        try:
+            await release_push.wait()
+        except asyncio.CancelledError:
+            return
+        completed_pushes.append((turn_id, home))
+
+    monkeypatch.setattr(git_tracking, "_debounced_push", controlled_push)
+
+    (home_repo / "memory").mkdir()
+
+    for i in range(5):
+        (home_repo / "memory" / f"file{i}.md").write_text(f"v{i}\n")
+        await git_tracking.commit_turn_changes(
+            turn_id=f"t{i}", trigger="user_message", home=home_repo, enabled=True,
+        )
+        # Let each worker reach its component-owned event before the next
+        # commit cancels it.  No wall-clock timer participates.
+        await asyncio.sleep(0)
+
+    # 5 commits landed on the branch.
+    log = subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert log.count("\n") == 6  # seed + 5
+
+    # Release all non-cancelled workers.  Only the final scheduled task may
+    # complete; the prior four were cancelled by the component under test.
+    assert git_tracking._pending_push_task is not None
+    release_push.set()
+    try:
+        await git_tracking._pending_push_task
+    except asyncio.CancelledError:
+        pass
+
+    assert completed_pushes == [("t4", home_repo)]
+
+
+@pytest.mark.asyncio
+async def test_debounce_reset_cancels_prior_task(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second commit before the debounce expires must cancel the
+    prior pending push task and schedule a new one."""
+    entered = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def controlled_push(**kwargs: Any) -> None:
+        entered.put_nowait(kwargs["turn_id"])
+        await release.wait()
+
+    monkeypatch.setattr(git_tracking, "_debounced_push", controlled_push)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "a.md").write_text("a\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+    first_task = git_tracking._pending_push_task
+    assert first_task is not None
+    assert await entered.get() == "t1"
+    assert not first_task.done()
+
+    (home_repo / "memory" / "b.md").write_text("b\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t2", trigger="user_message", home=home_repo, enabled=True,
+    )
+    second_task = git_tracking._pending_push_task
+    assert second_task is not None
+    assert second_task is not first_task
+    assert await entered.get() == "t2"
+    assert first_task.cancelling()
+    with pytest.raises(asyncio.CancelledError):
+        await first_task
+    assert first_task.cancelled()
+
+    # No push event should have fired during the debounce window.
+    events = _read_events(tmp_path)
+    assert [e for e in events if e["type"] == "git_push_failed"] == []
+
+    # Cancel the new one to keep the test fast.
+    second_task.cancel()
+    try:
+        await second_task
+    except asyncio.CancelledError:
+        pass
+
+
+# ─── error paths ────────────────────────────────────────────────────
+
+
+_INDEX_LOCK_ERROR = (
+    "fatal: Unable to create '/tmp/home/.git/index.lock': File exists.\n"
+    "Another git process seems to be running in this repository."
+)
+
+
+@pytest.mark.asyncio
+async def test_git_retries_transient_index_lock_collision(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#880: a cross-process lock collision can clear during bounded backoff."""
+    real_git_once = git_tracking._git_once
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def transient_once(*args: str, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise git_tracking.GitError(128, _INDEX_LOCK_ERROR, args)
+        return await real_git_once(*args, **kwargs)
+
+    async def no_wait(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(git_tracking, "_git_once", transient_once)
+    monkeypatch.setattr(git_tracking.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    result = await git_tracking._git("add", "-A", cwd=home_repo)
+
+    assert isinstance(result, git_tracking.GitResult)
+    assert attempts == 2
+    assert sleeps == [git_tracking.INDEX_LOCK_RETRY_DELAYS[0]]
+
+
+@pytest.mark.asyncio
+async def test_commit_succeeds_after_real_index_lock_is_released(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real Git collision clears during backoff and the turn commit lands."""
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"")
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "eventual.md").write_text("eventual\n")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.05, 0.05))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+    real_git_once = git_tracking._git_once
+    first_add_collision = asyncio.Event()
+    add_attempts = 0
+
+    async def observe_real_git(*args: str, **kwargs: Any) -> Any:
+        nonlocal add_attempts
+        if args and args[0] == "add":
+            add_attempts += 1
+        try:
+            return await real_git_once(*args, **kwargs)
+        except git_tracking.GitError:
+            if args and args[0] == "add":
+                first_add_collision.set()
+            raise
+
+    async def release_lock() -> None:
+        await first_add_collision.wait()
+        lock_path.unlink()
+
+    monkeypatch.setattr(git_tracking, "_git_once", observe_real_git)
+    releaser = asyncio.create_task(release_lock())
+    await git_tracking.commit_turn_changes(
+        turn_id="t-eventual",
+        trigger="user_message",
+        home=home_repo,
+        enabled=True,
+    )
+    await releaser
+
+    assert add_attempts >= 2
+    message = subprocess.run(
+        ["git", "log", "-1", "--format=%B"],
+        cwd=home_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "turn t-eventual (user_message)" in message
+    assert not [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_commit_failed"
+    ]
+    if git_tracking._pending_push_task is not None:
+        git_tracking._pending_push_task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "stderr"),
+    [
+        (("fetch", "origin", "main"), "fatal: Authentication failed"),
+        (("add", "-A"), "fatal: Unable to create '.git/index.lock': Permission denied"),
+        (("add", "-A"), "fatal: Unable to create '.git/index.lock': No space left on device"),
+        (("status", "--porcelain"), _INDEX_LOCK_ERROR),
+    ],
+)
+async def test_git_does_not_retry_non_collision_failure(
+    home_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
+    stderr: str,
+) -> None:
+    """Auth, permissions, disk, and read-only-command failures remain immediate."""
+    attempts = 0
+
+    async def failure(*call_args: str, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise git_tracking.GitError(128, stderr, call_args)
+
+    monkeypatch.setattr(git_tracking, "_git_once", failure)
+
+    with pytest.raises(git_tracking.GitError) as exc_info:
+        await git_tracking._git(*args, cwd=home_repo)
+
+    assert attempts == 1
+    assert exc_info.value.attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subcommand", ["add", "commit", "fetch", "pull", "reset"])
+async def test_git_retry_scope_covers_index_touching_commands(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch, subcommand: str,
+) -> None:
+    attempts = 0
+
+    async def collision_then_success(*args: str, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise git_tracking.GitError(128, _INDEX_LOCK_ERROR, args)
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    monkeypatch.setattr(git_tracking, "_git_once", collision_then_success)
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    await git_tracking._git(subcommand, cwd=home_repo)
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_exhausted_index_lock_retries_report_attempts_without_deleting_lock(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent lock fails closed and leaves the lock untouched."""
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"owner marker")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "blocked.md").write_text("blocked\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t-index-lock",
+        trigger="user_message",
+        home=home_repo,
+        enabled=True,
+    )
+
+    failures = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_commit_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["stage"] == "add"
+    assert failures[0]["attempts"] == 3
+    assert "after 3 attempts" in failures[0]["error"]
+    assert lock_path.exists()
+    assert lock_path.read_bytes() == b"owner marker"
+    assert not [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+    assert git_tracking._pending_push_task is None
+
+
+@pytest.mark.asyncio
+async def test_stale_index_lock_episode_emits_once_recovers_and_can_recur(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"owner marker")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    (home_repo / "memory").mkdir()
+    note = home_repo / "memory" / "blocked.md"
+    note.write_text("blocked\n")
+
+    # A live-looking lock retains the existing retry/failure behavior but does
+    # not begin an operator-visible stale episode.
+    await git_tracking.commit_turn_changes(
+        turn_id="young", trigger="user_message", home=home_repo, enabled=True,
+    )
+    assert not [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+
+    old_mtime = time.time() - git_tracking.INDEX_LOCK_STALE_SECONDS - 1
+    os.utime(lock_path, (old_mtime, old_mtime))
+    await git_tracking.commit_turn_changes(
+        turn_id="stale", trigger="user_message", home=home_repo, enabled=True,
+    )
+    await git_tracking.commit_turn_changes(
+        turn_id="same-episode", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    stale = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+    assert len(stale) == 1
+    assert stale[0]["path"] == str(lock_path)
+    assert stale[0]["age_seconds"] >= git_tracking.INDEX_LOCK_STALE_SECONDS
+    assert stale[0]["failure_count"] == 2
+    assert stale[0]["blocked_commits"] == 2
+    assert stale[0]["blocked_pulls"] == 0
+    assert lock_path.read_bytes() == b"owner marker"
+
+    lock_path.unlink()
+    await git_tracking.commit_turn_changes(
+        turn_id="recovered", trigger="user_message", home=home_repo, enabled=True,
+    )
+    recovered = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_recovered"
+    ]
+    assert len(recovered) == 1
+    assert recovered[0]["failure_count"] == 3
+
+    note.write_text("blocked again\n")
+    lock_path.write_bytes(b"new owner")
+    os.utime(lock_path, (old_mtime, old_mtime))
+    await git_tracking.commit_turn_changes(
+        turn_id="new-episode", trigger="user_message", home=home_repo, enabled=True,
+    )
+    stale = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+    assert len(stale) == 2
+    assert stale[1]["failure_count"] == 1
+    assert lock_path.read_bytes() == b"new owner"
+
+
+@pytest.mark.asyncio
+async def test_stale_index_lock_counts_blocked_pulls_and_commits(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"owner")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    await git_tracking._record_index_lock_block(
+        home=home_repo,
+        turn_id="pull",
+        operation="pull",
+        exc=git_tracking.GitError(128, _INDEX_LOCK_ERROR, ("pull", "--rebase"), attempts=2),
+    )
+
+    old_mtime = time.time() - git_tracking.INDEX_LOCK_STALE_SECONDS - 1
+    os.utime(lock_path, (old_mtime, old_mtime))
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "blocked.md").write_text("blocked\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="commit", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    stale = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+    assert len(stale) == 1
+    assert stale[0]["failure_count"] == 2
+    assert stale[0]["blocked_commits"] == 1
+    assert stale[0]["blocked_pulls"] == 1
+    assert lock_path.read_bytes() == b"owner"
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_emits_event_skips_push(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``git commit`` fails (e.g. pre-commit hook refused), we
+    log ``git_commit_failed`` and do NOT schedule a push."""
+    _short_debounce(monkeypatch, 0.05)
+
+    # Install a refusing pre-commit hook.
+    hooks_dir = home_repo / ".git" / "hooks"
+    hook = hooks_dir / "pre-commit"
+    hook.write_text("#!/bin/sh\necho 'refused' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "secret.md").write_text("trip the hook\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    events = _read_events(tmp_path)
+    commit_failures = [e for e in events if e["type"] == "git_commit_failed"]
+    assert len(commit_failures) == 1
+    assert commit_failures[0]["stage"] == "commit"
+    assert commit_failures[0]["turn_id"] == "t1"
+
+    # No push should have been scheduled.
+    assert git_tracking._pending_push_task is None
+    push_failures = [e for e in events if e["type"] == "git_push_failed"]
+    assert push_failures == []
+
+
+@pytest.mark.asyncio
+async def test_push_timeout_logs_git_push_failed(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub ``_git`` so the push branch raises ``asyncio.TimeoutError``
+    — verify we surface ``git_push_failed`` with reason='timeout'."""
+    _short_debounce(monkeypatch, 0.02)
+
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    real_git = git_tracking._git
+
+    async def flaky_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "push":
+            raise asyncio.TimeoutError()
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", flaky_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "z.md").write_text("z\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t-timeout",
+        trigger="user_message",
+        home=home_repo,
+        enabled=True,
+    )
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    events = _read_events(tmp_path)
+    push_failures = [e for e in events if e["type"] == "git_push_failed"]
+    assert len(push_failures) == 1
+    assert push_failures[0]["reason"] == "timeout"
+    assert push_failures[0]["turn_id"] == "t-timeout"
+
+
+@pytest.mark.asyncio
+async def test_status_failure_emits_git_commit_failed(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the initial status probe blows up, we surface
+    ``git_commit_failed`` at stage=status and short-circuit."""
+
+    async def boom(*args: str, **kwargs: Any) -> Any:
+        raise OSError("git binary missing")
+
+    monkeypatch.setattr(git_tracking, "_git", boom)
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t-status",
+        trigger="user_message",
+        home=home_repo,
+        enabled=True,
+    )
+
+    events = _read_events(tmp_path)
+    failures = [e for e in events if e["type"] == "git_commit_failed"]
+    assert len(failures) == 1
+    assert failures[0]["stage"] == "status"
+    assert "git binary missing" in failures[0]["error"]
+
+
+# ─── chainlink #65: paired-positive emit on successful push ──────────
+
+
+@pytest.mark.asyncio
+async def test_push_success_emits_git_push_ok(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #65 (sub B): a successful push emits ``git_push_ok``
+    so the algedonic block can surface recovery alongside the sticky
+    ``git_push_failed`` failure line."""
+    _short_debounce(monkeypatch, 0.02)
+
+    # Stub `_git` so the push invocation succeeds without needing a
+    # real remote. ``_has_origin_remote`` only checks that
+    # ``git remote get-url origin`` succeeds; we add a dummy origin
+    # so that probe returns True, then short-circuit the push itself.
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    real_git = git_tracking._git
+
+    async def quiet_push(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "push":
+            return git_tracking.GitResult(stdout="", stderr="")
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", quiet_push)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "ok.md").write_text("ok\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t-ok", trigger="user_message",
+        home=home_repo, enabled=True,
+    )
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    events = _read_events(tmp_path)
+    push_oks = [e for e in events if e["type"] == "git_push_ok"]
+    assert len(push_oks) == 1
+    assert push_oks[0]["turn_id"] == "t-ok"
+    # No failure was emitted for this turn.
+    push_failures = [e for e in events if e["type"] == "git_push_failed"]
+    assert push_failures == []
+
+
+# ─── PR 4b: no-remote skips push silently ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_remote_skips_push_silently(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 4b: when no ``origin`` remote is configured, the debounced
+    push must skip silently — no ``git push`` invocation, no
+    ``git_push_failed`` event spam every turn for what is actually a
+    deliberate "init-only, no push target" configuration."""
+    _short_debounce(monkeypatch, 0.05)
+    push_calls = []
+    real_git = git_tracking._git
+
+    async def counting_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "push":
+            push_calls.append(args)
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", counting_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    # The commit landed even without a remote.
+    log = subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert log.count("\n") == 2
+
+    # Wait past debounce.
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    # Push was NOT invoked, and no failure event surfaced.
+    assert push_calls == []
+    events = _read_events(tmp_path)
+    push_failures = [e for e in events if e["type"] == "git_push_failed"]
+    assert push_failures == []
+
+@pytest.mark.asyncio
+async def test_debounced_push_reconciles_squash_merged_proposal_surface(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #368: a squash-merged proposal commit can conflict with local
+    commits that already contain a tightened/superseding version of the same
+    protected file. The push sync should reset onto origin and preserve the live
+    local protected-surface content as a fresh commit instead of wedging forever.
+    """
+    _short_debounce(monkeypatch, 0.0)
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
+
+    core = home_repo / "memory" / "core"
+    core.mkdir(parents=True)
+    rule = core / "40-learned-behaviors.md"
+    rule.write_text("local tightened rule\n")
+    subprocess.run(
+        ["git", "add", str(rule.relative_to(home_repo))],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "local tightened proposal"],
+        cwd=home_repo, check=True,
+    )
+
+    remote_work = tmp_path / "remote-work"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(remote_work)], check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "remote@example.com"],
+        cwd=remote_work, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "remote"],
+        cwd=remote_work, check=True,
+    )
+    (remote_work / "memory" / "core").mkdir(parents=True, exist_ok=True)
+    (remote_work / "memory" / "core" / "40-learned-behaviors.md").write_text(
+        "remote squash version\n"
+    )
+    subprocess.run(
+        ["git", "add", "memory/core/40-learned-behaviors.md"],
+        cwd=remote_work, check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "squash merged proposal"],
+        cwd=remote_work, check=True,
+    )
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=remote_work, check=True)
+
+    await git_tracking._debounced_push(turn_id="t-squash", home=home_repo)
+
+    assert rule.read_text() == "local tightened rule\n"
+    remote_show = subprocess.run(
+        ["git", "show", "origin/main:memory/core/40-learned-behaviors.md"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    )
+    assert remote_show.stdout == "local tightened rule\n"
+    events = _read_events(tmp_path)
+    reconciled = [e for e in events if e["type"] == "git_pull_reconciled"]
+    assert reconciled[-1]["mode"] == "remote_changes_superseded_locally"
+    assert [e for e in events if e["type"] == "git_pull_blocked"] == []
+    assert [e for e in events if e["type"] == "git_push_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_debounced_push_restores_stale_main_upstream_and_pushes_explicit_branch(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #368: if main's upstream is stale (e.g. points at a proposal
+    branch), sync should restore origin/main and push HEAD:main explicitly.
+    """
+    _short_debounce(monkeypatch, 0.0)
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(upstream)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(upstream)],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", "main"],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", "main:proposal/stale"],
+        cwd=home_repo, check=True,
+    )
+    subprocess.run(
+        ["git", "branch", "--set-upstream-to", "origin/proposal/stale", "main"],
+        cwd=home_repo, check=True,
+    )
+
+    (home_repo / "memory").mkdir(exist_ok=True)
+    (home_repo / "memory" / "x.md").write_text("x\n")
+    subprocess.run(["git", "add", "memory/x.md"], cwd=home_repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "local state"],
+        cwd=home_repo, check=True,
+    )
+
+    await git_tracking._debounced_push(turn_id="t-upstream", home=home_repo)
+
+    upstream_ref = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    )
+    assert upstream_ref.stdout.strip() == "origin/main"
+    remote_file = subprocess.run(
+        ["git", "show", "origin/main:memory/x.md"],
+        cwd=home_repo, capture_output=True, text=True, check=True,
+    )
+    assert remote_file.stdout == "x\n"
+    events = _read_events(tmp_path)
+    assert [e for e in events if e["type"] == "git_push_failed"] == []
+
+
+# ─── proposal cleanup hook ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_commit_turn_changes_runs_proposal_cleanup_before_status(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: list[Path] = []
+
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[object]:
+        called.append(home)
+        return []
+
+    monkeypatch.setattr("mimir.proposals.cleanup_resolved_proposal_branches", fake_cleanup)
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t-cleanup", trigger="scheduled_tick", home=home_repo, enabled=True,
+    )
+
+    assert called == [home_repo]
+
+
+@pytest.mark.asyncio
+async def test_proposal_cleanup_tracks_skip_reasons_for_edge_triggering(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.proposals import ProposalCleanupRecord
+
+    previous_states: list[dict[str, str]] = []
+    reasons = iter(("open_pr", "open_pr", "content_not_on_main", None))
+
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[ProposalCleanupRecord]:
+        previous_states.append(dict(previous_skip_reasons))
+        reason = next(reasons)
+        if reason is None:
+            return [
+                ProposalCleanupRecord(
+                    "proposal/pending", "abc", "deleted", "resolved_content_on_main"
+                )
+            ]
+        return [ProposalCleanupRecord("proposal/pending", "abc", "skipped", reason)]
+
+    monkeypatch.setattr(
+        "mimir.proposals.cleanup_resolved_proposal_branches", fake_cleanup
+    )
+
+    for turn_id in ("t1", "t2", "t3", "t4"):
+        await git_tracking._cleanup_resolved_proposal_branches(
+            home=home_repo, turn_id=turn_id
+        )
+
+    assert previous_states == [
+        {},
+        {"proposal/pending": "open_pr"},
+        {"proposal/pending": "open_pr"},
+        {"proposal/pending": "content_not_on_main"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_proposal_cleanup_restart_reannounces_active_skip(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.proposals import ProposalCleanupRecord
+
+    previous_states: list[dict[str, str]] = []
+
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[ProposalCleanupRecord]:
+        previous_states.append(dict(previous_skip_reasons))
+        return [ProposalCleanupRecord("proposal/pending", "abc", "skipped", "open_pr")]
+
+    monkeypatch.setattr(
+        "mimir.proposals.cleanup_resolved_proposal_branches", fake_cleanup
+    )
+
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="before-restart"
+    )
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="same-process"
+    )
+    git_tracking.reset_module_state()
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="after-restart"
+    )
+
+    assert previous_states == [
+        {},
+        {"proposal/pending": "open_pr"},
+        {},
+    ]
+
+# ─── porcelain summary helper ───────────────────────────────────────
+
+
+def test_porcelain_summary_truncates() -> None:
+    porcelain = (
+        " M memory/a.md\n"
+        " M memory/b.md\n"
+        " M memory/c.md\n"
+        " M memory/d.md\n"
+        " M memory/e.md\n"
+        " M memory/f.md\n"
+        " M memory/g.md\n"
+    )
+    summary = git_tracking._porcelain_summary(porcelain, max_paths=3)
+    assert summary.startswith("7 file(s):")
+    assert "memory/a.md" in summary
+    assert "memory/c.md" in summary
+    assert "…+4" in summary
+    # The truncated paths should not appear.
+    assert "memory/g.md" not in summary
+
+
+def test_porcelain_summary_handles_rename() -> None:
+    porcelain = "R  old/path.md -> new/path.md\n"
+    summary = git_tracking._porcelain_summary(porcelain)
+    assert "new/path.md" in summary
+    assert "old/path.md" not in summary
+
+
+# ─── health.git_status_summary ──────────────────────────────────────
+
+
+def test_git_status_summary_uninit_returns_zero(tmp_path: Path) -> None:
+    home = tmp_path / "no-git"
+    home.mkdir()
+    assert health.git_status_summary(home) == (0, [])
+
+
+def test_git_status_summary_clean_repo(home_repo: Path) -> None:
+    # No uncommitted changes — count 0, paths empty.
+    assert health.git_status_summary(home_repo) == (0, [])
+
+
+def test_git_status_summary_dirty_truncates(home_repo: Path) -> None:
+    (home_repo / "memory").mkdir()
+    for c in "abcdef":
+        (home_repo / "memory" / f"{c}.md").write_text(f"{c}\n")
+    count, paths = health.git_status_summary(home_repo, top_n=3)
+    assert count == 6
+    # First 3 paths in lex order, then the truncation marker.
+    assert len(paths) == 4
+    assert paths[-1] == "…+3"
+    assert paths[:3] == sorted(paths[:3])
+
+
+def test_git_status_summary_dirty_under_topn(home_repo: Path) -> None:
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "a.md").write_text("a\n")
+    (home_repo / "memory" / "b.md").write_text("b\n")
+    count, paths = health.git_status_summary(home_repo, top_n=3)
+    assert count == 2
+    assert paths == ["memory/a.md", "memory/b.md"]
+
+
+# ─── PR 4b: render_git_status_line ──────────────────────────────────
+
+
+def test_render_git_status_line_clean_returns_none(home_repo: Path) -> None:
+    assert health.render_git_status_line(home_repo) is None
+
+
+def test_render_git_status_line_uninit_returns_none(tmp_path: Path) -> None:
+    home = tmp_path / "no-git"
+    home.mkdir()
+    assert health.render_git_status_line(home) is None
+
+
+def test_render_git_status_line_singular_file(home_repo: Path) -> None:
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("x\n")
+    line = health.render_git_status_line(home_repo)
+    assert line is not None
+    # Singular noun, count 1, the path, and the home prefix all present.
+    assert ": 1 file —" in line
+    assert "memory/x.md" in line
+    assert str(home_repo) in line
+
+
+def test_render_git_status_line_plural_with_truncation(home_repo: Path) -> None:
+    (home_repo / "memory").mkdir()
+    for c in "abcdef":
+        (home_repo / "memory" / f"{c}.md").write_text(f"{c}\n")
+    line = health.render_git_status_line(home_repo, top_n=3)
+    assert line is not None
+    assert ": 6 files —" in line
+    assert "memory/a.md" in line
+    assert "memory/c.md" in line
+    assert "…+3" in line
+    # Truncated paths should NOT appear in the rendered text.
+    assert "memory/f.md" not in line
+
+
+# ─── push retry + stale escalation ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_push_failure_schedules_retry(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
+) -> None:
+    """A push failure should schedule a retry task in _push_retry_tasks."""
+    _short_debounce(monkeypatch, 0.02)
+
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+    # Wait for the debounce push to fail.
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    # A retry task should have been created.
+    key = git_tracking._home_key(home_repo)
+    retry_task = git_tracking._push_retry_tasks.get(key)
+    assert retry_task is not None
+    await retry_gate.get()
+    assert not retry_task.done()
+
+    # Clean up.
+    retry_task.cancel()
+    try:
+        await retry_task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_debounced_push_schedules_retry_under_home_lock(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chainlink #322: retry-task state is mutated while holding the per-home lock."""
+    _short_debounce(monkeypatch, 0.01)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    key = git_tracking._home_key(home_repo)
+    observed: list[bool] = []
+    release_retry = asyncio.Event()
+
+    async def fake_has_origin(_home: Path) -> bool:
+        return True
+
+    async def fake_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "pull":
+            return git_tracking.GitResult(stdout="", stderr="")
+        if args and args[0] == "push":
+            raise git_tracking.GitError(1, "network error", args)
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    def fake_schedule_retry_locked(**kwargs: Any) -> None:
+        observed.append(git_tracking._get_lock(home_repo).locked())
+        git_tracking._push_retry_tasks[key] = asyncio.create_task(release_retry.wait())
+
+    monkeypatch.setattr(git_tracking, "_has_origin_remote", fake_has_origin)
+    monkeypatch.setattr(git_tracking, "_git", fake_git)
+    monkeypatch.setattr(
+        git_tracking, "_schedule_push_retry_locked", fake_schedule_retry_locked
+    )
+
+    task = asyncio.create_task(
+        git_tracking._debounced_push(turn_id="t-lock", home=home_repo)
+    )
+    await task
+
+    assert observed == [True]
+    retry = git_tracking._push_retry_tasks.get(key)
+    assert retry is not None
+    retry.cancel()
+    await asyncio.gather(retry, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_retry_success_emits_git_push_ok(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
+) -> None:
+    """A retry that succeeds emits git_push_ok with via='retry'."""
+    _short_debounce(monkeypatch, 0.02)
+
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    real_git = git_tracking._git
+    push_count = [0]
+
+    async def conditional_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "fetch":
+            # The retry path treats a transient fetch failure as a reason to
+            # continue to push. Do not make this unit test's timing depend on a
+            # real subprocess against the deliberately nonexistent remote.
+            raise git_tracking.GitError(1, "network error", args)
+        if args and args[0] == "push":
+            push_count[0] += 1
+            if push_count[0] == 1:
+                raise git_tracking.GitError(1, "network error", args)
+            # Second call (retry) succeeds.
+            return git_tracking.GitResult(stdout="", stderr="")
+        return await real_git(*args, **kwargs)
+
+    monkeypatch.setattr(git_tracking, "_git", conditional_git)
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t-retry", trigger="user_message", home=home_repo, enabled=True,
+    )
+    # Wait for debounce push (fails) and then the retry (succeeds).
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    key = git_tracking._home_key(home_repo)
+    retry_task = git_tracking._push_retry_tasks.get(key)
+    assert retry_task is not None
+    (await retry_gate.get()).set()
+    await retry_task
+
+    events = _read_events(tmp_path)
+    ok_events = [e for e in events if e["type"] == "git_push_ok"]
+    assert len(ok_events) == 1
+    assert ok_events[0]["via"] == "retry"
+    assert ok_events[0]["attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_exhaustion_emits_git_push_stale(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
+) -> None:
+    """After all retries fail, git_push_stale is emitted with unpushed commit count."""
+    _short_debounce(monkeypatch, 0.02)
+
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    # All push attempts fail (nonexistent remote is already set up).
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("hello\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t-stale", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    # Drive the debounce push.
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    # Chain through all retries. Each retry creates a new task ref.
+    # Drive until no retry task remains.
+    key = git_tracking._home_key(home_repo)
+    for _ in range(5):  # upper bound to avoid infinite loop in test
+        retry = git_tracking._push_retry_tasks.get(key)
+        if retry is None or retry.done():
+            break
+        (await retry_gate.get()).set()
+        try:
+            await retry
+        except asyncio.CancelledError:
+            break
+
+    events = _read_events(tmp_path)
+    stale_events = [e for e in events if e["type"] == "git_push_stale"]
+    assert len(stale_events) == 1
+    # unpushed_commits should be ≥ 1 (we committed but never pushed).
+    assert stale_events[0]["unpushed_commits"] >= 1
+    assert stale_events[0]["attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_new_commit_cancels_retry(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    retry_gate,
+) -> None:
+    """A new commit (triggering a debounce push) should cancel any pending
+    retry task."""
+    _short_debounce(monkeypatch, 0.02)
+
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
+        cwd=home_repo, check=True,
+    )
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "x.md").write_text("v1\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home_repo, enabled=True,
+    )
+    # First debounce fails, schedules retry.
+    assert git_tracking._pending_push_task is not None
+    await git_tracking._pending_push_task
+
+    key = git_tracking._home_key(home_repo)
+    retry_task = git_tracking._push_retry_tasks.get(key)
+    assert retry_task is not None and not retry_task.done()
+    await retry_gate.get()
+
+    # New commit — should cancel the retry.
+    (home_repo / "memory" / "y.md").write_text("v2\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="t2", trigger="user_message", home=home_repo, enabled=True,
+    )
+    # The retry task should be cancelled.
+    assert retry_task.cancelling()
+    try:
+        await retry_task
+    except asyncio.CancelledError:
+        pass
+    assert retry_task.done()
+
+    # New retry task ref is None or a fresh task (from the new debounce failure).
+    # Cancel the second debounce to keep test clean.
+    second_debounce = git_tracking._pending_push_task
+    if second_debounce and not second_debounce.done():
+        second_debounce.cancel()
+        try:
+            await second_debounce
+        except asyncio.CancelledError:
+            pass
+
+
+def test_short_err_redacts_secrets():
+    """chainlink #259: _short_err routes through git_bootstrap._redact so a
+    credential in a git error message (token-in-URL, etc.) is stripped
+    before it lands in the auto-committed events.jsonl."""
+    from mimir.git_tracking import _short_err
+    exc = Exception(
+        "fatal: unable to access "
+        "https://x:ghp_0123456789abcdefghijklmnopqrstuvwxyz@github.com/o/r.git"
+    )
+    out = _short_err(exc)
+    assert "ghp_0123456789abcdefghijklmnopqrstuvwxyz" not in out
+    assert "[REDACTED]" in out
+    # Still single-lined + bounded.
+    assert "\n" not in out and len(out) <= 500
+
+
+def test_short_err_plain_message_unchanged():
+    """A secret-free error is passed through (minus whitespace collapse)."""
+    from mimir.git_tracking import _short_err
+    assert _short_err(Exception("fatal: not a git repository")) == (
+        "fatal: not a git repository"
+    )
+
+
+# ─── "nothing to commit" soft no-op via stdout (chainlink #299 follow-up) ──
+
+
+async def test_commit_nothing_to_commit_on_stdout_is_soft_noop(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """git reports "nothing to commit, working tree clean" on STDOUT (not
+    stderr) with rc=1 — e.g. when the only ``git status`` changes are
+    embedded-repo gitlinks that ``git add -A`` won't stage (the mimirbot
+    ``.review-scratch`` nested-repo case). The hook must treat that as a
+    no-op, NOT emit git_commit_failed. Pre-fix the guard only checked
+    stderr (empty here), so it fired every turn."""
+    _short_debounce(monkeypatch)
+
+    async def fake_git(*args: str, cwd=None, timeout: float = 0.0):
+        head = args[:1]
+        if head == ("status",):
+            return git_tracking.GitResult(
+                stdout=" M .review-scratch/nested\n", stderr="",
+            )
+        if head == ("add",):
+            return git_tracking.GitResult(stdout="", stderr="")
+        if head == ("commit",):
+            raise git_tracking.GitError(
+                1, "", args,
+                stdout="On branch main\nnothing to commit, working tree clean\n",
+            )
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    monkeypatch.setattr(git_tracking, "_git", fake_git)
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="poller", home=home_repo, enabled=True,
+    )
+    failures = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_commit_failed"
+    ]
+    assert not failures, f"'nothing to commit' must be a soft no-op; got {failures}"
+
+
+async def test_commit_real_error_still_emits_git_commit_failed(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widened soft-no-op guard must NOT swallow genuine commit
+    failures — a non-benign error still surfaces as git_commit_failed."""
+    _short_debounce(monkeypatch)
+
+    async def fake_git(*args: str, cwd=None, timeout: float = 0.0):
+        head = args[:1]
+        if head == ("status",):
+            return git_tracking.GitResult(stdout=" M file.txt\n", stderr="")
+        if head == ("add",):
+            return git_tracking.GitResult(stdout="", stderr="")
+        if head == ("commit",):
+            raise git_tracking.GitError(
+                128, "fatal: unable to write commit object", args, stdout="",
+            )
+        return git_tracking.GitResult(stdout="", stderr="")
+
+    monkeypatch.setattr(git_tracking, "_git", fake_git)
+    await git_tracking.commit_turn_changes(
+        turn_id="t2", trigger="poller", home=home_repo, enabled=True,
+    )
+    failures = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_commit_failed"
+    ]
+    assert len(failures) == 1, (
+        f"real commit error must emit git_commit_failed; got {failures}"
+    )
+    assert failures[0].get("stage") == "commit"
+
+
+# ─── chainlink #353: surface silently-ignored notes ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_surfaces_ignored_note_under_tracked_root(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """A prose note under a tracked root that git is ignoring is surfaced as
+    ``git_ignored_note_skipped`` — not silently dropped by ``git add -A`` (the
+    failure muninn hit with state/voice-drafts.md)."""
+    home = home_repo
+    # home_repo has no .gitignore; ignore one specific note under state/.
+    (home / ".gitignore").write_text("state/lost-note.md\n")
+    (home / "state").mkdir(exist_ok=True)
+    (home / "state" / "lost-note.md").write_text("a dropped note\n")
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert skipped, "expected a git_ignored_note_skipped event"
+    assert any("state/lost-note.md" in p for p in skipped[0].get("paths", []))
+
+
+
+@pytest.mark.asyncio
+async def test_ignored_note_marker_suppresses_intentional_artifact_subtree(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """Ignored package/vendor trees under state/ can contain thousands of README
+    files. A local marker lets intentionally ignored artifact subtrees stay quiet
+    while plain lost notes under state/ still surface."""
+    home = home_repo
+    (home / ".gitignore").write_text("state/vendor-artifacts/\n")
+    artifact_dir = home / "state" / "vendor-artifacts"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / ".mimir-ignore-notes-ok").write_text(
+        "runtime package install; intentionally ignored\n"
+    )
+    (artifact_dir / "README.md").write_text("package readme, not mimir state\n")
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert not skipped
+
+
+@pytest.mark.asyncio
+async def test_ignored_note_file_marker_suppresses_intentional_single_file(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """A single intentionally local note can be suppressed without muting its
+    whole parent directory."""
+    home = home_repo
+    (home / ".gitignore").write_text("memory/issues/local-only.md*\n")
+    issue_dir = home / "memory" / "issues"
+    issue_dir.mkdir(parents=True)
+    (issue_dir / "local-only.md").write_text("local experiment note\n")
+    (issue_dir / "local-only.md.mimir-ignore-notes-ok").write_text(
+        "intentionally local\n"
+    )
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert not skipped
+
+
+@pytest.mark.asyncio
+async def test_no_ignored_note_event_for_attachments_root(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """attachments/ is intentionally NOT a tracked root (the home .gitignore is an
+    allowlist that excludes it; it holds transient inbound/generated artifacts).
+    An ignored prose note there is *expected*, so it must NOT surface a
+    git_ignored_note_skipped signal — relocating to memory/state is the way to
+    persist (chainlink #356 reverted)."""
+    home = home_repo
+    (home / ".gitignore").write_text("attachments/transient-note.md\n")
+    (home / "attachments").mkdir(exist_ok=True)
+    (home / "attachments" / "transient-note.md").write_text("a transient note\n")
+    # A tracked change so commit_turn_changes proceeds past the no-op fast path.
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "real.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    skipped = [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+    assert not any(
+        "attachments/" in p
+        for e in skipped for p in e.get("paths", [])
+    ), "attachments/ prose must NOT surface a skipped-note signal"
+
+
+@pytest.mark.asyncio
+async def test_no_ignored_note_event_for_clean_tracked_write(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """A normal tracked write emits no ignored-note signal (no false positive)."""
+    home = home_repo
+    (home / "memory").mkdir(exist_ok=True)
+    (home / "memory" / "note.md").write_text("real\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t1", trigger="user_message", home=home, enabled=True,
+    )
+
+    assert not [
+        e for e in _read_events(tmp_path)
+        if e.get("type") == "git_ignored_note_skipped"
+    ]
+
+
+def test_git_ignored_note_skipped_classifies_negative() -> None:
+    from mimir.feedback.rules import classify
+
+    assert classify("git_ignored_note_skipped") == ("negative", "ignored_write")
+
+
+@pytest.mark.asyncio
+async def test_commit_refuses_when_live_home_is_on_feature_branch(
+    home_repo: Path, tmp_path: Path,
+) -> None:
+    """chainlink #368 update: the live home repo must not silently commit
+    turn state to a feature/proposal branch. Refuse the commit and surface an
+    invariant violation instead.
+    """
+    subprocess.run(["git", "checkout", "-q", "-b", "proposal/edit"], cwd=home_repo, check=True)
+    before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "off-main.md").write_text("should not commit\n")
+
+    await git_tracking.commit_turn_changes(
+        turn_id="t-off-main", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert after == before
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=home_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert "memory/" in status
+    events = _read_events(tmp_path)
+    violations = [e for e in events if e["type"] == "git_home_invariant_violation"]
+    assert violations[-1]["invariant"] == "live_branch"
+    assert violations[-1]["observed"] == "proposal/edit"
+    assert violations[-1]["action"] == "commit_refused"

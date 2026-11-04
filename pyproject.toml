@@ -1,0 +1,333 @@
+[project]
+# PyPI distribution name. The bare ``mimir`` name is taken by an
+# unrelated Twisted-protocol project (Ralph Meijer's "Mimir daemons"),
+# so the open-source release uses ``mimir-agent``. The Python import
+# name stays ``mimir`` (the package directory under ``mimir/``), so
+# code keeps writing ``from mimir.agent import ...`` — only the
+# install incantation changes: ``pip install mimir-agent``.
+name = "mimir-agent"
+version = "0.9.11"
+description = "Memory-centric agent harness on deepagents / LangGraph"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Jason Carreira" }]
+license = { text = "MIT" }
+
+dependencies = [
+    # Core: agent loop + memory backend.
+    # claude-agent-sdk was removed post-cutover (2026-05-14); the agent
+    # loop now runs through deepagents (LangGraph). Model adapters are
+    # optional extras — see [project.optional-dependencies] below.
+    #
+    # The runtime memory backend lives at ``mimir/saga/`` (inside this
+    # package) — it ships with the wheel and needs no external dep.
+    # The ``saga`` workspace package at ``benchmarks/saga/`` is the
+    # bench harness shell only; needed by ``benchmarks/longmemeval_via_*/``
+    # not by the runtime. It is installed from the dev dependency group below.
+    "aiohttp>=3.12",
+    "apscheduler>=3.11",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "fastembed>=0.4",
+    # Worklink epic role-runner bridge uses DeepAgents task-tool internals;
+    # guard at runtime and keep the dependency inside the tested-compatible 0.7 line.
+    # Floor is 0.7.10, not 0.7.1: that is the release CI locks to and the one
+    # deployments resolve. 0.7.10 changed the signature of
+    # _offload_to_backend/_aoffload_to_backend, and while our wrappers now forward
+    # *args and work against both, the floor should name the version actually
+    # exercised rather than the oldest that happens to import.
+    "deepagents>=0.7.10,<0.8",
+    "langchain>=1.3.14,<2",
+    "packaging>=24.0",
+    "pypdf>=6.16",
+    "requests>=2.33.1",
+    "agent-client-protocol==0.12.0",
+    "keyring==25.7.0",
+    "ruamel-yaml>=0.18,<0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/SquashMerge/mimir"
+Repository = "https://github.com/SquashMerge/mimir"
+Documentation = "https://github.com/SquashMerge/mimir/tree/main/docs"
+Issues = "https://github.com/SquashMerge/mimir/issues"
+
+[project.optional-dependencies]
+# Model-provider extras — install the one(s) you'll actually use.
+# Agent.resolve_model dispatches on the ``MIMIR_MODEL_SPEC`` prefix
+# (``claude-code:``, ``anthropic:``, ``openai:`` etc.) and lazy-imports
+# the matching package, so installing only one keeps the dep graph
+# small. Pick at least one or the agent can't build a model.
+# Claude Code support routes the agent loop through the Claude Code
+# CLI subprocess (Max-plan friendly). The maintained adapter is the
+# controlled distribution ``langchain-claude-code-mimir``; it preserves
+# the import package ``langchain_claude_code`` while letting operators
+# install a normal mimir extra instead of hand-copying a git URL.
+anthropic = [
+    "langchain-anthropic>=1.5.3,<2",
+]
+claude-code = [
+    "langchain-claude-code-mimir>=0.1.3,<0.2",
+]
+openai = [
+    "langchain-openai>=1.2.1",
+]
+# Codex Plus is a different protocol than the public OpenAI API
+# (``chatgpt.com/backend-api/codex/responses`` OAuth-backed SSE, not
+# ``api.openai.com/v1/responses``). The chat model lives in its own
+# package and ships an own rate-limit-headers integration that wires
+# directly into ``OpenAIQuotaProvider`` via the agent's callback hook.
+codex-plus = [
+    "langchain-codex-plus>=0.0.12,<0.1",
+]
+# Model Context Protocol — required if any ``MIMIR_MCP_SERVERS_*`` env
+# var is set. Pre-OSS hardening (review item #4 follow-on): this used
+# to come along transitively via the Claude Code adapter, but MCP now
+# has its own explicit extra so operators who want MCP know to install it.
+mcp = [
+    "mcp>=2.3,<3",
+]
+otel = [
+    "opentelemetry-api==1.45.1",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+]
+local-embeddings = [
+    "sentence-transformers>=5.1",
+    "transformers>=4.56,<5",
+    "torch>=2.2",
+]
+acp = []
+# Retain the bench extra for existing install commands. The LongMemEval
+# workspace harness lives in the dev dependency group, not in wheel metadata:
+# the name ``saga`` belongs to an unrelated distribution on PyPI.
+bench = []
+# Bridge extras — install if you want that bridge.
+discord = [
+    "discord-py>=2.6",
+]
+slack = [
+    "slack-bolt>=1.18",
+]
+# GEPA prompt-optimization skill (chainlink #332 / #405). Opt-in: the
+# standalone reflective-prompt optimizer (github.com/gepa-ai/gepa) is
+# only needed while a GEPA pilot runs, so it ships as an extra rather
+# than a core dep — the base runtime stays lean. gepa's core is
+# dependency-free; mimir routes its ``reflection_lm`` through the
+# already-configured ChatModel (see ``mimir/gepa_support.py``), so no
+# ``gepa[full]`` / LiteLLM extra is needed. Install:
+#   pip install 'mimir-agent[gepa]'        (pypi mode)
+#   uv sync --extra gepa                   (workspace mode)
+# A dockerfile.fragment can't carry it: fragments run as root before
+# the user venv exists, so a pip-install there lands in system Python,
+# not where the agent imports from — hence an extra, not a fragment.
+gepa = [
+    "gepa>=0.1.1,<0.2",
+]
+# ``pip install -e ".[dev]"`` — published test toolchain. Claude Code adapter
+# import coverage lives in the dedicated CI smoke job that installs
+# ``--extra claude-code``. The workspace-only LongMemEval harness is in the
+# dev dependency group below, not this published extra.
+dev = [
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+    "jsonschema==4.26.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-aiohttp>=1.0",
+    "pytest-xdist>=3.8",
+    "pytest-timeout>=2.4",
+    "discord-py>=2.6",
+    "slack-bolt>=1.18",
+    "langchain-anthropic>=1.5.3,<2",
+    "langchain-openai>=1.2.1",
+    "langchain-codex-plus>=0.0.12,<0.1",
+    "mcp>=2.3,<3",
+    # mimir.saga.vector_index uses FAISS for ANN search; without it
+    # the index degrades to an empty-result stub and tests asserting
+    # on indexed-atom counts (test_saga_correctness_regressions,
+    # test_memory_production_surface) fail. Hard dep at the package
+    # level is debatable (some operators may want BM25-only); pinning
+    # in dev means tests always exercise the real path.
+    "faiss-cpu>=1.13",
+    # gepa optimizer (chainlink #405) — dependency-free core. Included
+    # in dev so CI exercises the reflection_lm wiring against the real
+    # library; tests still ``importorskip`` it so a non-dev env stays green.
+    "gepa>=0.1.1,<0.2",
+    "botocore>=1.35",
+]
+
+[project.scripts]
+mimir = "mimir.entrypoint:main"
+mimir-agent = "mimir.entrypoint:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# No ``allow-direct-references`` here. Claude Code support is exposed
+# through the normal ``claude-code`` extra backed by the controlled
+# ``langchain-claude-code-mimir`` distribution.
+
+[tool.hatch.build.targets.wheel]
+packages = ["mimir"]
+
+# Operator reference docs. They live at the repo root (docs/, README.md,
+# .env.example) for GitHub + README links, but must ALSO ship in the wheel so
+# `mimir setup` can seed them into <home>/docs/ (mimir/doc_seed.py). force-include
+# maps the repo paths under the package as mimir/bundled_docs/; the seeder reads
+# from there in a wheel install and falls back to the repo root in a dev tree.
+[tool.hatch.build.targets.wheel.force-include]
+"docs" = "mimir/bundled_docs/docs"
+"README.md" = "mimir/bundled_docs/README.md"
+".env.example" = "mimir/bundled_docs/.env.example"
+
+# ...and the sdist must CARRY those root paths, because `uv build` builds the
+# wheel FROM the freshly built sdist. With no sdist config, hatchling's default
+# file selection ships only the inferred `mimir/` package, so all three sources
+# were absent and the wheel-from-sdist step died with "Forced include not found"
+# (`.env.example` merely being the first one alphabetically). Mapping each path
+# to itself only ADDS to the default selection -- an `include` allowlist here
+# would instead narrow it and risk silently dropping package data.
+[tool.hatch.build.targets.sdist.force-include]
+"docs" = "docs"
+"README.md" = "README.md"
+".env.example" = ".env.example"
+
+[tool.hatch.build]
+# The built React app (mimir/react_app/dist/) is a VCS-IGNORED build artifact:
+# frontend bundles are gitignored, only mimir/react_app/.gitkeep is tracked.
+# hatchling's `include` is intersected with VCS-tracked files, so an `include`
+# glob alone matches nothing for the dist and silently drops it from the wheel
+# — which is exactly why 0.6.0 shipped with no `mimir/react_app/` at all and
+# `/app/` returned "React app build not found" on a fresh `pip install`.
+# `artifacts` is hatchling's escape hatch for force-including VCS-ignored paths.
+# The dist must EXIST at build time, so CI (publish.yml) runs `npm ci` +
+# `npm run build` before `uv build`, and asserts the wheel contains it.
+artifacts = [
+    "mimir/react_app/dist/**/*",
+]
+# chainlink #290: everything below the .py line is a runtime data file
+# read by the INSTALLED package — it MUST ship in the wheel. This include
+# list is an allowlist intersected with VCS-tracked files, so anything not
+# matched here silently drops from the wheel (which is exactly how the
+# bugs noted below shipped in 0.2.0/0.2.1, breaking fresh `pip install`s).
+include = [
+    "mimir/**/*.py",
+    # Default operator prompt templates — seed_prompts() copies these into
+    # <home>/prompts/ on setup. The directory is prompt_templates/, NOT
+    # prompts/; the previous "mimir/prompts/**/*.md" glob was a dead path,
+    # so none of the templates ever shipped.
+    "mimir/prompt_templates/**/*.md",
+    # Default core-memory templates — seed_core_memory() copies these into
+    # <home>/memory/core/ on setup. Keep them as bundled files so package
+    # upgrades can git-merge prompt/default-memory changes uniformly.
+    "mimir/memory_templates/**/*.md",
+    # Default scheduler (seed_scheduler copies this to <home>/scheduler.yaml)
+    # and the mimir-core credential manifest (cred_verify loads it at import
+    # via _PACKAGE_MANIFEST). No glob covered top-level mimir/*.yaml before.
+    "mimir/scheduler_template.yaml",
+    "mimir/credentials.yaml",
+    # Saga DB schema — SagaStore executescript()s this on fresh-DB init
+    # (saga/client.py, under "if fresh:"). Without it a first-run install
+    # crashes with FileNotFoundError before saga can come up.
+    "mimir/saga/*.sql",
+    # Skills bundle arbitrary support files next to their .md/.py — shell
+    # scripts (tmux), scaffold fragments (chainlink), etc. Glob the whole
+    # subtree so a new support-file type can't silently drop (the old
+    # .md/.json/.py allowlist dropped tmux's .sh and chainlink's .fragment).
+    # .pyc / __pycache__ stay out — gitignored, and hatchling respects VCS.
+    "mimir/skills/**/*",
+    # Opt-in poller / integration skills (chainlink #299). Moved under the
+    # package so `mimir skills install` works on pip installs, not just
+    # source trees. Ships SKILL.md + scripts + pollers.json + tests.
+    "mimir/optional-skills/**/*",
+    "mimir/templates/**/*",
+    "mimir/react_app/dist/**/*",
+    "mimir/turn_viewer.html",
+    # chainlink #243: operator dashboards. HTML/JS lives in sibling .html
+    # files next to the dashboard module; loaders read them at runtime.
+    "mimir/ops_dashboard.html",
+    "mimir/saga_dashboard.html",
+    "mimir/file_memory_dashboard.html",
+    # web_ui serves this verbatim at /app/auth.js (`_load_web_auth_js` reads it
+    # from the installed package). It matched no glob above, so it shipped in a
+    # DIRECT wheel -- where the wheel target's `packages = ["mimir"]` bypasses
+    # this allowlist -- but not in the sdist, and therefore not in the wheel
+    # `uv build` assembles FROM the sdist. The published 0.6.9 wheel has no
+    # mimir/web_auth.js at all, so /app/auth.js is broken on a fresh install.
+    "mimir/web_auth.js",
+    # Inert VCS placeholder, listed only so the sdist carries every tracked file
+    # the wheel does and the parity guard needs no exemption list.
+    "mimir/react_app/.gitkeep",
+]
+# Belt-and-suspenders: nothing under ``deepagent_poc/`` (deleted in
+# the cutover, but the exclude prevents accidental re-add from sneaking
+# into a wheel), no smoke-artifact SQLite dumps, no transient bench logs.
+exclude = [
+    # The installable example is a test-only external distribution, not part of mimir-agent.
+    "tests/fixtures/plugins/example/**",
+    "mimir/deepagent_poc/**",
+    "mimir/**/_smoke_*",
+    "mimir/**/_bench_*.log",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-n auto --dist worksteal"
+markers = [
+    "allow_empty_parametrize: permit an intentionally empty parameter set to skip",
+    "real_worklink_identities: use provisioned mimir/worklink accounts instead of synthetic IDs",
+    "real_coding_cli(name): opt in to a host coding CLI via the real_coding_cli fixture",
+]
+# Fail stalled tests individually, preserving their node ids and the session.
+# The thread method exits the worker instead of reporting a normal failure.
+timeout = 300
+timeout_method = "signal"
+# Keep the diagnostic stack dump as well as pytest-timeout's failure traceback.
+faulthandler_timeout = 300
+faulthandler_exit_on_timeout = false
+
+# Workspace setup: mimir's pyproject is also the workspace root;
+# benchmarks/saga/ is the LongMemEval bench shell (not the runtime memory
+# backend, which lives at mimir/saga/). Cultivate is a separate distribution.
+[tool.uv.workspace]
+members = ["benchmarks/saga", "plugins/cultivate"]
+
+# Resolve the dev dependency group's ``saga`` from the workspace member
+# rather than PyPI. uv installs it editable for local tests and benchmarks.
+[tool.uv.sources]
+saga = { workspace = true }
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[dependency-groups]
+# uv-native dependency group (PEP 735). Includes the workspace-only bench
+# harness, which must never appear in published wheel metadata. uv sync
+# installs this group by default, including when --extra dev is requested.
+# Claude Code remains opt-in via ``--extra claude-code``; CI has a
+# dedicated smoke job for that adapter path.
+dev = [
+    "saga",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+    "jsonschema==4.26.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-aiohttp>=1.0",
+    "pytest-xdist>=3.8",
+    "pytest-timeout>=2.4",
+    "discord-py>=2.6",
+    "slack-bolt>=1.18",
+    "langchain-anthropic>=1.5.3,<2",
+    "langchain-openai>=1.2.1",
+    "langchain-codex-plus>=0.0.12,<0.1",
+    "mcp>=2.3,<3",
+    "faiss-cpu>=1.13",
+    "botocore>=1.35",
+]

@@ -1,0 +1,5295 @@
+from __future__ import annotations
+
+import asyncio
+import errno
+import fcntl
+import base64
+from dataclasses import asdict, replace
+from importlib.metadata import PackageNotFoundError, version
+import json
+import functools
+import hashlib
+import grp
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import socket
+import select
+import shlex
+import signal
+import stat
+import struct
+import sys
+from types import SimpleNamespace
+import subprocess
+import time
+import tomllib
+import traceback
+import uuid
+from unittest.mock import Mock
+
+import pytest
+import yaml
+from langchain_core.tools import ToolException
+
+from tests.lease_attestation_helper import assert_lease_attested
+
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("repository tooling requires installed Cultivate", allow_module_level=True)
+
+
+from mimir_cultivate.contained_execution import (
+    CollectedExecutionResult,
+    SensitiveMaterialScrubber,
+)
+from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snapshot
+from mimir_cultivate.policy import RepoPRAction, RepoPRActionScope, RepoReviewState
+from mimir_cultivate.repository import (
+    PRCheckoutLease,
+    acquire_pr_checkout_lease,
+    cleanup_pr_checkout_lease,
+    create_pr_checkout_lease,
+    hold_pr_checkout_lease,
+    recover_pr_checkout_lease,
+)
+from mimir_cultivate.repository import (
+    _TIMEOUT_SECONDS,
+    ProjectTestRefusal,
+    ProjectTestResult,
+    RepoProjectTests,
+    _safe_output,
+    _safe_stderr_output,
+    _validated_selectors,
+    _configured_command,
+)
+from mimir_cultivate.repository import (
+    GitCommit,
+    GitDiff,
+    GitFetch,
+    GitMerge,
+    GitMergeAbort,
+    GitProcessResult,
+    GitPush,
+    GitRebase,
+    GitRebaseAbort,
+    GitRefusal,
+    GitRevert,
+    GitRevertAbort,
+    GitStage,
+    GitStatus,
+    GitUnmerged,
+    RepoGitTools,
+    _HISTORY_REWRITE_EVENT_TYPES,
+    _bounded_subprocess_runner,
+    retained_factory_snapshot_bundle,
+    was_agent_push,
+)
+from mimir.tools.refusals import ToolPolicyRefusal
+
+
+@pytest.fixture(autouse=True)
+def provider_test_identities(monkeypatch, synthetic_worklink_identities):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    if synthetic_worklink_identities is not None:
+        from mimir_cultivate import repository
+
+        monkeypatch.setattr(repository, "get_identities", lambda: synthetic_worklink_identities)
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+def test_pr_lease_is_continuous_and_identity_changes_on_reacquisition(tmp_path: Path) -> None:
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    first = state.checkout_lease
+    assert first is not None
+
+    with hold_pr_checkout_lease(first):
+        fd = os.open(first.lease_root, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+        assert first.is_active
+
+    second = recover_pr_checkout_lease(
+        first.path, scope, owner=scope.principal,
+        lease_root=first.lease_root, review_state=state,
+    )
+    assert second.path == first.path
+    assert second.recovery_id != first.recovery_id
+    with pytest.raises(RuntimeError, match="no longer live"):
+        with hold_pr_checkout_lease(first):
+            pass
+    with hold_pr_checkout_lease(second):
+        assert second.is_active
+
+
+def test_middleware_dispatch_holds_checkout_through_observation(tmp_path: Path) -> None:
+    from contextlib import ExitStack
+    from mimir.tools.budget_gate import _hold_scoped_pr_dispatch
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    assert lease is not None
+    call = SimpleNamespace(
+        tool_name="repo_status", policy=None,
+        authorization=SimpleNamespace(repo_pr_action_scope=scope),
+        auth_context=SimpleNamespace(
+            server_discovered_pr_states=None,
+            repo_pr_scope_registry=SimpleNamespace(resolve=lambda *_: state),
+        ),
+        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+    )
+    fd = os.open(lease.lease_root, os.O_RDONLY)
+    try:
+        with ExitStack() as stack:
+            _hold_scoped_pr_dispatch(call, stack)
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Repeated observation within the same dispatch must not release it.
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_repo_rebase_description_matches_history_rewrite_events():
+    from mimir_cultivate.repository import repo_rebase
+
+    description = repo_rebase.description  # The description exposed to the model.
+    assert "Available only on turns for history-rewrite event types" in description
+    assert "_HISTORY_REWRITE_EVENT_TYPES" in description
+    event_text = description.split("_HISTORY_REWRITE_EVENT_TYPES (mimir/repo_tools.py):", 1)[1]
+    event_text = event_text.split("In other PR-remediation scopes", 1)[0]
+    named_events = re.findall(r"`([a-z][a-z0-9_]*)`", event_text)
+    assert len(named_events) == len(set(named_events))
+    assert set(named_events) == _HISTORY_REWRITE_EVENT_TYPES
+    assert "use repo_merge" in description
+
+
+def test_repo_merge_description_is_default_base_update_path():
+    from mimir_cultivate.repository import repo_merge
+
+    description = repo_merge.description
+    assert "default way to update a PR branch with its base" in description
+    assert "every PR-remediation scope" in description
+    description = " ".join(description.split())
+    assert (
+        "If it merges cleanly, the merge commit already exists; next call repo_push."
+        in description
+    )
+    assert (
+        "On conflicts: repo_unmerged, resolve, repo_stage, then repo_commit listing "
+        "every staged path (the merge stages auto-merged files too), then repo_push."
+        in description
+    )
+
+
+def test_history_tool_descriptions_and_redirect_refusal() -> None:
+    from mimir.access_control import parse_service_shell_argv_with_diagnostics
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir_cultivate.repository import repo_file_at_revision, repo_restore_file
+
+    assert "byte-exact fixtures or restores" in repo_restore_file.description
+    assert "Read old versions" in repo_file_at_revision.description
+    assert "never silently truncated" in repo_file_at_revision.description
+    assert "Decode each page according to encoding to recover exact bytes." in repo_file_at_revision.description
+    command = "git show 0123456789abcdef:fixture.bin > copy.bin"
+    argv, reason, _ = parse_service_shell_argv_with_diagnostics(command, "repo_review")
+    assert argv is None and "repo_restore_file" in reason
+    with policy_scope(core_policy_registry()):
+        argv, reason, _ = parse_service_shell_argv_with_diagnostics(command, "repo_review")
+        assert argv is None and "repo_restore_file" not in reason
+
+
+@pytest.mark.parametrize("error", [PermissionError, ProcessLookupError, OSError],
+                         ids=["EPERM", "ESRCH", "EINVAL"])
+def test_bounded_subprocess_runner_killpg_guard(monkeypatch, error):
+    from mimir_cultivate import repository as repo_tools
+
+    process = Mock(pid=12345)
+    process.wait.return_value = -signal.SIGKILL
+    selector = Mock()
+    selector.get_map.return_value = {1: object()}
+    monkeypatch.setattr(repo_tools.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(repo_tools.selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(repo_tools.os, "set_blocking", Mock())
+    exc = error(errno.EINVAL if error is OSError else
+                errno.EPERM if error is PermissionError else errno.ESRCH, "signal failed")
+    killpg = Mock(side_effect=exc)
+    monkeypatch.setattr(repo_tools.os, "killpg", killpg)
+
+    if error is OSError:
+        with pytest.raises(OSError) as caught:
+            _bounded_subprocess_runner(("git",), env={}, timeout=0, output_limit=10)
+        assert caught.value is exc
+        process.wait.assert_not_called()
+    else:
+        result = _bounded_subprocess_runner(("git",), env={}, timeout=0, output_limit=10)
+        assert result == GitProcessResult(-signal.SIGKILL, "", "", True, False)
+        process.wait.assert_called_once_with(timeout=1)
+    killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+    selector.close.assert_called_once_with()
+    process.stdout.close.assert_called_once_with()
+    process.stderr.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,scoped,decision", [
+    ("test_timeout", False, "publish"),
+    ("test_output_overflow", False, "publish"),
+    ("tests_failed_output_overflow", False, "publish"),
+    ("test_output_overflow", True, "hold"),
+    ("tests_failed_output_overflow", True, "hold"),
+    ("test_snapshot_unavailable", False, "publish"),
+    ("test_containment_unavailable", False, "publish"),
+    ("tests_failed", False, "hold"),
+    ("tests_failed", True, "hold"),
+    ("test_timeout", True, "hold"),
+    ("test_snapshot_unavailable", True, "hold"),
+    ("test_containment_unavailable", True, "hold"),
+    ("tests_passed", True, "eligible"),
+    ("tests_passed", False, "eligible"),
+    ("scope_action_denied", False, "refuse"),
+    ("test_snapshot_credentials_refused", False, "refuse"),
+])
+async def test_remediation_publication_decision_table(monkeypatch, code, scoped, decision):
+    from mimir_cultivate import repository as repo_module
+
+    result_codes = {
+        "tests_passed", "tests_failed", "test_timeout",
+        "test_output_overflow", "tests_failed_output_overflow",
+    }
+
+    async def execute(self, selectors, *, suite):
+        assert bool(selectors) is scoped
+        if code not in result_codes:
+            raise ProjectTestRefusal(code, "unavailable", execution_started=False)
+        return ProjectTestResult(
+            code == "tests_passed", code,
+            None if code == "test_timeout" else (
+                0 if code in {"tests_passed", "test_output_overflow"} else 1
+            ),
+            stdout="1 failed, 2 passed\nFAILED tests/test_fix.py::test_fix"
+            if code == "tests_failed" else "",
+        )
+
+    monkeypatch.setattr(repo_module, "_state", lambda *args: object())
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", execute)
+    selectors = ("tests/test_fix.py",) if scoped else ()
+    if code not in result_codes:
+        with pytest.raises(ToolException) as error:
+            await repo_module.repo_test.coroutine("owner/repo", 42, selectors)
+        guidance = str(error.value).split("\n", 1)[1]
+        assert isinstance(error.value, ToolPolicyRefusal)
+    else:
+        result = await repo_module.repo_test.coroutine("owner/repo", 42, selectors)
+        assert result["code"] == code
+        assert result["ok"] is (code == "tests_passed")
+        guidance = result["remediation_guidance"]
+
+    if decision != "refuse":
+        assert guidance != (
+            "Resolve this refusal; it does not authorize publication or bypass repository policy."
+        )
+
+    if decision == "publish":
+        assert not guidance.startswith("Hold publication")
+        assert "After scoped tests pass, commit, push" in guidance
+        assert "re-request review" in guidance
+        assert "did not complete (not failed)" in guidance
+        assert "CI is the validation surface" in guidance
+        if code in {"test_timeout", "test_output_overflow", "tests_failed_output_overflow"}:
+            assert "the contained runner did not complete the suite; this is not test evidence either way — push and rely on CI" in guidance
+    elif decision == "hold":
+        assert guidance.startswith("Hold publication")
+        if scoped:
+            assert "scoped tests must pass" in guidance
+            assert "push and rely on CI" not in guidance
+        else:
+            assert "completed failing full-suite run with counts observed and failed_tests non-empty" in guidance
+    elif decision == "eligible":
+        assert "Scoped tests must pass before pushing" in guidance
+    else:
+        assert "does not authorize publication" in guidance
+        assert "commit, push" not in guidance
+
+
+def _fixture_git_env() -> dict[str, str]:
+    # A test's source, origin and lease must not follow the runner's Git
+    # redirections (GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_COUNT, etc.).
+    return {
+        **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "maintenance.auto",
+        "GIT_CONFIG_VALUE_0": "false",
+    }
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
+        env=_fixture_git_env(),
+    )
+    return result.stdout.strip()
+
+
+def _repo_scope_and_state(
+    tmp_path: Path, *, event_type: str = "pr_changes_requested_stale",
+    commit_count: int = 1, pull_request_author: str | None = None,
+    base_ref: str = "main",
+    allowed_operations: frozenset[str] | None = None,
+    base_files: dict[str, bytes] | None = None,
+    base_modes: dict[str, int] | None = None,
+    history_entries: bool = False,
+) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
+    origin = tmp_path / "origin.git"
+    git_env = _fixture_git_env()
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, env=git_env)
+    source = tmp_path / "source"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True, env=git_env)
+    _git(source, "remote", "add", "origin", str(origin.resolve()))
+    _git(source, "config", "user.name", "test")
+    _git(source, "config", "user.email", "test@example.com")
+    _git(source, "config", "commit.gpgsign", "false")
+    (source / "tracked.txt").write_text("base\n", encoding="utf-8")
+    for name, data in (base_files or {}).items():
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod((base_modes or {}).get(name, 0o644))
+    if history_entries:
+        (source / "tree").mkdir()
+        (source / "tree" / "child").write_text("child")
+        (source / "link").symlink_to("tracked.txt")
+    _git(source, "add", ".")
+    _git(source, "commit", "-q", "-m", "base")
+    if history_entries:
+        _git(source, "update-index", "--add", "--cacheinfo", "160000," + _git(source, "rev-parse", "HEAD") + ",submodule")
+        _git(source, "commit", "-q", "-m", "submodule entry")
+    base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    if base_ref != "main":
+        _git(source, "push", "-q", "origin", f"HEAD:{base_ref}")
+    _git(source, "checkout", "-q", "-b", "worklink/7")
+    (source / "tracked.txt").write_text("pull request\n", encoding="utf-8")
+    _git(source, "commit", "-qam", "pull request")
+    for number in range(1, commit_count):
+        (source / "tracked.txt").write_text(f"pull request {number}\n", encoding="utf-8")
+        _git(source, "commit", "-qam", f"pull request {number}")
+    head = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+    assert _git(origin, "rev-parse", "--verify", "refs/heads/main") == base
+    assert _git(origin, "rev-parse", "--verify", "refs/heads/worklink/7") == head
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root=str(source.resolve()),
+        canonical_origin=str(origin.resolve()),
+        principal="mimir-bot",
+        event_type=event_type,
+        allowed_operations=allowed_operations if allowed_operations is not None else frozenset(action.value for action in RepoPRAction),
+        pr_number=7,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/worklink/7",
+        observed_head_sha=head,
+        base_ref=base_ref,
+        observed_base_sha=base,
+        pull_request_author=pull_request_author,
+    )
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    state = RepoReviewState(scope)
+    create_pr_checkout_lease(
+        scope, owner="mimir-bot", lease_root=leases, review_state=state,
+        runner=lambda args: subprocess.run(
+            args, capture_output=True, text=True, check=False, env=git_env,
+        ),
+    )
+    lease = state.checkout_lease
+    if lease is None:
+        pytest.fail("PR checkout fixture did not attach a lease")
+    checkout_head = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD^{commit}"],
+        capture_output=True, text=True, check=False, env=git_env,
+    )
+    if checkout_head.returncode != 0:
+        pytest.fail(f"PR checkout fixture cloned an empty lease: {checkout_head.stderr.strip()}")
+    if checkout_head.stdout.strip() != scope.observed_head_sha or lease.head_sha != scope.observed_head_sha:
+        pytest.fail(
+            "PR checkout fixture head differs from scoped PR head: "
+            f"checkout={checkout_head.stdout.strip()}, lease={lease.head_sha}, "
+            f"scope={scope.observed_head_sha}"
+        )
+    return origin, source, scope, state
+
+
+def _history_runtime(scope, state, *, tainted=False):
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+
+    return SimpleNamespace(context=replace(
+        _lineage_turn(scope, state, tainted=tainted),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    ))
+
+
+def test_historical_restore_and_binary_paging(tmp_path: Path) -> None:
+    from mimir_cultivate.repository import repo_file_at_revision, repo_restore_file
+
+    data = b"\xff\x00\xfe historical\n" * 85000
+    _, _, scope, state = _repo_scope_and_state(tmp_path, base_files={"fixture.bin": data})
+    runtime = _history_runtime(scope, state)
+    restored = repo_restore_file.func("owner/repo", 7, scope.observed_base_sha,
+                                      "fixture.bin", "testdata/copy.bin", runtime=runtime)
+    assert restored == {
+        "destination": "testdata/copy.bin", "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(), "mode": "100644",
+    }
+    assert (state.checkout_lease.path / "testdata/copy.bin").read_bytes() == data
+    pages = bytearray()
+    offset = 0
+    while True:
+        page = repo_file_at_revision.func("owner/repo", 7, scope.observed_base_sha,
+                                          "fixture.bin", offset=offset, limit=8192, runtime=runtime)
+        assert page["total_bytes"] == len(data)
+        assert page["encoding"] == "base64"
+        pages.extend(base64.b64decode(page["content"], validate=True))
+        if page["next_offset"] is None:
+            break
+        assert page["next_offset"] > offset
+        offset = page["next_offset"]
+    assert bytes(pages) == data
+
+
+def test_historical_review_scope_enforced_when_runtime_enforcement_is_off(tmp_path: Path) -> None:
+    from mimir_cultivate.repository import repo_file_at_revision, repo_restore_file
+
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, allowed_operations=frozenset({RepoPRAction.INSPECT.value, RepoPRAction.CHECKOUT.value}),
+    )
+    runtime = _history_runtime(scope, state)
+    runtime.context = replace(runtime.context, enforcement_enabled=False)
+    page = repo_file_at_revision.func(
+        "owner/repo", 7, scope.observed_base_sha, "tracked.txt", runtime=runtime,
+    )
+    assert page["encoding"] == "utf-8" and page["content"] == "base\n"
+    target = state.checkout_lease.path / "copy.txt"
+    with pytest.raises(ToolException, match="scope_action_denied"):
+        repo_restore_file.func(
+            "owner/repo", 7, scope.observed_base_sha, "tracked.txt", "copy.txt", runtime=runtime,
+        )
+    assert not target.exists()
+    assert not list(state.checkout_lease.path.rglob(".repo-restore-*"))
+
+
+@pytest.mark.parametrize("destination_still_valid", [True, False])
+def test_historical_restore_rechecks_destination_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, destination_still_valid: bool,
+) -> None:
+    from mimir import access_control
+    from mimir_cultivate.repository import repo_restore_file
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    runtime = _history_runtime(scope, state)
+    root = state.checkout_lease.path
+    target = root / "copy.txt"
+    original = b"unchanged destination\n"
+    target.write_bytes(original)
+    real_check = access_control._target_within_active_pr_checkout_lease
+    checks = []
+
+    def check_destination(path, active_state):
+        assert path == str(target) and active_state is state
+        assert real_check(path, active_state)
+        checks.append(path)
+        if len(checks) == 1:
+            return True
+        assert len(checks) == 2
+        assert len(list(root.glob(".repo-restore-*"))) == 1
+        return destination_still_valid
+
+    monkeypatch.setattr(access_control, "_target_within_active_pr_checkout_lease", check_destination)
+
+    def restore():
+        return repo_restore_file.func(
+            "owner/repo", 7, scope.observed_base_sha, "tracked.txt", "copy.txt", runtime=runtime,
+        )
+
+    if destination_still_valid:
+        assert restore()["destination"] == "copy.txt"
+        assert target.read_bytes() == b"base\n"
+    else:
+        with pytest.raises(ToolException, match="destination changed"):
+            restore()
+        assert target.read_bytes() == original
+    assert checks == [str(target), str(target)]
+    assert not list(root.rglob(".repo-restore-*"))
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o755])
+def test_historical_restore_preserves_mode(tmp_path: Path, mode: int) -> None:
+    from mimir_cultivate.repository import repo_restore_file
+
+    data = b"#!/bin/sh\nprintf 'verified\\n'\n"
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, base_files={"tools/verify": data}, base_modes={"tools/verify": mode},
+    )
+    runtime = _history_runtime(scope, state)
+    root = state.checkout_lease.path
+    target = root / "tools/verify"
+    target.chmod(0o644 if mode == 0o755 else 0o755)
+    target.write_bytes(b"changed\n")
+    old_umask = os.umask(0o077)
+    try:
+        result = repo_restore_file.func(
+            "owner/repo", 7, scope.observed_base_sha,
+            "tools/verify", "tools/verify", runtime=runtime,
+        )
+    finally:
+        os.umask(old_umask)
+    assert result["mode"] == f"100{mode:o}"
+    assert target.read_bytes() == data
+    assert stat.S_IMODE(target.stat().st_mode) == mode
+    assert _git(root, "diff", "--exit-code", scope.observed_base_sha, "--", "tools/verify") == ""
+
+
+@pytest.mark.parametrize("limit", [1, 2, 5, 8192])
+def test_historical_utf8_paging(tmp_path: Path, limit: int) -> None:
+    from mimir_cultivate.repository import repo_file_at_revision
+
+    data = "ASCII\né € 😀 café\n".encode("utf-8")
+    _, _, scope, state = _repo_scope_and_state(tmp_path, base_files={"unicode.txt": data})
+    runtime = _history_runtime(scope, state)
+    offset = 0
+    pages = bytearray()
+    encodings = set()
+    while True:
+        page = repo_file_at_revision.func(
+            "owner/repo", 7, scope.observed_base_sha, "unicode.txt",
+            offset=offset, limit=limit, runtime=runtime,
+        )
+        end = min(offset + limit, len(data))
+        expected = data[offset:end]
+        try:
+            text = expected.decode("utf-8")
+        except UnicodeDecodeError:
+            assert page["encoding"] == "base64"
+            decoded = base64.b64decode(page["content"], validate=True)
+        else:
+            assert page["encoding"] == "utf-8"
+            assert page["content"] == text
+            decoded = page["content"].encode("utf-8")
+        encodings.add(page["encoding"])
+        assert decoded == expected
+        assert page["offset"] == offset
+        assert page["total_bytes"] == len(data)
+        assert page["next_offset"] == (end if end < len(data) else None)
+        pages.extend(decoded)
+        if page["next_offset"] is None:
+            break
+        offset = page["next_offset"]
+    assert bytes(pages) == data
+    assert encodings == ({"utf-8"} if limit == 8192 else {"utf-8", "base64"})
+    eof = repo_file_at_revision.func(
+        "owner/repo", 7, scope.observed_base_sha, "unicode.txt",
+        offset=len(data), limit=limit, runtime=runtime,
+    )
+    assert eof["encoding"] == "utf-8" and eof["content"] == ""
+    assert eof["next_offset"] is None
+
+
+def test_historical_file_refusals(tmp_path: Path) -> None:
+    from mimir_cultivate.repository import repo_file_at_revision, repo_restore_file
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+
+    origin, source, scope, state = _repo_scope_and_state(
+        tmp_path, base_files={"small": b"\x00\xff", "large": b"a" * (2 * 1024 * 1024 + 1)},
+        history_entries=True,
+    )
+    runtime = _history_runtime(scope, state)
+    root = state.checkout_lease.path
+
+    def restore(revision=scope.observed_base_sha, source_path="small", destination_path="copy"):
+        return repo_restore_file.func("owner/repo", 7, revision, source_path,
+                                      destination_path, runtime=runtime)
+
+    with pytest.raises(ToolException):
+        restore(revision="HEAD")
+    for offset, limit in ((-1, 10), (0, 8193), (0, 0), (3, 10)):
+        with pytest.raises(ToolException):
+            repo_file_at_revision.func("owner/repo", 7, scope.observed_base_sha,
+                                        "small", offset=offset, limit=limit, runtime=runtime)
+    for source_path in ("tree", "link", "submodule", "large", "../small"):
+        with pytest.raises(ToolException):
+            restore(source_path=source_path)
+        with pytest.raises(ToolException):
+            repo_file_at_revision.func("owner/repo", 7, scope.observed_base_sha,
+                                        source_path, runtime=runtime)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    for target in ("../escape", str(outside / "escape"), "linked/escape", ".git/config", "config.py"):
+        with pytest.raises(ToolException):
+            restore(destination_path=target)
+    assert not (outside / "escape").exists()
+    assert not (root.parent / "escape").exists()
+    (root / "inside").mkdir()
+    (root / "inner-link").symlink_to("inside", target_is_directory=True)
+    with pytest.raises(ToolException):
+        restore(destination_path="inner-link/copy")
+    (root / "existing").write_bytes(b"old")
+    assert restore(destination_path="existing")["bytes"] == 2
+    assert (root / "existing").read_bytes() == b"\x00\xff"
+    for target in ("tree-dir", "link-file"):
+        if target == "tree-dir":
+            (root / target).mkdir()
+        else:
+            (root / target).symlink_to("existing")
+        with pytest.raises(ToolException):
+            restore(destination_path=target)
+
+    _git(source, "checkout", "-q", "-b", "unrelated", "main")
+    (source / "unrelated").write_text("not in PR history")
+    _git(source, "add", "unrelated")
+    _git(source, "commit", "-q", "-m", "unrelated")
+    arbitrary = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:unrelated")
+    _git(root, "fetch", "-q", str(origin), "unrelated")
+    with pytest.raises(ToolException, match="outside base and head history"):
+        restore(revision=arbitrary, source_path="unrelated")
+    assert not (root / "copy").exists()
+
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    _, _, review_scope, review_state = _repo_scope_and_state(
+        review_dir, allowed_operations=frozenset({RepoPRAction.INSPECT.value, RepoPRAction.CHECKOUT.value}),
+    )
+    runtime.context = replace(_lineage_turn(review_scope, review_state),
+                              repo_pr_scope_registry=RepoPRScopeRegistry((review_state,)))
+    page = repo_file_at_revision.func("owner/repo", 7, review_scope.observed_base_sha,
+                                      "tracked.txt", runtime=runtime)
+    assert page["encoding"] == "utf-8"
+    assert page["content"] == "base\n"
+    with pytest.raises(ToolException):
+        restore(revision=review_scope.observed_base_sha, source_path="tracked.txt")
+    runtime.context = _history_runtime(scope, state, tainted=True).context
+    with pytest.raises(ToolException, match="untrusted ingest"):
+        restore()
+
+
+def _lineage_turn(scope, state, *, tainted=False):
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel,
+        TurnInteractivity,
+    )
+
+    labels = InformationFlowLabels()
+    if tainted:
+        labels = labels.with_source(SourceLabel(
+            principal="outside", domain="web", resource_id="untrusted-instruction",
+            bridge_instance="web", sensitivity="public", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
+    ifc = InformationFlowState(labels=labels)
+    ifc.pr_checkout_author_trust[scope.scope_id] = True
+    return AuthContext(
+        principal="mimir-bot", canonical_principal="mimir-bot", roles=("user",),
+        event_ingress=None, trigger="poller", channel_id="channel-1",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        enforcement_enabled=not tainted, ifc_labels=labels, ifc_state=ifc,
+        repo_pr_action_scope=scope, repo_review_state=state,
+    )
+
+
+def _selected_checkout_and_follow_on_with_live_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
+    operation: str = "repo_fetch", author_trust: bool | None = True,
+    git_ok: bool = True,
+):
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+    from langchain.tools import ToolRuntime
+    from mimir.access_control import (
+        ScopedPRGrants, _SCOPED_PR_ISSUER, consume_scoped_pr_checkout,
+        observe_scoped_pr_checkout,
+    )
+    from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir_cultivate import forge as selected_forge, repository
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    selected = load_plugins(enable="cultivate").policy
+    labels = InformationFlowLabels()
+    ifc_state = InformationFlowState(labels=labels)
+    ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    auth = AuthContext(
+        principal=scope.principal, canonical_principal=scope.principal, roles=("service",),
+        event_ingress=None, trigger="poller", channel_id="poller:github",
+        interactivity=None, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+        ifc_labels=labels, ifc_state=ifc_state,
+        scoped_pr_grants=ScopedPRGrants(
+            scope.principal, (scope,), protocols=selected.scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        ), enforcement_enabled=True, _plugin_slot_policy=selected,
+    )
+    monkeypatch.setattr(selected_forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(selected_forge, "_client", lambda _: object())
+    git_operations = []
+    if operation != "repo_fetch":
+        def execute(_tools, git_operation):
+            git_operations.append(type(git_operation).__name__)
+            return repository.GitOperationResult(
+                git_ok, "ok" if git_ok else "merge_conflict",
+                stderr="" if git_ok else "distinctive SECRET error text",
+            )
+
+        monkeypatch.setattr(repository.RepoGitTools, "execute", execute)
+
+    arguments = {
+        "repo_stage": {"paths": ("tracked.txt",)},
+        "repo_commit": {"paths": ("tracked.txt",), "message": "update"},
+        "repo_revert": {"commit": scope.observed_head_sha},
+    }.get(operation, {})
+
+    def request_for(tool, identifier, context, *, extra=None):
+        return ToolCallRequest(
+            tool_call={"name": tool.name, "args": {
+                "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                **(extra or {}),
+            }, "id": identifier, "type": "tool_call"},
+            tool=tool, state={}, runtime=Runtime(context=context),
+        )
+
+    calls = []
+    def handler(call):
+        tool = getattr(repository, call.tool_call["name"])
+        calls.append(tool.name)
+        runtime = ToolRuntime(
+            state={}, context=call.runtime.context, config={}, stream_writer=lambda _: None,
+            tool_call_id=call.tool_call["id"], store=None,
+        )
+        result = tool.func(**call.tool_call["args"], runtime=runtime)
+        return ToolMessage(content=json.dumps(result), tool_call_id=call.tool_call["id"])
+
+    with policy_scope(selected):
+        gate = BudgetGateMiddleware(selected)
+        follow_on_tool = getattr(repository, operation)
+        before_checkout = gate.wrap_tool_call(
+            request_for(follow_on_tool, "prelease-operation", auth, extra=arguments), handler,
+        )
+        assert before_checkout.status == "error"
+        assert "repo_pr_grant_denied" in str(before_checkout.content)
+        assert calls == []
+        checked_out = gate.wrap_tool_call(
+            request_for(repository.repo_checkout, "selected-checkout", auth), handler,
+        )
+        assert checked_out.status != "error", checked_out.content
+        assert calls == ["repo_checkout"]
+        assert auth.ifc_state.has_untrusted_active_ingest()
+
+        clean_labels = InformationFlowLabels()
+        follow_on = replace(
+            auth, ifc_labels=clean_labels, ifc_state=InformationFlowState(labels=clean_labels),
+            scoped_pr_grants=ScopedPRGrants(
+                scope.principal, (scope,), protocols=selected.scoped_actions,
+                _issuer=_SCOPED_PR_ISSUER,
+            ),
+        )
+        follow_on.ifc_state.pr_checkout_author_trust[scope.scope_id] = author_trust
+        token = consume_scoped_pr_checkout(follow_on, scope, "cultivate")
+        assert token is not None
+        assert observe_scoped_pr_checkout(
+            follow_on, scope, state, token, "cultivate", selected.scoped_actions["cultivate"],
+        )
+        executed = gate.wrap_tool_call(
+            request_for(follow_on_tool, "selected-operation", follow_on, extra=arguments), handler,
+        )
+        assert executed.status != "error", executed.content
+        assert calls == ["repo_checkout", operation]
+        if operation != "repo_fetch":
+            assert len(git_operations) == 1
+    return selected, scope, auth, follow_on, checked_out, executed
+
+
+def test_selected_checkout_and_fetch_use_live_owner_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, _, _, checked_out, fetched = _selected_checkout_and_follow_on_with_live_grants(
+        tmp_path, monkeypatch,
+    )
+    assert checked_out.status != "error", checked_out.content
+    assert fetched.status != "error", fetched.content
+    assert json.loads(fetched.content)["ok"] is True
+
+
+@pytest.mark.parametrize("case", ["collaborator", "outsider", "head_mismatch", "git_timeout"])
+@pytest.mark.usefixtures("selected_repo_inventory")
+def test_github_activity_remediation_turn_attests_large_collaborator_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    from mimir import access_control, event_logger
+    from mimir_cultivate import repository as repo_tools
+    from mimir.access_control import CapabilityTier, ToolAuthorization, build_trigger_service_principal
+    from mimir_cultivate.forge import CommentProjection, PullRequestProjection, ReviewProjection
+    from mimir.models import InformationFlowLabels, InformationFlowState
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge, repository as repo
+
+    # This integration proves author/head policy and provenance through the real
+    # Git status proof, not runner latency. As in the taint-precedence test below,
+    # allow a loose test-only hang guard on loaded macOS workers. Keep production's
+    # requested bound pinned and prove timeout still fails closed end-to-end.
+    hardened_git = repo_tools.hardened_git_command
+    status_probes = []
+
+    def policy_test_git(root, arguments, **kwargs):
+        assert arguments == ("status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        assert kwargs["timeout"] == access_control._LEASE_GIT_TIMEOUT_S
+        status_probes.append(arguments)
+        if case == "git_timeout":
+            return GitProcessResult(-9, timed_out=True)
+        return hardened_git(root, arguments, **{**kwargs, "timeout": 30})
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", policy_test_git)
+    selected = selected_policy_registry()
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks, git_command=policy_test_git,
+    ))
+    # Git commit identity is intentionally unrelated to the GitHub PR login.
+    _origin, _source, scope, state = _repo_scope_and_state(
+        tmp_path, commit_count=56 if case == "collaborator" else 1,
+        pull_request_author="collaborator" if case != "outsider" else "outsider",
+        base_ref="feature/plugins",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{tmp_path / 'leases'}:rw")
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    metadata = PullRequestProjection(
+        7, "Title", "open", scope.pull_request_author, False, scope.base_ref, "worklink/7",
+        "f" * 40 if case == "head_mismatch" else scope.observed_head_sha,
+        True, "created", "updated",
+    )
+    client = SimpleNamespace(
+        author_is_trusted=lambda _repo, author: author in {"collaborator", "reviewer"},
+        get_pull_request=lambda _: metadata,
+        list_reviews=lambda _: (ReviewProjection("1", "reviewer", "approve", "ok", "now", scope.observed_head_sha),),
+        list_comments=lambda _: (CommentProjection("1", "reviewer", "note", "now", "now"),),
+    )
+    monkeypatch.setattr(forge, "_client", lambda _: client)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("edit_file",),
+        creation_path="test",
+    )
+    labels = InformationFlowLabels()
+    auth = replace(
+        _lineage_turn(scope, state), principal="service:poller:github-activity",
+        canonical_principal="poller:github-activity", roles=("service",), is_service=True,
+        service_authority=service,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    runtime = SimpleNamespace(context=auth)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **kw: events.append((name, kw)))
+    observed = {}
+    observed_provenance = {}
+    for tool in (forge.pr_reviews, forge.pr_comments, forge.pr_metadata, forge.pr_spec, repo.repo_checkout):
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = tool.func("owner/repo", 7, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        added = access_control.classify_protected_result(
+            tool.name, {"repository": "owner/repo", "pull_request": 7}, auth,
+            ToolAuthorization(tool_name=tool.name, decision="resource_scoped", allowed=True,
+                              repo_pr_action_scope=scope), result=result, provenance=provenance,
+        )
+        observed[tool.name] = added.sources[0].integrity
+        observed_provenance[tool.name] = (
+            provenance.sources[0].integrity if provenance is not None and provenance.sources
+            else None
+        )
+        auth.ifc_state.merge(added)
+    # Put fixed attestation reasons first: CI's short summary truncates the
+    # integrity map and full event payload before reaching the useful diagnostic.
+    refusal_reasons = [
+        kw["reason"] for name, kw in events
+        if name == "pr_checkout_lease_attestation_refused"
+    ]
+    assert observed_provenance == {
+        "pr_reviews": "trusted", "pr_comments": "trusted",
+        "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
+        "pr_spec": "trusted",
+        "repo_checkout": None if case != "collaborator" else "trusted",
+    }, f"lease_refusals={refusal_reasons}; observed={observed_provenance}; events={events}"
+    assert observed == {
+        "pr_reviews": "untrusted", "pr_comments": "untrusted",
+        "pr_metadata": "untrusted", "pr_spec": "untrusted",
+        "repo_checkout": "trusted" if case == "collaborator" else "untrusted",
+    }
+    assert auth.ifc_state.has_untrusted_active_ingest()
+    if case in {"collaborator", "git_timeout"}:
+        assert status_probes  # The positive/timeout controls reached the real proof boundary.
+    assert refusal_reasons == (
+        [] if case == "collaborator" else
+        ["git_timeout"] if case == "git_timeout" else ["no_author_trust"]
+    )
+    # Read actual lease content before exercising the real edit-file gate.
+    target = state.checkout_lease.path / "tracked.txt"
+    read = access_control.classify_protected_result(
+        "read_file", {"file_path": str(target)}, auth,
+        ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
+        result=target.read_text(),
+    )
+    auth.ifc_state.merge(read)
+    assert read.sources[0].integrity == (
+        "trusted" if case == "collaborator" else "untrusted"
+    )
+    decision = access_control.ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+    )
+    assert not decision.allowed, (decision.reason, observed, events)
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    fallbacks = [kw for name, kw in events if name == "repository_result_untrusted_default"]
+    assert fallbacks == []
+
+
+@pytest.mark.parametrize("case", ["unavailable", "missing_cause", "false", "true", "author_mismatch"])
+def test_checkout_records_fresh_turn_local_author_cause(tmp_path, monkeypatch, case):
+    from mimir import pollers
+    from mimir_cultivate import forge, repository as repo
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path, pull_request_author="owner")
+    auth = _lineage_turn(scope, state)
+    causes = auth.ifc_state.pr_checkout_author_trust_cause
+    causes[scope.scope_id] = "membership_timeout"
+    token = pollers._github_author_trust_cause.set("membership_timeout")
+    try:
+        monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+        monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *a, **k: (state.checkout_lease, []))
+        monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(author_is_trusted=lambda *_: None))
+        monkeypatch.setattr(repo, "_publish_attested_lease_result", lambda *_: None)
+
+        def authors(*_):
+            assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None
+            assert causes[scope.scope_id] == "author_unresolved"
+            return (("other",) if case == "author_mismatch" else ("owner",)), None
+
+        def verdict(*_):
+            assert pollers.github_author_trust_cause() is None
+            if case == "unavailable":
+                pollers._github_author_trust_cause.set("collaborator_timeout")
+            return {"false": False, "true": True}.get(case)
+
+        monkeypatch.setattr(forge, "_pr_content_authors", authors)
+        monkeypatch.setattr(forge, "_author_verdict", verdict)
+        repo.repo_checkout.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+        assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is {
+            "false": False, "true": True,
+        }.get(case)
+        if case in {"false", "true"}:
+            assert scope.scope_id not in causes
+        else:
+            assert causes[scope.scope_id] == (
+                "collaborator_timeout" if case == "unavailable" else "author_unresolved"
+            )
+    finally:
+        pollers._github_author_trust_cause.reset(token)
+
+
+def test_repo_scope_fixture_ignores_inherited_git_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foreign = tmp_path / "foreign.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(foreign)],
+        check=True, env=_fixture_git_env(),
+    )
+    monkeypatch.setenv("GIT_DIR", str(foreign))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.bare")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+
+    origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    assert _git(origin, "rev-parse", "--verify", scope.destination_ref) == scope.observed_head_sha
+    assert _git(state.checkout_lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert not (foreign / "refs" / "heads" / "worklink" / "7").exists()
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect
+
+    from mimir import access_control
+    from mimir_cultivate import repository as repo_tools
+    from mimir.access_control import SinkGate
+    from mimir.models import SourceLabel
+
+    # This proves taint precedence over a genuinely attested checkout, not Git
+    # latency. Loaded macOS runners can exceed the production five-second
+    # fail-closed bound. Keep the real hardened Git proof but give this test's
+    # subprocess a loose hang guard; timeout refusal is tested separately in
+    # test_lease_attestation_reasons.py. Production bounds remain unchanged.
+    hardened_git = repo_tools.hardened_git_command
+
+    def policy_test_git(root, arguments, **kwargs):
+        assert arguments == ("status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        assert kwargs["timeout"] == access_control._LEASE_GIT_TIMEOUT_S
+        return hardened_git(root, arguments, **{**kwargs, "timeout": 30})
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", policy_test_git)
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    assert lease is not None and lease.head_sha == scope.observed_head_sha
+    auth = _lineage_turn(scope, state)
+    assert_lease_attested(auth, scope, lease)
+    outsider = SourceLabel(
+        principal="outsider", domain="repository", resource_id="outside-comment",
+        bridge_instance="forge", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = auth.ifc_labels.with_source(outsider)
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    auth = replace(auth, ifc_labels=labels)
+    assert_lease_attested(auth, scope, lease)
+    for name in ("repo_commit", "repo_push"):
+        decision = SinkGate.check_sink_flow(
+            name, "owner/repo#pull/7", labels, auth,
+            enforce=False, repo_pr_action_scope=scope,
+        )
+        assert not decision.allowed and decision.reason == "write_blocked_by_untrusted_ingest"
+        assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+    # Checkout-content attestation cannot
+    # share the commit/push tool set: the model's decision itself is tainted.
+    assert "_REPO_PUBLISH_TOOLS" not in inspect.getsource(access_control._attested_pr_checkout_lease)
+
+
+@pytest.mark.parametrize("lineage", [
+    "clean", "tainted", "tainted_flip", "tainted_base", "missing", "unrecorded", "corrupt",
+])
+@pytest.mark.usefixtures("selected_repo_inventory")
+def test_resumed_local_commit_requires_clean_producing_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lineage: str,
+) -> None:
+    from mimir import access_control
+    # The local bare remote stands in for the configured GitHub origin.
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
+    from mimir.models import InformationFlowLabels
+    from mimir_cultivate.repository import _METADATA
+    from mimir_cultivate.repository import _publish_attested_lease_result
+
+    _origin, _source, scope, first = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "pull_request_author", scope.principal)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    turn1 = _lineage_turn(scope, first, tainted=lineage.startswith("tainted"))
+    lease = first.checkout_lease
+    (lease.path / "tracked.txt").write_text("local remediation\n")
+    RepoGitTools(first, auth_context=turn1, enforce=False).execute(
+        GitCommit(("tracked.txt",), "local fix"),
+    )
+    head = _git(lease.path, "rev-parse", "HEAD")
+    assert first.git_expected_head == head
+    assert lease.head_sha == head != scope.observed_head_sha
+    if lineage in {"tainted_flip", "tainted_base"}:
+        from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
+
+        home = tmp_path / "home"
+        home.mkdir()
+        router = FileToolRouter(
+            default=WriteGuardBackend(home, ["state"]),
+            routes=build_file_tool_routes([(str(lease.lease_root), "rw")]),
+        )
+        metadata_path = lease.path / _METADATA
+        before = metadata_path.read_text()
+        if lineage == "tainted_flip":
+            old, new = f'"{head}": false', f'"{head}": true'
+        else:
+            old, new = f'"{lease.base_sha}"', f'"{head}"'
+        # Real router, shadow enforcement, no SinkGate as a safety net.
+        assert turn1.enforcement_enabled is False
+        assert old in before
+        result = router.edit(str(metadata_path), old, new, replace_all=True)
+        assert "git_metadata_readonly" in result.error
+        assert metadata_path.read_text() == before
+    if lineage in {"missing", "unrecorded", "corrupt"}:
+        record = json.loads((lease.path / _METADATA).read_text())
+        record["lineage"] = (
+            None if lineage == "missing" else {} if lineage == "unrecorded"
+            else {head: "trusted"}
+        )
+        (lease.path / _METADATA).write_text(json.dumps(record))
+    # Turn 1 did not push: a failed/refused test leaves the PR remote pinned.
+    assert _git(_origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    second = RepoReviewState(scope)
+    turn2 = _lineage_turn(scope, second)
+    from mimir_cultivate import forge as forge_module, repository as repo_module
+    monkeypatch.setattr(forge_module, "remediation_checkout_preflight", lambda *_: (second, None))
+    monkeypatch.setattr(forge_module, "_client", lambda _: SimpleNamespace(
+        author_is_trusted=lambda *_: True,
+    ))
+    monkeypatch.setattr(forge_module, "_pr_content_authors", lambda *_: ((scope.principal,), None))
+    monkeypatch.setattr(forge_module, "_author_verdict", lambda *_: True)
+    from mimir.access_control import (
+        SinkGate, ToolAuthorization, begin_protected_result_capture,
+        classify_protected_result, end_protected_result_capture, protected_result_source,
+    )
+    token = begin_protected_result_capture()
+    try:
+        checkout = repo_module.repo_checkout.func(
+            "owner/repo", 7, runtime=SimpleNamespace(context=turn2),
+        )
+    finally:
+        checkout_provenance = end_protected_result_capture(token)
+    resumed = second.checkout_lease
+    assert checkout["status"] == "resumed" and checkout["candidate_commits"] == (head,)
+    assert resumed.head_sha == head
+    assert second.git_expected_head == head
+    trusted = lineage == "clean"
+    if trusted:
+        assert_lease_attested(turn2, scope, resumed)
+    else:
+        assert not access_control._attested_pr_checkout_lease(turn2, scope, resumed)
+    checkout_labels = classify_protected_result(
+        "repo_checkout", {"repository": "owner/repo", "pull_request": 7}, turn2,
+        ToolAuthorization(tool_name="repo_checkout", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=checkout,
+        provenance=checkout_provenance,
+    )
+    assert checkout_labels.sources[0].resource_id == (
+        f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted
+        else "<unresolved-resource:protected_tool:repo_checkout>"
+    )
+    assert checkout_labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+    turn2.ifc_state.merge(checkout_labels)
+    file_source = protected_result_source(
+        turn2, principal="filesystem", domain="filesystem",
+        resource_id=str(resumed.path / "tracked.txt"), bridge_instance="filesystem",
+    )
+    assert (file_source.domain, file_source.integrity) == (
+        ("repository", "trusted") if trusted else ("filesystem", "untrusted")
+    )
+    for name, result in (("repo_status", GitStatus()), ("repo_diff", GitDiff())):
+        token = begin_protected_result_capture()
+        try:
+            RepoGitTools(second).execute(result)
+            _publish_attested_lease_result(SimpleNamespace(context=turn2), second)
+        finally:
+            provenance = end_protected_result_capture(token)
+        labels = classify_protected_result(
+            name, {"repository": "owner/repo", "pull_request": 7}, turn2,
+            ToolAuthorization(tool_name=name, decision="resource_scoped", allowed=True,
+                              repo_pr_action_scope=scope), result="ok", provenance=provenance,
+        )
+        assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+        assert labels.sources[0].resource_id == (
+            f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted
+            else f"<unresolved-resource:protected_tool:{name}>"
+        )
+        turn2.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        turn2.ifc_state.current(InformationFlowLabels()), turn2,
+        enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is trusted
+    if not trusted:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+def test_rebase_cannot_clean_up_tainted_local_commit(tmp_path: Path) -> None:
+    from mimir import access_control
+    from mimir_cultivate.repository import _METADATA
+
+    _origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("tainted fix\n")
+    RepoGitTools(state, auth_context=_lineage_turn(scope, state, tainted=True),
+                 enforce=False).execute(GitCommit(("tracked.txt",), "tainted fix"))
+    _git(source, "checkout", "-q", "main")
+    (source / "base-change.txt").write_text("base update\n")
+    _git(source, "add", "base-change.txt")
+    _git(source, "commit", "-qm", "base update")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    clean = _lineage_turn(scope, state)
+    RepoGitTools(state, auth_context=clean).execute(GitRebase())
+    head = state.git_expected_head
+    lineage = json.loads((lease.path / _METADATA).read_text())["lineage"]
+    assert lineage[head] is False
+    assert not access_control._attested_pr_checkout_lease(clean, scope, lease)
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+def test_rebase_onto_live_advanced_protected_base_stays_attested(tmp_path: Path) -> None:
+    from mimir import access_control
+
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    turn = _lineage_turn(scope, state)
+    _git(source, "checkout", "-q", "main")
+    (source / "new-base.txt").write_text("advanced base\n")
+    _git(source, "add", "new-base.txt")
+    _git(source, "commit", "-qm", "move main")
+    advanced = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    assert scope.observed_base_sha != advanced
+    RepoGitTools(state, auth_context=turn).execute(GitRebase())
+    lease = state.checkout_lease
+    assert lease.base_sha == lease.verified_base_sha == advanced
+    assert_lease_attested(turn, scope, lease)
+    from mimir_cultivate.repository import _METADATA
+    record = json.loads((lease.path / _METADATA).read_text())
+    record["verified_base_sha"] = scope.observed_base_sha
+    (lease.path / _METADATA).write_text(json.dumps(record))
+    assert not access_control._attested_pr_checkout_lease(turn, scope, lease)
+    record["verified_base_sha"] = advanced
+    (lease.path / _METADATA).write_text(json.dumps(record))
+    (lease.path / "foreign.txt").write_text("foreign edit\n")
+    _git(lease.path, "add", "foreign.txt")
+    _git(lease.path, "-c", "user.name=outsider", "-c", "user.email=outside@example.test",
+         "commit", "-qm", "foreign commit")
+    foreign = _git(lease.path, "rev-parse", "HEAD")
+    state.record_git_head(scope.scope_id, foreign)
+    record["lineage"][foreign] = True
+    record["head_sha"] = foreign
+    object.__setattr__(lease, "head_sha", foreign)
+    (lease.path / _METADATA).write_text(json.dumps(record))
+    assert not access_control._attested_pr_checkout_lease(turn, scope, lease)
+
+
+def test_rebase_refuses_non_descendant_protected_base(tmp_path: Path) -> None:
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "--orphan", "unrelated")
+    _git(source, "commit", "-qm", "unrelated root")
+    unrelated = _git(source, "rev-parse", "HEAD")
+    # Transfer the orphan commit before pointing the bare remote's main at it.
+    _git(origin, "fetch", str(source), "unrelated")
+    _git(origin, "update-ref", "refs/heads/main", unrelated)
+    before = state.git_expected_head
+    with pytest.raises(GitRefusal, match="does not descend") as error:
+        RepoGitTools(state, auth_context=_lineage_turn(scope, state)).execute(GitRebase())
+    assert error.value.code == "unverified_base"
+    assert _git(state.checkout_lease.path, "rev-parse", "HEAD") == before
+
+
+def test_rebase_refuses_unprotected_base_ref(tmp_path: Path) -> None:
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "base_ref", "worklink/7")
+    with pytest.raises(GitRefusal, match="protected base") as error:
+        RepoGitTools(state, auth_context=_lineage_turn(scope, state)).execute(GitRebase())
+    assert error.value.code == "unverified_base"
+
+
+def test_lineage_refuses_attested_base_not_descending_from_observed(tmp_path: Path) -> None:
+    from mimir import access_control
+    from mimir_cultivate.repository import _METADATA, _metadata
+
+    _origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    turn = _lineage_turn(scope, state)
+    (lease.path / "tracked.txt").write_text("clean fix\n")
+    RepoGitTools(state, auth_context=turn).execute(GitCommit(("tracked.txt",), "clean fix"))
+    _git(source, "checkout", "--orphan", "unrelated")
+    _git(source, "commit", "-qm", "unrelated root")
+    unrelated = _git(source, "rev-parse", "HEAD")
+    _git(lease.path, "fetch", str(source), "unrelated")
+    object.__setattr__(lease, "base_sha", unrelated)
+    object.__setattr__(lease, "verified_base_sha", unrelated)
+    (lease.path / _METADATA).write_text(json.dumps(_metadata(lease)))
+    # Isolate this guard: identity/patch-id checks cannot mask its removal.
+    assert not access_control._lease_has_clean_lineage(
+        lease.path, lease, scope, scope.observed_head_sha, state.git_expected_head,
+    )
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+def test_fresh_lease_revert_refreshes_head_and_keeps_clean_lineage(tmp_path: Path) -> None:
+    from mimir import access_control
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    turn = _lineage_turn(scope, state)
+    tools = RepoGitTools(state, auth_context=turn)
+    tools.execute(GitRevert(scope.observed_head_sha))
+    lease = state.checkout_lease
+    assert state.git_expected_head == _git(lease.path, "rev-parse", "HEAD")
+    assert_lease_attested(turn, scope, lease)
+
+
+@pytest.fixture
+def repo_tools(tmp_path: Path) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState, RepoGitTools]:
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    return origin, source, scope, state, RepoGitTools(state)
+
+
+def test_inspection_uses_pinned_hardened_argv_and_sanitized_environment(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    lease = state.checkout_lease
+    assert lease is not None
+    marker = lease.path / "executed"
+    helper = lease.path / "helper.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    helper.chmod(0o755)
+    (lease.path / ".gitattributes").write_text("tracked.txt diff=evil filter=evil\n", encoding="utf-8")
+    _git(lease.path, "config", "diff.evil.textconv", str(helper))
+    _git(lease.path, "config", "filter.evil.clean", str(helper))
+    _git(lease.path, "config", "core.pager", str(helper))
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", str(helper))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "alias.status")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", f"!{helper}")
+    monkeypatch.setenv("PAGER", str(helper))
+    calls: list[tuple[tuple[str, ...], dict[str, str], float, int]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append((argv, env, timeout, output_limit))
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    tools = RepoGitTools(state, runner=recording_runner)
+    assert tools.execute(GitStatus()).ok
+    assert tools.execute(GitDiff(mode="base")).ok
+
+    assert not marker.exists()
+    assert calls
+    for argv, env, timeout, output_limit in calls:
+        assert argv[0] == str(Path("/usr/bin/git").resolve())
+        assert argv[1:3] == ("-C", str(lease.path.resolve()))
+        assert ("-c", "core.hooksPath=/dev/null") == argv[5:7]
+        assert "credential.helper=" in argv
+        assert "http.extraHeader=" in argv
+        assert "http.proxy=" in argv
+        assert "http.followRedirects=false" in argv
+        assert "protocol.allow=never" in argv
+        assert "--no-pager" in argv
+        assert "--no-optional-locks" in argv
+        assert timeout == 20.0
+        assert output_limit == 1_048_576
+        assert "GIT_EXTERNAL_DIFF" not in env
+        assert "GIT_CONFIG_COUNT" not in env
+        assert "PAGER" not in env
+        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    diff_argv = next(argv for argv, *_ in calls if "diff" in argv and "--no-color" in argv)
+    assert "--no-ext-diff" in diff_argv
+    assert "--no-textconv" in diff_argv
+    assert not any("protocol.file.allow=always" in argv for argv, *_ in calls)
+
+
+def test_fetch_is_typed_networked_and_uses_only_bound_refs(repo_tools) -> None:
+    _origin, _source, scope, state, _tools = repo_tools
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    result = RepoGitTools(state, runner=recording_runner).execute(GitFetch())
+    fetches = [argv for argv in calls if "fetch" in argv]
+    assert result.ok
+    assert len(fetches) == 2
+    assert [argv[-1] for argv in fetches] == [scope.destination_ref, f"refs/heads/{scope.base_ref}"]
+    assert all(scope.canonical_origin in argv for argv in fetches)
+    assert all("protocol.file.allow=always" in argv for argv in fetches)
+    assert all("fetch" not in argv for argv in calls if "status" in argv or "diff" in argv)
+
+
+def test_tracked_file_query_uses_index_membership_and_refuses_untracked_or_symlink(
+    repo_tools, tmp_path: Path,
+) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    tracked = lease.path / "tracked.txt"
+    tracked.write_text("modified but still tracked\n", encoding="utf-8")
+    untracked = lease.path / "untracked.txt"
+    untracked.write_text("not published\n", encoding="utf-8")
+    ignored = lease.path / "ignored.txt"
+    ignored.write_text("not published\n", encoding="utf-8")
+    (lease.path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    escape = lease.path / "escape.txt"
+    escape.symlink_to(outside)
+
+    assert tools.is_tracked_file(tracked) is True
+    assert tools.is_tracked_file(untracked) is False
+    assert tools.is_tracked_file(ignored) is False
+    assert tools.is_tracked_file(escape) is False
+    assert tools.is_tracked_file(outside) is False
+
+
+def test_commit_stages_only_explicit_paths_and_preserves_dirty_out_of_scope_file(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("remediated\n", encoding="utf-8")
+    (lease.path / "outside.txt").write_text("do not commit\n", encoding="utf-8")
+
+    result = tools.execute(GitCommit(("tracked.txt",), "remediate review"))
+
+    assert result.ok
+    assert _git(lease.path, "show", "--format=", "--name-only", "HEAD") == "tracked.txt"
+    assert (lease.path / "outside.txt").read_text(encoding="utf-8") == "do not commit\n"
+    assert "outside.txt" in _git(lease.path, "status", "--porcelain")
+
+
+def test_commit_disables_repo_controlled_hooks_and_clean_filters(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    marker = lease.path / "helper-executed"
+    helper = lease.path / "malicious-helper.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n", encoding="utf-8")
+    helper.chmod(0o755)
+    hooks = lease.path / "hooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").symlink_to(helper)
+    _git(lease.path, "config", "core.hooksPath", str(hooks))
+    _git(lease.path, "config", "filter.evil.clean", str(helper))
+    (lease.path / ".gitattributes").write_text("tracked.txt filter=evil\n", encoding="utf-8")
+    (lease.path / "tracked.txt").write_text("safe content\n", encoding="utf-8")
+
+    assert tools.execute(GitCommit(("tracked.txt",), "safe commit")).ok
+
+    assert not marker.exists()
+    assert _git(lease.path, "show", "HEAD:tracked.txt") == "safe content"
+
+
+def test_commit_refuses_pre_staged_out_of_scope_paths(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("wanted\n", encoding="utf-8")
+    (lease.path / "outside.txt").write_text("staged\n", encoding="utf-8")
+    _git(lease.path, "add", "outside.txt")
+
+    with pytest.raises(GitRefusal, match="outside") as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+
+    assert refusal.value.code == "dirty_out_of_scope"
+    assert "'outside.txt'" in str(refusal.value)
+    assert "include them in `paths`, or unstage them" in str(refusal.value)
+    assert _git(lease.path, "diff", "--cached", "--name-only") == "outside.txt"
+
+
+def test_commit_pre_staged_paths_are_sorted_and_capped(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    for index in range(12):
+        (lease.path / f"extra-{index:02}.txt").write_text("staged\n", encoding="utf-8")
+    _git(lease.path, "add", "--", *[f"extra-{index:02}.txt" for index in range(12)])
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+    assert refusal.value.code == "dirty_out_of_scope"
+    message = str(refusal.value)
+    assert message.index("'extra-00.txt'") < message.index("'extra-09.txt'")
+    assert "'extra-09.txt' … and 2 more" in message
+    assert "extra-10.txt" not in message and "extra-11.txt" not in message
+
+
+@pytest.mark.parametrize("stray_name", ["late.txt", "-flag.py", ":late.txt", "dir\\file.py"])
+def test_commit_refuses_out_of_scope_path_staged_during_stage(repo_tools, monkeypatch, stray_name) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("wanted\n", encoding="utf-8")
+    (lease.path / stray_name).write_text("extra\n", encoding="utf-8")
+    stage = tools._stage
+
+    def stage_with_extra(paths):
+        stage(paths)
+        _git(lease.path, "add", "--", f":(literal){stray_name}")
+
+    monkeypatch.setattr(tools, "_stage", stage_with_extra)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+    assert refusal.value.code == "dirty_out_of_scope"
+    assert f"staged paths do not match the explicit commit scope: {stray_name!r}" in str(refusal.value)
+    assert "include them in `paths`, or unstage them" in str(refusal.value)
+
+
+@pytest.mark.parametrize("stray_name", [
+    "line\nbreak.txt", "ansi\x1b[31m.txt", "-unsafe.txt", ":unsafe.txt", "dir\\file.py",
+])
+def test_commit_escapes_stray_names_without_changing_refusal_code(repo_tools, stray_name) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / stray_name).write_text("staged\n", encoding="utf-8")
+    _git(lease.path, "add", "--", f":(literal){stray_name}")
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+    assert refusal.value.code == "dirty_out_of_scope"
+    message = str(refusal.value)
+    assert repr(stray_name) in message
+    assert "include them in `paths`, or unstage them" in message
+    assert "\n" not in message and "\x1b" not in message
+    assert _git(lease.path, "diff", "--cached", "--name-only", "-z") == stray_name + "\x00"
+
+
+@pytest.mark.parametrize("paths", [(), ("-A",), ("../escape",), ("/tmp/escape",), (":(glob)*",)])
+def test_stage_refuses_empty_add_all_and_path_injection(repo_tools, paths: tuple[str, ...]) -> None:
+    tools = repo_tools[-1]
+    expected = "explicit_paths_required" if not paths else "invalid_path"
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitStage(paths))
+    assert refusal.value.code == expected
+
+
+def test_conflict_resolution_stage_requires_unmerged_index_proof(repo_tools, monkeypatch) -> None:
+    tools = repo_tools[-1]
+    monkeypatch.setattr(tools, "_unmerged_paths", lambda: {"conflict.txt"})
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitStage(("tracked.txt",)))
+
+    assert refusal.value.code == "unproven_conflict_path"
+
+
+def test_invalid_revert_ancestry_is_refused(repo_tools) -> None:
+    _origin, _source, scope, _state, tools = repo_tools
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitRevert(scope.observed_base_sha))
+    assert refusal.value.code == "invalid_revert_ancestry"
+
+
+def test_merge_conflict_names_unmerged_path_and_recovery_operations(tmp_path: Path) -> None:
+    origin, source, scope, _old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "commit", "-qam", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, observed_base_sha=advanced_base)
+    leases = tmp_path / "merge-leases"
+    leases.mkdir()
+    state = RepoReviewState(scope)
+    create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=leases, review_state=state)
+    tools = RepoGitTools(state)
+
+    with pytest.raises(GitRefusal) as conflict:
+        tools.execute(GitMerge())
+
+    assert conflict.value.code == "merge_conflict"
+    assert "tracked.txt" in str(conflict.value)
+    assert "merge conflict" in str(conflict.value)
+    assert "repo_unmerged" in str(conflict.value)
+    assert "repo_merge_abort" in str(conflict.value)
+    assert "CONFLICT (content)" in str(conflict.value)
+    assert tools.execute(GitMergeAbort()).ok
+
+
+def test_merge_non_conflict_failure_preserves_git_stderr(repo_tools) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    unknown_sha = "f" * 40
+    object.__setattr__(
+        state,
+        "checkout_lease",
+        replace(state.checkout_lease, base_sha=unknown_sha),
+    )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitMerge())
+
+    assert refusal.value.code == "git_failed"
+    assert str(refusal.value) != "Git operation failed"
+    assert unknown_sha in str(refusal.value)
+    assert "repo_unmerged" not in str(refusal.value)
+    assert "repo_merge_abort" not in str(refusal.value)
+
+
+def test_checked_failure_reports_redacted_stdout_and_names_silent_exit(repo_tools) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    secret = "stdout-secret"
+
+    def failed_runner(argv, *, env, timeout, output_limit):
+        if "status" in argv:
+            return GitProcessResult(1, stdout=f"diagnostic {secret}")
+        if "show" in argv:
+            return GitProcessResult(1)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    tools = RepoGitTools(state, runner=failed_runner)
+    with pytest.raises(GitRefusal) as refusal:
+        tools._command(("status",), sensitive_values=(secret,))
+
+    assert str(refusal.value) == "diagnostic [REDACTED]"
+
+    with pytest.raises(GitRefusal) as silent:
+        tools._checked(("show",))
+    assert str(silent.value) == "Git exited with status 1 without diagnostic output"
+
+
+@pytest.mark.parametrize(
+    ("failed_command", "operation", "stream", "condition"),
+    [
+        (
+            "add",
+            GitStage(("tracked.txt",)),
+            "stderr",
+            "index.lock: File exists",
+        ),
+        (
+            "commit",
+            GitCommit(("tracked.txt",), "remediate review"),
+            "stdout",
+            "nothing to commit, working tree clean",
+        ),
+    ],
+)
+def test_stage_and_commit_failures_report_named_redacted_git_condition(
+    repo_tools,
+    failed_command: str,
+    operation,
+    stream: str,
+    condition: str,
+) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    secret_url = "https://agent:super-secret-password@example.invalid/owner/repo.git"
+    (state.checkout_lease.path / "tracked.txt").write_text("remediated\n", encoding="utf-8")
+
+    def failed_runner(argv, *, env, timeout, output_limit):
+        if failed_command in argv:
+            return GitProcessResult(
+                1,
+                **{stream: f"{condition}; remote {secret_url}"},
+            )
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as failure:
+        RepoGitTools(state, runner=failed_runner).execute(operation)
+
+    detail = str(failure.value)
+    assert failure.value.code == "git_failed"
+    assert condition in detail
+    assert detail != "Git operation failed"
+    assert "super-secret-password" not in detail
+    assert "https://[REDACTED]@example.invalid/owner/repo.git" in detail
+
+
+def test_rebase_is_refused_when_lease_cannot_publish_rewritten_history(
+    tmp_path: Path,
+) -> None:
+    _origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    restricted_scope = replace(
+        scope,
+        event_type="pr_review_requested",
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(restricted_scope)
+    lease = create_pr_checkout_lease(
+        restricted_scope,
+        owner=restricted_scope.principal,
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    original_head = _git(lease.path, "rev-parse", "HEAD")
+    original_status = _git(lease.path, "status", "--porcelain=v1", "--untracked-files=all")
+    original_metadata = metadata_path.read_bytes()
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitRebase())
+
+    assert refusal.value.code == "rebase_in_lease_refused"
+    assert "use repo_merge to merge the base and scoped published PR head" in str(refusal.value)
+    assert _git(lease.path, "rev-parse", "HEAD") == original_head
+    assert _git(lease.path, "status", "--porcelain=v1", "--untracked-files=all") == original_status
+    assert metadata_path.read_bytes() == original_metadata
+    assert not (lease.path / ".git" / "rebase-merge").exists()
+
+
+def test_retained_non_fast_forward_fix_can_resume_and_publish_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    origin, source, scope, original_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-qm", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, event_type="pr_review_requested", observed_base_sha=advanced_base)
+    lease = original_state.checkout_lease
+    _git(lease.path, "fetch", "origin", "main")
+    _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com", "rebase", "origin/main")
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+    state = RepoReviewState(scope)
+    resumed, _ = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+    )
+    assert resumed.path == lease.path
+    tools = RepoGitTools(state)
+    (lease.path / "fix.txt").write_text("retained fix\n")
+    tools.execute(GitCommit(("fix.txt",), "fix after retained rebase"))
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
+    with pytest.raises(GitRefusal) as refused:
+        tools.execute(GitPush())
+    assert refused.value.code == "force_push_refused"
+    # Reproduce the old fallback exactly: base is already included, so merging
+    # it alone cannot reconcile the published PR history.
+    assert "Already up to date" in _git(lease.path, "merge", "--no-edit", advanced_base)
+    with pytest.raises(GitRefusal) as refused:
+        tools.execute(GitPush())
+    assert refused.value.code == "force_push_refused"
+    with pytest.raises(GitRefusal) as refused:
+        tools.execute(GitRebase())
+    assert refused.value.code == "rebase_in_lease_refused"
+
+    later_scope = replace(scope, event_type="pr_review_submitted")
+    assert later_scope.scope_id != scope.scope_id
+    later_state = RepoReviewState(later_scope)
+    later_lease, candidates = acquire_pr_checkout_lease(
+        later_scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=later_state,
+    )
+    assert later_lease.path == lease.path
+    assert candidates == (fix_head,)
+    assert _git(lease.path, "rev-parse", "HEAD") == fix_head
+    later_tools = RepoGitTools(later_state)
+    assert later_tools.execute(GitMerge()).ok
+    assert _git(lease.path, "merge-base", "--is-ancestor", scope.observed_head_sha, "HEAD") == ""
+    assert _git(lease.path, "merge-base", "--is-ancestor", fix_head, "HEAD") == ""
+    assert later_tools.execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
+    assert (lease.path / "fix.txt").read_text() == "retained fix\n"
+
+
+def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) -> None:
+    origin, source, scope, _old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "commit", "-qam", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, observed_base_sha=advanced_base)
+    leases = tmp_path / "new-leases"
+    leases.mkdir()
+    state = RepoReviewState(scope)
+    create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=leases, review_state=state)
+    tools = RepoGitTools(state)
+
+    with pytest.raises(GitRefusal) as conflict:
+        tools.execute(GitRebase())
+    assert conflict.value.code == "git_failed"
+    assert (state.checkout_lease.path / ".git" / "rebase-merge").is_dir()
+
+    unmerged = tools.execute(GitUnmerged())
+    records = [record for record in unmerged.stdout.split("\x00") if record]
+    assert {record.partition("\t")[2] for record in records} == {"tracked.txt"}
+    assert {
+        record.partition("\t")[0].rsplit(" ", 1)[1]
+        for record in records
+    } == {"1", "2", "3"}
+    status = tools.execute(GitStatus())
+    assert "tracked.txt" in status.stdout
+    assert tools.execute(GitDiff()).ok
+
+    for operation in (
+        GitCommit(("tracked.txt",), "must not commit a conflicted rebase"),
+        GitPush(),
+    ):
+        with pytest.raises(GitRefusal) as mutation:
+            tools.execute(operation)
+        assert mutation.value.code == "git_failed"
+
+    assert tools.execute(GitRebaseAbort()).ok
+    assert _git(state.checkout_lease.path, "symbolic-ref", "--short", "HEAD") == scope.head_ref
+    assert _git(state.checkout_lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+
+
+def _two_sided_conflict_tools(
+    tmp_path: Path,
+) -> tuple[Path, RepoPRActionScope, RepoReviewState, RepoGitTools]:
+    origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("base property\n", encoding="utf-8")
+    (source / "base-test").write_text(
+        "#!/bin/sh\ngrep -q 'base property' tracked.txt\n", encoding="utf-8",
+    )
+    (source / "head-test").write_text(
+        "#!/bin/sh\ngrep -q 'head property' tracked.txt\n", encoding="utf-8",
+    )
+    (source / "suite").write_text(
+        "#!/bin/sh\n./base-test && ./head-test\n", encoding="utf-8",
+    )
+    for path in ("base-test", "head-test", "suite"):
+        (source / path).chmod(0o755)
+    _git(source, "add", "tracked.txt", "base-test", "head-test", "suite")
+    _git(source, "commit", "-q", "-m", "advance base with pinned property")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    conflict_scope = replace(
+        scope,
+        event_type="pr_mergeability_conflicting",
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(conflict_scope)
+    create_pr_checkout_lease(
+        conflict_scope,
+        owner="mimir-bot",
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+    return origin, conflict_scope, state, RepoGitTools(state)
+
+
+@pytest.mark.parametrize("dropped_side", ["base", "head"])
+def test_conflict_resolution_dropping_either_test_pinned_side_is_not_pushed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dropped_side: str,
+) -> None:
+    origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
+    lease = state.checkout_lease
+    with pytest.raises(GitRefusal):
+        tools.execute(GitRebase())
+    chosen = "head property\n" if dropped_side == "base" else "base property\n"
+    (lease.path / "tracked.txt").write_text(chosen, encoding="utf-8")
+    tools.execute(GitStage(("tracked.txt",)))
+    assert tools.execute(GitRebase(
+        "base property", "base-test",
+        "head property", "head-test",
+    )).ok
+
+    home = tmp_path / "home"
+    _configure_worklink_test(home, str(lease.path / "suite"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    result = _execute_project_tests(state)
+    assert result.ok is False
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitPush())
+    assert refusal.value.code == "full_test_required"
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+
+
+def test_conflict_resolution_preserves_both_sides_records_evidence_and_pushes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
+    lease = state.checkout_lease
+    with pytest.raises(GitRefusal):
+        tools.execute(GitRebase())
+    (lease.path / "tracked.txt").write_text(
+        "base property\nhead property\n", encoding="utf-8",
+    )
+    tools.execute(GitStage(("tracked.txt",)))
+    assert tools.execute(GitRebase(
+        "base property", "base-test checks the rebased file",
+        "head property", "head-test checks the rebased file",
+    )).ok
+    message = _git(lease.path, "log", "-1", "--format=%B")
+    assert "Base property: base property" in message
+    assert "Base verification: base-test checks the rebased file" in message
+    assert "Head property: head property" in message
+    assert "Head verification: head-test checks the rebased file" in message
+
+    with pytest.raises(GitRefusal) as untested:
+        tools.execute(GitPush())
+    assert untested.value.code == "full_test_required"
+    home = tmp_path / "home"
+    _configure_worklink_test(home, str(lease.path / "suite"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert _execute_project_tests(state).ok
+    assert tools.execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(
+        lease.path, "rev-parse", "HEAD",
+    )
+
+
+def test_revert_conflict_has_separately_authorized_abort(repo_tools) -> None:
+    _origin, _source, scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("later remediation\n", encoding="utf-8")
+    tools.execute(GitCommit(("tracked.txt",), "later remediation"))
+
+    with pytest.raises(GitRefusal) as conflict:
+        tools.execute(GitRevert(scope.observed_head_sha))
+    assert conflict.value.code == "git_failed"
+    assert (lease.path / ".git" / "REVERT_HEAD").exists()
+
+    assert tools.execute(GitRevertAbort()).ok
+    assert _git(lease.path, "status", "--porcelain") == ""
+
+
+def test_stale_remote_head_raises_named_refusal_and_never_pushes(repo_tools) -> None:
+    origin, source, _scope, state, _tools = repo_tools
+    _git(source, "checkout", "-q", "worklink/7")
+    (source / "remote.txt").write_text("advanced\n", encoding="utf-8")
+    _git(source, "add", "remote.txt")
+    _git(source, "commit", "-q", "-m", "advance remote")
+    _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=recording_runner).execute(GitPush())
+
+    assert refusal.value.code == "stale_scope"
+    assert str(refusal.value) == "the checkout lease was preserved for retry"
+    assert any("ls-remote" in argv for argv in calls)
+    assert not any("push" in argv for argv in calls)
+    assert _git(origin, "rev-parse", "refs/heads/worklink/7") != state.checkout_lease.head_sha
+
+
+def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -> None:
+    _origin, _source, scope, state, _tools = repo_tools
+    original_head = scope.observed_head_sha
+    (state.checkout_lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    _tools.execute(GitCommit(("push.txt",), "push mutation"))
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
+    pushed_head = _git(state.checkout_lease.path, "rev-parse", "HEAD")
+    assert was_agent_push(
+        scope.canonical_repo, scope.pr_number, original_head, pushed_head,
+    )
+    push = next(argv for argv in calls if "push" in argv)
+    assert push[-4:] == ("push", "--porcelain", scope.canonical_origin, f"HEAD:{scope.destination_ref}")
+    assert not any(arg in push for arg in ("--force", "--force-with-lease", "--delete", "--tags", "--mirror", "--all"))
+    ls_remote_index = next(index for index, argv in enumerate(calls) if "ls-remote" in argv)
+    push_index = calls.index(push)
+    assert push_index == ls_remote_index + 1
+    verification_fetches = [
+        argv for argv in calls
+        if "fetch" in argv and scope.destination_ref in argv
+    ]
+    assert len(verification_fetches) == 1
+    assert calls.index(verification_fetches[0]) == push_index + 1
+    assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) == _git(
+        state.checkout_lease.path, "rev-parse", "HEAD",
+    )
+
+
+@pytest.mark.parametrize("event_type", [
+    "pr_changes_requested_stale", "pr_review", "pr_mergeability_rebase",
+])
+def test_wrapper_records_only_successful_verified_head_transition(
+    tmp_path, monkeypatch, event_type,
+) -> None:
+    from mimir.access_control import ScopedPRGrants, ToolRegistry, _SCOPED_PR_ISSUER
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import repository as git_module
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity,
+    )
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+    from mimir_cultivate import repository as wrapper
+
+    origin, _source, scope, state = _repo_scope_and_state(tmp_path, event_type=event_type)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    tools = RepoGitTools(state)
+    initial = scope.observed_head_sha
+    ingress = SourceLabel(
+        principal="operator", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"operator"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    result_source = SourceLabel(
+        principal="operator", domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{initial}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({"operator"}), source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), source_channels=frozenset({"slack-C1"}),
+        sources=(ingress, result_source),
+    )
+    def context_for_turn():
+        return AuthContext(
+            principal="service:poller", canonical_principal="poller",
+            roles=("service",), event_ingress=None, trigger="poller",
+            channel_id="poller:forge", interactivity=None,
+            repo_review_state=state, enforcement_enabled=True,
+        )
+
+    context = context_for_turn()
+    grants = ScopedPRGrants(
+        "operator", (scope,), protocols=selected_policy_registry().scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    checkout_token = grants.consume_checkout("cultivate", scope)
+    assert checkout_token is not None
+    assert grants.observe_checkout("cultivate", scope, state.checkout_lease, checkout_token)
+    assert grants.get("cultivate", scope, RepoPRAction.PR_COMMENT.value, checkout=False) is not None
+    assert selected_policy_registry().scoped_actions["cultivate"].live_lease(scope, state) is state.checkout_lease
+    authorization_context = AuthContext(
+        principal="slack-U1", canonical_principal="operator", roles=("user", "admin"),
+        event_ingress=None, trigger="user_message", channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
+        domain="channel", resource_id="slack-C1", bridge_instance="slack",
+        ifc_labels=labels, repo_review_state=state, repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        ifc_state=context.ifc_state, scoped_pr_grants=grants,
+    )
+    registry = ToolRegistry()
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    runtime = SimpleNamespace(context=context)
+    monkeypatch.setattr(wrapper, "_state", lambda *args: state)
+    # Exact transition records are process-global; own a unique commit per case.
+    (state.checkout_lease.path / "fix.txt").write_text(f"fix {uuid.uuid4().hex}\n", encoding="utf-8")
+    tools.execute(GitCommit(("fix.txt",), "fix"))
+    target = _git(state.checkout_lease.path, "rev-parse", "HEAD")
+    assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+
+    original_repo_git_tools = git_module.RepoGitTools
+
+    class FailedPush(original_repo_git_tools):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, runner=lambda argv, **kw: (
+                GitProcessResult(1, stderr="failed") if "push" in argv
+                else _bounded_subprocess_runner(argv, **kw)
+            ), **kwargs)
+
+    monkeypatch.setattr(wrapper, "RepoGitTools", FailedPush)
+    with pytest.raises(ToolException):
+        wrapper._execute(runtime, scope.canonical_repo, scope.pr_number, GitPush())
+    assert context.ifc_state.own_push_lineage() == {}
+    assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+
+    class UnverifiedPush(original_repo_git_tools):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, runner=lambda argv, **kw: (
+                GitProcessResult(0, stdout="up to date") if "push" in argv
+                else _bounded_subprocess_runner(argv, **kw)
+            ), **kwargs)
+
+    monkeypatch.setattr(wrapper, "RepoGitTools", UnverifiedPush)
+    with pytest.raises(ToolException):
+        wrapper._execute(runtime, scope.canonical_repo, scope.pr_number, GitPush())
+    assert context.ifc_state.own_push_lineage() == {}
+    assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+
+    # A foreign/unverified head still refuses every later forge effect.
+    advanced = replace(scope, observed_head_sha=target)
+    for tool_name in ("pr_comment", "pr_rerequest_review", "repo_cleanup"):
+        from mimir.access_control import SinkGate, SinkCategory
+        denied = SinkGate.check_sink_flow(
+            tool_name, scope.canonical_repo, labels, authorization_context,
+            enforce=True, sink_category=SinkCategory.FORGE, repo_pr_action_scope=advanced,
+        )
+        assert not denied.allowed
+        assert denied.forge_scope_mismatch["component"] == "observed_head_sha"
+
+    monkeypatch.setattr(wrapper, "RepoGitTools", original_repo_git_tools)
+    assert wrapper._execute(runtime, scope.canonical_repo, scope.pr_number, GitPush())["ok"]
+    assert context.ifc_state.own_push_lineage() == {
+        (scope.canonical_repo, scope.pr_number): frozenset({initial}),
+    }
+    assert git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+    assert git_module.was_agent_push(
+        scope.canonical_repo, scope.pr_number, initial, target,
+    ) is (event_type == "pr_changes_requested_stale")
+    assert _git(origin, "rev-parse", scope.destination_ref) == target
+    fresh_context = context_for_turn()
+    assert fresh_context.ifc_state.own_push_lineage() == {}
+    # A successful no-op push does not supersede a head in the new turn.
+    assert wrapper._execute(
+        SimpleNamespace(context=fresh_context), scope.canonical_repo, scope.pr_number,
+        GitPush(),
+    )["ok"]
+    assert fresh_context.ifc_state.own_push_lineage() == {}
+    assert state.action_scope is scope
+    assert selected_policy_registry().scoped_actions["cultivate"].live_lease(scope, state) is state.checkout_lease
+    updated_grants = ScopedPRGrants(
+        "operator", (scope,), protocols=selected_policy_registry().scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    updated_token = updated_grants.consume_checkout("cultivate", scope)
+    assert updated_token is not None
+    assert updated_grants.observe_checkout("cultivate", scope, state.checkout_lease, updated_token)
+    authorization_context = replace(authorization_context, scoped_pr_grants=updated_grants)
+    for tool_name in ("pr_comment", "pr_rerequest_review", "repo_cleanup"):
+        decision = registry.authorize_tool(
+            tool_name, authorization_context, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed, (tool_name, decision.reason, decision.refusal_detail)
+
+
+@pytest.mark.parametrize("recreate_tools", [False, True])
+def test_turn_pushes_twice_as_fast_forwards(repo_tools, recreate_tools) -> None:
+    origin, _source, scope, state, tools = repo_tools
+    identity = {key: value for key, value in vars(scope).items() if key != "observed_head_sha"}
+    lease = state.checkout_lease
+    observations = []
+    for name in ("A", "B"):
+        (lease.path / name).write_text(name, encoding="utf-8")
+        tools.execute(GitCommit((name,), f"commit {name}"))
+        head = state.git_expected_head
+        assert tools.execute(GitPush()).ok
+        assert _git(origin, "rev-parse", scope.destination_ref) == head
+        observations.append((scope.observed_head_sha, lease.head_sha, head))
+        assert json.loads((lease.path / ".git/mimir-pr-checkout-lease.json").read_text())["head_sha"] == head
+        assert {key: value for key, value in vars(scope).items() if key != "observed_head_sha"} == identity
+        if recreate_tools:
+            tools = RepoGitTools(state)
+    assert all(scoped == recorded == published for scoped, recorded, published in observations)
+
+
+def _clean_rebase_tools(
+    tmp_path: Path,
+    *,
+    event_type: str = "pr_mergeability_rebase",
+) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
+    origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    original_author = _git(source, "show", "-s", "--format=%an <%ae>", scope.observed_head_sha)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-only.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "add", "base-only.txt")
+    _git(source, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    rebase_scope = replace(
+        scope,
+        event_type=event_type,
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(rebase_scope)
+    create_pr_checkout_lease(
+        rebase_scope,
+        owner="mimir-bot",
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+    assert RepoGitTools(state).execute(GitRebase()).ok
+    assert _git(state.checkout_lease.path, "show", "-s", "--format=%an <%ae>") == original_author
+    return origin, source, rebase_scope, state
+
+
+def test_mergeability_rebase_push_uses_exact_head_lease_and_preserves_author(
+    tmp_path: Path,
+) -> None:
+    origin, _source, scope, state = _clean_rebase_tools(tmp_path)
+    original_head = scope.observed_head_sha
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
+    push = next(argv for argv in calls if "push" in argv)
+    assert (
+        f"--force-with-lease={scope.destination_ref}:{original_head}"
+        in push
+    )
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(
+        state.checkout_lease.path, "rev-parse", "HEAD",
+    )
+    assert cleanup_pr_checkout_lease(state.checkout_lease, review_state=state) is True
+
+
+def test_changes_requested_rebase_push_uses_exact_head_lease(tmp_path: Path) -> None:
+    origin, _source, scope, state = _clean_rebase_tools(
+        tmp_path, event_type="pr_changes_requested_stale",
+    )
+    original_head = scope.observed_head_sha
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
+    push = next(argv for argv in calls if "push" in argv)
+    assert (
+        f"--force-with-lease={scope.destination_ref}:{original_head}"
+        in push
+    )
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(
+        state.checkout_lease.path, "rev-parse", "HEAD",
+    )
+
+
+@pytest.mark.parametrize("operation", ["merge", "rebase", "revert"])
+@pytest.mark.parametrize("stale", [False, True, "race"])
+def test_heartbeat_live_scope_executes_git_remediation(tmp_path, monkeypatch, operation, stale):
+    import mimir.access_control as access
+    import mimir_cultivate.forge as forge
+    from mimir.models import AgentEvent, InformationFlowLabels, NormalizedPullRequestSnapshot
+
+    origin, source, previous, previous_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-only.txt").write_text("advance base\n", encoding="utf-8")
+    _git(source, "add", "base-only.txt")
+    _git(source, "commit", "-qm", "advance base")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    snapshot = NormalizedPullRequestSnapshot(
+        repo="owner/repo", number=7, state="open", author="mimir-bot",
+        head_repo="owner/repo", head_remote="origin", head_ref="worklink/7",
+        head_sha=previous.observed_head_sha, base_ref="main",
+        base_sha=_git(source, "rev-parse", "HEAD"),
+    )
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setattr(access, "_configured_scope_github_repos", lambda: frozenset({"owner/repo"}))
+    monkeypatch.setattr(access, "_canonical_repo_binding_resolution", lambda repo: access.RepoBindingResolution(
+        (str(source), str(origin)), (str(source),), 1,
+    ))
+    monkeypatch.setattr(forge, "_client_for_repository", lambda repo: SimpleNamespace(
+        get_pull_request_snapshot=lambda *args: snapshot,
+    ))
+    service = access.builtin_trigger_service_principal("heartbeat", tmp_path)
+    context = access.create_auth_context(
+        AgentEvent(trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+                   service_principal=service.canonical, service_authority=service),
+        None, enforce=True, ifc_labels=InformationFlowLabels(),
+    )
+    state = forge.resolve_review_state_for_context(context, "owner/repo", 7)
+    assert state.action_scope.event_type == "heartbeat_pr_maintenance"
+    lease = create_pr_checkout_lease(
+        state.action_scope, owner="mimir-bot",
+        lease_root=previous_state.checkout_lease.lease_root, review_state=state,
+    )
+    calls = []
+    concurrent = None
+
+    def advance_remote():
+        _git(source, "checkout", "-q", "worklink/7")
+        (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
+        _git(source, "add", "concurrent.txt")
+        _git(source, "commit", "-qm", "concurrent")
+        _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+        return _git(origin, "rev-parse", previous.destination_ref)
+
+    def runner(argv, *, env, timeout, output_limit):
+        nonlocal concurrent
+        calls.append(argv)
+        if stale == "race" and "push" in argv:
+            concurrent = advance_remote()
+        return _bounded_subprocess_runner(argv, env=env, timeout=timeout, output_limit=output_limit)
+
+    tools = RepoGitTools(state, runner=runner)
+    assert tools.execute({
+        "merge": GitMerge(), "rebase": GitRebase(),
+        "revert": GitRevert(previous.observed_head_sha),
+    }[operation]).ok
+    (lease.path / "tracked.txt").write_text("heartbeat remediation\n", encoding="utf-8")
+    assert tools.execute(GitCommit(("tracked.txt",), "heartbeat remediation")).ok
+    if stale:
+        if stale is True:
+            concurrent = advance_remote()
+        with pytest.raises(GitRefusal) as refused:
+            tools.execute(GitPush())
+        assert refused.value.code == ("stale_scope" if stale is True else "git_failed")
+        assert _git(origin, "rev-parse", previous.destination_ref) == concurrent
+        assert any("push" in argv for argv in calls) is (stale == "race")
+    else:
+        assert tools.execute(GitPush()).ok
+        assert _git(origin, "rev-parse", previous.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
+        push = next(argv for argv in calls if "push" in argv)
+        if operation == "rebase":
+            assert f"--force-with-lease={previous.destination_ref}:{previous.observed_head_sha}" in push
+        else:
+            assert not any(arg.startswith("--force") for arg in push)
+
+
+def test_head_accepted_by_rewritten_push_is_accepted_by_cleanup_when_commit_skipped(
+    tmp_path: Path,
+) -> None:
+    origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("pull request\n", encoding="utf-8")
+    _git(source, "commit", "-qam", "apply PR content upstream")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    rebase_scope = replace(
+        scope,
+        event_type="pr_mergeability_rebase",
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(rebase_scope)
+    lease = create_pr_checkout_lease(
+        rebase_scope,
+        owner="mimir-bot",
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+
+    assert RepoGitTools(state).execute(GitRebase()).ok
+    assert _git(lease.path, "rev-parse", "HEAD") == advanced_base
+    assert RepoGitTools(state).execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == advanced_base
+    assert cleanup_pr_checkout_lease(lease, review_state=state) is True
+
+
+def test_mergeability_rebase_stale_lease_refuses_concurrent_push(tmp_path: Path) -> None:
+    origin, source, scope, state = _clean_rebase_tools(tmp_path)
+    _git(source, "checkout", "-q", "worklink/7")
+    (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
+    _git(source, "add", "concurrent.txt")
+    _git(source, "commit", "-q", "-m", "concurrent push")
+    concurrent_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitPush())
+
+    assert refusal.value.code == "stale_scope"
+    assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
+
+
+def test_changes_requested_rebase_stale_lease_refuses_concurrent_push(
+    tmp_path: Path,
+) -> None:
+    origin, source, scope, state = _clean_rebase_tools(
+        tmp_path, event_type="pr_changes_requested_stale",
+    )
+    _git(source, "checkout", "-q", "worklink/7")
+    (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
+    _git(source, "add", "concurrent.txt")
+    _git(source, "commit", "-q", "-m", "concurrent push")
+    concurrent_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=recording_runner).execute(GitPush())
+
+    assert refusal.value.code == "stale_scope"
+    assert any("ls-remote" in argv for argv in calls)
+    assert not any("push" in argv for argv in calls)
+    assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
+
+
+def test_push_refuses_when_successful_command_leaves_remote_unchanged(repo_tools) -> None:
+    origin, _source, scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    tools.execute(GitCommit(("push.txt",), "stranded mutation"))
+    expected = _git(lease.path, "rev-parse", "HEAD")
+    observed = _git(origin, "rev-parse", scope.destination_ref)
+
+    def no_op_push(argv, *, env, timeout, output_limit):
+        if "push" in argv:
+            return GitProcessResult(0, stdout="To origin\n\tup to date\n")
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=no_op_push).execute(GitPush())
+
+    assert refusal.value.code == "push_not_applied"
+    assert expected in str(refusal.value)
+    assert observed in str(refusal.value)
+    assert f"local commit {expected} remains unpushed" in str(refusal.value)
+    assert _git(origin, "rev-parse", scope.destination_ref) == observed
+    assert scope.observed_head_sha == observed
+    assert lease.head_sha == expected
+
+
+def test_push_succeeds_if_remote_advances_on_top_before_verification(repo_tools) -> None:
+    origin, source, scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    tools.execute(GitCommit(("push.txt",), "push mutation"))
+    expected = _git(lease.path, "rev-parse", "HEAD")
+
+    def concurrent_push(argv, *, env, timeout, output_limit):
+        result = _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+        if "push" in argv and result.returncode == 0:
+            _git(source, "fetch", "-q", "origin", scope.destination_ref)
+            _git(source, "checkout", "-q", "-B", "concurrent", "FETCH_HEAD")
+            (source / "concurrent.txt").write_text("later work\n", encoding="utf-8")
+            _git(source, "add", "concurrent.txt")
+            _git(source, "commit", "-q", "-m", "concurrent advance")
+            _git(source, "push", "-q", "origin", f"HEAD:{scope.destination_ref}")
+        return result
+
+    result = RepoGitTools(state, runner=concurrent_push).execute(GitPush())
+    remote_head = _git(origin, "rev-parse", scope.destination_ref)
+
+    assert result.ok
+    assert remote_head != expected
+    assert scope.observed_head_sha == lease.head_sha == expected
+    assert _git(origin, "merge-base", "--is-ancestor", expected, remote_head) == ""
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitPush())
+    assert refusal.value.code == "stale_scope"
+
+
+@pytest.mark.parametrize("push_fails", [False, True])
+def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
+    repo_tools, monkeypatch: pytest.MonkeyPatch, push_fails: bool,
+) -> None:
+    origin, _source, scope, old_state, _tools = repo_tools
+    https_scope = replace(scope, canonical_origin="https://github.com/owner/repo.git")
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=https_scope.canonical_origin,
+        scope_id=https_scope.scope_id,
+    )
+    _git(lease.path, "remote", "set-url", "origin", https_scope.canonical_origin)
+    state = RepoReviewState(https_scope)
+    state.attach_checkout_lease(lease)
+    state.record_git_head(https_scope.scope_id, scope.observed_head_sha)
+    from mimir_cultivate.repository import _METADATA, _metadata
+    (lease.path / _METADATA).write_text(json.dumps(_metadata(lease)) + "\n")
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    token = "never-expose-this-token"
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+    monkeypatch.setattr(
+        "mimir_cultivate.forge.confirm_github_identity",
+        lambda principal, credential: principal,
+    )
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    def runner(argv, *, env, timeout, output_limit):
+        calls.append((argv, env))
+        if "push" in argv and push_fails:
+            return GitProcessResult(1, stderr=f"upstream rejected {token}")
+        local_argv = tuple(
+            str(origin)
+            if arg == https_scope.canonical_origin
+            else "protocol.file.allow=always"
+            if arg == "protocol.allow=never"
+            else arg
+            for arg in argv
+        )
+        return _bounded_subprocess_runner(
+            local_argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    tools = RepoGitTools(state, runner=runner)
+    tools.execute(GitCommit(("push.txt",), "push mutation"))
+    error = ""
+    events: list[str] = []
+    try:
+        result = tools.execute(GitPush())
+        assert push_fails is False
+        assert result.ok
+        events.append(repr(result))
+    except GitRefusal as exc:
+        assert push_fails is True
+        error = str(exc)
+        events.append(error)
+        assert exc.code == "git_failed"
+        assert "upstream rejected [REDACTED]" in error
+
+    network_calls = [
+        (argv, env) for argv, env in calls
+        if "ls-remote" in argv or "push" in argv or "fetch" in argv
+    ]
+    assert [
+        next(command for command in ("ls-remote", "push", "fetch") if command in argv)
+        for argv, _env in network_calls
+    ] == (["ls-remote", "push"] if push_fails else ["ls-remote", "push", "fetch"])
+    authorization = "Authorization: Basic " + base64.b64encode(
+        f"x-access-token:{token}".encode(),
+    ).decode()
+    for argv, env in network_calls:
+        assert https_scope.canonical_origin in argv
+        assert token not in "\0".join(argv)
+        assert "credential.helper=" in argv
+        assert "http.followRedirects=false" in argv
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == (
+            f"http.{https_scope.canonical_origin}.extraheader"
+        )
+        assert env["GIT_CONFIG_VALUE_0"] == authorization
+        assert env["GIT_ASKPASS"] == "/bin/false"
+    assert all(
+        "GIT_CONFIG_COUNT" not in env
+        for argv, env in calls
+        if "ls-remote" not in argv and "push" not in argv and "fetch" not in argv
+    )
+    assert token not in error
+    assert all(token not in event for event in events)
+    assert "credential" not in _git(lease.path, "config", "--local", "--list")
+    if push_fails:
+        assert _git(origin, "rev-parse", https_scope.destination_ref) != _git(
+            lease.path, "rev-parse", "HEAD",
+        )
+    else:
+        assert _git(origin, "rev-parse", https_scope.destination_ref) == _git(
+            lease.path, "rev-parse", "HEAD",
+        )
+
+
+def test_https_push_refuses_when_acting_identity_is_unverified(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    https_scope = replace(scope, canonical_origin="https://github.com/owner/repo.git")
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=https_scope.canonical_origin,
+        scope_id=https_scope.scope_id,
+    )
+    state = RepoReviewState(https_scope)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+
+    def refuse(_principal, _token):
+        raise ForgeError("github identity verification cache is empty")
+
+    from mimir_cultivate.forge import ForgeError
+
+    monkeypatch.setattr("mimir_cultivate.forge.confirm_github_identity", refuse)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state)._push_remote()
+
+    assert refusal.value.code == "push_identity_unverified"
+    assert "cache is empty" in str(refusal.value)
+
+
+def test_https_push_accepts_mixed_case_github_repo_origin(repo_tools, monkeypatch) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    mixed = "https://github.com/SquashMerge/trellis.git"
+    altered = replace(scope, canonical_repo="squashmerge/trellis", canonical_origin=mixed)
+    lease = replace(old_state.checkout_lease, canonical_repo=altered.canonical_repo,
+                    canonical_origin=mixed, scope_id=altered.scope_id)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    monkeypatch.setattr("mimir_cultivate.forge.confirm_github_identity", lambda *_: None)
+    origin, config, _secrets = RepoGitTools(state)._push_remote()
+    assert origin == mixed
+    assert config["GIT_CONFIG_KEY_0"] == f"http.{mixed}.extraheader"
+
+
+def test_push_failure_reports_and_preserves_stranded_local_commit(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    tools.execute(GitCommit(("push.txt",), "stranded mutation"))
+    stranded_head = _git(lease.path, "rev-parse", "HEAD")
+
+    def failed_push(argv, *, env, timeout, output_limit):
+        if "push" in argv:
+            return GitProcessResult(1, stderr="upstream diagnostic could contain sensitive data")
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=failed_push).execute(GitPush())
+
+    assert refusal.value.code == "git_failed"
+    assert str(refusal.value) == (
+        "push failed: upstream diagnostic could contain sensitive data; "
+        f"local commit {stranded_head} remains unpushed in preserved "
+        f"checkout lease {lease.path.resolve()}"
+    )
+    assert "upstream diagnostic" in str(refusal.value)
+    assert lease.is_active
+    assert _git(lease.path, "rev-parse", "HEAD") == stranded_head
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/other/repo.git",
+        "https://example.com/owner/repo.git",
+        "https://user@github.com/owner/repo.git",
+        "https://github.com:443/owner/repo.git",
+        "https://github.com/owner/repo.git?redirect=attacker",
+        "https://github.com/owner/repo.GIT",
+    ],
+)
+def test_push_credential_is_available_only_for_exact_canonical_github_origin(
+    repo_tools, monkeypatch: pytest.MonkeyPatch, origin: str,
+) -> None:
+    _local_origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(scope, canonical_origin=origin)
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=origin,
+        scope_id=altered.scope_id,
+    )
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state)._push_remote()
+
+    assert refusal.value.code == "push_auth_unavailable"
+
+
+def test_unrelated_event_force_push_refuses_before_any_network_call(
+    repo_tools, monkeypatch,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    unrelated_scope = replace(scope, event_type="pr_review_requested")
+    state = RepoReviewState(unrelated_scope)
+    state.attach_checkout_lease(replace(
+        old_state.checkout_lease, scope_id=unrelated_scope.scope_id,
+    ))
+    tools = RepoGitTools(state, enforce=False)
+    original_raw = tools._raw
+    network_seen = False
+
+    def non_ancestor(arguments, **kwargs):
+        nonlocal network_seen
+        if arguments[:2] == ("merge-base", "--is-ancestor"):
+            return GitProcessResult(1)
+        if "ls-remote" in arguments or "push" in arguments:
+            network_seen = True
+        return original_raw(arguments, **kwargs)
+
+    monkeypatch.setattr(tools, "_raw", non_ancestor)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitPush())
+    assert refusal.value.code == "force_push_refused"
+    assert "use repo_merge to merge the base and scoped published PR head" in str(refusal.value)
+    assert network_seen is False
+
+
+@pytest.mark.parametrize("branch", ["main", "master"])
+def test_protected_branch_force_push_refuses_from_remediation_scope(
+    repo_tools, monkeypatch, branch: str,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    protected_scope = replace(scope, destination_ref=f"refs/heads/{branch}")
+    lease = replace(
+        old_state.checkout_lease,
+        scope_id=protected_scope.scope_id,
+        destination_ref=protected_scope.destination_ref,
+    )
+    _git(lease.path, "checkout", "-q", "-B", branch)
+    state = RepoReviewState(protected_scope)
+    state.attach_checkout_lease(lease)
+    tools = RepoGitTools(state, enforce=False)
+    original_raw = tools._raw
+    network_seen = False
+
+    def non_ancestor(arguments, **kwargs):
+        nonlocal network_seen
+        if arguments[:2] == ("merge-base", "--is-ancestor"):
+            return GitProcessResult(1)
+        if "ls-remote" in arguments or "push" in arguments:
+            network_seen = True
+        return original_raw(arguments, **kwargs)
+
+    monkeypatch.setattr(tools, "_raw", non_ancestor)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitPush())
+    assert refusal.value.code == "force_push_refused"
+    assert network_seen is False
+
+
+def test_cross_pr_checkout_is_refused(repo_tools) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    tools = RepoGitTools(state, enforce=False)
+    _git(state.checkout_lease.path, "checkout", "-q", "-b", "other-pr")
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitStatus())
+    assert refusal.value.code == "cross_pr_checkout"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("destination_ref", "refs/heads/worklink/7:refs/tags/pwned"),
+        ("destination_ref", "--upload-pack=evil"),
+        ("base_ref", "../pwned"),
+        ("head_remote", "attacker"),
+    ],
+)
+def test_scope_ref_and_remote_injection_is_refused(repo_tools, field: str, value: str) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(scope, **{field: value})
+    old_lease = old_state.checkout_lease
+    lease = replace(old_lease, scope_id=altered.scope_id, destination_ref=altered.destination_ref)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state)
+    assert refusal.value.code == "invalid_scope"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("observed_head_sha", "abc"), ("observed_base_sha", "f" * 39)],
+)
+def test_scope_requires_full_bound_commit_ids(repo_tools, field: str, value: str) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(scope, **{field: value})
+    lease = replace(old_state.checkout_lease, scope_id=altered.scope_id)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state)
+    assert refusal.value.code == "invalid_scope"
+
+
+@pytest.mark.parametrize("kind", ["missing", "scope", "owner", "revoked"])
+def test_checkout_lease_identity_checks_are_each_pinned(repo_tools, kind: str) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    lease = state.checkout_lease
+    candidate = {
+        "missing": None,
+        "scope": replace(lease, scope_id="other"),
+        "owner": replace(lease, owner="other"),
+        "revoked": replace(lease, revoked=True),
+    }[kind]
+    object.__setattr__(state, "checkout_lease", candidate)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state)
+    assert refusal.value.code == "inactive_checkout"
+
+
+def test_checkout_symlink_and_root_escape_are_refused(repo_tools, tmp_path: Path) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    lease = state.checkout_lease
+    alias = lease.lease_root / "alias"
+    alias.symlink_to(lease.path, target_is_directory=True)
+    object.__setattr__(state, "checkout_lease", replace(lease, path=alias))
+    with pytest.raises(GitRefusal) as symlink_refusal:
+        RepoGitTools(state, enforce=False)
+    assert symlink_refusal.value.code == "invalid_checkout"
+
+    outside = tmp_path / "outside-checkout"
+    outside.mkdir()
+    object.__setattr__(state, "checkout_lease", replace(lease, path=outside))
+    with pytest.raises(GitRefusal) as escape_refusal:
+        RepoGitTools(state, enforce=False)
+    assert escape_refusal.value.code == "invalid_checkout"
+
+
+def test_repo_url_rewrite_config_is_refused_before_network(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    _git(state.checkout_lease.path, "config", "url.file:///tmp/attacker.insteadOf", "unused:")
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitFetch())
+    assert refusal.value.code == "unsafe_repo_config"
+
+
+def test_repo_url_rewrite_config_is_refused_before_authenticated_push(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(scope, canonical_origin="https://github.com/owner/repo.git")
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=altered.canonical_origin,
+        scope_id=altered.scope_id,
+    )
+    _git(lease.path, "remote", "set-url", "origin", altered.canonical_origin)
+    _git(lease.path, "config", "url.https://attacker.invalid/.insteadOf", altered.canonical_origin)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitPush())
+
+    assert refusal.value.code == "unsafe_repo_config"
+
+
+def test_unsupported_bound_remote_transport_is_refused(repo_tools) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(scope, canonical_origin="ftp://example.invalid/repo")
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=altered.canonical_origin,
+        scope_id=altered.scope_id,
+    )
+    _git(lease.path, "remote", "set-url", "origin", altered.canonical_origin)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitFetch())
+    assert refusal.value.code == "unsupported_transport"
+
+
+def test_malformed_unmerged_index_output_is_refused(repo_tools, monkeypatch) -> None:
+    tools = repo_tools[-1]
+    original = tools._command
+
+    def malformed(arguments, **kwargs):
+        if arguments[:3] == ("ls-files", "--unmerged", "-z"):
+            return GitProcessResult(0, "missing-tab-record\x00")
+        return original(arguments, **kwargs)
+
+    monkeypatch.setattr(tools, "_command", malformed)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitStage(("tracked.txt",)))
+    assert refusal.value.code == "invalid_git_output"
+
+
+def test_fetch_ref_mismatch_is_named_stale_scope(repo_tools, monkeypatch) -> None:
+    tools = RepoGitTools(repo_tools[-2], enforce=False)
+    original = tools._command
+
+    def stale(arguments, **kwargs):
+        result = original(arguments, **kwargs)
+        if arguments[:3] == ("rev-parse", "--verify", "FETCH_HEAD^{commit}"):
+            return replace(result, stdout="f" * 40 + "\n")
+        return result
+
+    monkeypatch.setattr(tools, "_command", stale)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitFetch())
+    assert refusal.value.code == "stale_scope"
+
+
+def test_fetch_refuses_base_advanced_mid_remediation_with_actionable_reason(repo_tools) -> None:
+    _origin, source, _scope, state, tools = repo_tools
+    checked_out_base = state.checkout_lease.base_sha
+    _git(source, "checkout", "-q", "main")
+    (source / "advanced.txt").write_text("new base work\n", encoding="utf-8")
+    _git(source, "add", "advanced.txt")
+    _git(source, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitFetch())
+
+    assert refusal.value.code == "base_advanced"
+    assert checked_out_base in str(refusal.value)
+    assert advanced_base in str(refusal.value)
+    assert "restart checkout before rebasing" in str(refusal.value)
+
+
+def test_fetch_refuses_rewritten_base_mid_remediation_with_both_shas(repo_tools) -> None:
+    _origin, source, _scope, state, tools = repo_tools
+    checked_out_base = state.checkout_lease.base_sha
+    _git(source, "checkout", "-q", "--orphan", "replacement-main")
+    _git(source, "rm", "-q", "-rf", ".")
+    (source / "replacement.txt").write_text("replacement\n", encoding="utf-8")
+    _git(source, "add", "replacement.txt")
+    _git(source, "commit", "-q", "-m", "rewrite base")
+    rewritten_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "--force", "origin", "HEAD:main")
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitFetch())
+
+    assert refusal.value.code == "base_history_rewritten"
+    assert checked_out_base in str(refusal.value)
+    assert rewritten_base in str(refusal.value)
+
+
+def test_shape_message_and_commit_id_validations_are_pinned(repo_tools) -> None:
+    tools = repo_tools[-1]
+    cases = (
+        (GitStage(["tracked.txt"]), "invalid_shape"),  # type: ignore[arg-type]
+        (GitStage(("tracked.txt", "tracked.txt")), "invalid_paths"),
+        (GitDiff(mode="attacker"), "invalid_shape"),  # type: ignore[arg-type]
+        (GitCommit(("tracked.txt",), ""), "invalid_message"),
+        (GitCommit(("tracked.txt",), "x" * (64 * 1024 + 1)), "invalid_message"),
+        (GitRevert("HEAD"), "invalid_commit"),
+        (object(), "invalid_shape"),
+    )
+    for operation, code in cases:
+        with pytest.raises(GitRefusal) as refusal:
+            tools.execute(operation)  # type: ignore[arg-type]
+        assert refusal.value.code == code
+
+
+def test_commit_requires_at_least_one_matching_staged_change(repo_tools) -> None:
+    tools = repo_tools[-1]
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "empty commit refused"))
+    assert refusal.value.code == "dirty_out_of_scope"
+    assert "nothing staged" in str(refusal.value)
+
+
+@pytest.mark.parametrize("change", ["origin", "head"])
+def test_checkout_origin_and_expected_head_checks_are_each_pinned(repo_tools, change: str) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    if change == "origin":
+        _git(lease.path, "remote", "set-url", "origin", "/tmp/other-origin")
+    else:
+        (lease.path / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+        _git(lease.path, "add", "unexpected.txt")
+        _git(lease.path, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "unexpected")
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitStatus())
+    assert refusal.value.code == "cross_pr_checkout"
+
+
+def test_constructor_refuses_unbounded_execution_and_untrusted_git_pins(tmp_path: Path, repo_tools) -> None:
+    state = repo_tools[-2]
+    with pytest.raises(ValueError, match="positive"):
+        RepoGitTools(state, timeout=0)
+    with pytest.raises(ValueError, match="positive"):
+        RepoGitTools(state, output_limit=0)
+    with pytest.raises(ValueError, match="absolute"):
+        RepoGitTools(state, git_executable=Path("git"))
+    with pytest.raises(ValueError, match="missing"):
+        RepoGitTools(state, git_executable=tmp_path / "missing-git")
+    not_executable = tmp_path / "not-executable"
+    not_executable.write_text("not git\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not executable"):
+        RepoGitTools(state, git_executable=not_executable)
+
+
+def _configure_worklink_test(home: Path, command: str = "/usr/bin/true -q") -> None:
+    home.mkdir(exist_ok=True)
+    (home / "worklink.yaml").write_text(
+        f"defaults:\n  test_command: {command}\n",
+        encoding="utf-8",
+    )
+
+
+def _test_checkout_factory(source: Path, **_kwargs):
+    return SimpleNamespace(path=source, capability=SimpleNamespace(path=source), close=lambda: None)
+
+
+def _configure_test_suites(home: Path, state: RepoReviewState, **overrides) -> None:
+    _configure_worklink_test(home)
+    record = {
+        "slug": state.action_scope.canonical_repo,
+        "root": str(state.checkout_lease.path),
+        "origin": f"https://github.com/{state.action_scope.canonical_repo}.git",
+        "mode": "rw", "base_branch": "main",
+        "test_suites": [
+            {"name": "python", "command": "/usr/bin/true -q", "default": True,
+             "selector_prefixes": ["tests/"], "selector_suffixes": [".py"]},
+            {"name": "frontend", "command": "npm run test:ci",
+             "selector_prefixes": ["frontend/"], "selector_suffixes": [".test.ts", ".test.tsx"]},
+        ],
+    }
+    record.update(overrides)
+    (home / "repositories.yaml").write_text(yaml.safe_dump({"repositories": [record]}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["none", "targeted", "full"])
+async def test_repo_test_review_policy_is_enforced_before_execution(tmp_path, monkeypatch, policy):
+    from mimir_cultivate import repository as repo_module
+
+    review_actions = frozenset({RepoPRAction.CHECKOUT.value, RepoPRAction.TEST.value, RepoPRAction.PR_REVIEW.value})
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, event_type="pr_opened", allowed_operations=review_actions,
+    )
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, review_tests=policy, test_suites=[
+        {"name": "unit", "command": "/usr/bin/true", "default": True,
+         "selector_prefixes": ["tests/"]},
+    ])
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(repo_module, "_state", lambda *args: state)
+    (state.checkout_lease.path / "tests").mkdir()
+    (state.checkout_lease.path / "tests/test_changed.py").write_text("def test_changed(): pass\n")
+    calls = []
+
+    async def runner(argv, *args, **kwargs):
+        calls.append(argv)
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(repo_module, "RepoProjectTests", lambda state: RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+
+    async def invoke(selectors=(), suite=None):
+        return await repo_module.repo_test.coroutine(scope.canonical_repo, scope.pr_number,
+                                                     selectors, suite=suite)
+
+    if policy != "full":
+        with pytest.raises(ToolPolicyRefusal, match="review_test_policy") as refusal:
+            await invoke()
+        assert "CI" in str(refusal.value)
+        assert policy in str(refusal.value)
+        assert not calls
+    else:
+        assert (await invoke())["ok"]
+        assert len(calls) == 1
+
+    if policy == "none":
+        with pytest.raises(ToolPolicyRefusal, match="CI is the validation surface"):
+            await invoke(("tests/test_changed.py",))
+        assert not calls
+    else:
+        assert (await invoke(("tests/test_changed.py",)))["ok"]
+        assert calls[-1][-1] == "tests/test_changed.py"
+        assert (await invoke(suite="unit"))["ok"]
+
+
+@pytest.mark.asyncio
+async def test_repo_test_remediation_scope_ignores_review_policy(tmp_path, monkeypatch):
+    from mimir_cultivate import repository as repo_module
+
+    actions = frozenset({RepoPRAction.CHECKOUT.value, RepoPRAction.TEST.value, RepoPRAction.PUSH.value})
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, allowed_operations=actions,
+    )
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, review_tests="none")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(repo_module, "_state", lambda *args: state)
+    calls = []
+
+    async def runner(argv, *args, **kwargs):
+        calls.append(argv)
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(repo_module, "RepoProjectTests", lambda state: RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    result = await repo_module.repo_test.coroutine(scope.canonical_repo, scope.pr_number)
+    assert result["ok"] and len(calls) == 1
+
+
+@pytest.fixture
+def selected_repo_inventory():
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suite,selectors,expected", [
+    ("frontend", (), "frontend"),
+    ("frontend", ("frontend/example.tsx",), "frontend"),
+    (None, ("frontend/example.tsx",), "frontend"),
+    (None, ("outside.test.ts",), "frontend"),
+    (None, ("test_example.py",), "python"),
+    ("python", (), "python"),
+    (None, (), "python"),
+])
+@pytest.mark.parametrize("runner_layout", ["regular", "symlink"])
+async def test_project_suite_selection_and_snapshot_argv(
+    repo_tools, tmp_path, monkeypatch, suite, selectors, expected, runner_layout,
+):
+    from mimir_cultivate import repository as project_tests
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    executable = tmp_path / "fixture-runner"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    runner_path = executable
+    if runner_layout == "symlink":
+        runner_path = tmp_path / "runner-link"
+        runner_path.symlink_to(executable.name)
+    _configure_test_suites(home, state, test_suites=[
+        {"name": "python", "command": f"{shlex.quote(str(runner_path))} -q", "default": True,
+         "selector_prefixes": ["tests/"], "selector_suffixes": [".py"]},
+        {"name": "frontend", "command": "npm run test:ci",
+         "selector_prefixes": ["frontend/"], "selector_suffixes": [".test.ts", ".test.tsx"]},
+    ])
+    original_which = project_tests.shutil.which
+
+    def resolve_runner(command, *args, **kwargs):
+        if command == "npm":
+            return str(runner_path)
+        return original_which(command, *args, **kwargs)
+
+    monkeypatch.setattr(project_tests.shutil, "which", resolve_runner)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NPM_CONFIG_CACHE", str(home / "shared-cache"))
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/controller/secret.js")
+    monkeypatch.setenv("NPM_TOKEN", "never-forwarded")
+    root = state.checkout_lease.path
+    for path in selectors:
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("// fixture\n")
+    # Keep real executable canonicalization: both absolute Python commands and
+    # PATH-resolved npm commands must use the fixture target, not a host tool.
+    issued = []
+    calls = []
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append(argv)
+        assert directory.path == issued[-1] != root
+        assert projections == ()
+        assert not {"HOME", "MIMIR_HOME", "NODE_OPTIONS", "NPM_TOKEN", "NPM_CONFIG_CACHE"} & env.keys()
+        (directory.path / "node_modules").mkdir()
+        return CollectedExecutionResult(0, b"suite output", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_snapshot_checkout_factory(tmp_path, issued),
+    ).execute(selectors, suite=suite)
+    expected_command = (str(executable), "run", "test:ci") if expected == "frontend" else (str(executable), "-q")
+    if expected == "frontend" and selectors:
+        expected_command += ("--",)
+    assert calls == [(*expected_command, *selectors)]
+    assert result.suite == expected
+    assert result.returncode == 0 and result.stdout == "suite output"
+    assert state.full_tested_head == (state.git_expected_head if expected == "python" and not selectors else None)
+    assert not (root / "node_modules").exists()
+    assert not issued[0].exists()
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suite,selectors,overlap", [
+    (None, ("frontend/example.tsx", "test_example.py"), False),
+    (None, ("test_example.py", "tracked.txt"), False),
+    (None, ("tracked.txt",), False),
+    ("unknown", (), False),
+    (None, ("test_example.py",), True),
+])
+async def test_project_suite_selection_refuses_without_execution(
+    repo_tools, tmp_path, monkeypatch, suite, selectors, overlap,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    if overlap:
+        config = yaml.safe_load((home / "repositories.yaml").read_text())
+        config["repositories"][0]["test_suites"][1]["selector_suffixes"].append(".py")
+        (home / "repositories.yaml").write_text(yaml.safe_dump(config))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    for path in selectors:
+        target = state.checkout_lease.path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture\n")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("suite refusal must precede snapshot creation")
+
+    with pytest.raises(ProjectTestRefusal) as error:
+        await RepoProjectTests(state, checkout_factory=forbidden).execute(selectors, suite=suite)
+    assert error.value.code == "test_suite_selection_refused"
+    assert "python, frontend" in str(error.value)
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+def test_selector_helper_drives_inference_and_refusal_message(
+    repo_tools, tmp_path, monkeypatch,
+):
+    from mimir_cultivate import repository as project_tests
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    # Neither selector matches the declared prefixes/suffixes. Change only the
+    # shared helper: it must control both inference and unmatched diagnostics.
+    matched = "custom-directory/"
+    unmatched = "other-directory/"
+    monkeypatch.setattr(
+        project_tests, "_selector_matches",
+        lambda path, suite: path == matched and suite.name == "python",
+    )
+    assert project_tests._configured_command(
+        state.action_scope.canonical_repo, (matched,),
+    )[3] == "python"
+    with pytest.raises(ProjectTestRefusal) as error:
+        project_tests._configured_command(
+            state.action_scope.canonical_repo, (matched, unmatched),
+        )
+    assert error.value.code == "test_suite_selection_refused"
+    assert f"unmatched selectors: {[unmatched]!r}" in str(error.value)
+    assert matched not in str(error.value)
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.asyncio
+async def test_unmatched_directory_selector_refusal_names_explicit_suite(
+    repo_tools, tmp_path, monkeypatch,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    selector = "mimir/optional-skills/social-cli/tests/"
+    (state.checkout_lease.path / selector).mkdir(parents=True)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("suite refusal must precede snapshot creation")
+
+    with pytest.raises(ProjectTestRefusal) as error:
+        await RepoProjectTests(state, checkout_factory=forbidden).execute((selector,))
+    assert error.value.code == "test_suite_selection_refused"
+    assert selector in str(error.value)
+    assert 'pass suite="python" (or suite="frontend")' in str(error.value)
+
+    calls = []
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append(argv)
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute((selector,), suite="python")
+    assert result.ok and result.suite == "python"
+    assert calls == [("/usr/bin/true", "-q", selector.rstrip("/"))]
+
+
+@pytest.mark.parametrize("selector,code", [
+    ("frontend/example.tsx::case", "test_selector_invalid"),
+    ("tracked.txt", "test_selector_invalid"),
+    ("../outside.ts", "test_selector_outside_checkout"),
+    ("/outside.tsx", "test_selector_outside_checkout"),
+    ("-option.ts", "test_selector_invalid"),
+    ("frontend/link.ts", "test_selector_symlink"),
+])
+def test_frontend_selector_guards(tmp_path, selector, code):
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend/example.tsx").write_text("fixture")
+    (tmp_path / "tracked.txt").write_text("fixture")
+    (tmp_path / "-option.ts").write_text("fixture")
+    (tmp_path / "frontend/link.ts").symlink_to("example.tsx")
+    if selector == "../outside.ts":
+        selector = f"../{tmp_path.name}/frontend/example.tsx"
+    elif selector == "/outside.tsx":
+        selector = str(tmp_path / "frontend/example.tsx")
+    with pytest.raises(ProjectTestRefusal) as error:
+        _validated_selectors(tmp_path, (selector,), suite="frontend")
+    assert error.value.code == code
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.asyncio
+async def test_project_legacy_repository_command_keeps_argv(repo_tools, tmp_path, monkeypatch):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, test_suites=[], test_command="/usr/bin/true -q")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    calls = []
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append((argv, directory.path))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(state, runner=runner, checkout_factory=_test_checkout_factory).execute(("tracked.txt::case",))
+    assert calls == [(("/usr/bin/true", "-q", "tracked.txt::case"), state.checkout_lease.path)]
+    assert result.suite == "default" and result.command_source == "repository"
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+def test_project_suite_default_and_legacy_fallback(repo_tools, tmp_path, monkeypatch):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    frontend = {"name": "frontend", "command": "/usr/bin/true"}
+    _configure_test_suites(home, state, test_suites=[frontend])
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    with pytest.raises(ProjectTestRefusal, match="frontend") as error:
+        _configured_command(state.action_scope.canonical_repo)
+    assert error.value.code == "test_suite_selection_refused"
+    _configure_test_suites(home, state, test_suites=[frontend], test_command="/usr/bin/false -q")
+    command, _, source, suite, is_default = _configured_command(state.action_scope.canonical_repo)
+    assert (command, source, suite, is_default) == (("/usr/bin/false", "-q"), "repository", "default", True)
+    _configure_test_suites(home, state, test_suites=[{
+        "name": "default", "command": "/usr/bin/false", "default": True,
+    }])
+    command, _, source, suite, is_default = _configured_command(state.action_scope.canonical_repo)
+    assert (command, source, suite, is_default) == (("/usr/bin/false",), "repository", "default", True)
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code,overflow,timed_out,code", [
+    (2, False, False, "tests_failed"),
+    (0, True, False, "test_output_overflow"),
+    (2, True, False, "tests_failed_output_overflow"),
+    (None, False, True, "test_timeout"),
+])
+async def test_frontend_result_preserves_bounded_failure_reporting(
+    repo_tools, tmp_path, monkeypatch, exit_code, overflow, timed_out, code,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr("mimir_cultivate.repository.shutil.which", lambda *a, **k: "/usr/bin/true")
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(exit_code, b"x" * 9000, b"e" * 5000, timed_out, overflow, 0, 0)
+
+    result = await RepoProjectTests(state, runner=runner, checkout_factory=_test_checkout_factory).execute(suite="frontend")
+    assert not result.ok and result.code == code and result.suite == "frontend"
+    assert result.returncode == exit_code
+    assert len(result.stdout) == 8000 and len(result.stderr) == 4000
+    assert result.output_limited
+    assert result.stdout_return_dropped_bytes > 0
+    assert result.stderr_return_dropped_bytes > 0
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code,overflow,timed_out,code", [
+    (0, False, False, "tests_passed"),
+    (2, False, False, "tests_failed"),
+    (0, True, False, "test_output_overflow"),
+    (2, True, False, "tests_failed_output_overflow"),
+    (None, True, False, "tests_failed_output_overflow"),
+    (0, True, True, "test_timeout"),
+    (2, True, True, "test_timeout"),
+])
+async def test_project_test_output_overflow_verdict_and_accounting(
+    repo_tools, tmp_path, monkeypatch, exit_code, overflow, timed_out, code,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    stdout_dropped = 123 if overflow else 0
+    stderr_dropped = 456 if overflow else 0
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(
+            exit_code, b"x" * 9000, b"e" * 5000, timed_out, overflow,
+            stdout_dropped, stderr_dropped,
+        )
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute()
+
+    assert result.code == code
+    assert result.ok is (code == "tests_passed")
+    assert result.returncode == (None if timed_out else exit_code)
+    assert result.output_limited is True
+    assert result.stdout_dropped_bytes == stdout_dropped
+    assert result.stderr_dropped_bytes == stderr_dropped
+    assert result.stdout_return_dropped_bytes > 0
+    assert result.stderr_return_dropped_bytes > 0
+    assert len(result.stdout) == 8000 and len(result.stderr) == 4000
+    assert state.full_tested_head == (state.git_expected_head if result.ok else None)
+
+
+@pytest.mark.asyncio
+async def test_project_test_long_pytest_output_keeps_footer_and_validated_failure_ids(
+    repo_tools, tmp_path, monkeypatch,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    lease = state.checkout_lease.path
+    tests = lease / "tests"
+    tests.mkdir()
+    (tests / "test_results.py").write_text(
+        "def test_broken(): pass\n"
+        "def test_other(): pass\n"
+    )
+    footer = (
+        "=== short test summary info ===\n"
+        "FAILED tests/test_results.py::test_broken - AssertionError\n"
+        "FAILED tests/test_results.py::test_other - AssertionError\n"
+        "2 failed, 21 passed in 19.42s\n"
+    )
+    stdout = ("pytest session\n" + "." * 25_000 + "\n" + footer).encode()
+    stderr = ("stderr opening\n" + "e" * 7_000 + "\nstderr ending\n").encode()
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(1, stdout, stderr, False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tests/test_results.py",))
+    assert result.code == "tests_failed"
+    assert result.output_limited is True
+    assert result.stdout_dropped_bytes == result.stderr_dropped_bytes == 0
+    assert result.stdout.startswith("pytest session\n")
+    assert result.stdout.endswith(footer)
+    assert result.failing_node_ids == [
+        "tests/test_results.py::test_broken", "tests/test_results.py::test_other",
+    ]
+    assert result.pytest_summary == {
+        "passed": 21, "failed": 2, "errors": 0, "skipped": 0, "duration": "19.42s",
+    }
+    for source, excerpt, dropped, limit in (
+        (stdout, result.stdout, result.stdout_return_dropped_bytes, 8000),
+        (stderr, result.stderr, result.stderr_return_dropped_bytes, 4000),
+    ):
+        assert len(excerpt) == limit
+        assert dropped == len(source) - len(excerpt.encode()) + len(f"…[{dropped} bytes omitted]…".encode())
+        assert f"…[{dropped} bytes omitted]…" in excerpt
+    assert result.stderr.startswith("stderr opening\n")
+    assert result.stderr.endswith("\nstderr ending\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stdout", "expected"), [
+    (b"1 passed in 0.11s\n", {"passed": 1, "failed": 0, "errors": 0, "skipped": 0, "duration": "0.11s"}),
+    (b"1 error in 0.30s\n", {"passed": 0, "failed": 0, "errors": 1, "skipped": 0, "duration": "0.30s"}),
+    (b"pytest process crashed before summary\n", None),
+])
+async def test_project_test_short_output_and_missing_summary(
+    repo_tools, tmp_path, monkeypatch, stdout, expected,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0 if expected and expected["passed"] else 1,
+                                        stdout, b"short stderr", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+    assert result.stdout == stdout.decode()
+    assert result.stderr == "short stderr"
+    assert result.output_limited is False
+    assert result.stdout_return_dropped_bytes == result.stderr_return_dropped_bytes == 0
+    assert result.pytest_summary == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("complete", [True, False])
+async def test_repo_test_raw_result_leads_with_parsed_summary_when_available(
+    repo_tools, monkeypatch, complete,
+):
+    from mimir_cultivate import repository as repo_module
+
+    state = repo_tools[-2]
+    monkeypatch.setattr(repo_module, "_state", lambda *args: state)
+
+    async def execute(self, selectors, *, suite):
+        return ProjectTestResult(
+            False, "tests_failed", 1,
+            stdout="1 failed in 0.20s\n" if complete else "process crashed\n",
+            pytest_summary=({"passed": 0, "failed": 1, "errors": 0,
+                             "skipped": 0, "duration": "0.20s"} if complete else None),
+            failing_node_ids=["tests/test_results.py::test_broken"] if complete else [],
+        )
+
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", execute)
+    result = await repo_module.repo_test.coroutine("owner/repo", 7, include_output=True)
+    assert list(result)[:3] == ["ok", "code", "returncode"]
+    if complete:
+        assert list(result)[3:5] == ["pytest_summary", "failing_node_ids"]
+        assert result["pytest_summary"] == {
+            "passed": 0, "failed": 1, "errors": 0, "skipped": 0, "duration": "0.20s",
+        }
+        assert result["failing_node_ids"] == ["tests/test_results.py::test_broken"]
+    else:
+        assert "pytest_summary" not in result
+        assert result["failing_node_ids"] == []
+
+
+def _snapshot_checkout_factory(root: Path, issued: list[Path]):
+    def factory(source: Path, **_kwargs):
+        boundary = root / f"issued-{len(issued)}"
+        destination = boundary / "checkout"
+        create_git_snapshot(source, destination)
+        issued.append(destination)
+
+        def close() -> None:
+            shutil.rmtree(boundary)
+
+        return SimpleNamespace(
+            path=destination,
+            capability=SimpleNamespace(path=destination),
+            close=close,
+        )
+
+    return factory
+
+
+@pytest.mark.parametrize("creation_returncode", [0, 1])
+def test_retained_snapshot_bundle_is_removed_on_success_and_creation_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, creation_returncode: int,
+) -> None:
+    from mimir_cultivate import repository as repo_tools_module
+    from mimir_cultivate.worklink import worker_client
+
+    source = tmp_path / "checkout"
+    source.mkdir()
+    removed: list[Path] = []
+
+    def create(argv, **_kwargs):
+        artifact = Path(argv[-2])
+        artifact.write_bytes(b"partial bundle")
+        return subprocess.CompletedProcess(argv, creation_returncode, b"", b"")
+
+    def control(checkout, argv, **_kwargs):
+        assert checkout == source
+        assert argv[:3] == ("/bin/rm", "-f", "--")
+        artifact = Path(argv[-1])
+        artifact.unlink(missing_ok=True)
+        removed.append(artifact)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(repo_tools_module, "retained_factory_subprocess_runner", create)
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+
+    if creation_returncode:
+        with pytest.raises(OSError, match="bundle creation failed"):
+            with retained_factory_snapshot_bundle(source):
+                pytest.fail("failed bundle creation yielded an artifact")
+    else:
+        with retained_factory_snapshot_bundle(source) as artifact:
+            assert artifact.exists()
+        assert not artifact.exists()
+
+    assert len(removed) == 1
+    assert not tuple(source.glob(".mimir-repo-test-*.bundle"))
+
+
+def _recursive_metadata(root: Path) -> dict[str, tuple[int, int, int]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat(follow_symlinks=False).st_uid,
+            path.stat(follow_symlinks=False).st_gid,
+            stat.S_IMODE(path.stat(follow_symlinks=False).st_mode),
+        )
+        for path in (root, *root.rglob("*"))
+    }
+
+
+def _repo_test_conftest_payload(canary: Path) -> bytes:
+    return (
+        "from pathlib import Path\n"
+        "import json, os\n"
+        "def pytest_sessionstart(session):\n"
+        "    marker = Path('snapshot-executed.json')\n"
+        "    details = {'uid': os.getuid(), 'home': os.environ['HOME'], 'attacked': True}\n"
+        "    try:\n"
+        f"        Path(*{list(canary.parts)!r}).write_text('altered')\n"
+        "    except OSError:\n"
+        "        details['attacked'] = False\n"
+        "    details['marker'] = 'executed'\n"
+        "    marker.write_text(json.dumps(details))\n"
+        "    print('MIMIR_PAYLOAD=' + json.dumps(details), flush=True)\n"
+    ).encode()
+
+
+def _plant_repo_test_payload(
+    lease: Path, conftest_payload: bytes, python_executable: str,
+) -> None:
+    (lease / "conftest.py").write_bytes(conftest_payload)
+    (lease / "test_payload.py").write_text("def test_payload():\n    assert True\n", encoding="utf-8")
+    command = (
+        'namespace={}; exec(compile(open("conftest.py").read(), '
+        '"conftest.py", "exec"), namespace); '
+        'namespace["pytest_sessionstart"](None)'
+    )
+    (lease / "run-tests.sh").write_text(
+        f"#!/bin/sh\nexec {python_executable} -c {command!r} \"$@\"\n",
+        encoding="utf-8",
+    )
+
+
+async def _local_contained_runner(argv, directory, worker_env, projections, **_kwargs):
+    completed = await asyncio.to_thread(
+        subprocess.run, argv, cwd=directory.path, env=dict(worker_env), capture_output=True, check=False,
+    )
+    return CollectedExecutionResult(
+        completed.returncode, completed.stdout, completed.stderr, False, False, 0, 0,
+    )
+
+
+def _execute_project_tests(state: RepoReviewState):
+    return asyncio.run(RepoProjectTests(
+        state, runner=_local_contained_runner, checkout_factory=_test_checkout_factory,
+    ).execute())
+
+
+@pytest.mark.asyncio
+async def test_project_tests_use_snapshot_collected_result_and_worker_environment(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("GITHUB_TOKEN", "never-forwarded")
+    calls = []
+
+    def factory(source, **kwargs):
+        capability = SimpleNamespace(path=tmp_path / "snapshot")
+        return SimpleNamespace(path=capability.path, capability=capability, close=lambda: None)
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append((argv, directory, env, projections, kwargs))
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(state, runner=runner, checkout_factory=factory).execute(
+        ("tracked.txt::case",)
+    )
+    assert result.ok is True
+    argv, directory, env, projections, kwargs = calls[0]
+    assert argv == ("/usr/bin/true", "-q", "tracked.txt::case")
+    assert directory.path == tmp_path / "snapshot"
+    assert projections == ()
+    assert "HOME" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "MIMIR_HOME" not in env
+    assert env["CI"] == "1"
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == "*"
+    assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 16 * 1024 * 1024
+    # Assert propagation, not the magnitude: the value is pinned as a floor
+    # by test_project_test_timeout_can_actually_run_this_repository_suite.
+    assert kwargs["timeout_s"] == _TIMEOUT_SECONDS
+    assert result.git_context == (
+        "contained Git context: runner=worklink uid=42002 gid=42003; "
+        "checkout_owner=worklink uid=42002 gid=42003; global_config=/dev/null; "
+        "system_config=disabled; safe.directory=*"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_uv_uses_disposable_cache_and_preserves_uv_hardening(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(home, f"{fake_uv} run pytest -q")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    observed: dict[str, str] = {}
+
+    async def runner(_argv, _directory, env, _projections, **_kwargs):
+        observed.update(env)
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.ok
+    assert observed["UV_NO_CONFIG"] == "1"
+    assert observed["UV_CACHE_DIR"] == f'{observed["XDG_CACHE_HOME"]}/uv'
+    assert "HOME" not in observed
+
+
+@pytest.mark.asyncio
+async def test_project_tests_scrub_checkout_home_and_sensitive_output(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "controller-home"
+    _configure_worklink_test(home, "/usr/bin/false")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz"
+
+    async def runner(*_args, **_kwargs):
+        payload = f"{state.checkout_lease.path} {home} {secret}".encode()
+        return CollectedExecutionResult(3, payload, payload, False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute()
+    assert result.code == "tests_failed"
+    assert str(home) not in result.stdout + result.stderr
+    assert str(state.checkout_lease.path) not in result.stdout + result.stderr
+    assert secret not in result.stdout + result.stderr
+
+
+def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.CompletedProcess[bytes]:
+    test_path = tmp_path / "test_synthetic_hang.py"
+    test_path.write_text(test_source, encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-s",
+            "-p",
+            "no:anyio",
+            # The synthetic test uses no anyio fixtures; exclude its optional
+            # plugin, whose import emits a deprecation under pytest 9.2.
+            "-o",
+            "asyncio_default_fixture_loop_scope=function",
+            # pytest 9.2.0 / pytest-asyncio 1.4.0 emits PytestDeprecationWarning
+            # from pytest_configure when this is unset, polluting stderr even
+            # for the fast-test quietness control. Configure, don't filter it.
+            str(test_path),
+            "-o",
+            "faulthandler_timeout=0.1",
+            "-o",
+            "faulthandler_exit_on_timeout=false",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        # Nested pytest startup can be heavily delayed while the full suite is
+        # contending for CPU; keep this outer guard well above the intentional
+        # three-second sleep that the assertion exercises.
+        timeout=30,
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed = await asyncio.to_thread(
+        _run_synthetic_pytest,
+        tmp_path,
+        "import os\n"
+        "import threading\n"
+        "import time\n"
+        "\n"
+        "def blocked_worker(gate):\n"
+        "    gate.wait()\n"
+        "\n"
+        "def test_synthetic_hang():\n"
+        "    credential = 'credential-value-must-not-appear'\n"
+        "    gate = threading.Event()\n"
+        "    threading.Thread(target=blocked_worker, args=(gate,), daemon=True).start()\n"
+        "    os.write(2, b'x' * 5000)\n"
+        # 0.1s faulthandler threshold against a 3s hang: a 30x margin, because a
+        # contended CI runner can otherwise finish a 0.2s sleep before the dump
+        # is written. Observed failing twice on pytest-macos (3.11) at that margin
+        # while passing locally and on every Linux job.
+        "    time.sleep(3.0)\n"
+        "    assert credential\n",
+    )
+    assert completed.returncode == 0
+    assert len(completed.stderr) > 4_000
+    assert b"Timeout (0:00:00.100000)!" in completed.stderr
+    assert b"in blocked_worker" in completed.stderr
+    assert b"in test_synthetic_hang" in completed.stderr
+    # Python's faulthandler emits stack locations, not frame local values.
+    assert b"credential-value-must-not-appear" not in completed.stderr
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    async def runner(*_args, **_kwargs):
+        return CollectedExecutionResult(
+            completed.returncode, b"", completed.stderr, False, False, 0, 0,
+        )
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+    assert result.ok
+    assert len(result.stderr) <= 4_000
+    assert result.stderr.startswith("Timeout (0:00:00.100000)!") or re.match(
+        r"^…\[\d+ bytes omitted\]…Timeout \(0:00:00.100000\)!", result.stderr,
+    )
+    assert "in blocked_worker" in result.stderr
+    assert "in test_synthetic_hang" in result.stderr
+    assert "credential-value-must-not-appear" not in result.stderr
+    assert result.output_limited is True
+    assert result.stderr_dropped_bytes == 0
+    assert result.stderr_return_dropped_bytes > 0
+
+
+@pytest.mark.parametrize(
+    "noise", ["", "noise\n" + "ø" * 5_000 + "\n"], ids=["no-prefix", "utf8-prefix"],
+)
+@pytest.mark.parametrize("long_dump", [False, True])
+def test_stderr_hang_dump_keeps_contiguous_leading_frames_and_counts_dropped_bytes(
+    noise: str, long_dump: bool,
+) -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    dump = (
+        "Timeout (0:05:00)!\n"
+        + "  File worker_context.py, line 1\n" * 50
+        + "  File test_hang.py, line 7, in blocked_worker\n"
+        + "  File test_hang.py, line 10, in test_synthetic_hang\n"
+        + ("  File later_context.py, line 20\n" * 200 if long_dump else "")
+    )
+    source = noise + dump
+    excerpt, dropped = _safe_stderr_output(source.encode(), scrubber, 4_000)
+    prefix_bytes = len(noise.encode())
+    prefix = f"…[{prefix_bytes} bytes omitted]…" if noise else ""
+    if len(source) <= 4_000:
+        assert excerpt == source
+        assert dropped == 0
+    else:
+        expected_dump = dump[:4_000 - len(prefix)]
+        assert excerpt == prefix + expected_dump
+        assert dropped == prefix_bytes + len(dump[len(expected_dump):].encode())
+    assert len(excerpt) <= 4_000
+    # These frames occur past the ordinary excerpt's 1,000-character head.
+    assert dump.index("in blocked_worker") > 1_000
+    assert "in blocked_worker" in excerpt
+    assert "in test_synthetic_hang" in excerpt
+
+
+def test_stderr_without_hang_dump_keeps_existing_positional_policy() -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    stderr = b"head-context\n" + b"x" * 5_000 + b"\ntail-context"
+
+    excerpt, dropped = _safe_stderr_output(stderr, scrubber, 100)
+    assert excerpt.startswith("head-context")
+    assert excerpt.endswith("tail-context")
+    assert dropped > 0
+
+
+def test_bounded_output_counts_scrubbed_utf8_bytes_and_keeps_both_ends() -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    secret = "https://user:password@example.invalid/path"
+    scrubber.add_scalar(secret)
+    payload = ("opening " + secret + "\n" + "ø" * 9_000 + "\nlast line\n").encode()
+    excerpt, dropped = _safe_output(payload, scrubber, 8_000)
+    assert len(excerpt) <= 8_000
+    assert excerpt.startswith("opening <redacted>\n")
+    assert excerpt.endswith("\nlast line\n")
+    assert "password" not in excerpt
+    assert f"…[{dropped} bytes omitted]…" in excerpt
+    # Multi-byte characters make omitted bytes different from omitted chars.
+    scrubbed = scrubber.scrub_text(payload)
+    assert dropped > len(scrubbed) - len(excerpt) + len(f"…[{dropped} bytes omitted]…")
+
+
+@pytest.mark.asyncio
+async def test_project_test_timeout_returns_captured_hang_diagnostic(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    stderr = (
+        b"noise\n"
+        + b"x" * 5_000
+        + b"\nTimeout (0:05:00)!\nThread dump\n  File test_hang.py, line 7\n"
+    )
+
+    async def runner(*_args, **kwargs):
+        kwargs["stdout_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["stdout_path"].write_bytes(b"partial stdout")
+        kwargs["stderr_path"].write_bytes(stderr)
+        return CollectedExecutionResult(None, b"partial stdout", stderr, True, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.code == "test_timeout"
+    assert result.stdout == "partial stdout"
+    assert re.match(r"^…\[\d+ bytes omitted\]…Timeout \(0:05:00\)!", result.stderr)
+    assert "test_hang.py" in result.stderr
+    assert result.stdout_path.startswith("state/worklink/transcripts/repo-test-")
+    assert result.stderr_path.startswith("state/worklink/transcripts/repo-test-")
+    assert (home / result.stdout_path).read_bytes() == b"partial stdout"
+    assert b"test_hang.py" in (home / result.stderr_path).read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_project_test_hang_is_observable_before_runner_completes(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    output_written = asyncio.Event()
+    release_runner = asyncio.Event()
+    observed: dict[str, object] = {}
+    dump = (
+        b"Timeout (0:05:00)!\n"
+        b'Thread 0x1 (most recent call first):\n  File "test_never_finishes.py", line 9\n'
+    )
+
+    async def runner(*_args, **kwargs):
+        observed.update(kwargs)
+        stdout_path = kwargs["stdout_path"]
+        stderr_path = kwargs["stderr_path"]
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(b"tests/test_never_finishes.py::test_hangs ")
+        stderr_path.write_bytes(dump)
+        output_written.set()
+        await release_runner.wait()
+        return CollectedExecutionResult(
+            None, stdout_path.read_bytes(), stderr_path.read_bytes(), True, False, 0, 0,
+        )
+
+    task = asyncio.create_task(RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",)))
+    # Real Git setup and the entire runner protocol share pytest's 300s ceiling.
+    await output_written.wait()
+
+    stdout_path = observed["stdout_path"]
+    stderr_path = observed["stderr_path"]
+    assert isinstance(stdout_path, Path)
+    assert isinstance(stderr_path, Path)
+    assert task.done() is False
+    assert b"test_never_finishes.py::test_hangs" in stdout_path.read_bytes()
+    assert b"test_never_finishes.py" in stderr_path.read_bytes()
+    assert observed["stdout_limit"] == observed["stderr_limit"] == 16 * 1024 * 1024
+    assert stdout_path.stat().st_size <= 64 * 1024
+    assert stderr_path.stat().st_size <= 64 * 1024
+
+    release_runner.set()
+    result = await task
+    assert result.code == "test_timeout"
+    assert home / result.stdout_path == stdout_path
+    assert home / result.stderr_path == stderr_path
+
+
+@pytest.mark.asyncio
+async def test_project_test_fast_run_removes_live_output_files(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    written: list[Path] = []
+
+    async def runner(*_args, **kwargs):
+        stdout_path = kwargs["stdout_path"]
+        stderr_path = kwargs["stderr_path"]
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.write_bytes(b"one passed")
+        stderr_path.write_bytes(b"")
+        written.extend((stdout_path, stderr_path))
+        return CollectedExecutionResult(0, b"one passed", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.ok is True
+    assert result.stdout == "one passed"
+    assert result.stdout_path == result.stderr_path == ""
+    assert written and all(not path.exists() for path in written)
+
+
+@pytest.mark.asyncio
+async def test_builtin_hang_diagnostic_configuration_leaves_fast_test_quiet(
+    tmp_path: Path,
+) -> None:
+    config = tomllib.loads(
+        (Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )["tool"]["pytest"]["ini_options"]
+    assert config["faulthandler_timeout"] == 300
+    assert config["faulthandler_timeout"] < _TIMEOUT_SECONDS / 2
+    assert config["faulthandler_exit_on_timeout"] is False
+
+    completed = await asyncio.to_thread(
+        _run_synthetic_pytest,
+        tmp_path,
+        "def test_fast():\n"
+        "    pass\n",
+    )
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    assert b"Timeout" not in completed.stdout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "reason"),
+    [
+        ("--flag", "test_selector_invalid"),
+        ("../outside", "test_selector_outside_checkout"),
+        ("tracked.txt;id", "test_selector_invalid"),
+        ("/tmp/test", "test_selector_outside_checkout"),
+    ],
+)
+async def test_project_test_selector_injection_is_refused(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selector: str,
+    reason: str,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(state).execute((selector,))
+    assert refusal.value.code == reason
+
+
+def test_project_test_missing_selector_has_named_non_disclosing_refusal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    selector = "missing/test_file.py::test_named_case"
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, (selector,))
+
+    assert refusal.value.code == "test_selector_not_found"
+    assert str(refusal.value) == f"test selector was not found in checkout: {selector}"
+    assert str(root) not in str(refusal.value)
+
+
+def test_pytest_failure_summary_is_bounded_and_uses_last_section_only():
+    from mimir_cultivate.repository import pytest_failure_summary
+
+    ids = "".join(f"FAILED tests/test_a.py::test_{i} - reason\n" for i in range(55))
+    output = (
+        "FAILED injected text with spaces\n"
+        "=== short test summary info ===\nFAILED tests/old.py::test_old\n"
+        "=== 1 failed in 0.01s ===\n"
+        "=== short test summary info ===\n"
+        "FAILED tests/bad.py::test_<inject> - reason\n"
+        f"ERROR {'a' * 257} - reason\n"
+        "FAILED injected text with spaces\n" + ids +
+        "=== 55 failed, 1 error, 2 passed, 3 skipped in 0.2s ===\n"
+    ).encode()
+    inventory = frozenset(f"tests/test_a.py::test_{i}" for i in range(55))
+    summary = pytest_failure_summary(output, inventory)
+    assert summary == {
+        "failed": 55, "errors": 1, "passed": 2, "skipped": 3,
+        "failing": [f"tests/test_a.py::test_{i}" for i in range(50)],
+        "failing_dropped": 8,
+    }
+    assert pytest_failure_summary(b"FAILED tests/printed.py::test_x\nfrontend failed\n") == {
+        "failed": None, "errors": None, "passed": None, "skipped": None,
+        "failing": [], "failing_dropped": 0,
+    }
+
+
+def test_project_test_symlink_selector_is_refused_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "linked").symlink_to(tmp_path / "missing-target", target_is_directory=True)
+
+    def unexpected_resolve(*_args, **_kwargs):
+        raise AssertionError("symlink selector must be refused before resolution")
+
+    monkeypatch.setattr(Path, "resolve", unexpected_resolve)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, ("linked/test_file.py",))
+
+    assert refusal.value.code == "test_selector_symlink"
+    assert "symlink" in str(refusal.value)
+
+
+@pytest.mark.parametrize("selector", ["../absent-outside.py", "/absent-outside.py"])
+def test_project_test_absent_escape_is_not_reclassified_as_not_found(
+    tmp_path: Path, selector: str,
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, (selector,))
+
+    assert refusal.value.code == "test_selector_outside_checkout"
+    assert str(refusal.value) == (
+        "test selector does not resolve inside the authorized checkout"
+    )
+
+
+def test_project_test_unreadable_parent_has_resolution_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkout"
+    unreadable = root / "unreadable"
+    unreadable.mkdir(parents=True)
+    original_resolve = Path.resolve
+
+    def permission_denied(path: Path, *args, **kwargs):
+        if path == unreadable / "test_file.py":
+            raise PermissionError(13, "Permission denied", str(unreadable))
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", permission_denied)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        _validated_selectors(root, ("unreadable/test_file.py",))
+
+    assert refusal.value.code == "test_selector_unresolvable"
+
+
+@pytest.mark.asyncio
+async def test_project_test_scope_and_active_lease_guards(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    denied = RepoReviewState(replace(
+        scope, allowed_operations=scope.allowed_operations - {RepoPRAction.TEST.value},
+    ))
+    with pytest.raises(ProjectTestRefusal, match="scope does not grant"):
+        await RepoProjectTests(denied).execute()
+    object.__setattr__(state, "checkout_lease", replace(state.checkout_lease, revoked=True))
+    with pytest.raises(ProjectTestRefusal) as inactive:
+        await RepoProjectTests(state).execute()
+    assert inactive.value.code == "inactive_checkout"
+
+
+@pytest.mark.asyncio
+async def test_project_test_snapshot_credentials_are_named_refusal(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    def refused(*_args, **_kwargs):
+        raise SnapshotCredentialsRefused(1)
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(state, checkout_factory=refused).execute()
+    assert refusal.value.code == "test_snapshot_credentials_refused"
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suite", [None, "frontend"])
+async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    suite,
+) -> None:
+    import mimir.event_logger as event_logger
+    from mimir_cultivate import repository as repo_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "controller-config"
+    _configure_worklink_test(home)
+    if suite is not None:
+        _configure_test_suites(home, state)
+        monkeypatch.setattr("mimir_cultivate.repository.shutil.which", lambda *a, **k: "/usr/bin/true")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    credential_path = state.checkout_lease.path / "nested" / "credentials.json"
+    credential_path.parent.mkdir()
+    credential_bytes = b"arbitrary-credential\x00\xff\x10-not-token-shaped"
+    credential_path.write_bytes(credential_bytes)
+    issued: list[Path] = []
+    event_path = tmp_path / "persisted" / "events.jsonl"
+    previous_logger = event_logger._logger
+    event_logger.init_logger(event_path, "repo-test-containment")
+    caplog.set_level("DEBUG")
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
+    monkeypatch.setattr(
+        repo_module,
+        "RepoProjectTests",
+        lambda review_state: RepoProjectTests(
+            review_state,
+            runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("credential refusal must happen before launch")
+            ),
+            checkout_factory=_snapshot_checkout_factory(tmp_path / "snapshots", issued),
+        ),
+    )
+    assert repo_module.repo_test.coroutine is not None
+    try:
+        with pytest.raises(ToolException) as refusal:
+            await repo_module.repo_test.coroutine(
+                repository="owner/repo",
+                pull_request=7,
+                selectors=(),
+                runtime=None,
+                suite=suite,
+            )
+    finally:
+        event_logger._logger = previous_logger
+
+    assert isinstance(refusal.value, ToolPolicyRefusal)
+    persisted_events = event_path.read_bytes()
+    event_records = [json.loads(line) for line in persisted_events.splitlines()]
+    assert [(record["type"], record["reason_code"]) for record in event_records] == [
+        ("repo_test_containment_refused", "snapshot_credentials")
+    ]
+    assert event_records[0]["repository"] == "owner/repo"
+    assert event_records[0]["pull_request"] == 7
+    outward_sinks = (
+        str(refusal.value).encode(),
+        persisted_events,
+        caplog.text.encode(),
+    )
+    for sink in outward_sinks:
+        assert credential_bytes not in sink
+        assert os.fsencode(credential_path) not in sink
+        assert os.fsencode(home) not in sink
+    assert issued == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("socket unavailable"),
+        PermissionError("peer rejected"),
+        ValueError("checkout fd admission rejected"),
+        RuntimeError("worker launch rejected"),
+    ],
+    ids=("socket", "peer", "fd-admission", "launch"),
+)
+async def test_project_test_containment_unavailable_fails_closed(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    from mimir_cultivate import repository as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    marker = tmp_path / "must-not-execute"
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    async def unavailable(*_args, **_kwargs):
+        assert not marker.exists()
+        raise failure
+
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state, runner=unavailable, checkout_factory=_test_checkout_factory,
+        ).execute()
+    assert refusal.value.code == "test_containment_unavailable"
+    assert str(failure) not in str(refusal.value)
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "containment_unavailable",
+        "repository": "owner/repo",
+        "pull_request": 7,
+    })]
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_project_test_names_stale_root_executor_and_rebuild_action(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate import repository as project_tests_module
+    from mimir_cultivate.worklink.worker_client import StaleWorkerExecutorError
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    async def stale(*_args, **_kwargs):
+        raise StaleWorkerExecutorError(
+            "stale root executor image; rebuild the image and restart the container"
+        )
+
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state, runner=stale, checkout_factory=_test_checkout_factory,
+        ).execute()
+
+    assert refusal.value.code == "test_stale_root_executor"
+    assert "rebuild the image and restart the container" in str(refusal.value)
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "stale_root_executor",
+        "repository": "owner/repo",
+        "pull_request": 7,
+    })]
+
+
+@pytest.mark.asyncio
+async def test_project_test_permission_refusal_names_path_metadata_and_identity(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    synthetic_worklink_identities,
+) -> None:
+    from mimir_cultivate import repository as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    boundary = tmp_path / "unreadable"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    failed_path = checkout_path / "uv.toml"
+    failed_path.write_text("file-content-must-not-be-logged", encoding="utf-8")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    async def denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", failed_path)
+
+    def close() -> None:
+        boundary.chmod(0o700)
+
+    boundary.chmod(0)
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    checkout = SimpleNamespace(
+        path=checkout_path,
+        capability=SimpleNamespace(path=checkout_path),
+        close=close,
+    )
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state,
+            runner=denied,
+            checkout_factory=lambda *_args, **_kwargs: checkout,
+        ).execute()
+
+    assert refusal.value.code == "test_path_permission_denied"
+    identities = synthetic_worklink_identities
+    message = str(refusal.value)
+    assert f"path={failed_path}" in message
+    assert "path_mode=0o000" in message
+    assert f"path_uid={os.geteuid()}" in message
+    assert f"path_gid={os.getegid()}" in message
+    assert f"runner_effective_uid={identities.worklink_uid}" in message
+    assert f"runner_effective_gid={identities.worklink_gid}" in message
+    assert f"traversal_failed={boundary}" in message
+    assert "file-content-must-not-be-logged" not in message
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "path_permission_denied",
+        "repository": "owner/repo",
+        "pull_request": 7,
+        "path": str(failed_path),
+        "path_mode": "0o000",
+        "path_uid": os.geteuid(),
+        "path_gid": os.getegid(),
+        "runner_effective_uid": identities.worklink_uid,
+        "runner_effective_gid": identities.worklink_gid,
+        "traversal_failed": str(boundary),
+    })]
+    assert "file-content-must-not-be-logged" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_uv_config_search_is_bounded_at_unsearchable_snapshot_boundary(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pins the production property that RepoProjectTests sets UV_NO_CONFIG=1 for
+    # uv commands, so uv cannot search above an fd-entered checkout for ambient
+    # config. Deliberately independent of three things this previously depended
+    # on by accident: the real uv's release behaviour, ``/proc`` (absent on
+    # macOS), and running as non-root -- root bypasses the directory mode, which
+    # silently voided the premise when the suite ran as root in a container.
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_uv = bin_dir / "uv"  # must be named `uv`: production keys on command[0].
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        'if [ "$UV_NO_CONFIG" = "1" ]; then exit 0; fi\n'
+        'echo "ambient uv config discovery was not disabled" >&2\n'
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(home, f"{fake_uv} run --offline /usr/bin/true")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    boundary = tmp_path / "snapshot-boundary"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    checkout_fd = os.open(checkout_path, os.O_RDONLY | os.O_DIRECTORY)
+    boundary.chmod(0)
+
+    # Negative control: without the production environment, the command fails.
+    observed = subprocess.run(
+        [str(fake_uv), "run", "--offline", "/usr/bin/true"],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+        capture_output=True,
+        check=False,
+    )
+    assert observed.returncode == 2
+    assert b"ambient uv config discovery was not disabled" in observed.stderr
+
+    # The boundary is unsearchable by pathname, which is why production enters
+    # the checkout by fd. Root ignores the mode, so only assert where the OS
+    # enforces it; the fd path below is what production relies on either way.
+    if os.geteuid() != 0:
+        with pytest.raises(PermissionError):
+            os.listdir(checkout_path)
+
+    observed_env: dict[str, str] = {}
+
+    async def runner(argv, _directory, env, _projections, **_kwargs):
+        observed_env.update(env)
+        completed = await asyncio.to_thread(
+            functools.partial(
+                subprocess.run,
+                list(argv),
+                env=env,
+                preexec_fn=lambda: os.fchdir(checkout_fd),
+                capture_output=True,
+                check=False,
+            ),
+        )
+        return CollectedExecutionResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            False,
+            False,
+            0,
+            0,
+        )
+
+    def close() -> None:
+        boundary.chmod(0o700)
+        os.close(checkout_fd)
+
+    checkout = SimpleNamespace(
+        path=checkout_path,
+        capability=SimpleNamespace(path=checkout_path),
+        close=close,
+    )
+    result = await RepoProjectTests(
+        state,
+        runner=runner,
+        checkout_factory=lambda *_args, **_kwargs: checkout,
+    ).execute(("tracked.txt",))
+
+    # Deleting the production ``environment["UV_NO_CONFIG"] = "1"`` line makes
+    # the fake uv exit 2, which fails both assertions below.
+    assert result.ok is True
+    assert observed_env.get("UV_NO_CONFIG") == "1"
+    # Cleanup restored the boundary before the fd was closed.
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_fails", [False, True])
+async def test_project_test_snapshot_is_removed_after_execution(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_fails: bool,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    issued: list[Path] = []
+
+    async def runner(*_args, **_kwargs):
+        if runner_fails:
+            raise OSError("launch failed")
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    service = RepoProjectTests(
+        state,
+        runner=runner,
+        checkout_factory=_snapshot_checkout_factory(tmp_path / "snapshots", issued),
+    )
+    if runner_fails:
+        with pytest.raises(ProjectTestRefusal) as refusal:
+            await service.execute(("tracked.txt",))
+        assert refusal.value.code == "test_containment_unavailable"
+    else:
+        assert (await service.execute(("tracked.txt",))).ok
+    assert len(issued) == 1
+    assert not issued[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_project_test_snapshot_cleanup_failure_is_not_silent(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate import repository as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    checkout = SimpleNamespace(
+        path=state.checkout_lease.path,
+        capability=SimpleNamespace(path=state.checkout_lease.path),
+        close=lambda: (_ for _ in ()).throw(OSError("cleanup path must not escape")),
+    )
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state,
+            runner=lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+            ),
+            checkout_factory=lambda *_args, **_kwargs: checkout,
+        ).execute(("tracked.txt",))
+
+    assert refusal.value.code == "test_snapshot_cleanup_failed"
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "cleanup_failed",
+        "repository": "owner/repo",
+        "pull_request": 7,
+    })]
+    assert str(state.checkout_lease.path) not in str(refusal.value)
+
+
+@pytest.mark.real_worklink_identities
+def test_project_test_real_executor_preserves_active_lease_for_later_commit(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("requires Linux root to exercise the fixed worker identity")
+
+    import mimir_cultivate.contained_checkout as contained_checkout
+    import mimir_cultivate.contained_execution as contained_execution
+    import mimir_cultivate.worklink.checkout as worklink_checkout
+    import mimir_cultivate.worklink.worker_exec as worker_exec
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    try:
+        controller = pwd.getpwnam("mimir")
+        worker = pwd.getpwnam("worklink")
+        worker_gid = grp.getgrnam("worklink").gr_gid
+    except KeyError:
+        pytest.skip("requires real mimir and worklink accounts and the worklink group")
+    controller_uid = controller.pw_uid
+    controller_gid = controller.pw_gid
+    worker_uid = worker.pw_uid
+    if controller_uid == worker_uid:
+        pytest.skip("controller and worker identities must be distinct")
+
+    state = repo_tools[-2]
+    lease = state.checkout_lease.path
+    restored_modes: dict[Path, int] = {}
+    for ancestor in (lease, *lease.parents):
+        restored_modes[ancestor] = stat.S_IMODE(ancestor.stat().st_mode)
+        ancestor.chmod(restored_modes[ancestor] | 0o001)
+        if ancestor == Path("/tmp"):
+            break
+    boundary = Path("/tmp") / f"mimir-repo-test-{uuid.uuid4()}"
+    checkout_root = boundary / "repo-test-checkouts"
+    home_root = boundary / "homes"
+    uv_cache = boundary / "uv-cache"
+    controller_home = boundary / "controller-home"
+    socket_path = boundary / "executor.sock"
+    boundary.mkdir()
+    boundary.chmod(0o755)
+    checkout_root.mkdir(mode=0o771)
+    checkout_root.chmod(0o771)
+    os.chown(checkout_root, 0, controller_gid)
+    home_root.mkdir(mode=0o710)
+    home_root.chmod(0o710)
+    os.chown(home_root, 0, worker_gid)
+    uv_cache.mkdir(mode=0o555)
+    cached_wheel = uv_cache / "cached-wheel"
+    cached_wheel.write_text("pre-populated", encoding="utf-8")
+    cached_wheel.chmod(0o444)
+    controller_home.mkdir(mode=0o700)
+    os.chown(controller_home, controller_uid, controller_gid)
+    canary = controller_home / "repo-test-canary"
+    canary.write_text("protected", encoding="utf-8")
+    os.chown(canary, controller_uid, controller_gid)
+    canary.chmod(0o600)
+    config_home = boundary / "config"
+    python_executable = shutil.which("python")
+    assert python_executable is not None
+    fake_uv = boundary / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'test "$(cat "$UV_CACHE_DIR/cached-wheel")" = pre-populated\n'
+        f"if touch {shlex.quote(str(uv_cache / 'cross-pr-write'))} 2>/dev/null; then exit 91; fi\n"
+        'printf downloaded > "$UV_CACHE_DIR/cache-miss"\n'
+        'echo "MIMIR_UV_CACHE=$UV_CACHE_DIR"\n'
+        f"exec {shlex.quote(python_executable)} -c "
+        + shlex.quote(
+            'namespace={}; exec(compile(open("conftest.py").read(), '
+            '"conftest.py", "exec"), namespace); '
+            'namespace["pytest_sessionstart"](None)'
+        )
+        + ' "$@"\n',
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(config_home, f"{fake_uv} run pytest -q")
+    for path in (config_home, *config_home.rglob("*"), lease, *lease.rglob("*")):
+        os.chown(path, controller_uid, controller_gid, follow_symlinks=False)
+    monkeypatch.setenv("MIMIR_HOME", str(config_home))
+    monkeypatch.setenv("HOME", str(controller_home))
+    planted_conftest = _repo_test_conftest_payload(canary)
+    _plant_repo_test_payload(lease, planted_conftest, python_executable)
+    assert (lease / "conftest.py").read_bytes() == planted_conftest
+    for path in (lease / "conftest.py", lease / "test_payload.py", lease / "run-tests.sh"):
+        os.chown(path, controller_uid, controller_gid)
+    before = _recursive_metadata(lease)
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o666)
+    listener.listen(1)
+    result_read, result_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    unsafe_root = boundary / "unsafe-snapshots"
+    unsafe_root.mkdir()
+    os.chown(unsafe_root, controller_uid, controller_gid)
+    previous_roots = (
+        contained_checkout.REPO_TEST_CHECKOUT_ROOT,
+        worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
+        worker_exec.REPO_TEST_CHECKOUT_ROOT,
+        worker_exec.HOME_ROOT,
+        worker_exec.REPO_TEST_UV_CACHE,
+        contained_execution.WorkerClient,
+    )
+    contained_checkout.REPO_TEST_CHECKOUT_ROOT = checkout_root
+    worklink_checkout._REPO_TEST_CHECKOUT_ROOT = checkout_root
+    worker_exec.REPO_TEST_CHECKOUT_ROOT = checkout_root
+    worker_exec.HOME_ROOT = home_root
+    worker_exec.REPO_TEST_UV_CACHE = uv_cache
+    controller_pid = os.fork()
+    if controller_pid == 0:
+        os.close(result_read)
+        os.close(ready_read)
+        try:
+            os.setgroups([worker_gid])
+            os.setresgid(controller_gid, controller_gid, controller_gid)
+            os.setresuid(controller_uid, controller_uid, controller_uid)
+            assert os.access(lease, os.R_OK | os.X_OK)
+            assert any(lease.iterdir())
+            assert os.access(socket_path, os.W_OK)
+            assert stat.S_ISSOCK(socket_path.stat().st_mode)
+            assert os.access(config_home / "worklink.yaml", os.R_OK)
+            assert (config_home / "worklink.yaml").read_text(encoding="utf-8")
+            os.write(ready_write, b"controller-ready")
+            os.close(ready_write)
+            contained_execution.WorkerClient = lambda capability: WorkerClient(
+                capability, socket_path=socket_path
+            )
+            result = asyncio.run(RepoProjectTests(state).execute(("test_payload.py",)))
+            positive_canary = canary.read_text(encoding="utf-8")
+            canary.write_text("protected", encoding="utf-8")
+            unsafe_observation: dict[str, object] = {}
+            unsafe_issued: list[Path] = []
+
+            async def unsafe_runner(argv, directory, worker_env, projections, **_kwargs):
+                execution_env = dict(worker_env)
+                execution_env["HOME"] = str(controller_home)
+                unsafe_cache = controller_home / ".cache" / "uv"
+                unsafe_cache.mkdir(parents=True, exist_ok=True)
+                (unsafe_cache / "cached-wheel").write_text(
+                    "pre-populated", encoding="utf-8"
+                )
+                execution_env["UV_CACHE_DIR"] = str(unsafe_cache)
+                completed = await asyncio.to_thread(
+                    subprocess.run,
+                    argv,
+                    cwd=directory.path,
+                    env=execution_env,
+                    capture_output=True,
+                    check=False,
+                )
+                snapshot_evidence = directory.path / "snapshot-executed.json"
+                assert snapshot_evidence.exists(), completed.stderr.decode(
+                    errors="replace"
+                )
+                unsafe_observation.update(json.loads(
+                    snapshot_evidence.read_text(encoding="utf-8")
+                ))
+                return CollectedExecutionResult(
+                    completed.returncode,
+                    completed.stdout,
+                    completed.stderr,
+                    False,
+                    False,
+                    0,
+                    0,
+                )
+
+            unsafe_result = asyncio.run(RepoProjectTests(
+                state,
+                runner=unsafe_runner,
+                checkout_factory=_snapshot_checkout_factory(unsafe_root, unsafe_issued),
+            ).execute(("test_payload.py",)))
+            lease_preserved = _recursive_metadata(lease) == before
+            payload_preserved = (lease / "conftest.py").read_bytes() == planted_conftest
+            for payload_path in ("conftest.py", "test_payload.py", "run-tests.sh"):
+                (lease / payload_path).unlink()
+            (lease / "tracked.txt").write_text("after test\n", encoding="utf-8")
+            later_stage = RepoGitTools(state).execute(GitStage(("tracked.txt",))).ok
+            later_commit = RepoGitTools(state).execute(
+                GitCommit(("tracked.txt",), "after contained test")
+            ).ok
+            response = {
+                "positive": asdict(result),
+                "positive_canary": positive_canary,
+                "unsafe": unsafe_observation,
+                "unsafe_ok": unsafe_result.ok,
+                "unsafe_snapshot_cleaned": (
+                    len(unsafe_issued) == 1 and not unsafe_issued[0].exists()
+                ),
+                "final_canary": canary.read_text(encoding="utf-8"),
+                "lease_preserved": lease_preserved,
+                "payload_preserved": payload_preserved,
+                "later_stage": later_stage,
+                "later_commit": later_commit,
+            }
+            os.write(result_write, json.dumps(response).encode())
+            os._exit(0)
+        except BaseException as exc:
+            os.write(result_write, json.dumps({
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            }).encode())
+            os._exit(1)
+
+    os.close(result_write)
+    os.close(ready_write)
+    controller_reaped = False
+
+    def controller_failure(stage: str) -> None:
+        nonlocal controller_reaped
+        readable, _, _ = select.select([result_read], [], [], 0)
+        detail = os.read(result_read, 1_048_576).decode() if readable else ""
+        reaped_pid, status = os.waitpid(controller_pid, os.WNOHANG)
+        controller_reaped = reaped_pid == controller_pid
+        pytest.fail(
+            f"controller failed before {stage}: status={status}, result={detail or '<none>'}"
+        )
+
+    try:
+        readable, _, _ = select.select([ready_read, result_read], [], [], 20)
+        if result_read in readable:
+            controller_failure("readiness")
+        if ready_read not in readable:
+            controller_failure("readiness deadline")
+        assert os.read(ready_read, 64) == b"controller-ready"
+
+        readable, _, _ = select.select([listener, result_read], [], [], 20)
+        if result_read in readable:
+            controller_failure("executor connection")
+        if listener not in readable:
+            controller_failure("executor connection deadline")
+        connection, _ = listener.accept()
+        _pid, uid, _gid = struct.unpack(
+            "3i",
+            connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")),
+        )
+        assert uid == controller_uid
+
+        def execution_deadline(_signum, _frame):
+            raise TimeoutError("contained repo-test proof exceeded 30 seconds")
+
+        previous_alarm_handler = signal.signal(signal.SIGALRM, execution_deadline)
+        signal.alarm(30)
+        try:
+            worker_exec.handle_connection(connection)
+            _, status = os.waitpid(controller_pid, 0)
+            controller_reaped = True
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_alarm_handler)
+        observed = json.loads(os.read(result_read, 1_048_576))
+        assert os.waitstatus_to_exitcode(status) == 0, json.dumps(observed, indent=2)
+        positive = observed["positive"]
+        assert positive["ok"] is True, json.dumps(observed, indent=2)
+        payload_line = next(
+            line.removeprefix("MIMIR_PAYLOAD=")
+            for line in positive["stdout"].splitlines()
+            if line.startswith("MIMIR_PAYLOAD=")
+        )
+        payload = json.loads(payload_line)
+        assert payload["uid"] == worker_uid
+        assert Path(payload["home"]).parent == home_root
+        assert payload["marker"] == "executed"
+        assert payload["attacked"] is False
+        cache_line = next(
+            line.removeprefix("MIMIR_UV_CACHE=")
+            for line in positive["stdout"].splitlines()
+            if line.startswith("MIMIR_UV_CACHE=")
+        )
+        assert Path(cache_line).parent.parent == Path(payload["home"])
+        assert not (uv_cache / "cross-pr-write").exists()
+        assert observed["positive_canary"] == "protected"
+        assert not Path(payload["home"]).exists()
+        assert not any(checkout_root.rglob("checkout"))
+
+        unsafe_observation = observed["unsafe"]
+        assert observed["unsafe_ok"] is True
+        assert unsafe_observation["marker"] == "executed"
+        assert unsafe_observation["attacked"] is True
+        assert unsafe_observation["home"] == str(controller_home)
+        assert observed["final_canary"] == "altered"
+        assert observed["unsafe_snapshot_cleaned"] is True
+        assert canary.read_text(encoding="utf-8") == "altered"
+        assert observed["lease_preserved"] is True
+        assert observed["payload_preserved"] is True
+        assert observed["later_stage"] is True
+        assert observed["later_commit"] is True
+    finally:
+        if not controller_reaped:
+            try:
+                os.kill(controller_pid, 9)
+            except ProcessLookupError:
+                pass
+            os.waitpid(controller_pid, 0)
+        (
+            contained_checkout.REPO_TEST_CHECKOUT_ROOT,
+            worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
+            worker_exec.REPO_TEST_CHECKOUT_ROOT,
+            worker_exec.HOME_ROOT,
+            worker_exec.REPO_TEST_UV_CACHE,
+            contained_execution.WorkerClient,
+        ) = previous_roots
+        os.close(result_read)
+        os.close(ready_read)
+        listener.close()
+        shutil.rmtree(boundary, ignore_errors=True)
+        for ancestor, mode in restored_modes.items():
+            ancestor.chmod(mode)
+
+
+
+
+
+@pytest.mark.parametrize("kind", ["argument_scope", "lease_scope", "inactive", "invalid_head"])
+def test_recorded_mutation_head_cannot_widen_or_outlive_checkout_scope(repo_tools, kind: str) -> None:
+    _origin, _source, scope, state, _tools = repo_tools
+    lease = state.checkout_lease
+    scope_id = scope.scope_id
+    head = scope.observed_head_sha
+    if kind == "argument_scope":
+        scope_id = "other"
+    elif kind == "lease_scope":
+        object.__setattr__(state, "checkout_lease", replace(lease, scope_id="other"))
+    elif kind == "inactive":
+        object.__setattr__(state, "checkout_lease", replace(lease, revoked=True))
+    else:
+        head = "not-a-commit"
+    with pytest.raises(ValueError, match="does not match"):
+        state.record_git_head(scope_id, head)
+
+
+@pytest.mark.parametrize(
+    ("operation", "removed_action"),
+    [
+        (GitStatus(), RepoPRAction.INSPECT),
+        (GitFetch(), RepoPRAction.CHECKOUT),
+        (GitStage(("tracked.txt",)), RepoPRAction.WRITE),
+        (GitCommit(("tracked.txt",), "message"), RepoPRAction.COMMIT),
+        (GitMerge(), RepoPRAction.WRITE),
+        (GitMerge(), RepoPRAction.COMMIT),
+        (GitMergeAbort(), RepoPRAction.WRITE),
+        (GitRebase(), RepoPRAction.WRITE),
+        (GitRebase(), RepoPRAction.COMMIT),
+        (GitRebaseAbort(), RepoPRAction.WRITE),
+        (GitRevert("a" * 40), RepoPRAction.COMMIT),
+        (GitRevertAbort(), RepoPRAction.WRITE),
+        (GitPush(), RepoPRAction.PUSH),
+    ],
+)
+def test_every_typed_operation_pins_its_scope_authority_check(
+    repo_tools, operation, removed_action: RepoPRAction,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(
+        scope,
+        allowed_operations=scope.allowed_operations - {removed_action.value},
+    )
+    lease = replace(old_state.checkout_lease, scope_id=altered.scope_id)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    tools = RepoGitTools(state)
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(operation)
+
+    assert refusal.value.code == "scope_action_denied"
+
+
+def test_scope_action_check_is_shadowed_when_enforcement_is_disabled(repo_tools) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(
+        scope,
+        allowed_operations=scope.allowed_operations - {RepoPRAction.WRITE.value},
+    )
+    lease = replace(old_state.checkout_lease, scope_id=altered.scope_id)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+
+    result = RepoGitTools(state, enforce=False).execute(GitStage(("tracked.txt",)))
+
+    assert result.ok is True
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [GitMerge(), GitMergeAbort(), GitRebase(), GitRebaseAbort(), GitRevertAbort()],
+)
+def test_merge_rebase_and_abort_are_separate_closed_operation_types(operation) -> None:
+    assert not hasattr(operation, "argv")
+    assert not hasattr(operation, "abort")
+
+
+@pytest.mark.parametrize("failure,code", [("timeout", "timeout"), ("output", "output_limit")])
+def test_git_execution_refuses_timeout_and_output_overflow(repo_tools, failure: str, code: str) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+
+    def bounded_failure(argv, *, env, timeout, output_limit):
+        if "status" in argv:
+            return GitProcessResult(
+                -9,
+                stdout="x" * output_limit if failure == "output" else "",
+                timed_out=failure == "timeout",
+                output_limited=failure == "output",
+            )
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    tools = RepoGitTools(state, runner=bounded_failure)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitStatus())
+    assert refusal.value.code == code
+
+
+def test_git_execution_os_failure_is_a_named_refusal(repo_tools) -> None:
+    state = repo_tools[-2]
+
+    def failed_runner(argv, *, env, timeout, output_limit):
+        raise OSError("exec failed")
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=failed_runner).execute(GitStatus())
+    assert refusal.value.code == "git_failed"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "exception_type"),
+    [
+        (ToolPolicyRefusal("scope action denied"), "repository_authorization_refused", ToolPolicyRefusal),
+        (
+            GitRefusal("inactive_checkout", "lease binding missing", execution_started=False),
+            "repository_binding_invalid",
+            ToolPolicyRefusal,
+        ),
+        (
+            GitRefusal("stale_scope", "local commit remains unpushed in preserved checkout"),
+            "repository_git_failed",
+            ToolException,
+        ),
+        (RuntimeError("plain Git invocation failed"), "repository_git_failed", ToolException),
+    ],
+)
+def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
+    repo_tools,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    expected_code: str,
+    exception_type: type[Exception],
+) -> None:
+    from mimir_cultivate import repository as repo_module
+
+    state = repo_tools[-2]
+    if isinstance(failure, ToolPolicyRefusal):
+        monkeypatch.setattr(repo_module, "_state", lambda *_args: (_ for _ in ()).throw(failure))
+    else:
+        monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
+
+        class FailingRepoGitTools:
+            def __init__(self, review_state, *, enforce=True, auth_context=None):
+                self.review_state = review_state
+                self.execution_started = False
+
+            def execute(self, operation):
+                raise failure
+
+        monkeypatch.setattr(repo_module, "RepoGitTools", FailingRepoGitTools)
+
+    with pytest.raises(exception_type) as refusal:
+        repo_module._execute(None, "owner/repo", 7, GitStatus())
+
+    assert f"repository operation rejected ({expected_code})" in str(refusal.value)
+    assert "repository_operation_failed" not in str(refusal.value)
+    if isinstance(failure, GitRefusal) and failure.code == "stale_scope":
+        assert "local commit remains unpushed in preserved checkout" in str(refusal.value)
+
+
+def test_inactive_checkout_refusal_from_selected_provider_is_not_trusted(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+    from langchain_core.messages import ToolMessage
+    from mimir import access_control
+    from mimir.access_control import ToolAuthorization, ToolRegistry
+    from mimir_cultivate import repository as repo
+
+    _origin, _source, scope, state, _tools = repo_tools
+    lease = state.checkout_lease
+    auth = replace(_lineage_turn(scope, state), roles=("admin",))
+    runtime = SimpleNamespace(context=auth)
+    monkeypatch.setattr(repo, "_state", lambda *_args: state)
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease.path}:rw")
+    object.__setattr__(state, "checkout_lease", replace(
+        lease, expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    ))
+    capture = access_control.begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolPolicyRefusal, match="inactive_checkout") as refusal:
+            repo._execute(runtime, "owner/repo", 7, GitStatus())
+    finally:
+        provenance = access_control.end_protected_result_capture(capture)
+    assert provenance is not None and provenance.sources == ()
+    assert provenance.content_free_error == str(refusal.value)
+    labels = access_control.classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_status", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {refusal.value}", tool_call_id="refusal", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    assert auth.ifc_state.has_untrusted_active_ingest()
+    object.__setattr__(state, "checkout_lease", lease)
+    target = lease.path / "tracked.txt"
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+        arguments={"file_path": str(target)},
+    )
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate import repository as repo_module
+
+    secret_url = "https://agent:super-secret-password@example.invalid/owner/repo.git"
+
+    class FailingRepoGitTools:
+        def __init__(self, review_state, *, enforce=True, auth_context=None):
+            self.review_state = review_state
+            self.execution_started = False
+
+        def execute(self, operation):
+            raise GitRefusal(
+                "git_failed",
+                f"fatal: unable to access {secret_url}",
+                execution_started=True,
+            )
+
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: repo_tools[-2])
+    monkeypatch.setattr(repo_module, "RepoGitTools", FailingRepoGitTools)
+
+    with pytest.raises(ToolException) as refusal:
+        repo_module._execute(None, "owner/repo", 7, GitStatus())
+
+    # The wrapper is a second redaction boundary for injected/future runners.
+    rendered = str(refusal.value)
+    assert "repository operation rejected (repository_git_failed)" in rendered
+    assert "super-secret-password" not in rendered
+    assert "https://[REDACTED]@example.invalid/owner/repo.git" in rendered
+
+
+def test_inspection_operation_types_cannot_express_fetch_or_mutation() -> None:
+    for operation in (GitStatus(), GitDiff(), GitUnmerged()):
+        assert not hasattr(operation, "argv")
+        assert not hasattr(operation, "remote")
+        assert not hasattr(operation, "ref")
+
+
+@pytest.mark.parametrize("mode", ["timeout", "output"])
+def test_real_subprocess_runner_enforces_wall_time_and_capture_cap(mode: str) -> None:
+    command = (
+        ("/bin/sh", "-c", "sleep 2")
+        if mode == "timeout"
+        else ("/bin/sh", "-c", "while :; do printf 1234567890; done")
+    )
+    result = _bounded_subprocess_runner(
+        command,
+        env={"PATH": "/usr/bin:/bin"},
+        timeout=0.05 if mode == "timeout" else 2,
+        output_limit=64,
+    )
+    if mode == "timeout":
+        assert result.timed_out is True
+    else:
+        assert result.output_limited is True
+        assert len(result.stdout.encode()) <= 64
+
+
+def test_project_test_timeout_can_actually_run_this_repository_suite() -> None:
+    """The bound has to exceed how long this repository's own suite takes.
+
+    At 300s it did not. Every measured full-suite run sat between 492s and
+    597s, so ``repo_test`` on the gate command timed out every time -- not
+    intermittently, arithmetically -- and the agent reviewed pull requests
+    reporting "the bounded runner timed out with empty output", falling back to
+    whatever counts the author supplied.
+
+    Pinned as a floor rather than an exact value so the bound can rise with the
+    suite, but cannot silently drop back under it.
+
+    The floor was 700s, chosen as the observed ceiling (597s) plus headroom,
+    with a note that this test was the place to notice if a run ever
+    legitimately exceeded it. One did: 1023s, with two worklink builds running
+    concurrently on the same host. The suite passed -- load stretches the run
+    rather than breaking it -- but every earlier measurement had been taken on
+    an idle machine, and the runner's normal condition is a busy one, because
+    the agent and its builds share a host. 1200s is the loaded measurement plus
+    headroom.
+    """
+    assert _TIMEOUT_SECONDS >= 1200.0
+
+
+
+async def _red_run_after_lineage(monkeypatch, scope, state, turn):
+    from mimir.access_control import (
+        SinkGate, ToolAuthorization, begin_protected_result_capture,
+        classify_protected_result, end_protected_result_capture,
+    )
+    from mimir.models import InformationFlowLabels
+    from mimir_cultivate.repository import ProjectTestResult, pytest_failure_summary, remember_node_inventory, pytest_node_inventory
+    from mimir_cultivate import repository as repo
+    lease = state.checkout_lease
+    (lease.path / "tests").mkdir(exist_ok=True)
+    (lease.path / "tests" / "test_work.py").write_text("def test_fix():\n    pass\n")
+    inv = pytest_node_inventory(Path(lease.path).resolve(strict=True))
+    remember_node_inventory(Path(lease.path).resolve(strict=True), scope.scope_id, inv)
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+    out = b"=== short test summary info ===\nFAILED tests/test_work.py::test_fix - AssertionError\n1 failed, 2 passed in 0.1s\n"
+
+    async def execute(self, selectors, *, suite):
+        return ProjectTestResult(False, "tests_failed", 1, stdout=out.decode(), stderr="", git_context="",
+                                 failure_summary=pytest_failure_summary(out, inv))
+    monkeypatch.setattr(repo.RepoProjectTests, "execute", execute)
+    cap = begin_protected_result_capture()
+    try:
+        result = await repo.repo_test.coroutine("owner/repo", 7, runtime=SimpleNamespace(context=turn))
+    finally:
+        prov = end_protected_result_capture(cap)
+    labels = classify_protected_result(
+        "repo_test", {"repository": "owner/repo", "pull_request": 7}, turn,
+        ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=result, provenance=prov, failed=True,
+    )
+    integ = labels.sources[0].integrity if labels.sources else None
+    turn.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        turn.ifc_state.current(InformationFlowLabels()), turn, enforce=False, repo_pr_action_scope=scope,
+    )
+    return integ, decision.allowed
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.parametrize("case", ["at_head", "ahead_clean_commit", "rebased_onto_base"])
+async def test_failed_repo_test_on_lineage_advanced_lease_retains_attestation(tmp_path, monkeypatch, case):
+    """Attested clean lineage preserves main's failed-result classification."""
+    from mimir import access_control
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
+    _origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "pull_request_author", scope.principal)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    turn = _lineage_turn(scope, state)
+    lease = state.checkout_lease
+    if case == "ahead_clean_commit":
+        (lease.path / "tracked.txt").write_text("local remediation\n")
+        RepoGitTools(state, auth_context=turn, enforce=False).execute(GitCommit(("tracked.txt",), "local fix"))
+    elif case == "rebased_onto_base":
+        _git(source, "checkout", "-q", "main")
+        (source / "base-change.txt").write_text("base update\n")
+        _git(source, "add", "base-change.txt"); _git(source, "commit", "-qm", "base update")
+        _git(source, "push", "-q", "origin", "HEAD:main")
+        RepoGitTools(state, auth_context=turn).execute(GitRebase())
+    assert_lease_attested(turn, scope, lease)
+    integ, allowed = await _red_run_after_lineage(monkeypatch, scope, state, turn)
+    assert integ == "trusted"
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_failed_repo_test_after_tainted_commit_stays_untrusted(tmp_path, monkeypatch):
+    _origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "pull_request_author", scope.principal)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("tainted\n")
+    RepoGitTools(state, auth_context=_lineage_turn(scope, state, tainted=True), enforce=False).execute(GitCommit(("tracked.txt",), "t"))
+    integ, allowed = await _red_run_after_lineage(monkeypatch, scope, state, _lineage_turn(scope, state))
+    assert integ == "untrusted" and allowed is False
+
+
+def test_recorded_inventory_unresolvable_key_fails_closed(tmp_path, monkeypatch):
+    """An inventory key that cannot be resolved (e.g. a symlink loop on Python
+    <= 3.12, where Path.resolve raises) must fail closed, never crash result
+    classification. Simulated so the test does not depend on the Python
+    version's resolve() semantics (3.13 returns the looped path instead)."""
+    from mimir_cultivate import repository as project_tests
+
+    project_tests.remember_node_inventory(tmp_path, "scope-loop", frozenset({"x"}))
+
+    for error in (RuntimeError("Symlink loop"), OSError("unresolvable")):
+        def raise_error(root, scope_id, _error=error):
+            raise _error
+
+        monkeypatch.setattr(project_tests, "_inventory_key", raise_error)
+        project_tests.remember_node_inventory(tmp_path, "scope-other", frozenset({"y"}))
+        assert project_tests.recorded_node_inventory(tmp_path, "scope-loop") is None

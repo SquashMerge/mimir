@@ -1,0 +1,39 @@
+# social-cli — install the social-cli binary used by both the
+# notifications poller and the feed poller (Bluesky / X CLI from
+# https://github.com/letta-ai/social-cli). The pollers call
+# `social-cli` from PATH unless SOCIAL_CLI_BIN overrides.
+#
+# social-cli is a Node project; we clone, pnpm install + build, then
+# symlink the upstream binary directly to /usr/local/bin/social-cli.
+# Local count is handled only by the skill's run-social-cli.sh wrapper.
+# The base image is expected to
+# have Node 20 + npm already (the scaffolder bakes that into the base
+# Dockerfile when ANY poller is installed). pnpm is installed via
+# corepack which ships with Node 20.
+#
+# Pinned to a specific commit SHA because letta-ai/social-cli is still
+# pre-release (no tags published). Bump to the next SHA (or a release
+# tag when one lands) after verifying the fix/feature is included.
+#
+# Current pin: 4c8aab83 (2026-05-30) — includes the EXDEV fix from
+# PR #66 (shutil.move / moveFile fallback for cross-device rename) and
+# PR #68 (singular post.platform dispatch). chainlink #188.
+#
+# Symlink target: ``dist/cli.js`` (the built output) directly, NOT
+# the ``bin/`` directory listed in package.json's ``bin`` field —
+# that ``bin/social-cli`` only materializes when the package is
+# installed externally (via ``npm install``, ``pnpm link --global``,
+# etc.), not by ``pnpm build`` on the package's own tree. Pre-fix,
+# the symlink pointed at a path that never existed, so the bundled
+# install was silently broken — every ``social-cli`` invocation
+# inside the container hit a dangling symlink and operators were
+# forced to clone + build into ``/tmp`` as a workaround. The
+# ``chmod +x`` is required because ``dist/cli.js`` is shipped with
+# 0644 perms by default; the shebang (``#!/usr/bin/env node``)
+# handles dispatch once it's executable.
+RUN corepack enable && corepack prepare pnpm@latest --activate \
+ && git clone https://github.com/letta-ai/social-cli.git /opt/social-cli \
+ && git -C /opt/social-cli checkout 4c8aab8393a6c04568f8017f176d3d24055e3cc6 \
+ && cd /opt/social-cli && pnpm install --frozen-lockfile && pnpm build \
+ && chmod +x /opt/social-cli/dist/cli.js \
+ && ln -sf /opt/social-cli/dist/cli.js /usr/local/bin/social-cli

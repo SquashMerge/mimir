@@ -1,0 +1,1090 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Annotated, NotRequired
+
+from deepagents.backends import StateBackend
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.subagents import _build_task_tool
+from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import AgentState, PrivateStateAttr
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import Runnable, RunnableLambda
+from langchain.tools import ToolRuntime
+import pytest
+
+from mimir._deepagents_subagent_auth import (
+    _AuthContextRunnable,
+    _create_auth_context_runnable,
+    _wrap_task_tool,
+    install_subagent_auth_context_patch,
+)
+from mimir.access_control import builtin_trigger_service_principal, create_auth_context
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels
+from mimir.subagents import (
+    CriticFinding,
+    CriticFindings,
+    build_mimir_subagents,
+    readonly_filesystem_permissions,
+)
+from mimir.tools.budget_gate import _authorize_tool_call
+
+
+class _PrivateProbeState(AgentState):
+    private_probe: Annotated[NotRequired[str], PrivateStateAttr]
+
+
+class _PrivateProbeMiddleware(AgentMiddleware):
+    state_schema = _PrivateProbeState
+
+    def before_agent(self, state, runtime):  # noqa: ARG002
+        return {"private_probe": "parent-only"}
+
+
+class _AuthorizingSubagent(Runnable):
+    def __init__(self) -> None:
+        self.contexts: list[AuthContext | None] = []
+
+    def _result(self, context: AuthContext | None) -> dict:
+        self.contexts.append(context)
+        authorization, denial = _authorize_tool_call("add_schedule", context)
+        return {
+            "messages": [
+                AIMessage(
+                    content=json.dumps(
+                        {"allowed": authorization.allowed, "denial": denial}
+                    )
+                )
+            ]
+        }
+
+    def invoke(self, input, config=None, *, context=None, **kwargs):
+        return self._result(context)
+
+    async def ainvoke(self, input, config=None, *, context=None, **kwargs):
+        return self._result(context)
+
+
+def _auth_context(*, roles: tuple[str, ...], enforce: bool) -> AuthContext:
+    return AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=roles,
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=enforce,
+        ifc_labels=InformationFlowLabels(),
+    )
+
+
+def _auth_task_tool(runnable: Runnable):
+    return _wrap_task_tool(
+        _build_task_tool(
+            [
+                {
+                    "name": "general-purpose",
+                    "description": "authorization test child",
+                    "runnable": _AuthContextRunnable(runnable),
+                }
+            ]
+        )
+    )
+
+
+def _task_runtime(context) -> ToolRuntime:
+    return ToolRuntime(
+        state={"messages": [HumanMessage(content="parent prompt")]},
+        context=context,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="toolu-auth",
+        store=None,
+    )
+
+
+def test_declarative_subagent_graph_uses_auth_context_schema() -> None:
+    sentinel = RunnableLambda(lambda state: state)
+    seen_kwargs = {}
+
+    def create_agent(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return sentinel
+
+    wrapped = _create_auth_context_runnable(create_agent, "model", tools=[])
+
+    assert isinstance(wrapped, _AuthContextRunnable)
+    assert seen_kwargs["context_schema"] is AuthContext
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tasks_keep_each_child_authorization_carrier() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen = []
+
+    class ConcurrentChild(Runnable):
+        def invoke(self, input, config=None, *, context=None, **kwargs):
+            raise AssertionError("async child must not use sync invocation")
+
+        async def ainvoke(self, input, config=None, *, context=None, **kwargs):
+            seen.append(context)
+            if len(seen) == 2:
+                entered.set()
+            await release.wait()
+            seen.append(context)
+            return {"messages": [AIMessage(content="done")]}
+
+    tool = _auth_task_tool(ConcurrentChild())
+    admin = _auth_context(roles=("admin",), enforce=True)
+    user = _auth_context(roles=("user",), enforce=True)
+    tasks = [asyncio.create_task(tool.coroutine(
+        description="probe", subagent_type="general-purpose", runtime=_task_runtime(auth),
+    )) for auth in (admin, user)]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        release.set()
+        await asyncio.gather(*tasks)
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert sum(context is admin for context in seen) == 2
+    assert sum(context is user for context in seen) == 2
+
+
+def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp() -> None:
+    specs = build_mimir_subagents()
+
+    # The Worklink epic roles are per-run tool-armed agents constructed inside
+    # the retired epic roles module (removed #830).
+    assert [spec["name"] for spec in specs] == [
+        "general-purpose",
+        "critic-structured",
+    ]
+    critic = specs[1]
+    general = specs[0]
+    assert [middleware.name for middleware in general["middleware"]] == [
+        "TodoListMiddleware",
+        "IterationGateMiddleware",
+        "ServiceToolSurfaceMiddleware",
+        "BudgetGateMiddleware",
+    ]
+    assert critic["response_format"] is CriticFindings
+    assert critic["tools"] == []
+    assert [middleware.name for middleware in critic["middleware"]] == [
+        "TodoListMiddleware",
+        "IterationGateMiddleware",
+        "ServiceToolSurfaceMiddleware",
+        "BudgetGateMiddleware",
+        "StructuredOutputRetryMiddleware",
+    ]
+    assert critic["middleware"][0].tools == ()
+    assert "Read-only" in critic["description"]
+
+
+def test_every_subagent_registers_service_surface_before_budget_gate_with_home(tmp_path) -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
+
+    specs = build_mimir_subagents(home=tmp_path)
+    assert {spec["name"] for spec in specs} == {"general-purpose", "critic-structured"}
+    for spec in specs:
+        middleware = spec["middleware"]
+        assert sum(isinstance(item, ServiceToolSurfaceMiddleware) for item in middleware) == 1
+        surface_index = next(i for i, item in enumerate(middleware)
+                             if isinstance(item, ServiceToolSurfaceMiddleware))
+        assert surface_index + 1 < len(middleware), "service surface must precede BudgetGate"
+        assert isinstance(middleware[surface_index + 1], BudgetGateMiddleware)
+
+
+def test_every_subagent_runs_tool_calls_through_budget_gate() -> None:
+    specs = build_mimir_subagents()
+
+    assert all(
+        any(
+            middleware.__class__.__name__ == "BudgetGateMiddleware"
+            for middleware in spec["middleware"]
+        )
+        for spec in specs
+    )
+
+
+def test_readonly_permissions_deny_write_catchall() -> None:
+    rules = readonly_filesystem_permissions()
+
+    assert len(rules) == 1
+    assert rules[0].operations == ["write"]
+    assert rules[0].paths == ["/**"]
+    assert rules[0].mode == "deny"
+
+
+def test_readonly_permissions_block_filesystem_write_tool() -> None:
+    middleware = FilesystemMiddleware(
+        backend=StateBackend(),
+        _permissions=readonly_filesystem_permissions(),
+    )
+    write_tool = next(tool for tool in middleware.tools if tool.name == "write_file")
+    runtime = ToolRuntime(
+        state={},
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="toolu-write",
+        store=None,
+    )
+
+    result = write_tool.func(
+        file_path="/blocked.txt",
+        content="should not be written",
+        runtime=runtime,
+    )
+
+    assert result.status == "error"
+    assert result.content == "Error: permission denied for write on /blocked.txt"
+
+
+def test_critic_findings_parses_observed_model_variance_payload() -> None:
+    structured = CriticFindings.model_validate(
+        {
+            "verdict": "findings",
+            "summary": "Two concerns found.",
+            "ignored": "extra response field",
+            "findings": [
+                {
+                    "title": "Missing guard",
+                    "severity": "high",
+                    "evidence": "mimir/subagents.py crashes on literal mismatch",
+                    "file": "mimir/subagents.py",
+                },
+                {
+                    "title": "Retry loses review",
+                    "severity": "medium",
+                    "evidence": "agent.astream failed before returning a result",
+                    "file": "mimir/subagents.py",
+                },
+            ],
+        }
+    )
+
+    assert structured.verdict == "blocker"
+    assert [finding.severity for finding in structured.findings] == [
+        "blocker",
+        "important",
+    ]
+    assert structured.findings[0].recommendation == ""
+    assert structured.findings[0].model_dump() == {
+        "title": "Missing guard",
+        "severity": "blocker",
+        "evidence": "mimir/subagents.py crashes on literal mismatch",
+        "recommendation": "",
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw_severity", "expected"),
+    [
+        ("critical", "blocker"),
+        ("high", "blocker"),
+        ("medium", "important"),
+        ("low", "nit"),
+        ("minor", "nit"),
+        ("Not Mapped", "important"),
+    ],
+)
+def test_critic_finding_normalizes_severity_synonyms(
+    raw_severity: str, expected: str
+) -> None:
+    finding = CriticFinding.model_validate(
+        {
+            "title": "Concern",
+            "severity": raw_severity,
+            "evidence": "evidence",
+            "recommendation": "fix",
+        }
+    )
+
+    assert finding.severity == expected
+
+
+def test_critic_findings_unknown_verdict_falls_back_to_most_severe_finding() -> None:
+    structured = CriticFindings.model_validate(
+        {
+            "verdict": "findings",
+            "summary": "Fallback from findings.",
+            "findings": [
+                {
+                    "title": "Minor concern",
+                    "severity": "minor",
+                    "evidence": "small issue",
+                    "recommendation": "polish",
+                },
+                {
+                    "title": "Important concern",
+                    "severity": "medium",
+                    "evidence": "larger issue",
+                    "recommendation": "fix",
+                },
+            ],
+        }
+    )
+
+    assert structured.verdict == "important"
+
+
+def test_critic_findings_unknown_verdict_without_findings_defaults_to_important() -> None:
+    structured = CriticFindings.model_validate(
+        {"verdict": "findings", "summary": "No concrete findings.", "findings": []}
+    )
+
+    assert structured.verdict == "important"
+
+
+def test_critic_findings_malformed_finding_degrades_to_best_effort() -> None:
+    structured = CriticFindings.model_validate(
+        {
+            "verdict": "findings",
+            "summary": "Malformed child item.",
+            "findings": [
+                "plain finding text",
+                {
+                    "message": "message-only finding",
+                    "severity": {"unexpected": "shape"},
+                    "file": "mimir/subagents.py",
+                },
+            ],
+        }
+    )
+
+    assert structured.verdict == "important"
+    assert structured.findings[0].model_dump() == {
+        "title": "plain finding text",
+        "severity": "important",
+        "evidence": "",
+        "recommendation": "",
+    }
+    assert structured.findings[1].model_dump() == {
+        "title": "message-only finding",
+        "severity": "important",
+        "evidence": "mimir/subagents.py",
+        "recommendation": "",
+    }
+
+
+def test_critic_findings_well_formed_round_trip_is_unchanged() -> None:
+    payload = {
+        "verdict": "important",
+        "summary": "One test gap remains.",
+        "findings": [
+            {
+                "title": "Missing regression test",
+                "severity": "important",
+                "evidence": "tests/test_example.py has no coverage for the new branch",
+                "recommendation": "Add a focused test before shipping.",
+            }
+        ],
+        "open_questions": ["Should this path be covered at the API boundary?"],
+    }
+
+    assert CriticFindings.model_validate(payload).model_dump() == payload
+
+
+def test_task_tool_returns_structured_response_as_json_tool_message() -> None:
+    finding = CriticFinding(
+        title="Missing regression test",
+        severity="important",
+        evidence="tests/test_example.py has no coverage for the new branch",
+        recommendation="Add a focused test before shipping.",
+    )
+    structured = CriticFindings(
+        verdict="important",
+        summary="One test gap remains.",
+        findings=[finding],
+        open_questions=[],
+    )
+    runnable = RunnableLambda(
+        lambda state: {
+            "messages": [AIMessage(content="unstructured fallback should not leak")],
+            "structured_response": structured,
+        }
+    )
+    tool = _build_task_tool(
+        [
+            {
+                "name": "critic-structured",
+                "description": "returns schema JSON",
+                "runnable": runnable,
+            }
+        ]
+    )
+    runtime = ToolRuntime(
+        state={"messages": [HumanMessage(content="parent prompt")]},
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="toolu-test",
+        store=None,
+    )
+
+    result = tool.func(
+        description="review this",
+        subagent_type="critic-structured",
+        runtime=runtime,
+    )
+
+    assert result.update["messages"][0] == ToolMessage(
+        json.dumps(structured.model_dump(), separators=(",", ":")),
+        tool_call_id="toolu-test",
+    )
+    payload = json.loads(result.update["messages"][0].content)
+    assert payload["verdict"] == "important"
+    assert payload["findings"][0]["severity"] == "important"
+    assert "unstructured fallback" not in result.update["messages"][0].content
+
+
+def test_task_tool_validation_failure_surfaces_instead_of_falling_back_to_prose() -> None:
+    def invalid_structured_response(_state):
+        # Simulate a child graph whose structured-output strategy rejected the model output.
+        raise ValueError("structured response validation failed: missing verdict")
+
+    tool = _build_task_tool(
+        [
+            {
+                "name": "critic-structured",
+                "description": "returns schema JSON",
+                "runnable": RunnableLambda(invalid_structured_response),
+            }
+        ]
+    )
+    runtime = ToolRuntime(
+        state={"messages": [HumanMessage(content="parent prompt")]},
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="toolu-test",
+        store=None,
+    )
+
+    with pytest.raises(ValueError, match="structured response validation failed"):
+        tool.func(
+            description="review this",
+            subagent_type="critic-structured",
+            runtime=runtime,
+        )
+
+
+def test_task_subagent_authorizes_with_exact_parent_admin_carrier() -> None:
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    parent_auth = _auth_context(roles=("admin",), enforce=True)
+
+    result = tool.func(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts == [parent_auth]
+    assert child.contexts[0] is parent_auth
+    assert payload == {"allowed": True, "denial": None}
+
+
+def test_heartbeat_task_subagent_cannot_exceed_parent_capabilities(tmp_path) -> None:
+    authority = builtin_trigger_service_principal("heartbeat", tmp_path)
+    parent_auth = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="heartbeat:test",
+            service_principal="heartbeat",
+            service_authority=authority,
+        ),
+        enforce=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    child = _AuthorizingSubagent()
+
+    result = _auth_task_tool(child).func(
+        description="attempt an authority-widening schedule mutation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts == [parent_auth]
+    assert child.contexts[0] is parent_auth
+    assert payload["allowed"] is False
+    assert "requires an admin identity" in payload["denial"]
+
+
+@pytest.mark.asyncio
+async def test_atask_subagent_denies_non_admin_parent_under_enforcement() -> None:
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    parent_auth = _auth_context(roles=("user",), enforce=True)
+
+    result = await tool.coroutine(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts[0] is parent_auth
+    assert payload["allowed"] is False
+    assert "requires an admin identity" in payload["denial"]
+
+
+def test_task_subagent_uses_frozen_parent_enforcement_not_live_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    parent_auth = _auth_context(roles=("user",), enforce=False)
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+
+    result = tool.func(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts[0] is parent_auth
+    assert payload == {"allowed": True, "denial": None}
+
+
+def test_task_subagent_rejects_model_supplied_auth_context_lookalike(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ForgedContext:
+        roles = ("admin",)
+        enforcement_enabled = False
+
+    child = _AuthorizingSubagent()
+    tool = _auth_task_tool(child)
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+
+    result = tool.func(
+        description="run an admin operation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(ForgedContext()),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts == [None]
+    assert payload["allowed"] is False
+    assert "missing_auth_context" in payload["denial"]
+
+
+@pytest.mark.parametrize(
+    ("roles", "expected_allowed"),
+    [(('admin',), True), (('user',), False)],
+)
+@pytest.mark.asyncio
+async def test_real_task_subagent_gate_uses_propagated_parent_carrier(
+    monkeypatch: pytest.MonkeyPatch,
+    roles: tuple[str, ...],
+    expected_allowed: bool,
+) -> None:
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+
+    from mimir.tools import budget_gate
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    executions: list[str] = []
+
+    @tool
+    def add_schedule(name: str) -> str:
+        """Record a scheduler operation without touching production state."""
+        executions.append(name)
+        return "executed"
+
+    parent_auth = _auth_context(roles=roles, enforce=True)
+    decisions = []
+    child_invocations: list[str] = []
+    original_authorize = budget_gate._authorize_tool_call
+    original_invoke = _AuthContextRunnable.invoke
+    original_ainvoke = _AuthContextRunnable.ainvoke
+
+    def capture_authorization(tool_name, *args, **kwargs):
+        authorization = original_authorize(tool_name, *args, **kwargs)
+        if tool_name == "add_schedule":
+            decisions.append((authorization[0], args[0] if args else None))
+        return authorization
+
+    def capture_invoke(self, *args, **kwargs):
+        child_invocations.append("sync")
+        return original_invoke(self, *args, **kwargs)
+
+    async def capture_ainvoke(self, *args, **kwargs):
+        child_invocations.append("async")
+        return await original_ainvoke(self, *args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", capture_authorization)
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(_AuthContextRunnable, "invoke", capture_invoke)
+    monkeypatch.setattr(_AuthContextRunnable, "ainvoke", capture_ainvoke)
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "task",
+            "args": {
+                "description": "add the nightly schedule",
+                "subagent_type": "general-purpose",
+            },
+            "id": "tc-task", "type": "tool_call",
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "add_schedule",
+            "args": {"name": "nightly"},
+            "id": "tc-add-schedule", "type": "tool_call",
+        }]),
+        AIMessage(content="child done"),
+        AIMessage(content="parent done"),
+    ]))
+
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt="parent test",
+        subagents=[{
+            "name": "general-purpose",
+            "description": "authorization test child",
+            "system_prompt": "Call add_schedule once.",
+            "tools": [add_schedule],
+            "middleware": [BudgetGateMiddleware()],
+        }],
+        context_schema=AuthContext,
+    )
+
+    result = await agent.ainvoke(
+        {"messages": [HumanMessage(content="delegate schedule creation")]},
+        context=parent_auth,
+    )
+
+    assert len(decisions) == 1
+    assert child_invocations
+    decision, observed_context = decisions[0]
+    assert observed_context is parent_auth
+    assert decision.allowed is expected_allowed
+    assert executions == (["nightly"] if expected_allowed else [])
+    assert any(
+        isinstance(message, ToolMessage) and message.tool_call_id == "tc-task"
+        for message in result["messages"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subagent_name", ["general-purpose", "critic-structured"])
+async def test_subagent_refusal_loop_hits_shared_iteration_ceiling(monkeypatch, subagent_name):
+    import time
+
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+
+    from mimir._context import get_current_turn, reset_current_turn, set_current_turn
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.models import TurnContext
+    from mimir.tools import budget_gate, iteration_gate
+
+    class ToolCallingModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    @tool
+    def add_schedule(name: str) -> str:
+        """Create a schedule (admin-only)."""
+        pytest.fail("authorization-denied tool executed")
+
+    auth = _auth_context(roles=("user",), enforce=True)
+    ctx = TurnContext(
+        turn_id="refusal-loop", session_id="ch-1", channel_id="ch-1",
+        trigger="user_message", started_at=time.monotonic(),
+        iteration_budget=20, tool_call_budget=100, tool_call_count=7,
+    )
+    ctx.auth_context = auth
+    ctx.ifc_labels = auth.ifc_labels
+    decisions = []
+    events = []
+    original_authorize = budget_gate._authorize_tool_call
+
+    def capture_authorization(tool_name, *args, **kwargs):
+        result = original_authorize(tool_name, *args, **kwargs)
+        if tool_name == "add_schedule":
+            assert get_current_turn() is ctx
+            assert args[0] is auth
+            decisions.append(result[0].allowed)
+        return result
+
+    def messages():
+        yield AIMessage(content="", tool_calls=[{
+            "name": "task", "id": "delegate", "type": "tool_call",
+            "args": {"description": "Keep trying add_schedule", "subagent_type": subagent_name},
+        }])
+        for i in range(40):
+            yield AIMessage(content="", tool_calls=[{
+                "name": "add_schedule", "id": f"denied-{i}", "type": "tool_call",
+                "args": {"name": "nightly"},
+            }])
+        raise AssertionError("refusal loop escaped the iteration ceiling")
+
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", capture_authorization)
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *a, **kw: None)
+    monkeypatch.setattr(iteration_gate, "_emit_event_sync", lambda kind, **kw: events.append(kind))
+    specs = build_mimir_subagents()
+    for spec in specs:
+        # Arm the read-only critic with a test-only admin tool too.
+        spec["tools"] = [add_schedule]
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=ToolCallingModel(messages=messages()), tools=[],
+        middleware=[iteration_gate.IterationGateMiddleware()],
+        subagents=specs, context_schema=AuthContext,
+    )
+    token = set_current_turn(ctx)
+    try:
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content="Delegate the schedule creation")]}, context=auth,
+        )
+    finally:
+        reset_current_turn(token)
+
+    # Parent uses boundary 1; child models run at 2..19, stopping at 20.
+    # Resuming the parent must stop again at 21, without another model call.
+    assert decisions == [False] * 18
+    assert ctx.tool_call_count == 7  # refusals consume no tool budget
+    assert ctx.iteration_count == 21
+    assert ctx.iteration_hard_stopped
+    assert events == ["iteration_budget_warning", "iteration_budget_reached"]
+    task_result = next(m for m in result["messages"] if isinstance(m, ToolMessage))
+    assert "Turn force-stopped" in task_result.content
+    assert "Turn force-stopped" in result["messages"][-1].content
+
+
+@pytest.mark.asyncio
+async def test_subagent_todo_policy_and_general_filesystem_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepagents import HarnessProfile, create_deep_agent
+    from deepagents.backends import StateBackend
+    import deepagents.graph as deepagents_graph
+    from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+
+    observed_todos: list[list[dict]] = []
+    critic_todo_presence: list[bool] = []
+    bound_tools: list[list[str]] = []
+
+    class _TodoStateCaptureMiddleware(AgentMiddleware):
+        def before_model(self, state, runtime):  # noqa: ARG002
+            if state.get("todos"):
+                observed_todos.append(state["todos"])
+
+    class _CriticStateCaptureMiddleware(AgentMiddleware):
+        def before_model(self, state, runtime):  # noqa: ARG002
+            critic_todo_presence.append("todos" in state)
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            bound_tools.append([tool.name for tool in tools])
+            return self
+
+    monkeypatch.setattr(
+        deepagents_graph,
+        "_harness_profile_for_model",
+        lambda *_args: HarnessProfile(extra_middleware=(TodoListMiddleware(),)),
+    )
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "task",
+            "args": {
+                "description": "track and finish the inventory check",
+                "subagent_type": "general-purpose",
+            },
+            "id": "tc-general-task",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "write_todos",
+            "args": {"todos": [{"content": "Check tools", "status": "in_progress"}]},
+            "id": "tc-general-todo",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="general done"),
+        AIMessage(content="", tool_calls=[{
+            "name": "task",
+            "args": {
+                "description": "review the inventory check",
+                "subagent_type": "critic-structured",
+            },
+            "id": "tc-critic-task",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "CriticFindings",
+            "args": {
+                "verdict": "no_concerns",
+                "summary": "The inventory is consistent.",
+                "findings": [],
+                "open_questions": [],
+            },
+            "id": "tc-critic-response",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="parent done"),
+    ]))
+    subagents = build_mimir_subagents()
+    subagents[0]["middleware"].append(_TodoStateCaptureMiddleware())
+    subagents[1]["middleware"].append(_CriticStateCaptureMiddleware())
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt="parent test",
+        backend=StateBackend(),
+        middleware=[TodoListMiddleware()],
+        subagents=subagents,
+        context_schema=AuthContext,
+    )
+
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="delegate the inventory check")]},
+        context=_auth_context(roles=("user",), enforce=False),
+    )
+
+    general_requests = [
+        names for names in bound_tools
+        if "task" not in names and "CriticFindings" not in names
+    ]
+    assert general_requests
+    filesystem_names = {"ls", "read_file", "write_file", "edit_file", "glob", "grep"}
+    for names in general_requests:
+        assert set(names) & filesystem_names == filesystem_names
+        assert names.count("write_todos") == 1
+        assert "delete" not in names
+        assert "execute" not in names
+    assert observed_todos == [[{"content": "Check tools", "status": "in_progress"}]]
+    critic_requests = [names for names in bound_tools if "CriticFindings" in names]
+    assert critic_requests
+    assert all("write_todos" not in names for names in critic_requests)
+    assert critic_todo_presence == [False]
+
+
+@pytest.mark.asyncio
+async def test_critic_preserves_auth_context_while_private_state_is_stripped() -> None:
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+
+    child_inputs: list[dict] = []
+    child_contexts: list[AuthContext | None] = []
+
+    class _CapturingCritic(Runnable):
+        def invoke(self, input, config=None, *, context=None, **kwargs):  # noqa: ARG002
+            child_inputs.append(input)
+            child_contexts.append(context)
+            return {"messages": [AIMessage(content="critic done")]}
+
+        async def ainvoke(self, input, config=None, *, context=None, **kwargs):  # noqa: ARG002
+            return self.invoke(input, config, context=context, **kwargs)
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "task",
+            "args": {
+                "description": "review the private-state boundary",
+                "subagent_type": "critic-structured",
+            },
+            "id": "tc-private-state",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="parent done"),
+    ]))
+    parent_auth = _auth_context(roles=("admin",), enforce=True)
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt="parent test",
+        middleware=[_PrivateProbeMiddleware()],
+        subagents=[{
+            "name": "critic-structured",
+            "description": "private-state boundary test",
+            "runnable": _AuthContextRunnable(_CapturingCritic()),
+        }],
+        context_schema=AuthContext,
+    )
+
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="review the boundary")]},
+        context=parent_auth,
+    )
+
+    assert len(child_inputs) == 1
+    assert "private_probe" not in child_inputs[0]
+    assert child_contexts == [parent_auth]
+    assert child_contexts[0] is parent_auth
+
+
+@pytest.mark.parametrize("child_name", ["general-purpose", "critic-structured"])
+@pytest.mark.parametrize("capture_content", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_delegated_model_and_tool_share_turn_trace_without_leaking_content(
+    monkeypatch: pytest.MonkeyPatch, child_name: str, capture_content: bool,
+    asynchronous: bool,
+) -> None:
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+    from langgraph.config import get_config
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.tools import budget_gate
+    from mimir.tracing import TraceController
+
+    seen_callbacks: list[list] = []
+
+    class ChildCallbackProbe(AgentMiddleware):
+        def before_model(self, state, runtime):  # noqa: ARG002
+            callbacks = get_config()["callbacks"]
+            handlers = callbacks.handlers if hasattr(callbacks, "handlers") else callbacks
+            seen_callbacks.append(handlers)
+
+    class ToolCallingModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    @tool
+    def add_schedule(name: str) -> str:
+        """Add a named schedule."""
+        return f"schedule created: {name}"
+
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    secret = "api_key=child-secret-canary"
+    child_prompt = f"review child-request-sentinel {secret}"
+    tool_name = "ls" if child_name == "critic-structured" else "add_schedule"
+    tool_args = (
+        {"path": "/critic-tool-sentinel"}
+        if child_name == "critic-structured" else {"name": "nightly-child-sentinel"}
+    )
+    child_output = (
+        "critic-output-sentinel" if child_name == "critic-structured"
+        else "general-output-sentinel"
+    )
+    messages = [
+        AIMessage(content="", tool_calls=[{
+            "name": "task", "id": "delegate", "type": "tool_call",
+            "args": {"description": child_prompt, "subagent_type": child_name},
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": tool_name, "id": "child-tool", "type": "tool_call",
+            "args": tool_args,
+        }]),
+    ]
+    if child_name == "critic-structured":
+        messages.append(AIMessage(content="", tool_calls=[{
+            "name": "CriticFindings", "id": "critic-response", "type": "tool_call",
+            "args": {"verdict": "no_concerns", "summary": child_output, "findings": [], "open_questions": []},
+        }]))
+    else:
+        messages.append(AIMessage(content=child_output))
+    messages.append(AIMessage(content="parent done"))
+
+    specs = build_mimir_subagents()
+    assert specs[1]["tools"] == []
+    specs[0]["tools"] = [add_schedule]
+    for spec in specs:
+        spec["middleware"].append(ChildCallbackProbe())
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=ToolCallingModel(messages=iter(messages)), tools=[], subagents=specs,
+        context_schema=AuthContext,
+    )
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    controller = TraceController(provider, capture_content=capture_content)
+    with controller.turn(conversation_id="ch-1", agent_name="mimir", model="fake") as turn:
+        callback = turn.callback
+        kwargs = {
+            "config": {"callbacks": [callback]},
+            "context": _auth_context(roles=("admin",), enforce=True),
+        }
+        if asynchronous:
+            await agent.ainvoke({"messages": [HumanMessage(content="parent sentinel")]}, **kwargs)
+        else:
+            agent.invoke({"messages": [HumanMessage(content="parent sentinel")]}, **kwargs)
+
+    spans = exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "invoke_agent")
+    models = [span for span in spans if span.name == "chat"]
+    tools = [span for span in spans if span.name == "execute_tool"]
+    assert len(seen_callbacks) == 2
+    assert all(
+        sum(handler is callback for handler in handlers) == 1
+        for handlers in seen_callbacks
+    )
+    assert len(models) == len(messages)
+    assert len(tools) == 2
+    task_span = next(span for span in tools if span.attributes.get("gen_ai.tool.name") == "task")
+    child_tools = [span for span in tools if span.attributes.get("gen_ai.tool.name") == tool_name]
+    assert len(child_tools) == 1
+    child_tool = child_tools[0]
+    assert child_tool.attributes["gen_ai.tool.call.id"] == "child-tool"
+    assert task_span.parent.span_id == root.context.span_id or task_span.parent.span_id in {
+        span.context.span_id for span in models
+    }
+    assert child_tool.context.trace_id == root.context.trace_id
+    assert all(span.context.trace_id == root.context.trace_id for span in spans)
+    serialized = json.dumps([dict(span.attributes) for span in spans])
+    assert "child-secret-canary" not in serialized
+    content_keys = (
+        "gen_ai.input.messages", "gen_ai.output.messages",
+        "gen_ai.tool.call.arguments", "gen_ai.tool.call.result",
+    )
+    if capture_content:
+        child_models = models[1:-1]
+        assert len(child_models) == 2
+        assert all(
+            "child-request-sentinel" in span.attributes["gen_ai.input.messages"]
+            for span in child_models
+        )
+        assert child_output in child_models[-1].attributes["gen_ai.output.messages"]
+        assert str(tool_args) in child_tool.attributes["gen_ai.tool.call.arguments"]
+        assert "gen_ai.tool.call.result" in child_tool.attributes
+        if child_name == "general-purpose":
+            assert "nightly-child-sentinel" in child_tool.attributes["gen_ai.tool.call.arguments"]
+            assert "schedule created: nightly-child-sentinel" in child_tool.attributes["gen_ai.tool.call.result"]
+        else:
+            assert "critic-tool-sentinel" in child_tool.attributes["gen_ai.tool.call.arguments"]
+            assert "No files found" in child_tool.attributes["gen_ai.tool.call.result"]
+    else:
+        assert all(key not in span.attributes for span in (*models, child_tool) for key in content_keys)
+    provider.shutdown()

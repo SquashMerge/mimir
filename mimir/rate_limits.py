@@ -1,0 +1,903 @@
+"""Persistent store for Anthropic plan-window rate-limit state.
+
+The Claude Agent SDK emits ``RateLimitEvent`` messages on status
+transitions, carrying the actual Max-plan window utilization that
+Claude Code's ``/usage`` surfaces — five-hour rolling, seven-day
+plan-wide, seven-day Opus-specific, seven-day Sonnet-specific, and
+the overage / pay-as-you-go bucket. These events are sparse (one
+per state transition, not one per turn), so mimir persists the
+most recently observed entry per ``rate_limit_type`` and renders it
+in the prompt's Resource usage block until the window resets.
+
+Store path: ``<home>/.mimir/rate_limits.json``. Single JSON object
+keyed by ``rate_limit_type``:
+
+    {
+      "five_hour": {
+        "status": "allowed" | "allowed_warning" | "rejected",
+        "utilization": 0.0-1.0,
+        "resets_at": <unix ts>,
+        "observed_at": <iso8601 ts>,
+        "overage_status": ... | null,
+        "overage_resets_at": ... | null
+      },
+      "seven_day_opus": { ... },
+      ...
+    }
+
+Stale entries (``now > resets_at``) are filtered out by ``current()``
+so a forgotten record from last week doesn't pollute the prompt.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import threading
+import time
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# chainlink #239: this module's prior ``_write_json_atomic`` did NOT
+# fsync the file or the parent dir — a crash between os.replace and
+# writeback could revert the rename. ``mimir._atomic.atomic_write_json``
+# now applies the CR#7 invariant (fsync file + fsync parent dir)
+# uniformly across rate_limits, oauth_usage_poller, and quota_pause.
+from ._atomic import atomic_write_json
+from .quota_windows import (
+    provider_store_keys,
+    store_key_order,
+    store_label_map,
+    store_window_hours,
+)
+
+log = logging.getLogger(__name__)
+
+
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _path_lock(path: Path) -> threading.RLock:
+    """Return the process-wide writer lock for one store path."""
+    resolved = path.resolve()
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(resolved, threading.RLock())
+
+
+def running_on_claude_max() -> bool:
+    """True iff the agent appears to be configured for Claude Max
+    OAuth — the only config where ``ClaudeSDKClient.get_context_usage()``
+    returns useful per-window utilization data.
+
+    Heuristic:
+    - ``CLAUDE_CODE_OAUTH_TOKEN`` set (Max OAuth path).
+    - ``ANTHROPIC_BASE_URL`` empty (no proxy / OpenRouter / Minimax
+      redirect that would route the agent's calls outside Anthropic).
+
+    Either condition flipping means we're in a config where the
+    daemon's ``apiUsage`` will be empty — direct API keys deliver
+    rate-limit headers per-response (already captured by
+    ``RateLimitEvent``) but no plan-window picture; OpenRouter /
+    Minimax don't have a plan-window concept at all.
+
+    The check is environment-only — no network calls, safe to invoke
+    at scheduler-registration time before the agent is up.
+    """
+    has_oauth = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip())
+    has_base_url_override = bool(os.environ.get("ANTHROPIC_BASE_URL", "").strip())
+    return has_oauth and not has_base_url_override
+
+
+@dataclass
+class RateLimitSnapshot:
+    """Persisted shape of a single rate-limit-type entry. Mirrors the
+    SDK's ``RateLimitInfo`` minus the type tag (which is the dict key)
+    plus an ``observed_at`` field so we can reason about staleness.
+
+    ``derived`` (chainlink #17): true when ``utilization`` was estimated
+    from cost data rather than read from a usage endpoint. The OAuth
+    poller's cost-rate-back-derived 5h estimator sets this when the
+    layer-(a) anomaly detector rejected an endpoint reading and we
+    need a usable 5h signal during a long endpoint glitch. The
+    arbiter (mimir/billing.py:evaluate_quota_severity) applies a higher
+    suppress threshold (90% vs 80% direct) when this is set —
+    derived values are approximations and shouldn't trip the wall
+    threshold as quickly as ground truth."""
+
+    status: str  # "allowed" | "allowed_warning" | "rejected"
+    utilization: float | None = None
+    resets_at: int | None = None
+    reset_after_seconds: int | None = None
+    observed_at: str = ""
+    overage_status: str | None = None
+    overage_resets_at: int | None = None
+    overage_disabled_reason: str | None = None
+    derived: bool = False
+
+
+@dataclass
+class RateLimitStore:
+    """Lock-serialized JSON file at ``<home>/.mimir/rate_limits.json``.
+    Multiple turns can in principle write concurrently (subagents),
+    so writes are gated through an asyncio.Lock (async path) and a
+    threading.Lock (sync path). Both paths use atomic write-to-temp +
+    rename so a concurrent write or crash never leaves a corrupted file."""
+
+    path: Path
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _thread_lock: threading.RLock = field(init=False, repr=False)
+    _write_failed: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Agent callbacks and scheduler pollers may construct separate store
+        # objects for the same file. Atomic rename prevents corruption, but a
+        # shared lock also prevents stale read-modify-write lost updates.
+        self._thread_lock = _path_lock(self.path)
+
+    async def record(
+        self,
+        rate_limit_type: str,
+        snapshot: RateLimitSnapshot,
+    ) -> bool:
+        """Replace the entry for ``rate_limit_type`` with ``snapshot``.
+        Best effort — on IO failure we log and move on; the prompt
+        section degrades to "no plan data" rather than crashing the
+        turn. Returns whether the snapshot was persisted.
+
+        The asyncio.Lock serializes concurrent coroutine callers.
+        Writes are atomic (temp + rename) so a crash mid-write cannot
+        corrupt the file."""
+        async with self._lock:
+            with self._thread_lock:
+                data = self._load()
+                data[rate_limit_type] = asdict(snapshot)
+                try:
+                    atomic_write_json(self.path, data)
+                except OSError as exc:
+                    log.warning("rate_limits.json write failed: %s", exc)
+                    self._report_write_failure(exc)
+                    return False
+                self._write_failed = False
+                return True
+
+    def record_sync(
+        self,
+        rate_limit_type: str,
+        snapshot: RateLimitSnapshot,
+    ) -> bool:
+        """Synchronous version of :meth:`record` for callers that can't
+        ``await`` (e.g. ``ChatCodexPlus.rate_limit_callback``, which
+        fires inline from a streaming SSE handler on either the loop
+        thread or a thread executor — figuring out which is brittle).
+
+        A threading.Lock serializes concurrent thread callers; writes
+        are atomic (temp + rename) so a crash mid-write cannot corrupt
+        the file. Last-write-wins semantics are acceptable because
+        snapshots are monotonically refreshed (each successful response
+        carries the latest quota state). Best-effort: IO errors are
+        logged and swallowed. Returns whether the snapshot was persisted.
+        """
+        with self._thread_lock:
+            data = self._load()
+            data[rate_limit_type] = asdict(snapshot)
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
+
+    def reconcile_sync(
+        self,
+        updates: dict[str, RateLimitSnapshot],
+        *,
+        owned_keys: Iterable[str],
+    ) -> bool:
+        """Atomically apply ``updates`` AND drop any ``owned_keys`` absent
+        from ``updates``, in one locked write.
+
+        Use when a provider reports the full current set of its windows in a
+        single callback: a window it owns but did NOT report this round is
+        stale and must be removed, not left to linger. :meth:`current` only
+        drops entries by ``resets_at``, so a misclassified key carrying a
+        future reset — e.g. a 7-day reset written under ``openai_five_hour``
+        by an older position-based mapper (#1058) — would otherwise
+        survive for the whole window and keep the panel/arbiter reading a
+        phantom 5h bucket. Popping absent owned keys keeps the on-disk set
+        for this provider exactly equal to what the snapshot reported.
+
+        Keys outside ``owned_keys`` (other providers' windows) are left
+        untouched. Best-effort: IO errors are logged and swallowed. Returns
+        whether the reconciliation was persisted."""
+        owned = set(owned_keys)
+        with self._thread_lock:
+            data = self._load()
+            for key in owned:
+                data.pop(key, None)
+            for key, snapshot in updates.items():
+                data[key] = asdict(snapshot)
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
+
+    def reconcile_codex_probe_sync(
+        self,
+        updates: dict[str, RateLimitSnapshot],
+        *,
+        owned_keys: Iterable[str],
+        observed_epoch: float,
+    ) -> tuple[bool, dict[str, tuple[float, float, bool]]]:
+        """Persist a Codex usage probe with a bounded rolling-max history.
+
+        The raw history is Codex-private store metadata. ``current()`` ignores
+        it, so other providers and the public snapshot shape are unchanged.
+        A generation-429 rejection remains authoritative until its reset or a
+        successful generation response overwrites it.
+        """
+        cutoff = observed_epoch - 15 * 60
+        owned = set(owned_keys)
+        stats: dict[str, tuple[float, float, bool]] = {}
+        with self._thread_lock:
+            data = self._load()
+            for key in owned:
+                if key not in updates:
+                    previous = data.get(key)
+                    if isinstance(previous, dict):
+                        reset = _as_timestamp(previous.get("resets_at"))
+                        if (
+                            previous.get("status") == "rejected"
+                            and previous.get("_codex_rejection_source") == "generation"
+                            and (reset is None or reset > observed_epoch)
+                        ):
+                            # Missing probe windows do not revoke a live 429.
+                            continue
+                    data.pop(key, None)
+            for key, snapshot in updates.items():
+                previous = data.get(key)
+                previous = previous if isinstance(previous, dict) else {}
+                history: list[dict[str, float]] = []
+                raw_history = previous.get("_codex_probe_readings", [])
+                if isinstance(raw_history, list):
+                    for item in raw_history:
+                        if not isinstance(item, dict):
+                            continue
+                        ts = _as_float(item.get("ts"))
+                        util = _as_float(item.get("utilization"))
+                        if ts is not None and util is not None and ts >= cutoff:
+                            history.append({"ts": ts, "utilization": util})
+                if snapshot.utilization is not None:
+                    history.append({
+                        "ts": observed_epoch,
+                        "utilization": snapshot.utilization,
+                    })
+                history = history[-5:]
+                values = [item["utilization"] for item in history]
+                if values:
+                    low, high = min(values), max(values)
+                    snapshot.utilization = high
+                    stats[key] = (low, high, high - low > 0.10)
+
+                # A usage endpoint saying "allowed" is not evidence that a
+                # generation 429 was transient. Only a successful generation
+                # callback may clear that enforced verdict before reset.
+                previous_reset = _as_timestamp(previous.get("resets_at"))
+                rejection_live = previous_reset is None or previous_reset >= int(observed_epoch)
+                if (
+                    previous.get("status") == "rejected"
+                    and previous.get("_codex_rejection_source") == "generation"
+                    and rejection_live
+                ):
+                    snapshot.status = "rejected"
+                    snapshot.resets_at = previous_reset
+
+                raw = asdict(snapshot)
+                raw["_codex_probe_readings"] = history
+                if snapshot.status == "rejected":
+                    raw["_codex_rejection_source"] = (
+                        previous.get("_codex_rejection_source") or "probe"
+                    )
+                data[key] = raw
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False, {}
+            self._write_failed = False
+            return True, stats
+
+    def record_codex_rejection_sync(
+        self,
+        rate_limit_type: str,
+        snapshot: RateLimitSnapshot,
+    ) -> bool:
+        """Record an enforced generation rejection without dropping siblings."""
+        with self._thread_lock:
+            data = self._load()
+            raw = asdict(snapshot)
+            raw["_codex_rejection_source"] = "generation"
+            data[rate_limit_type] = raw
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
+
+    def clear_codex_generation_rejections_sync(self) -> bool:
+        """Clear enforced Codex rejections after a successful canary."""
+        with self._thread_lock:
+            data = self._load()
+            changed = False
+            for key, raw in data.items():
+                if not key.startswith("openai_") or not isinstance(raw, dict):
+                    continue
+                if raw.get("_codex_rejection_source") != "generation":
+                    continue
+                raw["status"] = "allowed"
+                raw.pop("_codex_rejection_source", None)
+                changed = True
+            if not changed:
+                return True
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
+
+    def _report_write_failure(self, exc: OSError) -> None:
+        """Emit once when persistence enters a failed state."""
+        if self._write_failed:
+            return
+        self._write_failed = True
+        try:
+            from .event_logger import log_event_sync
+            log_event_sync(
+                "quota_state_write_failed",
+                path=str(self.path),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("quota state failure event could not be emitted", exc_info=True)
+
+    def current(self) -> dict[str, RateLimitSnapshot]:
+        """Return only entries whose window hasn't reset. Drops stale
+        entries (resets_at < now) but keeps records with ``resets_at=None``
+        (the SDK doesn't always populate it; surface what we have)."""
+        data = self._load()
+        now = int(time.time())
+        try:
+            file_mtime = self.path.stat().st_mtime
+        except OSError:
+            file_mtime = float(now)
+        window_hours = store_window_hours()
+        out: dict[str, RateLimitSnapshot] = {}
+        for key, raw in data.items():
+            if not isinstance(raw, dict):
+                continue
+            resets_at = _as_timestamp(raw.get("resets_at"))
+            reset_after = _as_positive_int(raw.get("reset_after_seconds"))
+            observed_epoch = _observed_epoch(raw.get("observed_at"))
+            anchor = observed_epoch if observed_epoch is not None else file_mtime
+            nominal_seconds = window_hours.get(key)
+            nominal_seconds = nominal_seconds * 3600 if nominal_seconds is not None else None
+            is_codex = key.startswith("openai_")
+
+            # A reset supplied by the provider is trusted only when it is
+            # plausible for this declared window. Otherwise use the relative
+            # reset, then the nominal window. The file timestamp is a bounded
+            # migration anchor for legacy records with malformed observations.
+            expiry: float | None = None
+            if resets_at is not None:
+                max_reset = (
+                    max(anchor, float(now)) + nominal_seconds + 300
+                    if nominal_seconds is not None
+                    else None
+                )
+                if not is_codex or max_reset is None or resets_at <= max_reset:
+                    expiry = float(resets_at)
+            if expiry is None and reset_after is not None:
+                if nominal_seconds is None or reset_after <= nominal_seconds + 300:
+                    expiry = anchor + reset_after
+            if expiry is None and is_codex and nominal_seconds is not None:
+                expiry = anchor + nominal_seconds
+            if expiry is not None and expiry < now:
+                continue
+            out[key] = RateLimitSnapshot(
+                status=str(raw.get("status") or "allowed"),
+                utilization=_as_float(raw.get("utilization")),
+                resets_at=resets_at,
+                reset_after_seconds=reset_after,
+                observed_at=str(raw.get("observed_at") or ""),
+                overage_status=raw.get("overage_status"),
+                overage_resets_at=raw.get("overage_resets_at"),
+                overage_disabled_reason=raw.get("overage_disabled_reason"),
+                derived=bool(raw.get("derived", False)),
+            )
+        return out
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            log.warning("rate_limits.json is corrupt; treating as empty")
+            return {}
+        return data if isinstance(data, dict) else {}
+
+
+def _as_float(v: Any) -> float | None:
+    if isinstance(v, (int, float)):
+        return float(v)
+    return None
+
+
+def _as_timestamp(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value > 0 else None
+
+
+def _as_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value >= 0 else None
+
+
+def _observed_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return observed.timestamp()
+
+
+def filter_to_active_provider(
+    snapshots: dict[str, RateLimitSnapshot],
+    active_provider: str | None,
+) -> dict[str, RateLimitSnapshot]:
+    """Keep only the store keys owned by ``active_provider`` (the resolved
+    quota-provider key for this deployment). Drops stale cross-provider
+    keys a now-disabled poller left behind AND junk keys not in any
+    provider's window set (chainlink #301).
+
+    An unknown / falsy ``active_provider`` (or one with no declared keys)
+    returns ``snapshots`` unchanged — fail-open so a routing gap never
+    blanks the whole view."""
+    if not active_provider:
+        return snapshots
+    allowed = set(provider_store_keys(active_provider))
+    if not allowed:
+        return snapshots
+    return {k: v for k, v in snapshots.items() if k in allowed}
+
+
+def render_plan_quota_lines(
+    snapshots: dict[str, RateLimitSnapshot],
+) -> list[str]:
+    """Format snapshots as bullet lines for the Resource usage block.
+    Empty list when there's nothing to show.
+
+    Order matters for readability — five_hour first (most-frequently
+    relevant), then seven_day (plan-wide), then per-model entries,
+    then overage. Unknown / future types fall through alphabetically."""
+    if not snapshots:
+        return []
+    # Render order comes from the per-provider registry (Anthropic, then
+    # the vendor-prefixed providers, windows as declared). Unknown /
+    # future keys still fall through alphabetically below.
+    order = store_key_order()
+    keys = list(order) + sorted(k for k in snapshots if k not in order)
+    lines: list[str] = []
+    for key in keys:
+        snap = snapshots.get(key)
+        if snap is None:
+            continue
+        lines.append(_render_one(key, snap))
+    return lines
+
+
+def off_pace_buckets(
+    snapshots: dict[str, RateLimitSnapshot],
+) -> list[tuple[str, RateLimitSnapshot, "WindowProjection"]]:
+    """Return all (key, snapshot, projection) triples whose projection
+    is off track (on_pace_utilization >= 1.0). Ordered by severity
+    (highest projected utilization first) so the worst case leads."""
+    out: list[tuple[str, RateLimitSnapshot, WindowProjection]] = []
+    for key, snap in snapshots.items():
+        window = _WINDOW_HOURS.get(key)
+        if window is None:
+            continue
+        proj = project_window_end(snap, window)
+        if proj is None or proj.on_track:
+            continue
+        out.append((key, snap, proj))
+    out.sort(key=lambda t: t[2].on_pace_utilization, reverse=True)
+    return out
+
+
+def render_off_pace_warning(
+    off_pace: list[tuple[str, RateLimitSnapshot, "WindowProjection"]],
+) -> list[str]:
+    """Multi-line callout block for the off-pace alert. The inline ⚠
+    on the bucket line is a marker; this paragraph is the "scale back
+    NOW" message the agent reads when deciding what to do next.
+
+    Tier the verb by severity:
+    - on pace > 150% → "defer all expensive work"
+    - on pace 100-150% → "scale back"
+
+    Returns empty list when nothing's off pace."""
+    if not off_pace:
+        return []
+    worst = off_pace[0][2].on_pace_utilization
+    if worst >= 1.5:
+        verb_line = (
+            "🛑 PLAN QUOTA AT RISK — defer all expensive work. "
+            "Bash-only investigations, memory cleanup, or end the turn "
+            "silently. Do NOT fan out subagents. Multi-turn research is "
+            "off the table until the burn rate normalizes."
+        )
+    else:
+        verb_line = (
+            "⚠ Plan quota tracking off pace — scale back. "
+            "Pick the cheapest backlog items, avoid fan-out, prefer "
+            "Bash queries over subagent tasks. End silently more readily "
+            "than usual."
+        )
+    lines: list[str] = [verb_line]
+    for key, snap, proj in off_pace:
+        label = _LABEL.get(key, key.replace("_", " "))
+        cur_pct = (
+            f"{snap.utilization * 100:.0f}% used"
+            if snap.utilization is not None
+            else "unknown"
+        )
+        lines.append(
+            f"- {label}: {cur_pct}, projects to "
+            f"{proj.on_pace_utilization * 100:.0f}% by reset "
+            f"({_humanize_resets(snap.resets_at) if snap.resets_at else 'no reset time'})"
+        )
+    return lines
+
+
+def _render_one(key: str, snap: RateLimitSnapshot) -> str:
+    label = _LABEL.get(key, key.replace("_", " "))
+    parts: list[str] = [label]
+    if snap.utilization is not None:
+        parts.append(f"{snap.utilization * 100:.0f}% used")
+    if snap.status and snap.status != "allowed":
+        parts.append(snap.status)
+    if snap.resets_at:
+        parts.append(f"resets {_humanize_resets(snap.resets_at)}")
+    window = _WINDOW_HOURS.get(key)
+    if window is not None:
+        proj = project_window_end(snap, window)
+        if proj is not None:
+            pct = proj.on_pace_utilization * 100
+            marker = "" if proj.on_track else "⚠ "
+            parts.append(f"{marker}on pace: {pct:.0f}% by reset")
+    return " — ".join(parts)
+
+
+# Agent-facing labels + window lengths per store key, DERIVED from the
+# per-provider quota-window registry (mimir/quota_windows.py) rather than
+# enumerated here. Each subscription type (Anthropic / Minimax / Codex
+# Plus) owns its windows there, so adding a provider or window is a
+# one-place edit and this renderer stays in lockstep with what the
+# pollers actually write — no central key list to keep in sync.
+# (chainlink #298)
+_LABEL: dict[str, str] = store_label_map()
+
+
+# Window length per store key, in hours — drives the off-pace burn-rate
+# projection uniformly across providers. Open-ended windows (Anthropic's
+# ``overage``) carry ``hours=None`` in the registry and are omitted here,
+# so we don't print a misleading projection for them.
+_WINDOW_HOURS: dict[str, float] = store_window_hours()
+
+
+@dataclass(frozen=True)
+class WindowProjection:
+    """Where current burn rate puts us at window end.
+
+    ``on_pace_utilization`` is the projected end-of-window utilization
+    (>1.0 = will exceed quota). ``elapsed_fraction`` is how far into
+    the window we are; below ``min_elapsed_fraction`` the projection
+    is too noisy to surface (a single call in the first 30s of a 5h
+    window looks like 100× growth)."""
+
+    elapsed_hours: float
+    hours_until_reset: float
+    on_pace_utilization: float
+    on_track: bool
+
+
+def project_window_end(
+    snapshot: RateLimitSnapshot,
+    window_size_hours: float,
+    *,
+    min_elapsed_fraction: float = 0.05,
+    reference_time: float | None = None,
+) -> WindowProjection | None:
+    """Project end-of-window utilization assuming the current burn
+    rate continues. Returns None when:
+
+    - ``utilization`` is unknown (no signal to project from)
+    - ``resets_at`` is unknown (no time anchor for the window)
+    - ``utilization >= 1.0`` (bucket saturated / pegged). A reading of
+      100% means the old bucket is fully consumed; it carries no rate
+      information useful for projecting the new window. The window will
+      reset to 0% — projecting forward from 1.0 at the start of the new
+      window produces absurd multiples like 1093% (fingerprinted in
+      ``memory/issues/anthropic-5h-bucket-pegged.md``). The raw-utilization
+      suppress check (≥ 0.80) already handles the suppression decision in
+      this case; adding a spurious "⚠ on pace: 1093% by reset" banner is
+      pure noise.
+    - elapsed fraction of the window < ``min_elapsed_fraction``
+      (early-window noise dominates: a single call in the first
+      few minutes of a 5h window projects to absurd multiples)
+    - elapsed time has gone non-positive (window already past)
+
+    The math is the simplest possible: rate = util / elapsed; project
+    = rate × window. Equivalent to ``util × (window / elapsed)``.
+    """
+    if snapshot.utilization is None or snapshot.resets_at is None:
+        return None
+    if snapshot.utilization >= 1.0:
+        # Saturated / pegged bucket — see docstring. Raw suppress fires
+        # at ≥ 0.80; no useful rate signal to extrapolate here.
+        return None
+    if window_size_hours <= 0:
+        return None
+    now = reference_time if reference_time is not None else time.time()
+    if snapshot.resets_at <= now:
+        # Window already reset — the snapshot is stale; the next event
+        # will refresh. Projecting from stale data is misleading.
+        return None
+    hours_until_reset = (snapshot.resets_at - now) / 3600.0
+    elapsed_hours = window_size_hours - hours_until_reset
+    if elapsed_hours <= 0:
+        return None
+    if elapsed_hours / window_size_hours < min_elapsed_fraction:
+        return None
+    on_pace = snapshot.utilization * (window_size_hours / elapsed_hours)
+    return WindowProjection(
+        elapsed_hours=elapsed_hours,
+        hours_until_reset=hours_until_reset,
+        on_pace_utilization=on_pace,
+        on_track=on_pace < 1.0,
+    )
+
+
+def _humanize_resets(unix_ts: int) -> str:
+    """Format a future reset time relative to now: 'in 1h 23m', or
+    fall back to ISO8601 when the offset isn't human-friendly."""
+    delta = unix_ts - int(time.time())
+    if delta <= 0:
+        return "now"
+    if delta < 60:
+        return f"in {delta}s"
+    if delta < 3600:
+        return f"in {delta // 60}m"
+    if delta < 24 * 3600:
+        return f"in {delta // 3600}h {(delta % 3600) // 60}m"
+    days = delta // (24 * 3600)
+    hours = (delta % (24 * 3600)) // 3600
+    return f"in {days}d {hours}h"
+
+
+def snapshot_from_sdk_event(rate_limit_info: Any) -> RateLimitSnapshot:
+    """Convert an SDK ``RateLimitInfo`` dataclass to our persisted
+    snapshot. Tolerates objects that lack one of the optional fields
+    (older SDK versions or sparse events)."""
+    return RateLimitSnapshot(
+        status=str(getattr(rate_limit_info, "status", "allowed")),
+        utilization=_as_float(getattr(rate_limit_info, "utilization", None)),
+        resets_at=getattr(rate_limit_info, "resets_at", None),
+        observed_at=datetime.now(tz=timezone.utc).isoformat(),
+        overage_status=getattr(rate_limit_info, "overage_status", None),
+        overage_resets_at=getattr(rate_limit_info, "overage_resets_at", None),
+        overage_disabled_reason=getattr(
+            rate_limit_info, "overage_disabled_reason", None,
+        ),
+    )
+
+
+# ─── apiUsage parsing (ClaudeSDKClient.get_context_usage) ────────────
+#
+# Stage 5 of CLAUDE_SDK_CLIENT_MIGRATION.md: each turn calls the
+# shared persistent client's ``get_context_usage()`` and writes the
+# returned ``apiUsage`` buckets here. This replaces the throwaway-
+# subprocess cron poller (``mimir/quota_poller.py``) — same data,
+# cheaper path, fresher cadence (every turn vs every 10 min).
+#
+# Claude Code's apiUsage shape is undocumented in the SDK type
+# annotations (just ``dict[str, Any] | None``); ``_KNOWN_WINDOW_TYPES``
+# is what we've observed (and what RateLimitInfo's literal types
+# name). Unknown keys still get recorded — the store is a free-form
+# dict.
+
+_KNOWN_WINDOW_TYPES = {
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "overage",
+}
+
+
+def _coerce_utilization(raw: Any, *, percent: bool = False) -> float | None:
+    """Normalize a utilization value to a 0-1 float.
+
+    Most ``apiUsage`` fields report a fraction (0-1), but percent-named
+    fields report 0-100. Keep the field-name hint explicit so an exact
+    1% value from ``usage_pct``/``percentage`` does not get mistaken for
+    a saturated 1.0 fraction.
+    """
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if percent or v > 1.0:
+        # Explicit percent fields are 0-100 even at exact boundary values
+        # like 1 (1%, not 100%). Bare utilization keeps the historical
+        # heuristic: values >1 look percentage-shaped and are rescaled.
+        v = v / 100.0
+    if v < 0.0 or v > 1.5:  # >1.5 means we're past 150% — store anyway but
+                            # likely indicates a parse error, log it.
+        log.warning("apiUsage: utilization out of range (%r → %f)", raw, v)
+    return v
+
+
+def _coerce_resets_at(raw: Any) -> int | None:
+    """resets_at may be unix seconds (int/float) or an ISO timestamp.
+    Normalize to unix seconds (int)."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        try:
+            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def snapshot_from_api_usage_bucket(bucket: dict[str, Any]) -> RateLimitSnapshot | None:
+    """Best-effort parse of one ``apiUsage[<window_type>]`` bucket from
+    ``ClaudeSDKClient.get_context_usage()``. Returns None if the
+    bucket is too malformed to be useful (no resets_at AND no
+    utilization)."""
+    if "utilization" in bucket:
+        util = _coerce_utilization(bucket.get("utilization"))
+    elif "usage_pct" in bucket:
+        util = _coerce_utilization(bucket.get("usage_pct"), percent=True)
+    else:
+        util = _coerce_utilization(bucket.get("percentage"), percent=True)
+    resets = _coerce_resets_at(
+        bucket.get("resets_at")
+        or bucket.get("reset_at")
+        or bucket.get("resetsAt"),
+    )
+    if util is None and resets is None:
+        return None
+    status = str(bucket.get("status") or "allowed")
+    overage_status = bucket.get("overage_status")
+    overage_resets = _coerce_resets_at(
+        bucket.get("overage_resets_at") or bucket.get("overage_reset_at"),
+    )
+    overage_disabled = bucket.get("overage_disabled_reason")
+    return RateLimitSnapshot(
+        status=status,
+        utilization=util,
+        resets_at=resets,
+        observed_at=datetime.now(tz=timezone.utc).isoformat(),
+        overage_status=overage_status if isinstance(overage_status, str) else None,
+        overage_resets_at=overage_resets,
+        overage_disabled_reason=(
+            overage_disabled if isinstance(overage_disabled, str) else None
+        ),
+    )
+
+
+async def record_api_usage(
+    store: "RateLimitStore",
+    api_usage: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Write each parseable ``apiUsage`` bucket into ``store``.
+    Returns a summary mapping window_type → {utilization, resets_at,
+    status} of what was recorded, so the caller can emit a structured
+    log event without re-loading the store. Empty dict when there's
+    nothing useful to record (apiUsage is None, empty, or all buckets
+    are unparseable)."""
+    recorded: dict[str, dict[str, Any]] = {}
+    if not isinstance(api_usage, dict) or not api_usage:
+        return recorded
+    for window_type, bucket in api_usage.items():
+        if not isinstance(bucket, dict):
+            continue
+        snapshot = snapshot_from_api_usage_bucket(bucket)
+        if snapshot is None:
+            log.debug(
+                "apiUsage: skipping unparseable bucket %r: %r",
+                window_type, bucket,
+            )
+            continue
+        try:
+            persisted = await store.record(window_type, snapshot)
+        except Exception:  # noqa: BLE001
+            log.exception("apiUsage: store.record failed for %s", window_type)
+            continue
+        if not persisted:
+            continue
+        recorded[window_type] = {
+            "utilization": snapshot.utilization,
+            "resets_at": snapshot.resets_at,
+            "status": snapshot.status,
+        }
+        if window_type not in _KNOWN_WINDOW_TYPES:
+            log.info("apiUsage: recorded unknown window type %r", window_type)
+    return recorded
+
+
+def snapshot_from_response_bucket(bucket: dict[str, Any]) -> RateLimitSnapshot:
+    """Convert one ``rate_limits[<bucket_type>]`` dict from an
+    Anthropic ``message_start`` API response to our snapshot.
+
+    The per-response shape is undocumented (Claude.ai subscription
+    private path) but observed with two possible utilization fields:
+    ``utilization`` (0.0-1.0 fraction, matches the SDK's transition
+    event shape) and ``used_percentage`` (0-100, matches the
+    statusline JSON jq expressions). We accept either so the
+    capture path is robust across CLI versions."""
+    util = _as_float(bucket.get("utilization"))
+    if util is None:
+        pct = bucket.get("used_percentage")
+        if isinstance(pct, (int, float)):
+            util = float(pct) / 100.0
+    resets_at = bucket.get("resets_at")
+    if resets_at is None:
+        resets_at = bucket.get("resetsAt")
+    return RateLimitSnapshot(
+        status=str(bucket.get("status") or "allowed"),
+        utilization=util,
+        resets_at=int(resets_at) if isinstance(resets_at, (int, float)) else None,
+        observed_at=datetime.now(tz=timezone.utc).isoformat(),
+        overage_status=bucket.get("overage_status") or bucket.get("overageStatus"),
+        overage_resets_at=(
+            bucket.get("overage_resets_at") or bucket.get("overageResetsAt")
+        ),
+        overage_disabled_reason=(
+            bucket.get("overage_disabled_reason")
+            or bucket.get("overageDisabledReason")
+        ),
+    )

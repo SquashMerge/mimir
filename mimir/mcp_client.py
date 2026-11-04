@@ -1,0 +1,1559 @@
+"""MCP client — run MCP servers as subprocesses and bridge their tools into LangChain.
+
+Each ``MCPServerConfig`` describes one stdio subprocess (command + args +
+env). ``MCPManager.start_servers`` starts them in a dedicated owner task, calls
+``ClientSession.list_tools``, and wraps each remote tool as a
+``langchain_core.tools.StructuredTool``. The resulting flat list is
+appended to the agent's tool surface alongside mimir's native tools.
+
+Tool names are namespaced as ``mcp_{server}_{tool}`` so collisions
+with mimir built-ins are impossible. Errors thrown by an MCP tool
+propagate as ``ToolException`` — LangGraph surfaces those to the
+model as tool error messages, so the agent can recover rather than
+crash the turn.
+
+Lifecycle is managed by ``server.py``: ``_on_startup`` calls
+``start_servers``, ``_on_cleanup`` calls ``shutdown``. Failure to
+connect to any single server is non-fatal — the server is logged
+and skipped, other servers and mimir's native tools keep working.
+Ported from open-strix's ``mcp_client.py`` with PR #181 review
+hardening: per-server exit stacks (one server's hang doesn't block
+others), timeouts on ``initialize`` + ``call_tool``, regex-based
+``${VAR}`` expansion (handles ``"Bearer ${TOKEN}"`` patterns), and
+warning-on collision for ``mcp_{server}_{tool}`` namespaced names.
+
+Chainlink #870 adds provenance tracking:
+- Versioned provenance record on each wrapper with immutable server_config_id,
+  transport/endpoint identity, canonical non-secret config and schema digests,
+  original tool name, adapter/version, approval and policy version
+- Classification via registered adapters for resource-scoped authorization
+- Drift detection that invalidates approval without logging secrets
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+import unicodedata
+import uuid
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Callable
+
+from langchain_core.tools import StructuredTool, ToolException
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import InputRequiredResult
+from pydantic import Field, create_model
+
+from ._atomic import atomic_write_json
+from .event_logger import log_event_sync
+
+log = logging.getLogger(__name__)
+
+# Timeouts. Servers and tools that hang past these silently shouldn't
+# block the agent turn or the startup pipeline forever.
+DEFAULT_MCP_INITIALIZE_TIMEOUT_S = 30.0
+DEFAULT_MCP_CALL_TIMEOUT_S = 60.0
+DEFAULT_MCP_SHUTDOWN_TIMEOUT_S = 10.0
+
+# Keep a single server's repeated prompt overhead finite while accommodating
+# ordinary catalogs. 64 also leaves room for native tools in common 128-tool APIs.
+MAX_MCP_TOOLS_PER_SERVER = 64
+# Common model APIs require ASCII function names of at most 64 characters,
+# including our namespace. Reject rather than rewrite authoritative remote names.
+MAX_MCP_TOOL_NAME_LENGTH = 64
+# About a page of documentation per tool, plus one shared page for schema fields.
+# The field budget prevents many property descriptions bypassing the prose cap.
+MAX_MCP_DESCRIPTION_LENGTH = 4096
+
+
+def _validated_mcp_name(server_name: str, tool_name: str) -> str:
+    name = f"mcp_{server_name}_{tool_name}"
+    if (
+        not tool_name
+        or len(name) > MAX_MCP_TOOL_NAME_LENGTH
+        or re.fullmatch(r"[A-Za-z0-9_-]+", name) is None
+    ):
+        raise ValueError("MCP tool name must be ASCII alphanumeric/underscore/hyphen and fit the 64-character namespace")
+    return name
+
+
+def _bounded_mcp_description(text: str, limit: int) -> str:
+    # Preserve ordinary multiline documentation, not terminal/bidi controls.
+    return "".join(
+        char for char in text[:limit]
+        if char in "\n\t" or unicodedata.category(char) not in {"Cc", "Cf", "Cs"}
+    )
+
+# Matches ``${VAR_NAME}`` anywhere in a string. Pre-fix the parser only
+# accepted the exact form ``^${VAR}$`` — common operator patterns like
+# ``"Bearer ${TOKEN}"`` or ``"${A}${B}"`` were passed through literally,
+# shipping the placeholder to the subprocess instead of the secret.
+_ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_SERVER_CONFIG_NAMESPACE = uuid.UUID("4797522a-a5f1-47ef-9716-bfd7408b0b85")
+_TOOL_ID_NAMESPACE = uuid.UUID("4d87c6fe-7512-43f7-97b7-e1376f0b092a")
+MCP_POLICY_STORE_VERSION = 1
+UI_MCP_POLICY_VERSION = "ui-v1"
+_MCP_POLICY_STORE_LOCK = threading.RLock()
+
+_SECRET_KEYWORDS = frozenset({
+    "token", "secret", "password", "key", "auth", "credential",
+    "api_key", "api-key", "access_token", "access-token",
+})
+
+
+def _is_secret_key(key: str) -> bool:
+    """Check if a config key name suggests a secret value."""
+    return any(kw in key.lower() for kw in _SECRET_KEYWORDS)
+
+
+def _canonical_env_value(key: str, value: str) -> dict[str, Any]:
+    """Return identity-bearing env metadata without resolved secret values."""
+    references = _ENV_VAR_RE.findall(value)
+    if _is_secret_key(key):
+        return {"secret_references": references}
+    parts: list[dict[str, str]] = []
+    offset = 0
+    for match in _ENV_VAR_RE.finditer(value):
+        if match.start() > offset:
+            parts.append({"literal": value[offset:match.start()]})
+        parts.append({"secret_reference": match.group(1)})
+        offset = match.end()
+    if offset < len(value):
+        parts.append({"literal": value[offset:]})
+    return {"parts": parts or [{"literal": value}]}
+
+
+def _canonical_config_digest(config: MCPServerConfig) -> str:
+    """Generate a deterministic digest of non-secret config fields.
+
+    Includes environment keys, non-secret literals, and secret-reference
+    names. Resolved secret values are never part of the canonical payload.
+    """
+    env_identity = config.env_identity
+    if env_identity is None:
+        env_identity = {
+            key: _canonical_env_value(key, value)
+            for key, value in sorted((config.env or {}).items())
+        }
+    canonical = {
+        "args": config.args,
+        "command": config.command,
+        "env": env_identity,
+        "name": config.name,
+        # Bind approvals to the immutable server identity, not only its
+        # operator-facing name and otherwise-identical launch configuration.
+        "server_config_id": config.server_config_id,
+        "transport_type": "stdio",
+    }
+    content = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+def _derived_server_config_id(name: str) -> str:
+    """Derive a restart-stable ID from the operator-owned logical name."""
+    return str(uuid.uuid5(_SERVER_CONFIG_NAMESPACE, name))
+
+
+def _tool_identity(server_config_id: str, tool_name: str) -> str:
+    canonical = json.dumps([server_config_id, tool_name], separators=(",", ":"))
+    return str(uuid.uuid5(_TOOL_ID_NAMESPACE, canonical))
+
+
+def _schema_digest(input_schema: dict[str, Any]) -> str:
+    """Generate a deterministic digest of the tool's input schema.
+
+    Used for drift detection - any change to the schema will produce
+    a different digest, indicating the tool's contract has changed.
+    """
+    normalized = json.dumps(input_schema, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class MCPProvenance:
+    """Versioned provenance record for an MCP tool wrapper (chainlink #870).
+
+    Immutable metadata that identifies the tool's origin, configuration,
+    and approval state. Used for drift detection and authorization.
+    """
+    server_config_id: str
+    tool_id: str = ""
+    transport_type: str = "stdio"
+    endpoint_identity: str = ""
+    config_digest: str = ""
+    schema_digest: str = ""
+    original_tool_name: str = ""
+    classification: str = ""
+    adapter_name: str = ""
+    adapter_version: str = ""
+    approval_version: str = ""
+    policy_version: str = ""
+    result_integrity: str = "untrusted"
+    argument_egress: str = "taint_gated"
+    is_tombstoned: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        config: MCPServerConfig,
+        tool_name: str,
+        input_schema: dict[str, Any],
+        *,
+        server_config_id: str | None = None,
+    ) -> "MCPProvenance":
+        """Create a new provenance record for an MCP tool."""
+        return cls(
+            server_config_id=server_config_id or config.server_config_id,
+            tool_id=_tool_identity(server_config_id or config.server_config_id, tool_name),
+            endpoint_identity=config.name,
+            config_digest=_canonical_config_digest(config),
+            schema_digest=_schema_digest(input_schema),
+            original_tool_name=tool_name,
+            result_integrity="trusted",
+        )
+
+    def with_drift_detection(
+        self,
+        config: MCPServerConfig,
+        tool_name: str,
+        input_schema: dict[str, Any],
+    ) -> "MCPProvenance":
+        """Create a new provenance record with drift detection checks.
+
+        Returns a new provenance with is_tombstoned=True if:
+        - The tool name has changed
+        - The config digest has changed
+        - The schema digest has changed
+        """
+        new_config_digest = _canonical_config_digest(config)
+        new_schema_digest = _schema_digest(input_schema)
+
+        name_changed = tool_name != self.original_tool_name
+        config_changed = new_config_digest != self.config_digest
+        schema_changed = new_schema_digest != self.schema_digest
+
+        if name_changed or config_changed or schema_changed:
+            log.warning(
+                "MCP tool drift detected for %s: name_changed=%s, config_changed=%s, schema_changed=%s",
+                self.original_tool_name, name_changed, config_changed, schema_changed,
+            )
+
+        return MCPProvenance(
+            server_config_id=self.server_config_id,
+            tool_id=self.tool_id,
+            transport_type=self.transport_type,
+            endpoint_identity=self.endpoint_identity,
+            config_digest=new_config_digest,
+            schema_digest=new_schema_digest,
+            original_tool_name=tool_name,
+            classification=self.classification,
+            adapter_name=self.adapter_name,
+            adapter_version=self.adapter_version,
+            approval_version=self.approval_version,
+            policy_version=self.policy_version,
+            result_integrity=(
+                "untrusted" if self.is_tombstoned or name_changed or config_changed or schema_changed
+                else self.result_integrity
+            ),
+            argument_egress="taint_gated",
+            is_tombstoned=self.is_tombstoned or name_changed or config_changed or schema_changed,
+        )
+
+
+def _expand_env_refs(value: str) -> str:
+    """Replace every ``${VAR}`` occurrence with ``os.environ[VAR]``.
+
+    Missing variables become an empty string AND log a warning so
+    operators see the misconfiguration. Pre-fix the missing-var case
+    was silent — a server would start with an empty secret.
+    """
+    def _sub(match: re.Match[str]) -> str:
+        var_name = match.group(1)
+        if var_name not in os.environ:
+            log.warning(
+                "MCP env expansion: %r referenced in config but not set "
+                "in environment — substituting empty string", var_name,
+            )
+            return ""
+        return os.environ[var_name]
+    return _ENV_VAR_RE.sub(_sub, value)
+
+
+@dataclass(frozen=True)
+class MCPToolPolicy:
+    """Operator approval and argument-egress grant bound to discovery provenance."""
+
+    tool_name: str
+    classification: str
+    adapter_name: str
+    adapter_version: str
+    approval_version: str
+    policy_version: str
+    config_digest: str
+    schema_digest: str
+    argument_egress: str = "taint_gated"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MCPToolPolicy":
+        def value(*names: str) -> str:
+            for name in names:
+                if name in data:
+                    return str(data[name]).strip()
+            return ""
+
+        policy = cls(
+            tool_name=value("tool_name", "toolName", "original_tool_name"),
+            classification=value("classification").lower(),
+            adapter_name=value("adapter_name", "adapterName", "adapter_id", "adapterId"),
+            adapter_version=value("adapter_version", "adapterVersion"),
+            approval_version=value("approval_version", "approvalVersion"),
+            policy_version=value("policy_version", "policyVersion"),
+            config_digest=value("config_digest", "configDigest"),
+            schema_digest=value("schema_digest", "schemaDigest"),
+            argument_egress=(
+                value("argument_egress", "argumentEgress") or "taint_gated"
+            ).lower(),
+        )
+        required = (
+            policy.tool_name,
+            policy.classification,
+            policy.adapter_name,
+            policy.adapter_version,
+            policy.approval_version,
+            policy.policy_version,
+            policy.config_digest,
+            policy.schema_digest,
+        )
+        if not all(required):
+            raise ValueError("MCP tool policy requires all provenance and version fields")
+        if policy.classification not in {"open", "resource_scoped", "admin_required"}:
+            raise ValueError(f"invalid MCP classification: {policy.classification}")
+        if policy.argument_egress not in {"allowed", "taint_gated"}:
+            raise ValueError(
+                f"invalid MCP argument_egress: {policy.argument_egress}"
+            )
+        return policy
+
+
+@dataclass(frozen=True)
+class MCPAdapterConfig:
+    """Durable configuration for the built-in argument/resource adapter."""
+
+    name: str
+    version: str
+    policy_version: str
+    resource_argument: str = ""
+    owner_argument: str = ""
+    source: bool = False
+    sink: bool = False
+    direction: str = ""
+
+    @property
+    def flow_direction(self) -> str:
+        if self.direction:
+            return self.direction
+        if self.source and self.sink:
+            return "both"
+        if self.source:
+            return "source"
+        if self.sink:
+            return "sink"
+        return "unknown"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MCPAdapterConfig":
+        def value(*names: str) -> str:
+            for name in names:
+                if name in data:
+                    return str(data[name]).strip()
+            return ""
+
+        direction = value("direction", "flow", "flow_direction", "flowDirection").lower()
+        if not direction and ("source" in data or "sink" in data):
+            source = bool(data.get("source", False))
+            sink = bool(data.get("sink", False))
+            direction = "both" if source and sink else "source" if source else "sink" if sink else "neither"
+        if direction and direction not in {"source", "sink", "both", "neither"}:
+            raise ValueError(f"invalid MCP adapter flow direction: {direction}")
+        adapter = cls(
+            name=value("name", "id", "adapter_name", "adapterName"),
+            version=value("version", "adapter_version", "adapterVersion"),
+            policy_version=value("policy_version", "policyVersion"),
+            resource_argument=value("resource_argument", "resourceArgument"),
+            owner_argument=value("owner_argument", "ownerArgument"),
+            source=bool(data.get("source", False)),
+            sink=bool(data.get("sink", False)),
+            direction=direction,
+        )
+        if not adapter.name or not adapter.version or not adapter.policy_version:
+            raise ValueError("MCP adapter requires name, version, and policy_version")
+        return adapter
+
+
+@dataclass
+class MCPServerConfig:
+    """Per-server config — command, args, and environment for one stdio MCP subprocess."""
+
+    name: str
+    command: str
+    args: list[str]
+    env: dict[str, str] | None = None
+    server_config_id: str = ""
+    policy_version: str = ""
+    adapters: tuple[MCPAdapterConfig, ...] = ()
+    tool_policies: tuple[MCPToolPolicy, ...] = ()
+    env_identity: dict[str, dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.server_config_id:
+            self.server_config_id = _derived_server_config_id(self.name)
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        name_override: str | None = None,
+    ) -> MCPServerConfig:
+        """Build from a dict. Expands ``${VAR}`` placeholders in env values.
+
+        When ``name_override`` is supplied (the Claude Desktop dict-shape
+        path supplies the name as a key, not a value), it's used instead
+        of ``data["name"]``.
+        """
+        if name_override is not None:
+            name = name_override.strip()
+        else:
+            name = str(data.get("name", "")).strip()
+        if not name:
+            raise ValueError("MCP server config requires a 'name' field")
+        command = str(data.get("command", "")).strip()
+        if not command:
+            raise ValueError(f"MCP server '{name}' requires a 'command' field")
+        raw_args = data.get("args", [])
+        args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
+        raw_env = data.get("env")
+        env: dict[str, str] | None = None
+        env_identity: dict[str, dict[str, Any]] | None = None
+        if isinstance(raw_env, dict):
+            raw_values = {str(k): str(v) for k, v in raw_env.items()}
+            env = {key: _expand_env_refs(value) for key, value in raw_values.items()}
+            env_identity = {
+                key: _canonical_env_value(key, value)
+                for key, value in sorted(raw_values.items())
+            }
+        server_config_id = str(
+            data.get("server_config_id", data.get("serverConfigId", ""))
+        ).strip() or _derived_server_config_id(name)
+        policy_version = str(
+            data.get("policy_version", data.get("policyVersion", ""))
+        ).strip()
+        raw_adapters = data.get("adapters", [])
+        raw_policies = data.get("tool_policies", data.get("toolPolicies", []))
+        adapters = tuple(
+            MCPAdapterConfig.from_dict(item)
+            for item in raw_adapters
+            if isinstance(item, dict)
+        ) if isinstance(raw_adapters, list) else ()
+        tool_policies: list[MCPToolPolicy] = []
+        if isinstance(raw_policies, list):
+            if any(
+                isinstance(item, dict)
+                and ("result_integrity" in item or "resultIntegrity" in item)
+                for item in raw_policies
+            ):
+                log.warning(
+                    "MCP server %s: retired tool_policies key result_integrity "
+                    "(resultIntegrity) is ignored; configuring a server now trusts "
+                    "successful results by default", name,
+                )
+            for item in raw_policies:
+                if not isinstance(item, dict):
+                    log.warning("Ignoring invalid non-object MCP tool policy for %s", name)
+                    continue
+                try:
+                    tool_policies.append(MCPToolPolicy.from_dict(item))
+                except (TypeError, ValueError) as exc:
+                    log.warning("Ignoring invalid MCP tool policy for %s: %s", name, exc)
+        return cls(
+            name=name,
+            command=command,
+            args=args,
+            env=env,
+            server_config_id=server_config_id,
+            policy_version=policy_version,
+            adapters=adapters,
+            tool_policies=tuple(tool_policies),
+            env_identity=env_identity,
+        )
+
+
+class MCPConnection:
+    """A live MCP server connection plus the tools it exposes."""
+
+    def __init__(
+        self,
+        config: MCPServerConfig,
+        session: ClientSession,
+        exit_stack: AsyncExitStack,
+    ) -> None:
+        self.config = config
+        self.session = session
+        self.exit_stack = exit_stack
+        self.tool_names: list[str] = []
+
+    async def discover_tools(
+        self,
+        call_timeout_s: float = DEFAULT_MCP_CALL_TIMEOUT_S,
+        server_config_id: str | None = None,
+    ) -> list[StructuredTool]:
+        """Call ``list_tools`` and bridge each into a LangChain StructuredTool.
+
+        Args:
+            call_timeout_s: Timeout for each tool call.
+            server_config_id: Optional immutable ID for this server config.
+                             If not provided, one will be generated.
+        """
+        result = await self.session.list_tools()
+        tools: list[StructuredTool] = []
+        config_id = server_config_id or self.config.server_config_id
+        if len(result.tools) > MAX_MCP_TOOLS_PER_SERVER:
+            log_event_sync(
+                "mcp_tools_dropped", server_name=self.config.name,
+                server_config_id=config_id, reason="tool_count_limit",
+                limit=MAX_MCP_TOOLS_PER_SERVER,
+                dropped=len(result.tools) - MAX_MCP_TOOLS_PER_SERVER,
+            )
+        for index, mcp_tool in enumerate(result.tools[:MAX_MCP_TOOLS_PER_SERVER]):
+            try:
+                _validated_mcp_name(self.config.name, mcp_tool.name)
+            except ValueError:
+                log_event_sync(
+                    "mcp_tool_rejected", server_name=self.config.name,
+                    server_config_id=config_id, tool_index=index,
+                    reason="invalid_tool_name", limit=MAX_MCP_TOOL_NAME_LENGTH,
+                )
+                continue
+            provenance = MCPProvenance.create(
+                config=self.config,
+                tool_name=mcp_tool.name,
+                input_schema=mcp_tool.input_schema or {},
+                server_config_id=config_id,
+            )
+            policy = next(
+                (
+                    item for item in self.config.tool_policies
+                    if item.tool_name == mcp_tool.name
+                ),
+                None,
+            )
+            if policy is not None:
+                identity_matches = (
+                    policy.config_digest == provenance.config_digest
+                    and policy.schema_digest == provenance.schema_digest
+                    and policy.policy_version == self.config.policy_version
+                )
+                provenance = replace(
+                    provenance,
+                    classification=policy.classification,
+                    adapter_name=policy.adapter_name,
+                    adapter_version=policy.adapter_version,
+                    approval_version=policy.approval_version,
+                    policy_version=policy.policy_version,
+                    result_integrity="trusted" if identity_matches else "untrusted",
+                    argument_egress=(
+                        policy.argument_egress if identity_matches else "taint_gated"
+                    ),
+                    is_tombstoned=not identity_matches,
+                )
+            lc_tool = _bridge_mcp_tool(
+                server_name=self.config.name,
+                tool_name=mcp_tool.name,
+                description=mcp_tool.description or "",
+                input_schema=mcp_tool.input_schema or {},
+                session=self.session,
+                call_timeout_s=call_timeout_s,
+                provenance=provenance,
+            )
+            tools.append(lc_tool)
+            self.tool_names.append(mcp_tool.name)
+        return tools
+
+
+class MCPPolicyStore:
+    """Operator-owned server config and provenance-bound tool policy store."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def _load_document(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"version": MCP_POLICY_STORE_VERSION, "servers": {}, "tools": {}}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid MCP policy store {self.path}: {exc}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != MCP_POLICY_STORE_VERSION
+            or not isinstance(payload.get("tools"), dict)
+        ):
+            raise ValueError(f"invalid MCP policy store format: {self.path}")
+        records = payload["tools"]
+        if not all(isinstance(key, str) and isinstance(value, dict) for key, value in records.items()):
+            raise ValueError(f"invalid MCP policy records: {self.path}")
+        servers = payload.get("servers", {})
+        if not isinstance(servers, dict) or not all(
+            isinstance(key, str) and isinstance(value, dict)
+            for key, value in servers.items()
+        ):
+            raise ValueError(f"invalid MCP server records: {self.path}")
+        return {"version": MCP_POLICY_STORE_VERSION, "servers": servers, "tools": records}
+
+    def load(self) -> dict[str, dict[str, Any]]:
+        with _MCP_POLICY_STORE_LOCK:
+            return dict(self._load_document()["tools"])
+
+    def load_server_records(self) -> dict[str, dict[str, Any]]:
+        with _MCP_POLICY_STORE_LOCK:
+            return dict(self._load_document()["servers"])
+
+    def load_server_configs(self) -> list[MCPServerConfig]:
+        configs: list[MCPServerConfig] = []
+        for record in self.load_server_records().values():
+            try:
+                configs.append(MCPServerConfig.from_dict(record))
+            except (TypeError, ValueError) as exc:
+                log.warning("Ignoring invalid UI-managed MCP server: %s", exc)
+        return configs
+
+    def save(self, records: dict[str, dict[str, Any]]) -> None:
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            document["tools"] = records
+            atomic_write_json(self.path, document)
+
+    def upsert_server(self, record: dict[str, Any]) -> None:
+        server_id = str(record.get("server_config_id", "")).strip()
+        if not server_id:
+            raise ValueError("server_config_id required")
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            document["servers"][server_id] = record
+            atomic_write_json(self.path, document)
+
+    def remove_server(self, server_id: str) -> bool:
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            removed = document["servers"].pop(server_id, None) is not None
+            for record in document["tools"].values():
+                if record.get("server_config_id") == server_id:
+                    record["is_tombstoned"] = True
+                    record["classification"] = ""
+                    record["argument_egress"] = "taint_gated"
+            atomic_write_json(self.path, document)
+            return removed
+
+    def update_tool_policy(
+        self,
+        tool_id: str,
+        *,
+        classification: str,
+        argument_egress: str,
+        expected_config_digest: str,
+        expected_schema_digest: str,
+    ) -> dict[str, Any]:
+        if classification not in {"open", "resource_scoped", "admin_required"}:
+            raise ValueError("invalid authorization tier")
+        if argument_egress not in {"allowed", "taint_gated"}:
+            raise ValueError("invalid argument_egress")
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            record = document["tools"].get(tool_id)
+            if record is None or record.get("is_tombstoned"):
+                raise KeyError(tool_id)
+            if (
+                record.get("config_digest") != expected_config_digest
+                or record.get("schema_digest") != expected_schema_digest
+            ):
+                raise RuntimeError("tool provenance changed; rediscover before approving")
+            server_id = str(record.get("server_config_id", ""))
+            server = document["servers"].get(server_id)
+            if server is None:
+                raise KeyError(server_id)
+            policy_version = str(server.get("policy_version") or UI_MCP_POLICY_VERSION)
+            adapter_name = f"mimir-ui-{server_id}"
+            record.update({
+                "classification": classification,
+                "adapter_name": adapter_name,
+                "adapter_version": "1",
+                "approval_version": str(uuid.uuid4()),
+                "policy_version": policy_version,
+                "argument_egress": argument_egress,
+            })
+            atomic_write_json(self.path, document)
+            return dict(record)
+
+
+def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[str, Any]:
+    return {
+        "tool_id": provenance.tool_id,
+        "server_config_id": provenance.server_config_id,
+        "transport_type": provenance.transport_type,
+        "endpoint_identity": provenance.endpoint_identity,
+        "config_digest": provenance.config_digest,
+        "schema_digest": provenance.schema_digest,
+        "original_tool_name": provenance.original_tool_name,
+        "display_name": tool.name,
+        "classification": provenance.classification,
+        "adapter_name": provenance.adapter_name,
+        "adapter_version": provenance.adapter_version,
+        "approval_version": provenance.approval_version,
+        "policy_version": provenance.policy_version,
+        "argument_egress": provenance.argument_egress,
+        "is_tombstoned": provenance.is_tombstoned,
+    }
+
+
+class MCPManager:
+    """Lifecycle owner for all MCP server connections.
+
+    Each connection owns its own ``AsyncExitStack``. The SDK's AnyIO
+    cancel scopes must be exited in the task that entered them, in
+    reverse order; teardown is bounded per connection.
+    """
+
+    def __init__(
+        self,
+        *,
+        initialize_timeout_s: float = DEFAULT_MCP_INITIALIZE_TIMEOUT_S,
+        call_timeout_s: float = DEFAULT_MCP_CALL_TIMEOUT_S,
+        shutdown_timeout_s: float = DEFAULT_MCP_SHUTDOWN_TIMEOUT_S,
+        policy_store_path: Path | None = None,
+    ) -> None:
+        self.connections: list[MCPConnection] = []
+        self._init_timeout = initialize_timeout_s
+        self._call_timeout = call_timeout_s
+        self._shutdown_timeout = shutdown_timeout_s
+        self._policy_store = MCPPolicyStore(policy_store_path) if policy_store_path else None
+        self.policy_records: dict[str, dict[str, Any]] = {}
+        self.startup_failures: list[dict[str, str]] = []
+        self._owner_task: asyncio.Task[None] | None = None
+        self._stop_event: asyncio.Event | None = None
+
+    def _validate_identities(
+        self,
+        configs: list[MCPServerConfig],
+        records: dict[str, dict[str, Any]],
+    ) -> None:
+        seen: dict[str, MCPServerConfig] = {}
+        for config in configs:
+            prior = seen.get(config.server_config_id)
+            if prior is not None:
+                raise ValueError(
+                    "duplicate MCP server_config_id "
+                    f"{config.server_config_id!r} for {prior.name!r} and {config.name!r}"
+                )
+            seen[config.server_config_id] = config
+            endpoints = {
+                str(record.get("endpoint_identity", ""))
+                for record in records.values()
+                if record.get("server_config_id") == config.server_config_id
+            }
+            if endpoints and endpoints != {config.name}:
+                raise ValueError(
+                    f"MCP server_config_id {config.server_config_id!r} endpoint mismatch"
+                )
+
+    @staticmethod
+    def _apply_stored_policies(
+        configs: list[MCPServerConfig],
+        records: dict[str, dict[str, Any]],
+    ) -> list[MCPServerConfig]:
+        """Attach only complete records belonging to the current immutable server."""
+        resolved: list[MCPServerConfig] = []
+        for config in configs:
+            policies = list(config.tool_policies)
+            configured_names = {policy.tool_name for policy in policies}
+            for record in records.values():
+                if (
+                    record.get("server_config_id") != config.server_config_id
+                    or record.get("is_tombstoned")
+                    or record.get("original_tool_name") in configured_names
+                ):
+                    continue
+                try:
+                    policies.append(MCPToolPolicy.from_dict(record))
+                except (TypeError, ValueError):
+                    # Discovery-only and partially approved records remain fail-closed.
+                    continue
+            resolved.append(replace(config, tool_policies=tuple(policies)))
+        return resolved
+
+    async def start_servers(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool = False,
+    ) -> list[StructuredTool]:
+        """Start every configured server, bridge their tools, return flat list.
+
+        Detects ``mcp_{server}_{tool}`` namespaced-name collisions
+        across servers and rejects the ambiguous tool set. Two
+        servers can legitimately share a tool name as long as the
+        server names differ; collision only happens when an operator
+        configures the same server name twice or when underscore-laden
+        tool names happen to produce the same namespaced string.
+        """
+        if self._owner_task is not None and not self._owner_task.done():
+            raise RuntimeError("MCP servers already started; shut down before restarting")
+        ready: asyncio.Future[list[StructuredTool]] = asyncio.get_running_loop().create_future()
+        stop = asyncio.Event()
+        self._stop_event = stop
+        self._owner_task = asyncio.create_task(
+            self._own_servers(configs, fail_fast=fail_fast, ready=ready, stop=stop),
+            name="mcp-manager-owner",
+        )
+        try:
+            return await asyncio.shield(ready)
+        except BaseException:
+            stop.set()
+            # Startup cancellation must not strand a transport owner. Shield its
+            # teardown from the caller; all SDK contexts remain in that task.
+            await asyncio.shield(self._owner_task)
+            if ready.done() and not ready.cancelled():
+                ready.exception()
+            raise
+
+    async def _own_servers(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool,
+        ready: asyncio.Future[list[StructuredTool]],
+        stop: asyncio.Event,
+    ) -> None:
+        """Enter and exit every SDK context in one dedicated, long-lived task."""
+        try:
+            tools = await self._start_servers_owned(configs, fail_fast=fail_fast)
+            ready.set_result(tools)
+            await stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError):
+                log.exception("MCP owner task failed")
+        finally:
+            await self._close_connections()
+
+    async def _start_servers_owned(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool,
+    ) -> list[StructuredTool]:
+        self.startup_failures = []
+        records = self._policy_store.load() if self._policy_store else {}
+        configs = self._apply_stored_policies(configs, records)
+        self._validate_identities(configs, records)
+        register_configured_mcp_adapters(configs)
+        all_tools: list[StructuredTool] = []
+        successful_config_ids: set[str] = set()
+        display_names: set[str] = set()
+        for config in configs:
+            try:
+                conn = await self._connect(config)
+                # Retain ownership even if discovery or acceptance fails.
+                self.connections.append(conn)
+                tools = await conn.discover_tools(
+                    call_timeout_s=self._call_timeout,
+                    server_config_id=config.server_config_id or None,
+                )
+                server_names: set[str] = set()
+                for tool in tools:
+                    if get_tool_provenance(tool) is None:
+                        raise ValueError(f"MCP tool {tool.name!r} is missing provenance")
+                    if tool.name in display_names or tool.name in server_names:
+                        raise ValueError(
+                            f"MCP display-name collision for {tool.name!r}; "
+                            "display names are not authoritative identities"
+                        )
+                    server_names.add(tool.name)
+                display_names.update(server_names)
+                successful_config_ids.add(config.server_config_id)
+                all_tools.extend(tools)
+                log.info(
+                    "MCP server connected: name=%s tools=%s",
+                    config.name, [tool.name for tool in tools],
+                )
+            except asyncio.TimeoutError:
+                self.startup_failures.append({
+                    "server_config_id": config.server_config_id,
+                    "server_name": config.name,
+                    "error": f"initialize timed out after {self._init_timeout:.1f}s",
+                })
+                log.warning(
+                    "MCP server '%s' initialize timed out after %.1fs",
+                    config.name, self._init_timeout,
+                )
+                if fail_fast:
+                    raise
+            except Exception as exc:
+                self.startup_failures.append({
+                    "server_config_id": config.server_config_id,
+                    "server_name": config.name,
+                    "error": str(exc),
+                })
+                # Don't block startup — log + skip so the agent still
+                # boots with native tools + the MCP servers that worked.
+                log.warning(
+                    "MCP server '%s' failed to start: %s", config.name, exc,
+                )
+                if fail_fast:
+                    raise
+        for tool in all_tools:
+            provenance = get_tool_provenance(tool)
+            assert provenance is not None
+            _tool_provenance_registry.setdefault(provenance.tool_id, provenance)
+
+        if self._policy_store:
+            configured_ids = {config.server_config_id for config in configs}
+            for record in records.values():
+                server_id = str(record.get("server_config_id", ""))
+                if server_id not in configured_ids or server_id in successful_config_ids:
+                    record["is_tombstoned"] = True
+            for tool in all_tools:
+                provenance = get_tool_provenance(tool)
+                assert provenance is not None
+                records[provenance.tool_id] = _provenance_record(tool, provenance)
+            self._policy_store.save(records)
+        self.policy_records = records
+        return all_tools
+
+    async def _connect(self, config: MCPServerConfig) -> MCPConnection:
+        """Start one MCP server subprocess and complete the handshake.
+
+        Each connection gets its own ``AsyncExitStack`` so a hang on
+        teardown of one server doesn't block any other server's
+        teardown. ``session.initialize`` is bounded by
+        ``initialize_timeout_s`` to fail loud on a misbehaving server
+        instead of stalling _on_startup forever.
+        """
+        server_params = StdioServerParameters(
+            command=config.command, args=config.args, env=config.env,
+        )
+        stack = AsyncExitStack()
+        try:
+            transport = await stack.enter_async_context(stdio_client(server_params))
+            read_stream, write_stream = transport
+            session = await stack.enter_async_context(
+                ClientSession(read_stream, write_stream),
+            )
+            await asyncio.wait_for(
+                session.initialize(), timeout=self._init_timeout,
+            )
+            return MCPConnection(config=config, session=session, exit_stack=stack)
+        except BaseException:
+            # If anything in the connect path fails, tear THIS server's
+            # stack down before re-raising so we don't leak the
+            # subprocess.
+            await stack.aclose()
+            raise
+
+    async def shutdown(self) -> None:
+        """Signal the transport owner and await teardown from any caller task."""
+        owner = self._owner_task
+        if owner is None:
+            return
+        assert self._stop_event is not None
+        self._stop_event.set()
+        # Do not move SDK context exits to this task, or propagate caller
+        # cancellation into the owner's AnyIO scopes during teardown.
+        await asyncio.shield(owner)
+
+    async def _close_connections(self) -> None:
+        """Close in reverse order inside the owner, bounded per connection."""
+        if not self.connections:
+            return
+        try:
+            for conn in reversed(self.connections):
+                try:
+                    async with asyncio.timeout(self._shutdown_timeout):
+                        await conn.exit_stack.aclose()
+                except TimeoutError:
+                    log.warning(
+                        "MCP server '%s' shutdown exceeded %.1fs",
+                        conn.config.name, self._shutdown_timeout,
+                    )
+                except Exception:
+                    log.exception("MCP server '%s' shutdown failed", conn.config.name)
+        finally:
+            self.connections.clear()
+
+
+_JSON_TYPE_MAP: dict[str, type] = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+
+
+def _python_type_for_schema(prop: dict[str, Any]) -> type:
+    """Best-effort JSON Schema → Python type for pydantic.create_model.
+
+    Handles primitives + the common ``["string","null"]`` union pattern.
+    Anything more exotic (anyOf/oneOf with multiple non-null branches,
+    enums, nested object schemas) falls back to ``Any`` so the tool
+    stays callable; the JSON Schema can still drive prose validation
+    via the description block.
+    """
+    schema_type = prop.get("type")
+    if isinstance(schema_type, list):
+        non_null = [t for t in schema_type if t != "null"]
+        if len(non_null) == 1:
+            return _JSON_TYPE_MAP.get(non_null[0], Any)  # type: ignore[arg-type]
+        return Any  # type: ignore[return-value]
+    if isinstance(schema_type, str):
+        return _JSON_TYPE_MAP.get(schema_type, Any)  # type: ignore[return-value]
+    return Any  # type: ignore[return-value]
+
+
+def _build_args_schema(
+    namespaced_name: str, input_schema: dict[str, Any]
+) -> Any:
+    """Build a pydantic BaseModel class from the remote JSON schema.
+
+    Pre-fix the schema was dumped into the description string and the
+    model got no typed validation. With ``args_schema=`` on the
+    StructuredTool, LangChain/LangGraph enforces required fields +
+    primitive coercion at call time, and surfaces the exact required
+    field list to the model in the tool-spec.
+
+    Returns ``None`` when the schema has no usable ``properties`` (the
+    StructuredTool then accepts arbitrary kwargs like before).
+    """
+    properties = input_schema.get("properties") or {}
+    if not isinstance(properties, dict) or not properties:
+        return None
+    required_fields = set(input_schema.get("required") or [])
+    fields: dict[str, Any] = {}
+    for prop_name, prop_info in properties.items():
+        if not isinstance(prop_info, dict):
+            continue
+        py_type = _python_type_for_schema(prop_info)
+        prop_desc = prop_info.get("description", "")
+        if prop_name in required_fields:
+            fields[prop_name] = (py_type, Field(..., description=prop_desc))
+        else:
+            default = prop_info.get("default", None)
+            fields[prop_name] = (
+                py_type | None if py_type is not Any else Any,  # type: ignore[operator]
+                Field(default=default, description=prop_desc),
+            )
+    try:
+        # The model name affects pydantic's repr + validation error
+        # paths; namespacing it on the tool name keeps multiple bridged
+        # MCP tools from sharing a class.
+        return create_model(f"{namespaced_name}_args", **fields)
+    except Exception:  # noqa: BLE001 — pydantic may reject exotic schemas
+        log.debug(
+            "args_schema build failed for %s; falling back to schema-in-description",
+            namespaced_name,
+        )
+        return None
+
+
+def _bridge_mcp_tool(
+    *,
+    server_name: str,
+    tool_name: str,
+    description: str,
+    input_schema: dict[str, Any],
+    session: ClientSession,
+    call_timeout_s: float = DEFAULT_MCP_CALL_TIMEOUT_S,
+    provenance: MCPProvenance | None = None,
+) -> StructuredTool:
+    """Wrap one MCP tool as a LangChain StructuredTool.
+
+    Tool name is namespaced ``mcp_{server}_{tool}`` so collisions with
+    mimir built-ins or other MCP servers are impossible. The remote
+    JSON Schema is converted to a pydantic ``args_schema`` where
+    possible — LangChain enforces required-field presence + primitive
+    coercion at call time. Falls back to schema-in-description when
+    the JSON schema uses constructs pydantic can't accept (nested
+    object schemas, complex anyOf unions, $ref).
+
+    Provenance is attached as a custom attribute for drift detection
+    and authorization (chainlink #870).
+    """
+    namespaced_name = _validated_mcp_name(server_name, tool_name)
+    original_description = description
+    description = _bounded_mcp_description(description, MAX_MCP_DESCRIPTION_LENGTH)
+    properties = input_schema.get("properties", {})
+    bounded_properties = {}
+    field_budget = MAX_MCP_DESCRIPTION_LENGTH
+    changed_fields = 0
+    for prop_name, prop_info in properties.items():
+        prop_info = dict(prop_info)
+        original = prop_info.get("description", "")
+        bounded = _bounded_mcp_description(original, field_budget)
+        field_budget -= len(bounded)
+        if bounded != original:
+            changed_fields += 1
+        if "description" in prop_info:
+            prop_info["description"] = bounded
+        bounded_properties[prop_name] = prop_info
+    input_schema = {**input_schema, "properties": bounded_properties}
+    properties = bounded_properties
+    required_fields = set(input_schema.get("required", []))
+    schema_desc_parts: list[str] = []
+    for prop_name, prop_info in properties.items():
+        prop_type = prop_info.get("type", "string")
+        prop_desc = prop_info.get("description", "")
+        req = " (required)" if prop_name in required_fields else ""
+        schema_desc_parts.append(f"  {prop_name} ({prop_type}{req}): {prop_desc}")
+    full_description = (
+        f"{description}\n\nParameters:\n" + "\n".join(schema_desc_parts)
+        if schema_desc_parts
+        else description
+    )
+    bounded_description = _bounded_mcp_description(full_description, MAX_MCP_DESCRIPTION_LENGTH)
+    if (description != original_description or bounded_description != full_description or changed_fields):
+        log_event_sync(
+            "mcp_tool_description_bounded", server_name=server_name,
+            tool_name=tool_name, limit=MAX_MCP_DESCRIPTION_LENGTH,
+            description_changed=(description != original_description or bounded_description != full_description),
+            schema_descriptions_changed=changed_fields,
+        )
+    full_description = bounded_description
+    args_schema = _build_args_schema(namespaced_name, input_schema)
+
+    async def _call_mcp_tool(**kwargs: Any) -> str:
+        try:
+            result = await asyncio.wait_for(
+                session.call_tool(
+                    tool_name, kwargs if kwargs else None, allow_input_required=True,
+                ),
+                timeout=call_timeout_s,
+            )
+            if isinstance(result, InputRequiredResult):
+                raise ToolException(
+                    f"MCP tool '{tool_name}' requested interactive input, which mimir does not support"
+                )
+            if result.is_error:
+                text_parts = [c.text for c in result.content if hasattr(c, "text")]
+                error_text = "\n".join(text_parts) if text_parts else "Unknown error"
+                raise ToolException(f"MCP tool '{tool_name}' returned error: {error_text}")
+            parts: list[str] = []
+            has_text = False
+            for content in result.content:
+                if hasattr(content, "text"):
+                    parts.append(content.text)
+                    has_text = True
+                elif hasattr(content, "data"):
+                    parts.append(f"[{content.mime_type} data]")
+                else:
+                    parts.append(json.dumps(content.model_dump(), default=str))
+            if not has_text and result.structured_content is not None:
+                parts.append(json.dumps(result.structured_content, default=str))
+            return "\n".join(parts) if parts else "(empty result)"
+        except asyncio.TimeoutError as exc:
+            raise ToolException(
+                f"MCP tool '{tool_name}' timed out after {call_timeout_s}s"
+            ) from exc
+        except ToolException:
+            raise
+        except Exception as exc:
+            raise ToolException(f"MCP tool '{tool_name}' failed: {exc}") from exc
+
+    kwargs: dict[str, Any] = {
+        "coroutine": _call_mcp_tool,
+        "name": namespaced_name,
+        "description": full_description,
+        "handle_tool_error": True,
+    }
+    if args_schema is not None:
+        kwargs["args_schema"] = args_schema
+    tool = StructuredTool.from_function(**kwargs)
+    if provenance is not None:
+        object.__setattr__(tool, "mcp_provenance", provenance)
+        object.__setattr__(tool, "mcp_tool_id", provenance.tool_id)
+    return tool
+
+
+def parse_mcp_server_configs(raw: Any) -> list[MCPServerConfig]:
+    """Parse a list (or Claude Desktop dict) of server configs.
+
+    Three accepted shapes:
+
+    * Bare list: ``[{"name": "a", "command": "x"}, ...]``
+    * Wrapped list: ``{"mcpServers": [...]}``  /  ``{"mcp_servers": [...]}``
+    * **Claude Desktop dict**: ``{"mcpServers": {"a": {"command": "x"}}}``
+
+    Pre-fix only the first two were accepted; Claude's actual format
+    (third shape) silently produced zero servers and operators copying
+    a working ``claude_desktop_config.json`` got no MCP wiring with no
+    warning. Now both list and dict shapes work and the dict's keys
+    are injected as the ``name`` field. Bad entries are skipped with
+    a warning rather than raised.
+    """
+    # Unwrap the {"mcpServers": ...} envelope before deciding shape.
+    if isinstance(raw, dict):
+        raw = raw.get("mcpServers") or raw.get("mcp_servers") or raw
+
+    configs: list[MCPServerConfig] = []
+
+    if isinstance(raw, dict):
+        # Claude Desktop dict shape: name is the key, body is the value.
+        for name, body in raw.items():
+            if not isinstance(body, dict):
+                log.warning(
+                    "Skipping MCP server %r: body is not a dict (got %s)",
+                    name, type(body).__name__,
+                )
+                continue
+            try:
+                configs.append(MCPServerConfig.from_dict(body, name_override=name))
+            except ValueError as exc:
+                log.warning("Skipping invalid MCP server %r: %s", name, exc)
+        return configs
+
+    if not isinstance(raw, list):
+        return []
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            configs.append(MCPServerConfig.from_dict(item))
+        except ValueError as exc:
+            log.warning("Skipping invalid MCP server config: %s", exc)
+    return configs
+
+
+def load_mcp_server_configs(*, json_inline: str | None, json_path: str | None) -> list[MCPServerConfig]:
+    """Build the configured server list from the two env-driven sources.
+
+    Inline ``MIMIR_MCP_SERVERS_JSON`` wins if both are set. If neither
+    is set or the JSON is malformed, returns an empty list — MCP is
+    opt-in and a missing config means "no MCP servers."
+    """
+    raw: Any = None
+    if json_inline:
+        try:
+            raw = json.loads(json_inline)
+        except json.JSONDecodeError as exc:
+            log.warning("MIMIR_MCP_SERVERS_JSON failed to parse: %s", exc)
+            return []
+    elif json_path:
+        path = Path(json_path).expanduser()
+        if not path.is_file():
+            log.warning("MIMIR_MCP_SERVERS_PATH does not exist: %s", path)
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            log.warning("MCP config %s failed to parse: %s", path, exc)
+            return []
+    if raw is None:
+        return []
+    return parse_mcp_server_configs(raw)
+
+
+_tool_provenance_registry: dict[str, MCPProvenance] = {}
+
+
+def clear_provenance_registry() -> None:
+    """Clear the provenance registry. Used by tests."""
+    global _tool_provenance_registry
+    _tool_provenance_registry.clear()
+
+
+def get_tool_provenance(tool: Any) -> MCPProvenance | None:
+    """Extract provenance from an MCP tool wrapper, if present."""
+    provenance = getattr(tool, "mcp_provenance", None)
+    if provenance is not None:
+        return provenance
+    tool_id = getattr(tool, "mcp_tool_id", "")
+    return _tool_provenance_registry.get(tool_id)
+
+
+def check_tool_drift(
+    tool: Any,
+    config: MCPServerConfig,
+    tool_name: str,
+    input_schema: dict[str, Any],
+) -> MCPProvenance | None:
+    """Check for drift between current tool state and original provenance.
+
+    Returns a new provenance record with is_tombstoned=True if drift is detected.
+    Returns None if the tool has no provenance (not an MCP tool).
+    """
+    provenance = get_tool_provenance(tool)
+    if provenance is None:
+        return None
+
+    return provenance.with_drift_detection(
+        config=config,
+        tool_name=tool_name,
+        input_schema=input_schema,
+    )
+
+
+@dataclass(frozen=True)
+class MCPAuthorizationRequest:
+    """Exact validated MCP invocation presented to an adapter."""
+
+    tool_name: str
+    arguments: dict[str, Any]
+    auth_context: Any
+    provenance: MCPProvenance
+
+
+@dataclass(frozen=True)
+class MCPAuthorizationResult:
+    """Structured adapter result; protected resources require ``allowed``."""
+
+    decision: Any
+    allowed: bool
+    reason: str | None = None
+    resources: tuple[str, ...] = ()
+    source_resources: tuple[str, ...] = ()
+    sink_resources: tuple[str, ...] = ()
+
+
+MCPAdapterClassifier = Callable[[MCPAuthorizationRequest], MCPAuthorizationResult]
+
+
+@dataclass(frozen=True)
+class MCPAdapterRegistration:
+    """Registered classifier for tools carrying matching provenance."""
+
+    version: str
+    policy_version: str
+    classify: MCPAdapterClassifier
+    flow_direction: str = "unknown"
+    server_config_id: str = ""
+    server_name: str = ""
+    config_digest: str = ""
+    adapter_digest: str = ""
+    adapter_definition: tuple[tuple[str, str], ...] = ()
+
+
+def register_mcp_adapter(
+    adapter_name: str,
+    adapter_version: str,
+    policy_version: str,
+    classify: MCPAdapterClassifier,
+    *,
+    flow_direction: str = "unknown",
+    server_config_id: str = "",
+    server_name: str = "",
+    config_digest: str = "",
+    adapter_digest: str = "",
+    adapter_definition: tuple[tuple[str, str], ...] = (),
+) -> None:
+    """Register a classifier for MCP tools carrying ``adapter_name`` provenance."""
+    if not callable(classify):
+        raise TypeError("MCP adapter classifier must be callable")
+    if flow_direction not in {"source", "sink", "both", "neither", "unknown"}:
+        raise ValueError(f"invalid MCP adapter flow direction: {flow_direction}")
+    _global_mcp_adapter_registry[adapter_name] = MCPAdapterRegistration(
+        version=adapter_version,
+        policy_version=policy_version,
+        classify=classify,
+        flow_direction=flow_direction,
+        server_config_id=server_config_id,
+        server_name=server_name,
+        config_digest=config_digest,
+        adapter_digest=adapter_digest,
+        adapter_definition=adapter_definition,
+    )
+
+
+def get_mcp_adapter_info(adapter_name: str) -> MCPAdapterRegistration | None:
+    """Get a registered MCP classifier by provenance adapter name."""
+    return _global_mcp_adapter_registry.get(adapter_name)
+
+
+def clear_mcp_adapter_registry() -> None:
+    """Clear registered MCP classifiers. Used by tests."""
+    _global_mcp_adapter_registry.clear()
+
+
+_global_mcp_adapter_registry: dict[str, MCPAdapterRegistration] = {}
+
+
+def _configured_resource_classifier(
+    config: MCPAdapterConfig,
+) -> MCPAdapterClassifier:
+    """Build a strict same-owner scalar-resource classifier."""
+    def classify(request: MCPAuthorizationRequest) -> MCPAuthorizationResult:
+        from .access_control import OperationDecision
+
+        decision = OperationDecision(request.provenance.classification)
+        if decision is not OperationDecision.RESOURCE_SCOPED:
+            roles = getattr(request.auth_context, "roles", ()) or ()
+            allowed = (
+                decision is OperationDecision.OPEN
+                or (decision is OperationDecision.ADMIN_REQUIRED and "admin" in roles)
+            )
+            return MCPAuthorizationResult(
+                decision=decision,
+                allowed=allowed,
+                reason=(
+                    None
+                    if allowed
+                    else "admin_required"
+                ),
+            )
+
+        arguments = request.arguments
+        resource = arguments.get(config.resource_argument) if config.resource_argument else None
+        owner = arguments.get(config.owner_argument) if config.owner_argument else None
+        principal = getattr(request.auth_context, "canonical_principal", None)
+        if not isinstance(resource, str) or not resource.strip():
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_resource_unknown")
+        resource = resource.strip()
+        if any(char in resource for char in ("*", "?", "[", "]")):
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_resource_wildcard")
+        if not isinstance(owner, str) or not owner.strip() or not isinstance(principal, str):
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_owner_unknown")
+        if owner.strip() != principal:
+            return MCPAuthorizationResult(decision=decision, allowed=False, reason="mcp_wrong_owner")
+        resources = (resource,)
+        flow_direction = config.flow_direction
+        return MCPAuthorizationResult(
+            decision=decision,
+            allowed=True,
+            resources=resources,
+            source_resources=resources if flow_direction in {"source", "both"} else (),
+            sink_resources=resources if flow_direction in {"sink", "both"} else (),
+        )
+    return classify
+
+
+def register_configured_mcp_adapters(configs: list[MCPServerConfig]) -> None:
+    """Register only explicit operator-configured adapter definitions."""
+    for server in configs:
+        for adapter in server.adapters:
+            adapter_definition = {
+                "name": adapter.name,
+                "version": adapter.version,
+                "policy_version": adapter.policy_version,
+                "resource_argument": adapter.resource_argument,
+                "owner_argument": adapter.owner_argument,
+                "flow_direction": adapter.flow_direction,
+            }
+            config_digest = _canonical_config_digest(server)
+            adapter_digest = _schema_digest(adapter_definition)
+            existing = get_mcp_adapter_info(adapter.name)
+            if existing is not None:
+                identity = (
+                    server.server_config_id,
+                    config_digest,
+                    adapter_digest,
+                )
+                existing_identity = (
+                    existing.server_config_id,
+                    existing.config_digest,
+                    existing.adapter_digest,
+                )
+                if identity == existing_identity:
+                    continue
+
+                existing_definition = dict(existing.adapter_definition)
+                differing_fields = [
+                    field for field, value in adapter_definition.items()
+                    if existing_definition.get(field) != value
+                ]
+                if existing.server_config_id != server.server_config_id:
+                    differing_fields.insert(0, "server_config_id")
+                if existing.config_digest != config_digest:
+                    differing_fields.insert(0, "server_config")
+                if not existing.adapter_definition:
+                    differing_fields.append("registration_source")
+                fields = ", ".join(dict.fromkeys(differing_fields))
+                raise ValueError(
+                    f"duplicate MCP adapter name {adapter.name!r} for server configurations "
+                    f"{existing.server_config_id or '<unconfigured>'!r} "
+                    f"({existing.server_name or '<unconfigured>'!r}) and "
+                    f"{server.server_config_id!r} ({server.name!r}); "
+                    f"differing fields: {fields}"
+                )
+            register_mcp_adapter(
+                adapter.name,
+                adapter.version,
+                adapter.policy_version,
+                _configured_resource_classifier(adapter),
+                flow_direction=adapter.flow_direction,
+                server_config_id=server.server_config_id,
+                server_name=server.name,
+                config_digest=config_digest,
+                adapter_digest=adapter_digest,
+                adapter_definition=tuple(sorted(adapter_definition.items())),
+            )
+
+
+def validate_mcp_policy(tools: list[Any]) -> list[dict[str, Any]]:
+    """Return redacted actionable startup policy issues."""
+    issues: list[dict[str, Any]] = []
+    for tool in tools:
+        provenance = get_tool_provenance(tool)
+        if provenance is None:
+            continue
+        reason = None
+        if provenance.is_tombstoned:
+            reason = "drift"
+        elif not provenance.classification:
+            reason = "unclassified"
+        elif not provenance.adapter_name:
+            reason = "missing_adapter"
+        elif get_mcp_adapter_info(provenance.adapter_name) is None:
+            reason = "unregistered_adapter"
+        if reason:
+            issues.append({
+                "reason": reason,
+                "server_config_id": provenance.server_config_id,
+                "original_tool_name": provenance.original_tool_name,
+                "adapter_name": provenance.adapter_name or None,
+                "policy_version": provenance.policy_version or None,
+            })
+    return issues
+
+
+def check_stale_policy_on_startup(
+    tools: list[Any],
+    expected_policy_version: str,
+) -> list[dict[str, Any]]:
+    """Check for tools with stale policy versions on startup.
+
+    Returns a list of tools that have a different policy version than expected.
+    This allows administrators to identify tools that need re-approval.
+    """
+    stale_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        provenance = get_tool_provenance(tool)
+        if provenance is None:
+            continue
+        if provenance.policy_version and provenance.policy_version != expected_policy_version:
+            stale_tools.append({
+                "tool_name": tool.name,
+                "expected_policy": expected_policy_version,
+                "actual_policy": provenance.policy_version,
+                "original_tool_name": provenance.original_tool_name,
+                "server_config_id": provenance.server_config_id,
+            })
+    return stale_tools

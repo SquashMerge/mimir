@@ -1,0 +1,446 @@
+"""events.jsonl firehose writer (SPEC §10.1).
+
+Append-only, lock-serialized. Writers all over the process call into the
+module-level singleton via ``log_event(event_type, **payload)``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import json
+import logging
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Final, TextIO
+
+from ._jsonl_tail import _tail_lines, count_lines_chunked
+from .redaction import redact_payload
+from .background_io import run_in_pool
+
+log = logging.getLogger(__name__)
+
+_EVENT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="event-log")
+_background_event_tasks: set[asyncio.Task[Any]] = set()
+
+FEEDBACK_EVENT_VERSION: Final[str] = "v1"
+PROCESS_LOCK_TIMEOUT_SECONDS = 1.0
+PROCESS_LOCK_POLL_SECONDS = 0.01
+
+# One FIFO writer, separate from asyncio's pool: a contended flock must not
+# starve unrelated to_thread work. Admission includes the in-flight record.
+SYNC_QUEUE_CAPACITY = 1024
+_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="event-logger")
+_SYNC_SLOTS = threading.BoundedSemaphore(SYNC_QUEUE_CAPACITY)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+class EventLogger:
+    def __init__(
+        self,
+        path: Path,
+        session_id: str,
+        max_events: int | None = None,
+        *,
+        agent_id: str | None = None,
+    ) -> None:
+        self._path = path
+        self._session_id = session_id
+        # Stamped on every event record below. ``None`` keeps the
+        # pre-existing record shape (the key is omitted), so the
+        # turn-viewer's existing schema-tolerance covers operators
+        # who haven't set MIMIR_AGENT_ID.
+        self._agent_id = agent_id
+        self._max_events = max_events
+        # A sibling lock remains stable while events.jsonl is atomically
+        # replaced. Locking the events file itself would protect the old inode,
+        # not the new path, after trim's rename.
+        self._process_lock_path = Path(f"{path}.lock")
+        self._lock: asyncio.Lock | None = None
+        # chainlink #393: serialize the SYNC file mutators that can run on
+        # different threads — log_sync (loop thread) and _trim_sync (worker
+        # thread, via to_thread). Without it, a log_sync append could land on
+        # the old inode in the window between _trim_sync's tail-read and its
+        # tmp.rename(), losing that record, and _line_count drifts (loop +=1 vs
+        # worker =len(kept)). A threading.Lock, NOT the asyncio lock, because
+        # _trim_sync runs off-loop. (The async log() path is already serialized
+        # by the asyncio lock and awaits its own _trim, so it never races.)
+        self._io_lock = threading.Lock()
+        self._line_count = 0
+        self._dir_ready = False
+        self.dropped_sync_records = 0
+        self._reported_sync_drops = 0
+
+        self._ensure_dir(force=True)
+        # CR2-#6: pre-2026-05-10 this read the entire file via
+        # ``read_text()`` then ``splitlines()``. events.jsonl is bounded
+        # at ~300 MB (750k events × ~400 B); every process start paid
+        # multi-hundred-MB memory + GC churn for a single integer.
+        # ``count_lines_chunked`` reads in 64 KB chunks and counts ``\n``
+        # bytes — O(1) memory.
+        self._line_count = count_lines_chunked(path)
+
+    def _ensure_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def _acquire_process_lock(self, operation: str) -> TextIO | None:
+        """Take the events-file process lock without blocking indefinitely.
+
+        A stuck holder must not wedge an agent turn. After one second, appends
+        continue best-effort and trims are skipped by their caller. Both cases
+        emit a warning so the degraded serialization is observable.
+        """
+        handle = self._process_lock_path.open("a", encoding="utf-8")
+        deadline = time.monotonic() + PROCESS_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    handle.close()
+                    log.warning(
+                        "events.jsonl process lock timed out after %.1fs; %s",
+                        PROCESS_LOCK_TIMEOUT_SECONDS,
+                        operation,
+                    )
+                    return None
+                time.sleep(min(PROCESS_LOCK_POLL_SECONDS, remaining))
+
+    @staticmethod
+    def _release_process_lock(handle: TextIO | None) -> None:
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def _ensure_dir(self, *, force: bool = False) -> None:
+        """Ensure the parent directory exists without a per-event mkdir.
+
+        The hot path trusts the directory created during initialization. If an
+        out-of-band cleanup removes it, the append helper forces a one-shot
+        recreation after the first ``FileNotFoundError``.
+        """
+        if self._dir_ready and not force:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._dir_ready = True
+        except OSError as exc:
+            self._dir_ready = False
+            log.warning("events.jsonl mkdir failed: %s", exc)
+
+    def _append_record_sync(
+        self, record: dict[str, Any], *, durable: bool = False,
+    ) -> None:
+        """Append a pre-built record using synchronous file IO.
+
+        Called from ``log_sync`` on its dedicated worker and from ``log`` via
+        ``asyncio.to_thread`` so ordinary awaited event logging does not do
+        mkdir/open/write work on the event loop.
+        """
+        with self._io_lock:
+            for attempt in range(2):
+                self._ensure_dir(force=attempt > 0)
+                process_lock: TextIO | None = None
+                try:
+                    process_lock = self._acquire_process_lock(
+                        "failing durable append"
+                        if durable
+                        else "continuing with an unlocked append"
+                    )
+                    if durable and process_lock is None:
+                        # A trim holding the sibling-process lock may already have
+                        # snapshotted the old file. Appending without the lock could
+                        # fsync successfully and then be erased by trim's rename,
+                        # falsely reporting durability. Ordinary telemetry remains
+                        # best-effort; durability callers must see the failure.
+                        raise TimeoutError(
+                            "events.jsonl process lock timed out during durable append"
+                        )
+                    with self._path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+                        if durable:
+                            f.flush()
+                            os.fsync(f.fileno())
+                    if durable and hasattr(os, "O_DIRECTORY"):
+                        # A file fsync persists contents but not a potentially new
+                        # directory entry. Fsync the parent on every rare durable
+                        # append: an earlier non-durable append may have created the
+                        # file without making that name crash-durable.
+                        directory_fd = os.open(
+                            self._path.parent,
+                            os.O_RDONLY | os.O_DIRECTORY,
+                        )
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
+                    self._line_count += 1
+                    return
+                except FileNotFoundError:
+                    self._dir_ready = False
+                    if attempt == 0:
+                        continue
+                    raise
+                finally:
+                    self._release_process_lock(process_lock)
+
+    async def log(self, event_type: str, **payload: Any) -> None:
+        try:
+            # Capture occurrence time before either the logger lock or executor
+            # can delay us; recovery compares it with independently stamped state.
+            record = self._record_header(event_type)
+
+            def redact_and_append() -> None:
+                self._append_record_sync(self._record(event_type, payload, header=record))
+
+            async with self._ensure_lock():
+                await run_in_pool(_EVENT_POOL, redact_and_append)
+                # Hysteresis: trim only when over cap by ≥10%. Without the
+                # buffer, every event past the cap triggers an O(file)
+                # rewrite — a high-throughput agent under a small cap pays
+                # that cost on every event. The 10% margin means a
+                # 1000-cap log rewrites once per ~100 events instead.
+                if (
+                    self._max_events
+                    and self._line_count > self._max_events + max(self._max_events // 10, 1)
+                ):
+                    await self._trim()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("events.jsonl write failed: %s", exc)
+
+    def log_sync(self, event_type: str, **payload: Any) -> None:
+        """Enqueue best-effort telemetry without doing file IO on the loop.
+
+        The capacity try-lock never waits for a writer. Full queues drop the
+        newest record, counted in ``dropped_sync_records`` and reported by the
+        worker on its next write (not through a blocking loop-thread handler).
+        Non-loop callers retain synchronous completion. All accepted calls use
+        the same FIFO, so a later uncontended call cannot overtake queued work.
+        This is not the fsync/security contract of ``log_durable_sync``.
+        """
+        if not _SYNC_SLOTS.acquire(blocking=False):
+            self.dropped_sync_records += 1
+            return
+        try:
+            record = self._record(event_type, payload)
+
+            def append() -> None:
+                try:
+                    self._append_record_sync(record)
+                    dropped = self.dropped_sync_records
+                    if dropped != self._reported_sync_drops:
+                        log.warning(
+                            "events.jsonl sync queue overflow: %d records dropped total",
+                            dropped,
+                        )
+                        self._reported_sync_drops = dropped
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("events.jsonl sync write failed: %s", exc)
+                finally:
+                    _SYNC_SLOTS.release()
+
+            future = _SYNC_EXECUTOR.submit(append)
+        except Exception as exc:  # noqa: BLE001
+            _SYNC_SLOTS.release()
+            log.warning("events.jsonl sync write failed: %s", exc)
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            future.result()
+
+    def flush_sync(self) -> None:
+        """Wait for previously submitted sync writes; call only off-loop.
+
+        The shared executor is also joined at normal interpreter shutdown.
+        Abrupt termination can lose queued best-effort telemetry.
+        """
+        _SYNC_EXECUTOR.submit(lambda: None).result()
+
+    def log_durable_sync(self, event_type: str, **payload: Any) -> None:
+        """Append and fsync a security-sensitive event.
+
+        Unlike the best-effort telemetry APIs, failures propagate so the caller
+        can refuse the state transition that depends on this audit record.
+        Payload keys reserved for the record header are dropped with a warning.
+        """
+        record = self._record(event_type, payload)
+        self._append_record_sync(record, durable=True)
+
+    def _record(
+        self, event_type: str, payload: dict[str, Any],
+        *, header: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rec = self._record_header(event_type) if header is None else header
+        # Reserve optional agent_id even when absent; payload cannot assert identity.
+        collisions = payload.keys() & (rec.keys() | {"agent_id"})
+        if collisions:
+            log.warning(
+                "events.jsonl dropped payload keys colliding with reserved record-header fields: %s",
+                ", ".join(sorted(collisions)),
+            )
+        rec.update(redact_payload({k: v for k, v in payload.items() if k not in collisions}))
+        return rec
+
+    def _record_header(self, event_type: str) -> dict[str, Any]:
+        rec: dict[str, Any] = {
+            "timestamp": _utc_now_iso(),
+            "type": event_type,
+            "session_id": self._session_id,
+        }
+        if self._agent_id is not None:
+            rec["agent_id"] = self._agent_id
+        return rec
+
+    async def _trim(self) -> None:
+        # CR2-#6: tail-stream up to ``max_events`` records and rewrite,
+        # rather than reading the whole file into memory. Memory bound
+        # is O(max_events × avg_record_size); previously the read was
+        # unbounded relative to file size. Wrapped in ``to_thread``
+        # because the rewrite still does sync file IO and trim runs
+        # from inside ``EventLogger.log`` which is on the event loop.
+        if not self._max_events:
+            return
+        try:
+            await run_in_pool(_EVENT_POOL, self._trim_sync)
+        except OSError as exc:
+            log.warning("events.jsonl trim failed: %s", exc)
+
+    def _trim_sync(self) -> None:
+        # _io_lock covers this process's threads; the sibling flock covers
+        # detached Worklink processes that append to the same stream.
+        with self._io_lock:
+            process_lock = self._acquire_process_lock("skipping trim")
+            if process_lock is None:
+                return
+            try:
+                kept_reversed: list[str] = []
+                try:
+                    for line in _tail_lines(self._path):
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        kept_reversed.append(stripped)
+                        if len(kept_reversed) >= self._max_events:
+                            break
+                except OSError as exc:
+                    log.warning("events.jsonl trim tail-read failed: %s", exc)
+                    return
+                if not kept_reversed:
+                    return
+                # tail yields newest-first; reverse for chronological rewrite.
+                kept = list(reversed(kept_reversed))
+                tmp = self._path.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                tmp.rename(self._path)
+                self._line_count = len(kept)
+            finally:
+                self._release_process_lock(process_lock)
+
+
+_logger: EventLogger | None = None
+
+
+def init_logger(
+    path: Path,
+    session_id: str,
+    max_events: int | None = None,
+    *,
+    agent_id: str | None = None,
+) -> EventLogger:
+    global _logger
+    _logger = EventLogger(
+        path, session_id, max_events=max_events, agent_id=agent_id,
+    )
+    return _logger
+
+
+def get_logger() -> EventLogger:
+    if _logger is None:
+        raise RuntimeError("event_logger not initialized — call init_logger() at startup")
+    return _logger
+
+
+def get_events_path() -> Path | None:
+    """Path the singleton EventLogger writes events.jsonl to, or ``None``
+    if the logger isn't initialized yet. Read-side consumers (poller
+    failed-turn recovery, chainlink #262) use this to tail turn-outcome
+    events without threading the path through every call site."""
+    return _logger._path if _logger is not None else None
+
+
+async def log_event(event_type: str, **payload: Any) -> None:
+    await get_logger().log(event_type, **payload)
+
+
+def log_event_sync(event_type: str, **payload: Any) -> None:
+    """Best-effort sync API; loop callers enqueue rather than wait for file IO.
+
+    A bounded FIFO preserves accepted sync-call order. Overflow drops newest
+    and increments the logger's ``dropped_sync_records`` counter. The worker
+    retains both the thread lock and sibling flock discipline. Trimming remains
+    deferred to ``log_event``. Use ``log_durable_event_sync`` for fsync with
+    propagated failures, not this telemetry API.
+    """
+    get_logger().log_sync(event_type, **payload)
+
+
+def log_durable_event_sync(event_type: str, **payload: Any) -> None:
+    """Durably append a structured event or raise if it was not persisted."""
+    get_logger().log_durable_sync(event_type, **payload)
+
+
+def _reset_logger_for_tests() -> None:
+    """Reset the module-level logger singleton.
+
+    Only for use in unit tests — clears the ``_logger`` global so a test
+    that called ``init_logger`` doesn't pollute the next test's logger state.
+    Never call from production code.
+    """
+    global _logger
+    _logger = None
+
+
+async def safe_log_event(event_type: str, **payload: Any) -> None:
+    """Best-effort wrapper around ``log_event`` that swallows logger-side
+    failures so a misbehaving event sink never crashes the primary work path.
+
+    Use at monitoring call sites (algedonic gap fills, bridge supervisors)
+    where the ``log_event`` result is informational only.  Logs at DEBUG
+    level on failure.
+
+    Public (no leading underscore) — intended for cross-module use.
+    Bridge modules keep their own private ``_safe_log_event`` helpers
+    (``mimir/bridges/{slack,discord}.py``) for isolation reasons that
+    are documented in those files.
+    """
+    try:
+        await log_event(event_type, **payload)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("log_event %r failed: %s", event_type, exc)
+
+
+def emit_event_background(kind: str, **kwargs: Any) -> None:
+    """Schedule best-effort event logging, dropping when no loop is running."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.debug("event %s dropped: no running loop", kind)
+        return
+    task = loop.create_task(safe_log_event(kind, **kwargs))
+    _background_event_tasks.add(task)
+    task.add_done_callback(_background_event_tasks.discard)

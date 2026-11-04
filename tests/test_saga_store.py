@@ -1,0 +1,896 @@
+"""Smoke tests for mimir.saga.client.SagaStore — the
+SagaClient-compatible facade.
+
+Validates that the public API methods all run without error against
+a fresh in-memory DB. Does NOT validate retrieval quality (FAISS
+adapter is stubbed in v1; recall falls through to FTS-only for
+candidates). Quality validation comes during the LongMemEval bench
+port in tier 5 v2.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+from dataclasses import replace
+
+import pytest
+
+from mimir.models import AuthContext
+from mimir.saga.client import SagaStore, _query_embed_sync
+ADMIN_AUTH = AuthContext(
+    principal="test-admin",
+    canonical_principal="test-admin",
+    roles=("admin",),
+    event_ingress=None,
+    trigger="user_message",
+    channel_id="test-channel",
+    interactivity=None,
+)
+ADMIN_SCOPE = ADMIN_AUTH
+
+
+def _end_auth(session_id: str) -> AuthContext:
+    return replace(ADMIN_AUTH, saga_session_id=session_id)
+
+
+@pytest.fixture
+def client(tmp_path):
+    db_path = tmp_path / "mimir.saga.db"
+    c = SagaStore(db_path=db_path)
+    yield c
+
+
+def _patch_provider(monkeypatch, *, enable_session_boundary_rrf: bool = False):
+    """Replace saga.embeddings.get_provider with a deterministic stub
+    so tests don't need real voyage credentials.
+
+    Returns a 4-dim "embedding" derived from text hash. Not useful for
+    real retrieval; sufficient to exercise the embed → store → recall
+    pipeline.
+    """
+
+    class _StubProvider:
+        def embed(self, text, *, input_type="passage"):
+            # Built-in hash() is randomized per process and can occasionally
+            # produce an all-zero query vector, making retrieval tests flaky.
+            digest = hashlib.sha256(text.encode()).digest()
+            return [float(digest[i] % 17 + 1) for i in range(4)]
+
+        def dimensions(self):
+            return 4
+
+    def fake_get_provider():
+        return _StubProvider()
+
+    def fake_get_config():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+                (
+                    "retrieval",
+                    "enable_session_boundary_rrf",
+                ): enable_session_boundary_rrf,
+            }.get((section, key), default)
+
+        return cfg
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", fake_get_provider)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
+
+
+@pytest.mark.asyncio
+async def test_client_health_returns_true_on_fresh_db(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    ok = await client.health()
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_client_store_returns_atom_id(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    result = await client.store(
+        "Alice prefers concise replies",
+        stream="semantic",
+    )
+    assert result["stored"] is True
+    assert "atom_id" in result
+
+
+@pytest.mark.asyncio
+async def test_client_store_dedupes(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    r1 = await client.store("duplicate content")
+    r2 = await client.store("duplicate content")
+    assert r1["atom_id"] == r2["atom_id"]
+    assert r2["stored"] is False
+
+
+@pytest.mark.asyncio
+async def test_client_store_does_not_dedupe_same_content_across_owners(
+    client, monkeypatch,
+):
+    _patch_provider(monkeypatch)
+
+    alice = await client.store(
+        "shared content",
+        owner_principal="user:alice",
+        visibility="private",
+    )
+    bob = await client.store(
+        "shared content",
+        owner_principal="user:bob",
+        visibility="private",
+    )
+
+    assert alice["stored"] is True
+    assert bob["stored"] is True
+    assert alice["atom_id"] != bob["atom_id"]
+
+
+@pytest.mark.asyncio
+async def test_store_embedding_runs_outside_write_lock(client, monkeypatch):
+    """#602: slow provider embedding must not hold SagaStore's write lock."""
+    import time
+
+    _patch_provider(monkeypatch)
+    original_lock = client._write_lock
+    lock_acquired_at: list[float] = []
+    embed_started_at: list[float] = []
+
+    class _RecordingLock:
+        def acquire(self, *args, **kwargs):
+            lock_acquired_at.append(time.monotonic())
+            return original_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return original_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.release()
+
+    def _recording_embed(_text):
+        embed_started_at.append(time.monotonic())
+        time.sleep(0.02)
+        return (b"\x00" * 16, "stub", "stub-4d", 4)
+
+    monkeypatch.setattr(client, "_write_lock", _RecordingLock())
+    monkeypatch.setattr("mimir.saga.client._embed_text_sync", _recording_embed)
+
+    result = await client.store("new content that needs embedding")
+
+    assert result["stored"] is True
+    assert embed_started_at
+    assert lock_acquired_at
+    assert embed_started_at[0] < lock_acquired_at[0], (
+        "provider embedding ran after the write lock was acquired"
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_exact_duplicate_fast_path_still_skips_embedding(
+    client, monkeypatch
+):
+    """Exact content-hash duplicates still dedupe without another embed."""
+    _patch_provider(monkeypatch)
+
+    first = await client.store("duplicate content fast path")
+
+    def _unexpected_embed(_text):
+        raise AssertionError("exact duplicate path should not call embed")
+
+    monkeypatch.setattr("mimir.saga.client._embed_text_sync", _unexpected_embed)
+    second = await client.store("duplicate content fast path")
+
+    assert first["atom_id"] == second["atom_id"]
+    assert second["stored"] is False
+
+
+@pytest.mark.asyncio
+async def test_client_query_returns_two_tier_shape(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    await client.store("Alice prefers concise replies")
+    result = await client.query("Alice", top_k=5, auth_context=ADMIN_SCOPE)
+    # Saga-compatible shape.
+    assert "observations" in result
+    assert "raws" in result
+    assert "items_returned" in result
+    assert "two_tier" in result
+
+
+def test_empty_query_embedding_warns_before_fts_fallback(monkeypatch, caplog):
+    class _EmptyProvider:
+        def embed(self, text, *, input_type="query"):
+            return []
+
+    monkeypatch.setattr(
+        "mimir.saga.embeddings.get_provider", lambda: _EmptyProvider()
+    )
+    monkeypatch.setattr(
+        "mimir.saga._config_io.get_config",
+        lambda: lambda _section, _key, default=None: default,
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.saga.client"):
+        assert _query_embed_sync("query") == []
+
+    assert "query embedding was empty" in caplog.text
+    assert "degraded to FTS5" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_query_falls_back_to_fts_when_query_embedding_is_empty(
+    client, monkeypatch,
+):
+    _patch_provider(monkeypatch)
+    stored = await client.store("Alice prefers concise replies")
+    assert client.connection().execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 1
+
+    monkeypatch.setattr("mimir.saga.client._query_embed_sync", lambda _query: [])
+
+    def unexpected_vector_search(*args, **kwargs):
+        raise AssertionError("empty query embedding reached VectorIndex.search")
+
+    monkeypatch.setattr(
+        "mimir.saga.vector_index.VectorIndex.search", unexpected_vector_search
+    )
+
+    result = await client.query("Alice concise replies", top_k=5, auth_context=ADMIN_SCOPE)
+
+    returned_ids = [item["id"] for item in result["observations"] + result["raws"]]
+    assert stored["atom_id"] in returned_ids
+
+
+@pytest.mark.asyncio
+async def test_query_reads_and_scores_triples_once(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    atom = await client.store(
+        "Alice prefers concise replies",
+        origin_trigger="user_message", origin_ref="msg-1",
+    )
+    conn = client._ensure_conn()
+    from mimir.saga.triples import store_triples
+
+    store_triples(
+        conn,
+        [{"subject": "Alice", "predicate": "prefers", "object": "concise"}],
+        source_atom_id=atom["atom_id"],
+        embed_fn=lambda _text: (b"\x00\x00\x80?" * 4, "stub", "stub-4d", 4),
+    )
+    conn.commit()
+    from mimir.saga import triples
+
+    score_calls: list[sqlite3.Connection] = []
+    original_rank_triple_candidates = triples.rank_triple_candidates
+
+    def observed_rank_triple_candidates(operation_conn, *args, **kwargs):
+        score_calls.append(operation_conn)
+        return original_rank_triple_candidates(operation_conn, *args, **kwargs)
+
+    monkeypatch.setattr(
+        triples, "rank_triple_candidates", observed_rank_triple_candidates
+    )
+
+    result = await client.query("Alice", top_k=3, auth_context=ADMIN_SCOPE)
+
+    # A loaded-host failure on 2026-09-20 did not reproduce. Count the owned
+    # scoring seam instead of SQLite trace callbacks, which are lower-level
+    # execution diagnostics and not the property this test guards.
+    assert len(score_calls) == 1
+    assert result["triples"]
+    source = result["_ifc_sources"][0]
+    assert source["resource_id"] == f"atom:{atom['atom_id']}"
+    assert source["integrity"] == "trusted"
+    captured_at = conn.execute(
+        "SELECT created_at FROM atoms WHERE id = ?", (atom["atom_id"],)
+    ).fetchone()[0]
+    assert result["observations"] + result["raws"]
+    for item in result["observations"] + result["raws"] + result["triples"]:
+        assert "integrity" not in item
+        assert item["origin_trigger"] == source["origin_trigger"] == "user_message"
+        assert item["origin_ref"] == source["origin_ref"] == "msg-1"
+        assert item["captured_at"] == source["captured_at"] == captured_at
+
+
+@pytest.mark.asyncio
+async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypatch):
+    _patch_provider(monkeypatch, enable_session_boundary_rrf=True)
+    client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)
+    boundary_atom = await client.store("Alice prefers concise replies", session_id="s1")
+    await client.store("Bob likes verbose explanations", session_id="s2")
+    await client.end_session("s1", "Alice reply preferences", auth_context=_end_auth("s1"))
+    await client.end_session("s2", "Bob reply preferences", auth_context=_end_auth("s2"))
+
+    def fake_search_sessions(conn, query, **kwargs):
+        assert query == "unmatched-query"
+        assert kwargs["alpha"] == 0.7
+        assert kwargs["limit"] == 3
+        return [{"session_id": "s1", "blended_score": 1.0}]
+
+    monkeypatch.setattr(client, "_search_sessions_with_conn", fake_search_sessions)
+    monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
+
+    result = await client.query(
+        "unmatched-query",
+        top_k=5,
+        min_confidence_tier="none",
+        auth_context=ADMIN_SCOPE,
+    )
+
+    assert [a["id"] for a in result["raws"]] == [boundary_atom["atom_id"]]
+
+
+@pytest.mark.asyncio
+async def test_query_can_disable_session_boundary_rrf(tmp_path, monkeypatch):
+    _patch_provider(monkeypatch)
+    client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)
+    await client.store("Alice prefers concise replies", session_id="s1")
+    await client.end_session("s1", "Alice reply preferences", auth_context=_end_auth("s1"))
+
+    async def unexpected_search_sessions(*args, **kwargs):
+        raise AssertionError("session boundary lane should be disabled")
+
+    monkeypatch.setattr(client, "search_sessions", unexpected_search_sessions)
+    monkeypatch.setattr(client, "_ensure_index", lambda conn: None)
+
+    result = await client.query(
+        "unmatched-query",
+        top_k=5,
+        enable_session_boundary_rrf=False,
+        auth_context=ADMIN_SCOPE,
+    )
+
+    assert result["raws"] == []
+
+
+@pytest.mark.asyncio
+async def test_client_feedback_records_event(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    r = await client.store("test atom")
+    result = await client.feedback(
+        [r["atom_id"]],
+        "agent reply text",
+        feedback="positive",
+        auth_context=ADMIN_AUTH,
+    )
+    assert result["marked"] == 1
+    assert result["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_client_end_session_writes_summary(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    result = await client.end_session(
+        "s1",
+        "we discussed PR review",
+        topics_discussed=["pr-review"],
+        auth_context=_end_auth("s1"),
+    )
+    assert result["session_id"] == "s1"
+    assert result["session_summary_written"] is True
+
+
+@pytest.mark.asyncio
+async def test_client_end_session_idempotent(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    r1 = await client.end_session("s1", "first call", auth_context=_end_auth("s1"))
+    r2 = await client.end_session("s1", "second call", auth_context=_end_auth("s1"))
+    assert r1["session_id"] == r2["session_id"] == "s1"
+    assert r1["session_summary_written"] is True
+    assert r2["session_summary_written"] is False
+
+
+# ── get_atoms: batch by-id load (pure read) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_batch_load_preserves_order(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    a = await client.store("first atom about apples")
+    b = await client.store("second atom about bridges")
+    res = await client.get_atoms([b["atom_id"], a["atom_id"]], auth_context=ADMIN_SCOPE)
+    assert [x["id"] for x in res["atoms"]] == [b["atom_id"], a["atom_id"]]
+    assert res["missing"] == []
+    contents = {x["id"]: x["content"] for x in res["atoms"]}
+    assert contents[a["atom_id"]] == "first atom about apples"
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_round_trips_immutable_provenance(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    stored = await client.store(
+        "poller finding", owner_principal="service:poller:feed",
+        origin_trigger="research-poller:feed",
+        origin_ref="https://example.test/finding/7",
+    )
+    result = await client.get_atoms([stored["atom_id"]], auth_context=ADMIN_SCOPE)
+
+    atom = result["atoms"][0]
+    assert "integrity" not in atom
+    assert atom["origin_trigger"] == "research-poller:feed"
+    assert atom["origin_ref"] == "https://example.test/finding/7"
+    assert atom["captured_at"] == atom["created_at"]
+    assert result["_ifc_sources"][0]["integrity"] == "trusted"
+    assert result["_ifc_sources"][0]["origin_trigger"] == atom["origin_trigger"]
+    assert result["_ifc_sources"][0]["origin_ref"] == atom["origin_ref"]
+    assert result["_ifc_sources"][0]["captured_at"] == atom["captured_at"]
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_reports_missing(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    a = await client.store("a real atom")
+    res = await client.get_atoms(
+        [a["atom_id"], "0000nonexistent0000"], auth_context=ADMIN_SCOPE
+    )
+    assert [x["id"] for x in res["atoms"]] == [a["atom_id"]]
+    assert res["missing"] == ["0000nonexistent0000"]
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_excludes_tombstoned(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    a = await client.store("doomed atom")
+    conn = client.connection()
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = ?", (a["atom_id"],))
+    conn.commit()
+    res = await client.get_atoms([a["atom_id"]], auth_context=ADMIN_SCOPE)
+    assert res["atoms"] == []
+    assert res["missing"] == [a["atom_id"]]
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_fires_no_access_events(client, monkeypatch):
+    """A by-id load must NOT reinforce activation — unlike query()."""
+    _patch_provider(monkeypatch)
+    a = await client.store("atom we will load by id")
+    conn = client.connection()
+    before = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
+    await client.get_atoms([a["atom_id"]], auth_context=ADMIN_SCOPE)
+    after = conn.execute("SELECT COUNT(*) FROM access_events").fetchone()[0]
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_empty_and_dedupe(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    assert await client.get_atoms([]) == {"atoms": [], "missing": []}
+    a = await client.store("dedupe me")
+    res = await client.get_atoms([a["atom_id"], a["atom_id"]], auth_context=ADMIN_SCOPE)
+    assert [x["id"] for x in res["atoms"]] == [a["atom_id"]]  # deduped
+
+
+# ── recall concurrency: access-event write must be best-effort ─────────
+
+
+@pytest.mark.asyncio
+async def test_query_access_write_is_best_effort(client, monkeypatch):
+    """Regression: recall's Pass-4 access-event write must not crash the
+    query when it can't BEGIN because the shared connection already has a
+    transaction open — exactly what concurrent memory_query calls caused.
+    Before the fix it raised 'cannot start a transaction within a
+    transaction'; now it logs and the query still returns its result.
+
+    AND (mimir-carreira #564 review): the best-effort failure path must NOT
+    roll back the OTHER open transaction — only the one this block began. We
+    open a transaction, make an uncommitted write, run query(), and assert the
+    write survives (the access-event handler's rollback is ownership-guarded)."""
+    _patch_provider(monkeypatch)
+    r = await client.store("Alice prefers concise replies")
+    conn = client.connection()
+    conn.execute("BEGIN IMMEDIATE")  # block recall's access-event write
+    # An uncommitted write owned by THIS (the caller's) transaction.
+    conn.execute("UPDATE atoms SET arousal = 0.99 WHERE id = ?", (r["atom_id"],))
+    try:
+        result = await client.query(
+            "Alice", top_k=5, auth_context=ADMIN_SCOPE
+        )  # must NOT raise
+        # recall's skipped access-event write must NOT have rolled us back.
+        arousal = conn.execute(
+            "SELECT arousal FROM atoms WHERE id = ?", (r["atom_id"],)
+        ).fetchone()[0]
+        assert arousal == 0.99  # victim transaction intact
+        conn.commit()
+    finally:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+    assert "raws" in result and "observations" in result
+
+
+# NOTE: a concurrent-query smoke test (asyncio.gather of N query() calls)
+# was deliberately NOT added here — it segfaults in fts_search, exposing a
+# deeper issue: concurrent READS on the single shared sqlite connection are
+# unsafe, not just the BEGIN IMMEDIATE write this PR makes best-effort. That
+# needs the connection model reworked (per-call connections / serialized DB
+# access) and is tracked separately. See chainlink.
+
+
+# ── memory_get tool wrapper ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_memory_get_tool_formats_and_reports_missing(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    from mimir.tools.memory import memory_get, set_memory_client
+
+    a = await client.store("apple atom content")
+    set_memory_client(client)
+    original_get_atoms = client.get_atoms
+
+    async def admin_get_atoms(ids, **_kwargs):
+        return await original_get_atoms(ids, auth_context=ADMIN_SCOPE)
+
+    monkeypatch.setattr(client, "get_atoms", admin_get_atoms)
+    try:
+        out = await memory_get.ainvoke({"atom_ids": [a["atom_id"], "missing-id"]})
+    finally:
+        set_memory_client(None)
+    assert a["atom_id"] in out
+    assert "apple atom content" in out
+    assert "missing-id" in out and "not found" in out
+
+
+@pytest.mark.asyncio
+async def test_memory_get_tool_no_client():
+    from mimir.tools.memory import memory_get, set_memory_client
+
+    set_memory_client(None)
+    out = await memory_get.ainvoke({"atom_ids": ["x"]})
+    assert "no SagaStore configured" in out
+
+
+def test_memory_client_can_be_cleared(client):
+    from mimir.tools.memory import _MEMORY_STATE, set_memory_client
+
+    set_memory_client(client)
+    assert _MEMORY_STATE["client"] is client
+
+    set_memory_client(None)
+
+    assert _MEMORY_STATE["client"] is None
+
+
+@pytest.mark.asyncio
+async def test_client_recent_session_boundaries(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    await client.end_session("s1", "first", auth_context=_end_auth("s1"))
+    await client.end_session("s2", "second", auth_context=_end_auth("s2"))
+    boundaries = await client.recent_session_boundaries(
+        count=10, auth_context=ADMIN_SCOPE
+    )
+    assert len(boundaries) == 2
+
+
+@pytest.mark.asyncio
+async def test_client_forget_dry_run(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    await client.store("stale atom")
+    result = await client.forget(dry_run=True, auth_context=ADMIN_AUTH)
+    assert result["dry_run"] is True
+    # Returns count + preview ids without writing.
+
+
+@pytest.mark.asyncio
+async def test_client_most_retrieved_atoms(client, monkeypatch):
+    """The mapping to access_events for "what got retrieved most"."""
+    _patch_provider(monkeypatch)
+    await client.store("atom to retrieve")
+    # Fire a few retrievals.
+    for _ in range(3):
+        await client.query("atom to retrieve")
+    top = await client.most_retrieved_atoms(days=7, count=5)
+    assert isinstance(top, list)
+
+
+@pytest.mark.asyncio
+async def test_saga_store_async_context_manager(tmp_path, monkeypatch):
+    """``async with SagaStore(...) as store:`` opens the connection
+    eagerly and closes it on exit — operator + test-fixture
+    ergonomics fix so callers don't have to remember
+    ``await store.close()`` manually."""
+    from mimir.saga.client import SagaStore
+
+    _patch_provider(monkeypatch)
+    db_path = tmp_path / "ctx_mgr.db"
+
+    async with SagaStore(db_path=db_path) as store:
+        # Connection was opened eagerly on __aenter__.
+        assert store._conn is not None
+        # Real method call still works.
+        await store.store("atom in async-with body")
+
+    # On exit, the connection is closed.
+    assert store._conn is None
+
+
+@pytest.mark.asyncio
+async def test_saga_store_async_context_manager_propagates_exceptions(
+    tmp_path,
+    monkeypatch,
+):
+    """An exception raised in the ``async with`` body propagates —
+    ``__aexit__`` must not suppress. Defends against accidentally
+    introducing exception swallow in close-on-exit."""
+    from mimir.saga.client import SagaStore
+
+    _patch_provider(monkeypatch)
+    db_path = tmp_path / "ctx_mgr_exc.db"
+
+    with pytest.raises(ValueError, match="from body"):
+        async with SagaStore(db_path=db_path) as store:
+            raise ValueError("from body")
+    # And the connection still got closed.
+    assert store._conn is None
+
+
+# ─── contextual-rewrite default-from-config ──────────────────────────
+
+
+def _patch_provider_with_rewrite_flag(monkeypatch, *, rewrite_enabled: bool):
+    """Like ``_patch_provider`` but the stubbed saga.toml config also
+    reports ``[retrieval].enable_contextual_rewrite``."""
+
+    class _StubProvider:
+        def embed(self, text, *, input_type="passage"):
+            return [0.1, 0.2, 0.3, 0.4]
+
+        def dimensions(self):
+            return 4
+
+    def fake_get_provider():
+        return _StubProvider()
+
+    def fake_get_config():
+        def cfg(section, key, default=None):
+            return {
+                ("embedding", "max_input_chars"): 2000,
+                ("embedding", "provider"): "stub",
+                ("embedding", "model"): "stub-4d",
+                ("retrieval", "enable_contextual_rewrite"): rewrite_enabled,
+            }.get((section, key), default)
+
+        return cfg
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", fake_get_provider)
+    monkeypatch.setattr("mimir.saga._config_io.get_config", fake_get_config)
+
+
+@pytest.mark.asyncio
+async def test_query_reads_rewrite_flag_from_config_when_kwarg_omitted(
+    client,
+    monkeypatch,
+):
+    """When the caller omits ``enable_contextual_rewrite=`` and passes
+    ``context=``, SagaStore.query consults saga.toml's
+    ``[retrieval].enable_contextual_rewrite`` — so the agent doesn't
+    have to thread the toml flag through every call site.
+    """
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=True)
+    rewrite_calls: list = []
+
+    async def fake_rewrite(query, context):
+        rewrite_calls.append((query, context))
+        return "anchor for X"
+
+    monkeypatch.setattr(
+        "mimir.saga.query_rewrite.rewrite_query",
+        fake_rewrite,
+    )
+    payload = await client.query(
+        "what about that?",
+        context=[{"role": "user", "content": "tell me about X"}],
+    )
+    assert len(rewrite_calls) == 1
+    assert payload.get("rewritten_query") == "anchor for X"
+
+
+@pytest.mark.asyncio
+async def test_query_skips_rewrite_when_config_disabled(client, monkeypatch):
+    """Config flag OFF + caller passes context= → rewrite must NOT fire.
+    The toml flag is the authoritative gate when the caller defers.
+    """
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=False)
+    rewrite_calls: list = []
+
+    async def fake_rewrite(query, context):
+        rewrite_calls.append((query, context))
+        return "should not be used"
+
+    monkeypatch.setattr(
+        "mimir.saga.query_rewrite.rewrite_query",
+        fake_rewrite,
+    )
+    payload = await client.query(
+        "what about that?",
+        context=[{"role": "user", "content": "tell me about X"}],
+    )
+    assert rewrite_calls == []
+    # No rewrite happened — rewritten_query stays empty in the response.
+    assert not payload.get("rewritten_query")
+
+
+@pytest.mark.asyncio
+async def test_query_explicit_kwarg_overrides_config_flag(client, monkeypatch):
+    """Explicit ``enable_contextual_rewrite=False`` wins over a toml
+    flag set to True. Lets bench / test code force-off."""
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=True)
+    rewrite_calls: list = []
+
+    async def fake_rewrite(query, context):
+        rewrite_calls.append((query, context))
+        return "anchor"
+
+    monkeypatch.setattr(
+        "mimir.saga.query_rewrite.rewrite_query",
+        fake_rewrite,
+    )
+    await client.query(
+        "what about that?",
+        context=[{"role": "user", "content": "tell me about X"}],
+        enable_contextual_rewrite=False,
+    )
+    assert rewrite_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_content", [False, True])
+async def test_query_rewrite_direct_call_traces_only_active_turn(
+    client, monkeypatch, capture_content,
+):
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from mimir.tracing import MODEL, OPERATION, TraceController
+
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=True)
+    monkeypatch.setattr(
+        "mimir.saga._config_io.resolve_llm_config",
+        lambda section: {"model": "rewrite-fake"},
+    )
+    calls = []
+
+    async def fake_call(cfg, *, prompt, **kwargs):
+        calls.append((cfg, prompt, kwargs))
+        return "safe anchor token=private-canary"
+
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    controller = TraceController(provider, capture_content=capture_content)
+    context = [{"role": "user", "content": "safe context token=private-canary"}]
+    try:
+        with controller.turn(conversation_id="rewrite-turn", agent_name="mimir", model="fake"):
+            payload = await client.query("what about it?", context=context)
+        assert payload["rewritten_query"] == "safe anchor token=private-canary"
+        assert len(calls) == 1
+        assert calls[0][0] == {"model": "rewrite-fake"}
+        spans = exporter.get_finished_spans()
+        chat = next(span for span in spans if span.name == "chat")
+        root = next(span for span in spans if span.name == "invoke_agent")
+        assert chat.parent.span_id == root.context.span_id
+        assert chat.attributes[OPERATION] == "chat"
+        assert chat.attributes[MODEL] == "rewrite-fake"
+        content = {key: value for key, value in chat.attributes.items() if "messages" in key}
+        if capture_content:
+            assert "safe context" in content["gen_ai.input.messages"]
+            assert "safe anchor" in content["gen_ai.output.messages"]
+            assert "private-canary" not in str([dict(span.attributes) for span in spans])
+        else:
+            assert content == {}
+
+        exporter.clear()
+        outside = await client.query("what about it?", context=context)
+        assert outside["rewritten_query"] == payload["rewritten_query"]
+        assert len(calls) == 2
+        assert not exporter.get_finished_spans()
+    finally:
+        provider.shutdown()
+
+
+# ─── PR #342 follow-up: warning when NYI forget params are passed ────
+
+
+@pytest.mark.asyncio
+async def test_forget_warns_when_contribution_threshold_passed(
+    tmp_path,
+    caplog,
+):
+    """``SagaStore.forget(contribution_threshold=...)`` accepts the
+    param at the surface (so HTTP-path-shape callsites don't break)
+    but ``forget_by_criteria`` doesn't implement it. Pre-fix the
+    in-process path silently dropped the kwarg — same shape as the
+    bug PR #342 was closing for ``agent_id`` + ``min_retrievals``.
+    Now it logs a clear warning so operators see the gap.
+    """
+    import logging
+    from mimir.saga.client import SagaStore
+
+    db_path = tmp_path / "test.saga.db"
+    store = SagaStore(db_path=db_path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.saga.client"):
+        await store.forget(
+            dry_run=True,
+            contribution_threshold=0.3,
+        )
+    warning_msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "contribution_threshold" in r.getMessage()
+    ]
+    assert warning_msgs, (
+        f"expected a WARNING mentioning contribution_threshold; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    assert "ignored" in warning_msgs[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_forget_warns_when_contradiction_threshold_passed(
+    tmp_path,
+    caplog,
+):
+    """Same shape for the contradiction_threshold param."""
+    import logging
+    from mimir.saga.client import SagaStore
+
+    db_path = tmp_path / "test.saga.db"
+    store = SagaStore(db_path=db_path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.saga.client"):
+        await store.forget(
+            dry_run=True,
+            contradiction_threshold=0.5,
+        )
+    warning_msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "contradiction_threshold" in r.getMessage()
+    ]
+    assert warning_msgs
+    assert "ignored" in warning_msgs[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_forget_silent_when_only_implemented_params_passed(
+    tmp_path,
+    caplog,
+):
+    """Regression guard: a forget call that only uses the supported
+    params (agent_id is injected automatically, plus min_retrievals /
+    grace_days / activation_below) must NOT emit a warning."""
+    import logging
+    from mimir.saga.client import SagaStore
+
+    db_path = tmp_path / "test.saga.db"
+    store = SagaStore(db_path=db_path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.saga.client"):
+        await store.forget(
+            dry_run=True,
+            grace_days=30,
+            min_retrievals=5,
+        )
+    nyi_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and (
+            "contribution_threshold" in r.getMessage()
+            or "contradiction_threshold" in r.getMessage()
+        )
+    ]
+    assert not nyi_warnings, (
+        f"unexpected NYI-param warnings on a supported-params-only "
+        f"call: {[r.getMessage() for r in nyi_warnings]}"
+    )

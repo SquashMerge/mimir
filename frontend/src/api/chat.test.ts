@@ -1,0 +1,159 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ChatStreamError, createChatStream, fetchChatSkills } from "./chat";
+
+function sseResponse(chunks: string[]): Response {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    }
+  }), { status: 200 });
+}
+
+function openSseResponse(chunks: string[]): Response {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+    }
+  }), { status: 200 });
+}
+
+function jsonResponse(body: unknown): Response {
+  return {
+    ok: true,
+    headers: new Headers({ "content-type": "application/json" }),
+    json: async () => body
+  } as Response;
+}
+
+describe("fetchChatSkills", () => {
+  it("loads the backend-authoritative chat skill commands", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      ok: true,
+      version: "v1",
+      data: {
+        enabled: true,
+        skills: [{ id: "memory", label: "Memory", command: "/memory", description: "Capture durable context." }]
+      }
+    }));
+
+    const response = await fetchChatSkills({ fetchImpl });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "/api/v1/chat/skills",
+      expect.objectContaining({ method: "GET", headers: expect.any(Headers) })
+    );
+    expect(response.data.skills).toEqual([
+      expect.objectContaining({ command: "/memory", label: "Memory" })
+    ]);
+  });
+});
+
+describe("createChatStream", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reconnects after a clean EOF instead of silently dying", async () => {
+    vi.useFakeTimers();
+    const onPayload = vi.fn();
+    const onOpen = vi.fn();
+    const onError = vi.fn();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(sseResponse([
+        'data: {"kind":"chat.message","channel_id":"web-default","text":"first","message_id":"m1","attachments":[]}\n\n'
+      ]))
+      .mockResolvedValueOnce(openSseResponse([]));
+
+    const handle = createChatStream(onPayload, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      reconnectDelayMs: 25,
+      onOpen,
+      onError
+    });
+
+    await vi.waitFor(() => expect(onPayload).toHaveBeenCalledOnce());
+    expect(onPayload).toHaveBeenCalledWith(expect.objectContaining({ text: "first" }));
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect(onError).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(25);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+
+    handle.close();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconnects after a failed stream attempt", async () => {
+    vi.useFakeTimers();
+    const onPayload = vi.fn();
+    const onError = vi.fn();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("too many chat streams", { status: 429 }))
+      .mockResolvedValueOnce(openSseResponse([
+        'data: {"kind":"chat.message","channel_id":"web-default","text":"recovered","message_id":"m2","attachments":[]}\n\n'
+      ]));
+
+    const handle = createChatStream(onPayload, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      reconnectDelayMs: 25,
+      onError
+    });
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(25);
+    await vi.waitFor(() => expect(onPayload).toHaveBeenCalledWith(expect.objectContaining({ text: "recovered" })));
+
+    handle.close();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops retrying on a 403 and surfaces the server error code", async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "master_key_not_chat_identity" }), { status: 403 })
+    );
+
+    const handle = createChatStream(vi.fn(), {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      reconnectDelayMs: 25,
+      onError
+    });
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    const err = onError.mock.calls[0][0] as ChatStreamError;
+    expect(err).toBeInstanceOf(ChatStreamError);
+    expect(err.status).toBe(403);
+    expect(err.code).toBe("master_key_not_chat_identity");
+
+    // Terminal: advancing past the reconnect delay must NOT re-fetch.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    handle.close();
+  });
+
+  it("stops retrying on a 401 (not logged in)", async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "chat_login_required" }), { status: 401 })
+    );
+
+    const handle = createChatStream(vi.fn(), {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      reconnectDelayMs: 25,
+      onError
+    });
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(100);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect((onError.mock.calls[0][0] as ChatStreamError).status).toBe(401);
+    handle.close();
+  });
+});

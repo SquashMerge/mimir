@@ -1,0 +1,376 @@
+"""Tests for the ``list_schedules`` tool.
+
+Regression coverage: ``list_schedules`` was reading ``j.last_run`` /
+``j.next_fire`` on the YAML-config :class:`mimir.scheduler.SchedulerJob`
+dataclass, which doesn't have those attributes (they live on
+apscheduler's runtime ``Job``). Every call by the agent crashed the
+turn — observed in production on muninn-mimir (2026-05-21 morning):
+``'SchedulerJob' object has no attribute 'last_run'`` blew up
+``morning-briefing`` / ``ai-news-check`` / ``moltbook-browse`` turns,
+which is why Muninn went silent on Discord for a day.
+
+This test pins the tool's output to config fields only, so adding
+runtime fields later (via a proper apscheduler join) is an additive
+change that won't accidentally re-introduce the same attribute-error
+path.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from mimir.scheduler import SchedulerJob
+from mimir.tools.registry import _STATE, list_schedules
+from mimir._context import set_current_turn, reset_current_turn
+from mimir.access_control import (
+    SinkGate, _operator_can_invoke_admin_shell, begin_protected_result_capture,
+    end_protected_result_capture, classify_protected_result, ToolRegistry,
+)
+from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel, TurnInteractivity
+from types import SimpleNamespace
+
+
+class _StubScheduler:
+    """Minimal stand-in for ``mimir.scheduler.Scheduler``: returns whatever
+    list of :class:`SchedulerJob` (and, for #522, poller details) we set up.
+    The real scheduler's ``list_jobs`` is ``async``; we mirror that."""
+
+    def __init__(self, jobs: list[SchedulerJob], pollers=(), home=None) -> None:
+        self._jobs = jobs
+        self._pollers = [dict(p) for p in pollers]
+        self._home = home
+
+    async def list_jobs(self) -> list[SchedulerJob]:
+        return list(self._jobs)
+
+    def registered_poller_details(self) -> list[dict[str, str]]:
+        return [dict(p) for p in self._pollers]
+
+
+@pytest.fixture
+def stub_scheduler():
+    """Install a stub Scheduler in the tool's _STATE for the test,
+    restore on teardown so other tests don't inherit it."""
+    prev = _STATE.get("scheduler")
+    yield lambda jobs, pollers=(), home=None: _STATE.__setitem__(
+        "scheduler", _StubScheduler(jobs, pollers, home=home)
+    )
+    _STATE["scheduler"] = prev
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_preserves_trusted_operator_ingest(stub_scheduler) -> None:
+    stub_scheduler([SchedulerJob(name="daily", cron="0 8 * * *", prompt="report")],
+                   pollers=[{"name": "mail", "cron": "* * * * *", "priority": "normal"}])
+    auth = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("user",),
+        trigger="user_message", channel_id="channel", resource_id="channel",
+        domain="channel", bridge_instance="discord", event_ingress=None,
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    operator = SourceLabel(
+        principal="operator", domain="channel", resource_id="channel",
+        bridge_instance="discord", sensitivity="internal",
+        authorized_principals=frozenset({"operator"}), source_kind="channel",
+        integrity="trusted", integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(operator)
+    state = InformationFlowState(labels=labels)
+    auth = replace(auth, ifc_labels=labels, ifc_state=state)
+    token = set_current_turn(SimpleNamespace(turn_id="trusted-schedule-list", auth_context=auth))
+    try:
+        capture = begin_protected_result_capture()
+        try:
+            result = await list_schedules.ainvoke({})
+        finally:
+            provenance = end_protected_result_capture(capture)
+        assert len(json.loads(result)) == 2
+        assert provenance is not None and len(provenance.sources) == 2
+        assert all(s.integrity == "trusted" and s.domain == "schedule_metadata"
+                   for s in provenance.sources)
+        decision = ToolRegistry().authorize_tool("list_schedules", auth, enforce=False)
+        ingested = classify_protected_result(
+            "list_schedules", {}, auth, decision, result=result, provenance=provenance,
+        )
+        assert ingested is not None
+        for source in ingested.sources:
+            state.labels = state.labels.with_source(source)
+        current = state.current(labels)
+        assert not state.has_untrusted_active_ingest(labels)
+        assert _operator_can_invoke_admin_shell("shell_exec", current, auth)
+    finally:
+        reset_current_turn(token)
+
+
+# ─── Regression: was crashing on j.last_run / j.next_fire ──────────────
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_does_not_crash_on_pure_yaml_jobs(stub_scheduler):
+    """Real ``SchedulerJob`` objects from YAML never have ``last_run``
+    or ``next_fire``. The tool must NOT touch those attributes."""
+    stub_scheduler([
+        SchedulerJob(
+            name="heartbeat",
+            prompt_file="heartbeat.md",
+            cron="0 * * * *",
+            channel_id=None,
+        ),
+    ])
+    result = await list_schedules.ainvoke({})
+    # Crash would have produced a string starting "list_schedules failed:".
+    assert "failed" not in result.lower()
+    parsed = json.loads(result)
+    assert parsed[0]["name"] == "heartbeat"
+    assert parsed[0]["cron"] == "0 * * * *"
+    # The fields that used to crash MUST NOT be in the output —
+    # adding them back would re-introduce the production bug.
+    assert "last_run" not in parsed[0]
+    assert "next_fire" not in parsed[0]
+
+
+# ─── Output surfaces the prompt-source field (whichever is set) ────────
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_prompt_file(stub_scheduler):
+    stub_scheduler([
+        SchedulerJob(
+            name="morning-briefing", prompt_file="morning-briefing.md",
+            cron="0 8 * * *", channel_id=None,
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert parsed[0]["prompt_file"] == "morning-briefing.md"
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_inline_prompt(stub_scheduler):
+    stub_scheduler([
+        SchedulerJob(
+            name="custom",
+            prompt="Check the deploy queue and report.",
+            cron="*/15 * * * *",
+            channel_id="C12345",
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert parsed[0]["prompt"] == "Check the deploy queue and report."
+    assert parsed[0]["channel_id"] == "C12345"
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_truncates_long_inline_prompts(stub_scheduler):
+    """Inline prompts can be hundreds of lines (entire workflows); the
+    tool's job is a quick listing, not full prompt rendering."""
+    long_prompt = "Step one. " * 100  # >200 chars
+    stub_scheduler([
+        SchedulerJob(
+            name="long-one", prompt=long_prompt,
+            cron="0 0 * * *", channel_id=None,
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert parsed[0]["prompt"].endswith("...")
+    assert len(parsed[0]["prompt"]) <= 205  # 200 chars + the "..."
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_callable_name(stub_scheduler):
+    """Some jobs are code-callable references rather than prompts."""
+    stub_scheduler([
+        SchedulerJob(
+            name="saga-consolidate", callable_name="saga-consolidate",
+            cron="0 4 * * *", channel_id=None,
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert parsed[0]["callable"] == "saga-consolidate"
+    assert "prompt" not in parsed[0]
+    assert "prompt_file" not in parsed[0]
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_time_of_day(stub_scheduler):
+    """``time_of_day`` is the alternative to ``cron`` style; the tool
+    should surface it instead of pretending cron is the only option."""
+    stub_scheduler([
+        SchedulerJob(
+            name="evening", prompt_file="evening.md",
+            cron=None, time_of_day="22:00", channel_id=None,
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert parsed[0]["time_of_day"] == "22:00"
+
+
+# ─── Empty / no-scheduler cases ────────────────────────────────────────
+
+
+# ─── #523/#522: priority + type discriminator + poller surfacing ──────
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_includes_type_and_priority(stub_scheduler):
+    """#523: every job entry carries its arbiter ``priority`` and a ``type``
+    discriminator so jobs and pollers are distinguishable."""
+    stub_scheduler([
+        SchedulerJob(
+            name="heartbeat", prompt_file="heartbeat.md",
+            cron="0 * * * *", channel_id=None, priority="high",
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert parsed[0]["type"] == "job"
+    assert parsed[0]["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_pollers(stub_scheduler):
+    """#522: skill pollers (a separate registry) appear alongside jobs,
+    labeled ``type: poller``, with their cron + priority."""
+    stub_scheduler(
+        [SchedulerJob(name="heartbeat", prompt_file="heartbeat.md",
+                      cron="0 * * * *", channel_id=None)],
+        pollers=[{
+            "name": "worklink-ready-queue",
+            "cron": "*/10 * * * *",
+            "priority": "normal",
+            "budget": {"windows": {"1h": {"max_agent_turns": 2}}, "on_exceed": "suppress"},
+        }],
+    )
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    by_type: dict[str, list] = {}
+    for entry in parsed:
+        by_type.setdefault(entry["type"], []).append(entry)
+    assert [j["name"] for j in by_type["job"]] == ["heartbeat"]
+    assert len(by_type["poller"]) == 1
+    poller = by_type["poller"][0]
+    assert poller["name"] == "worklink-ready-queue"
+    assert poller["cron"] == "*/10 * * * *"
+    assert poller["priority"] == "normal"
+    assert poller["budget"]["windows"]["1h"]["max_agent_turns"] == 2
+
+
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_surfaces_poller_usage(tmp_path: Path, stub_scheduler):
+    """#696: registered pollers include read-only agent-turn usage from turns.jsonl."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "turns.jsonl").write_text(
+        json.dumps({
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "channel_id": "poller:github-activity",
+            "total_cost_usd": 0.125,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+        home=tmp_path,
+    )
+
+    parsed = json.loads(await list_schedules.ainvoke({}))
+
+    assert parsed[0]["type"] == "poller"
+    assert parsed[0]["usage"]["poller"] == "github-activity"
+    assert parsed[0]["usage"]["windows"]["1h"]["agent_turns"] == 1
+    assert parsed[0]["usage"]["windows"]["1h"]["total_cost_usd"] == 0.125
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_serializes_missing_poller_cost_as_null(tmp_path: Path, stub_scheduler):
+    """Non-Anthropic gateways record no cost; list_schedules must not call it $0.00."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "turns.jsonl").write_text(
+        json.dumps({
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "channel_id": "poller:github-activity",
+            "total_cost_usd": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+        home=tmp_path,
+    )
+
+    parsed = json.loads(await list_schedules.ainvoke({}))
+
+    window = parsed[0]["usage"]["windows"]["1h"]
+    assert window["agent_turns"] == 1
+    assert window["total_cost_usd"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_no_scheduler_configured():
+    prev = _STATE.get("scheduler")
+    _STATE["scheduler"] = None
+    try:
+        result = await list_schedules.ainvoke({})
+        assert "no scheduler configured" in result
+    finally:
+        _STATE["scheduler"] = prev
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_no_jobs(stub_scheduler):
+    stub_scheduler([])
+    result = await list_schedules.ainvoke({})
+    assert "no scheduled jobs" in result
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_poller_only_deployment_not_reported_empty(stub_scheduler):
+    """#522 regression (mimir review on PR #728): an install with NO yaml-config
+    jobs but registered pollers must surface the pollers, not report
+    '(no scheduled jobs)' — that empty-check used to fire before poller rows
+    were appended, recreating the exact poller-only visibility gap."""
+    stub_scheduler(
+        [],
+        pollers=[{"name": "github-activity", "cron": "*/5 * * * *", "priority": "normal"}],
+    )
+    result = await list_schedules.ainvoke({})
+    assert "no scheduled jobs" not in result
+    parsed = json.loads(result)
+    assert len(parsed) == 1
+    assert parsed[0]["type"] == "poller"
+    assert parsed[0]["name"] == "github-activity"
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_multiple_jobs_round_trip(stub_scheduler):
+    """The real muninn schedule mixes prompt_file (most jobs), inline
+    prompt (a couple of one-liners), and callable_name (saga jobs).
+    All three need to coexist in the output."""
+    stub_scheduler([
+        SchedulerJob(
+            name="heartbeat", prompt_file="heartbeat.md",
+            cron="0 * * * *", channel_id=None,
+        ),
+        SchedulerJob(
+            name="process-conditional-todos",
+            prompt="Run python3 scripts/process_conditional_todos.py ...",
+            cron="0 7 * * *", channel_id=None,
+        ),
+        SchedulerJob(
+            name="saga-consolidate", callable_name="saga-consolidate",
+            cron="0 4 * * *", channel_id=None,
+        ),
+    ])
+    parsed = json.loads(await list_schedules.ainvoke({}))
+    assert len(parsed) == 3
+    by_name = {p["name"]: p for p in parsed}
+    assert "prompt_file" in by_name["heartbeat"]
+    assert "prompt" in by_name["process-conditional-todos"]
+    assert "callable" in by_name["saga-consolidate"]

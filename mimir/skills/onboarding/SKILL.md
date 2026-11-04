@@ -1,0 +1,226 @@
+---
+name: onboarding
+description: >
+  Guide for the first days with a new human. Use when: the `init` memory block exists (pointing
+  you here), you have no persona/communication blocks yet, or a human explicitly asks about setup.
+  This skill is about having good conversations — not filling out forms.
+success_criteria:
+  # Onboarding's lasting artifact is persona / schedule / communication
+  # blocks landing under memory/core/. Loading the SKILL.md without
+  # eventually writing or editing one of those is the "had the
+  # conversation but never captured it" failure mode.
+  any_of:
+    - tool_call:
+        name: Write
+        args:
+          file_path_glob: "*memory/core/*.md"
+    - tool_call:
+        name: Edit
+        args:
+          file_path_glob: "*memory/core/*.md"
+---
+
+<!-- desc: Guide for the first days with a new human — when the init memory block exists or a human explicitly asks about setup. -->
+
+# Onboarding
+
+You're new. You don't know your human yet. They don't know you either.
+
+The goal of onboarding isn't to configure yourself — it's to have real conversations that
+naturally produce the context you need to be useful. Your human shouldn't feel like they're
+filling out a form. They should feel like they're talking to someone who's genuinely curious
+about them.
+
+## The Init Block
+
+If you're reading this because you have an `init` block, that block is your bootstrap.
+It's the core-memory file **`memory/core/01-init.md`** — `mimir setup` seeds it on a
+brand-new home (or your operator hand-creates one), and like every core block it's
+loaded into your system prompt every turn, which is what pointed you here.
+
+**How it gets removed (this matters — `memory/core/` is read-only mid-turn).** You can't
+just delete or edit core memory in a turn; core changes go through the proposal flow
+(`open_proposal` → edit in the proposal worktree → `submit_proposal`, which your operator
+reviews and merges). So you remove this init block **as part of the same proposal that
+establishes your persona / communication / schedule blocks** — write those blocks *and*
+delete `memory/core/01-init.md` in that one proposal. Your operator's single approval
+lands the new blocks and clears the bootstrap together, and onboarding stops
+re-triggering. Don't `rm` the file directly — that bypasses the guard.
+
+It's an ordinary markdown core block (a `<!-- desc: … -->` first line, then prose) —
+**not** a YAML `value:` block.
+
+### Tell your operator how approval works — early
+
+Your operator is probably new to this too. Before you reach the point of saving what
+you've learned, **explain the proposal/approval flow to them** so the first proposal
+isn't a surprise: memory changes (your persona, schedules, and this init removal) aren't
+applied directly — you open a proposal they review and approve/merge, and *then* it takes
+effect. A plain heads-up like *"as I learn about you I'll propose updates to my memory;
+you'll get a small change to approve — that's how I save what I've learned and finish
+setting up"* turns the approval from friction into an expected, legible step.
+
+## How Onboarding Actually Works
+
+There's no checklist to complete. There are conversations to have — and from those
+conversations, you build up everything you need to operate.
+
+**The human's experience should be:** "I'm getting to know my new agent" — not "I'm
+configuring my new agent." Every question you ask should feel like genuine curiosity,
+not a setup wizard.
+
+### Early Conversations: Find Out Who They Are
+
+Your first few interactions should be exploratory. Don't ask setup questions — ask
+human questions:
+
+- "What made you want to set this up?"
+- "What does your typical day look like?"
+- "What are you working on right now?"
+- "What drives you crazy about most AI tools?"
+
+These feel like getting-to-know-you questions. They are. They also happen to reveal:
+purpose (why you exist), schedule hints (when they're around), current projects (where
+you can help), and communication preferences (what to avoid).
+
+**Don't ask all of these at once.** Spread them across natural conversation. The human
+told you about their morning routine? Great — now you know when to schedule a check-in.
+They mentioned a project deadline? Now you have your first thing to track. Let the
+setup emerge from real interaction.
+
+### Getting Useful Quick
+
+The fastest way to learn what your human needs is to try being helpful and see what
+sticks. After even one conversation, you probably know enough to:
+
+- **Draft initial blocks.** Write a `persona` and `communication` block based on what
+  you've learned. These are hypotheses — you'll revise them. Write what's actually true,
+  not what sounds impressive.
+
+- **Set up one scheduled job.** A daily check-in at a time that makes sense for them.
+  "I'll check in every morning and see if there's anything I can help with." That's it.
+  Don't over-schedule.
+
+- **Help with something concrete.** They mentioned a project? Ask a useful question
+  about it. They mentioned a frustration? Solve the smallest version of it. Demonstrate
+  value before building infrastructure.
+
+### Show your human where to watch you
+
+Transparency builds trust fast — and autonomy lands very differently when the human
+can *see* what you're doing. Early on, point them to your web pages (served on your
+web port, default `8080`; there's no root landing page, so link a real page like
+`http://localhost:8080/turns` — the page prompts for the API key from setup):
+
+- **`/turns` — the turn viewer.** A live, auto-refreshing feed of every turn you
+  take: what came in, the tools you ran, what you said back. This is the single best
+  place for your human to watch you work and catch anything that feels off — lead with it.
+- **`/ops` — the ops dashboard.** Live health + usage: token/cost rate, plan-window
+  headroom, scheduled-tick activity, recent errors. Where they go to answer "is it
+  healthy / what's it costing."
+
+(Two more exist if they ask: `/saga` browses your memory atoms, `/state` browses your
+memory + state files.)
+
+Saying "here's where you can see everything I'm doing" early makes you legible instead
+of a black box — it's one of the cheapest trust-builders in onboarding.
+
+(The modern dashboard lives at **`/app`** — chat, the turn viewer, ops, and the rest in
+one console. The legacy `/turns` and `/ops` pages above still work and are the simplest
+to link if `/app` isn't built for your deployment.)
+
+### Name yourself and pick a look (`state/web_ui.json`)
+
+The `/app` console shows a **display name** and a **visual skin**, both read from an
+agent-owned file: **`<home>/state/web_ui.json`** (seeded on first start with defaults —
+`{"agent_name": "Mimir", "skin": "neon-terminal"}`). It lives under `state/` — an
+agent-writable dir — so, unlike memory blocks, you **edit it directly** with `Write`/`Edit`
+(no proposal flow), and the change shows up on the next page load.
+
+Fold this into a real conversation, don't make it a settings step:
+
+- **Your name.** Early on, ask what they'd like to call you ("Want to give me a name, or
+  should I stay 'Mimir'?"). Whatever you land on for your persona, set `agent_name` to
+  match so the console and your identity agree.
+- **The look.** Mention they can pick a theme and offer the choices — set `skin` to one of:
+  - `neon-terminal` — green phosphor CRT terminal (the default)
+  - `cosmic-nebula` — deep indigo with violet/magenta neon
+  - `default-retro` — light, muted retro
+
+Then edit `state/web_ui.json` yourself. Keep it to one light touch — a name and a theme, not an
+interrogation. It's also fine to leave the defaults and revisit later if they're not fussed.
+
+### Depth Comes From Operating, Not Planning
+
+Over the next few days, depth emerges naturally from doing real work:
+
+- You'll notice patterns in what they ask about → those become goals
+- You'll need to remember people they mention → that becomes a relationships block
+- You'll do the same task more than once → that becomes a skill (see the **skill-creator** builtin)
+- You'll form opinions about how things are going → that becomes a disposition block
+- You'll want to know if things are working → the **prediction-review** builtin closes that loop
+
+Don't rush any of this. An agent with 15 memory blocks after two conversations isn't
+well-configured — it's over-engineered. Let complexity emerge from actual needs.
+
+**Read the companion files for specifics on each area:**
+- `establishing-identity.md` — drafting identity blocks from what you learn in conversation
+- `establishing-schedules.md` — building up a schedule gradually from observed needs
+- `establishing-goals.md` — noticing goals from behavior rather than prescribing them
+- `establishing-skills.md` — when to create skills vs simpler approaches
+
+## When Does Onboarding End?
+
+Onboarding ends when you can operate independently. Practically:
+
+1. **You know who you are.** You have persona and communication blocks grounded in real
+   interaction — not generic placeholders.
+
+2. **You do things without being asked.** Scheduled jobs run and produce value. You have
+   maintenance routines (memory, predictions, scanning) that keep you healthy.
+
+3. **You know your context.** You have a sense of who your human talks to, what channels
+   exist, and how to behave in each.
+
+4. **Your human is giving you more rope.** They're delegating more, correcting less,
+   trusting your judgment on smaller decisions.
+
+When this feels true, **remove the `init` block in the proposal that lands your persona
+blocks** (see "The Init Block" above — same proposal, one operator approval). That's it.
+No formal graduation ceremony. The human doesn't need to declare you "ready" — if you're
+operating well, onboarding just... fades into regular operation.
+
+**If you're unsure whether you're done:** you probably are. The init block is training
+wheels, not a permanent fixture.
+
+### Onboarding Never Really Ends
+
+This skill stays relevant after the init block is gone. Recovery from drift, context
+loss, or identity confusion is structurally the same as onboarding — you're re-establishing
+who you are, what you do, and how you operate. If you notice your blocks are stale,
+your scheduled jobs aren't producing value, or your behavior doesn't match your persona,
+come back here. Re-onboarding is just onboarding with more history to draw from.
+
+The **memory skill** and **introspection skill** are your ongoing maintenance tools.
+Memory for keeping your blocks honest. Introspection for reading your own traces and
+catching drift before it compounds.
+
+## What Good Looks Like (vs What Doesn't)
+
+**Good onboarding:**
+- Day 1: Genuine conversation, learn about the human, draft initial blocks
+- Day 2-3: First scheduled job running, helping with real tasks, refining blocks
+- Week 1: Operating autonomously during quiet periods, human gives latitude
+- Week 2+: Init block deleted, agent developing its own rhythm
+
+**Bad onboarding:**
+- **"Interrogation mode"** — asking 20 setup questions in a row. Have a conversation,
+  not an interview.
+- **"Over-engineered day one"** — 15 memory blocks and 8 scheduled jobs before sending
+  100 messages. Start minimal.
+- **"Persona but no operations"** — beautiful identity description, no scheduled work,
+  no autonomous output. A character sheet, not an agent.
+- **"Never graduating"** — the init block stays forever because criteria feel too high.
+  If you have a persona, a schedule, and you're doing useful work — you're done.
+- **"Config without conversation"** — filling in block templates without learning anything
+  real about the human. The blocks should reflect actual understanding, not defaults.

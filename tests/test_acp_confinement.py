@@ -1,0 +1,885 @@
+from __future__ import annotations
+
+import json
+import asyncio
+import errno
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from mimir.acp import confinement
+from mimir.acp.execution_scope import ScopeApproval
+
+
+MACOS = pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site,outcome", [
+    (site, outcome)
+    for site in ("scope", "permission", "permission-missing", "risk-recheck", "risk-recovered",
+                 "shell", "execute", "execute-reuse", "spawn")
+    for outcome in (("success", "error", "closed") if site in ("execute", "execute-reuse", "spawn")
+                    else ("success", "error", "closed", "invalidated", "replaced",
+                          "scope-closed", "provider-closed")
+                    + (("consent-granted", "consent-revoked") if site == "scope" else ()))
+])
+async def test_prepare_off_loop(monkeypatch, tmp_path, site, outcome):
+    from mimir.acp import hosted, python_kernel
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    permission = AsyncMock(return_value=True)
+    provider = hosted.HostedHandsProvider(request_unconfined_permission=permission)
+    provider.bind_session("s", tmp_path)
+    session = provider._sessions["s"]
+    manager = provider._python_kernels
+    is_kernel = site in ("execute", "execute-reuse", "spawn")
+    target = 2 if site in ("risk-recheck", "risk-recovered", "spawn") else 1
+    armed = site != "execute-reuse"
+    if outcome == "consent-revoked":
+        session.scope.unconfined_approved = True
+    calls = []
+    closing = []
+
+    def prepare(argv, **kwargs):
+        # A direct-call mutation fails immediately, rather than deadlocking the loop.
+        assert threading.get_ident() != loop_thread
+        calls.append((tuple(argv), kwargs))
+        index = len(calls)
+        resumed = threading.Event()
+
+        def handshake():
+            if armed and index == target:
+                if is_kernel:
+                    if outcome == "closed":
+                        closing.append(asyncio.create_task(manager.close()))
+                elif outcome == "replaced":
+                    session.scope = hosted.ExecutionScope(tmp_path)
+                elif outcome in ("closed", "invalidated"):
+                    session.scope.invalidate(close=outcome == "closed")
+                elif outcome == "scope-closed":
+                    session.scope.closed = True
+                elif outcome == "provider-closed":
+                    provider._closed = True
+                elif outcome in ("consent-granted", "consent-revoked"):
+                    session.scope.unconfined_approved = outcome == "consent-granted"
+            loop.call_soon(resumed.set)
+
+        loop.call_soon_threadsafe(handshake)
+        assert resumed.wait(5), "event loop did not respond during preparation"
+        if armed and index == target and outcome == "error":
+            raise confinement.ConfinementUnavailable("fixture preparation failure")
+        if site in ("risk-recheck", "permission-missing") or (site == "risk-recovered" and index == 1):
+            raise confinement.BackendUnavailable("fixture missing backend")
+        return confinement.PreparedCommand(tuple(argv), confinement._environment())
+
+    monkeypatch.setattr(python_kernel if is_kernel else hosted, "prepare_command", prepare)
+    try:
+        if site == "execute-reuse":
+            assert (await manager.execute("s", tmp_path, "40 + 2"))["value"] == "42"
+            calls.clear()
+            armed = True
+        if site == "scope":
+            operation = provider.request_scope(session, "")
+        elif site in ("permission", "permission-missing", "risk-recheck", "risk-recovered"):
+            operation = provider._ensure_execution_permission(session)
+        elif site == "shell":
+            operation = provider._shell(session, "printf fixture")
+            # Exercise only launch preparation here; permission probes have their own cases.
+            monkeypatch.setattr(provider, "_ensure_execution_permission", AsyncMock())
+        else:
+            operation = manager.execute("s", tmp_path, "40 + 2")
+        if outcome not in ("success", "error") or (outcome == "error" and site != "scope"):
+            error = python_kernel.PythonKernelUnavailable if is_kernel else (
+                confinement.ConfinementUnavailable if site in ("permission", "permission-missing", "risk-recheck", "risk-recovered")
+                and outcome == "error" else hosted.HostedMcpError
+            )
+            with pytest.raises(error, match="fixture preparation failure|closed|expired|changed"):
+                await operation
+        else:
+            result = await operation
+            if site == "scope":
+                assert result["approved"] is True
+                assert result["paths"] == [str(tmp_path)]
+                assert result["message"].startswith("BLOCKED:" if outcome == "error" else "CONFINED:")
+            elif site == "shell":
+                assert result == {"stdout": "fixture", "stderr": "", "exitCode": 0, "executionMode": "confined"}
+            elif is_kernel:
+                assert result["ok"] and result["value"] == "42"
+                reused = await manager.execute("s", tmp_path, "6 * 7")
+                assert reused["kernel"] == "reused" and reused["value"] == "42"
+            elif site in ("risk-recheck", "permission-missing"):
+                assert session.scope.unconfined_approved
+        assert len(calls) >= target
+        assert all(call[1]["cwd"] == tmp_path for call in calls)
+        assert all(call[1]["approved_paths"] == () for call in calls)
+        if site in ("risk-recheck", "risk-recovered") or (site == "permission-missing" and outcome == "success"):
+            permission.assert_awaited_once_with("s")
+            assert not session.scope.risk_pending
+            assert session.scope.unconfined_approved is (outcome == "success" and site != "risk-recovered")
+        else:
+            permission.assert_not_awaited()
+        if outcome != "success":
+            assert not provider._processes
+            assert not manager._processes
+    finally:
+        await asyncio.gather(*closing)
+        if outcome == "provider-closed":
+            provider._closed = False
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["scope", "risk"])
+async def test_prepare_off_loop_preserves_approval_serialization(monkeypatch, tmp_path, kind):
+    from mimir.acp import hosted
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    probes = asyncio.Queue()
+    prompted = asyncio.Event()
+    answer = asyncio.Event()
+
+    async def approve(*args):
+        prompted.set()
+        await answer.wait()
+        return True
+
+    permission = AsyncMock(side_effect=approve)
+    provider = hosted.HostedHandsProvider(
+        request_scope_permission=permission, request_unconfined_permission=permission,
+    )
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.touch()
+    provider.bind_session("s", cwd)
+    session = provider._sessions["s"]
+    releases = []
+
+    def prepare(argv, **kwargs):
+        assert threading.get_ident() != loop_thread
+        resumed = threading.Event()
+        releases.append(resumed)
+        loop.call_soon_threadsafe(probes.put_nowait, resumed)
+        assert resumed.wait(5), "probe was not released"
+        if kind == "risk":
+            raise confinement.BackendUnavailable("fixture")
+        return confinement.PreparedCommand(tuple(argv), {})
+
+    monkeypatch.setattr(hosted, "prepare_command", prepare)
+    monkeypatch.setattr(hosted, "validate_scope", lambda **kwargs: None)
+    operation = (lambda: provider.request_scope(session, str(candidate))) if kind == "scope" else (
+        lambda: provider._ensure_execution_permission(session)
+    )
+    tasks = [asyncio.create_task(operation()) for _ in range(2)]
+    try:
+        for _ in range(2):
+            (await asyncio.wait_for(probes.get(), 5)).set()
+        await asyncio.wait_for(prompted.wait(), 5)
+        done, pending = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        assert len(done) == len(pending) == 1
+        permission.assert_awaited_once()
+        assert not session.scope.approved and not session.scope.unconfined_approved
+        rejected = await asyncio.gather(*done, return_exceptions=True)
+        if kind == "scope":
+            assert not rejected[0]["approved"]
+        else:
+            assert isinstance(rejected[0], hosted.HostedMcpError)
+            assert "pending" in str(rejected[0])
+        answer.set()
+        if kind == "risk":
+            (await asyncio.wait_for(probes.get(), 5)).set()
+        await asyncio.gather(*pending)
+        assert bool(session.scope.approved) is (kind == "scope")
+        assert session.scope.unconfined_approved is (kind == "risk")
+        assert not session.scope.pending and not session.scope.risk_pending
+    finally:
+        for release in releases:
+            release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await provider.close()
+
+
+def test_unavailable_platform_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(confinement.sys, "platform", "unsupported")
+    with pytest.raises(confinement.ConfinementUnavailable, match="unavailable"):
+        confinement.prepare_command(["/bin/sh", "-c", "true"], cwd=tmp_path)
+
+
+def test_missing_backend_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", tmp_path / "missing")
+    with pytest.raises(confinement.ConfinementUnavailable, match="sandbox-exec"):
+        confinement.SeatbeltBackend().prepare(["/bin/true"], cwd=tmp_path)
+
+
+def test_environment_does_not_trust_injected_runtime(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/untrusted")
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", "/untrusted.dylib")
+    for name in ("ANTHROPIC_API_KEY", "MIMIR_TEST_SECRET", "SSH_AUTH_SOCK", "BASH_ENV", "ENV", "LD_PRELOAD"):
+        monkeypatch.setenv(name, "must-not-inherit")
+    env = confinement._environment()
+    assert "must-not-inherit" not in env.values()
+    assert "DYLD_INSERT_LIBRARIES" not in env
+    assert env["PYTHONPATH"] != "/untrusted"
+    assert env["PYTHONNOUSERSITE"] == "1"
+
+
+@pytest.fixture
+def fixture_scope(tmp_path):
+    tmp_path = tmp_path.resolve()
+    cwd = tmp_path / 'cwd "quoted" café'
+    cwd.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (cwd / "inside").write_text("fixture")
+    (outside / "approved").write_text("fixture")
+    (outside / "denied").write_text("fixture")
+    (cwd / "escape").symlink_to(outside / "denied")
+    return cwd, outside
+
+
+def run_confined(argv, cwd, approved=()):
+    prepared = confinement.prepare_command(argv, cwd=cwd, approved_paths=approved)
+    return subprocess.run(
+        prepared.argv, cwd=cwd, env=prepared.env, text=True,
+        capture_output=True, timeout=15,
+    )
+
+
+@MACOS
+def test_shell_scope_exact_file_and_symlink_escape(fixture_scope):
+    cwd, outside = fixture_scope
+    command = "echo local > created; /bin/cat inside >/dev/null"
+    result = run_confined(["/bin/sh", "-c", command], cwd)
+    assert result.returncode == 0, result.stderr
+    assert (cwd / "created").read_text() == "local\n"
+    approved = outside / "approved"
+    approval = ScopeApproval(approved, recursive=False)
+    result = run_confined(["/bin/cat", str(approved)], cwd, [approval])
+    assert result.returncode == 0, result.stderr
+    for denied in (outside / "denied", cwd / "escape", Path("/etc/hosts")):
+        # Redirect contents even if confinement regresses: never print hosts data.
+        result = run_confined(
+            ["/bin/sh", "-c", f"/bin/cat {shlex.quote(str(denied))} >/dev/null"],
+            cwd, [approval],
+        )
+        assert result.returncode != 0, f"unexpected read permission: {denied}"
+    result = run_confined(
+        ["/bin/sh", "-c", f"echo denied > {shlex.quote(str(outside / 'new'))}"], cwd,
+    )
+    assert result.returncode != 0
+    assert not (outside / "new").exists()
+
+
+def test_seatbelt_approved_directory_policy_includes_descendants(monkeypatch, tmp_path):
+    """Pin directory-tree approval independently of macOS availability."""
+    cwd = (tmp_path / "session").resolve()
+    cwd.mkdir()
+    approved = (tmp_path / "approved").resolve()
+    approved.mkdir()
+    (approved / "child.txt").write_text("fixture")
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    monkeypatch.setattr(confinement, "_runtime_reads", lambda: (set(), set()))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[ScopeApproval(approved, recursive=True)],
+    )
+    profile = prepared.argv[2]
+    # Exact rule equality catches dropping descendants or widening to a parent.
+    # No helper under test constructs this expectation.
+    filters = sorted((f'(subpath {json.dumps(str(cwd))})',
+                      f'(subpath {json.dumps(str(approved))})'))
+    writable = [line for line in profile.splitlines()
+                if line.startswith("(allow file-read* file-write*")]
+    assert writable == ["(allow file-read* file-write* " + " ".join(filters) + ")"]
+    assert f'(literal {json.dumps(str(approved))})' not in profile
+
+
+@MACOS
+def test_directory_addition_grants_subtree_without_escape(fixture_scope):
+    cwd, outside = fixture_scope
+    directory = outside / "approved-tree"
+    nested = directory / "nested"
+    nested.mkdir(parents=True)
+    existing = nested / "existing"
+    existing.write_text("fixture")
+    sibling = outside / "approved-tree-sibling"
+    sibling.mkdir()
+    (sibling / "denied").write_text("fixture")
+    escape = nested / "escape"
+    escape.symlink_to(outside)
+    approval = ScopeApproval(directory, recursive=True)
+    created = nested / "new" / "created"
+    script = (
+        "from pathlib import Path; "
+        f"existing = Path({str(existing)!r}); "
+        "assert existing.read_text() == 'fixture'; "
+        "existing.write_text('updated'); "
+        f"created = Path({str(created)!r}); "
+        "created.parent.mkdir(); created.write_text('created')"
+    )
+    result = run_confined([sys.executable, "-c", script], cwd, [approval])
+    assert result.returncode == 0, result.stderr
+    assert existing.read_text() == "updated"
+    assert created.read_text() == "created"
+    for denied in (outside / "denied", sibling / "denied", escape / "denied"):
+        result = run_confined(["/bin/cat", str(denied)], cwd, [approval])
+        assert result.returncode != 0, f"unexpected read permission: {denied}"
+        result = run_confined(
+            ["/bin/sh", "-c", f"echo changed > {shlex.quote(str(denied))}"],
+            cwd, [approval],
+        )
+        assert result.returncode != 0, f"unexpected write permission: {denied}"
+        assert denied.read_text() == "fixture"
+    for denied in (outside / "new", sibling / "new", escape / "new"):
+        result = run_confined(
+            ["/bin/sh", "-c", f"echo denied > {shlex.quote(str(denied))}"],
+            cwd, [approval],
+        )
+        assert result.returncode != 0, f"unexpected create permission: {denied}"
+        assert not denied.exists()
+
+
+@pytest.mark.parametrize("recursive", [False, True], ids=["file-literal", "directory-subpath"])
+def test_seatbelt_profile_exact_writable_scope(monkeypatch, fixture_scope, recursive):
+    cwd, outside = fixture_scope
+    approved = outside / "approved"
+    if recursive:
+        approved.unlink()
+        approved.mkdir()
+        (approved / "escape").symlink_to(outside / "denied")
+    approval = ScopeApproval(approved, recursive=recursive)
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[approval],
+    )
+    profile = prepared.argv[2]
+    filters = sorted([
+        f'(subpath {json.dumps(str(cwd), ensure_ascii=False)})',
+        f'({"subpath" if recursive else "literal"} {json.dumps(str(approved), ensure_ascii=False)})',
+    ])
+    # Exact writable rules exclude parent trees, prefix siblings and escape targets.
+    assert [line for line in profile.splitlines() if "file-write" in line] == [
+        "(allow file-read* file-write* " + " ".join(filters) + ")",
+        '(allow file-write* (literal "/dev/null"))',
+    ]
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink-to-directory", "symlink-to-file"])
+def test_seatbelt_profile_preserves_file_snapshot(monkeypatch, fixture_scope, replacement):
+    cwd, outside = fixture_scope
+    approved = outside / "approved"
+    assert approved.is_file()
+    approval = ScopeApproval(approved.resolve(), recursive=False)
+    approved.unlink()
+    if replacement == "directory":
+        approved.mkdir()
+    elif replacement == "symlink-to-directory":
+        approved.symlink_to(outside, target_is_directory=True)
+    else:
+        approved.symlink_to(outside / "denied")
+    monkeypatch.setattr(confinement.SeatbeltBackend, "executable", Path(sys.executable))
+    prepared = confinement.SeatbeltBackend().prepare(
+        ["/bin/true"], cwd=cwd, approved_paths=[approval],
+    )
+    filters = sorted([
+        f'(subpath {json.dumps(str(cwd), ensure_ascii=False)})',
+        f'(literal {json.dumps(str(approval.path), ensure_ascii=False)})',
+    ])
+    assert [line for line in prepared.argv[2].splitlines() if "file-write" in line] == [
+        "(allow file-read* file-write* " + " ".join(filters) + ")",
+        '(allow file-write* (literal "/dev/null"))',
+    ]
+
+
+@MACOS
+def test_persistent_python_native_scope(fixture_scope):
+    cwd, outside = fixture_scope
+    approved = outside / "approved"
+    script = """
+import ctypes, json, sys
+libc = ctypes.CDLL(None)
+count = 0
+for line in sys.stdin:
+    count += 1
+    path = json.loads(line)
+    fd = libc.open(path.encode(), 0)
+    allowed = fd >= 0
+    if allowed:
+        libc.close(fd)
+    print(json.dumps({'request': count, 'allowed': allowed}), flush=True)
+"""
+    prepared = confinement.prepare_command(
+        [sys.executable, "-c", script], cwd=cwd,
+        approved_paths=[ScopeApproval(approved, recursive=False)],
+    )
+    paths = [cwd / "inside", approved, outside / "denied", cwd / "escape", Path("/etc/hosts")]
+    result = subprocess.run(
+        prepared.argv, env=prepared.env, cwd=cwd,
+        input="".join(json.dumps(str(path)) + "\n" for path in paths),
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert [json.loads(line) for line in result.stdout.splitlines()] == [
+        {"request": i + 1, "allowed": allowed}
+        for i, allowed in enumerate((True, True, False, False, False))
+    ]
+    result = run_confined(
+        [sys.executable, "-c", "from pathlib import Path; Path('written').write_text('fixture')"], cwd,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (cwd / "written").read_text() == "fixture"
+
+
+@MACOS
+def test_module_runtime_and_private_scratch(fixture_scope, tmp_path):
+    cwd, outside = fixture_scope
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    prepared = confinement.prepare_command(
+        [sys.executable, "-c", "import mimir.acp.python_kernel; from pathlib import Path; "
+         f"Path({str(scratch / 'out')!r}).write_text('fixture')"],
+        cwd=cwd, scratch_paths=[scratch],
+    )
+    result = subprocess.run(prepared.argv, env=prepared.env, cwd=cwd, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert (scratch / "out").read_text() == "fixture"
+    # A runtime scratch grant must not imply access to another sibling directory.
+    assert run_confined(["/bin/cat", str(outside / "denied")], cwd).returncode != 0
+
+
+@MACOS
+def test_suppressed_denials_are_not_observable(fixture_scope):
+    cwd, outside = fixture_scope
+    result = run_confined(
+        ["/bin/sh", "-c", f"/bin/cat {shlex.quote(str(outside / 'denied'))} 2>/dev/null || true"], cwd,
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+@MACOS
+def test_invalid_profile_does_not_execute(tmp_path):
+    marker = tmp_path / "executed"
+    result = subprocess.run(
+        [str(confinement.SeatbeltBackend.executable), "-p", "(version 1)(unknown-operation)",
+         "/usr/bin/touch", str(marker)], capture_output=True, timeout=15,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+@MACOS
+def test_replaced_approved_file_does_not_grant_new_symlink_target(fixture_scope):
+    cwd, outside = fixture_scope
+    approved = (outside / "approved").resolve()
+    approval = ScopeApproval(approved, recursive=False)
+    approved.unlink()
+    approved.symlink_to(outside / "denied")
+    result = run_confined(["/bin/cat", str(approved)], cwd, [approval])
+    assert result.returncode != 0
+
+
+@MACOS
+def test_replaced_session_cwd_fails_closed(fixture_scope):
+    cwd, outside = fixture_scope
+    frozen_cwd = cwd.resolve()
+    cwd.rename(cwd.with_name("original-cwd"))
+    cwd.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(confinement.ConfinementUnavailable, match="changed identity"):
+        confinement.prepare_command(["/bin/cat", "denied"], cwd=frozen_cwd)
+
+
+@MACOS
+def test_replaced_scratch_directory_fails_closed(fixture_scope, tmp_path):
+    cwd, outside = fixture_scope
+    scratch = (tmp_path / "scratch").resolve()
+    scratch.mkdir()
+    scratch.rmdir()
+    scratch.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(confinement.ConfinementUnavailable, match="scratch directory changed identity"):
+        confinement.prepare_command(["/bin/cat", str(outside / "denied")], cwd=cwd, scratch_paths=[scratch])
+
+
+@MACOS
+def test_scratch_root_cannot_be_removed_by_child(fixture_scope, tmp_path):
+    cwd, _ = fixture_scope
+    scratch = (tmp_path / "scratch").resolve()
+    scratch.mkdir()
+    prepared = confinement.prepare_command(
+        [sys.executable, "-c", f"import os; os.rmdir({str(scratch)!r})"],
+        cwd=cwd, scratch_paths=[scratch],
+    )
+    result = subprocess.run(prepared.argv, env=prepared.env, cwd=cwd, capture_output=True, timeout=15)
+    assert result.returncode != 0
+    assert scratch.is_dir()
+
+
+@pytest.fixture
+def apparmor(monkeypatch, tmp_path):
+    backend = confinement.AppArmorBackend()
+    enabled = tmp_path / "enabled"
+    enabled.write_text("Y\n")
+    tool = tmp_path / "tool"
+    tool.write_text("")
+    tool.chmod(0o700)
+    monkeypatch.setattr(confinement.AppArmorBackend, "enabled", enabled)
+    for name in ("parser", "executable", "interpreter"):
+        monkeypatch.setattr(confinement.AppArmorBackend, name, tool)
+    monkeypatch.setattr(confinement, "_backend", lambda: backend)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        stdout = argv[2] + " (enforce)\n" if "-p" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(confinement.subprocess, "run", run)
+    return backend, calls, run
+
+
+@pytest.mark.parametrize("platform, expected", [
+    ("linux", confinement.AppArmorBackend), ("darwin", confinement.SeatbeltBackend),
+])
+def test_backend_platform_selection(monkeypatch, platform, expected):
+    monkeypatch.setattr(confinement.sys, "platform", platform)
+    assert isinstance(confinement._backend(), expected)
+
+
+@pytest.mark.parametrize("suffix", [
+    '"', "'", " ", "\t", "\n", "\r", "*", "?", "[x]", "{a,b}",
+    "\\", "@{HOME}", "#", ",", "\x00", "\udcff", "\u00a0",
+])
+@pytest.mark.parametrize("source", ["cwd", "approved", "scratch"])
+def test_apparmor_refuses_path_syntax(suffix, source):
+    values = {"cwd": Path("/session"), "approved": Path("/approved"), "scratch": Path("/scratch")}
+    values[source] = Path("/bad" + suffix)
+    with pytest.raises(confinement.ConfinementUnavailable, match="represent"):
+        confinement.apparmor_profile(values["cwd"], [ScopeApproval(values["approved"], recursive=True)], [values["scratch"]])
+
+
+@pytest.mark.parametrize("path", ["/", "relative", "/a/../b"])
+def test_apparmor_requires_frozen_nonroot_path(path):
+    with pytest.raises(confinement.ConfinementUnavailable):
+        confinement.apparmor_profile(Path(path))
+
+
+def test_apparmor_enforce_allowlist_denies_network():
+    profile = confinement.apparmor_profile(Path("/session"))
+    header, *rules = profile.splitlines()
+    # No flags (complain/default_allow), includes, or exec transitions may widen it.
+    assert header.split() == ["profile", header.split()[1], "{"]
+    # Exact allowlist: no network grant, so the default-deny profile blocks it.
+    assert rules == [
+        "  /** ix,",
+        "  /usr/bin/** mr,", "  /bin/** mr,",
+        "  /usr/lib/** mr,", "  /usr/lib64/** mr,",
+        "  /lib/** mr,", "  /lib64/** mr,", "  /usr/local/lib/** mr,",
+        "  /etc/ld.so.cache r,",
+        "  /dev/null rw,", "  /dev/urandom r,", "  /dev/random r,",
+        "  /proc/*/attr/current r,",
+        "  /session rwk,", "  /session/ rw,", "  /session/** rwk,",
+        "}",
+    ]
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="requires Seatbelt or AppArmor")
+def test_real_sandbox_denies_network(tmp_path):
+    cwd = tmp_path.resolve()
+    interpreter = str(confinement.AppArmorBackend.interpreter) if sys.platform == "linux" else sys.executable
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        listener.settimeout(5)
+        script = f"""import socket
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect({listener.getsockname()!r})
+except OSError as exc:
+    print(exc.errno)
+else:
+    print('connected')
+"""
+        argv = [interpreter, "-I", "-S", "-c", script]
+        control = subprocess.run(
+            argv, cwd=cwd, env=confinement._environment(), capture_output=True,
+            text=True, timeout=15, close_fds=True,
+        )
+        assert control.returncode == 0, control.stderr
+        assert control.stdout.strip() == "connected", control.stdout
+        connection, _ = listener.accept()
+        connection.close()
+        try:
+            prepared = confinement.prepare_command(argv, cwd=cwd)
+        except confinement.BackendUnavailable as exc:
+            pytest.skip(str(exc))
+        assert prepared.execution_mode == "confined"
+        result = subprocess.run(
+            prepared.argv, cwd=cwd, env=prepared.env, capture_output=True,
+            text=True, timeout=15, close_fds=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() in {str(errno.EACCES), str(errno.EPERM)}, result.stdout
+
+
+def test_apparmor_approved_directory_policy_includes_descendants():
+    """Pin tree approval in synthesized policy, not live kernel enforcement."""
+    baseline = confinement.apparmor_profile(Path("/session"))
+    profile = confinement.apparmor_profile(
+        Path("/session"), approved_paths=[ScopeApproval(Path("/outside/approved"), recursive=True)],
+    )
+    # Ignore only the content-addressed profile header; compare every rule so
+    # dropping descendants or granting a parent/sibling cannot pass unnoticed.
+    baseline_rules = set(baseline.splitlines()[1:])
+    rules = set(profile.splitlines()[1:])
+    assert baseline_rules <= rules
+    assert rules - baseline_rules == {
+        "  /outside/approved rwk,",
+        "  /outside/approved/ rw,",
+        "  /outside/approved/** rwk,",
+    }
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink"])
+def test_apparmor_file_approval_never_grows_after_replacement(tmp_path, replacement):
+    cwd = tmp_path / "session"
+    cwd.mkdir()
+    approved = tmp_path / "approved"
+    approved.touch()
+    grant = ScopeApproval(approved, recursive=False)
+    before = confinement.apparmor_profile(cwd, [grant])
+    approved.unlink()
+    if replacement == "directory":
+        approved.mkdir()
+        (approved / "child").touch()
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        approved.symlink_to(outside, target_is_directory=True)
+    after = confinement.apparmor_profile(cwd, [grant])
+    assert after == before
+    baseline = set(confinement.apparmor_profile(cwd).splitlines()[1:])
+    assert set(after.splitlines()[1:]) - baseline == {f"  {approved} rwk,"}
+
+
+def test_apparmor_pure_exact_scope(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("synthesis must not inspect files or start processes")
+    with monkeypatch.context() as patch:
+        for name in ("resolve", "stat", "read_text", "is_dir", "is_file"):
+            patch.setattr(Path, name, forbidden)
+        patch.setattr(subprocess, "run", forbidden)
+        profile = confinement.apparmor_profile(Path("/session"), [ScopeApproval(Path("/outside/approved"), recursive=True)], [Path("/scratch")])
+    assert profile == confinement.apparmor_profile(Path("/session"), [ScopeApproval(Path("/outside/approved"), recursive=True)], [Path("/scratch")])
+    writable = {line.strip() for line in profile.splitlines() if " rw" in line}
+    assert writable == {
+        "/dev/null rw,", "/session rwk,", "/session/ rw,", "/session/** rwk,",
+        "/outside/approved rwk,", "/outside/approved/ rw,", "/outside/approved/** rwk,",
+        "/scratch rwk,", "/scratch/ rw,", "/scratch/** rwk,",
+    }
+    assert "ux," not in profile and "px," not in profile and "change_profile" not in profile
+    assert "complain" not in profile
+    assert "  deny /scratch w," in profile
+    assert "  deny /scratch/ w," in profile
+
+
+@pytest.mark.parametrize("enabled", ["N", "", "yes", "Y (complain)", "\udcff"])
+def test_apparmor_lsm_must_be_enabled(apparmor, tmp_path, enabled):
+    backend, calls, _ = apparmor
+    backend.enabled.write_bytes(enabled.encode("utf-8", errors="surrogateescape"))
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+@pytest.mark.parametrize("missing", ["enabled", "parser", "executable", "interpreter"])
+def test_apparmor_missing_prerequisite(apparmor, tmp_path, monkeypatch, missing):
+    backend, calls, _ = apparmor
+    monkeypatch.setattr(backend, missing, tmp_path / "missing")
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+def test_apparmor_executable_permission_required(apparmor, tmp_path):
+    backend, calls, _ = apparmor
+    backend.parser.chmod(0o600)
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+@pytest.mark.parametrize("name", ["parser", "executable", "interpreter"])
+def test_apparmor_tool_must_be_regular_file(apparmor, monkeypatch, tmp_path, name):
+    backend, calls, _ = apparmor
+    monkeypatch.setattr(backend, name, tmp_path)
+    with pytest.raises(confinement.BackendUnavailable):
+        backend.prepare(["/bin/true"], cwd=tmp_path)
+    assert not calls
+
+
+@pytest.mark.parametrize("path", [Path('/bad"'), Path('/bad\udcff')])
+def test_apparmor_bad_scope_never_uses_existing_risk_consent(apparmor, tmp_path, path):
+    with pytest.raises(confinement.ConfinementUnavailable, match="represent"):
+        confinement.prepare_command(["/bin/true"], cwd=tmp_path,
+                                    approved_paths=[ScopeApproval(path, recursive=False)], allow_unconfined=True)
+    assert not apparmor[1]
+
+
+def test_apparmor_prepares_only_after_load_and_transition(apparmor, tmp_path):
+    backend, calls, _ = apparmor
+    approved = ScopeApproval(tmp_path / "approved", recursive=True)
+    prepared = backend.prepare(["/bin/sh", "-c", "exit 37"], cwd=tmp_path, approved_paths=[approved])
+    assert prepared.execution_mode == "confined"
+    assert len(calls) == 3
+    assert calls[0][0][-1] == "--skip-kernel-load"
+    assert calls[1][0][-1] == "--replace"
+    assert calls[0][1]["input"] == calls[1][1]["input"] == confinement.apparmor_profile(tmp_path, [approved])
+    assert all("--config-file=/dev/null" in argv and "--skip-cache" in argv and "--Werror" in argv
+               for argv, _ in calls[:2])
+    assert all(kwargs["close_fds"] and kwargs["timeout"] == 15 for _, kwargs in calls)
+    assert prepared.argv == (*calls[2][0], "/bin/sh", "-c", "exit 37")
+    assert calls[2][0][3:9] == ("--", str(backend.interpreter), "-I", "-S", "-c", confinement._APPARMOR_LAUNCH)
+    assert prepared.env["TMPDIR"] == str(tmp_path)
+    assert not any(str(approved.path) in arg for argv, _ in calls[:2] for arg in argv)
+
+
+@pytest.mark.parametrize("code, label", [
+    (0, "unconfined"), (0, "{name} (complain)"), (0, "other (enforce)"),
+    (1, "{name} (enforce)"), (0, ""), (0, "{name}//other (enforce)"),
+])
+def test_apparmor_transition_not_inferred_from_successful_load(apparmor, monkeypatch, tmp_path, code, label):
+    backend, calls, run = apparmor
+    def bad_probe(argv, **kwargs):
+        result = run(argv, **kwargs)
+        if "-p" in argv:
+            return subprocess.CompletedProcess(argv, code, label.format(name=argv[2]), "")
+        return result
+    monkeypatch.setattr(subprocess, "run", bad_probe)
+    with pytest.raises(confinement.BackendUnavailable, match="transition"):
+        confinement.prepare_command(["/bin/true"], cwd=tmp_path)
+    assert len(calls) == 3
+    prepared = confinement.prepare_command(["/bin/true"], cwd=tmp_path, allow_unconfined=True)
+    assert prepared.execution_mode == "unconfined" and prepared.argv == ("/bin/true",)
+
+
+@pytest.mark.parametrize("phase", [0, 1, 2])
+@pytest.mark.parametrize("failure", ["status", "oserror", "timeout"])
+def test_apparmor_setup_failures_never_silently_execute(apparmor, monkeypatch, tmp_path, phase, failure):
+    backend, calls, run = apparmor
+    def fail(argv, **kwargs):
+        if len(calls) == phase:
+            calls.append((argv, kwargs))
+            if failure == "oserror":
+                raise OSError("fixture")
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, 15)
+            return subprocess.CompletedProcess(argv, 1, "", "fixture")
+        return run(argv, **kwargs)
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(confinement.ConfinementUnavailable):
+        confinement.prepare_command(["/bin/true"], cwd=tmp_path)
+    assert len(calls) == phase + 1
+    if phase == 0 and failure == "status":
+        calls.clear()
+        with pytest.raises(confinement.ConfinementUnavailable, match="compilation"):
+            confinement.prepare_command(["/bin/true"], cwd=tmp_path, allow_unconfined=True)
+
+
+@pytest.mark.parametrize("kind", ["cwd", "scratch"])
+def test_apparmor_changed_identity_is_not_backend_absence(apparmor, tmp_path, kind):
+    backend, calls, _ = apparmor
+    alias = tmp_path / "alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    kwargs = {"cwd": alias} if kind == "cwd" else {"cwd": tmp_path, "scratch_paths": [alias]}
+    with pytest.raises(confinement.ConfinementUnavailable, match="identity"):
+        confinement.prepare_command(["/bin/true"], allow_unconfined=True, **kwargs)
+    assert not calls
+
+
+@pytest.mark.parametrize("kind", ["cwd", "scratch"])
+def test_apparmor_missing_directory_is_not_backend_absence(apparmor, tmp_path, kind):
+    missing = tmp_path / "missing"
+    kwargs = {"cwd": missing} if kind == "cwd" else {"cwd": tmp_path, "scratch_paths": [missing]}
+    with pytest.raises(confinement.ConfinementUnavailable, match="identity"):
+        confinement.prepare_command(["/bin/true"], allow_unconfined=True, **kwargs)
+
+
+def test_apparmor_empty_command(apparmor, tmp_path):
+    with pytest.raises(ValueError, match="argv"):
+        apparmor[0].prepare([], cwd=tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_apparmor_rejected_candidate_is_never_loaded_or_launched(apparmor, monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+    from mimir.acp import hosted
+
+    backend, calls, _ = apparmor
+    monkeypatch.setattr(confinement.sys, "platform", "linux")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(candidate, target_is_directory=True)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    validated = []
+    synthesize = confinement.apparmor_profile
+    def synth(cwd, approved_paths=(), scratch_paths=()):
+        approved_paths = tuple(approved_paths)
+        validated.append(approved_paths)
+        return synthesize(cwd, approved_paths, scratch_paths)
+    monkeypatch.setattr(confinement, "apparmor_profile", synth)
+    grant = ScopeApproval(candidate.resolve(), recursive=True)
+    async def reject(*args):
+        assert validated[-1] == (grant,)
+        assert all(str(candidate) not in kwargs.get("input", "") for _, kwargs in calls)
+        return False
+    provider = hosted.HostedHandsProvider(request_scope_permission=AsyncMock(side_effect=reject))
+    provider.bind_session("s", cwd)
+    session = provider._sessions["s"]
+    result = await provider.request_scope(session, str(alias))
+    assert not result["approved"]
+    provider._request_scope_permission.assert_awaited_once_with("s", grant)
+    assert not session.scope.approved
+    # Exercise the actual execution callsite, stopping at process creation.
+    spawn = AsyncMock(side_effect=OSError("fixture: do not run emulated AppArmor"))
+    monkeypatch.setattr(hosted.asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(hosted.HostedMcpError, match="fixture"):
+        await provider._confined_shell(session, "true")
+    spawn.assert_awaited_once()
+    assert all(str(candidate) not in kwargs.get("input", "") for _, kwargs in calls)
+    assert validated[-1] == ()
+    await provider.close()
+
+
+def test_apparmor_validation_loads_nothing(apparmor, monkeypatch, tmp_path):
+    monkeypatch.setattr(confinement.sys, "platform", "linux")
+    confinement.validate_scope(cwd=tmp_path, candidate_paths=[ScopeApproval(tmp_path / "candidate", recursive=True)])
+    assert not apparmor[1]
+
+
+@pytest.mark.parametrize("label", ["unconfined", "intended (complain)", "other (enforce)", "intended (enforce)"])
+def test_apparmor_actual_launcher_checks_label_before_exec(label, tmp_path):
+    # Exercise the actual launcher source in an isolated child, emulating only
+    # the kernel label file. This is not an AppArmor enforcement test.
+    marker = tmp_path / "ran"
+    script = f"""import builtins, io, sys
+real_open = builtins.open
+builtins.open = lambda path, *a, **kw: io.StringIO({label!r}) if path == '/proc/self/attr/current' else real_open(path, *a, **kw)
+sys.argv = ['launcher', 'intended', sys.executable, '-c', {f'from pathlib import Path; Path({str(marker)!r}).touch(); raise SystemExit(37)'!r}]
+exec({confinement._APPARMOR_LAUNCH!r})
+"""
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", script], capture_output=True, timeout=15)
+    assert marker.exists() is (label == "intended (enforce)")
+    assert result.returncode == (37 if label == "intended (enforce)" else 1)

@@ -1,0 +1,4921 @@
+"""Dedicated coverage for mimir/server.py (chainlink #247, slice 3/5).
+
+Pins behaviour of the components that aren't covered by the three
+existing focused files (test_server_auth_warning, test_server_bind_security,
+test_server_consolidate):
+
+- ``_safe_str_eq``         — constant-time string comparison helper
+- ``_make_auth_middleware`` — key-header gate + exempt-route bypass
+- ``_AUTH_EXEMPT``         — correct set membership
+- ``_MaskApiKeyInAccessLog`` — access-log filter redaction
+- ``_handle_health``       — liveness endpoint
+- ``_handle_event``        — event injection endpoint (valid + error paths)
+
+All tests exercise these units without standing up the full ``build_app``
+wiring (dispatcher, scheduler, saga, bridges) — each test builds a
+minimal ``aiohttp.web.Application`` with only the routes and state
+needed to prove the behaviour under test.
+"""
+from __future__ import annotations
+
+import ast
+import asyncio
+import builtins
+import inspect
+import json
+import logging
+import os
+import signal
+import shutil
+import sys
+import tempfile
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from aiohttp import ClientSession, web
+from tests.timing import HANG_GUARD_SECONDS
+from aiohttp.test_utils import TestClient, TestServer
+
+from mimir.server import (
+    _AUTH_EXEMPT,
+    _AUTH_EXEMPT_PREFIXES,
+    _MaskApiKeyInAccessLog,
+    _is_auth_exempt,
+    _make_auth_middleware,
+    _safe_str_eq,
+    _start_mcp_servers,
+    _handle_health,
+    _capture_controller_source_commit,
+    _handle_event,
+    _handle_root,
+    build_app,
+    _http_runner,
+    _record_shutdown_signal,
+)
+
+
+@pytest.mark.asyncio
+async def test_real_http_shutdown_closes_all_sse_before_marker(tmp_path, monkeypatch, caplog):
+    """Three real SSE handlers must release aiohttp before graceful cleanup."""
+    from mimir import web_ui
+    from mimir.bridges.web_chat import WebChatBridge as RealWebChatBridge
+    from mimir.http_shutdown import HTTP_SHUTDOWN
+    from mimir.turn_event_bus import TurnEventBus
+
+    real_routes = web_ui.register_routes
+    controlled, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(controlled)
+    app = web.Application()
+    app[HTTP_SHUTDOWN] = controlled[HTTP_SHUTDOWN]
+    real_routes(app, turns_log=tmp_path / "turns.jsonl",
+                events_log=tmp_path / "events.jsonl", turn_event_bus=TurnEventBus())
+
+    @web.middleware
+    async def identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    app.middlewares.append(identity)
+    chat = RealWebChatBridge(enqueue=AsyncMock(return_value=True), home=tmp_path)
+    chat.register_routes(app)
+    # These are the actual build_app lifecycle hooks, shared with the app-level
+    # signal; the small app avoids starting the unrelated runtime a second time.
+    app.on_shutdown.append(next(h for h in controlled.on_shutdown
+                                if getattr(h, "__name__", "") == "_on_shutdown"))
+    app.on_cleanup.append(next(h for h in controlled.on_cleanup
+                               if getattr(h, "__name__", "") == "_handlers_drained"))
+    completed = []
+
+    async def finish(_app):
+        await _run_cleanup(controlled)
+        completed.append("marker")
+
+    app.on_cleanup.append(finish)
+    # An ignored shutdown signal must fail the 9s hang guard rather than
+    # succeeding only because aiohttp forcibly cancels handlers at its bound.
+    runner = _http_runner(app, SimpleNamespace(http_shutdown_timeout_seconds=30.0))
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    caplog.set_level(logging.INFO, logger="mimir.server")
+    async with ClientSession() as session:
+        streams = [await session.get(f"http://127.0.0.1:{port}{path}") for path in (
+            "/api/v1/live-events", "/api/v1/turn-events", "/chat/stream",
+        )]
+        try:
+            assert all(stream.status == 200 for stream in streams)
+            assert app[HTTP_SHUTDOWN].active_streams == 3
+            _record_shutdown_signal(app, signal.SIGTERM)
+            await asyncio.wait_for(runner.cleanup(), 9)
+            assert completed == ["marker"]
+            assert "liveness:clean" in control.events
+            assert [await stream.content.read() for stream in streams] == [b"", b"", b""]
+            assert app[HTTP_SHUTDOWN].active_streams == 0
+            stages = [r.getMessage() for r in caplog.records if r.name == "mimir.server"
+                      and r.getMessage().startswith("shutdown:")]
+            expected = ("signal received (SIGTERM)", "sites stopped", "dispatcher drain start",
+                        "streams active at shutdown (3)", "handlers drained", "clean marker written",
+                        "dispatcher drain end", "cleanup complete")
+            assert [next(s for s in stages if name in s) for name in expected] == stages
+            assert all("elapsed=" in stage for stage in stages)
+        finally:
+            if not completed:
+                for stream in streams:
+                    stream.close()
+                await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_on_shutdown_closes_admission_before_handler_drain_and_cleanup_is_idempotent(
+    tmp_path, monkeypatch,
+):
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+    shutdown = next(h for h in app.on_shutdown if getattr(h, "__name__", "") == "_on_shutdown")
+    await shutdown(app)
+    control.events.append("handlers:drained")
+    await _run_cleanup(app)
+    assert control.events.count("scheduler:stop") == 1
+    assert control.events.index("scheduler:stop") < control.events.index("dispatcher:close")
+    assert control.events.count("dispatcher:drain") == 1
+    assert control.events.index("dispatcher:close") < control.events.index("handlers:drained")
+    assert control.events.index("dispatcher:close") < control.events.index("dispatcher:drain")
+    assert control.events.index("webchat:disconnect") < control.events.index("handlers:drained")
+
+
+def test_http_runner_uses_configured_shutdown_bound(tmp_path, monkeypatch):
+    from mimir.config import Config
+    monkeypatch.delenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", raising=False)
+    assert Config.from_env().http_shutdown_timeout_seconds == 5.0
+    monkeypatch.setenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", "2.5")
+    config = Config.from_env()
+    runner = _http_runner(web.Application(), config)
+    assert runner._shutdown_timeout == 2.5
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "-inf"])
+def test_http_shutdown_timeout_rejects_nonpositive_or_nonfinite(monkeypatch, raw):
+    from mimir.config import Config
+
+    monkeypatch.setenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", raw)
+    with pytest.raises(ValueError, match="MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS"):
+        Config.from_env()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_stage", ["drain", "bundle"])
+async def test_clean_marker_precedes_blocked_graceful_cleanup(
+    tmp_path, monkeypatch, blocked_stage,
+):
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    marked = asyncio.Event()
+    from mimir import liveness
+
+    def mark_clean(home):
+        control.hit("liveness:clean")
+        marked.set()
+        return True
+
+    monkeypatch.setattr(liveness, "mark_clean_shutdown", mark_clean)
+
+    async def block(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    if blocked_stage == "drain":
+        control.dispatcher.drain = block
+        # Exercise joining the drain that on_shutdown started, not just the
+        # cleanup-only fallback.
+        shutdown = next(h for h in app.on_shutdown
+                        if getattr(h, "__name__", "") == "_on_shutdown")
+        await shutdown(app)
+    else:
+        control.bundle.aclose = block
+
+    cleanup = asyncio.create_task(_run_cleanup(app))
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        # The early drain may enter before cleanup; observe the marker itself.
+        await asyncio.wait_for(marked.wait(), HANG_GUARD_SECONDS)
+        assert "liveness:clean" in control.events
+        assert not cleanup.done()
+        assert "bridges:disconnect" not in control.events
+    finally:
+        release.set()
+        await asyncio.wait_for(cleanup, HANG_GUARD_SECONDS)
+    assert control.events.count("liveness:clean") == 1
+
+
+def test_server_startup_routes_factory_recovery_to_run_epic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The expected argv below is the DEFAULT run_bin. server.py resolves it as
+    # shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir"), and the live
+    # deployment sets WORKLINK_RUN_BIN="uv run mimir", so without pinning it here
+    # this test asserts ambient state it does not own: green in CI, red in every
+    # Worklink sandbox that inherits the container env.
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+    pytest.importorskip("mimir_cultivate")
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
+    from mimir_cultivate.server import reattach_inflight_worklink_runs
+
+    record = factory_state.FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory.js",
+        sandbox=str(tmp_path / ".factory-sandboxes" / "chainlink-700"),
+        session=None,
+        handle=None,
+        observed_at=None,
+        controller_phase="running",
+        status=None,
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: factory_state.FactoryRecordListing((record,), ()),
+    )
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
+    spawned: list[tuple[list[str], dict[str, Any]]] = []
+
+    dispatched = reattach_inflight_worklink_runs(
+        tmp_path,
+        popen=lambda argv, **kwargs: spawned.append((list(argv), kwargs)) or object(),
+    )
+
+    assert dispatched == [700]
+    argv, kwargs = spawned[0]
+    assert argv[:4] == ["mimir", "worklink", "run-epic", "700"]
+    expected_log = tmp_path / "state" / "worklink" / "runs" / "factory-recover-700.log"
+    assert kwargs["env"]["WORKLINK_RUN_LOG"] == str(expected_log)
+
+
+def test_server_factory_spawn_failure_records_all_recovery_pointers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.server import reattach_inflight_worklink_runs
+
+    transcript = tmp_path / "factory-transcript.json"
+    record = factory_state.FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=3,
+        repository="owner/repo",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        launcher="/opt/factory.js",
+        sandbox=str(tmp_path / ".factory-sandboxes" / "chainlink-700"),
+        session="session-1",
+        handle=None,
+        observed_at=None,
+        controller_phase="running",
+        status=None,
+        transcript=str(transcript),
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: factory_state.FactoryRecordListing((record,), ()),
+    )
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
+
+    def fail_spawn(argv: list[str], **kwargs: Any) -> object:
+        expected = tmp_path / "state" / "worklink" / "runs" / "factory-recover-700.log"
+        assert kwargs["env"]["WORKLINK_RUN_LOG"] == str(expected)
+        raise OSError("spawn unavailable")
+
+    assert reattach_inflight_worklink_runs(tmp_path, popen=fail_spawn) == []
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert incident["attempt"] == 3
+    assert incident["run_id"] == "chainlink-700"
+    assert incident["work_path"] == record.sandbox
+    assert incident["preserved_ref"] == record.branch
+    assert incident["transcript_path"] == str(transcript)
+    assert incident["log_path"].endswith("factory-recover-700.log")
+
+
+def test_server_leaf_spawn_failure_records_retained_identity_and_actual_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.server import reattach_inflight_worklink_runs
+    from mimir_cultivate.worklink.run_state import WorklinkRunState
+
+    state = WorklinkRunState(
+        issue_id=441,
+        attempt=4,
+        backend="fake",
+        compute_name="fake_remote",
+        handle_substrate="fake_remote",
+        handle_identifier="original-job",
+        branch="issue/441-a4",
+        base_ref="main",
+        local_base="origin/main",
+        repo="/workspace/mimir",
+        repo_url="git@github.com:owner/repo.git",
+        test_command="pytest -q",
+        started_at="2026-09-19T00:00:00+00:00",
+        checkout=str(tmp_path / "retained-checkout"),
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+    monkeypatch.setattr(
+        control, "reconcile_run_states", lambda *args, **kwargs: [state]
+    )
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: factory_state.FactoryRecordListing((), ()),
+    )
+
+    def fail_spawn(argv: list[str], **kwargs: Any) -> object:
+        expected = tmp_path / "state" / "worklink" / "runs" / "reattach-441.log"
+        assert argv[:5] == ["mimir", "worklink", "run", "441", "--reattach"]
+        assert kwargs["env"]["WORKLINK_RUN_LOG"] == str(expected)
+        raise OSError("spawn unavailable")
+
+    assert reattach_inflight_worklink_runs(tmp_path, popen=fail_spawn) == []
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
+    assert incident["attempt"] == state.attempt
+    assert incident["preserved_ref"] == state.branch
+    assert incident["work_path"] == state.checkout
+    assert incident["log_path"].endswith("reattach-441.log")
+
+
+def _production_call_sites(call_name: str) -> set[str]:
+    root = Path(__file__).resolve().parent.parent
+    sites: set[str] = set()
+    for path in (root / "mimir").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if isinstance(function, ast.Name) and function.id == call_name:
+                sites.add(path.relative_to(root).as_posix())
+            elif isinstance(function, ast.Attribute) and function.attr == call_name:
+                sites.add(path.relative_to(root).as_posix())
+    return sites
+
+
+def test_runtime_is_only_production_agent_constructor() -> None:
+    assert _production_call_sites("Agent") == {"mimir/runtime.py"}
+
+
+def test_runtime_is_only_production_global_buffer_writer() -> None:
+    assert _production_call_sites("set_global_buffer") == {"mimir/runtime.py"}
+
+
+def test_runtime_is_only_production_mcp_tools_writer() -> None:
+    assert _production_call_sites("set_mcp_tools") == {"mimir/runtime.py"}
+
+
+def _writer_call_sites(writer_names: set[str]) -> dict[str, set[str]]:
+    root = Path(__file__).resolve().parent.parent
+    sites = {name: set() for name in writer_names}
+    for path in (*(root / "mimir").rglob("*.py"),
+                 *(root / "plugins" / "cultivate" / "mimir_cultivate").rglob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        module_name = relative.removesuffix(".py").replace("/", ".")
+        if relative.startswith("plugins/cultivate/"):
+            module_name = module_name.removeprefix("plugins.cultivate.")
+        package_parts = module_name.split(".")[:-1]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        aliases: dict[str, str] = {}
+        local_writers = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in writer_names
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    prefix = package_parts[: len(package_parts) - node.level + 1]
+                    base = ".".join([*prefix, *(node.module or "").split(".")]).rstrip(".")
+                else:
+                    base = node.module or ""
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = ".".join(
+                        part for part in (base, alias.name) if part
+                    )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            writer: str | None = None
+            if isinstance(node.func, ast.Name):
+                imported = aliases.get(node.func.id, "")
+                if imported.rsplit(".", 1)[-1] in writer_names:
+                    writer = imported.rsplit(".", 1)[-1]
+                elif node.func.id in local_writers:
+                    writer = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                parts: list[str] = []
+                value: ast.expr = node.func
+                while isinstance(value, ast.Attribute):
+                    parts.append(value.attr)
+                    value = value.value
+                if isinstance(value, ast.Name):
+                    base = aliases.get(value.id)
+                    if base is not None:
+                        resolved = ".".join([base, *reversed(parts)])
+                        candidate = resolved.rsplit(".", 1)[-1]
+                        if candidate in writer_names and resolved.startswith(
+                            ("mimir.tools", "mimir.history", "mimir.event_logger")
+                        ):
+                            writer = candidate
+            if writer is not None:
+                sites[writer].add(relative)
+    return sites
+
+
+def test_production_global_writers_are_confined() -> None:
+    root = Path(__file__).resolve().parent.parent
+    expected = {
+        "init_logger": {
+            "mimir/server.py",
+            "plugins/cultivate/mimir_cultivate/commands.py",
+            "mimir/wiki_backlinks.py",
+        },
+        "set_github_identity_degraded_callback": {"plugins/cultivate/mimir_cultivate/registration.py"},
+        "set_forge_client": {
+            "plugins/cultivate/mimir_cultivate/registration.py",
+            "plugins/cultivate/mimir_cultivate/forge.py",
+        },
+        "set_memory_client": {"mimir/agent.py", "mimir/runtime.py"},
+        "set_indexer": {"mimir/runtime.py"},
+        "set_index_generator": {"mimir/runtime.py"},
+        "set_turns_log_path": {"mimir/runtime.py"},
+        "set_channel_registry": {"mimir/runtime.py"},
+        "set_identity_resolver": {"mimir/runtime.py"},
+        "set_dispatcher": {"mimir/runtime.py"},
+        "set_scheduler": {"mimir/runtime.py"},
+        "set_arbiter": {"mimir/runtime.py"},
+        "set_global_buffer": {"mimir/runtime.py"},
+        "set_commitments_store": {"mimir/runtime.py"},
+        "set_spawn_config": {"mimir/runtime.py"},
+        "set_shell_job_registry": {"mimir/runtime.py"},
+        "set_home": {"mimir/runtime.py"},
+        "set_mcp_tools": {"mimir/runtime.py"},
+    }
+    assert _writer_call_sites(set(expected)) == expected
+
+    saga_config_writers = {
+        path.relative_to(root).as_posix()
+        for path in (root / "mimir").rglob("*.py")
+        if 'os.environ["SAGA_CONFIG"] =' in path.read_text(encoding="utf-8")
+    }
+    # Every single-home entrypoint uses the installer instead of writing the env.
+    assert saga_config_writers == set()
+
+    server_source = (root / "mimir" / "server.py").read_text(encoding="utf-8")
+    provider_source = (root / "plugins" / "cultivate" / "mimir_cultivate" / "server.py").read_text(encoding="utf-8")
+    assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] =' in provider_source
+    assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] =' not in server_source
+    assert "_access_log.addFilter(_MaskApiKeyInAccessLog())" in server_source
+
+    server_tree = ast.parse(
+        server_source
+    )
+    module_assignments = [
+        node
+        for node in server_tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+    ]
+    assert not any(
+        target.id == "_STARTUP_BACKGROUND_TASKS"
+        for node in module_assignments
+        for target in (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+        )
+        if isinstance(target, ast.Name)
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MCP production startup wiring
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_returns_tools_and_policy_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from mimir.mcp_client import MCPProvenance, MCPServerConfig
+
+    config = MCPServerConfig(
+        name="demo",
+        command="demo-server",
+        args=[],
+        server_config_id="demo-production",
+        policy_version="policy-v2",
+    )
+    provenance = replace(
+        MCPProvenance.create(
+            config,
+            "read_item",
+            {},
+            server_config_id=config.server_config_id,
+        ),
+        classification="resource_scoped",
+        adapter_name="demo-owner",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = SimpleNamespace(name="mcp_demo_read_item", mcp_provenance=provenance)
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(return_value=[tool])
+    manager.shutdown = AsyncMock()
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture(kind: str, **fields: Any) -> None:
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", capture)
+    returned_manager, tools = await _start_mcp_servers(manager, [config])
+
+    manager.start_servers.assert_awaited_once_with([config])
+    assert tools == [tool]
+    assert returned_manager is manager
+    assert events[0] == (
+        "mcp_servers_ready",
+        {"count": 1, "tool_names": ["mcp_demo_read_item"]},
+    )
+    attention = next(fields for kind, fields in events if kind == "mcp_policy_attention_required")
+    assert attention["count"] >= 1
+    assert any(issue.get("actual_policy") == "policy-v1" for issue in attention["issues"])
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_failure_shuts_down_and_returns_no_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
+    manager.shutdown = AsyncMock()
+
+    returned_manager, tools = await _start_mcp_servers(manager, [object()])
+
+    assert returned_manager is None
+    assert tools == []
+    manager.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_retains_manager_when_failure_shutdown_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
+    manager.shutdown = AsyncMock(side_effect=RuntimeError("shutdown failed"))
+
+    returned_manager, tools = await _start_mcp_servers(manager, [object()])
+
+    assert returned_manager is manager
+    assert tools == []
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_emits_operator_event_for_skipped_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(return_value=[])
+    manager.startup_failures = [{
+        "server_config_id": "broken-id",
+        "server_name": "broken",
+        "error": "binary not found",
+    }]
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture(kind: str, **fields: Any) -> None:
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", capture)
+    returned_manager, tools = await _start_mcp_servers(
+        manager, [SimpleNamespace(policy_version="")]
+    )
+
+    assert returned_manager is manager
+    assert tools == []
+    assert events == [("mcp_server_start_failed", manager.startup_failures[0])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ["collision", "duplicate_batch", "missing_provenance", None])
+async def test_mcp_acceptance_writes_events_and_preserves_healthy_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str | None,
+) -> None:
+    from mimir.event_logger import EventLogger
+    from mimir.mcp_client import MCPManager, MCPProvenance, MCPServerConfig
+
+    events_path = tmp_path / "events.jsonl"
+    monkeypatch.setattr("mimir.server.log_event", EventLogger(events_path, "mcp-test").log)
+    configs = [
+        MCPServerConfig(name=name, command="unused", args=[], server_config_id=name)
+        for name in ("healthy", "candidate", "later")
+    ]
+
+    def tool(config: Any, name: str) -> Any:
+        return SimpleNamespace(
+            name=name,
+            mcp_provenance=MCPProvenance.create(config, name, {}),
+        )
+
+    healthy = tool(configs[0], "mcp_healthy_read")
+    candidate = tool(configs[1], "mcp_candidate_read")
+    later = tool(configs[2], candidate.name if defect else "mcp_later_read")
+    batches = [[healthy], [candidate], [later]]
+    if defect == "collision":
+        batches[1].append(tool(configs[1], healthy.name))
+    elif defect == "duplicate_batch":
+        batches[1].append(tool(configs[1], candidate.name))
+    elif defect == "missing_provenance":
+        batches[1].append(SimpleNamespace(name="mcp_unstamped"))
+    connections = [
+        SimpleNamespace(
+            discover_tools=AsyncMock(return_value=batch),
+            exit_stack=SimpleNamespace(aclose=AsyncMock()),
+        )
+        for batch in batches
+    ]
+    manager = MCPManager()
+    monkeypatch.setattr(manager, "_connect", AsyncMock(side_effect=connections))
+    try:
+        returned_manager, tools = await _start_mcp_servers(manager, configs)
+        assert returned_manager is manager
+        assert tools == ([healthy, later] if defect else [healthy, candidate, later])
+        assert manager.connections == connections
+        for connection in connections:
+            connection.exit_stack.aclose.assert_not_awaited()
+        records = [json.loads(line) for line in events_path.read_text().splitlines()]
+        failures = [record for record in records if record["type"] == "mcp_server_start_failed"]
+        assert len(failures) == (1 if defect else 0)
+        if defect:
+            assert failures[0]["server_config_id"] == "candidate"
+            assert failures[0]["server_name"] == "candidate"
+            expected_error = "missing provenance" if defect == "missing_provenance" else "display-name collision"
+            assert expected_error in failures[0]["error"]
+        assert not any(record["type"] == "mcp_startup_failed" for record in records)
+        ready = [record for record in records if record["type"] == "mcp_servers_ready"]
+        assert len(ready) == 1
+        assert ready[0]["tool_names"] == [tool.name for tool in tools]
+        assert ready[0]["count"] == len(tools)
+    finally:
+        await manager.shutdown()
+    for connection in connections:
+        connection.exit_stack.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown_fails", [False, True])
+@pytest.mark.parametrize("prior_failure", [False, True])
+async def test_mcp_global_abort_writes_events_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    shutdown_fails: bool, prior_failure: bool,
+) -> None:
+    from mimir.event_logger import EventLogger
+
+    events_path = tmp_path / "events.jsonl"
+    monkeypatch.setattr("mimir.server.log_event", EventLogger(events_path, "mcp-abort-test").log)
+    failure = {"server_config_id": "broken-id", "server_name": "broken", "error": "invalid tools"}
+    manager = SimpleNamespace(
+        start_servers=AsyncMock(side_effect=RuntimeError("global startup abort")),
+        shutdown=AsyncMock(side_effect=RuntimeError("cleanup failed") if shutdown_fails else None),
+        startup_failures=[failure] if prior_failure else [],
+    )
+
+    returned_manager, tools = await _start_mcp_servers(manager, [])
+
+    assert returned_manager is (manager if shutdown_fails else None)
+    assert tools == []
+    manager.shutdown.assert_awaited_once()
+    records = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert [record["type"] for record in records] == (
+        ["mcp_startup_failed", "mcp_server_start_failed"] if prior_failure else ["mcp_startup_failed"]
+    )
+    assert records[0]["error"] == "global startup abort"
+    if prior_failure:
+        assert {key: records[1][key] for key in failure} == failure
+
+
+def test_runtime_field_proxies_delegate_and_fail_closed() -> None:
+    from types import SimpleNamespace
+
+    from mimir.server import _RuntimeFieldProxy, _RuntimeSlot
+
+    slot = _RuntimeSlot()
+    proxy = _RuntimeFieldProxy(slot, "turn_event_bus")
+    with pytest.raises(RuntimeError, match="agent runtime is not initialized"):
+        proxy.subscribe("channel")
+
+    bus = SimpleNamespace(subscribe=lambda channel: f"queue:{channel}")
+    slot.bundle = SimpleNamespace(turn_event_bus=bus)
+    assert proxy.subscribe("channel") == "queue:channel"
+
+
+@pytest.mark.asyncio
+async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.server import _PairingNotifier
+
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    config = SimpleNamespace(
+        operator_alert_channel="ops",
+        pairing_operator_digest_delay_seconds=60.0,
+        pairing_dm_auto_reply_enabled=True,
+        pairing_dm_auto_reply_interval_seconds=60.0,
+        pairing_dm_auto_reply_text="pending",
+        pairing_pending_max=100,
+        home=tmp_path,
+    )
+    notifier = _PairingNotifier(config, channels)
+    await notifier.notify_operator(
+        canonical="alice",
+        display="Alice",
+        platform="slack",
+        channel_id="dm-alice",
+        delivery="dm",
+    )
+    await notifier.maybe_reply_dm(canonical="alice", dm_channel_id="dm-slack-D123", code="ABCDEF23")
+    await asyncio.sleep(0)
+    operator_task = notifier._operator_task
+    dm_task = notifier._dm_reply_task
+
+    await notifier.aclose()
+    await notifier.aclose()
+
+    assert notifier._operator_task is None
+    assert notifier._dm_reply_task is None
+    assert notifier._operator_pending == []
+    assert notifier._dm_reply_queue.empty()
+    assert operator_task is not None and operator_task.cancelled()
+    assert dm_task is not None and dm_task.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alert_channel", ["discord-ops", "slack-ops"])
+@pytest.mark.parametrize("display,cleaned", [
+    ("@everyone <@&123> [x](https://evil)", "everyone &123 xhttps://evil"),
+    ("<!channel> <!subteam^S123|@devs>", "!channel !subteam^S123|devs"),
+    ("Alice\u202ediscord-999\u202c\u200b", "Alicediscord-999"),
+])
+async def test_pairing_operator_alert_neutralizes_sender_display_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alert_channel: str, display: str, cleaned: str,
+) -> None:
+    from types import SimpleNamespace
+    from mimir.server import _PairingNotifier
+
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    notifier = _PairingNotifier(
+        SimpleNamespace(home=tmp_path, operator_alert_channel=alert_channel,
+                        pairing_operator_digest_delay_seconds=60.0), channels,
+    )
+    try:
+        await notifier.notify_operator(
+            canonical="discord-123", display=display,
+            platform="discord", channel_id="discord-1", delivery="dm",
+        )
+        await notifier.flush_operator_alerts()
+        channels.send.assert_awaited_once()
+        assert channels.send.await_args.args[0] == alert_channel
+        alert = channels.send.await_args.args[1]
+        assert "@everyone" not in alert and "<@&" not in alert and "](" not in alert
+        assert "<!channel" not in alert and "<!subteam" not in alert
+        assert f"discord-123 ({cleaned}; discord; DM)" in alert
+        assert "mimir identities approve-pairing discord-123" in alert
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pairing_alert_constructs_and_reloads_resolver_off_loop(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from mimir.server import _PairingNotifier
+
+    loop_thread = threading.get_ident()
+    operations = []
+
+    class Resolver:
+        def __init__(self, home):
+            assert home == tmp_path
+            assert threading.get_ident() != loop_thread
+            operations.append("construct")
+
+        def reload(self):
+            assert threading.get_ident() != loop_thread
+            operations.append("reload")
+
+        def identity(self, canonical):
+            return SimpleNamespace(pairing=SimpleNamespace(request_id="pair-abcd"))
+
+    monkeypatch.setattr("mimir.identities.IdentityResolver", Resolver)
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    notifier = _PairingNotifier(SimpleNamespace(
+        home=tmp_path, operator_alert_channel="discord-ops",
+        pairing_operator_digest_delay_seconds=60.0,
+    ), channels)
+    try:
+        await notifier.notify_operator(canonical="discord-123", display="Alice",
+                                       platform="discord", channel_id="discord-1", delivery="dm")
+        await notifier.flush_operator_alerts()
+        assert operations == ["construct", "reload"]
+        assert "approve pair-abcd" in channels.send.await_args.args[1]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.parametrize("codepoint", [
+    0x00AD, 0x061C, 0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
+    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+    0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF,
+])
+def test_neutralize_display_name_strips_bidi_and_format_characters(codepoint):
+    import unicodedata
+    from mimir.bridges._mentions import neutralize_display_name
+
+    char = chr(codepoint)
+    assert unicodedata.category(char) == "Cf"
+    assert neutralize_display_name(f"Alice{char}discord-999") == "Alicediscord-999"
+
+
+def test_neutralize_display_name_removes_controls_collapses_spaces_and_caps_length():
+    from mimir.bridges._mentions import neutralize_display_name
+
+    assert neutralize_display_name("  A\x00\n  B\t @here  ") == "A B here"
+    assert neutralize_display_name("Z" * 90) == "Z" * 64
+
+
+@dataclass
+class _ServerControl:
+    events: list[str] = field(default_factory=list)
+    event_payloads: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    failures: dict[str, BaseException] = field(default_factory=dict)
+    runtime_failure: BaseException | None = None
+    mcp_enabled: bool = False
+    mcp_returns_manager: bool = True
+    panel_enabled: bool = False
+    optional_bridges: bool = False
+    scheduler_should_start: bool = True
+    plugin_jobs_installed: int = 0
+    bundle: Any | None = None
+    app: web.Application | None = None
+    route_kwargs: dict[str, Any] = field(default_factory=dict)
+    poller_candidates: tuple[Any, ...] = ()
+    plugin_manager: Any | None = None
+    real_web_routes: bool = False
+    core: Any | None = None
+    dispatcher: Any | None = None
+    scheduler: Any | None = None
+    channels: Any | None = None
+    web_chat: Any | None = None
+    mcp_manager: Any | None = None
+    mcp_policy_store: Any | None = None
+    panel: Any | None = None
+    identity_resolver: Any | None = None
+    real_dispatcher: bool = False
+    real_runtime: bool = False
+    turns: list[Any] = field(default_factory=list)
+
+    def hit(self, name: str) -> None:
+        self.events.append(name)
+        failure = self.failures.get(name)
+        if failure is not None:
+            raise failure
+
+
+def _controlled_server_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: _ServerControl | None = None,
+    *, real_skill_setup: bool = False,
+) -> tuple[web.Application, _ServerControl]:
+    import mimir.background_tasks
+    import mimir.doc_seed
+    import mimir.liveness
+    import mimir.mcp_client
+    import mimir.runtime
+    import mimir.skill_install
+    import mimir.tools
+    import mimir.update_on_start
+    from mimir.config import Config
+    from mimir.history import set_global_buffer
+
+    control = control or _ServerControl()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_API_KEY", "test-key")
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:test")
+    monkeypatch.setenv("MIMIR_GIT_TRACKING_ENABLED", "false")
+    monkeypatch.setenv("MIMIR_LIVENESS_BEAT_SECONDS", "0")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "false")
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(tmp_path / "missing-source"))
+    monkeypatch.setenv("DISCORD_TOKEN", "")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "")
+
+    class Resolver:
+        def resolve_web_key(self, key: str) -> None:
+            return None
+
+        def has_web_keys(self) -> bool:
+            return False
+
+    resolver = control.identity_resolver or Resolver()
+    chat_skills = object()
+    core = SimpleNamespace(
+        identity_resolver=resolver,
+        aliases_loaded=4,
+        saga_db_path=tmp_path / ".mimir" / "saga.db",
+        chat_skill_registry=chat_skills,
+    )
+    control.core = core
+
+    def create_core_services(config: Any) -> Any:
+        control.hit("core")
+        return core
+
+    class Dispatcher:
+        def __init__(self, config: Any, run_turn: Any = None, *, resolver: Any = None) -> None:
+            control.hit("dispatcher")
+            self.config = config
+            self.resolver = resolver
+            self._run_turn = run_turn
+            self._on_channel_idle = None
+            self._on_inject = None
+            self._on_event = None
+            self._on_pairing_required = None
+            self._on_channel_drained = None
+            control.dispatcher = self
+
+        def set_run_turn(self, run_turn: Any) -> None:
+            self._run_turn = run_turn
+            control.events.append("dispatcher:bound" if run_turn is not None else "dispatcher:unbound")
+
+        def set_on_channel_drained(self, callback: Any) -> None:
+            self._on_channel_drained = callback
+
+        async def enqueue(self, event: Any) -> bool:
+            control.events.append(f"enqueue:{self._run_turn is not None}")
+            return self._run_turn is not None
+
+        def intake_admits(self, event: Any) -> bool:
+            return True
+
+        def close_admission(self) -> None:
+            control.hit("dispatcher:close")
+
+        async def drain(self, *, timeout: float) -> None:
+            control.hit("dispatcher:drain")
+
+        def is_channel_busy(self, channel_id: str) -> bool:
+            return False
+
+    class Scheduler:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            control.hit("scheduler")
+            self.init_kwargs = kwargs
+            self.policy = kwargs["policy"]
+            self._started = False
+            self._scheduler = SimpleNamespace(running=False)
+            self._arbiter = None
+            control.scheduler = self
+
+        def __getattr__(self, name: str) -> Any:
+            if not name.startswith("add_"):
+                raise AttributeError(name)
+
+            def add(*args: Any, **kwargs: Any) -> Any:
+                control.hit(f"scheduler:{name}")
+                if name == "add_saga_consolidate_job":
+                    return control.scheduler_should_start
+                if name == "add_poller_jobs":
+                    control.poller_candidates = self.policy.selected_plugin_candidates
+                    return 0
+                return False
+
+            return add
+
+        def reload(self) -> dict[str, int]:
+            control.hit("scheduler:reload")
+            return {"registered": 0, "invalid": 0}
+
+        def bind_plugin_jobs(self, jobs: Any) -> int:
+            assert self.policy.frozen
+            assert tuple(jobs) == tuple(self.policy.scheduler_jobs.values())
+            control.hit("scheduler:bind_plugin_jobs")
+            return control.plugin_jobs_installed
+
+        def register_callable(
+            self, name: str, fn: Any, default_cron: str, *, job_id: str | None = None,
+            **kwargs: Any,
+        ) -> bool:
+            assert callable(fn)
+            assert name and job_id
+            assert isinstance(default_cron, str)
+            return bool(default_cron)
+
+        def start(self) -> None:
+            self._started = True
+            self._scheduler.running = True
+            control.hit("scheduler:start")
+
+        async def stop(self) -> None:
+            self._started = False
+            self._scheduler.running = False
+            control.hit("scheduler:stop")
+
+        def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
+            control.events.append(f"scheduler:trigger:{poller_name}:{reason}")
+            return self._started
+
+        def set_arbiter(self, arbiter: Any) -> None:
+            self._arbiter = arbiter
+
+    class Channels:
+        def __init__(self) -> None:
+            self._bridges: list[Any] = []
+            control.channels = self
+
+        def register(self, bridge: Any) -> None:
+            self._bridges.append(bridge)
+            control.events.append(f"register:{type(bridge).__name__}")
+
+        def bridges(self) -> list[Any]:
+            return list(self._bridges)
+
+        async def connect_all(self) -> None:
+            control.events.append(f"bridges:bound:{control.dispatcher._run_turn is not None}")
+            control.hit("bridges:connect")
+
+        async def disconnect_all(self) -> None:
+            control.hit("bridges:disconnect")
+
+        async def send(self, *args: Any, **kwargs: Any) -> None:
+            control.hit("channels:send")
+
+        def find(self, channel_id: str) -> None:
+            return None
+
+    class BenchBridge:
+        def __init__(self, *, home: Path) -> None:
+            self.home = home
+            control.hit("bench")
+
+    class WebChatBridge:
+        def __init__(self, *, enqueue: Any, home: Path, chat_skill_registry: Any) -> None:
+            self.enqueue = enqueue
+            self.home = home
+            self.chat_skill_registry = chat_skill_registry
+            control.web_chat = self
+            control.hit("webchat")
+
+        def register_routes(self, app: web.Application) -> None:
+            control.hit("webchat:routes")
+
+            async def ok(request: web.Request) -> web.Response:
+                return web.json_response({"ok": True})
+
+            app.router.add_post("/chat", ok)
+            app.router.add_get("/chat/stream", ok)
+
+        async def disconnect(self) -> None:
+            control.hit("webchat:disconnect")
+
+    class DiscordBridge:
+        name = "discord"
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            control.hit("discord")
+
+    class SlackBridge:
+        name = "slack"
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            control.hit("slack")
+
+    class Indexer:
+        async def start(self, **kwargs: Any) -> None:
+            control.hit("indexer:start")
+
+        async def sweep(self) -> None:
+            control.hit("indexer:sweep")
+
+    class Agent:
+        def __init__(self) -> None:
+            self._commitments = object()
+            self._rate_limits = object()
+
+        async def run_turn(self, event: Any) -> None:
+            control.turns.append(event)
+
+    class Bundle:
+        def __init__(self, adapters: Any) -> None:
+            self.config = config
+            self.core = core
+            self.agent = Agent()
+            self.turn_logger = object()
+            self.message_buffer = object()
+            self.indexes = object()
+            self.indexer = Indexer()
+            self.saga_client = object()
+            self.sessions = object()
+            self.commitments_store = SimpleNamespace(list=lambda *args, **kwargs: [])
+            self.turn_event_bus = SimpleNamespace(
+                subscribe=lambda channel: asyncio.Queue(),
+                unsubscribe=lambda channel, queue: None,
+            )
+            self.replayed_messages = 9
+            self.adapters = adapters
+            self.installed_tools: list[Any] = []
+            self.closed = False
+
+        def install_mcp_tools(self, tools: list[Any]) -> None:
+            self.installed_tools = list(tools)
+            control.hit("bundle:mcp")
+
+        async def aclose(self) -> None:
+            if self.closed:
+                return
+            self.closed = True
+            self.adapters.dispatcher.set_run_turn(None)
+            set_global_buffer(None)
+            control.hit("bundle:close")
+
+    async def create_agent_runtime(config: Any, core_arg: Any, adapters: Any) -> Any:
+        control.hit("runtime")
+        if control.runtime_failure is not None:
+            raise control.runtime_failure
+        bundle = Bundle(adapters)
+        control.bundle = bundle
+        adapters.dispatcher.set_run_turn(bundle.agent.run_turn)
+        set_global_buffer(bundle.message_buffer)
+        return bundle
+
+    class ActivityPanel:
+        def __init__(self, bus: Any, channels: Any, channel_ids: Any) -> None:
+            self.bus = bus
+            self.channels = channels
+            self.channel_ids = channel_ids
+            control.panel = self
+            control.hit("panel:construct")
+
+        def start(self) -> None:
+            control.hit("panel:start")
+
+        async def stop(self) -> None:
+            control.hit("panel:stop")
+
+    class MCPManager:
+        def __init__(self, **kwargs: Any) -> None:
+            control.mcp_manager = self
+            control.hit("mcp:construct")
+
+        async def shutdown(self) -> None:
+            control.hit("mcp:shutdown")
+
+    class MCPPolicyStore:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            control.mcp_policy_store = self
+            control.hit("mcp:policy-store")
+
+        def load_server_configs(self) -> list[Any]:
+            return []
+
+    async def start_mcp(manager: Any, configs: list[Any], **kwargs: Any) -> tuple[Any | None, list[Any]]:
+        assert control.app is not None
+        assert control.app["startup_state"].mcp_manager is manager
+        control.hit("mcp:start")
+        if control.mcp_returns_manager:
+            return manager, ["mcp-tool"]
+        return None, []
+
+    async def event(kind: str, **fields: Any) -> None:
+        control.event_payloads.append((kind, fields))
+        control.hit(f"log:{kind}")
+
+    def register_routes(app: web.Application, **kwargs: Any) -> None:
+        control.route_kwargs = kwargs
+        control.hit("webui:routes")
+
+        async def ok(request: web.Request) -> web.Response:
+            return web.json_response({"ok": True})
+
+        app.router.add_get("/api/v1/turn-events", ok)
+
+    async def cancel_tasks(tasks: set[asyncio.Task[Any]], *, label: str) -> list[BaseException]:
+        control.hit(f"cancel:{label}")
+        return await mimir.background_tasks.cancel_background_tasks(tasks, label=label)
+
+    monkeypatch.setattr("mimir.server.init_logger", lambda *args, **kwargs: control.hit("logger"))
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: control.event_payloads.append((kind, fields)),
+    )
+    monkeypatch.setattr("mimir.server.seed_subagent_defs", lambda home: {})
+    if not real_skill_setup:
+        monkeypatch.setattr("mimir.server.migrate_legacy_skills_dir", lambda home: None)
+        monkeypatch.setattr("mimir.server.refresh_builtin_skills", lambda home: {})
+    monkeypatch.setattr("mimir.server.seed_prompts", lambda home: None)
+    monkeypatch.setattr("mimir.server.seed_scheduler", lambda home: None)
+    monkeypatch.setattr("mimir.server.ensure_chainlink_initialized", lambda home: None)
+    if control.real_dispatcher:
+        from mimir.dispatcher import Dispatcher as ProductionDispatcher
+
+        monkeypatch.setattr("mimir.server.Dispatcher", ProductionDispatcher)
+    else:
+        monkeypatch.setattr("mimir.server.Dispatcher", Dispatcher)
+    monkeypatch.setattr("mimir.server.Scheduler", Scheduler)
+    monkeypatch.setattr("mimir.server.ChannelRegistry", Channels)
+    monkeypatch.setattr("mimir.server.BenchBridge", BenchBridge)
+    monkeypatch.setattr("mimir.server.WebChatBridge", WebChatBridge)
+    monkeypatch.setattr("mimir.server.log_event", event)
+    monkeypatch.setattr(
+        "mimir.server.log_durable_event_sync",
+        lambda kind, **fields: (
+            control.event_payloads.append((kind, fields)),
+            control.hit(f"log:{kind}"),
+        ),
+    )
+    monkeypatch.setattr("mimir.server.cancel_background_tasks", cancel_tasks)
+    monkeypatch.setattr("mimir.server._start_mcp_servers", start_mcp)
+    if not control.real_web_routes:
+        monkeypatch.setattr("mimir.server.web_ui.register_routes", register_routes)
+    monkeypatch.setattr(mimir.runtime, "create_core_services", create_core_services)
+    if not control.real_runtime:
+        monkeypatch.setattr(mimir.runtime, "create_agent_runtime", create_agent_runtime)
+    monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: control.hit("preflight"))
+    monkeypatch.setattr(mimir.doc_seed, "refresh_docs", lambda home: {})
+    monkeypatch.setattr(
+        mimir.skill_install,
+        "auto_update_installed_optional_skills",
+        lambda home: SimpleNamespace(any_updates=False),
+    )
+    monkeypatch.setattr(mimir.update_on_start, "consume_startup_events", AsyncMock(return_value=0))
+    monkeypatch.setattr(mimir.update_on_start, "consume_update_digest", AsyncMock(return_value=0))
+    monkeypatch.setattr(mimir.update_on_start, "emit_version_bump_digest", AsyncMock(return_value=False))
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", lambda home: None)
+    monkeypatch.setattr(
+        mimir.liveness,
+        "mark_session_running",
+        lambda *args, **kwargs: (control.hit("liveness:running"), True)[1],
+    )
+    monkeypatch.setattr(
+        mimir.liveness,
+        "mark_clean_shutdown",
+        lambda home: (control.hit("liveness:clean"), True)[1],
+    )
+    monkeypatch.setattr(mimir.mcp_client, "MCPManager", MCPManager)
+    monkeypatch.setattr(mimir.mcp_client, "MCPPolicyStore", MCPPolicyStore)
+    monkeypatch.setitem(
+        sys.modules,
+        "mimir.bridges.discord",
+        SimpleNamespace(DiscordBridge=DiscordBridge),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mimir.bridges.slack",
+        SimpleNamespace(SlackBridge=SlackBridge),
+    )
+    monkeypatch.setattr("mimir.bridges._activity_panel.ActivityPanel", ActivityPanel)
+
+    config = Config.from_env()
+    config = replace(
+        config,
+        home=tmp_path,
+        api_key="test-key",
+        git_tracking_enabled=False,
+        liveness_beat_seconds=0,
+        activity_panel_channels=("ops",) if control.panel_enabled else (),
+        mcp_servers=[SimpleNamespace(policy_version="", server_config_id="server")]
+        if control.mcp_enabled
+        else [],
+        discord_token="discord" if control.optional_bridges else "",
+        slack_bot_token="slack-bot" if control.optional_bridges else "",
+        slack_app_token="slack-app" if control.optional_bridges else "",
+        oauth_credentials_path=None,
+        commitments_due_check_cron="",
+        minimax_usage_poll_cron="",
+        plugin_manager=control.plugin_manager or config.plugin_manager,
+    )
+    set_global_buffer(None)
+    app = build_app(config)
+    control.app = app
+    control.dispatcher = app["dispatcher"]
+    pairing_notifier = app["pairing_notifier"]
+    original_pairing_close = pairing_notifier.aclose
+
+    async def close_pairing() -> None:
+        control.hit("pairing:close")
+        await original_pairing_close()
+
+    pairing_notifier.aclose = close_pairing
+    return app, control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True], ids=["upgrade", "restart"])
+@pytest.mark.parametrize("existing_ignore", [False, True], ids=["new-ignore", "existing-ignore"])
+async def test_build_app_sweeps_crashed_turn_stores_and_seeds_home_ignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restart: bool, existing_ignore: bool,
+) -> None:
+    """Exercise real build_app wiring, not direct calls to the cleanup helpers."""
+    from tests.test_turn_content_followups import _install_research_manifest
+
+    _install_research_manifest(tmp_path, "papers")
+    marker = tmp_path / ".mimir/turn-stores-v1"
+    if restart:
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    stale = []
+    for store in (
+        "large_tool_results", "conversation_history", "attachments/fetch-cache",
+        ".mimir/conversation_history_labels",
+    ):
+        path = tmp_path / store / ("crashed-turn/body.txt" if restart else "legacy.txt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("untrusted crashed-turn bytes", encoding="utf-8")
+        stale.append(path)
+    for relative in (
+        "state/pollers/github-ci-watch/logs/42-101.log",
+        "state/pollers/papers/paper-draft.md",
+        "state/pollers/papers/drafts/nested/paper.md",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("abandoned untrusted output", encoding="utf-8")
+        stale.append(path)
+    durable = {
+        "state/pollers/papers/cursor.json": '{"last_id": 42}',
+        "state/pollers/papers/seen-ids.json": '["paper:42"]',
+        "state/pollers/worklink/diagnostic.log": "retained diagnostic",
+        "state/pollers/gmail/audit.jsonl": '{"operator_audit": true}',
+    }
+    for relative, content in durable.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    ignore = tmp_path / ".ignore"
+    if existing_ignore:
+        ignore.write_text("custom/\nlogs/\n", encoding="utf-8")
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    try:
+        await _run_startup(app)
+        assert "runtime" in control.events
+        assert all(not path.exists() for path in stale)
+        assert not (tmp_path / "state/pollers/papers/drafts").exists()
+        if restart:
+            assert all(not (tmp_path / store / "crashed-turn").exists() for store in (
+                "large_tool_results", "conversation_history", "attachments/fetch-cache",
+                ".mimir/conversation_history_labels",
+            ))
+        assert marker.is_file()
+        for relative, content in durable.items():
+            assert (tmp_path / relative).read_text() == content
+        entries = ignore.read_text().splitlines()
+        expected = {
+            "logs/", "messages/", "large_tool_results/", "conversation_history/",
+            "attachments/fetch-cache/", "state/pollers/",
+        }
+        if existing_ignore:
+            expected.add("custom/")
+        assert set(entries) >= expected
+        assert all(entries.count(entry) == 1 for entry in expected)
+    finally:
+        await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linked_root", [
+    "large_tool_results", "conversation_history", "attachments/fetch-cache",
+    ".mimir/conversation_history_labels", "state/pollers/github-ci-watch/logs",
+    "state/pollers", ".mimir",
+])
+async def test_build_app_skips_symlinked_store_root_and_continues_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, linked_root: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    external = tmp_path / "outside-store"
+    external.mkdir()
+    sentinel = external / "keep.txt"
+    sentinel.write_text("must not be swept", encoding="utf-8")
+    link = home / linked_root
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(external, target_is_directory=True)
+    # This unrelated owned store must still be swept after refusing the link.
+    other_store = (
+        "conversation_history" if linked_root == "large_tool_results" else "large_tool_results"
+    )
+    stale = home / other_store / "crashed-turn/body.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale bytes", encoding="utf-8")
+    # Core turn-store startup only: plugin defaults install refuses a linked .mimir.
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
+        app, control = _controlled_server_app(home, monkeypatch)
+        try:
+            await _run_startup(app)
+            assert "runtime" in control.events
+            assert link.is_symlink()
+            assert sentinel.read_text() == "must not be swept"
+            assert set(external.iterdir()) == {sentinel}
+            assert not stale.parent.exists()
+            if linked_root != ".mimir":
+                assert (home / ".mimir/turn-stores-v1").is_file()
+            assert "large_tool_results/" in (home / ".ignore").read_text().splitlines()
+            assert any(record.name == "mimir.turn_stores" and record.levelno >= logging.WARNING
+                       for record in caplog.records)
+        finally:
+            await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected", [True, False], ids=["cultivate-selected", "core-only"])
+async def test_build_app_discovers_existing_cultivate_seeds_with_active_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, selected: bool,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir import pollers
+    from mimir.plugins.defaults import seed_plugin_defaults
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
+    monkeypatch.setenv("WORKLINK_REPO", "o/r")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    cultivate = load_plugins(enable="cultivate")
+    seed_plugin_defaults(tmp_path, selected=cultivate.policy.selected_plugin_candidates)
+    seeded_names = {"worklink-ready-queue", "worklink-tool-pins"}
+    for directory in ("cultivate-chainlink-orchestrator", "cultivate-worklink-tool-pins"):
+        assert (tmp_path / "skills" / directory / "pollers.json").is_file()
+
+    # Observe real discovery invoked by build_app's sweep. Do not replace the
+    # sweep or supply its policy from the test: startup must thread it itself.
+    real_discover = pollers.discover_pollers
+    discoveries = []
+
+    def observe_discovery(root, **kwargs):
+        invalid = kwargs.setdefault("invalid_entries", [])
+        configs = real_discover(root, **kwargs)
+        discoveries.append((root, {config.name for config in configs}, list(invalid)))
+        return configs
+
+    monkeypatch.setattr(pollers, "discover_pollers", observe_discovery)
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        app, control = _controlled_server_app(tmp_path, monkeypatch, real_skill_setup=True)
+        try:
+            await _run_startup(app)
+            assert "runtime" in control.events
+            home_discovery = [row for row in discoveries if row[0] == tmp_path / "skills"]
+            assert home_discovery, "startup never discovered the seeded home skills"
+            _, names, invalid = home_discovery[0]
+            if selected:
+                assert seeded_names <= names
+                assert invalid == []
+                assert "poller_plugin_seed_unselected" not in caplog.text
+            else:
+                assert seeded_names.isdisjoint(names)
+                assert any("seeded by plugin 'cultivate'" in reason for _, _, reason in invalid)
+                assert "poller_plugin_seed_unselected" in caplog.text
+        finally:
+            await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_build_app_skips_symlinked_ignore_and_still_sweeps_stores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    external = tmp_path / "operator-ignore"
+    external.write_text("operator-owned/\n", encoding="utf-8")
+    ignore = home / ".ignore"
+    ignore.symlink_to(external)
+    stale = home / "large_tool_results/crashed-turn/body.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale bytes", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
+        app, control = _controlled_server_app(home, monkeypatch)
+        try:
+            await _run_startup(app)
+            assert "runtime" in control.events
+            assert ignore.is_symlink()
+            assert external.read_text() == "operator-owned/\n"
+            assert not stale.parent.exists()
+            assert (home / ".mimir/turn-stores-v1").is_file()
+            assert any(record.name == "mimir.turn_stores" and record.levelno >= logging.WARNING
+                       for record in caplog.records)
+        finally:
+            await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_startup_sweeps_research_drafts_after_legacy_skill_migration(tmp_path, monkeypatch):
+    from tests.test_turn_content_followups import _install_research_manifest
+
+    _install_research_manifest(tmp_path, "legacy-papers")
+    legacy = tmp_path / ".claude/skills"
+    legacy.parent.mkdir(parents=True)
+    (tmp_path / "skills").rename(legacy)
+    draft = tmp_path / "state/pollers/legacy-papers/drafts/paper.md"
+    draft.parent.mkdir(parents=True)
+    draft.write_text("crashed draft")
+    app, _ = _controlled_server_app(tmp_path, monkeypatch, real_skill_setup=True)
+    try:
+        assert (tmp_path / "skills/legacy-papers/pollers.json").is_file()
+        assert not draft.exists()
+        assert (tmp_path / ".mimir_builtin_skills").is_dir()
+    finally:
+        await _run_cleanup(app)
+
+
+def test_server_boot_installs_home_saga_config(tmp_path, monkeypatch):
+    from mimir.saga._config_io import get_config, resolve_llm_config, was_set_in_toml
+
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text(
+        '[llm]\nprovider = "codex_plus"\nmodel = "gpt-6-luna"\n'
+        '[embedding]\nprovider = "voyage"\n'
+        '[retrieval]\nenable_contextual_rewrite = true\n',
+        encoding="utf-8",
+    )
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+    for subsystem in ("consolidation", "reflection", "retrieval_v2"):
+        resolved = resolve_llm_config(subsystem)
+        assert (resolved["provider"], resolved["model"]) == ("codex_plus", "gpt-6-luna")
+    assert get_config()("retrieval", "enable_contextual_rewrite") is True
+    assert was_set_in_toml("embedding", "provider") is True
+    assert ("saga_config_loaded", {
+        "path": str(tmp_path / "saga.toml"), "source": "home",
+    }) in control.event_payloads
+    assert control.events.index("logger") < control.events.index("core")
+
+
+def test_server_boot_defaults_emit_config_event(tmp_path, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="saga.config")
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+    assert ("saga_config_loaded", {"path": None, "source": "defaults"}) in control.event_payloads
+    assert "has no saga.toml" in caplog.text
+
+
+def test_server_boot_exported_saga_config_wins(tmp_path, monkeypatch):
+    from mimir.saga._config_io import resolve_llm_config
+
+    (tmp_path / "saga.toml").write_text('[llm]\nprovider = "codex_plus"\n')
+    operator = tmp_path / "operator.toml"
+    operator.write_text('[llm]\nprovider = "minimax"\n')
+    monkeypatch.setenv("SAGA_CONFIG", str(operator))
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+    assert resolve_llm_config("reflection")["provider"] == "minimax"
+    assert ("saga_config_loaded", {"path": str(operator), "source": "env"}) in control.event_payloads
+
+
+def test_server_boot_rejects_invalid_saga_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text("[llm\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="saga.toml"):
+        _controlled_server_app(tmp_path, monkeypatch)
+
+
+async def _run_startup(app: web.Application) -> None:
+    hooks = [
+        hook
+        for hook in app.on_startup
+        if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+    ]
+    assert len(hooks) == 1
+    await hooks[0](app)
+
+
+async def _run_cleanup(app: web.Application) -> None:
+    hooks = [
+        hook
+        for hook in app.on_cleanup
+        if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+        and getattr(hook, "__name__", "") == "_on_cleanup"
+    ]
+    assert len(hooks) == 1
+    await hooks[0](app)
+
+
+def _selected_server_manager() -> Any:
+    from mimir.plugins.manager import PluginManager
+    from mimir.plugins.registry import PolicyRegistry
+
+    policy = PolicyRegistry()
+    candidate = SimpleNamespace(name="example", enabled=True, manifest=None)
+    policy.select_plugin_candidates((candidate,))
+    registrar = policy.registrar("example")
+
+    async def job() -> None:
+        return None
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.json_response({"plugin": "example"})
+
+    registrar.register_scheduler_job("example-check", "example-check", job)
+    registrar.register_route("GET", "/api/v1/plugins/example/private", handler, role="admin")
+    policy.freeze()
+    return PluginManager(policy, ())
+
+
+@pytest.mark.asyncio
+async def test_selected_plugin_server_wiring_and_admin_route(tmp_path, monkeypatch):
+    manager = _selected_server_manager()
+    control = _ServerControl(plugin_manager=manager, scheduler_should_start=False,
+                             plugin_jobs_installed=1, real_web_routes=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    assert app["plugin_manager"] is manager
+    assert control.poller_candidates == ()
+    assert ("GET", "/api/v1/plugins/example/private") in {
+        (route.method, route.resource.canonical) for route in app.router.routes()
+    }
+    app["check_worker_executor_health"] = False
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/v1/plugins/example/private")).status == 401
+        # A valid non-admin identity passes authentication but not route RBAC.
+        identity = SimpleNamespace(canonical="alice", access=SimpleNamespace(
+            is_authorized=True, is_admin=False))
+        app["identity_resolver"].resolve_web_key = lambda key: identity if key == "user-key" else None
+        assert (await client.get("/api/v1/plugins/example/private",
+                                 headers={"X-API-Key": "user-key"})).status == 403
+        response = await client.get("/api/v1/plugins/example/private",
+                                    headers={"X-API-Key": "test-key"})
+        assert response.status == 200
+        assert await response.json() == {"plugin": "example"}
+        assert control.poller_candidates == manager.policy.selected_plugin_candidates
+        assert control.events.index("scheduler:add_scheduler_health_check_job") < control.events.index(
+            "scheduler:bind_plugin_jobs") < control.events.index("scheduler:reload")
+        assert control.events.index("scheduler:reload") < control.events.index("scheduler:add_poller_jobs")
+        assert "scheduler:start" in control.events
+
+
+@pytest.mark.asyncio
+async def test_plugin_defaults_seed_and_upgrade_use_frozen_selection(tmp_path, monkeypatch):
+    from mimir import defaults_upgrade
+    from mimir.plugins import defaults
+
+    manager = _selected_server_manager()
+    selected = manager.policy.selected_plugin_candidates
+    seen = []
+    original_seed = defaults.seed_plugin_defaults
+
+    def seed(home, *, selected):
+        seen.append(("seed", selected))
+        return original_seed(home, selected=selected)
+
+    def upgrade(home, *, selected):
+        seen.append(("upgrade", selected))
+        return {}
+
+    monkeypatch.setattr(defaults, "seed_plugin_defaults", seed)
+    monkeypatch.setattr(defaults_upgrade, "check_and_open_plugin_defaults_upgrade", upgrade)
+    app, control = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(plugin_manager=manager),
+    )
+    try:
+        await _run_startup(app)
+        assert seen == [("seed", selected), ("upgrade", selected)]
+    finally:
+        await _run_cleanup(app)
+
+
+def _fail_mcp_client_import(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    missing_name: str,
+) -> None:
+    original_import = builtins.__import__
+
+    def guarded_import(
+        name: str,
+        globals: dict[str, Any] | None = None,
+        locals: dict[str, Any] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> Any:
+        if name == "mcp_client" and level == 1 and "MCPManager" in fromlist:
+            raise ModuleNotFoundError(
+                f"No module named {missing_name!r}",
+                name=missing_name,
+            )
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected_plugins", ["", "cultivate"])
+async def test_source_repo_hook_uses_pushed_from_repo_not_running_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_plugins: str,
+) -> None:
+    if selected_plugins:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", selected_plugins)
+    pushed_from = tmp_path / "pushed-from"
+    running_source = tmp_path / "running-source"
+    (pushed_from / ".git" / "hooks").mkdir(parents=True)
+    (running_source / ".git" / "hooks").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(running_source))
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(pushed_from))
+
+    try:
+        await _run_startup(app)
+        assert (pushed_from / ".git" / "hooks" / "pre-push").is_file()
+        assert not (running_source / ".git" / "hooks" / "pre-push").exists()
+    finally:
+        await _run_cleanup(app)
+
+
+def test_build_app_remains_synchronous_with_unchanged_signature_and_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    assert inspect.iscoroutinefunction(build_app) is False
+    assert str(inspect.signature(build_app)) == "(config: 'Config') -> 'web.Application'"
+    assert isinstance(app, web.Application)
+    assert control.events.index("preflight") < control.events.index("logger")
+    assert control.events.index("logger") < control.events.index("core")
+    assert (tmp_path / "memory" / "core").is_dir()
+    assert (tmp_path / "messages").is_dir()
+
+
+def test_build_app_constructs_core_before_unbound_adapters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    assert control.events.index("core") < control.events.index("dispatcher")
+    assert control.events.index("dispatcher") < control.events.index("scheduler")
+    assert app["dispatcher"].resolver is control.core.identity_resolver
+    assert app["dispatcher"]._run_turn is None
+    assert app["scheduler"]._started is False
+
+
+def test_server_collaborator_and_bridge_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(optional_bridges=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    assert [type(bridge).__name__ for bridge in app["channels"].bridges()] == [
+        "BenchBridge",
+        "WebChatBridge",
+        "DiscordBridge",
+        "SlackBridge",
+    ]
+    assert app["pairing_notifier"]._channels is app["channels"]
+    assert control.web_chat.chat_skill_registry is control.core.chat_skill_registry
+    assert control.web_chat.enqueue.__self__ is app["dispatcher"]
+
+
+def test_optional_feedback_bridges_receive_core_identity_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolver = object()
+    control = _ServerControl(optional_bridges=True, identity_resolver=resolver)
+
+    app, _ = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    optional_bridges = app["channels"].bridges()[2:]
+    assert [bridge.kwargs["identity_resolver"] for bridge in optional_bridges] == [
+        resolver,
+        resolver,
+    ]
+    for bridge in optional_bridges:
+        assert bridge.kwargs["enqueue"] == app["dispatcher"].enqueue
+        assert bridge.kwargs["admit"] == app["dispatcher"].intake_admits
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platforms,enforced,open_bridge,alert_channel,expected", [
+    (("discord",), True, False, "", True),
+    (("slack",), False, False, "", True),
+    (("discord", "slack"), True, False, "", True),
+    (("discord", "slack"), False, True, "", False),
+    ((), True, False, "", False),
+    (("discord", "slack"), True, False, "ops", False),
+])
+async def test_startup_warns_only_for_enforced_pairing_without_alert_channel(
+    tmp_path, monkeypatch, caplog, platforms, enforced, open_bridge, alert_channel, expected,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true" if enforced else "false")
+    monkeypatch.setenv("MIMIR_OPEN_BRIDGE", "true" if open_bridge else "false")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", alert_channel)
+    app, control = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(optional_bridges=True),
+    )
+    app["channels"]._bridges = [
+        bridge for bridge in app["channels"].bridges()
+        if getattr(bridge, "name", None) not in ("discord", "slack")
+        or bridge.name in platforms
+    ]
+    try:
+        with caplog.at_level("WARNING", logger="mimir.server"):
+            await _run_startup(app)
+        warnings = [record.message for record in caplog.records
+                    if record.name == "mimir.server" and "Pairing requests from new users" in record.message]
+        events = [fields for kind, fields in control.event_payloads
+                  if kind == "pairing_alert_channel_missing"]
+        assert len(warnings) == len(events) == int(expected)
+        if expected:
+            assert "MIMIR_OPERATOR_ALERT_CHANNEL" in warnings[0]
+            assert "/app/admin/users" in warnings[0]
+            assert "mimir identities list" in warnings[0]
+            assert events == [{"platforms": sorted(platforms)}]
+    finally:
+        await _run_cleanup(app)
+
+
+def test_route_and_hook_parity_with_runtime_proxies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.server import _RuntimeFieldProxy
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
+
+    assert {
+        ("GET", "/"),
+        ("POST", "/event"),
+        ("GET", "/health"),
+        ("POST", "/api/memory/consolidate"),
+        ("GET", "/api/v1/turn-events"),
+        ("POST", "/chat"),
+        ("GET", "/chat/stream"),
+    } <= routes
+    assert sum(
+        getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+        for hook in app.on_startup
+    ) == 1
+    assert sum(
+        getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+        for hook in app.on_cleanup
+    ) == 2
+    assert _capture_controller_source_commit in app.on_startup
+    assert app.on_startup.index(_capture_controller_source_commit) < next(
+        index for index, hook in enumerate(app.on_startup)
+        if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+    )
+    assert isinstance(control.route_kwargs["commitments_store"], _RuntimeFieldProxy)
+    assert isinstance(control.route_kwargs["turn_event_bus"], _RuntimeFieldProxy)
+    with pytest.raises(RuntimeError, match="agent runtime is not initialized"):
+        control.route_kwargs["turn_event_bus"].subscribe("channel")
+
+
+@pytest.mark.asyncio
+async def test_startup_constructs_runtime_first_and_publishes_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    control.events.clear()
+
+    def check_home(home):
+        assert home == tmp_path
+        control.events.append("home:isolation")
+        return "unknown"
+
+    monkeypatch.setattr("mimir.home_isolation.check_home_isolation", check_home)
+
+    assert app["agent"] is None
+    await _run_startup(app)
+    await asyncio.sleep(0)
+
+    assert control.events.index("liveness:running") < control.events.index("runtime")
+    assert control.events.count("home:isolation") == 1
+    assert control.events.index("liveness:running") < control.events.index("home:isolation")
+    assert control.events.index("home:isolation") < control.events.index("runtime")
+    assert "bridges:bound:True" in control.events
+    assert app["agent"] is control.bundle.agent
+    assert app["agent_runtime"] is control.bundle
+    assert app["runtime_slot"].bundle is control.bundle
+    assert app["startup_state"].runtime_published is True
+    assert control.route_kwargs["turn_event_bus"].subscribe("channel") is not None
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "warning_text"),
+    [
+        (False, "MCP bridging is disabled"),
+        (True, "skipping 1 configured MCP server(s)"),
+    ],
+)
+async def test_missing_mcp_extra_still_serves_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    configured: bool,
+    warning_text: str,
+) -> None:
+    control = _ServerControl(mcp_enabled=configured)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    app["check_worker_executor_health"] = False
+    _fail_mcp_client_import(monkeypatch, missing_name="mcp")
+    caplog.set_level(logging.WARNING, logger="mimir.server")
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/health")
+
+        assert response.status == 200
+        assert await response.json() == {"ok": True}
+        assert app["startup_state"].mcp_manager is None
+        assert app["startup_state"].phase != "mcp_start"
+        assert "scheduler:start" in control.events
+        assert "mcp:construct" not in control.events
+
+    mcp_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "Optional extra `mcp` is not installed" in record.getMessage()
+    ]
+    assert len(mcp_warnings) == 1
+    assert warning_text in mcp_warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_import_bug_remains_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    _fail_mcp_client_import(monkeypatch, missing_name="mcp.client.broken")
+
+    with pytest.raises(ModuleNotFoundError) as caught:
+        await _run_startup(app)
+
+    assert caught.value.name == "mcp.client.broken"
+    assert app["startup_state"].compensated is True
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_startup_logs_effective_lease_read_scope(tmp_path, monkeypatch, enabled):
+    from mimir.read_policy import configured_non_admin_read_roots
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "leases"
+    root.mkdir()
+    if enabled:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if enabled else "")
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    app, control = _controlled_server_app(home, monkeypatch)
+    await _run_startup(app)
+    try:
+        payloads = [
+            fields for kind, fields in control.event_payloads
+            if kind == "filesystem_read_scope"
+        ]
+        assert payloads == [{
+            "derived_pr_checkout_read_roots": [str(root)] if enabled else [],
+            "effective_non_admin_read_roots": [
+                str(path) for path in configured_non_admin_read_roots()
+            ],
+        }]
+        assert (str(root) in payloads[0]["effective_non_admin_read_roots"]) is enabled
+    finally:
+        await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_operational_startup_order_and_mcp_bundle_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    control.events.clear()
+
+    await _run_startup(app)
+    await asyncio.sleep(0)
+
+    ordered = [
+        "liveness:running",
+        "runtime",
+        "panel:construct",
+        "panel:start",
+        "indexer:start",
+        "bridges:connect",
+        "mcp:policy-store",
+        "mcp:construct",
+        "mcp:start",
+        "bundle:mcp",
+        "scheduler:start",
+    ]
+    positions = [control.events.index(name) for name in ordered]
+    assert positions == sorted(positions)
+    assert app["mcp_manager"] is control.mcp_manager
+    assert control.mcp_policy_store is not None
+    assert control.mcp_manager is not None
+    assert control.bundle.installed_tools == ["mcp-tool"]
+    assert app["activity_panel"] is control.panel
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_startup_preserves_bad_cron_and_mcp_start_best_effort_policies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(mcp_enabled=True, mcp_returns_manager=False)
+    control.failures["scheduler:add_saga_consolidate_job"] = ValueError("bad cron")
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    await _run_startup(app)
+
+    assert app["agent"] is control.bundle.agent
+    assert app["mcp_manager"] is None
+    assert control.bundle.installed_tools == []
+    assert "log:scheduler_invalid_cron" in control.events
+    assert "bridges:bound:True" in control.events
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_bridge_connection_keeps_per_bridge_failures_best_effort() -> None:
+    from mimir.channel_registry import ChannelRegistry
+
+    events: list[str] = []
+
+    class Bridge:
+        prefixes: tuple[str, ...] = ()
+
+        def __init__(self, name: str, failure: BaseException | None = None) -> None:
+            self.name = name
+            self.failure = failure
+
+        async def connect(self) -> None:
+            events.append(self.name)
+            if self.failure is not None:
+                raise self.failure
+
+        async def disconnect(self) -> None:
+            return None
+
+        def matches(self, channel_id: str) -> bool:
+            return False
+
+    channels = ChannelRegistry()
+    channels.register(Bridge("failed", RuntimeError("bridge unavailable")))
+    channels.register(Bridge("healthy"))
+
+    await channels.connect_all()
+
+    assert events == ["failed", "healthy"]
+
+
+@pytest.mark.asyncio
+async def test_startup_state_records_every_attempt_and_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    await _run_startup(app)
+    state = app["startup_state"]
+
+    assert state.runtime_attempted is True
+    assert state.bundle is control.bundle
+    assert state.runtime_published is True
+    assert state.activity_panel is control.panel
+    assert state.activity_panel_start_attempted is True
+    assert state.indexer_start_attempted is True
+    assert state.bridges_connect_attempted is True
+    assert state.mcp_start_attempted is True
+    assert state.mcp_manager is control.mcp_manager
+    assert state.scheduler_start_attempted is True
+    assert state.scheduler_started is True
+    assert state.liveness_mark_attempted is True
+    assert state.compensated is False
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_failed_factory_cancels_resistant_app_tasks_and_preserves_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.background_tasks
+
+    original = LookupError("runtime failed")
+    control = _ServerControl(runtime_failure=original)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant() -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(resistant(), name="resistant-server-task")
+    app["startup_background_tasks"].add(task)
+    await started.wait()
+    monkeypatch.setattr(mimir.background_tasks, "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        with pytest.raises(LookupError) as caught:
+            await _run_startup(app)
+        assert caught.value is original
+        assert "resistant-server-task" in " ".join(getattr(original, "__notes__", []))
+        assert app["startup_background_tasks"] == set()
+        assert app["startup_state"].compensated is True
+        assert app["agent"] is None
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_early_runtime_failure_marks_boot_unclean_and_logs_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.event_logger import EventLogger
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    original = RuntimeError("agent runtime failed")
+    control = _ServerControl(runtime_failure=original)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    events_path = app["config"].events_log
+    event_logger = EventLogger(events_path, "failed-startup-test")
+    monkeypatch.setattr(
+        "mimir.server.log_durable_event_sync",
+        event_logger.log_durable_sync,
+    )
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    records = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    failures = [record for record in records if record["type"] == "startup_failed"]
+    assert len(failures) == 1
+    assert failures[0]["phase"] == "agent_runtime"
+    assert failures[0]["exception"] == repr(original)
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None and marker["clean"] is False
+    assert mimir.liveness.detect_unclean_restart(tmp_path) == marker
+    assert "liveness:clean" not in control.events
+    assert "runtime" in control.events
+    assert "bundle:close" not in control.events
+    assert "pairing:close" in control.events
+    assert app["agent"] is None
+    assert app["runtime_slot"].bundle is None
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_marker_persistence_failure_aborts_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl()
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setattr("mimir.liveness.mark_session_running", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="failed to persist unclean startup marker"):
+        await _run_startup(app)
+
+    failure = next(
+        fields for kind, fields in control.event_payloads if kind == "startup_failed"
+    )
+    assert failure["phase"] == "liveness_marker"
+    assert "runtime" not in control.events
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_startup_preserves_original_when_durable_and_fallback_logging_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("agent runtime failed")
+    control = _ServerControl(runtime_failure=original)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    def fail_durable(*args: Any, **kwargs: Any) -> None:
+        raise OSError("events disk unavailable")
+
+    def fail_fallback(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("logging handler failed")
+
+    monkeypatch.setattr("mimir.server.log_durable_event_sync", fail_durable)
+    monkeypatch.setattr("mimir.server.log.exception", fail_fallback)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert "pairing:close" in control.events
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_next_start_reports_early_aborted_startup_as_unclean_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    assert mimir.liveness.read_session_marker(tmp_path) is None
+    original = RuntimeError("agent runtime failed")
+    first_control = _ServerControl(runtime_failure=original)
+    first_app, _ = _controlled_server_app(tmp_path, monkeypatch, first_control)
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+
+    with pytest.raises(RuntimeError):
+        await _run_startup(first_app)
+
+    prior = mimir.liveness.detect_unclean_restart(tmp_path)
+    assert prior is not None and prior["clean"] is False
+
+    second_app, control = _controlled_server_app(tmp_path, monkeypatch)
+    notified: list[dict[str, Any]] = []
+
+    async def notify(home: Path, *, prior: dict[str, Any]) -> None:
+        notified.append(prior)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", notify)
+
+    await _run_startup(second_app)
+    await asyncio.sleep(0)
+
+    assert "log:liveness_unclean_restart" in control.events
+    assert notified == [prior]
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None
+    assert isinstance(marker.get("last_unclean_notify_ts"), float)
+    await _run_cleanup(second_app)
+
+
+@pytest.mark.asyncio
+async def test_recovery_boot_failure_does_not_suppress_next_unclean_restart_alert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    mark_session_running(tmp_path, started_at=1000.0)
+    first_prior = detect_unclean_restart(tmp_path)
+    assert first_prior is not None
+
+    failed_recovery = RuntimeError("recovery runtime failed")
+    second_app, _ = _controlled_server_app(
+        tmp_path,
+        monkeypatch,
+        _ServerControl(runtime_failure=failed_recovery),
+    )
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+
+    with pytest.raises(RuntimeError, match="recovery runtime failed"):
+        await _run_startup(second_app)
+
+    pending = detect_unclean_restart(tmp_path)
+    assert pending is not None
+    assert pending.get("last_unclean_notify_ts") is None
+
+    third_app, control = _controlled_server_app(tmp_path, monkeypatch)
+    notified: list[dict[str, Any]] = []
+
+    async def notify(home: Path, *, prior: dict[str, Any]) -> None:
+        notified.append(prior)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", notify)
+
+    await _run_startup(third_app)
+    await asyncio.sleep(0)
+
+    assert "log:liveness_unclean_restart" in control.events
+    assert notified == [pending]
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None
+    assert isinstance(marker.get("last_unclean_notify_ts"), float)
+    await _run_cleanup(third_app)
+
+
+@pytest.mark.asyncio
+async def test_notify_task_creation_failure_does_not_suppress_next_boot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    detect_unclean_restart = mimir.liveness.detect_unclean_restart
+    mark_session_running = mimir.liveness.mark_session_running
+    assert mark_session_running(tmp_path, started_at=1000.0)
+    prior = detect_unclean_restart(tmp_path)
+    assert prior is not None
+
+    recovery_app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    real_spawn = __import__("mimir.server", fromlist=["spawn_background"]).spawn_background
+
+    def fail_notify_spawn(tasks: set[asyncio.Task[Any]], coro: Any, *, name: str | None = None):
+        if name == "mimir-unclean-restart-notify":
+            coro.close()
+            raise RuntimeError("notify task creation failed")
+        return real_spawn(tasks, coro, name=name)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", detect_unclean_restart)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", mark_session_running)
+    monkeypatch.setattr("mimir.server.spawn_background", fail_notify_spawn)
+
+    with pytest.raises(RuntimeError, match="notify task creation failed"):
+        await _run_startup(recovery_app)
+
+    pending = detect_unclean_restart(tmp_path)
+    assert pending is not None
+    assert pending.get("last_unclean_notify_ts") is None
+
+
+@pytest.mark.asyncio
+async def test_notification_finishing_during_cleanup_preserves_clean_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    real_detect = mimir.liveness.detect_unclean_restart
+    real_mark = mimir.liveness.mark_session_running
+    real_mark_clean = mimir.liveness.mark_clean_shutdown
+    assert real_mark(tmp_path, started_at=1000.0)
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    notify_started = asyncio.Event()
+    handoff_write_attempted = asyncio.Event()
+    real_write = mimir.liveness.write_session_marker
+
+    async def notify(home: Path, *, prior: dict[str, Any]) -> None:
+        notify_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Model a notification transport that completed at the same moment
+            # cleanup cancelled its wrapper task. The wrapper must re-read the
+            # now-clean marker rather than resurrecting stale unclean state.
+            return
+
+    def write_session_marker(home: Path, marker: dict[str, Any]) -> bool:
+        handoff_write_attempted.set()
+        return real_write(home, marker)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", real_detect)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", real_mark)
+    monkeypatch.setattr(mimir.liveness, "mark_clean_shutdown", real_mark_clean)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", notify)
+    monkeypatch.setattr(mimir.liveness, "write_session_marker", write_session_marker)
+
+    await _run_startup(app)
+    await asyncio.wait_for(notify_started.wait(), timeout=HANG_GUARD_SECONDS)
+    await _run_cleanup(app)
+
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None and marker["clean"] is True
+    assert handoff_write_attempted.is_set()
+    assert isinstance(marker.get("last_unclean_notify_ts"), float)
+
+
+@pytest.mark.asyncio
+async def test_notify_handoff_marker_failure_stays_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    real_detect = mimir.liveness.detect_unclean_restart
+    real_mark = mimir.liveness.mark_session_running
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    assert real_mark(tmp_path, started_at=1000.0)
+
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", real_detect)
+    monkeypatch.setattr(mimir.liveness, "mark_session_running", real_mark)
+    monkeypatch.setattr(mimir.liveness, "notify_unclean_restart", AsyncMock())
+    monkeypatch.setattr(mimir.liveness, "write_session_marker", lambda *args, **kwargs: False)
+
+    await _run_startup(app)
+    await asyncio.sleep(0)
+
+    marker = mimir.liveness.read_session_marker(tmp_path)
+    assert marker is not None and marker["clean"] is False
+    assert marker.get("last_unclean_notify_ts") is None
+    await _run_cleanup(app)
+    assert any(
+        kind == "liveness_unclean_restart_handoff_persist_failed"
+        and fields["prior_started_iso"] == "1970-01-01T00:16:40+00:00"
+        for kind, fields in control.event_payloads
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_scheduler_start_is_stopped_during_compensation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("scheduler partial start")
+    control = _ServerControl()
+    control.failures["scheduler:start"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert app["startup_state"].scheduler_start_attempted is True
+    assert app["startup_state"].scheduler_started is False
+    assert "scheduler:stop" in control.events
+    assert control.scheduler._scheduler.running is False
+
+
+@pytest.mark.asyncio
+async def test_retained_mcp_manager_is_shutdown_on_later_startup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("later startup failure")
+    control = _ServerControl(mcp_enabled=True)
+    control.failures["scheduler:reload"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert control.events.index("mcp:start") < control.events.index("mcp:shutdown")
+    assert app["mcp_manager"] is None
+    assert app["startup_state"].mcp_manager is None
+
+
+@pytest.mark.asyncio
+async def test_bridge_attempt_is_disconnected_on_startup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("bridge connection failed")
+    control = _ServerControl()
+    control.failures["bridges:connect"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert "bridges:disconnect" in control.events
+    assert app["startup_state"].bridges_connect_attempted is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["runtime", "indexer:start"])
+async def test_startup_failure_distinguishes_factory_and_published_bundle_rollback(
+    failure_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError(f"{failure_stage} failed")
+    control = _ServerControl(
+        runtime_failure=original if failure_stage == "runtime" else None,
+    )
+    if failure_stage != "runtime":
+        control.failures[failure_stage] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert ("bundle:close" in control.events) is (failure_stage != "runtime")
+    assert app["dispatcher"]._run_turn is None
+    assert app["agent_runtime"] is None
+
+
+@pytest.mark.asyncio
+async def test_partial_activity_panel_start_is_stopped_and_pairing_is_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("panel start failed")
+    control = _ServerControl(panel_enabled=True)
+    control.failures["panel:start"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert "bundle:close" in control.events
+    assert "panel:stop" in control.events
+    assert "pairing:close" in control.events
+    assert app["activity_panel"] is None
+
+
+@pytest.mark.asyncio
+async def test_startup_compensation_continues_after_errors_and_reraises_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = LookupError("startup terminal failure")
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    control.failures.update(
+        {
+            "log:api_started": original,
+            "scheduler:stop": RuntimeError("scheduler cleanup"),
+            "mcp:shutdown": RuntimeError("mcp cleanup"),
+            "bridges:disconnect": RuntimeError("bridge cleanup"),
+            "bundle:close": RuntimeError("bundle cleanup"),
+            "panel:stop": RuntimeError("panel cleanup"),
+            "pairing:close": RuntimeError("pairing cleanup"),
+        }
+    )
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(LookupError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    for event_name in (
+        "scheduler:stop",
+        "mcp:shutdown",
+        "bridges:disconnect",
+        "bundle:close",
+        "panel:stop",
+        "pairing:close",
+    ):
+        assert event_name in control.events
+    assert "cleanup failure(s)" in " ".join(getattr(original, "__notes__", []))
+    assert app["agent"] is None
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_server_startup_and_cleanup_resource_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    await _run_startup(app)
+    await asyncio.sleep(0)
+    assert "log:app_started" in control.events
+    assert "log:api_started" in control.events
+    control.events.clear()
+
+    await _run_cleanup(app)
+
+    ordered = [
+        "liveness:clean",
+        "log:shutdown",
+        "scheduler:stop",
+        "dispatcher:drain",
+        "cancel:server cleanup",
+        "bundle:close",
+        "panel:stop",
+        "pairing:close",
+        "bridges:disconnect",
+        "mcp:shutdown",
+    ]
+    positions = [control.events.index(name) for name in ordered]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_joins_git_push_and_retry_registries(tmp_path, monkeypatch):
+    from mimir import git_tracking
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    pending, retries = {}, {}
+    monkeypatch.setattr(git_tracking, "_pending_push_tasks", pending)
+    monkeypatch.setattr(git_tracking, "_push_retry_tasks", retries)
+    started = asyncio.Queue()
+    finished = []
+
+    async def worker(registry, key):
+        started.put_nowait(key)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            registry.pop(key, None)
+            finished.append(key)
+
+    tasks = []
+    for registry, key in [(pending, "push"), (retries, "retry")]:
+        task = asyncio.create_task(worker(registry, key))
+        registry[key] = task
+        tasks.append(task)
+    retries["empty"] = None
+    await started.get()
+    await started.get()
+    try:
+        await _run_cleanup(app)
+        assert all(task.done() for task in tasks)
+        assert sorted(finished) == ["push", "retry"]
+        assert pending == retries == {}
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_server_cleanup_stops_scheduler_before_final_channel_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+
+    async def drain(*, timeout: float) -> None:
+        callback = control.dispatcher._on_channel_drained
+        if callback is not None:
+            callback("poller:github-activity")
+        control.hit("dispatcher:drain")
+
+    control.dispatcher.drain = drain
+    await _run_cleanup(app)
+
+    assert control.events.index("scheduler:stop") < control.events.index(
+        "dispatcher:drain"
+    )
+    assert ("scheduler:trigger:github-activity:remediation_queue_drained" in control.events) == bool(
+        app["plugin_manager"].policy.server_hooks
+    )
+    assert control.scheduler._started is False
+
+
+@pytest.mark.asyncio
+async def test_part_b_startup_summary_emits_when_nothing_dispatched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    await _run_startup(app)
+
+    assert (
+        "worklink_reattach_dispatched",
+        {"issues": []},
+    ) in control.event_payloads
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_part_c_server_shutdown_summary_includes_released_and_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    import mimir_cultivate.worklink.autonomy as autonomy
+    from mimir_cultivate.worklink.claims import ShutdownClaimFailure
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    issued_agent_id = os.environ["MIMIR_WORKLINK_AGENT_ID"]
+    monkeypatch.setenv("MIMIR_WORKLINK_AGENT_ID", "mimir-worklink:another-generation")
+    observed: list[str] = []
+
+    def release(*args: Any, **kwargs: Any) -> tuple[list[Any], list[Any]]:
+        observed.append(kwargs["agent_id"])
+        return (
+            [SimpleNamespace(issue_id=1400)],
+            [ShutdownClaimFailure(issue_id=1401, reason="release denied")],
+        )
+
+    monkeypatch.setattr(
+        autonomy,
+        "release_claims_for_graceful_shutdown",
+        release,
+    )
+
+    await _run_cleanup(app)
+    assert observed == [issued_agent_id]
+
+    assert (
+        "worklink_shutdown_claims_released",
+        {
+            "issue_ids": [1400],
+            "failed": [{"issue_id": 1401, "reason": "release denied"}],
+        },
+    ) in control.event_payloads
+
+
+@pytest.mark.asyncio
+async def test_clean_marker_persistence_failure_is_reported_during_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.liveness
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    monkeypatch.setattr(mimir.liveness, "mark_clean_shutdown", lambda home: False)
+
+    with pytest.raises(ExceptionGroup, match="server cleanup failed") as caught:
+        await _run_cleanup(app)
+
+    assert any(
+        isinstance(error, RuntimeError)
+        and "failed to persist clean-shutdown marker" in str(error)
+        for error in caught.value.exceptions
+    )
+    assert "scheduler:stop" in control.events
+    assert "bundle:close" in control.events
+    assert app["agent"] is None
+
+
+@pytest.mark.asyncio
+async def test_server_cleanup_continues_aggregates_errors_and_clears_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    await _run_startup(app)
+    await asyncio.sleep(0)
+    control.events.clear()
+    control.failures.update(
+        {
+            "liveness:clean": RuntimeError("liveness cleanup"),
+            "log:shutdown": RuntimeError("log cleanup"),
+            "dispatcher:drain": RuntimeError("drain cleanup"),
+            "cancel:server cleanup": RuntimeError("task cleanup"),
+            "scheduler:stop": RuntimeError("scheduler cleanup"),
+            "bundle:close": RuntimeError("bundle cleanup"),
+            "panel:stop": RuntimeError("panel cleanup"),
+            "pairing:close": RuntimeError("pairing cleanup"),
+            "bridges:disconnect": RuntimeError("bridge cleanup"),
+            "mcp:shutdown": RuntimeError("mcp cleanup"),
+        }
+    )
+
+    with pytest.raises(ExceptionGroup, match="server cleanup failed") as caught:
+        await _run_cleanup(app)
+
+    assert len(caught.value.exceptions) == 10
+    for event_name in control.failures:
+        assert event_name in control.events
+    assert app["agent"] is None
+    assert app["agent_runtime"] is None
+    assert app["runtime_slot"].bundle is None
+    assert app["startup_state"].bundle is None
+    assert app["mcp_manager"] is None
+    assert app["activity_panel"] is None
+
+
+@pytest.mark.asyncio
+async def test_normal_cleanup_resistant_task_timeout_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.background_tasks
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    await asyncio.sleep(0)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant() -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(resistant(), name="cleanup-resistant-task")
+    app["startup_background_tasks"].add(task)
+    await started.wait()
+    monkeypatch.setattr(mimir.background_tasks, "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
+    control.events.clear()
+
+    try:
+        with pytest.raises(ExceptionGroup, match="server cleanup failed") as caught:
+            await _run_cleanup(app)
+        assert any(
+            isinstance(error, TimeoutError) and "cleanup-resistant-task" in str(error)
+            for error in caught.value.exceptions
+        )
+        assert "scheduler:stop" in control.events
+        assert "bundle:close" in control.events
+        assert "pairing:close" in control.events
+        assert "bridges:disconnect" in control.events
+        assert app["agent"] is None
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_server_cleanup_does_not_repeat_compensated_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("indexer failed")
+    control = _ServerControl()
+    control.failures["indexer:start"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    with pytest.raises(RuntimeError):
+        await _run_startup(app)
+    control.events.clear()
+
+    await _run_cleanup(app)
+
+    assert control.events == ["cancel:server cleanup"]
+
+
+def test_complete_prestartup_app_key_contract_and_benchmark_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    runtime_fields = {
+        "agent",
+        "turn_logger",
+        "message_buffer",
+        "indexes",
+        "indexer",
+        "saga_client",
+        "sessions",
+        "agent_runtime",
+        "replayed_messages",
+    }
+
+    assert all(app[field_name] is None for field_name in runtime_fields)
+    assert app["config"] is not None
+    assert app["dispatcher"] is control.dispatcher
+    assert app["scheduler"] is control.scheduler
+    assert app["channels"] is control.channels
+    assert app["pairing_notifier"] is not None
+    assert app["identity_resolver"] is control.core.identity_resolver
+    assert app["aliases_loaded"] == 4
+    assert app["seeded_subagents"] == {}
+    assert app["seeded_skills"] == {}
+    assert app["api_key"] == "test-key"
+    assert app["consolidate_guard"] is not None
+    assert app["startup_background_tasks"] == set()
+    assert app["startup_state"].runtime_attempted is False
+    assert "activity_panel" not in app
+    assert "mcp_manager" not in app
+
+
+@pytest.mark.asyncio
+async def test_runtime_and_server_owned_app_keys_follow_success_and_cleanup_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.history import get_global_buffer
+
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    dispatcher = app["dispatcher"]
+    scheduler = app["scheduler"]
+    channels = app["channels"]
+    notifier = app["pairing_notifier"]
+
+    await _run_startup(app)
+
+    assert app["agent"] is control.bundle.agent
+    assert app["turn_logger"] is control.bundle.turn_logger
+    assert app["message_buffer"] is control.bundle.message_buffer
+    assert app["indexes"] is control.bundle.indexes
+    assert app["indexer"] is control.bundle.indexer
+    assert app["saga_client"] is control.bundle.saga_client
+    assert app["sessions"] is control.bundle.sessions
+    assert app["replayed_messages"] == 9
+    assert get_global_buffer() is control.bundle.message_buffer
+    assert app["dispatcher"] is dispatcher
+    assert app["scheduler"] is scheduler
+    assert app["channels"] is channels
+    assert app["pairing_notifier"] is notifier
+
+    await _run_cleanup(app)
+
+    assert all(app[field_name] is None for field_name in (
+        "agent",
+        "turn_logger",
+        "message_buffer",
+        "indexes",
+        "indexer",
+        "saga_client",
+        "sessions",
+        "agent_runtime",
+        "replayed_messages",
+    ))
+    assert get_global_buffer() is None
+    assert dispatcher._run_turn is None
+    assert app["dispatcher"] is dispatcher
+    assert app["scheduler"] is scheduler
+    assert app["channels"] is channels
+    assert app["pairing_notifier"] is notifier
+
+
+@pytest.mark.asyncio
+async def test_conditional_panel_mcp_and_dispatcher_ingress_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    assert app["activity_panel"] is None
+    assert "mcp_manager" not in app
+    assert await app["dispatcher"].enqueue(object()) is False
+    assert control.web_chat.enqueue.__self__ is app["dispatcher"]
+
+    await _run_startup(app)
+
+    assert app["activity_panel"] is control.panel
+    assert app["mcp_manager"] is control.mcp_manager
+    assert await app["dispatcher"].enqueue(object()) is True
+
+    await _run_cleanup(app)
+
+    assert app["activity_panel"] is None
+    assert app["mcp_manager"] is None
+    assert await app["dispatcher"].enqueue(object()) is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _safe_str_eq
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestSafeStrEq:
+    def test_equal_strings_returns_true(self) -> None:
+        assert _safe_str_eq("abc123", "abc123") is True
+
+    def test_unequal_strings_returns_false(self) -> None:
+        assert _safe_str_eq("abc123", "abc124") is False
+
+    def test_empty_equal(self) -> None:
+        assert _safe_str_eq("", "") is True
+
+    def test_empty_vs_non_empty(self) -> None:
+        assert _safe_str_eq("", "x") is False
+
+    def test_different_length(self) -> None:
+        assert _safe_str_eq("short", "much-longer-string") is False
+
+    def test_unicode_equal(self) -> None:
+        assert _safe_str_eq("kéy-🔑", "kéy-🔑") is True
+
+    def test_unicode_unequal(self) -> None:
+        assert _safe_str_eq("kéy-🔑", "key-🔑") is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _AUTH_EXEMPT
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestAuthExemptSet:
+    def test_health_get_is_exempt(self) -> None:
+        assert ("GET", "/health") in _AUTH_EXEMPT
+
+    def test_react_app_get_is_exempt(self) -> None:
+        assert ("GET", "/app") in _AUTH_EXEMPT
+
+    def test_browser_auth_bootstrap_is_exempt(self) -> None:
+        assert ("GET", "/app/auth.js") in _AUTH_EXEMPT
+        assert ("GET", "/api/web/bootstrap") not in _AUTH_EXEMPT
+        assert ("GET", "/api/v1/web/bootstrap") in _AUTH_EXEMPT
+
+    def test_skill_auto_update_event_reports_failures_without_drift(self) -> None:
+        from mimir.server import _skill_auto_update_event
+        from mimir.skill_install import AutoSkillUpdateResult
+
+        event = _skill_auto_update_event(AutoSkillUpdateResult(
+            failed={"github-poller": ["poller.py"]},
+        ))
+
+        assert event is not None
+        kind, fields = event
+        assert kind == "skills_auto_update_failed"
+        assert fields["failed"] == {"github-poller": ["poller.py"]}
+
+    def test_skill_auto_update_event_reports_remaining_drift_as_non_failed(self) -> None:
+        from mimir.server import _skill_auto_update_event
+        from mimir.skill_install import AutoSkillUpdateResult
+
+        event = _skill_auto_update_event(AutoSkillUpdateResult(
+            remaining_drift={"github-poller": {"extra": ["local-note.md"]}},
+        ))
+
+        assert event is not None
+        kind, fields = event
+        assert kind == "skills_auto_update"
+        assert fields["remaining_drift"] == {
+            "github-poller": {"extra": ["local-note.md"]}
+        }
+
+    def test_react_assets_get_are_prefix_exempt(self) -> None:
+        assert ("GET", "/app/") in _AUTH_EXEMPT_PREFIXES
+        assert _is_auth_exempt("GET", "/app/assets/index.js") is True
+
+    def test_turns_get_is_exempt(self) -> None:
+        assert ("GET", "/turns") in _AUTH_EXEMPT
+
+    def test_ops_get_is_exempt(self) -> None:
+        assert ("GET", "/ops") in _AUTH_EXEMPT
+
+    def test_saga_get_is_exempt(self) -> None:
+        assert ("GET", "/saga") in _AUTH_EXEMPT
+
+    def test_state_get_is_exempt(self) -> None:
+        assert ("GET", "/state") in _AUTH_EXEMPT  # renamed from /memory
+
+    def test_root_get_is_exempt(self) -> None:
+        assert ("GET", "/") in _AUTH_EXEMPT
+
+    def test_event_post_is_not_exempt(self) -> None:
+        assert ("POST", "/event") not in _AUTH_EXEMPT
+
+    def test_health_post_is_not_exempt(self) -> None:
+        """A hypothetical POST /health must NOT inherit the GET exemption."""
+        assert ("POST", "/health") not in _AUTH_EXEMPT
+
+    def test_turns_post_is_not_exempt(self) -> None:
+        assert ("POST", "/turns") not in _AUTH_EXEMPT
+
+    def test_react_prefix_does_not_exempt_post(self) -> None:
+        assert _is_auth_exempt("POST", "/app/assets/index.js") is False
+
+    def test_is_frozenset_of_tuples(self) -> None:
+        assert isinstance(_AUTH_EXEMPT, frozenset)
+        for item in _AUTH_EXEMPT:
+            assert isinstance(item, tuple)
+            assert len(item) == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _MaskApiKeyInAccessLog
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestMaskApiKeyInAccessLog:
+    def _make_record(self, msg: Any, args: tuple = ()) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name="aiohttp.access",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg=msg,
+            args=args,
+            exc_info=None,
+        )
+        return record
+
+    def test_masks_query_param_in_msg(self) -> None:
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record("GET /?api_key=supersecret HTTP/1.1")
+        result = filt.filter(record)
+        assert result is True
+        assert "supersecret" not in record.msg
+        assert "REDACTED" in record.msg
+
+    def test_masks_mid_query_string(self) -> None:
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record("/path?foo=bar&api_key=s3cr3t&baz=qux")
+        filt.filter(record)
+        assert "s3cr3t" not in record.msg
+        assert "REDACTED" in record.msg
+        # Other params survive
+        assert "foo=bar" in record.msg
+        assert "baz=qux" in record.msg
+
+    def test_masks_in_args_tuple(self) -> None:
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record(
+            "method=%s url=%s",
+            ("GET", "/?api_key=exposed"),
+        )
+        filt.filter(record)
+        for arg in record.args:
+            assert "exposed" not in str(arg)
+
+    def test_non_string_args_left_alone(self) -> None:
+        """Non-string elements in args (numbers, None) are passed through."""
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record("code=%s time=%s", (200, 0.001))
+        filt.filter(record)
+        assert record.args == (200, 0.001)
+
+    def test_non_string_msg_not_crashed(self) -> None:
+        """A non-string msg (aiohttp may pass structured objects) must not crash."""
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record(42)  # int msg
+        result = filt.filter(record)
+        assert result is True
+        assert record.msg == 42  # untouched
+
+    def test_clean_record_unchanged(self) -> None:
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record("GET /health HTTP/1.1")
+        filt.filter(record)
+        assert record.msg == "GET /health HTTP/1.1"
+
+    def test_case_insensitive_match(self) -> None:
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record("GET /?API_KEY=secret HTTP/1.1")
+        filt.filter(record)
+        assert "secret" not in record.msg
+
+    def test_always_returns_true(self) -> None:
+        """filter() must return True to keep the record in the log stream."""
+        filt = _MaskApiKeyInAccessLog()
+        record = self._make_record("irrelevant")
+        assert filt.filter(record) is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _handle_health
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _health_app(with_worker: bool = False) -> web.Application:
+    """Minimal app with only the /health route."""
+    app = web.Application()
+    if with_worker:
+        pytest.importorskip("mimir_cultivate")
+        from mimir.plugins.manager import load_plugins
+
+        app["plugin_manager"] = load_plugins(enable="cultivate")
+    app.router.add_get("/health", _handle_health)
+    app.on_startup.append(_capture_controller_source_commit)
+    return app
+
+
+def _root_app() -> web.Application:
+    """Minimal app with only the / route."""
+    app = web.Application()
+    app.router.add_get("/", _handle_root)
+    return app
+
+
+class TestRootRedirect:
+    async def test_root_redirects_to_react_app(self) -> None:
+        async with TestClient(TestServer(_root_app())) as client:
+            resp = await client.get("/", allow_redirects=False)
+            assert resp.status == 302
+            assert resp.headers["Location"] == "/app"
+
+
+class TestHandleHealth:
+    @pytest.mark.asyncio
+    async def test_health_returns_200(self) -> None:
+        async with TestClient(TestServer(_health_app())) as client:
+            resp = await client.get("/health")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_health_returns_ok_true(self) -> None:
+        async with TestClient(TestServer(_health_app())) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+        assert body == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_health_is_json(self) -> None:
+        async with TestClient(TestServer(_health_app())) as client:
+            resp = await client.get("/health")
+        assert "application/json" in resp.headers.get("Content-Type", "")
+
+    @pytest.mark.asyncio
+    async def test_health_reports_stale_root_executor_before_launch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
+
+        socket_path = tmp_path / "executor.sock"
+        socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+        async def stale(_socket_path: Path = socket_path) -> None:
+            raise worker_client.StaleWorkerExecutorError(
+                worker_client.STALE_EXECUTOR_DIAGNOSTIC
+            )
+
+        monkeypatch.setattr(worker_client, "verify_executor_identity", stale)
+        app = _health_app(with_worker=True)
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+
+        assert resp.status == 503
+        assert body["ok"] is False
+        assert "stale root executor image" in body["error"]
+        assert "rebuild the image and restart the container" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_health_reports_root_executor_source_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
+
+        monkeypatch.delenv("WORKLINK_REPO", raising=False)
+        socket_path = tmp_path / "executor.sock"
+        socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+        async def identity(_socket_path: Path = socket_path) -> str:
+            return "c" * 40
+
+        monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
+        app = _health_app(with_worker=True)
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body == {
+            "ok": True,
+            "worklink_executor_source_commit": "c" * 40,
+            "worklink_controller_source_commit": None,
+            "worklink_executor_source_status": "unknown",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boot_commit", ["a" * 40, None])
+    @pytest.mark.parametrize("executor_commit", ["a" * 40, "b" * 40])
+    async def test_health_keeps_boot_commit_after_checkout_moves(
+        self, boot_commit: str | None, executor_commit: str,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import subprocess
+        import threading
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
+
+        monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+        socket_path = tmp_path / "executor.sock"
+        socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+        head = boot_commit
+        calls = []
+        loop_thread = threading.get_ident()
+
+        def read_head(argv, **kwargs):
+            assert threading.get_ident() != loop_thread
+            assert argv == ["git", "-C", str(tmp_path), "rev-parse", "--verify", "HEAD"]
+            assert kwargs == {
+                "capture_output": True, "text": True, "check": True, "timeout": 5,
+            }
+            calls.append(head)
+            if head is None:
+                raise FileNotFoundError("git")
+            return subprocess.CompletedProcess(argv, 0, stdout=head + "\n")
+
+        monkeypatch.setattr(subprocess, "run", read_head)
+
+        async def identity():
+            return executor_commit
+
+        monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
+        app = _health_app(with_worker=True)
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            # Move/repair the checkout AFTER startup but BEFORE the first probe.
+            # Lazy first-request caching would already report the wrong commit.
+            assert calls == [boot_commit]
+            head = "b" * 40
+            for _ in range(3):
+                resp = await client.get("/health")
+                body = await resp.json()
+                assert resp.status == 200
+                assert body["worklink_controller_source_commit"] == boot_commit
+                assert body["worklink_executor_source_status"] == (
+                    "unknown" if boot_commit is None else
+                    "matched" if boot_commit == executor_commit else "mismatched"
+                )
+            assert calls == [boot_commit]
+
+        # A fresh server startup (restart) captures the new source instead.
+        restarted = _health_app(with_worker=True)
+        restarted["check_worker_executor_health"] = True
+        async with TestClient(TestServer(restarted)) as client:
+            resp = await client.get("/health")
+            assert (await resp.json())["worklink_controller_source_commit"] == head
+        assert calls == [boot_commit, head]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", [
+        "matched", "mismatched", "no_socket", "no_repo", "not_git",
+        "missing_commit_file", "git_timeout", "git_missing",
+    ])
+    async def test_health_executor_source_comparison(
+        self, case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import subprocess
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
+        from mimir_cultivate.worklink import worker_exec
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run([
+            "git", "-C", str(repo), "-c", "user.name=Test", "-c",
+            "user.email=test@example.com", "commit", "--allow-empty", "-m", "test",
+        ], check=True, capture_output=True)
+        commit = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        monkeypatch.setenv("WORKLINK_REPO", str(repo))
+        if case == "no_repo":
+            monkeypatch.delenv("WORKLINK_REPO")
+        elif case == "not_git":
+            monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+        elif case in {"git_timeout", "git_missing"}:
+            def unavailable_git(*args, **kwargs):
+                if case == "git_timeout":
+                    raise subprocess.TimeoutExpired(args[0], 5)
+                raise FileNotFoundError("git")
+            monkeypatch.setattr(subprocess, "run", unavailable_git)
+
+        source_file = tmp_path / "executor-source-commit"
+        executor_commit = "0" * 40 if case == "mismatched" else commit
+        if case != "missing_commit_file":
+            source_file.write_text(executor_commit)
+        monkeypatch.setattr(worker_exec, "EXECUTOR_SOURCE_COMMIT_PATH", source_file)
+        socket_path = tmp_path / "executor.sock"
+        if case != "no_socket":
+            socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+        # Exercise the real identity verifier, including the executor's missing-file error.
+        class IdentitySocket:
+            def send(self, payload):
+                assert json.loads(payload)["op"] == "identity"
+
+            def recv(self, size):
+                try:
+                    response = {
+                        "status": "identity",
+                        "executor_identity": worker_client.EXECUTOR_PROTOCOL_IDENTITY,
+                        "source_commit": worker_exec._executor_source_commit(),
+                        "checkout_root": str(worker_exec.worklink_checkout_root()),
+                    }
+                except RuntimeError as exc:
+                    response = {"error": str(exc)}
+                return json.dumps(response).encode()
+
+            def close(self):
+                pass
+
+        def connect(self):
+            assert case != "no_socket"
+            return IdentitySocket()
+
+        monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
+        app = _health_app(with_worker=True)
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+
+        expected = case if case in {"matched", "mismatched"} else "unknown"
+        assert body["worklink_executor_source_status"] == expected
+        assert resp.status == (503 if case == "missing_commit_file" else 200)
+        assert body["ok"] is (case != "missing_commit_file")
+        assert body["worklink_executor_source_commit"] == (
+            None if case in {"no_socket", "missing_commit_file"} else executor_commit
+        )
+        assert body["worklink_controller_source_commit"] == (
+            None if case in {"no_repo", "not_git", "git_timeout", "git_missing"} else commit
+        )
+        if case == "mismatched":
+            assert "Worklink executor source drift" in caplog.text
+            assert executor_commit in caplog.text
+            assert commit in caplog.text
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _make_auth_middleware
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def _ok_handler(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
+
+
+def _auth_app(expected_key: str, *, web_host: str | None = None) -> web.Application:
+    """Minimal app wiring the auth middleware around a simple route."""
+    app = web.Application(
+        middlewares=[_make_auth_middleware(expected_key, web_host=web_host)]
+    )
+    app.router.add_get("/protected", _ok_handler)
+    app.router.add_post("/protected", _ok_handler)
+    app.router.add_put("/protected", _ok_handler)
+    app.router.add_patch("/protected", _ok_handler)
+    app.router.add_delete("/protected", _ok_handler)
+    app.router.add_get("/api/v1/sessions", _ok_handler)
+    # Register all exempt paths so we can hit them in tests
+    app.router.add_get("/health", _handle_health)
+    app.router.add_get("/turns", _ok_handler)
+    app.router.add_get("/ops", _ok_handler)
+    app.router.add_get("/saga", _ok_handler)
+    app.router.add_get("/state", _ok_handler)
+    app.router.add_get("/api/v1/web/bootstrap", _ok_handler)
+    return app
+
+
+class TestAuthMiddlewareNoKey:
+    """When no key is configured the middleware is a no-op pass-through."""
+
+    @pytest.mark.asyncio
+    async def test_no_key_allows_any_request(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            resp = await client.get("/protected")
+        assert resp.status == 200
+
+class TestBrowserRequestSecurity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expected_key", ["", "secret"])
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+    async def test_cross_site_fetch_metadata_rejects_write_before_auth(
+        self, expected_key: str, method: str,
+    ) -> None:
+        headers = {"Sec-Fetch-Site": "cross-site"}
+        if expected_key:
+            headers["X-API-Key"] = expected_key
+        async with TestClient(TestServer(_auth_app(expected_key))) as client:
+            resp = await client.request(method, "/protected", headers=headers)
+            body = await resp.json()
+        assert resp.status == 403
+        assert body == {"error": "cross_site_request"}
+
+    @pytest.mark.asyncio
+    async def test_foreign_origin_rejects_write_when_gate_is_inactive(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            resp = await client.post(
+                "/protected",
+                headers={"Origin": "https://attacker.example"},
+            )
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_same_origin_write_is_allowed(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            origin = str(client.make_url("/")).rstrip("/")
+            resp = await client.post(
+                "/protected",
+                headers={"Origin": origin, "Sec-Fetch-Site": "same-origin"},
+            )
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_non_browser_write_without_origin_headers_is_allowed(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            resp = await client.post("/protected")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_loopback_bind_rejects_rebinding_host_on_read_route(self) -> None:
+        app = _auth_app("", web_host="127.0.0.1")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/v1/sessions", headers={"Host": "attacker.example"}
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body == {"error": "invalid_host"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "host", ["127.0.0.1:8080", "localhost:8080", "[::1]:8080"]
+    )
+    async def test_loopback_bind_accepts_loopback_hostnames(self, host: str) -> None:
+        app = _auth_app("", web_host="127.0.0.1")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/sessions", headers={"Host": host})
+        assert resp.status == 200
+
+
+class TestBrowserRequestSecurity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expected_key", ["", "secret"])
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+    async def test_cross_site_fetch_metadata_rejects_write_before_auth(
+        self, expected_key: str, method: str,
+    ) -> None:
+        headers = {"Sec-Fetch-Site": "cross-site"}
+        if expected_key:
+            headers["X-API-Key"] = expected_key
+        async with TestClient(TestServer(_auth_app(expected_key))) as client:
+            resp = await client.request(method, "/protected", headers=headers)
+            body = await resp.json()
+        assert resp.status == 403
+        assert body == {"error": "cross_site_request"}
+
+    @pytest.mark.asyncio
+    async def test_foreign_origin_rejects_write_when_gate_is_inactive(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            resp = await client.post(
+                "/protected",
+                headers={"Origin": "https://attacker.example"},
+            )
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_same_origin_write_is_allowed(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            origin = str(client.make_url("/")).rstrip("/")
+            resp = await client.post(
+                "/protected",
+                headers={"Origin": origin, "Sec-Fetch-Site": "same-origin"},
+            )
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_non_browser_write_without_origin_headers_is_allowed(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            resp = await client.post("/protected")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_loopback_bind_rejects_rebinding_host_on_read_route(self) -> None:
+        app = _auth_app("", web_host="127.0.0.1")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/v1/sessions", headers={"Host": "attacker.example"}
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body == {"error": "invalid_host"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "host", ["127.0.0.1:8080", "localhost:8080", "[::1]:8080"]
+    )
+    async def test_loopback_bind_accepts_loopback_hostnames(self, host: str) -> None:
+        app = _auth_app("", web_host="127.0.0.1")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/sessions", headers={"Host": host})
+        assert resp.status == 200
+
+
+class TestAuthMiddlewareWithKey:
+    """When a key IS configured the middleware gates every non-exempt route."""
+
+    @pytest.mark.asyncio
+    async def test_correct_header_key_passes(self) -> None:
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get(
+                "/protected", headers={"X-API-Key": "my-secret"}
+            )
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_wrong_header_key_rejected(self) -> None:
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get(
+                "/protected", headers={"X-API-Key": "wrong"}
+            )
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_missing_key_header_rejected(self) -> None:
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get("/protected")
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_401_body_has_error_field(self) -> None:
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get("/protected")
+            body = await resp.json()
+        assert body.get("error") == "unauthorized"
+
+    @pytest.mark.asyncio
+    async def test_query_param_api_key_is_rejected(self) -> None:
+        """API keys in URLs are rejected; browsers use header-based fetch."""
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get("/protected?api_key=my-secret")
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_query_param_wrong_key_is_rejected(self) -> None:
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get("/protected?api_key=nope")
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_header_takes_precedence_over_query_when_both_present(
+        self,
+    ) -> None:
+        """Header auth still works if a non-auth query string is present."""
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get(
+                "/protected?api_key=garbage",
+                headers={"X-API-Key": "my-secret"},
+            )
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_empty_header_does_not_fall_back_to_query(self) -> None:
+        async with TestClient(TestServer(_auth_app("my-secret"))) as client:
+            resp = await client.get(
+                "/protected?api_key=my-secret",
+                headers={"X-API-Key": ""},
+            )
+        assert resp.status == 401
+
+
+class TestAuthMiddlewareExemptRoutes:
+    """_AUTH_EXEMPT routes bypass the gate even when a key is configured."""
+
+    @pytest.mark.asyncio
+    async def test_health_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/health")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_turns_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/turns")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_ops_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/ops")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_saga_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/saga")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_state_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/state")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_v1_web_bootstrap_is_exempt(self) -> None:
+        async with TestClient(TestServer(_auth_app("secret"))) as client:
+            resp = await client.get("/api/v1/web/bootstrap")
+        assert resp.status == 200
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _handle_event
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _event_app(
+    *,
+    enqueue_returns: bool = True,
+) -> tuple[web.Application, MagicMock]:
+    """Minimal app wiring the /event route with a stub dispatcher.
+
+    Returns (app, stub_dispatcher) so tests can inspect calls.
+    """
+    stub = MagicMock()
+    stub.enqueue = AsyncMock(return_value=enqueue_returns)
+
+    app = web.Application(middlewares=[_make_auth_middleware("")])
+    app["dispatcher"] = stub
+    app.router.add_post("/event", _handle_event)
+    return app, stub
+
+
+def _event_app_authed(
+    identity: Any,
+    *,
+    is_admin: bool = False,
+) -> tuple[web.Application, MagicMock]:
+    """/event app that injects an authenticated per-user identity.
+
+    Mirrors the request keys the real auth middleware stamps
+    (``auth_identity`` / ``auth_is_admin``) so the per-user channel-binding
+    path in ``_handle_event`` is exercised.
+    """
+    stub = MagicMock()
+    stub.enqueue = AsyncMock(return_value=True)
+
+    @web.middleware
+    async def _inject(request: web.Request, handler: Any) -> web.StreamResponse:
+        request["auth_identity"] = identity
+        request["auth_is_admin"] = is_admin
+        return await handler(request)
+
+    app = web.Application(middlewares=[_inject])
+    app["dispatcher"] = stub
+    app.router.add_post("/event", _handle_event)
+    return app, stub
+
+
+class TestHandleEvent:
+    @pytest.mark.asyncio
+    async def test_cross_site_text_plain_event_is_rejected_before_enqueue(self) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                data='{"channel_id":"web-default","content":"run"}',
+                headers={
+                    "Content-Type": "text/plain",
+                    "Origin": "https://attacker.example",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+            )
+        assert resp.status == 403
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_event_returns_200(self) -> None:
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "test-channel", "content": "hello"},
+            )
+        assert resp.status == 200
+
+    async def test_event_strips_forged_chat_skill_extra(self) -> None:
+        # chainlink #783 (security): the generic /event ingress is
+        # client-controlled, so a forged chat-skill invocation must be stripped
+        # before enqueue — only the WebChatBridge may produce one.
+        from mimir.chat_skills import CHAT_SKILL_EXTRA_KEY, LEGACY_CHAT_SKILL_EXTRA_KEY
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "/deploy now",
+                    "extra": {
+                        CHAT_SKILL_EXTRA_KEY: {
+                            "name": "deploy", "command": "/deploy",
+                            "args": "now", "raw": "/deploy now",
+                        },
+                        LEGACY_CHAT_SKILL_EXTRA_KEY: {"x": 1},
+                        "keep": "me",
+                    },
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert CHAT_SKILL_EXTRA_KEY not in event.extra
+        assert LEGACY_CHAT_SKILL_EXTRA_KEY not in event.extra
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+
+    async def test_event_strips_client_asserted_bridge_authority(self) -> None:
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "publish my synthesis",
+                    "author": "alice",
+                    "source": "api",
+                    "extra": {
+                        "channel_visibility": "public",
+                        "bridge_instance": "forged-bridge",
+                        "keep": "me",
+                    },
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+        from mimir.access_control import create_auth_context
+        from mimir.models import SessionACL
+
+        context = create_auth_context(event, enforce=True)
+        durable_acl = SessionACL.from_auth_context(
+            context,
+            origin_domain=event.source,
+            visibility=event.extra.get("channel_visibility", "private"),
+        )
+        assert durable_acl.visibility == "private"
+
+    async def test_event_strips_server_and_worklink_extra(self) -> None:
+        from mimir.http_ingress import SERVER_OWNED_EXTRA_KEYS
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            WORKLINK_HINT_EXTRA_KEYS,
+        )
+
+        extra = dict.fromkeys(SERVER_OWNED_EXTRA_KEYS | WORKLINK_HINT_EXTRA_KEYS, "forged")
+        extra["keep"] = "me"
+        extra["nested"] = [dict.fromkeys(WORKLINK_HINT_EXTRA_KEYS, "forged")]
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/event", json={"channel_id": "c", "extra": extra})
+        assert response.status == 200
+        assert stub.enqueue.call_args.args[0].extra == {
+            "keep": "me",
+            "nested": [{}],
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        }
+
+    async def test_event_strips_client_asserted_saga_session_id(self) -> None:
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "extra": {
+                        "saga_session_id": "saga-foreign-123-abc",
+                        "keep": "me",
+                    },
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+
+    async def test_event_strips_client_asserted_delivery_channel(self) -> None:
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "summarize my recent messages",
+                    "extra": {"deliver": "slack-C0PRIVATE", "keep": "me"},
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+        }
+
+    async def test_event_strips_forged_worklink_hint_extra(self) -> None:
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "resume chainlink #740",
+                    "extra": {
+                        "issue_id": 740,
+                        "pr_url": "https://github.com/acme/demo/pull/7",
+                        "worktree": "/tmp/evil",
+                        "poller_name": "forged-poller",
+                        "schedule_name": "forged-schedule",
+                        "run_id": "chainlink-740",
+                        "keep": "me",
+                        "nested": {
+                            "issue_id": 999,
+                            "schedule_name": "nested-forged-schedule",
+                            "still_here": True,
+                        },
+                    },
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": "me",
+            "nested": {"still_here": True},
+        }
+
+    async def test_event_stamps_http_ingress_as_untrusted_for_privileged_side_effects(self) -> None:
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "c",
+                    "content": "resume chainlink #740",
+                    "extra": {
+                        HTTP_EVENT_INGRESS_EXTRA_KEY: "forged-client-value",
+                        "keep": {"nested": True},
+                    },
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.extra == {
+            HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE,
+            "keep": {"nested": True},
+        }
+
+    @pytest.mark.asyncio
+    async def test_valid_event_returns_ok_true(self) -> None:
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "test-channel"},
+            )
+            body = await resp.json()
+        assert body["ok"] is True
+        assert body["channel_id"] == "test-channel"
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_returns_400(self) -> None:
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                data=b"not-json",
+                headers={"Content-Type": "application/json"},
+            )
+        assert resp.status == 400
+        # Dispatcher must not be called when the body is invalid
+        app["dispatcher"].enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_channel_id_returns_400(self) -> None:
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/event", json={"content": "oops"})
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_missing_channel_id_error_body(self) -> None:
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/event", json={})
+            body = await resp.json()
+        assert "channel_id" in body.get("error", "")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id", [["web-x"], 123])
+    async def test_non_string_channel_id_returns_400_before_enqueue(
+        self, channel_id: Any
+    ) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event", json={"channel_id": channel_id, "content": "hi"}
+            )
+            body = await resp.json()
+
+        assert resp.status == 400
+        assert body["error"] == "channel_id must be a string"
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_dict_extra_returns_400(self) -> None:
+        """#487: a truthy non-dict ``extra`` is rejected with 400, not coerced
+        (coercion let it reach ``event.extra.get(...)`` → AttributeError/500)."""
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "ch", "extra": "oops"},
+            )
+        assert resp.status == 400
+        app["dispatcher"].enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_list_attachment_names_returns_400(self) -> None:
+        """#487: a non-list ``attachment_names`` is rejected with 400."""
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "ch", "attachment_names": "a.txt"},
+            )
+        assert resp.status == 400
+        app["dispatcher"].enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_rejects_returns_503(self) -> None:
+        """When the dispatcher's queue is full it returns False → 503."""
+        app, _ = _event_app(enqueue_returns=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "busy-channel"},
+            )
+        assert resp.status == 503
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_rejects_body_has_channel_id(self) -> None:
+        app, _ = _event_app(enqueue_returns=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "busy-channel"},
+            )
+            body = await resp.json()
+        assert body.get("channel_id") == "busy-channel"
+
+    @pytest.mark.asyncio
+    async def test_non_admin_key_cannot_target_another_users_channel(self) -> None:
+        # Security: the request-body channel_id is spoofable. A per-user web key
+        # must not be able to run a turn on another user's channel (which would
+        # pull that user's private history into context / steer its egress).
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": web_channel_for_identity("alice"),
+                    "content": "read alice's history",
+                },
+            )
+        assert resp.status == 403
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_key_may_target_own_channel(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        own = web_channel_for_identity("bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": own, "content": "hi"},
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.channel_id == own
+        assert event.author == "bob"
+
+    @pytest.mark.asyncio
+    async def test_admin_key_may_target_any_channel(self) -> None:
+        # Admins (and the master key, which has identity=None) target any
+        # channel for operator/automation use.
+        from types import SimpleNamespace
+
+        admin = SimpleNamespace(canonical="op", display_name="Op")
+        app, stub = _event_app_authed(admin, is_admin=True)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "web-alice", "content": "ops broadcast"},
+            )
+        assert resp.status == 200
+        stub.enqueue.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_trigger_defaults_to_user_message(self) -> None:
+        """A body with no ``trigger`` field should default to ``user_message``."""
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            await client.post(
+                "/event",
+                json={"channel_id": "ch"},
+            )
+        call_args = stub.enqueue.call_args
+        event = call_args.args[0]
+        assert event.trigger == "user_message"
+
+    @pytest.mark.asyncio
+    async def test_non_admin_arbitrary_trigger_is_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": web_channel_for_identity("bob"),
+                    "trigger": "arbitrary_internal_wake",
+                },
+            )
+            body = await resp.json()
+
+        assert resp.status == 403
+        assert body == {
+            "error": "trigger not permitted for non-admin HTTP callers",
+            "allowed_triggers": ["user_message"],
+        }
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_privileged_trigger_is_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": web_channel_for_identity("bob"),
+                    "trigger": "saga_session_end",
+                },
+            )
+
+        assert resp.status == 403
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_admin_explicit_trigger_is_forwarded_without_session_selector(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        admin = SimpleNamespace(canonical="op", display_name="Op")
+        app, stub = _event_app_authed(admin, is_admin=True)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": "ch",
+                    "trigger": "scheduled_tick",
+                    "extra": {"saga_session_id": "saga-foreign-123-abc"},
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.trigger == "scheduled_tick"
+        assert "saga_session_id" not in event.extra
+
+    @pytest.mark.asyncio
+    async def test_content_forwarded(self) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            await client.post(
+                "/event",
+                json={"channel_id": "ch", "content": "ping"},
+            )
+        event = stub.enqueue.call_args.args[0]
+        assert event.content == "ping"
+
+    @pytest.mark.asyncio
+    async def test_author_forwarded(self) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            await client.post(
+                "/event",
+                json={"channel_id": "ch", "author": "alice", "author_id": "u123"},
+            )
+        event = stub.enqueue.call_args.args[0]
+        assert event.author == "alice"
+        assert event.author_id == "u123"
+
+    @pytest.mark.asyncio
+    async def test_per_user_key_ignores_spoofed_admin_and_service_authority(
+        self, tmp_path,
+    ) -> None:
+        from mimir.access_control import create_auth_context
+        from mimir.identities import IdentityResolver
+        from mimir.identities_populator import issue_web_key
+        from mimir.web_channels import web_channel_for_identity
+
+        user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+        issue_web_key(tmp_path, "operator", roles=["admin"])
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+
+        stub = MagicMock()
+        stub.enqueue = AsyncMock(return_value=True)
+        app = web.Application(middlewares=[_make_auth_middleware("master-secret")])
+        app["dispatcher"] = stub
+        app["identity_resolver"] = resolver
+        app.router.add_post("/event", _handle_event)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                headers={"X-API-Key": user_key},
+                json={
+                    # A non-admin per-user key may only target its own channel;
+                    # the spoofed author/service_principal below must still be
+                    # stripped regardless.
+                    "channel_id": web_channel_for_identity("alice"),
+                    "author": "operator",
+                    "author_id": "operator",
+                    "trigger": "user_message",
+                    "source": "api",
+                    "service_principal": "scheduler",
+                },
+            )
+
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.author == "alice"
+        assert event.author_id == "alice"
+        assert event.service_principal is None
+        auth_context = create_auth_context(event, resolver, enforce=True)
+        assert auth_context.roles == ()
+        assert auth_context.is_service is False
+        assert auth_context.canonical_principal == "alice"
+        assert auth_context.channel_id == web_channel_for_identity("alice")
+
+        import sqlite3
+        from mimir.saga.ownership import authorization_predicate, get_authorization_scope
+
+        scope = get_authorization_scope(auth_context)
+        assert scope.is_admin is False
+        predicate, params = authorization_predicate(scope)
+        with sqlite3.connect(":memory:") as conn:
+            rows = conn.execute(
+                "WITH atoms(owner_principal, visibility) AS "
+                "(VALUES ('alice', 'private'), ('operator', 'private')) "
+                f"SELECT owner_principal FROM atoms WHERE {predicate}", params,
+            ).fetchall()
+        assert rows == [("alice",)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("master_key", [None, "master-secret"])
+    async def test_transport_only_event_preserves_body_attribution(
+        self, tmp_path, monkeypatch, master_key,
+    ) -> None:
+        from mimir.access_control import create_auth_context
+        from mimir.identities import IdentityResolver
+        from mimir.identities_populator import issue_web_key
+        from mimir.saga.ownership import authorization_predicate, get_authorization_scope
+
+        # The keyless gate must see no issued keys, independently of the resolver
+        # used below to model the claimed author's configured admin role.
+        monkeypatch.delenv("MIMIR_API_KEY", raising=False)
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        stub = MagicMock()
+        stub.enqueue = AsyncMock(return_value=True)
+        app = web.Application(middlewares=[_make_auth_middleware(master_key)])
+        app["dispatcher"] = stub
+        app.router.add_post("/event", _handle_event)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                headers={"X-API-Key": master_key} if master_key else {},
+                json={
+                    "trigger": "user_message", "channel_id": "automation-target",
+                    "author": "jason", "author_id": "body-id",
+                    "author_display": "Automation attribution",
+                },
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.author == "jason"
+        assert event.author_id == "body-id"
+        assert event.author_display == "Automation attribution"
+        assert event.channel_id == "automation-target"
+
+        issue_web_key(tmp_path, "jason", roles=["admin"])
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+        context = create_auth_context(event, resolver)
+        assert context.roles == ()
+        assert authorization_predicate(get_authorization_scope(context)) != ("1=1", [])
+
+    @pytest.mark.asyncio
+    async def test_empty_body_returns_400(self) -> None:
+        """A totally empty JSON object has no channel_id → 400."""
+        app, _ = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/event", json={})
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_event_routed_through_auth_middleware(self) -> None:
+        """POST /event is NOT in _AUTH_EXEMPT → gated when a key is configured."""
+        stub = MagicMock()
+        stub.enqueue = AsyncMock(return_value=True)
+
+        app = web.Application(middlewares=[_make_auth_middleware("gatekey")])
+        app["dispatcher"] = stub
+        app.router.add_post("/event", _handle_event)
+
+        async with TestClient(TestServer(app)) as client:
+            # No key → 401
+            resp = await client.post(
+                "/event", json={"channel_id": "ch"}
+            )
+        assert resp.status == 401
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_source_forwarded_but_http_ingress_marker_added(self) -> None:
+        """chainlink #890: client-supplied source is forwarded but the HTTP
+        ingress marker is added so the dispatcher knows it's untrusted."""
+        from mimir.http_ingress import (
+            HTTP_EVENT_INGRESS_EXTRA_KEY,
+            HTTP_EVENT_INGRESS_EXTRA_VALUE,
+        )
+
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            await client.post(
+                "/event",
+                json={"channel_id": "ch", "source": "api", "author": "unknown"},
+            )
+        event = stub.enqueue.call_args.args[0]
+        assert event.source == "api"
+        assert event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
+@pytest.fixture
+def deterministic_server_embeddings():
+    from mimir.saga import embeddings
+
+    provider = MagicMock(spec=embeddings.EmbeddingProvider)
+    provider.provider_name = "server-test"
+    provider.model_id = "constant-4d"
+    provider.dimensions.return_value = 4
+    provider.embed.side_effect = lambda text, input_type="passage": [1.0, 0.0, 0.0, 0.0]
+    provider.batch_embed.side_effect = lambda texts, input_type="passage": [
+        provider.embed(text, input_type=input_type) for text in texts
+    ]
+    original = embeddings.get_provider
+    real_acquisition = MagicMock(wraps=original)
+    # The return value bypasses delegation to the real acquisition spy, including
+    # its process-global provider cache. Cover startup and turn-time memory alike.
+    acquire = MagicMock(wraps=real_acquisition, return_value=provider)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(embeddings, "get_provider", acquire)
+            yield provider
+            real_acquisition.assert_not_called()
+            acquire.assert_called()
+            provider.dimensions.assert_called()
+            provider.embed.assert_any_call("unrelated channel turn", input_type="query")
+    finally:
+        assert embeddings.get_provider is original
+
+
+@pytest.mark.asyncio
+async def test_cleanup_joins_cancelled_startup_index_sweep_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the startup task must not leave its file-writing thread alive."""
+    import threading
+
+    from mimir.search import Indexer
+
+    entered = asyncio.Event()
+    finished = threading.Event()
+    stop_entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    marker = tmp_path / "state" / "sweep-finished"
+
+    def held_sweep(indexer: Indexer) -> dict[str, int]:
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            if not release.wait(HANG_GUARD_SECONDS):
+                raise TimeoutError("startup index sweep was not released")
+            marker.write_text("done", encoding="utf-8")
+            return {"added": 0, "updated": 0, "removed": 0}
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(Indexer, "_check_dim_mismatch", lambda self: None)
+    monkeypatch.setattr(Indexer, "_sweep_sync", held_sweep)
+    original_stop = Indexer.stop
+
+    async def checked_stop(indexer: Indexer) -> None:
+        stop_entered.set()
+        await original_stop(indexer)
+        assert finished.is_set(), "indexer.stop returned while its sweep worker could still write"
+
+    monkeypatch.setattr(Indexer, "stop", checked_stop)
+    app, _ = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(real_dispatcher=True, real_runtime=True),
+    )
+    await _run_startup(app)
+    cleanup: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        cleanup = asyncio.create_task(_run_cleanup(app))
+        await asyncio.wait_for(stop_entered.wait(), HANG_GUARD_SECONDS)
+        release.set()
+        await asyncio.wait_for(asyncio.shield(cleanup), HANG_GUARD_SECONDS)
+        assert finished.is_set()
+        assert marker.read_text(encoding="utf-8") == "done"
+    finally:
+        release.set()
+        if cleanup is None:
+            await _run_cleanup(app)
+        else:
+            await asyncio.wait_for(cleanup, HANG_GUARD_SECONDS)
+        assert await asyncio.to_thread(finished.wait, HANG_GUARD_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_healthy(
+    monkeypatch: pytest.MonkeyPatch,
+    deterministic_server_embeddings,
+) -> None:
+    import mimir.tools
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
+    from mimir.acp.daemon import AcpDaemon
+    from mimir.agent import Agent
+    from mimir.dispatcher import Dispatcher
+    from mimir.event_logger import EventLogger
+    from mimir.identities import IdentityResolver, hash_web_key
+    from mimir.models import AgentEvent
+    from mimir.runtime import AgentRuntimeBundle
+
+    class DeterministicModel(GenericFakeChatModel):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> DeterministicModel:
+            return self
+
+    raw_key = "owned-server-acp-key"
+    home = Path(tempfile.mkdtemp(prefix="mimir-server-acp-", dir="/tmp"))
+    state = home / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        json.dumps(
+            {
+                "people": [
+                    {
+                        "canonical": "operator",
+                        "display_name": "Operator",
+                        "aliases": [hash_web_key(raw_key)],
+                        "access": {"roles": ["admin"], "is_service": False},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(home)
+    resolver.reload()
+    monkeypatch.setattr("mimir.dispatcher.log_event", AsyncMock())
+    control = _ServerControl(
+        identity_resolver=resolver,
+        real_dispatcher=True,
+        real_runtime=True,
+    )
+    app, control = _controlled_server_app(home, monkeypatch, control)
+    monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "mimir.event_logger._logger",
+        EventLogger(home / "logs" / "events.jsonl", "failure-isolation"),
+    )
+    model = DeterministicModel(messages=iter([AIMessage(content="turn complete")]))
+    monkeypatch.setattr("mimir.agent.resolve_model_from_config", lambda *args, **kwargs: model)
+    monkeypatch.setenv("MIMIR_SYSTEM_PROMPT_OVERRIDE", "Owned failure-isolation test prompt")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+    await _run_startup(app)
+
+    try:
+        daemon = app["acp_daemon"]
+        bundle = app["agent_runtime"]
+        dispatcher = app["dispatcher"]
+        assert isinstance(daemon, AcpDaemon)
+        assert isinstance(bundle, AgentRuntimeBundle)
+        assert isinstance(bundle.agent, Agent)
+        assert isinstance(dispatcher, Dispatcher)
+        assert daemon._bundle is bundle
+        assert app["runtime_slot"].bundle is bundle
+        assert bundle.adapters is app["runtime_adapters"]
+        assert bundle.adapters.channels is app["channels"]
+        # The dispatcher's runner is the identity-preflight wrapper rather
+        # than the bare bound method, so reach through __wrapped__ to prove
+        # it still belongs to THIS bundle's agent.
+        assert dispatcher._run_turn.__wrapped__.__self__ is bundle.agent
+
+        reader, writer = await asyncio.open_unix_connection(str(daemon.socket_path))
+        for request in (
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": 1},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "authenticate",
+                "params": {
+                    "methodId": "mimir-web-key",
+                    "_meta": {"mimir.webKey": raw_key},
+                },
+            },
+        ):
+            writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+        await writer.drain()
+        # This timeout is a hang guard, not a latency budget.
+        responses = [
+            json.loads(await asyncio.wait_for(reader.readline(), 10.0))
+            for _ in range(2)
+        ]
+        assert [response["id"] for response in responses] == [1, 2]
+        assert all("error" not in response for response in responses)
+
+        writer.transport.abort()
+        # This poll is a ten-second hang guard, not a latency budget.
+        for _ in range(1000):
+            if not daemon._peers and not daemon._connection_runners:
+                break
+            await asyncio.sleep(0.01)
+        assert not daemon._peers
+        assert not daemon._connection_runners
+
+        event = AgentEvent(
+            trigger="user_message",
+            channel_id="web:unrelated-after-acp-failure",
+            content="unrelated channel turn",
+            author="operator",
+            source="web",
+        )
+        turn_events = bundle.turn_event_bus.subscribe(event.channel_id)
+        try:
+            assert await dispatcher.enqueue(event) is True
+            channel_queue = dispatcher._queues[event.channel_id]
+            await asyncio.wait_for(channel_queue.join(), 10.0)
+            observed_events = []
+            while not turn_events.empty():
+                observed_events.append(turn_events.get_nowait())
+            terminal = next(
+                (
+                    observed
+                    for observed in observed_events
+                    if observed["type"] == "turn" and observed["phase"] == "end"
+                ),
+                None,
+            )
+        finally:
+            bundle.turn_event_bus.unsubscribe(event.channel_id, turn_events)
+
+        assert terminal is not None
+        assert terminal["status"] == "ok"
+        assert bundle.agent._agent_model is model
+        assert bundle._close_task is None
+        assert bundle.adapters.dispatcher is dispatcher
+        assert bundle.adapters.channels is app["channels"]
+        assert bundle.adapters.scheduler is app["scheduler"]
+        # The dispatcher's runner is the identity-preflight wrapper rather
+        # than the bare bound method, so reach through __wrapped__ to prove
+        # it still belongs to THIS bundle's agent.
+        assert dispatcher._run_turn.__wrapped__.__self__ is bundle.agent
+    finally:
+        await _run_cleanup(app)
+        shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_acp_daemon_uses_published_bundle_and_stops_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+            control.events.append("acp:construct")
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    control.events.clear()
+    await _run_startup(app)
+    assert control.events.count("runtime") == 1
+    assert control.events.index("runtime") < control.events.index("acp:construct")
+    assert control.events.index("acp:construct") < control.events.index("acp:start")
+
+    control.events.clear()
+    await _run_cleanup(app)
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")
+
+
+@pytest.mark.asyncio
+async def test_explicit_acp_overlong_socket_path_fails_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_home = tmp_path / ("h" * 160)
+    long_home.mkdir()
+    socket_path = long_home / ".mimir" / "acp" / "daemon.sock"
+    assert len(os.fsencode(socket_path)) > 108
+    app, control = _controlled_server_app(long_home, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    with pytest.raises(OSError, match="too long"):
+        await _run_startup(app)
+    assert control.bundle.closed is True
+
+    assert not socket_path.exists()
+    assert app["startup_state"].acp_daemon is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_acp_does_not_construct_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.delenv("MIMIR_ACP_ENABLED")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            raise AssertionError("disabled ACP must not construct the daemon")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    await _run_startup(app)
+
+    assert app.get("acp_daemon") is None
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_acp_daemon_construction_error_is_not_suppressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, _ = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            raise RuntimeError("constructor bug")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="constructor bug"):
+        await _run_startup(app)
+    assert app["startup_state"].acp_daemon is None
+
+
+@pytest.mark.asyncio
+async def test_acp_stop_failure_preserves_shared_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop:failed")
+            raise RuntimeError("peer still owns runtime work")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    await _run_startup(app)
+    control.events.clear()
+    with pytest.raises(ExceptionGroup, match="server cleanup failed"):
+        await _run_cleanup(app)
+    assert "acp:stop:failed" in control.events
+    assert "bundle:close" not in control.events
+    assert "bridges:disconnect" not in control.events
+    assert control.bundle.closed is False
+
+
+@pytest.mark.asyncio
+async def test_acp_is_stopped_before_bundle_on_startup_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    control = _ServerControl(failures={"indexer:start": RuntimeError("later startup")})
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="later startup"):
+        await _run_startup(app)
+    assert control.events.index("acp:start") < control.events.index("indexer:start")
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_compensation_preserves_ownership_for_cleanup_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    control = _ServerControl(failures={"indexer:start": RuntimeError("startup failure")})
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        stop_calls = 0
+
+        def __init__(self, bundle: Any) -> None:
+            self.bundle = bundle
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            type(self).stop_calls += 1
+            if type(self).stop_calls == 1:
+                raise RuntimeError("peer cleanup incomplete")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="startup failure"):
+        await _run_startup(app)
+    assert app["startup_state"].compensated is False
+    assert app["startup_state"].acp_daemon is app["acp_daemon"]
+    assert app["agent_runtime"] is control.bundle
+    assert control.bundle.closed is False
+
+    await _run_cleanup(app)
+    assert Daemon.stop_calls == 2
+    assert app["startup_state"].acp_daemon is None
+    assert app["acp_daemon"] is None
+    assert app["agent_runtime"] is None
+    assert control.bundle.closed is True
+
+
+def test_build_app_passes_operator_live_notice_to_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.server import _operator_notice_callbacks as real
+
+    created: list[Any] = []
+
+    def spy(config: Any, channels: Any) -> Any:
+        callbacks = real(config, channels)
+        created.append(callbacks)
+        return callbacks
+
+    monkeypatch.setattr("mimir.server._operator_notice_callbacks", spy)
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    [(operator_notice, operator_live_notice)] = created
+    kwargs = control.scheduler.init_kwargs
+    assert kwargs["operator_notice"] is operator_notice
+    assert kwargs["operator_live_notice"] is operator_live_notice

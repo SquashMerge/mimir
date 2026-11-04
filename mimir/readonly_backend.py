@@ -1,0 +1,2806 @@
+"""Filesystem backends that enforce per-directory write permissions.
+
+``WriteGuardBackend`` wraps ``FilesystemBackend`` and blocks writes/edits
+outside an operator-configured allowlist (``Config.writable_dirs``).
+``ReadOnlyFilesystemBackend`` blocks every write. Both delegate read
+operations to the underlying ``FilesystemBackend`` unchanged, so file
+search and read tools keep working.
+
+Wired into ``create_deep_agent(backend=...)`` from ``mimir.agent``.
+Ported from open-strix; the ``LoggingWriteGuardBackend`` variant is
+intentionally not carried over — mimir's ``turn_logger`` already
+records the relevant events on the dispatcher side.
+
+Security boundary: lexical ``..`` collapse + ``Path.resolve()``
+defeat both ``"/state/../logs/x.txt"``-style traversal and symlink
+escapes (a symlink under ``state/`` pointing into ``.mimir/`` resolves
+out of the writable root and is rejected). Read methods are an
+explicit allowlist — no ``__getattr__`` passthrough — so future
+mutator methods added by deepagents (``delete_file``, ``rename``,
+``mkdir``, …) don't silently bypass the guard.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import codecs
+import errno
+import json
+import logging
+import os
+import re
+import stat
+import subprocess
+import tempfile
+import time
+from collections.abc import Callable, Iterable, Iterator
+from contextvars import ContextVar
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import Annotated, Any, Literal
+
+from deepagents.backends import FilesystemBackend
+from deepagents.backends.composite import CompositeBackend
+# Optional upstream internals: dependency bumps must not prevent agent startup.
+try:
+    from deepagents.backends.filesystem import _get_backend_read_file_type
+except ImportError:
+    _get_backend_read_file_type = None
+from deepagents.backends.protocol import (
+    EditResult,
+    FileUploadResponse,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    WriteResult,
+)
+from deepagents.middleware import filesystem as deepagents_filesystem
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from langchain.tools import ToolRuntime
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, Field
+
+from .models import AuthContext
+
+log = logging.getLogger(__name__)
+
+_DEFAULT_TRAVERSAL_EXCLUDES = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".worktrees",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+})
+_DEFAULT_MAX_GREP_MATCHES = 2_000
+_DEFAULT_MAX_GLOB_MATCHES = 2_000
+_DEFAULT_MAX_SCAN_FILES = 20_000
+_DEFAULT_GREP_TIMEOUT_SECONDS = 10
+MAX_GREP_CONTEXT_LINES = 200
+_grep_context: ContextVar[tuple[int, int]] = ContextVar(
+    "mimir_grep_context", default=(0, 0),
+)
+_read_withheld_notices: ContextVar[list[str] | None] = ContextVar(
+    "mimir_read_withheld_notices", default=None,
+)
+_FILESYSTEM_TOOLS = [
+    "ls",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "replace_file",
+    "glob",
+    "grep",
+    "execute",
+]
+_WRITE_FILE_DESCRIPTION = (
+    "Creates a new file and writes the supplied content. It never overwrites an "
+    "existing path; when the target exists, use `edit_file` for a targeted change "
+    "or `replace_file` for its full content. Parent "
+    "directories are created as needed."
+)
+_EDIT_FILE_DESCRIPTION = (
+    "Change part of an existing file by replacing the specified old_string with "
+    "new_string. Anchor old_string on existing text; content outside the match "
+    "is preserved. This tool does not require a prior read. For a deliberate "
+    "full rewrite, use replace_file and pass the entire new content."
+)
+_REPLACE_FILE_DESCRIPTION = (
+    "Atomically replaces the ENTIRE content of an existing regular file with `content`, "
+    "preserving its permissions. Any existing text you do not include is deleted. "
+    "To add, prepend, append or change part of a file, use `edit_file` instead. "
+    "Use `write_file` to create a missing file. Symlinks and directories are refused. "
+    "Replacing a file of at least 1,024 bytes with under 10% of its size is refused "
+    "unless `allow_shrink=true`."
+)
+_UNSUPPORTED_CREATE_ERROR = (
+    "Write failed: descriptor-relative file creation is unsupported on this platform."
+)
+_UNSAFE_COMPONENT_ERROR = (
+    "Write blocked: path contains a symbolic-link or non-directory component."
+)
+_OS_OPEN = os.open
+_OS_MKDIR = os.mkdir
+_OS_STAT = os.stat
+_TEXT_PROBE_BYTES = 4096
+# Fallback only when deepagents renames its optional private classifier. Keep
+# native image/audio/video handling upstream; PDF deliberately uses our probe.
+_NATIVE_MEDIA_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
+    ".tif", ".tiff", ".avif", ".heic", ".heif",
+    ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".aiff", ".opus",
+    ".mp4", ".mpeg", ".mpg", ".mov", ".avi", ".webm", ".mkv", ".wmv",
+})
+
+
+def _is_native_media(file_path: str) -> bool:
+    if _get_backend_read_file_type is not None:
+        return _get_backend_read_file_type(file_path) in {"image", "audio", "video"}
+    return Path(file_path).suffix.lower() in _NATIVE_MEDIA_SUFFIXES
+
+
+def _read_decoded_text(content: str, offset: int, limit: int) -> ReadResult:
+    """Format exceptional decoded text without depending on upstream internals."""
+    if not content.strip():
+        return ReadResult(file_data={
+            "content": "System reminder: File exists but has empty contents",
+            "encoding": "utf-8",
+        })
+    lines = content.splitlines(keepends=True)
+    if offset >= len(lines):
+        return ReadResult(error=f"Line offset {offset} exceeds file length ({len(lines)} lines)")
+    end = min(offset + limit, len(lines))
+    return ReadResult(
+        file_data={"content": "".join(lines[offset:end]), "encoding": "utf-8"},
+        total_lines=len(lines), start_line=offset + 1, end_line=end,
+        next_offset=end if end < len(lines) else None,
+    )
+
+
+def _read_probed_text(handle, suffix: str) -> tuple[str | None, bytes]:
+    """Share bounded classification and byte loading between read and grep."""
+    size = os.fstat(handle.fileno()).st_size
+    probe = handle.read(_TEXT_PROBE_BYTES)
+    error = _probe_text_file(probe, suffix, size)
+    return (error, b"") if error else (None, probe + handle.read())
+
+
+_BINARY_READ_HINTS = {
+    ".pdf": ("PDF", "Use shell_exec with pdftotext on the PDF to extract text."),
+    ".docx": (
+        "zip-based Office document (DOCX)",
+        "Use shell_exec with python -c and stdlib zipfile to read word/document.xml "
+        "from the zip and strip XML tags (see view-attachment). No new dependency is needed.",
+    ),
+    ".xlsx": (
+        "zip-based Office document (XLSX)",
+        "No extractor on this deployment. Ask for a text or CSV export.",
+    ),
+    ".pptx": (
+        "zip-based Office document (PPTX)",
+        "No extractor on this deployment. Ask for a text export.",
+    ),
+}
+
+
+def _probe_text_file(probe: bytes, suffix: str, size: int) -> str | None:
+    """Classify only a bounded prefix; never decompress an archive to identify it."""
+    kind_hint = _BINARY_READ_HINTS.get(suffix)
+    if kind_hint is None and probe.startswith(b"%PDF-"):
+        kind_hint = _BINARY_READ_HINTS[".pdf"]
+    binary = b"\x00" in probe or probe.startswith(b"PK\x03\x04")
+    try:
+        # A multibyte character split at the probe boundary is not invalid UTF-8.
+        codecs.getincrementaldecoder("utf-8-sig")().decode(probe, final=size <= len(probe))
+    except UnicodeDecodeError:
+        # Latin-1 prose is text-like; control bytes distinguish opaque payloads.
+        binary = binary or any(
+            not char.isprintable() and char not in "\t\n\r\f"
+            for char in probe.decode("latin-1")
+        )
+    if kind_hint is None and not binary:
+        return None
+    kind, hint = kind_hint or (
+        "binary", "No text extractor is available for this format. Ask for a text export.",
+    )
+    return f"Binary file: kind={kind}; size={size} bytes. Next step: {hint}"
+
+
+class _WriteCollision(str):
+    pass
+
+
+_WRITE_COLLISION = _WriteCollision("mimir-private-write-collision")
+
+
+class _WriteFailure(str):
+    pass
+
+
+class _TraversalDeadlineExceeded(Exception):
+    pass
+
+
+def _exclusive_write(
+    root: Path, file_path: str, content: str,
+) -> WriteResult | _WriteCollision | _WriteFailure:
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or _OS_OPEN not in supports_dir_fd
+        or _OS_MKDIR not in supports_dir_fd
+        or _OS_STAT not in supports_dir_fd
+        or _OS_STAT not in supports_follow_symlinks
+    ):
+        return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)
+
+    root_text = str(root).rstrip("/")
+    key = file_path
+    if key == root_text:
+        key = "/"
+    elif root_text and key.startswith(root_text + "/"):
+        key = "/" + key[len(root_text) + 1:]
+    if key.startswith("~"):
+        return WriteResult(error="Path traversal not allowed")
+    relative = PurePosixPath(key.lstrip("/"))
+    parts = relative.parts
+    if not parts:
+        return WriteResult(error="File path must name a file")
+    if any(part in {"..", "~"} for part in parts):
+        return WriteResult(error="Path traversal not allowed")
+
+    opened: list[int] = []
+    final_fd: int | None = None
+    try:
+        opened.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY))
+        for component in parts[:-1]:
+            try:
+                os.mkdir(component, 0o777, dir_fd=opened[-1])
+            except FileExistsError:
+                pass
+            try:
+                nested = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=opened[-1],
+                )
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+                raise
+            opened.append(nested)
+
+        try:
+            final_fd = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=opened[-1],
+            )
+        except FileExistsError:
+            try:
+                existing = os.stat(parts[-1], dir_fd=opened[-1], follow_symlinks=False)
+            except OSError:
+                return _WRITE_COLLISION
+            if stat.S_ISLNK(existing.st_mode):
+                return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+            return _WRITE_COLLISION
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+            raise
+
+        try:
+            with os.fdopen(final_fd, "w", encoding="utf-8", newline="") as handle:
+                final_fd = None
+                handle.write(content)
+        except BaseException:
+            # ``O_CREAT | O_EXCL`` already created the destination, so a failure
+            # during the write leaves an empty or partial file behind. Because
+            # ``write_file`` is create-only, that turns a transient encoding or
+            # I/O error into a PERMANENT collision: the corrected retry gets
+            # FileExistsError and is told to use ``edit_file`` instead, against
+            # content the model never successfully wrote. Unlink through the
+            # same ``dir_fd`` used to create it, so cleanup cannot be redirected
+            # by a symlink swapped in after the open.
+            try:
+                os.unlink(parts[-1], dir_fd=opened[-1])
+            except OSError:
+                pass
+            raise
+        return WriteResult(path=file_path)
+    except NotImplementedError:
+        return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)
+    except (OSError, UnicodeEncodeError) as exc:
+        return _WriteFailure(str(exc))
+    finally:
+        if final_fd is not None:
+            try:
+                os.close(final_fd)
+            except OSError:
+                pass
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _collision_error(file_path: str) -> str:
+    return (f"File '{file_path}' already exists. To add lines or make a partial change, "
+            "use edit_file anchored on existing text. replace_file discards all content not passed.")
+
+
+def _missing_replace_error(file_path: str) -> str:
+    return f"File '{file_path}' does not exist. Use write_file to create new files."
+
+
+def _replace_shrink_error(existing_bytes: int, new_bytes: int, allow_shrink: bool) -> str | None:
+    """Use UTF-8 byte sizes and one threshold/message across replacement routes."""
+    if not allow_shrink and existing_bytes >= 1024 and new_bytes * 10 < existing_bytes:
+        return (
+            f"replace_file refused: new content ({new_bytes} bytes) is under 10% "
+            f"of the existing file ({existing_bytes} bytes) and would delete most of it. "
+            "Use edit_file for a partial change, or pass allow_shrink=true if replacing "
+            "the whole file is intended."
+        )
+    return None
+
+
+def _atomic_replace(
+    root: Path, file_path: str, content: str, max_bytes: int, allow_shrink: bool = False,
+) -> WriteResult:
+    """Publish through an anchored parent; never open the destination for writing."""
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or _OS_OPEN not in os.supports_dir_fd or _OS_STAT not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks
+            or os.rename not in os.supports_dir_fd):
+        return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)
+    root_text = str(root).rstrip("/")
+    key = file_path
+    if key == root_text:
+        key = "/"
+    elif root_text and key.startswith(root_text + "/"):
+        key = "/" + key[len(root_text) + 1:]
+    if key.startswith("~"):
+        return WriteResult(error="Path traversal not allowed")
+    parts = PurePosixPath(key.lstrip("/")).parts
+    if not parts or any(part in {"..", "~"} for part in parts):
+        return WriteResult(error="Path traversal not allowed")
+    opened: list[int] = []
+    temporary: str | None = None
+    try:
+        opened.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        for component in parts[:-1]:
+            opened.append(os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                  dir_fd=opened[-1]))
+        parent = opened[-1]
+        try:
+            target_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=parent)
+        except FileNotFoundError:
+            return WriteResult(error=_missing_replace_error(file_path))
+        try:
+            metadata = os.fstat(target_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                return WriteResult(error=f"File '{file_path}' is not a regular file.")
+        finally:
+            os.close(target_fd)
+        encoded = content.encode("utf-8")
+        if len(encoded) > max_bytes:
+            return WriteResult(error=f"File '{file_path}' exceeds size limit.")
+        shrink_error = _replace_shrink_error(metadata.st_size, len(encoded), allow_shrink)
+        if shrink_error:
+            return WriteResult(error=shrink_error)
+        temporary = f".mimir-{os.getpid()}-{os.urandom(8).hex()}.tmp"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     stat.S_IMODE(metadata.st_mode), dir_fd=parent)
+        try:
+            os.fchmod(fd, stat.S_IMODE(metadata.st_mode))
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        current = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(current.st_mode) or current.st_dev != metadata.st_dev
+                or current.st_ino != metadata.st_ino):
+            return WriteResult(error=f"File '{file_path}' changed during replacement.")
+        os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+        temporary = None
+        return WriteResult(path=file_path)
+    except FileNotFoundError:
+        return WriteResult(error=_missing_replace_error(file_path))
+    except (OSError, UnicodeEncodeError) as exc:
+        if isinstance(exc, OSError) and exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+        return WriteResult(error=_write_failure_error(file_path, str(exc)))
+    finally:
+        if temporary is not None and opened:
+            try:
+                os.unlink(temporary, dir_fd=opened[-1])
+            except FileNotFoundError:
+                pass
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+
+
+def _write_failure_error(file_path: str, detail: str) -> str:
+    return f"Error writing file '{file_path}': {detail}"
+
+
+class GrepWithContextSchema(BaseModel):
+    """DeepAgents grep schema extended with bounded line context."""
+
+    pattern: str = Field(description="Text pattern to search for (literal string, not regex).")
+    path: str | None = Field(
+        default=None,
+        description="Directory or file to search. Defaults to the current working directory.",
+    )
+    glob: str | None = Field(
+        default=None,
+        description="Glob pattern used to filter searched files (for example, '*.py').",
+    )
+    output_mode: Literal["files_with_matches", "content", "count"] = Field(
+        default="files_with_matches",
+        description=(
+            "Output format: 'files_with_matches' (paths only), 'content' "
+            "(matching and context lines), or 'count' (match counts per file)."
+        ),
+    )
+    before_context: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_GREP_CONTEXT_LINES,
+        description=f"Lines before each match for content output (max {MAX_GREP_CONTEXT_LINES}).",
+    )
+    after_context: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_GREP_CONTEXT_LINES,
+        description=f"Lines after each match for content output (max {MAX_GREP_CONTEXT_LINES}).",
+    )
+
+
+class MimirFilesystemMiddleware(FilesystemMiddleware):
+    """Filesystem middleware whose grep tool exposes backend context support."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        descriptions = dict(kwargs.pop("custom_tool_descriptions", None) or {})
+        descriptions["write_file"] = _WRITE_FILE_DESCRIPTION
+        descriptions["edit_file"] = _EDIT_FILE_DESCRIPTION
+        descriptions["replace_file"] = _REPLACE_FILE_DESCRIPTION
+        kwargs["custom_tool_descriptions"] = descriptions
+        kwargs["tools"] = [name for name in _FILESYSTEM_TOOLS if name != "replace_file"]
+        super().__init__(**kwargs)
+        self.tools.insert(4, self._create_replace_file_tool())
+
+    def _create_replace_file_tool(self) -> BaseTool:
+        from deepagents.middleware.filesystem import WriteFileSchema, _check_fs_permission, validate_path
+
+        class ReplaceFileSchema(WriteFileSchema):
+            allow_shrink: bool = Field(
+                default=False,
+                description="Set true to intentionally replace a large file with under 10% of its size.",
+            )
+
+        def result(path: str, response: WriteResult, runtime: ToolRuntime[AuthContext]) -> ToolMessage:
+            return ToolMessage(
+                content=response.error or f"Updated file {response.path}",
+                name="replace_file", tool_call_id=runtime.tool_call_id,
+                status="error" if response.error else "success",
+            )
+
+        def sync_replace(
+            file_path: str, content: str, runtime: ToolRuntime[AuthContext], allow_shrink: bool = False,
+        ) -> ToolMessage:
+            try:
+                path = validate_path(file_path)
+            except ValueError as exc:
+                return result(file_path, WriteResult(error=f"Error: {exc}"), runtime)
+            if _check_fs_permission(self._permissions, "write", path) == "deny":
+                return result(path, WriteResult(error=f"Error: permission denied for write on {path}"), runtime)
+            return result(path, self.backend.replace(path, content, allow_shrink=allow_shrink), runtime)
+
+        async def async_replace(
+            file_path: str, content: str, runtime: ToolRuntime[AuthContext], allow_shrink: bool = False,
+        ) -> ToolMessage:
+            try:
+                path = validate_path(file_path)
+            except ValueError as exc:
+                return result(file_path, WriteResult(error=f"Error: {exc}"), runtime)
+            if _check_fs_permission(self._permissions, "write", path) == "deny":
+                return result(path, WriteResult(error=f"Error: permission denied for write on {path}"), runtime)
+            return result(path, await self.backend.areplace(path, content, allow_shrink=allow_shrink), runtime)
+
+        for wrapper in (sync_replace, async_replace):
+            wrapper.__annotations__["runtime"] = ToolRuntime[AuthContext]
+        return StructuredTool.from_function(
+            name="replace_file", description=_REPLACE_FILE_DESCRIPTION,
+            func=sync_replace, coroutine=async_replace, infer_schema=False,
+            args_schema=ReplaceFileSchema,
+        )
+
+    @staticmethod
+    def _record_eviction(message: ToolMessage, evicted: bool) -> None:
+        if not evicted or not message.tool_call_id:
+            return
+        from ._context import get_current_turn
+
+        turn = get_current_turn()
+        ids = getattr(turn, "evicted_tool_result_ids", None)
+        if ids is not None:
+            ids.append(
+                deepagents_filesystem.sanitize_tool_call_id(message.tool_call_id)
+            )
+
+    def _process_large_message(self, message: ToolMessage, resolved_backend: Any) -> tuple[ToolMessage, bool]:
+        from .turn_stores import turn_store
+        from ._context import get_current_turn
+
+        prefix = turn_store("large_tool_results")
+        if prefix is None and get_current_turn() is not None:
+            return message, False
+        if prefix is None:
+            processed, evicted = super()._process_large_message(message, resolved_backend)
+        else:
+            content = deepagents_filesystem._extract_text_from_message(message)
+            processed = (
+                deepagents_filesystem._offload_tool_message_content(
+                    message, content, resolved_backend, prefix,
+                ) if self._tool_token_limit_before_evict
+                and len(content) > deepagents_filesystem.NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict
+                else None
+            )
+            evicted = processed is not None
+            processed = processed or message
+        self._record_eviction(message, evicted)
+        return processed, evicted
+
+    async def _aprocess_large_message(self, message: ToolMessage, resolved_backend: Any) -> tuple[ToolMessage, bool]:
+        from .turn_stores import turn_store
+        from ._context import get_current_turn
+
+        prefix = turn_store("large_tool_results")
+        if prefix is None and get_current_turn() is not None:
+            return message, False
+        if prefix is None:
+            processed, evicted = await super()._aprocess_large_message(message, resolved_backend)
+        else:
+            content = deepagents_filesystem._extract_text_from_message(message)
+            processed = (
+                await deepagents_filesystem._aoffload_tool_message_content(
+                    message, content, resolved_backend, prefix,
+                ) if self._tool_token_limit_before_evict
+                and len(content) > deepagents_filesystem.NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict
+                else None
+            )
+            evicted = processed is not None
+            processed = processed or message
+        self._record_eviction(message, evicted)
+        return processed, evicted
+
+    def _create_grep_tool(self) -> BaseTool:
+        stock_tool = super()._create_grep_tool()
+
+        def sync_grep(
+            pattern: Annotated[str, "Literal text to search for."],
+            runtime: ToolRuntime[AuthContext],
+            path: str | None = None,
+            glob: str | None = None,
+            output_mode: Literal["files_with_matches", "content", "count"] = "files_with_matches",
+            before_context: int = 0,
+            after_context: int = 0,
+        ):
+            token = _grep_context.set(
+                (before_context, after_context) if output_mode == "content" else (0, 0),
+            )
+            try:
+                return stock_tool.func(
+                    pattern=pattern,
+                    runtime=runtime,
+                    path=path,
+                    glob=glob,
+                    output_mode=output_mode,
+                )
+            finally:
+                _grep_context.reset(token)
+
+        async def async_grep(
+            pattern: Annotated[str, "Literal text to search for."],
+            runtime: ToolRuntime[AuthContext],
+            path: str | None = None,
+            glob: str | None = None,
+            output_mode: Literal["files_with_matches", "content", "count"] = "files_with_matches",
+            before_context: int = 0,
+            after_context: int = 0,
+        ):
+            token = _grep_context.set(
+                (before_context, after_context) if output_mode == "content" else (0, 0),
+            )
+            try:
+                return await stock_tool.coroutine(
+                    pattern=pattern,
+                    runtime=runtime,
+                    path=path,
+                    glob=glob,
+                    output_mode=output_mode,
+                )
+            finally:
+                _grep_context.reset(token)
+
+        # This module uses ``from __future__ import annotations``, so every
+        # annotation above is a string at runtime. LangChain decides which
+        # arguments are runtime-injected in
+        # ``StructuredTool._injected_args_keys``, which reads the RAW
+        # ``inspect.signature`` annotation and never resolves it via
+        # ``get_type_hints``. A stringified ``"ToolRuntime[AuthContext]"`` is therefore not
+        # recognised as injected, and ``BaseTool._parse_input`` drops any key
+        # that is neither an ``args_schema`` field nor a known injected arg --
+        # so LangGraph's injected ``runtime`` was discarded and the wrapper was
+        # called without it. Bind the parameterized type so detection sees it.
+        # ``_injected_args_keys`` is a cached_property, so this must happen
+        # before the tool is first invoked; doing it here keeps it adjacent to
+        # the signatures it describes.
+        for wrapper in (sync_grep, async_grep):
+            wrapper.__annotations__["runtime"] = ToolRuntime[AuthContext]
+
+        return StructuredTool.from_function(
+            name="grep",
+            description=stock_tool.description,
+            func=sync_grep,
+            coroutine=async_grep,
+            infer_schema=False,
+            args_schema=GrepWithContextSchema,
+        )
+
+    @staticmethod
+    def _append_withheld_notices(message: ToolMessage, notices: list[str]) -> ToolMessage:
+        if not notices or message.status != "success":
+            return message
+        return message.model_copy(update={
+            "content": f"{message.content}\n\n{' '.join(notices)}",
+        })
+
+    def _create_ls_tool(self) -> BaseTool:
+        stock_tool = super()._create_ls_tool()
+
+        def sync_ls(runtime: ToolRuntime[AuthContext], path: str) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = stock_tool.func(runtime=runtime, path=path)
+            finally:
+                _read_withheld_notices.reset(token)
+            return self._append_withheld_notices(message, notices)
+
+        async def async_ls(runtime: ToolRuntime[AuthContext], path: str) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = await stock_tool.coroutine(runtime=runtime, path=path)
+            finally:
+                _read_withheld_notices.reset(token)
+            return self._append_withheld_notices(message, notices)
+
+        for wrapper in (sync_ls, async_ls):
+            wrapper.__annotations__["runtime"] = ToolRuntime[AuthContext]
+        return StructuredTool.from_function(
+            name="ls",
+            description=stock_tool.description,
+            func=sync_ls,
+            coroutine=async_ls,
+            infer_schema=False,
+            args_schema=stock_tool.args_schema,
+        )
+
+    def _create_glob_tool(self) -> BaseTool:
+        stock_tool = super()._create_glob_tool()
+
+        def sync_glob(
+            pattern: str,
+            runtime: ToolRuntime[AuthContext],
+            path: str | None = None,
+        ) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = stock_tool.func(pattern=pattern, runtime=runtime, path=path)
+            finally:
+                _read_withheld_notices.reset(token)
+            # The upstream executor can time out before the backend returns.
+            # Attest only its exact fixed error, never an arbitrary glob failure.
+            if (message.status == "error"
+                    and message.content == deepagents_filesystem._glob_timeout_message()):
+                _publish_content_free_error(message.content)
+            return self._append_withheld_notices(message, notices)
+
+        async def async_glob(
+            pattern: str,
+            runtime: ToolRuntime[AuthContext],
+            path: str | None = None,
+        ) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = await stock_tool.coroutine(
+                    pattern=pattern, runtime=runtime, path=path,
+                )
+            finally:
+                _read_withheld_notices.reset(token)
+            if (message.status == "error"
+                    and message.content == deepagents_filesystem._glob_timeout_message()):
+                _publish_content_free_error(message.content)
+            return self._append_withheld_notices(message, notices)
+
+        for wrapper in (sync_glob, async_glob):
+            wrapper.__annotations__["runtime"] = ToolRuntime[AuthContext]
+        return StructuredTool.from_function(
+            name="glob",
+            description=stock_tool.description,
+            func=sync_glob,
+            coroutine=async_glob,
+            infer_schema=False,
+            args_schema=stock_tool.args_schema,
+        )
+
+
+def _log_truncation(op: str, reason: str) -> None:
+    log.warning("%s truncated: %s; narrow the path or pattern", op, reason)
+
+
+def _read_denied_message(reason: str) -> str:
+    guidance = {
+        "core_memory_block": "Use an allowed memory or state path instead.",
+        "protected_name_match": "Use a non-secret source or an authorized secret interface.",
+        "service_scoped_read_boundary": "Use a path inside this service's configured read roots.",
+        "mimir_home_read_boundary": "Use an allowed state path instead.",
+        "outside_file_tool_roots": (
+            "The path is not under any configured file-tool root. "
+            "Check the path spelling or ask the operator to configure its root."
+        ),
+        "protected_read_result": "For published PR content, use pr_files or pr_diff.",
+    }.get(reason, "Choose an allowed read target.")
+    return f"Read denied: {reason}. {guidance}"
+
+
+def _withheld_notice(reason_counts: dict[str, int]) -> str | None:
+    counted = []
+    for reason, count in sorted(reason_counts.items()):
+        if reason not in {"mimir_home_read_boundary", "service_scoped_read_boundary"}:
+            # Naming-rule denials are intentionally silent: even a coarse reason would
+            # disclose that a secret-shaped file exists in the requested listing.
+            continue
+        noun = "entry" if count == 1 else "entries"
+        counted.append(f"{count} {noun} ({reason})")
+    if not counted:
+        return None
+    return (
+        f"Note: read policy withheld {', '.join(counted)}. "
+        "The permitted results above are valid but incomplete."
+    )
+
+
+def _publish_withheld_notice(reason_counts: dict[str, int]) -> str | None:
+    notice = _withheld_notice(reason_counts)
+    channel = _read_withheld_notices.get()
+    if notice is not None and channel is not None:
+        channel.append(notice)
+    return notice
+
+
+def _contextualize_grep_matches(
+    matches: list[dict[str, Any]],
+    *,
+    reader: Callable[..., ReadResult],
+    before_context: int,
+    after_context: int,
+    max_lines: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Read merged line windows around matches without crossing files."""
+    by_path: dict[str, list[int]] = {}
+    for match in matches:
+        by_path.setdefault(str(match["path"]), []).append(int(match["line"]))
+
+    contextual: list[dict[str, Any]] = []
+    for file_path, line_numbers in by_path.items():
+        ranges = sorted(
+            (max(1, line - before_context), line + after_context)
+            for line in line_numbers
+        )
+        merged: list[tuple[int, int]] = []
+        for start, end in ranges:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+
+        for start, end in merged:
+            read_result = reader(file_path, offset=start - 1, limit=end - start + 1)
+            if read_result.error or not read_result.file_data:
+                continue
+            content = str(read_result.file_data.get("content", ""))
+            for line_number, text in enumerate(content.splitlines(), start):
+                contextual.append({
+                    "path": file_path,
+                    "line": line_number,
+                    "text": text,
+                })
+                if len(contextual) >= max_lines:
+                    return contextual, f"returned more than {max_lines} match/context lines"
+    return contextual, None
+
+
+def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
+    """Identify literal outside paths without remapping missing absolute paths.
+
+    Existing virtual targets retain precedence. Missing descendants of an
+    existing home namespace also retain their virtual spelling (e.g. /state/x).
+    """
+    if key == "/":
+        return None
+    try:
+        root = Path(cwd).resolve()  # resolve both sides so a symlinked home
+                                    # (e.g. macOS /var -> /private/var) can't
+                                    # false-flag a path that is really under it
+        virtual = (Path(cwd) / key.lstrip("/")).resolve()
+        if virtual.exists():
+            try:
+                virtual.relative_to(root)
+                return None
+            except ValueError:
+                pass
+
+        literal = Path(key)
+        if not literal.is_absolute():
+            return None
+        if not literal.exists() and (root / literal.parts[1]).exists():
+            return None
+        real = literal.resolve()
+    except OSError:
+        return None
+    try:
+        real.relative_to(root)
+    except ValueError:
+        return real
+    return None
+
+
+def _publish_content_free_error(error: str) -> None:
+    """Attest only at construction sites using fixed text and caller arguments.
+
+    Exception text, resolved targets and traversal state are resource content;
+    those errors must retain the ordinary fail-closed classification.
+    """
+    from .access_control import publish_protected_result
+
+    publish_protected_result((), content_free_error=error)
+
+
+class _BoundedFilesystemBackend(FilesystemBackend):
+    """FilesystemBackend with bounded recursive grep/glob traversal.
+
+    DeepAgents' stock backend already runs async grep/glob through
+    ``asyncio.to_thread`` and gives ripgrep a 30s timeout, but the synchronous
+    call still walks every configured root recursively. Once mimir exposed
+    operator-configured multi-GB roots (chainlink #650), a broad grep over a
+    route such as ``/workspace/mimir`` could descend into ``.worktrees/`` or
+    ``node_modules/`` for hundreds of seconds and starve the service. This
+    subclass keeps read/write behavior intact while making recursive search
+    safe by default: skip vendor/VCS/build trees and cap matches/files/time.
+
+    This is defense in depth on top of PR #875's Docker-level ripgrep install:
+    the ``rg`` path handles the normal case quickly, while the Python fallback
+    remains bounded for drifted images or shells without ``rg``. Revisit this
+    local fork if deepagents grows native traversal bounds or a non-error
+    truncation signal.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        traversal_excludes: Iterable[str] = _DEFAULT_TRAVERSAL_EXCLUDES,
+        max_grep_matches: int = _DEFAULT_MAX_GREP_MATCHES,
+        max_glob_matches: int = _DEFAULT_MAX_GLOB_MATCHES,
+        max_scan_files: int = _DEFAULT_MAX_SCAN_FILES,
+        grep_timeout_seconds: int = _DEFAULT_GREP_TIMEOUT_SECONDS,
+        glob_timeout_seconds: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._traversal_excludes = frozenset(traversal_excludes)
+        self._max_grep_matches = max_grep_matches
+        self._max_glob_matches = max_glob_matches
+        self._max_scan_files = max_scan_files
+        self._grep_timeout_seconds = grep_timeout_seconds
+        self._glob_timeout_seconds = glob_timeout_seconds
+
+    def _resolve_read_path(self, key: str) -> Path:
+        from ._context import get_current_turn
+        from .read_policy import is_current_service_scoped_read_path, non_admin_read_filter_enabled
+
+        resolved = self._resolve_path(key)
+        from .memory_proposals import is_protected_model_path
+
+        if is_protected_model_path(resolved):
+            raise ValueError("Read denied: protected_memory_proposal_path")
+        auth = getattr(get_current_turn(), "auth_context", None)
+        authority = getattr(auth, "service_authority", None)
+        if non_admin_read_filter_enabled() and getattr(authority, "authority_profile", None) == "github":
+            # Composite routes strip the shared lease parent, not the caller's
+            # selected lease. Check that spelling before resolution loses it.
+            lexical = Path(key)
+            if self.virtual_mode and not lexical.is_relative_to(self.cwd):
+                lexical = self.cwd / key.lstrip("/")
+            if lexical != resolved and not is_current_service_scoped_read_path(lexical):
+                raise ValueError("Read denied: service_scoped_read_boundary")
+        return resolved
+
+    def _is_excluded(
+        self,
+        path: Path,
+        *,
+        tool: str,
+        on_withheld: Callable[[str], None] | None = None,
+    ) -> bool:
+        from .memory_proposals import is_protected_model_path
+
+        if is_protected_model_path(path):
+            return True
+        try:
+            rel_parts = path.resolve().relative_to(self.cwd.resolve()).parts
+        except (OSError, RuntimeError, ValueError):
+            rel_parts = path.parts
+        if any(part in self._traversal_excludes for part in rel_parts):
+            return True
+        from .read_policy import (
+            is_mimir_home_root,
+            non_admin_read_filter_enabled,
+            protected_read_denial_reason,
+        )
+
+        reason = (
+            protected_read_denial_reason(path)
+            if non_admin_read_filter_enabled() and not is_mimir_home_root(path)
+            else None
+        )
+        if reason is not None:
+            from .read_policy import emit_hard_read_denial
+
+            emit_hard_read_denial(tool, str(path), reason)
+            if on_withheld is not None:
+                on_withheld(reason)
+        return reason is not None
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        resolved = self._resolve_read_path(file_path)
+        try:
+            if not resolved.is_file():
+                error = f"File '{file_path}' not found"
+                _publish_content_free_error(error)
+                return ReadResult(error=error)
+            # Preserve native multimodal payloads, but PDFs use extraction hints.
+            if _is_native_media(file_path):
+                return super().read(file_path, offset, limit)
+            fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as handle:
+                error, raw = _read_probed_text(handle, resolved.suffix.lower())
+                if error is not None:
+                    return ReadResult(error=error)
+            notice = ""
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                content = raw.decode("utf-8-sig", errors="replace")
+                notice = "\n\n[Decoded as UTF-8 with replacement for non-UTF-8 text bytes.]"
+            else:
+                if not raw.startswith(codecs.BOM_UTF8):
+                    # Normal UTF-8 stays on the upstream reader, including its
+                    # empty-file, offset/limit and response metadata behaviour.
+                    return super().read(file_path, offset, limit)
+                content = content.removeprefix("\ufeff")
+            # Only BOM/replacement text uses our compatibility path. It mirrors
+            # upstream universal newlines, empty-content warnings and line slicing.
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+            result = _read_decoded_text(content, offset, limit)
+            if notice and result.file_data is not None:
+                result.file_data["content"] += notice
+            return result
+        except (OSError, RuntimeError) as exc:
+            return ReadResult(error=f"Error reading file '{file_path}': {exc}")
+
+    def _walk_files(
+        self,
+        root: Path,
+        *,
+        tool: str,
+        deadline: float | None = None,
+        on_visit: Callable[[], None] | None = None,
+        descend: Callable[[Path], bool] | None = None,
+        on_withheld: Callable[[str], None] | None = None,
+        visited: list[bool] | None = None,
+    ) -> Iterator[Path]:
+        """Walk incrementally so callers can bound and observe every entry.
+
+        ``visited`` is the recursion-shared "has one entry been reached yet"
+        flag. The deadline is not honoured until it has, so the walk always
+        makes one entry of forward progress. Without that, a tight budget can
+        expire between the caller's ``time.monotonic()`` and the first check
+        here, and the caller reports truncation having visited nothing —
+        ``"search of '<path>' was cut short after 0 entries"``, which says
+        nothing about how far the scan reached. It also made the bound race
+        against process scheduling rather than against the size of the tree.
+        """
+        if deadline is None and on_visit is None and descend is None:
+            for dirpath, dirnames, filenames in os.walk(root):
+                base = Path(dirpath)
+                dirnames[:] = sorted(
+                    name
+                    for name in dirnames
+                    if not self._is_excluded(
+                        base / name, tool=tool, on_withheld=on_withheld,
+                    )
+                )
+                for filename in sorted(filenames):
+                    candidate = base / filename
+                    if not self._is_excluded(
+                        candidate, tool=tool, on_withheld=on_withheld,
+                    ):
+                        yield candidate
+            return
+
+        if visited is None:
+            visited = [False]
+
+        if visited[0] and deadline is not None and time.monotonic() >= deadline:
+            raise _TraversalDeadlineExceeded
+        directories: list[Path] = []
+        files: list[Path] = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if visited[0] and deadline is not None and time.monotonic() >= deadline:
+                    raise _TraversalDeadlineExceeded
+                if on_visit is not None:
+                    on_visit()
+                # Set unconditionally, not only when ``on_visit`` is supplied:
+                # a deadline with no observer must still be enforced from the
+                # second entry on, or the walk would never stop.
+                visited[0] = True
+                candidate = Path(entry.path)
+                if self._is_excluded(
+                    candidate, tool=tool, on_withheld=on_withheld,
+                ):
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                (directories if is_dir else files).append(candidate)
+
+        # Match the deterministic ordering of the os.walk fast path: files in
+        # the current directory first, then each child directory recursively.
+        # Sorting before yielding also makes either truncation bound retain the
+        # same prefix across filesystems and after unrelated directory churn.
+        yield from sorted(files, key=lambda path: path.name)
+        for directory in sorted(directories, key=lambda path: path.name):
+            if descend is None or descend(directory):
+                yield from self._walk_files(
+                    directory,
+                    tool=tool,
+                    deadline=deadline,
+                    on_visit=on_visit,
+                    descend=descend,
+                    on_withheld=on_withheld,
+                    visited=visited,
+                )
+
+    @staticmethod
+    def _glob_descender(_root: Path, pattern: str) -> Callable[[Path], bool] | None:
+        """Return safe pattern pruning without changing ``Path.match`` semantics.
+
+        A trailing slash can only name a directory, while this backend returns
+        files only, so no descendant can produce a result. Other patterns may
+        match a suffix at any depth (for example, ``src/*.py`` also matches
+        ``docs/src/x.py``), making fixed-prefix pruning unsafe.
+        """
+        if pattern.endswith("/"):
+            return lambda _directory: False
+        return None
+
+    @staticmethod
+    def _record_glob_search(
+        *,
+        pattern: str,
+        root: Path,
+        visited_entries: int,
+        elapsed_seconds: float,
+        truncated: bool,
+        reason: str | None,
+    ) -> None:
+        try:
+            from .event_logger import log_event_sync
+
+            log_event_sync(
+                "filesystem_glob_search",
+                pattern=pattern,
+                root=str(root),
+                visited_entries=visited_entries,
+                elapsed_seconds=round(elapsed_seconds, 6),
+                truncated=truncated,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001 - telemetry must not break file search
+            log.debug("Could not record filesystem_glob_search", exc_info=True)
+
+    def _ripgrep_search(
+        self, pattern: str, base_full: Path, include_glob: str | None,
+    ) -> tuple[dict[str, list[tuple[int, str]]], str | None] | None:
+        """Search with ripgrep while excluding expensive dirs and bounding time."""
+        from .read_policy import non_admin_read_filter_enabled
+
+        # The Python path checks each file's content once before returning any
+        # match. Ripgrep cannot provide that guarantee for secret-bearing files.
+        if non_admin_read_filter_enabled():
+            return None
+        cmd = ["rg", "--json", "-F"]
+        for name in sorted(self._traversal_excludes):
+            cmd.extend(["--glob", f"!{name}/**"])
+        if include_glob:
+            cmd.extend(["--glob", include_glob])
+        cmd.extend(["--", pattern, str(base_full)])
+
+        try:
+            proc = subprocess.run(  # noqa: S603
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._grep_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {}, f"ran longer than {self._grep_timeout_seconds}s"
+        except (FileNotFoundError, PermissionError):
+            return None
+
+        results: dict[str, list[tuple[int, str]]] = {}
+        match_count = 0
+        truncated: str | None = None
+        for line in proc.stdout.splitlines():
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") != "match":
+                continue
+            pdata = data.get("data", {})
+            ftext = pdata.get("path", {}).get("text")
+            if not ftext:
+                continue
+            p = Path(ftext)
+            if self._is_excluded(p, tool="grep"):
+                continue
+            if self.virtual_mode:
+                try:
+                    virt = self._to_virtual_path(p)
+                except ValueError:
+                    log.debug("Skipping grep result outside root: %s", p)
+                    continue
+                except (OSError, RuntimeError):
+                    log.warning("Could not resolve grep result path: %s", p, exc_info=True)
+                    continue
+            else:
+                virt = str(p)
+            ln = pdata.get("line_number")
+            lt = pdata.get("lines", {}).get("text", "").rstrip("\n")
+            if ln is None:
+                continue
+            results.setdefault(virt, []).append((int(ln), lt))
+            match_count += 1
+            if match_count >= self._max_grep_matches:
+                truncated = f"matched more than {self._max_grep_matches} lines"
+                break
+        return results, truncated
+
+    def _python_search(
+        self, pattern: str, base_full: Path, include_glob: str | None,
+    ) -> tuple[dict[str, list[tuple[int, str]]], str | None]:  # noqa: C901, PLR0912
+        """Fallback search with excluded dirs and file/match caps."""
+        regex = re.compile(pattern)
+        results: dict[str, list[tuple[int, str]]] = {}
+        root = base_full if base_full.is_dir() else base_full.parent
+        candidates: Iterator[Path]
+        if base_full.is_file():
+            candidates = iter([base_full])
+        else:
+            candidates = self._walk_files(root, tool="grep")
+        scanned = 0
+        matches = 0
+        truncated: str | None = None
+        for fp in candidates:
+            try:
+                if self._is_excluded(fp, tool="grep") or not fp.is_file():
+                    continue
+            except (PermissionError, OSError, RuntimeError):
+                continue
+            if include_glob and not fp.match(include_glob):
+                continue
+            scanned += 1
+            if scanned > self._max_scan_files:
+                truncated = f"scanned more than {self._max_scan_files} files"
+                break
+            try:
+                if fp.stat().st_size > self.max_file_size_bytes:
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            try:
+                with fp.open("rb") as handle:
+                    error, raw = _read_probed_text(handle, fp.suffix.lower())
+                    if error:
+                        continue
+                    content = raw.decode("utf-8-sig", errors="replace")
+            except (UnicodeDecodeError, PermissionError, OSError, RuntimeError):
+                continue
+            from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
+
+            reason = (
+                protected_read_result_reason(fp, text=content)
+                if non_admin_read_filter_enabled()
+                else None
+            )
+            if reason is not None:
+                from .read_policy import emit_hard_read_denial
+
+                emit_hard_read_denial("grep", str(fp), reason)
+                continue
+            for line_num, line in enumerate(content.splitlines(), 1):
+                if regex.search(line):
+                    if self.virtual_mode:
+                        try:
+                            virt_path = self._to_virtual_path(fp)
+                        except ValueError:
+                            log.debug("Skipping grep result outside root: %s", fp)
+                            continue
+                        except (OSError, RuntimeError):
+                            log.warning("Could not resolve grep result path: %s", fp, exc_info=True)
+                            continue
+                    else:
+                        virt_path = str(fp)
+                    results.setdefault(virt_path, []).append((line_num, line))
+                    matches += 1
+                    if matches >= self._max_grep_matches:
+                        return results, f"matched more than {self._max_grep_matches} lines"
+        return results, truncated
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
+    ) -> GrepResult:
+        """Search for literal text with bounded traversal and result caps."""
+        if before_context == 0 and after_context == 0:
+            before_context, after_context = _grep_context.get()
+        if (
+            isinstance(before_context, bool)
+            or isinstance(after_context, bool)
+            or not isinstance(before_context, int)
+            or not isinstance(after_context, int)
+            or not 0 <= before_context <= MAX_GREP_CONTEXT_LINES
+            or not 0 <= after_context <= MAX_GREP_CONTEXT_LINES
+        ):
+            return GrepResult(
+                error=(
+                    "grep context must be integer line counts between 0 and "
+                    f"{MAX_GREP_CONTEXT_LINES}"
+                ),
+                matches=[],
+            )
+        try:
+            base_full = self._resolve_read_path(path or ".")
+        except ValueError:
+            return GrepResult(matches=[])
+        except (OSError, RuntimeError) as e:
+            search_path = path or "."
+            return GrepResult(error=f"Error searching path '{search_path}': {e}", matches=[])
+
+        try:
+            if not base_full.exists():
+                return GrepResult(matches=[])
+        except OSError as e:
+            search_path = path or "."
+            return GrepResult(error=f"Error searching path '{search_path}': {e}", matches=[])
+
+        rg_results = self._ripgrep_search(pattern, base_full, glob)
+        if rg_results is None:
+            results, truncated = self._python_search(re.escape(pattern), base_full, glob)
+        else:
+            results, truncated = rg_results
+
+        matches = []
+        for fpath, items in results.items():
+            for line_num, line_text in items:
+                matches.append({"path": fpath, "line": int(line_num), "text": line_text})
+        if before_context or after_context:
+            matches, context_truncated = self._add_grep_context(
+                matches,
+                before_context=before_context,
+                after_context=after_context,
+            )
+            truncated = truncated or context_truncated
+        if truncated:
+            _log_truncation("Grep", truncated)
+        return GrepResult(matches=matches)
+
+    def _add_grep_context(
+        self,
+        matches: list[dict[str, Any]],
+        *,
+        before_context: int,
+        after_context: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        return _contextualize_grep_matches(
+            matches,
+            reader=self.read,
+            before_context=before_context,
+            after_context=after_context,
+            max_lines=self._max_grep_matches,
+        )
+
+    def glob(
+        self, pattern: str, path: str | None = None,
+    ) -> GlobResult:  # noqa: C901, PLR0912
+        """Find files matching a glob pattern without walking excluded trees forever."""
+        if not isinstance(pattern, str):
+            return GlobResult(
+                error=(
+                    "Invalid glob argument 'pattern': expected a string, "
+                    f"got {type(pattern).__name__}. Retry with a glob pattern such as '**/*.py'."
+                ),
+                matches=[],
+            )
+        if path is not None and not isinstance(path, str):
+            return GlobResult(
+                error=(
+                    "Invalid glob argument 'path': expected a string or null, "
+                    f"got {type(path).__name__}. Retry with an absolute search path, or omit "
+                    "'path' to search the file-tool root."
+                ),
+                matches=[],
+            )
+        started = time.monotonic()
+        timeout_seconds = (
+            deepagents_filesystem.GLOB_TIMEOUT * 0.5
+            if self._glob_timeout_seconds is None
+            else self._glob_timeout_seconds
+        )
+        requested_pattern = pattern
+        if pattern.startswith("/"):
+            pattern = pattern.lstrip("/")
+
+        if self.virtual_mode and ".." in Path(pattern).parts:
+            return GlobResult(error="Path traversal not allowed in glob pattern", matches=[])
+
+        try:
+            search_path = self._resolve_read_path(path or "/")
+            if path is None:
+                # A literal leading directory is an anchor, not a reason to
+                # visit every sibling in the home. Keep the last component as
+                # the match target when the entire pattern is literal.
+                parts = Path(pattern).parts
+                prefix = []
+                for part in parts[:-1]:
+                    if any(char in part for char in "*?["):
+                        break
+                    prefix.append(part)
+                if prefix:
+                    search_path = self._resolve_read_path("/" + "/".join(prefix))
+            from .read_policy import (
+                is_mimir_home_root,
+                non_admin_read_filter_enabled,
+                protected_read_result_reason,
+            )
+
+            if non_admin_read_filter_enabled() and not is_mimir_home_root(search_path):
+                reason = protected_read_result_reason(search_path)
+                if reason is not None:
+                    from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+                    emit_hard_read_denial("glob", str(search_path), reason)
+                    message = _read_denied_message(reason)
+                    record_read_policy_refusal(message)
+                    _publish_content_free_error(message)
+                    return GlobResult(error=message, matches=[])
+            if not search_path.exists():
+                return GlobResult(matches=[])
+        except (OSError, RuntimeError, ValueError) as e:
+            display_path = path if path is not None else "<default>"
+            return GlobResult(error=f"Error globbing path '{display_path}': {e}", matches=[])
+
+        results: list[dict[str, Any]] = []
+        scanned = 0
+        visited_entries = 0
+        truncated: str | None = None
+        withheld: dict[str, int] = {}
+
+        def record_withheld(reason: str) -> None:
+            withheld[reason] = withheld.get(reason, 0) + 1
+
+        candidates: Iterator[Path]
+        if search_path.is_file():
+            candidates = iter([search_path])
+            visited_entries = 1
+        else:
+            def record_visit() -> None:
+                nonlocal visited_entries
+                visited_entries += 1
+
+            candidates = self._walk_files(
+                search_path,
+                tool="glob",
+                deadline=started + timeout_seconds,
+                on_visit=record_visit,
+                descend=self._glob_descender(search_path, pattern),
+                on_withheld=record_withheld,
+            )
+        try:
+            for candidate in candidates:
+                scanned += 1
+                if scanned > self._max_scan_files:
+                    truncated = f"scanned more than {self._max_scan_files} files"
+                    break
+                if self._is_excluded(candidate, tool="glob") or not candidate.match(pattern):
+                    continue
+                matched_path = candidate
+                from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
+
+                reason = (
+                    protected_read_result_reason(matched_path)
+                    if non_admin_read_filter_enabled()
+                    else None
+                )
+                if reason is not None:
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial("glob", str(matched_path), reason)
+                    record_withheld(reason)
+                    continue
+                try:
+                    is_file = matched_path.is_file()
+                except (PermissionError, OSError, RuntimeError):
+                    continue
+                if not is_file:
+                    continue
+                if self.virtual_mode:
+                    try:
+                        matched_path.resolve().relative_to(self.cwd)
+                    except (OSError, RuntimeError, ValueError):
+                        continue
+                    try:
+                        out_path = self._to_virtual_path(matched_path)
+                    except ValueError:
+                        log.debug("Skipping glob result outside root: %s", matched_path)
+                        continue
+                    except (OSError, RuntimeError):
+                        log.warning("Could not resolve glob result path: %s", matched_path, exc_info=True)
+                        continue
+                else:
+                    out_path = str(matched_path)
+                try:
+                    st = matched_path.stat()
+                    results.append({
+                        "path": out_path,
+                        "is_dir": False,
+                        "size": int(st.st_size),
+                        "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    })
+                except OSError:
+                    results.append({"path": out_path, "is_dir": False})
+                if len(results) >= self._max_glob_matches:
+                    truncated = f"matched more than {self._max_glob_matches} files"
+                    break
+        except _TraversalDeadlineExceeded:
+            truncated = f"ran longer than {timeout_seconds:g}s"
+        except (OSError, RuntimeError, ValueError) as e:
+            display_path = path if path is not None else "<default>"
+            msg = f"Glob of '{display_path}' aborted partway: {e}"
+            log.warning("%s", msg, exc_info=True)
+            results.sort(key=lambda x: x.get("path", ""))
+            return GlobResult(error=msg, matches=results)
+
+        results.sort(key=lambda x: x.get("path", ""))
+        elapsed = time.monotonic() - started
+        _publish_withheld_notice(withheld)
+        if truncated:
+            _log_truncation(
+                "Glob",
+                f"search of '{search_path}' was cut short after {visited_entries} entries: "
+                f"{truncated}",
+            )
+        self._record_glob_search(
+            pattern=requested_pattern,
+            root=search_path,
+            visited_entries=visited_entries,
+            elapsed_seconds=elapsed,
+            truncated=truncated is not None,
+            reason=truncated,
+        )
+        if truncated and truncated.startswith("ran longer than"):
+            error = (
+                f"glob timed out after {timeout_seconds:g}s; results are incomplete; "
+                "narrow the path or pattern"
+            )
+            _publish_content_free_error(error)
+            return GlobResult(error=error, matches=[], truncated=True)
+        return GlobResult(matches=results, truncated=truncated is not None)
+
+    def ls(self, path: str) -> LsResult:
+        """List direct children, omitting excluded traversal roots by default."""
+        from .read_policy import (
+            is_mimir_home_root,
+            non_admin_read_filter_enabled,
+            protected_read_result_reason,
+        )
+
+        requested = self._resolve_read_path(path)
+        from .memory_proposals import is_protected_model_path
+
+        filtering = non_admin_read_filter_enabled()
+        if filtering:
+            try:
+                requested = self._resolve_read_path(path)
+                reason = (
+                    None
+                    if is_mimir_home_root(requested)
+                    else protected_read_result_reason(requested)
+                )
+            except (OSError, RuntimeError, ValueError):
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+                emit_hard_read_denial("ls", path, "unresolved_read_target")
+                message = "Read denied: unresolved path"
+                record_read_policy_refusal(message)
+                _publish_content_free_error(message)
+                return LsResult(error=message)
+            if reason is not None:
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+                emit_hard_read_denial(
+                    "ls", path, reason, remapped_candidate=str(requested),
+                )
+                message = _read_denied_message(reason)
+                record_read_policy_refusal(message)
+                _publish_content_free_error(message)
+                return LsResult(error=message)
+
+        if not requested.is_dir():
+            error = f"Directory '{path}' not found or not a directory"
+            _publish_content_free_error(error)
+            return LsResult(error=error)
+        result = super().ls(path)
+        entries = result.entries or []
+        filtered = [
+            entry for entry in entries
+            if Path(str(entry.get("path", "")).rstrip("/")).name not in self._traversal_excludes
+            and not is_protected_model_path(
+                self._resolve_path(str(entry.get("path", "")).rstrip("/")),
+            )
+        ]
+        withheld: dict[str, int] = {}
+        if filtering:
+            safe = []
+            for entry in filtered:
+                try:
+                    resolved = self._resolve_read_path(str(entry.get("path", "")).rstrip("/"))
+                except (OSError, RuntimeError, ValueError):
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial(
+                        "ls", str(entry.get("path", "")), "unresolved_read_target",
+                    )
+                    withheld["unresolved_read_target"] = (
+                        withheld.get("unresolved_read_target", 0) + 1
+                    )
+                    continue
+                reason = protected_read_result_reason(resolved)
+                if reason is None:
+                    safe.append(entry)
+                else:
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial("ls", str(resolved), reason)
+                    withheld[reason] = withheld.get(reason, 0) + 1
+            filtered = safe
+        _publish_withheld_notice(withheld)
+        return LsResult(error=result.error, entries=filtered)
+
+
+class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
+    """FilesystemBackend that treats absolute paths under ``cwd`` as virtual.
+
+    Upstream's ``virtual_mode=True`` resolves every incoming path as a
+    virtual path under ``cwd``, so ``/mimir-home/state/foo.md`` becomes
+    ``cwd/mimir-home/state/foo.md`` on disk — i.e. double-prefixed.
+    Agents that see container-absolute paths in shell output (or in the
+    feedback signals at the top of the prompt) naturally call
+    ``read_file("/mimir-home/...")`` and get a misleading "not found",
+    even when the file is right there.
+
+    The fix: if an incoming absolute path is already rooted at ``cwd``,
+    strip the prefix before ``_resolve_path`` sees it. The virtual form
+    (``/state/foo.md``) still works unchanged, so existing callers are
+    not affected.
+    """
+
+    def __init__(self, *args: Any, guard_outside_root: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # When True, an absolute path outside ``cwd`` returns a
+        # clear error instead of being silently remapped under ``cwd`` (the
+        # false-not-found of chainlink #650). Opt-in: only the home/default
+        # backend sets it; CompositeBackend route backends receive
+        # prefix-stripped keys, so the guard never misfires on them.
+        self._guard_outside_root = guard_outside_root
+
+    def _resolve_path(self, key: str) -> Path:
+        if self.virtual_mode and key.startswith("/"):
+            root_str = str(self.cwd).rstrip("/")
+            if key == root_str:
+                key = "/"
+            elif key.startswith(root_str + "/"):
+                key = "/" + key[len(root_str) + 1:]
+        return super()._resolve_path(key)
+
+    # --- out-of-root guard (chainlink #650) ---------------------------------
+    # When ``guard_outside_root`` is set (the home/default backend), an absolute
+    # path outside ``cwd`` would otherwise be silently
+    # remapped under ``cwd`` and read back as "not found" (the 746-failure bug).
+    # Return a clear, actionable error RESULT instead. We return rather than
+    # raise: deepagents' middleware wraps only ``validate_path`` (not the backend
+    # call) in try/except, so a raise from ``_resolve_path`` would propagate
+    # uncaught. Route backends are plain ``_RootAwareFilesystemBackend`` instances
+    # (no WriteGuard wrapper), so read/ls/write/edit all catch the ValueError that
+    # ``_resolve_path`` raises when a ..-free symlink resolves outside ``cwd``.
+
+    def _outside_root_msg(self, key: str, *, tool: str | None = None) -> str:
+        if tool is not None:
+            from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+            reason = "outside_file_tool_roots"
+            emit_hard_read_denial(
+                tool, key, reason,
+                remapped_candidate=str(self.cwd / key.lstrip("/")),
+            )
+            message = _read_denied_message(reason)
+            record_read_policy_refusal(message)
+            return message
+        return (
+            f"Path '{key}' is outside the file-tool root '{self.cwd}'. It exists "
+            f"on disk but the file tools can't reach it — read or edit it with "
+            f"shell_exec, or have the operator add its directory to "
+            f"MIMIR_FILE_TOOL_ROOTS."
+        )
+
+    def _path_value_error_msg(self, key: str, exc: ValueError) -> str:
+        if "outside root directory" in str(exc):
+            return self._outside_root_msg(key)
+        return str(exc)
+
+    def _is_outside_root(self, key: str) -> bool:
+        return self._guard_outside_root and _real_path_outside_root(key, self.cwd) is not None
+
+    @staticmethod
+    def _read_denied_message(reason: str) -> str:
+        return _read_denied_message(reason)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        if self._is_outside_root(file_path):
+            error = self._outside_root_msg(file_path, tool="read_file")
+            _publish_content_free_error(error)
+            return ReadResult(error=error)
+        from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
+
+        if non_admin_read_filter_enabled():
+            try:
+                resolved = self._resolve_read_path(file_path)
+                reason = protected_read_result_reason(resolved)
+                if reason is not None:
+                    from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+                    emit_hard_read_denial(
+                        "read_file", file_path, reason, remapped_candidate=str(resolved),
+                    )
+                    message = self._read_denied_message(reason)
+                    record_read_policy_refusal(message)
+                    _publish_content_free_error(message)
+                    return ReadResult(error=message)
+            except (OSError, RuntimeError, ValueError):
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+                emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
+                message = "Read denied: unresolved path"
+                record_read_policy_refusal(message)
+                _publish_content_free_error(message)
+                return ReadResult(error=message)
+        try:
+            result = super().read(file_path, offset, limit)
+        except ValueError as e:
+            error = self._path_value_error_msg(file_path, e)
+            return ReadResult(error=error)
+        if result.error is None:
+            self._publish_read_provenance(file_path)
+        return result
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        if self._is_outside_root(file_path):
+            error = self._outside_root_msg(file_path, tool="read_file")
+            _publish_content_free_error(error)
+            return ReadResult(error=error)
+        from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
+
+        if non_admin_read_filter_enabled():
+            try:
+                resolved = self._resolve_read_path(file_path)
+                reason = protected_read_result_reason(resolved)
+                if reason is not None:
+                    from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+                    emit_hard_read_denial(
+                        "read_file", file_path, reason, remapped_candidate=str(resolved),
+                    )
+                    message = self._read_denied_message(reason)
+                    record_read_policy_refusal(message)
+                    _publish_content_free_error(message)
+                    return ReadResult(error=message)
+            except (OSError, RuntimeError, ValueError):
+                from .read_policy import emit_hard_read_denial, record_read_policy_refusal
+
+                emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
+                message = "Read denied: unresolved path"
+                record_read_policy_refusal(message)
+                _publish_content_free_error(message)
+                return ReadResult(error=message)
+        return await asyncio.to_thread(self.read, file_path, offset, limit)
+
+    def _publish_read_provenance(self, file_path: str) -> None:
+        """Publish the path only after backend resolution and a successful read."""
+        self._publish_read_paths([file_path])
+
+    def _publish_read_paths(self, file_paths: list[str]) -> None:
+        """Publish every exact resource in a successful backend collection result."""
+        from ._context import get_current_turn
+        from .access_control import (
+            invalidate_protected_result_capture,
+            protected_result_source,
+            publish_protected_result,
+        )
+        from .read_policy import framework_large_tool_results_root
+        from ._deepagents_summarization import read_offload_labels
+
+        turn = get_current_turn()
+        auth_context = getattr(turn, "auth_context", None)
+        resolved_paths = []
+        artifact_root = framework_large_tool_results_root()
+        for file_path in dict.fromkeys(file_paths):
+            try:
+                resolved = self._resolve_path(file_path).resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                invalidate_protected_result_capture()
+                return
+            # Reading back this turn's own offload is not a new IFC input.
+            if (
+                turn is not None and artifact_root is not None
+                and resolved.parent == artifact_root / str(getattr(turn, "turn_id", ""))
+                and resolved.name in getattr(turn, "evicted_tool_result_ids", ())
+            ):
+                continue
+            resolved_paths.append(str(resolved))
+        sources = []
+        for resolved in resolved_paths:
+            sources.append(protected_result_source(
+                auth_context,
+                principal="filesystem",
+                domain="filesystem",
+                resource_id=resolved,
+                bridge_instance="filesystem",
+            ))
+            # Exact, content-bound offload inputs accompany the filesystem
+            # label. A missing record leaves the ordinary untrusted path label.
+            sources.extend(read_offload_labels(resolved) or ())
+        publish_protected_result(tuple(sources))
+
+    def ls(self, path: str) -> LsResult:
+        if self._is_outside_root(path):
+            error = self._outside_root_msg(path, tool="ls")
+            _publish_content_free_error(error)
+            return LsResult(error=error)
+        try:
+            result = super().ls(path)
+        except ValueError as e:
+            error = self._path_value_error_msg(path, e)
+            return LsResult(error=error)
+        if result.error is None:
+            # Ordinary names belong to the listed directory. Resolved symlink
+            # targets can disclose names from elsewhere and need their own source.
+            read_paths = [path]
+            try:
+                listed_directory = self._resolve_path(path).resolve(strict=True)
+                for entry in result.entries or ():
+                    entry_path = entry.get("path")
+                    if not entry_path:
+                        continue
+                    resolved_entry = self._resolve_path(str(entry_path)).resolve(strict=True)
+                    if resolved_entry.parent != listed_directory:
+                        read_paths.append(str(entry_path))
+            except (OSError, RuntimeError, ValueError):
+                from .access_control import invalidate_protected_result_capture
+
+                invalidate_protected_result_capture()
+            else:
+                self._publish_read_paths(read_paths)
+        return result
+
+    async def als(self, path: str) -> LsResult:
+        if self._is_outside_root(path):
+            error = self._outside_root_msg(path, tool="ls")
+            _publish_content_free_error(error)
+            return LsResult(error=error)
+        return await asyncio.to_thread(self.ls, path)
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        result = super().glob(pattern, path)
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
+
+    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
+        result = await super().aglob(pattern, path)
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
+    ) -> GrepResult:
+        result = super().grep(pattern, path, glob, before_context, after_context)
+        if result.error is None:
+            self._publish_read_paths([
+                str(match.get("path"))
+                for match in result.matches or ()
+                if match.get("path")
+            ])
+        return result
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
+    ) -> GrepResult:
+        return await asyncio.to_thread(
+            self.grep, pattern, path, glob, before_context, after_context,
+        )
+
+    def _git_metadata_write_denied(self, file_path: str) -> bool:
+        """Git metadata is controller-owned, even in shadow enforcement mode.
+
+        Check both the request and its resolved destination so a worktree
+        symlink cannot make lease integrity records model-writable. This also
+        protects .git pointer files and routes rooted inside a Git directory.
+        """
+        root = str(self.cwd).rstrip("/")
+        key = file_path
+        if key == root or key.startswith(root + "/"):
+            key = key[len(root):]
+        lexical = self.cwd / key.lstrip("/")
+        denied = ".git" in lexical.parts
+        try:
+            denied = denied or ".git" in lexical.resolve(strict=False).parts
+        except (OSError, RuntimeError, ValueError):
+            # Existing path-confinement guards own unresolved/outside paths.
+            # Do not mislabel their refusals as Git metadata violations.
+            pass
+        if denied:
+            from .tools.budget_gate import _emit_hard_boundary_denied
+
+            _emit_hard_boundary_denied(
+                tool="filesystem_write", boundary="git_metadata",
+                reason="git_metadata_readonly", target=file_path,
+            )
+        return denied
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        if self._git_metadata_write_denied(file_path):
+            return WriteResult(error="Write denied: git_metadata_readonly")
+        result = _exclusive_write(self.cwd, file_path, content)
+        if result is _WRITE_COLLISION:
+            return WriteResult(error=_WRITE_COLLISION)
+        if isinstance(result, _WriteFailure):
+            return WriteResult(error=result)
+        return result
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.write, file_path, content)
+
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        if self._git_metadata_write_denied(file_path):
+            return WriteResult(error="Write denied: git_metadata_readonly")
+        return _atomic_replace(self.cwd, file_path, content, self.max_file_size_bytes, allow_shrink)
+
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        if self._git_metadata_write_denied(file_path):
+            return EditResult(error="Edit denied: git_metadata_readonly")
+        try:
+            return super().edit(file_path, old_string, new_string, replace_all)
+        except ValueError as e:
+            return EditResult(error=self._path_value_error_msg(file_path, e))
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return await asyncio.to_thread(self.edit, file_path, old_string, new_string, replace_all)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        if any(self._git_metadata_write_denied(path) for path, _ in files):
+            return [FileUploadResponse(path=path, error="permission_denied") for path, _ in files]
+        return super().upload_files(files)
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        return await asyncio.to_thread(self.upload_files, files)
+
+
+def _normalize_writable_dir(name: str) -> str | None:
+    """Reject unsafe names (``.``, ``..``, absolute, traversal) up-front.
+
+    Returns the cleaned name (no leading/trailing slash) or ``None`` if
+    the input should be ignored. Logging the rejection at warning level
+    keeps operator typos visible without crashing startup.
+    """
+    raw = name
+    cleaned = name.strip().strip("/")
+    if not cleaned:
+        log.warning("WriteGuardBackend: ignoring empty writable_dir %r", raw)
+        return None
+    if cleaned in (".", ".."):
+        log.warning(
+            "WriteGuardBackend: ignoring writable_dir %r (would alias root)", raw,
+        )
+        return None
+    parts = PurePosixPath(cleaned).parts
+    if any(p in ("..", ".") for p in parts):
+        log.warning(
+            "WriteGuardBackend: ignoring writable_dir %r (contains traversal)", raw,
+        )
+        return None
+    return cleaned
+
+
+class WriteGuardBackend:
+    """Filesystem backend that restricts writes to specific directories.
+
+    ``writable_dirs`` are path fragments (e.g. ``"state"`` or
+    ``"state/agent"``) interpreted relative to ``root_dir``. A write is
+    allowed when the request's target, after lexical ``..`` collapse
+    AND symlink resolution, resolves under one of the writable roots
+    (which themselves must resolve under ``root_dir``).
+    """
+
+    # Methods we explicitly forward to the underlying FilesystemBackend.
+    # Anything not in this list raises AttributeError — default-deny so
+    # a future deepagents release adding ``delete_file`` / ``rename`` /
+    # ``mkdir`` can't bypass the guard until we audit + wrap it.
+    #
+    _ALLOWED_READS = frozenset({
+        "read", "aread",
+        "ls", "als",
+        "grep", "agrep",
+        "glob", "aglob",
+        "download_files", "adownload_files",
+    })
+
+    def __init__(
+        self,
+        root_dir: Path,
+        writable_dirs: list[str],
+        *,
+        enforce_core_memory_readonly: bool = True,
+        guard_outside_root: bool = False,
+    ) -> None:
+        self._root = Path(root_dir).resolve()
+        self._fs = _RootAwareFilesystemBackend(
+            root_dir=root_dir, virtual_mode=True, guard_outside_root=guard_outside_root,
+        )
+        cleaned: list[str] = []
+        for d in writable_dirs:
+            normalized = _normalize_writable_dir(d)
+            if normalized is not None:
+                cleaned.append(normalized)
+        # Pre-resolve writable roots so the per-write check just compares
+        # resolved-target vs resolved-root. resolve(strict=False) handles
+        # roots that don't exist yet (created lazily on first write).
+        self._writable_roots: list[Path] = [
+            (self._root / d).resolve() for d in cleaned
+        ]
+        from .read_policy import framework_large_tool_results_root
+
+        artifact_root = framework_large_tool_results_root(self._root)
+        if artifact_root is not None and artifact_root not in self._writable_roots:
+            self._writable_roots.append(artifact_root)
+        # For error messages — the friendlier "/state/" form.
+        self._writable_labels: list[str] = ["/" + d for d in cleaned]
+        # Pre-resolved memory/core/ root for the runtime read-only gate.
+        # When ``enforce_core_memory_readonly`` is True, writes under this
+        # path are blocked during ANY active turn (chainlink #342): core
+        # memory is the agent's constitution, and changes go through the PR
+        # proposal flow (open_proposal) for operator review — not
+        # an in-turn write, reflection included. Turns with no TurnContext
+        # (the scaffold genesis seed, ``mimir setup``, tests, non-turn
+        # callables) are unaffected, so the initial seed still works. Policy:
+        # ``memory/core/30-reflection-policy.md``.
+        self._memory_core_root: Path = (self._root / "memory" / "core").resolve()
+        # Pre-resolved prompts/ root. prompts is operator-managed and (by
+        # default) not a writable dir, so live writes are already blocked by the
+        # writable-root check; this lets the deny message point at the proposal
+        # flow (chainlink #344) instead of a generic "not writable".
+        self._prompts_root: Path = (self._root / "prompts").resolve()
+        # Pre-resolved state/identities.yaml — the auth identity + role registry.
+        # The agent must NEVER edit this via its file tools: a prompt-injected
+        # chat user could otherwise talk the agent into adding an ``admin`` role
+        # alias for themselves (privilege escalation, now that web RBAC gates
+        # saga/memory/ops/admin on the admin role). Legitimate changes go through
+        # the server-side admin Users UI (``issue_web_key``/``revoke_web_key``,
+        # which write the file directly — not through this backend), so key
+        # issuance is unaffected. Unconditional deny: there is no legitimate
+        # agent-tool write to this file.
+        self._identities_path: Path = (self._root / "state" / "identities.yaml").resolve()
+        self._enforce_core_memory_readonly: bool = enforce_core_memory_readonly
+        # Recorded denials, one per blocked Write/Edit/upload. The agent
+        # drains entries for its own turn at end-of-turn
+        # (``drain_denials(turn_id=...)``) into TurnRecord.permission_denials
+        # so the audit trail is visible in the turn viewer instead of
+        # silently empty. Entries carry the active turn id because the backend
+        # is process-global and cross-channel turns can run concurrently.
+        self._denials: list[dict[str, Any]] = []
+
+    def drain_denials(self, turn_id: str | None = None) -> list[dict[str, Any]]:
+        """Return + clear recorded permission denials.
+
+        ``turn_id=None`` preserves the historical behavior: drain everything,
+        useful for tests and non-turn callers. Agent.run_turn passes its
+        concrete turn id so concurrent cross-channel turns sharing the
+        process-global backend cannot drain and misattribute each other's
+        write-guard denials.
+        """
+        if turn_id is None:
+            snapshot = list(self._denials)
+            self._denials.clear()
+            return snapshot
+
+        matched: list[dict[str, Any]] = []
+        remaining: list[dict[str, Any]] = []
+        for denial in self._denials:
+            if denial.get("turn_id") == turn_id:
+                matched.append(denial)
+            else:
+                remaining.append(denial)
+        self._denials = remaining
+        return matched
+
+    def _record_denial(self, op: str, file_path: str) -> None:
+        denial: dict[str, Any] = {
+            "op": op,
+            "file_path": file_path,
+            "writable_dirs": list(self._writable_labels),
+        }
+        # Lazy import to avoid a module cycle. A missing context is valid for
+        # setup/tests/non-turn callables; in-turn denials get scoped so the
+        # process-global backend can be drained safely by concurrent turns.
+        from ._context import get_current_turn
+        ctx = get_current_turn()
+        if ctx is not None:
+            denial["turn_id"] = ctx.turn_id
+        self._denials.append(denial)
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        tool = ("edit_file" if op.startswith("edit") else
+                "replace_file" if op.startswith("replace") else "write_file")
+        if op.startswith("upload"):
+            tool = "upload_files"
+        if "prompts_readonly" in op:
+            reason = "prompts_readonly"
+        elif "scheduled_instruction_veto" in op:
+            reason = "scheduled_instruction_veto"
+        elif "core_memory_readonly" in op:
+            reason = "core_memory_readonly"
+        elif "identities_protected" in op:
+            reason = "identities_protected"
+        else:
+            reason = "filesystem_target_not_writable"
+        resolved = self._resolve_target(file_path)
+        _emit_hard_boundary_denied(
+            tool=tool,
+            boundary="filesystem_write_guard",
+            reason=reason,
+            target=str(resolved) if resolved is not None else file_path,
+            turn_context=ctx,
+        )
+        # Bound the buffer: denials with no turn_id (setup/non-turn
+        # callables) and denials from turns that died before the post-turn
+        # drain are never drained by the turn-scoped path — drop oldest so
+        # they can't accumulate for process lifetime.
+        if len(self._denials) > 512:
+            del self._denials[: len(self._denials) - 512]
+
+    def __getattr__(self, name: str) -> Any:
+        # Default-deny passthrough: only explicit reads forward.
+        if name in self._ALLOWED_READS:
+            return getattr(self._fs, name)
+        raise AttributeError(
+            f"{type(self).__name__} does not forward {name!r} — "
+            f"add it to _ALLOWED_READS after auditing whether it's a mutator."
+        )
+
+    def _canonicalize_path(self, file_path: str) -> str:
+        """Strip the container-root prefix from absolute paths.
+
+        Agents see container-absolute paths (``/mimir-home/state/x.md``)
+        in shell output and feedback signals, then pass them straight to
+        read/write tools. Without this collapse, both the FilesystemBackend
+        (with ``virtual_mode=True``) and ``_resolve_target`` end up
+        double-prefixing the path with ``root_dir``.
+        """
+        if not file_path.startswith("/"):
+            return file_path
+        root_str = str(self._root).rstrip("/")
+        if file_path == root_str:
+            return "/"
+        if file_path.startswith(root_str + "/"):
+            return "/" + file_path[len(root_str) + 1:]
+        return file_path
+
+    def _resolve_target(self, file_path: str) -> Path | None:
+        """Resolve a tool-supplied path to a real filesystem location.
+
+        Returns ``None`` when the input contains lexical traversal that
+        survives normalization (cheap check before hitting the disk).
+        """
+        # Strip the container-root prefix (no-op when the path is already
+        # in virtual form) so the writable-root check sees the same path
+        # the FilesystemBackend will receive after canonicalization.
+        file_path = self._canonicalize_path(file_path)
+        # Strip leading slashes so the input is always relative to root.
+        relative = PurePosixPath(file_path.lstrip("/"))
+        # Lexical traversal rejection before touching the disk: anything
+        # whose normalized form starts with ``..`` is escaping.
+        if any(p == ".." for p in relative.parts):
+            return None
+        try:
+            return (self._root / relative).resolve(strict=False)
+        except (OSError, RuntimeError):
+            return None
+
+    def _is_write_allowed(self, file_path: str) -> bool:
+        resolved = self._resolve_target(file_path)
+        if resolved is None:
+            return False
+        from .memory_proposals import is_protected_model_path
+
+        if is_protected_model_path(resolved):
+            return False
+        # Resolved target must live under at least one writable root.
+        # ``is_relative_to`` was added in Python 3.9; we depend on >=3.11.
+        return any(
+            resolved == root or resolved.is_relative_to(root)
+            for root in self._writable_roots
+        )
+
+    @staticmethod
+    def _same_write_target(target: Path, protected: Path) -> bool:
+        """Compare live file identity, retaining protection for future creates.
+
+        Missing components have no inode. Compare their parents first; when
+        both names are absent and differ, ask the filesystem via an empty,
+        private temporary probe in the nearest existing parent. This retains
+        case/normalization semantics without guessing them or creating the
+        protected resource. Probe/stat errors propagate to the fail-closed
+        guards. Do not cache identities: admin updates can replace the file.
+        """
+        from .memory_proposals import same_model_target
+        return same_model_target(target, protected)
+
+    def _is_core_memory_write_blocked(self, file_path: str) -> bool:
+        """True iff this write should be refused — ``memory/core/`` is
+        read-only at runtime (chainlink #342).
+
+        Returns True only when ALL of these hold:
+          1. ``enforce_core_memory_readonly`` is True (default)
+          2. the resolved target is under ``memory/core/``
+          3. there is an active ``TurnContext``
+
+        No active turn (the scaffold genesis seed, ``mimir setup``, backend
+        tests, non-turn cron callables) → False, so the initial core seed and
+        tooling are unaffected. There is no reflection exception and no
+        onboarding bypass: every in-turn core change — reflection included —
+        goes through the PR proposal flow (open_proposal). The
+        first check (writable-root membership) is done by ``_is_write_allowed``;
+        this gate stacks on top.
+        """
+        if not self._enforce_core_memory_readonly:
+            return False
+        resolved = self._resolve_target(file_path)
+        if resolved is None:
+            return False
+        try:
+            # Include missing descendants: a create under an existing core
+            # directory is still a protected write, whatever its spelling.
+            under_core = any(
+                self._same_write_target(parent, self._memory_core_root)
+                for parent in (resolved, *resolved.parents)
+            )
+        except OSError:
+            # An unreadable identity is not evidence that the target is safe.
+            under_core = True
+        if not under_core:
+            return False
+        # Lazy import to avoid a module cycle (mimir._context → models →
+        # potentially back into the agent layer that constructs the backend).
+        from ._context import get_current_turn
+        return get_current_turn() is not None
+
+    def _is_identities_write_blocked(self, file_path: str) -> bool:
+        """True iff this write targets ``state/identities.yaml`` — the auth
+        identity + role registry. Blocked UNCONDITIONALLY for the agent's file
+        tools (no turn-context exception, unlike core memory) to prevent
+        prompt-injection privilege escalation: a chat user must not be able to
+        talk the agent into editing the file that decides who is an admin. The
+        admin Users UI mutates identities server-side (not through this
+        backend), so legitimate web-key issuance/revocation is unaffected."""
+        resolved = self._resolve_target(file_path)
+        if resolved is None:
+            return False
+        try:
+            return self._same_write_target(resolved, self._identities_path)
+        except OSError:
+            return True
+
+    def _is_prompts_path(self, file_path: str) -> bool:
+        """True if ``file_path`` resolves under ``prompts/`` — used only to
+        choose a more helpful deny message (point at the proposal flow) when a
+        prompts write is blocked. Does NOT itself block: prompts is gated by
+        the writable-root check (it isn't a writable dir by default)."""
+        resolved = self._resolve_target(file_path)
+        if resolved is None:
+            return False
+        return (
+            resolved == self._prompts_root
+            or resolved.is_relative_to(self._prompts_root)
+        )
+
+    _CORE_MEMORY_DENY_REASON = (
+        "Write blocked: memory/core/ is read-only at runtime by policy "
+        "(memory/core/30-reflection-policy.md). To change core memory, open a "
+        "proposal with open_proposal, edit it there, then submit_proposal — the "
+        "operator reviews and merges the PR. For a non-diff suggestion, file a "
+        "Chainlink issue or state/spec note."
+    )
+
+    _PROMPTS_DENY_REASON = (
+        "Write blocked: prompts/ is operator-managed and not writable at "
+        "runtime. To change a prompt template, open a proposal with "
+        "open_proposal, edit it there, then submit_proposal — the operator "
+        "reviews and merges the PR."
+    )
+
+    _IDENTITIES_DENY_REASON = (
+        "Write blocked: state/identities.yaml is the auth identity + role "
+        "registry (it governs who is an admin) and is not editable via file "
+        "tools, by policy. Manage users and roles through the operator-only "
+        "admin Users UI / web-key endpoints — not by editing this file."
+    )
+
+    # The ingest veto belongs at the model tool-call boundary (BudgetGate and
+    # ToolRegistry), not here: summarization uses this same backend internally.
+
+    def _is_scheduler_write(self, file_path: str) -> bool:
+        configured_home = os.environ.get("MIMIR_HOME", "").strip()
+        if not configured_home or self._root != Path(configured_home).resolve():
+            return False
+        candidate = self._root / self._canonicalize_path(file_path).lstrip("/")
+        try:
+            return candidate.resolve(strict=False) == (self._root / "scheduler.yaml").resolve(strict=False)
+        except (OSError, RuntimeError):
+            return True
+
+    _SCHEDULED_INSTRUCTION_DENY_REASON = (
+        "Write blocked: scheduler.yaml is managed by add_schedule / "
+        "remove_schedule / set_schedule_priority (and set_schedule_cron)."
+    )
+
+    def _allowed_dirs_label(self) -> str:
+        return ", ".join(f"{label}/" for label in self._writable_labels)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        if self._is_scheduler_write(file_path):
+            self._record_denial("write_scheduled_instruction_veto", file_path)
+            return WriteResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
+        if not self._is_write_allowed(file_path):
+            if self._is_prompts_path(file_path):
+                self._record_denial("write_prompts_readonly", file_path)
+                return WriteResult(error=self._PROMPTS_DENY_REASON)
+            self._record_denial("write", file_path)
+            return WriteResult(
+                error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}",
+            )
+        if self._is_core_memory_write_blocked(file_path):
+            self._record_denial("write_core_memory_readonly", file_path)
+            return WriteResult(error=self._CORE_MEMORY_DENY_REASON)
+        if self._is_identities_write_blocked(file_path):
+            self._record_denial("write_identities_protected", file_path)
+            return WriteResult(error=self._IDENTITIES_DENY_REASON)
+        # Idempotent with the strip already applied inside
+        # ``_resolve_target`` during the writable-root check — the
+        # explicit call here keeps the forward to ``self._fs`` self-
+        # contained against future refactors of ``_resolve_target``.
+        canonical_path = self._canonicalize_path(file_path)
+        if not canonical_path.startswith("/"):
+            canonical_path = "/" + canonical_path
+        from .turn_stores import record_research_draft, research_draft_write_guard
+        with research_draft_write_guard(self._root, canonical_path):
+            result = self._fs.write(file_path=canonical_path, content=content)
+            if result.error is None:
+                record_research_draft(self._root, canonical_path)
+        if result.error is _WRITE_COLLISION:
+            return WriteResult(error=_collision_error(canonical_path))
+        if isinstance(result.error, _WriteFailure):
+            return WriteResult(error=_write_failure_error(canonical_path, result.error))
+        return result
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.write, file_path, content)
+
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        if self._is_scheduler_write(file_path):
+            self._record_denial("replace_scheduled_instruction_veto", file_path)
+            return WriteResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
+        if not self._is_write_allowed(file_path):
+            if self._is_prompts_path(file_path):
+                self._record_denial("replace_prompts_readonly", file_path)
+                return WriteResult(error=self._PROMPTS_DENY_REASON)
+            self._record_denial("replace", file_path)
+            return WriteResult(error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}")
+        if self._is_core_memory_write_blocked(file_path):
+            self._record_denial("replace_core_memory_readonly", file_path)
+            return WriteResult(error=self._CORE_MEMORY_DENY_REASON)
+        if self._is_identities_write_blocked(file_path):
+            self._record_denial("replace_identities_protected", file_path)
+            return WriteResult(error=self._IDENTITIES_DENY_REASON)
+        canonical_path = self._canonicalize_path(file_path)
+        if not canonical_path.startswith("/"):
+            canonical_path = "/" + canonical_path
+        from .turn_stores import record_research_draft, research_draft_write_guard
+        with research_draft_write_guard(self._root, canonical_path):
+            result = self._fs.replace(canonical_path, content, allow_shrink=allow_shrink)
+            if result.error is None:
+                record_research_draft(self._root, canonical_path)
+        return result
+
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        if self._is_scheduler_write(file_path):
+            self._record_denial("edit_scheduled_instruction_veto", file_path)
+            return EditResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
+        if self._fs._is_outside_root(file_path):
+            return EditResult(error=self._fs._outside_root_msg(file_path, tool="edit_file"))
+        if not self._is_write_allowed(file_path):
+            if self._is_prompts_path(file_path):
+                self._record_denial("edit_prompts_readonly", file_path)
+                return EditResult(error=self._PROMPTS_DENY_REASON)
+            self._record_denial("edit", file_path)
+            return EditResult(
+                error=f"Edit blocked. Writable directories: {self._allowed_dirs_label()}",
+            )
+        if self._is_core_memory_write_blocked(file_path):
+            self._record_denial("edit_core_memory_readonly", file_path)
+            return EditResult(error=self._CORE_MEMORY_DENY_REASON)
+        if self._is_identities_write_blocked(file_path):
+            self._record_denial("edit_identities_protected", file_path)
+            return EditResult(error=self._IDENTITIES_DENY_REASON)
+        # Idempotent with ``_resolve_target`` — see ``write`` above.
+        canonical_path = self._canonicalize_path(file_path)
+        from .turn_stores import record_research_draft, research_draft_write_guard
+        with research_draft_write_guard(self._root, canonical_path):
+            result = self._fs.edit(
+                file_path=canonical_path, old_string=old_string,
+                new_string=new_string, replace_all=replace_all,
+            )
+            if result.error is None:
+                record_research_draft(self._root, canonical_path)
+        return result
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return await asyncio.to_thread(
+            self.edit,
+            file_path=file_path,
+            old_string=old_string,
+            new_string=new_string,
+            replace_all=replace_all,
+        )
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        # Atomic: if ANY path is blocked we reject the entire batch.
+        # The response shape is one entry per input path so the caller
+        # can match input order; allowed-but-not-written paths get
+        # ``permission_denied`` too (because nothing was uploaded).
+        # This is the documented semantic — partial uploads with a
+        # mixed response shape would be more surprising than failing
+        # the batch cleanly.
+        instruction_blocked = {p for p, _ in files
+                               if self._is_scheduler_write(p)}
+        blocked_paths = {p for p, _ in files if not self._is_write_allowed(p)}
+        core_blocked = {p for p, _ in files if self._is_core_memory_write_blocked(p)}
+        identities_blocked = {p for p, _ in files if self._is_identities_write_blocked(p)}
+        if blocked_paths or core_blocked or identities_blocked or instruction_blocked:
+            for p in instruction_blocked:
+                self._record_denial("upload_scheduled_instruction_veto", p)
+            for p in blocked_paths:
+                self._record_denial("upload", p)
+            for p in core_blocked - blocked_paths:
+                self._record_denial("upload_core_memory_readonly", p)
+            for p in identities_blocked - blocked_paths - core_blocked:
+                self._record_denial("upload_identities_protected", p)
+            return [
+                FileUploadResponse(path=p, error="permission_denied")
+                for p, _ in files
+            ]
+        return self._fs.upload_files(files)
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        return await asyncio.to_thread(self.upload_files, files)
+
+
+class ReadOnlyFilesystemBackend:
+    """Read-only wrapper: every write/edit/upload returns an error.
+
+    Use via ``CompositeBackend`` to scope read-only treatment to a
+    specific subtree (e.g. operator-shipped reference docs).
+    """
+
+    _ALLOWED_READS = WriteGuardBackend._ALLOWED_READS
+
+    def __init__(self, root_dir: Path) -> None:
+        self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
+
+    def _resolved_target(self, file_path: str) -> str:
+        try:
+            return str(self._fs._resolve_path(file_path))
+        except (OSError, RuntimeError, ValueError):
+            return file_path
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._ALLOWED_READS:
+            return getattr(self._fs, name)
+        raise AttributeError(
+            f"{type(self).__name__} does not forward {name!r} — "
+            f"add it to _ALLOWED_READS after auditing whether it's a mutator."
+        )
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="write_file",
+            boundary="readonly_filesystem",
+            reason="write_readonly",
+            target=self._resolved_target(file_path),
+        )
+        return WriteResult(error=f"Write blocked. '{file_path}' is read-only.")
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return self.write(file_path=file_path, content=content)
+
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="replace_file", boundary="readonly_filesystem",
+            reason="write_readonly", target=self._resolved_target(file_path),
+        )
+        return WriteResult(error=f"Write blocked. '{file_path}' is read-only.")
+
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="edit_file",
+            boundary="readonly_filesystem",
+            reason="edit_readonly",
+            target=self._resolved_target(file_path),
+        )
+        return EditResult(error=f"Edit blocked. '{file_path}' is read-only.")
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return self.edit(
+            file_path=file_path,
+            old_string=old_string,
+            new_string=new_string,
+            replace_all=replace_all,
+        )
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        for path, _ in files:
+            _emit_hard_boundary_denied(
+                tool="upload_files",
+                boundary="readonly_filesystem",
+                reason="upload_readonly",
+                target=self._resolved_target(path),
+            )
+        return [FileUploadResponse(path=path, error="permission_denied") for path, _ in files]
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        return self.upload_files(files)
+
+
+class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
+    """Read retained files normally and mutate them only through their owner."""
+
+    def __init__(self, root_dir: Path) -> None:
+        super().__init__(root_dir)
+        self._root = Path(root_dir)
+
+    def _binding(self, file_path: str):
+        from ._context import get_current_turn
+        from .access_control import _target_within_retained_factory_scope
+
+        turn = get_current_turn()
+        auth = getattr(turn, "auth_context", None)
+        absolute = self._root / file_path.lstrip("/")
+        scope = getattr(auth, "retained_factory_scope", None)
+        if scope is None or not _target_within_retained_factory_scope(str(absolute), auth):
+            return None, None, absolute
+        return auth, scope, absolute
+
+    def _operate(self, operation: str, file_path: str, **arguments: object) -> dict[str, object]:
+        from .plugins.core import selected_policy_registry
+
+        auth, scope, absolute = self._binding(file_path)
+        if scope is None:
+            return {"error": "retained factory scope does not authorize this path"}
+        registry = selected_policy_registry()
+        registered = registry.retained_checkout_operation
+        if registered is None or not any(
+            candidate.enabled and candidate.name == registered[0]
+            for candidate in registry.selected_plugin_candidates
+        ):
+            return {"error": "retained factory checkout provider is unavailable"}
+        return registered[1](operation, file_path, absolute, scope, **arguments)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        result = self._operate("write_file", file_path, content=content)
+        if result.get("status") == "ok":
+            return WriteResult(path=file_path)
+        error = str(result.get("error") or "retained factory write failed")
+        if error == "file already exists":
+            error = _collision_error(str(self._root / file_path.lstrip("/")))
+        return WriteResult(error=error)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.write, file_path, content)
+
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        result = self._operate(
+            "replace_file", file_path, content=content, allow_shrink=allow_shrink,
+        )
+        if result.get("status") == "ok":
+            return WriteResult(path=file_path)
+        error = str(result.get("error") or "retained factory replace failed")
+        if error == "file does not exist":
+            error = _missing_replace_error(str(self._root / file_path.lstrip("/")))
+        return WriteResult(error=error)
+
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
+
+    def edit(
+        self, file_path: str, old_string: str, new_string: str, replace_all: bool = False,
+    ) -> EditResult:
+        result = self._operate(
+            "edit_file", file_path, old_string=old_string,
+            new_string=new_string, replace_all=replace_all,
+        )
+        if result.get("status") == "ok":
+            return EditResult(
+                path=file_path,
+                occurrences=int(result.get("occurrences", 0)),
+            )
+        return EditResult(error=str(result.get("error") or "retained factory edit failed"))
+
+    async def aedit(
+        self, file_path: str, old_string: str, new_string: str, replace_all: bool = False,
+    ) -> EditResult:
+        return await asyncio.to_thread(
+            self.edit, file_path, old_string, new_string, replace_all,
+        )
+
+
+def build_file_tool_routes(roots: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    """Build ``CompositeBackend`` routes from validated ``(abs_path, mode)`` pairs
+    (chainlink #650).
+
+    ``rw`` -> a real-FS backend rooted at the path (reads + writes hit real
+    disk); ``ro`` -> the same wrapped read-only. ``CompositeBackend`` strips the
+    route prefix before delegating, so each backend resolves the remainder under
+    its own root. Route keys are the absolute path with a trailing ``/`` (the
+    boundary form CompositeBackend matches on)."""
+    routes: dict[str, Any] = {}
+    for path, mode in roots:
+        prefix = str(Path(path)).rstrip("/") + "/"
+        if mode == "ro":
+            routes[prefix] = ReadOnlyFilesystemBackend(Path(path))
+        elif mode == "retained":
+            routes[prefix] = RetainedCheckoutFilesystemBackend(Path(path))
+        else:
+            routes[prefix] = _RootAwareFilesystemBackend(root_dir=Path(path), virtual_mode=True)
+    return routes
+
+
+class FileToolRouter(CompositeBackend):
+    """``CompositeBackend`` that also forwards mimir's ``drain_denials`` to the
+    default (home) backend.
+
+    The write-guard records permission denials on the home ``WriteGuardBackend``;
+    ``Agent.run_turn`` drains them for the turn's audit trail. A bare
+    ``CompositeBackend`` has no ``drain_denials``, so wrapping the home backend
+    in routes would silently drop that trail — this preserves it (chainlink #650)."""
+
+    def drain_denials(self, turn_id: str | None = None) -> list[dict[str, Any]]:
+        drain = getattr(self.default, "drain_denials", None)
+        if callable(drain):
+            return drain(turn_id=turn_id)
+        return []
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        result = super().write(file_path, content)
+        if result.error is _WRITE_COLLISION:
+            return WriteResult(error=_collision_error(file_path))
+        if isinstance(result.error, _WriteFailure):
+            return WriteResult(error=_write_failure_error(file_path, result.error))
+        return result
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        result = await super().awrite(file_path, content)
+        if result.error is _WRITE_COLLISION:
+            return WriteResult(error=_collision_error(file_path))
+        if isinstance(result.error, _WriteFailure):
+            return WriteResult(error=_write_failure_error(file_path, result.error))
+        return result
+
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        backend, backend_path = self._get_backend_and_key(file_path)
+        result = backend.replace(backend_path, content, allow_shrink=allow_shrink)
+        if result.path is not None:
+            result.path = file_path
+        return result
+
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
+    ) -> GrepResult:
+        if before_context == 0 and after_context == 0:
+            before_context, after_context = _grep_context.get()
+        if (
+            isinstance(before_context, bool)
+            or isinstance(after_context, bool)
+            or not isinstance(before_context, int)
+            or not isinstance(after_context, int)
+            or not 0 <= before_context <= MAX_GREP_CONTEXT_LINES
+            or not 0 <= after_context <= MAX_GREP_CONTEXT_LINES
+        ):
+            return GrepResult(
+                error=(
+                    "grep context must be integer line counts between 0 and "
+                    f"{MAX_GREP_CONTEXT_LINES}"
+                ),
+                matches=[],
+            )
+        token = _grep_context.set((before_context, after_context))
+        try:
+            return super().grep(pattern, path, glob)
+        finally:
+            _grep_context.reset(token)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
+    ) -> GrepResult:
+        if before_context == 0 and after_context == 0:
+            before_context, after_context = _grep_context.get()
+        token = _grep_context.set((before_context, after_context))
+        try:
+            return await super().agrep(pattern, path, glob)
+        finally:
+            _grep_context.reset(token)

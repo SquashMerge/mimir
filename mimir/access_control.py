@@ -1,0 +1,13776 @@
+"""Pure access-control policy for inbound and action authorization.
+
+This module deliberately has no dispatcher or bridge side effects. Runtime
+callers pass the inbound ``AgentEvent`` (or an author id), an optional
+``IdentityResolver``, and an explicit enforcement flag; the policy returns a
+structured decision suitable for logs and tool errors.
+
+New in chainlink #865:
+- OperationCatalog: stable open/admin-required/resource-scoped decisions for tools
+- ServicePrincipal: explicit trusted-autonomous service entries with capabilities
+- ToolAuthorization: runtime tool surface inventory with shadow-decision logging
+
+New in chainlink #866:
+- ChannelResourceAdapter: resource-scoped authorization for send_message/react/
+  fetch_channel_history based on server-resolved triggering channel and bridge resources
+- Same-scope operations (target matches triggering channel) pass; cross-channel/
+  public/unknown operations require admin
+- Structured redacted denials without relying on model-supplied channel fields
+"""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+import logging
+import os
+import re
+import secrets
+import shlex
+import stat
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
+from typing import TYPE_CHECKING, Any
+
+from urllib.parse import urlsplit, urlunsplit
+
+from langchain_core.tools import ToolException
+
+from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
+from .identities import AccessMetadata
+from .memory_proposals import is_protected_model_path
+from .models import (
+    NormalizedPullRequestSnapshot,
+    SourceKind,
+)
+from .poller_tracker import safe_adapter, safe_ref, safe_url
+from .read_policy import (
+    READ_RESOURCE_OPERATIONS,
+    framework_large_tool_results_root,
+    read_target_from_arguments,
+    requested_read_target_from_arguments,
+    resolved_read_target_from_arguments,
+    resolve_large_tool_results_target,
+)
+from .tool_descriptors import (
+    ResultOriginKind,
+    SinkCategory,
+    TOOL_DESCRIPTORS,
+    get_tool_descriptor,
+)
+from .plugins.core import (
+    CapabilityTier, ServicePrincipal, ServiceSinkPolicy, core_policy_registry,
+    poller_properties, PolicyMappingView, PolicySetView, policy_membership,
+    scoped_policy_call, selected_policy_registry,
+)
+
+HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
+POLLER_RECOVERY_REPLAY_EXTRA_KEY = "_mimir_poller_recovery_replay"
+
+if TYPE_CHECKING:
+    from .identities import IdentityResolver
+    from .models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
+    from .tools.refusals import ToolPolicyRefusal
+
+log = logging.getLogger(__name__)
+
+_MAX_REQUESTED_TARGET_LENGTH = 1024
+
+
+class AccessTier(StrEnum):
+    USER = "user"
+    ADMIN = "admin"
+
+
+class AccessStatus(StrEnum):
+    LEGACY_ALLOWED = "legacy_allowed"
+    USER_ALLOWED = "user_allowed"
+    ADMIN_ALLOWED = "admin_allowed"
+    DENIED = "denied"
+
+
+class DenialReason(StrEnum):
+    MISSING_AUTHOR = "missing_author"
+    UNKNOWN_AUTHOR = "unknown_author"
+    USER_NOT_ALLOWLISTED = "user_not_allowlisted"
+    ADMIN_REQUIRED = "admin_required"
+
+
+class OperationDecision(StrEnum):
+    """Authorization decision for a tool/operation.
+
+    - OPEN: operation is accessible to any authorized user (no admin required)
+    - ADMIN_REQUIRED: operation requires admin role
+    - RESOURCE_SCOPED: operation requires specific resource/domain capability
+    - UNKNOWN: operation is unknown - denied by default when enforcement is on
+    """
+    OPEN = "open"
+    ADMIN_REQUIRED = "admin_required"
+    RESOURCE_SCOPED = "resource_scoped"
+    UNKNOWN = "unknown"
+
+
+_SINK_CATEGORY_CAPABILITY_ELIGIBLE = frozenset({
+    SinkCategory.SAME_CHANNEL,
+    SinkCategory.CROSS_CHANNEL,
+    SinkCategory.PUBLIC,
+    SinkCategory.SHELL_PROCESS,
+    SinkCategory.SPAWN,
+    SinkCategory.NOTIFICATION,
+    SinkCategory.FILE,
+    SinkCategory.DIRECT_MESSAGE,
+    SinkCategory.SAGA,
+    SinkCategory.SCHEDULER,
+    SinkCategory.PROPOSAL,
+    SinkCategory.FORGE,
+})
+
+assert set(SinkCategory) == _SINK_CATEGORY_CAPABILITY_ELIGIBLE | {
+    SinkCategory.NETWORK,
+    SinkCategory.HTTP_WEBHOOK,
+    SinkCategory.EXTERNAL_MCP,
+    SinkCategory.HARNESS_DISPLAY,
+    SinkCategory.UNKNOWN,
+}
+
+
+class ToolFlowDirection(StrEnum):
+    """Whether a tool reads protected data, emits data, does both, or neither."""
+
+    SOURCE = "source"
+    SINK = "sink"
+    BOTH = "both"
+    NEITHER = "neither"
+    UNKNOWN = "unknown"
+
+
+SHELL_PROCESS_TOOL_NAMES = PolicySetView(lambda policy: frozenset(
+    name for name, descriptor in policy.descriptors.items()
+    if descriptor.sink_category is SinkCategory.SHELL_PROCESS
+))
+
+_GENERIC_SHELL_INGEST_REFUSAL = (
+    "Shell execution was refused after untrusted active ingest "
+    "(ifc_label_blocked:shell_process). Use a declared or bounded command, "
+    "read_file/glob/grep for local reads, or open_proposal for repository changes. "
+    "Ask the operator for a fresh turn or a one-time approve_sink_once approval "
+    "(request_operator_approval on an eligible operator turn)."
+)
+
+
+def _generic_shell_ingest_refusal(auth_context: Any) -> str:
+    return _GENERIC_SHELL_INGEST_REFUSAL + _author_attestation_note(auth_context)
+
+
+def _author_attestation_note(auth_context: Any) -> str:
+    state = getattr(auth_context, "ifc_state", None)
+    unavailable = getattr(state, "author_attestation_was_unavailable", None)
+    if callable(unavailable) and unavailable():
+        return (
+            " GitHub author attestation was unavailable during this turn and is a possible "
+            "cause of the taint (for example, GitHub could not be reached). This is not "
+            "a measured non-collaborator verdict; the read still failed closed."
+        )
+    return ""
+
+_TOOL_FLOW_MAP: Mapping[str, ToolFlowDirection] = PolicyMappingView(lambda policy: {
+    name: ToolFlowDirection(flow) for name, flow in policy.flow.items()
+})
+
+IFC_POLICY_VERSION = "ifc-v1"
+DECLASSIFICATION_LIFETIME_SECONDS = 30.0
+
+
+def get_sink_category(tool_name: str) -> SinkCategory:
+    """Map a known egress operation to its sink category.
+
+    Unknown operations are not presumed public: doing so would make a newly
+    added harness send an implicit IFC bypass until the map was updated.
+    """
+    descriptor = get_tool_descriptor(tool_name)
+    return descriptor.sink_category if descriptor and descriptor.sink_category else SinkCategory.UNKNOWN
+
+
+def get_tool_flow_direction(tool_name: str) -> ToolFlowDirection:
+    """Return explicit native-tool flow metadata without name-prefix inference."""
+    return _TOOL_FLOW_MAP.get(tool_name, ToolFlowDirection.UNKNOWN)
+
+
+@dataclass(frozen=True)
+class ResourceScope:
+    """Defines a specific resource/domain that an operation scopes to."""
+    domain: str
+    capabilities: frozenset[str] = frozenset()
+    sink_destinations: frozenset[str] = frozenset()
+
+
+# Re-export the established API from the stdlib leaf used by the local proxy.
+from .client_file_resources import (
+    CLIENT_FILE_RESOURCE_NAMESPACE,
+    CLIENT_FILE_RESOURCE_POLICY,
+    ClientFileResourcePolicy,
+    canonical_client_file_resource,
+    client_file_resource_is_canonical,
+    client_file_resource_path,
+)
+
+
+TRIGGER_CAPABILITY_TIERS: Mapping[str, CapabilityTier] = PolicyMappingView(lambda policy: {
+    name: CapabilityTier(tier) for name, tier in policy.tiers.items()
+})
+
+_CAPABILITY_COMPANIONS: Mapping[str, frozenset[str]] = PolicyMappingView(
+    lambda policy: policy.capability_companions
+)
+
+_PROFILE_CAPABILITY_COMPANIONS: Mapping[str, Mapping[str, frozenset[str]]] = PolicyMappingView(lambda policy: {
+    name: profile.capability_companions for name, profile in policy.profiles.items()
+    if profile.capability_companions
+})
+
+
+def _missing_capability_companions(
+    capabilities: set[str], *, profile: str | None = None,
+) -> set[str]:
+    companions = dict(_CAPABILITY_COMPANIONS)
+    companions.update(_PROFILE_CAPABILITY_COMPANIONS.get(profile or "", {}))
+    return {
+        companion
+        for capability in capabilities
+        for companion in companions.get(capability, ())
+        if companion not in capabilities
+    }
+
+# Built-in services predate manifest-declarable trigger authority. Keep their
+# explicitly declared, review-bounded proposal workflow classified without
+# making those capabilities grantable to custom trigger manifests.
+_LEGACY_SERVICE_SINK_TIERS: Mapping[str, CapabilityTier] = PolicyMappingView(lambda policy: {
+    name: CapabilityTier(tier) for name, tier in policy.legacy_service_sink_tiers.items()
+})
+
+TRIGGER_AUTHORITY_PROFILES: Mapping[str, frozenset[str]] = PolicyMappingView(
+    lambda policy: policy.authority_profiles
+)
+
+# Scheduler records may opt into these built-in profiles. Keeping this set
+# separate prevents a scheduler entry from selecting a profile whose trigger
+# semantics require additional manifest data (for example a poller profile).
+SCHEDULER_AUTHORITY_PROFILES = PolicySetView(lambda policy: frozenset(
+    name for name, profile in policy.profiles.items() if profile.scheduler
+))
+
+_BUILTIN_TRIGGER_PROFILE_CONFIG: Mapping[str, Mapping[str, Any]] = PolicyMappingView(lambda policy: {
+    name: MappingProxyType({
+        **profile.builtin_trigger_config,
+        "tier": CapabilityTier(profile.builtin_trigger_config["tier"]),
+    })
+    for name, profile in policy.profiles.items()
+    if profile.builtin_trigger_config is not None
+})
+
+_SHELL_PROFILE_BY_AUTHORITY_PROFILE = PolicyMappingView(lambda policy: policy.shell_profile_mappings)
+OPERATOR_SHELL_PROFILE = core_policy_registry().operator_shell_profile
+_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = PolicyMappingView(lambda policy: {
+    name: profile.fetch_url_policy for name, profile in policy.profiles.items()
+    if profile.fetch_url_policy is not None
+})
+BOUNDED_PROFILE_CAPABILITIES: Mapping[str, frozenset[str]] = PolicyMappingView(lambda policy: {
+    name: profile.bounded_capabilities for name, profile in policy.profiles.items()
+    if profile.bounded_capabilities
+})
+_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = PolicySetView(lambda policy: frozenset(
+    name for name, profile in policy.profiles.items() if profile.pr_review_scope
+))
+
+_CAPABILITY_TIER_RANK = {
+    CapabilityTier.SCOPE_CONTAINED: 0,
+    CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
+    CapabilityTier.CODE_EXECUTION: 2,
+    CapabilityTier.UNBOUNDED: 3,
+}
+
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def build_trigger_service_principal(
+    *,
+    canonical: str,
+    trigger: str,
+    profile: str,
+    tier: CapabilityTier,
+    capabilities: tuple[str, ...],
+    roots: tuple[Path, ...] = (),
+    owned_skill_directory: Path | None = None,
+    saga_full_corpus_read: bool = False,
+    channel_memory_directory: str | None = None,
+    declared_shell_commands: tuple["DeclaredShellCommand", ...] = (),
+    approved_urls: tuple[str, ...] = (),
+    proposal_surface: str = "wiki",
+    creation_path: str,
+    policy: "PolicyRegistry | None" = None,
+    poller_owner: str | None = None,
+) -> ServicePrincipal:
+    """Build one immutable instance principal from already-validated authority."""
+    selected = policy if policy is not None else selected_policy_registry()
+    if not selected.frozen:
+        raise ValueError("service principal requires a frozen policy")
+    if policy is not None and profile not in selected.profiles:
+        raise ValueError(f"unknown authority profile: {profile!r}")
+    if profile == "research":
+        capabilities = tuple(cap for cap in capabilities if cap != "fetch_url")
+        if approved_urls:
+            capabilities += ("fetch_url",)
+    capability_set = set(capabilities)
+    if policy is not None:
+        outside = capability_set - selected.authority_profiles[profile]
+        if outside:
+            raise ValueError(f"capabilities outside {profile!r} profile: {', '.join(sorted(outside))}")
+        unknown = capability_set - selected.tiers.keys()
+        if unknown:
+            raise ValueError(f"unknown capabilities: {', '.join(sorted(unknown))}")
+    companions = dict(selected.capability_companions)
+    if profile in selected.profiles:
+        companions.update(selected.profiles[profile].capability_companions)
+    missing = {
+        companion for capability in capability_set
+        for companion in companions.get(capability, ()) if companion not in capability_set
+    }
+    if missing:
+        raise ValueError(
+            "capabilities require companions: "
+            f"{', '.join(sorted(missing))}"
+        )
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    artifact_root = framework_large_tool_results_root(Path(home)) if home else None
+    home_data_roots = (
+        (Path(home) / "state", Path(home) / "memory", artifact_root) if home else ()
+    )
+    poller_flags = (
+        poller_properties(canonical, owner=poller_owner, policy=selected).principal_fields()
+        if trigger == "poller" else {}
+    )
+    is_github_activity = poller_flags.get("github_activity", False)
+    repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
+    fetch_cache_roots = (
+        (Path(home) / "attachments" / "fetch-cache",)
+        if "fetch_url" in capability_set and home
+        else ()
+    )
+    service_work_roots = (
+        (Path(home) / "scratch",)
+        if is_github_activity and home
+        else ()
+    )
+    implicit_write_roots = () if trigger == "poller" else (
+        *(() if is_github_activity else _configured_repo_write_roots()),
+        *home_data_roots,
+        *((Path(home) / "scratch",) if is_github_activity and home else ()),
+    )
+    write_roots = tuple(dict.fromkeys(
+        root.resolve()
+        for root in (
+            *roots,
+            *implicit_write_roots,
+        )
+    ))
+    operations = tuple(dict.fromkeys(capabilities))
+    readable_domains = {
+        "poller_payload" if trigger == "poller"
+        else "session" if trigger == "saga_session_end"
+        else "configured_inputs"
+    }
+    sink_destinations: set[str] = set()
+    policies: list[ServiceSinkPolicy] = []
+    for operation in operations:
+        tool = selected.tools.get(operation)
+        domain = tool.readable_domain if tool is not None else _OPERATION_READABLE_DOMAIN.get(operation)
+        if domain:
+            readable_domains.add(domain)
+        descriptor = selected.descriptors.get(operation)
+        destination = descriptor.sink_destination if descriptor else None
+        if destination:
+            sink_destinations.add(destination)
+        if operation in {"write_file", "edit_file", "replace_file"}:
+            policies.append(ServiceSinkPolicy(
+                operation,
+                "trigger_service_write_roots",
+                json.dumps([str(root) for root in write_roots]),
+            ))
+        elif operation in {"open_proposal", "submit_proposal", "abandon_proposal"}:
+            if profile == "research" and trigger == "poller":
+                policies.append(ServiceSinkPolicy(operation, "poller_proposal", canonical))
+        elif operation in {"shell_exec", "bash_async"}:
+            shell_profile = _SHELL_PROFILE_BY_AUTHORITY_PROFILE.get(
+                profile, "scheduler_read_only",
+            )
+            policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
+        elif operation == "fetch_url":
+            fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
+            if profile in {"research", "github"} and approved_urls:
+                # GitHub API directory approvals (e.g. /repos/) cover descendants;
+                # research non-root URLs retain their existing exact semantics.
+                fetch_policy = ("approved_urls", json.dumps([
+                    url + "*" if (
+                        (urlsplit(url).path == "/" or (
+                            profile == "github" and urlsplit(url).path.endswith("/")
+                        )) and not urlsplit(url).query
+                    ) else url
+                    for url in approved_urls
+                ]))
+            if fetch_policy is not None:
+                policies.append(ServiceSinkPolicy(operation, *fetch_policy))
+        elif tool is not None and tool.owner != "core" and tool.service_sink_adapter is not None:
+            adapter = tool.service_sink_adapter
+            if adapter == "trigger_service_write_roots":
+                bound = json.dumps([str(root) for root in write_roots])
+            elif adapter == "approved_urls":
+                bound = "MIMIR_EGRESS_APPROVED_URLS"
+            elif adapter == "operator_alert":
+                bound = "MIMIR_OPERATOR_ALERT_CHANNEL"
+            elif adapter == "shell_profile":
+                bound = selected.shell_profile_mappings.get(profile, "scheduler_read_only")
+            elif adapter == "spawn_workspace":
+                bound = "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"
+            elif adapter == "worklink_repo":
+                bound = "WORKLINK_REPO/MIMIR_WORKLINK_REPO"
+            else:
+                raise ValueError(f"unsupported service sink adapter for {operation}: {adapter}")
+            policies.append(ServiceSinkPolicy(operation, adapter, bound))
+    if "operator_alert" in capabilities:
+        policies.append(ServiceSinkPolicy(
+            "operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL",
+        ))
+    return ServicePrincipal(
+        canonical=canonical,
+        trigger=trigger,
+        capabilities=operations,
+        readable_domains=tuple(sorted(readable_domains)),
+        sink_destinations=tuple(sorted(sink_destinations)),
+        sink_policies=tuple(policies),
+        filesystem_read_roots=(
+            tuple(str(root.resolve()) for root in (
+                *repo_roots, *fetch_cache_roots, *service_work_roots,
+                *((artifact_root,) if artifact_root is not None else ()),
+            ))
+        ),
+        owned_skill_directory=(
+            str(owned_skill_directory.resolve())
+            if owned_skill_directory is not None
+            else None
+        ),
+        channel_memory_directory=channel_memory_directory,
+        saga_full_corpus_read=saga_full_corpus_read,
+        creation_path=creation_path,
+        authority_profile=profile,
+        capability_tier=tier,
+        declared_shell_commands=declared_shell_commands,
+        proposal_surface=proposal_surface,
+        **poller_flags,
+    )
+
+
+def builtin_trigger_service_principal(
+    profile: str, home: Path, *, scheduler_job_name: str | None = None,
+    policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal:
+    """Return the authoritative built-in grant; manifests cannot replace it."""
+    selected = policy if policy is not None else selected_policy_registry()
+    if not selected.frozen:
+        raise ValueError("built-in principal requires a frozen policy")
+    declared = selected.profiles.get(profile)
+    config = declared.builtin_trigger_config if declared is not None else None
+    if config is None:
+        raise ValueError(f"unknown built-in authority profile: {profile!r}")
+    root_parts = config["root_parts"]
+    roots: tuple[Path, ...] = ()
+    if root_parts is not None:
+        root = home.joinpath(*root_parts).resolve()
+        if scheduler_job_name is not None:
+            root.mkdir(parents=True, exist_ok=True)
+        roots = (root,)
+    channel_memory_directory = config["channel_memory_directory"]
+    if scheduler_job_name is not None:
+        channel_memory_directory = f"scheduler:{scheduler_job_name}"
+    return build_trigger_service_principal(
+        canonical=config["canonical"],
+        trigger=config["trigger"],
+        profile=profile,
+        tier=CapabilityTier(config["tier"]),
+        capabilities=tuple(sorted(selected.authority_profiles[profile])),
+        roots=roots,
+        channel_memory_directory=channel_memory_directory,
+        creation_path=config["creation_path"],
+        saga_full_corpus_read=config["saga_full_corpus_read"],
+        policy=selected,
+    )
+
+
+def build_scheduled_tick_service_principal(
+    job_name: str, home: Path | None,
+) -> ServicePrincipal | None:
+    """Bind the shared scheduled-tick authority to one scheduler job's reads."""
+    base = get_service_principal("scheduled_tick")
+    if base is None:
+        return None
+    script_roots = (
+        (str((home / "scripts").resolve()),) if home is not None else ()
+    )
+    if job_name == "commitments-review":
+        # Server-issued, job-specific read/proposal grant; no closure authority.
+        base = replace(
+            base,
+            capabilities=tuple(dict.fromkeys((*base.capabilities, "commitment_list", "commitment_propose_closure"))),
+            readable_domains=tuple(dict.fromkeys((*base.readable_domains, "commitments"))),
+            sink_destinations=tuple(dict.fromkeys((*base.sink_destinations, "commitment_proposals"))),
+        )
+    return replace(
+        base,
+        filesystem_read_roots=tuple(dict.fromkeys((
+            *base.filesystem_read_roots,
+            *script_roots,
+        ))),
+        channel_memory_directory=f"scheduler:{job_name}",
+        creation_path="mimir.scheduler.Scheduler._fire:scheduled_tick",
+    )
+
+
+def _configured_file_roots() -> list[Path]:
+    """Return the same roots exposed by the live file-tool backend."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    # Import lazily: config imports this module while defining Config. Reuse its
+    # parser rather than maintaining a second env syntax/validation policy here.
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
+    )
+    return [Path(home), *(Path(path) for path, _mode in extra_roots)]
+
+
+def _configured_maintenance_git_roots() -> list[Path]:
+    """Return home plus explicit file-tool roots, excluding implicit ``/tmp``."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
+    )
+    return [Path(home), *(Path(path) for path, _mode in extra_roots)]
+
+
+def _upgrade_proposals_root() -> Path | None:
+    """Return the upgrade service's bounded proposal workspace root."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    return (Path(home).resolve() / "scratch" / "proposals").resolve()
+
+
+def _valid_turn_scratch_id(turn_id: object) -> bool:
+    return (
+        isinstance(turn_id, str)
+        and bool(turn_id)
+        and "\x00" not in turn_id
+        and Path(turn_id).name == turn_id
+        and turn_id not in {".", ".."}
+    )
+
+
+def _turn_scratch_path(home: Path, turn_id: object, *, create: bool) -> Path | None:
+    """Check each component relative to an opened directory, without following links.
+
+    The descriptor walk also prevents a replaced parent between lstat and mkdir
+    from redirecting creation through a symlink.
+    """
+    if not _valid_turn_scratch_id(turn_id):
+        return None
+    root = Path(home).resolve()
+    fd = None
+    component = "home"
+    index = -1
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for index, component in enumerate(("scratch", "turns", turn_id)):
+            try:
+                st = os.stat(component, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass  # Another turn may have created it; validate below.
+                st = os.stat(component, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode) or (
+                index == 2 and st.st_uid != os.getuid()
+            ):
+                if create:
+                    log.warning("turn_scratch_refused component=%s reason=unsafe_entry",
+                                "turn" if index == 2 else component)
+                return None
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=fd)
+            opened = os.fstat(next_fd)
+            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                os.close(next_fd)
+                if create:
+                    log.warning("turn_scratch_refused component=%s reason=changed_entry",
+                                "turn" if index == 2 else component)
+                return None
+            os.close(fd)
+            fd = next_fd
+            if index == 2 and create:
+                # Repair pre-existing owned workspaces through the validated fd,
+                # never a pathname that could be replaced with a symlink.
+                os.fchmod(fd, 0o700)
+        return root / "scratch" / "turns" / turn_id
+    except (OSError, RuntimeError) as exc:
+        if create:
+            log.warning("turn_scratch_refused component=%s reason=%s",
+                        "turn" if index == 2 else component,
+                        type(exc).__name__)
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def ensure_turn_scratch(home: Path, turn_id: str) -> Path | None:
+    """Create (or reuse) this turn's private scratch directory, or refuse it."""
+    return _turn_scratch_path(home, turn_id, create=True)
+
+
+def current_turn_scratch_root() -> Path | None:
+    """Return the active turn's server-owned ordinary scratch workspace."""
+    from ._context import get_current_turn
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    ctx = get_current_turn()
+    turn_id = getattr(ctx, "turn_id", None)
+    if not home:
+        return None
+    # An explicitly refused turn cannot acquire the root later via another
+    # caller's mkdir; the current filesystem entry must still be safe as well.
+    path = _turn_scratch_path(Path(home), turn_id, create=False)
+    if ctx is not None and hasattr(ctx, "turn_scratch_path") and path != ctx.turn_scratch_path:
+        return None
+    return path
+
+
+def worklink_retained_checkout_root() -> Path | None:
+    """Return the selected owner's retained-checkout root, if registered."""
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is not None:
+        return Path(hooks.retained_checkout_root())
+    return None
+
+
+def _is_registered_retained_scope(scope: object) -> bool:
+    for action in selected_policy_registry().scoped_actions.values():
+        constructors = getattr(action, "trusted_scope", None)
+        if constructors is not None and type(scope) is constructors.retained:
+            return True
+    return False
+
+
+def _registered_scope_constructors(auth_context: Any = None) -> Any:
+    policy = getattr(auth_context, "_plugin_slot_policy", None) or selected_policy_registry()
+    return next(
+        (constructors for protocol in policy.scoped_actions.values()
+         if (constructors := getattr(protocol, "trusted_scope", None)) is not None),
+        None,
+    )
+
+
+def _is_worklink_retained_checkout_service(
+    service: ServicePrincipal | None, *, auth_context: AuthContext | None = None,
+) -> bool:
+    """Bind retained-checkout authority to the authenticated reserved poller."""
+    return (
+        isinstance(service, ServicePrincipal)
+        and service.worklink_retained_checkout
+        and service.trigger == "poller"
+        and service.authority_profile == "github"
+        and service == get_trusted_service_from_auth_context(auth_context)
+    )
+
+
+def service_filesystem_read_roots(
+    service: ServicePrincipal | None, *, auth_context: AuthContext | None = None,
+) -> tuple[Path, ...]:
+    """Resolve static read roots plus built-in service-owned workspace roots."""
+    if service is None:
+        return ()
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    home_scratch = (Path(home).resolve() / "scratch").resolve() if home else None
+    roots = [
+        Path(root) for root in service.filesystem_read_roots
+        if home_scratch is None or Path(root).resolve() != home_scratch
+    ]
+    if home:
+        home_root = Path(home).resolve()
+        roots.extend((
+            home_root / "state",
+            home_root / "skills",
+            home_root / ".mimir_builtin_skills",
+            home_root / "CHANGELOG.md",
+        ))
+    turn_scratch = (
+        None if _is_research_proposal_poller(service) else current_turn_scratch_root()
+    )
+    if turn_scratch is not None:
+        roots.append(turn_scratch)
+    proposal_root = _active_poller_proposal_root(auth_context)
+    if proposal_root is not None and service == get_trusted_service_from_auth_context(auth_context):
+        roots.append(proposal_root)
+    revision = getattr(auth_context, "proposal_revision", None)
+    if revision is not None and home and service == get_trusted_service_from_auth_context(auth_context):
+        from .proposals import _worktree_dir
+        if revision.lane == "agent":
+            roots.append(_worktree_dir(Path(home).resolve(), revision.branch, lane="agent"))
+    if (
+        getattr(service, "authority_profile", None) == "github"
+        and service == get_trusted_service_from_auth_context(auth_context)
+    ):
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        states = list(registry.review_states) if registry is not None else [
+            getattr(auth_context, "repo_review_state", None)
+        ]
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        if discovered is not None:
+            states.extend(discovered.review_states)
+        for state in states:
+            lease = getattr(state, "checkout_lease", None)
+            if lease is not None and _target_within_active_pr_checkout_lease(str(lease.path), state):
+                roots.append(Path(lease.path))
+    if _is_worklink_retained_checkout_service(service, auth_context=auth_context):
+        retained_root = worklink_retained_checkout_root()
+        if retained_root is not None:
+            roots.append(retained_root)
+    if (
+        getattr(service, "trigger", None) == "poller"
+        and str(getattr(service, "canonical", "")).startswith("poller:")
+        and getattr(service, "owned_skill_directory", None)
+    ):
+        roots.append(Path(service.owned_skill_directory))
+    if (
+        getattr(service, "canonical", None) == "system"
+        and getattr(service, "trigger", None) == "upgrade"
+    ):
+        if home:
+            roots.append(Path(home).resolve() / "docs")
+        proposal_root = _upgrade_proposals_root()
+        if revision is not None and revision.lane == "upgrade" and home:
+            from .proposals import _worktree_dir
+            proposal_root = _worktree_dir(Path(home).resolve(), revision.branch, lane="upgrade")
+        if proposal_root is not None:
+            roots.append(proposal_root)
+    return tuple(dict.fromkeys(roots))
+
+
+def service_shell_filesystem_read_roots(
+    service: ServicePrincipal | None, *, auth_context: AuthContext | None = None,
+) -> tuple[Path, ...]:
+    """Return service read roots without file-tool-only retained checkouts."""
+    roots = service_filesystem_read_roots(service, auth_context=auth_context)
+    if not _is_worklink_retained_checkout_service(service, auth_context=auth_context):
+        return roots
+    retained_root = worklink_retained_checkout_root()
+    if retained_root is None:
+        return roots
+    retained = retained_root.resolve(strict=False)
+    static_roots = {
+        Path(root).resolve(strict=False)
+        for root in getattr(service, "filesystem_read_roots", ())
+    }
+    if retained in static_roots:
+        return roots
+    return tuple(root for root in roots if root.resolve(strict=False) != retained)
+
+
+def _configured_file_write_roots() -> list[Path]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
+    )
+    return [Path(home), *(Path(path) for path, mode in extra_roots if mode == "rw")]
+
+
+def _resolve_file_tool_target(
+    target: str,
+    home: Path | str | None = None,
+    *,
+    physical_roots: Iterable[Path] = (),
+) -> Path | None:
+    """Resolve a caller path using the live file backend's virtual convention."""
+    home_value = str(home or os.environ.get("MIMIR_HOME", "")).strip()
+    if not home_value or not target or "\x00" in target:
+        return None
+    requested = Path(target)
+    if ".." in requested.parts:
+        return None
+    try:
+        configured_home = Path(os.path.abspath(home_value))
+        home_root = Path(home_value).resolve()
+        if not requested.is_absolute():
+            return home_root / requested
+
+        # CompositeBackend routes real absolute paths before its default home
+        # backend. Preserve those spellings instead of remapping them as virtual.
+        external_roots = tuple(dict.fromkeys(
+            resolved
+            for root in (*_configured_file_roots(), *physical_roots)
+            if (resolved := root.resolve()) != home_root
+        ))
+        for root in sorted(external_roots, key=lambda item: len(item.parts), reverse=True):
+            if requested == root or requested.is_relative_to(root):
+                return requested
+
+        # The home backend accepts both its physical spelling and an absolute
+        # virtual spelling rooted at home (for example /state/x or /skills/x).
+        for spelling in dict.fromkeys((configured_home, home_root)):
+            if requested == spelling or requested.is_relative_to(spelling):
+                return home_root / requested.relative_to(spelling)
+        return home_root / requested.as_posix().lstrip("/")
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _repository_inventory(home: str) -> Any:
+    """Read inventory only from the selected owner; never trust a missing provider."""
+    policy = selected_policy_registry()
+    hooks = policy.policy_consumer_hooks
+    path = Path(home) / "repositories.yaml"
+    if hooks is not None:
+        return hooks.repository_inventory(path)
+    return None
+
+
+def _inventory_unavailable_with_declaration(home: str, inventory: Any) -> bool:
+    path = Path(home) / "repositories.yaml"
+    return inventory is None and (path.exists() or path.is_symlink())
+
+
+def _configured_repo_write_roots() -> list[Path]:
+    """Return only explicit external RW roots, excluding home and implicit /tmp."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    inventory = _repository_inventory(home)
+    if _inventory_unavailable_with_declaration(home, inventory):
+        return []
+    if inventory is not None and inventory.declared:
+        return [repo.root for repo in inventory.repositories if repo.mode == "rw"]
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
+    )
+    return [Path(path) for path, mode in extra_roots if mode == "rw"]
+
+
+def _configured_repo_roots() -> list[Path]:
+    """Return explicit external file-tool roots in either access mode."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    inventory = _repository_inventory(home)
+    if _inventory_unavailable_with_declaration(home, inventory):
+        return []
+    if inventory is not None and inventory.declared:
+        return [repo.root for repo in inventory.repositories]
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
+    )
+    return [Path(path) for path, _mode in extra_roots]
+def _github_repo_from_remote(remote: str) -> str | None:
+    """Normalize a GitHub origin URL to its owner/repository slug."""
+    value = remote.strip()
+    match = re.fullmatch(
+        r"(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/\s]+)/([^/\s]+?)(?:\.git)?/?",
+        value,
+    )
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def _valid_git_branch(value: object) -> bool:
+    """Apply Git's relevant ref-name exclusions without consulting a repository."""
+    if not isinstance(value, str) or not value or len(value) > 255:
+        return False
+    return not (
+        value.startswith(("-", ".", "/"))
+        or value.endswith((".", "/", ".lock"))
+        or ".." in value
+        or "@{" in value
+        or "//" in value
+        or any(character in value for character in " ~^:?*[\\\x7f")
+        or any(ord(character) < 32 for character in value)
+        or any(part.startswith(".") or part.endswith(".lock") for part in value.split("/"))
+    )
+
+
+def _typed_action_view(*memberships: str) -> Mapping[str, str | None]:
+    return PolicyMappingView(lambda policy: {
+        name: tool.typed_action.value if tool.typed_action is not None else None
+        for name, tool in policy.tools.items()
+        if tool.memberships.intersection(memberships)
+    })
+
+
+_FORGE_TOOL_ACTIONS = _typed_action_view("forge_actions")
+_REPO_TOOL_ACTIONS = _typed_action_view("repo_actions")
+_RETAINED_REPO_TOOLS = policy_membership("retained_repo_tools")
+_TYPED_REPO_PR_TOOL_ACTIONS = _typed_action_view("forge_actions", "repo_actions")
+_GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
+
+
+@dataclass(frozen=True)
+class RepoBindingResolution:
+    binding: tuple[str, str] | None
+    configured_roots: tuple[str, ...]
+    match_count: int
+
+
+@dataclass(frozen=True)
+class RepoPRScopeResolution:
+    scope: Any = None
+    refusal_reason: str | None = None
+
+
+def _configured_scope_github_repos() -> frozenset[str]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if home:
+        inventory = _repository_inventory(home)
+        if _inventory_unavailable_with_declaration(home, inventory):
+            return frozenset()
+        if inventory is not None and inventory.declared:
+            return frozenset(repo.slug for repo in inventory.repositories)
+    return frozenset(
+        f"{owner}/{name}" for owner, name in _configured_github_repos("GITHUB_REPOS")
+    )
+
+
+def is_configured_github_repo(repo: object) -> bool:
+    """Return whether a model-supplied selector names server configuration."""
+    return (
+        isinstance(repo, str)
+        and _GITHUB_REPO_PATTERN.fullmatch(repo) is not None
+        and repo.lower() in _configured_scope_github_repos()
+    )
+
+
+def _canonical_repo_binding_resolution(repo: str) -> RepoBindingResolution:
+    """Resolve a declared binding, with the legacy probe as migration fallback."""
+    repo = repo.lower()
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if home:
+        inventory = _repository_inventory(home)
+        if _inventory_unavailable_with_declaration(home, inventory):
+            return RepoBindingResolution(None, (), 0)
+        if inventory is not None and inventory.declared:
+            configured_roots = tuple(str(item.root) for item in inventory.repositories)
+            record = inventory.repository(repo)
+            if record is None:
+                return RepoBindingResolution(None, configured_roots, 0)
+            return RepoBindingResolution(
+                (str(record.root), record.origin), configured_roots, 1,
+            )
+    configured_roots = tuple(str(root) for root in _configured_repo_write_roots())
+    if repo not in _configured_scope_github_repos():
+        return RepoBindingResolution(None, configured_roots, 0)
+    git = _maintenance_resolved_pin("git")
+    if git is None:
+        return RepoBindingResolution(None, configured_roots, 0)
+    matching_roots: list[tuple[Path, str]] = []
+    for configured in map(Path, configured_roots):
+        try:
+            root = configured.resolve(strict=True)
+            result = subprocess.run(
+                [str(git), "-C", str(root), *_MAINTENANCE_GIT_BASE_OVERRIDES,
+                 "config", "--local", "--get", "remote.origin.url"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                env=_maintenance_git_probe_env(),
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            continue
+        observed_origin = result.stdout.strip()
+        remote_repo = _github_repo_from_remote(observed_origin)
+        if result.returncode == 0 and remote_repo is not None and remote_repo.lower() == repo:
+            matching_roots.append((root, observed_origin))
+    if len(matching_roots) != 1:
+        return RepoBindingResolution(None, configured_roots, len(matching_roots))
+    root, observed_origin = matching_roots[0]
+    return RepoBindingResolution((str(root), observed_origin), configured_roots, 1)
+
+
+def _canonical_repo_binding(repo: str) -> tuple[str, str] | None:
+    """Resolve one configured GitHub repo to its unique writable root and origin."""
+    return _canonical_repo_binding_resolution(repo).binding
+
+
+def _repo_binding_refusal_reason(repo: str, match_count: int) -> str:
+    mode = (
+        "zero roots matched"
+        if match_count == 0
+        else f"ambiguous: {match_count} roots matched"
+    )
+    return (
+        f"pull-request operation rejected: no unique writable root matched repository "
+        f"'{repo}' in MIMIR_FILE_TOOL_ROOTS ({mode}); configure exactly one :rw "
+        "entry for the checkout directory itself, not its parent"
+    )
+
+
+def _repo_pr_scope_resolution(
+    *,
+    policy: Any = None,
+    provenance: str,
+    repo: object,
+    principal: object,
+    event_type: object,
+    number: object,
+    head_repo: object,
+    head_remote: object,
+    head_ref: object,
+    head_sha: object,
+    base_ref: object,
+    base_sha: object,
+    review_state: object = None,
+    actor: object = None,
+    author_is_trusted: object = None,
+    pr_state: object = None,
+    pr_author_is_trusted: object = None,
+    pr_author_trust_cause: object = None,
+) -> RepoPRScopeResolution:
+    """Validate a PR snapshot, preserving whether state or configuration refused it."""
+    self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    is_fresh_changes_requested_remediation = (
+        event_type == "pr_review"
+        and review_state == "CHANGES_REQUESTED"
+        and principal == self_login
+    )
+    is_trusted_comment_remediation = (
+        (
+            event_type in {"issue_comment", "pr_review_comment"}
+            or (event_type == "pr_review" and review_state == "COMMENTED")
+        )
+        and principal == self_login
+        and author_is_trusted is True
+        and isinstance(actor, str)
+        and actor.lower() != self_login.lower()
+        and pr_state == "open"
+    )
+    is_remediation = (
+        is_fresh_changes_requested_remediation
+        or is_trusted_comment_remediation
+        or event_type in {
+            "heartbeat_pr_maintenance",
+            "pr_changes_requested_stale",
+            "pr_ci_failure",
+            "pr_mergeability_rebase",
+            "pr_mergeability_conflicting",
+        }
+    )
+    if (
+        not self_login
+        or not isinstance(repo, str)
+        or _GITHUB_REPO_PATTERN.fullmatch(repo) is None
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number < 1
+        or not isinstance(principal, str)
+        or not principal
+        or not isinstance(head_repo, str)
+        or _GITHUB_REPO_PATTERN.fullmatch(head_repo) is None
+        or (is_remediation and head_repo.lower() != repo.lower())
+        or (is_remediation and head_remote != "origin")
+        or (not is_remediation and head_remote not in {"origin", "source"})
+        or not _valid_git_branch(head_ref)
+        or not _valid_git_branch(base_ref)
+        or not isinstance(head_sha, str)
+        or _GITHUB_SHA_PATTERN.fullmatch(head_sha) is None
+        or not isinstance(base_sha, str)
+        or _GITHUB_SHA_PATTERN.fullmatch(base_sha) is None
+    ):
+        return RepoPRScopeResolution(
+            refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
+        )
+    repo = repo.lower()
+    head_repo = head_repo.lower()
+    binding_resolution = _canonical_repo_binding_resolution(repo)
+    if binding_resolution.binding is None:
+        return RepoPRScopeResolution(
+            refusal_reason=_repo_binding_refusal_reason(
+                repo, binding_resolution.match_count,
+            )
+        )
+    root, origin = binding_resolution.binding
+    if principal != self_login and pr_author_is_trusted is not True:
+        from .event_logger import log_event_sync
+
+        reason = (
+            "attestation_unavailable" if pr_author_is_trusted is None
+            else "bot_not_allowlisted" if principal.endswith("[bot]")
+            else "non_collaborator"
+        )
+        from .pollers import bounded_github_author_cause
+        cause = (bounded_github_author_cause(pr_author_trust_cause or "verdict_missing")
+                 if pr_author_is_trusted is None else None)
+        try:
+            fields = dict(
+                repo=repo, number=number,
+                author=principal if re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", principal, re.ASCII,
+                ) else "<invalid-login>", reason=reason,
+            )
+            if cause is not None:
+                fields["cause"] = cause
+            log_event_sync("github_outsider_pr_refused", **fields)
+            log_event_sync(
+                "github_content_withheld", tool="pr_scope", kind="pull_request",
+                count=1, reason=reason,
+            )
+        except RuntimeError:
+            # Standalone callers do not initialize the process event logger.
+            pass
+        return RepoPRScopeResolution(refusal_reason=(
+            "pull request withheld: its author is not a repository collaborator; "
+            "the item was withheld and logged"
+        ))
+    if is_remediation and principal != self_login:
+        return RepoPRScopeResolution(
+            refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
+        )
+    policy = policy if policy is not None else selected_policy_registry()
+    constructors = next(
+        (protocol.trusted_scope for protocol in policy.scoped_actions.values()
+         if protocol.trusted_scope is not None), None,
+    )
+    if constructors is None:
+        return RepoPRScopeResolution(refusal_reason="no selected scoped-action owner")
+    scope_type = constructors.issue
+    scope_fields = dict(
+        provenance=provenance,
+        canonical_repo=repo,
+        canonical_root=root,
+        canonical_origin=origin,
+        principal=self_login,
+        event_type=event_type,
+        pr_number=number,
+        head_repo=head_repo,
+        head_remote=head_remote if is_remediation else "origin",
+        destination_ref=f"refs/heads/{head_ref}",
+        observed_head_sha=head_sha.lower(),
+        base_ref=base_ref,
+        observed_base_sha=base_sha.lower(),
+        checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
+        pull_request_author=principal,
+    )
+    return RepoPRScopeResolution(scope=scope_type(
+        is_remediation=is_remediation, **scope_fields,
+    ))
+
+
+def _repo_pr_scope(**kwargs: Any) -> Any:
+    """Compatibility wrapper returning only an issued scope or ``None``."""
+    return _repo_pr_scope_resolution(**kwargs).scope
+
+
+def repo_binding_startup_alerts() -> tuple[dict[str, Any], ...]:
+    """Return one non-fatal operator alert for each unbound configured repo."""
+    alerts: list[dict[str, Any]] = []
+    for repo in sorted(_configured_scope_github_repos()):
+        resolution = _canonical_repo_binding_resolution(repo)
+        if resolution.binding is not None:
+            continue
+        alerts.append({
+            "repository": repo,
+            "probed_roots": list(resolution.configured_roots),
+            "match_count": resolution.match_count,
+            "error": _repo_binding_refusal_reason(repo, resolution.match_count),
+            "operator_visible": True,
+        })
+    return tuple(alerts)
+
+
+def heartbeat_cached_scope_refusal(previous: Any, current: Any) -> str | None:
+    """Keep live checkout pins and authority fixed across heartbeat discovery."""
+    if any(getattr(previous, name) != getattr(current, name) for name in (
+        "canonical_repo", "pr_number", "canonical_root", "canonical_origin",
+        "head_repo", "head_remote", "destination_ref", "observed_head_sha",
+        "base_ref", "observed_base_sha",
+    )):
+        return "stale_scope: heartbeat PR SHA/ref or repository binding changed"
+    if any(getattr(previous, name) != getattr(current, name) for name in (
+        "event_type", "allowed_operations", "checkout_ref", "provenance",
+    )):
+        return "heartbeat_scope_incompatible: cached scope is not heartbeat PR maintenance authority"
+    return None
+
+
+def create_server_discovered_heartbeat_scope(
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+    *,
+    event_type: str,
+    pr_author_is_trusted: object = None,
+) -> Any:
+    """Create heartbeat authority from one provider-normalized live PR snapshot."""
+    if (
+        not isinstance(pull_request, NormalizedPullRequestSnapshot)
+        or pull_request.state != "open"
+    ):
+        return None
+    return _repo_pr_scope(
+        provenance="server_discovered",
+        repo=repo,
+        principal=pull_request.author,
+        event_type=event_type,
+        number=pull_request.number,
+        head_repo=pull_request.head_repo,
+        head_remote=pull_request.head_remote,
+        head_ref=pull_request.head_ref,
+        head_sha=pull_request.head_sha,
+        base_ref=pull_request.base_ref,
+        base_sha=pull_request.base_sha,
+        pr_author_is_trusted=pr_author_is_trusted,
+    )
+
+
+def create_server_discovered_review_scope(
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+    *,
+    review_state: object = None,
+    pr_author_is_trusted: object = None,
+) -> Any:
+    """Issue standing review or fresh-remediation authority from a live PR."""
+    return resolve_server_discovered_review_scope(
+        repo, pull_request, review_state=review_state,
+        pr_author_is_trusted=pr_author_is_trusted,
+    ).scope
+
+
+def resolve_server_discovered_review_scope(
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+    *,
+    review_state: object = None,
+    pr_author_is_trusted: object = None,
+) -> RepoPRScopeResolution:
+    """Resolve standing review or fresh-remediation authority with a refusal."""
+    if (
+        not isinstance(pull_request, NormalizedPullRequestSnapshot)
+        or pull_request.state != "open"
+    ):
+        return RepoPRScopeResolution(
+            refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
+        )
+    return _repo_pr_scope_resolution(
+        provenance="server_discovered",
+        repo=repo,
+        principal=pull_request.author,
+        event_type="pr_review",
+        review_state=review_state,
+        number=pull_request.number,
+        head_repo=pull_request.head_repo,
+        head_remote=pull_request.head_remote,
+        head_ref=pull_request.head_ref,
+        head_sha=pull_request.head_sha,
+        base_ref=pull_request.base_ref,
+        base_sha=pull_request.base_sha,
+        pr_author_is_trusted=pr_author_is_trusted,
+    )
+
+
+def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal | None,
+                                  policy: Any = None) -> Any:
+    """Derive exactly the valid immutable PR scopes in a trusted poller payload."""
+    if (
+        service is None
+        or service.authority_profile != "github"
+        or event.trigger != "poller"
+        or not isinstance(event.extra, dict)
+        or event.extra.get(POLLER_RECOVERY_REPLAY_EXTRA_KEY) is not None
+    ):
+        return None
+    items = event.extra.get("items")
+    if not isinstance(items, list):
+        return None
+    constructors = next(
+        (protocol.trusted_scope for protocol in (policy or selected_policy_registry()).scoped_actions.values()
+         if protocol.trusted_scope is not None), None,
+    )
+    if constructors is None:
+        return None
+    review_type = constructors.review
+    registry_type = constructors.registry
+
+    by_target: dict[tuple[str, int], Any] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("event_type") in {
+            "pr_changes_requested_stale", "pr_ci_failure",
+            "pr_mergeability_rebase", "pr_mergeability_conflicting",
+        } and isinstance(item.get("repo"), str) and type(item.get("number")) is int and isinstance(item.get("head_sha"), str):
+            hooks = getattr(policy or selected_policy_registry(), "policy_consumer_hooks", None)
+            if hooks is None:
+                continue
+
+            if hooks.superseded_push(item["repo"], item["number"], item["head_sha"]):
+                # A queued event may outlive the poller fire that generated it.
+                # Never issue a stale authority even when it was already queued.
+                from .event_logger import log_event_sync
+
+                log_event_sync(
+                    "github_stale_trigger_dropped", stage="scope_binding",
+                    reason="superseded_by_verified_own_push",
+                )
+                continue
+        scope = _repo_pr_scope(
+            policy=policy,
+            provenance="poller_payload",
+            repo=item.get("repo"),
+            principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"
+                       else item.get("author")),
+            event_type=item.get("event_type"),
+            review_state=item.get("state"),
+            actor=item.get("actor"),
+            author_is_trusted=item.get("author_is_trusted"),
+            pr_author_is_trusted=item.get("pr_author_is_trusted"),
+            pr_author_trust_cause=item.get("pr_author_trust_cause"),
+            pr_state=item.get("pr_state"),
+            number=item.get("number"),
+            head_repo=item.get("head_repo"),
+            head_remote=item.get("head_remote"),
+            head_ref=item.get("head_ref"),
+            head_sha=item.get("head_sha"),
+            base_ref=item.get("base_ref"),
+            base_sha=item.get("base_sha"),
+        )
+        if scope is None:
+            continue
+        target = (scope.canonical_repo, scope.pr_number)
+        previous = by_target.get(target)
+        if previous is None and target in by_target:
+            continue
+        if previous is not None and previous.action_scope.scope_id != scope.scope_id:
+            # Never choose between conflicting trusted snapshots of one target.
+            by_target[target] = None
+        elif previous is None:
+            by_target[target] = review_type(scope)
+    states = tuple(
+        state for _target, state in sorted(by_target.items()) if state is not None
+    )
+    return registry_type(states) if states else None
+
+
+def _static_service_write_roots() -> list[Path]:
+    """Return the complete filesystem scope writable by static services.
+
+    ``/tmp`` is intentionally shared and attacker-influenced; granting it here
+    matches the file-tool backend's existing RW scope. Protected-name checks
+    below still apply, and executable pins must remain outside every root.
+    """
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+    home_root = Path(home).resolve()
+    artifact_root = framework_large_tool_results_root(home_root)
+    return list(dict.fromkeys([
+        *(root.resolve() for root in _configured_repo_write_roots()),
+        (home_root / "state").resolve(),
+        (home_root / "memory").resolve(),
+        (home_root / "scratch").resolve(),
+        *((artifact_root,) if artifact_root is not None else ()),
+        Path("/tmp").resolve(),
+    ]))
+
+
+def _target_within_configured_write_roots(target: str, _destination: str) -> bool:
+    from ._paths import PathOutsideHomeError
+
+    try:
+        candidate = _resolve_file_tool_target(target)
+        if candidate is None:
+            return False
+        resolve_configured_write_target(str(candidate))
+    except (OSError, PathOutsideHomeError):
+        return False
+    return True
+
+
+def _target_within_configured_repo_write_roots(target: str, _destination: str) -> bool:
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    if not Path(target).is_absolute():
+        return False
+    try:
+        resolve_within_roots(_configured_repo_write_roots(), target)
+    except (OSError, PathOutsideHomeError, RuntimeError):
+        return False
+    return True
+
+
+_STATIC_SERVICE_PROTECTED_WRITE_NAMES: frozenset[str] = frozenset({
+    ".env", ".git", ".mimir", ".venv", "config", "credentials", "identities",
+    "prompts", "secret", "secrets",
+})
+
+
+def _is_static_service_protected_write_path(
+    path: Path,
+    *,
+    under_memory_root: bool = False,
+    allow_git_metadata: bool = False,
+) -> bool:
+    """Keep live scheduler/system writes away from operator-controlled data."""
+    if under_memory_root and (
+        path == Path("core") or path.is_relative_to(Path("core"))
+    ):
+        return True
+    for part in (part.lower() for part in path.parts):
+        stem = Path(part).stem
+        is_git_metadata = part == ".git" or part.rstrip(".") == ".git"
+        if (
+            (part in _STATIC_SERVICE_PROTECTED_WRITE_NAMES and part != ".git")
+            or (is_git_metadata and not (part == ".git" and allow_git_metadata))
+            or stem.split(".", 1)[0] in {
+                "config", "credentials", "identities", "secret", "secrets",
+            }
+            or part.startswith(".env.")
+            or part.startswith("oauth_") and part.endswith(".json")
+            or Path(part).suffix in {".key", ".pem"}
+        ):
+            return True
+    return False
+
+
+def _target_within_static_service_write_roots(
+    target: str, _destination: str, *, allow_shared_scratch: bool = False,
+) -> bool:
+    """Authorize static service writes to narrow roots and safe home data."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return False
+    home_root = Path(home).resolve()
+    state_root = (home_root / "state").resolve()
+    memory_root = (home_root / "memory").resolve()
+    scratch_root = (home_root / "scratch").resolve()
+    artifact_root = framework_large_tool_results_root(home_root)
+    home_write_roots = {
+        state_root, memory_root, scratch_root,
+        *((artifact_root,) if artifact_root is not None else ()),
+    }
+    roots = _static_service_write_roots()
+    candidate = _resolve_file_tool_target(
+        target, home_root, physical_roots=roots,
+    )
+    if candidate is None:
+        return False
+    try:
+        # Check both the lexical spelling and resolved destination.  The former
+        # prevents a protected component that is itself a symlink (for example
+        # ``state/credentials -> <repo>/data``) from laundering its name by
+        # resolving into another otherwise-safe configured root.
+        lexical_root, lexical_relative = max(
+            (
+                (root, candidate.relative_to(root))
+                for root in roots
+                if candidate == root or candidate.is_relative_to(root)
+            ),
+            key=lambda item: len(item[0].parts),
+        )
+        lexical_has_git_metadata = any(
+            part.lower().rstrip(".") == ".git"
+            for part in lexical_relative.parts
+        )
+        if (
+            (candidate == home_root or candidate.is_relative_to(home_root))
+            and lexical_root not in home_write_roots
+        ):
+            return False
+        if lexical_root == scratch_root and not allow_shared_scratch:
+            turn_scratch = current_turn_scratch_root()
+            if turn_scratch is None or not (
+                candidate == turn_scratch or candidate.is_relative_to(turn_scratch)
+            ):
+                return False
+        # ``allow_git_metadata`` permits exactly ``.git`` under scratch — not
+        # its trailing-dot laundering variants, and NOT ``.git/config``: the
+        # ``config`` name is independently protected, which preserves #984's
+        # invariant that .gitignore/.gitattributes may SELECT a filter or diff
+        # driver while the definitions (in config) stay unwritable, even inside
+        # scratch. Consequence: ``git init`` / ``git config`` in scratch are
+        # refused. That does not break the proposals flow — ``proposals.py``
+        # creates its worktrees through a direct server-side subprocess, not
+        # through ``shell_exec``, so that path is not gated here. Do not
+        # "fix" a git-init refusal by unprotecting ``config``.
+        if _is_static_service_protected_write_path(
+            lexical_relative,
+            under_memory_root=lexical_root == memory_root,
+            allow_git_metadata=lexical_root == scratch_root,
+        ):
+            return False
+        resolved = resolve_within_roots(roots, str(candidate))
+        root, relative = max(
+            (
+                (root, resolved.relative_to(root))
+                for root in roots
+                if resolved == root or resolved.is_relative_to(root)
+            ),
+            key=lambda item: len(item[0].parts),
+        )
+        if (
+            (resolved == home_root or resolved.is_relative_to(home_root))
+            and root not in home_write_roots
+        ):
+            return False
+        if root == scratch_root and not allow_shared_scratch:
+            turn_scratch = current_turn_scratch_root()
+            if turn_scratch is None or not (
+                resolved == turn_scratch or resolved.is_relative_to(turn_scratch)
+            ):
+                return False
+        # A lexical scratch/.git alias may not launder writes into another
+        # writable root. Both spellings must remain inside scratch.
+        if lexical_has_git_metadata and root != scratch_root:
+            return False
+    except (OSError, PathOutsideHomeError, RuntimeError, StopIteration, ValueError):
+        return False
+    return not _is_static_service_protected_write_path(
+        relative,
+        under_memory_root=root == memory_root,
+        allow_git_metadata=root == scratch_root,
+    )
+
+
+def _target_within_upgrade_proposals(target: str, _destination: str) -> bool:
+    """Restrict upgrade file mutations to the proposal workspace it owns."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    root = _upgrade_proposals_root()
+    if root is None:
+        return False
+    candidate = _resolve_file_tool_target(target, physical_roots=(root,))
+    if candidate is None:
+        return False
+    try:
+        resolve_within_roots([root], str(candidate))
+    except (OSError, PathOutsideHomeError, RuntimeError):
+        return False
+    return _target_within_static_service_write_roots(
+        str(candidate), _destination, allow_shared_scratch=True,
+    )
+
+
+def _target_within_revision_proposal(
+    target: str, destination: str, *, auth_context: AuthContext | None,
+) -> bool:
+    """Only the bound revision's exact worktree and protected surface."""
+    from ._paths import resolve_within_roots
+    from .proposals import PROPOSAL_SURFACES, _worktree_dir
+
+    revision = getattr(auth_context, "proposal_revision", None)
+    home = os.environ.get("MIMIR_HOME")
+    if revision is None or not home or revision.lane not in ("agent", "upgrade"):
+        return False
+    worktree = _worktree_dir(Path(home).resolve(), revision.branch, lane=revision.lane)
+    candidate = _resolve_file_tool_target(target, physical_roots=(worktree,))
+    if candidate is None:
+        return False
+    try:
+        roots = [worktree / surface for surface in PROPOSAL_SURFACES]
+        resolved = resolve_within_roots(roots, str(candidate))
+        root = next(root for root in roots if resolved.is_relative_to(root))
+        relative = resolved.relative_to(root)
+        if not relative.parts or relative.suffix.lower() != ".md":
+            return False
+        if _is_static_service_protected_write_path(relative):
+            return False
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return True
+
+
+def resolve_configured_write_target(target: str) -> Path:
+    """Resolve a write sink exactly as the configured-roots adapter does."""
+    from ._paths import resolve_within_roots
+
+    return resolve_within_roots(_configured_file_write_roots(), target)
+
+
+_SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[]*?\n\r")
+
+_CHAINLINK_EXECUTABLES = frozenset({"chainlink", "/usr/local/bin/chainlink"})
+_CHAINLINK_OUTPUT_OPTIONS = frozenset({"-q", "--quiet", "--json"})
+_CHAINLINK_QUERY_SUBCOMMANDS = frozenset({
+    "show", "list", "search", "ready", "blocked", "related", "cascade",
+    "next", "tree",
+})
+_CHAINLINK_MUTATION_SUBCOMMANDS = frozenset({
+    "create", "update", "comment", "label", "unlabel", "block", "unblock",
+    "relate", "unrelate", "close", "reopen", "subissue", "quick",
+})
+
+
+def _chainlink_arguments(argv: list[str]) -> list[str]:
+    """Normalize Clap's attached label values before bounded shape checks."""
+    arguments: list[str] = []
+    for argument in argv[1:]:
+        if argument.startswith("--label="):
+            arguments.extend(("--label", argument[len("--label="):]))
+        elif argument.startswith("-l="):
+            arguments.extend(("-l", argument[3:]))
+        elif argument.startswith("-l") and argument != "-l" and not argument.startswith("--"):
+            arguments.extend(("-l", argument[2:]))
+        elif argument not in _CHAINLINK_OUTPUT_OPTIONS:
+            arguments.append(argument)
+    return arguments
+
+
+# Audited against ``chainlink issue --help``. These commands are mutations that
+# remain outside the bounded service surface rather than unclassified reads.
+_CHAINLINK_REFUSED_ISSUE_SUBCOMMANDS = {
+    "close-all": "bulk mutation",
+    "delete": "irreversible mutation",
+    "falsify": "dependency mutation",
+    "tested": "test-reminder mutation",
+}
+# Audited against ``chainlink --help``. The service profile intentionally
+# exposes only bounded issue orientation and session status; these other roots
+# are recorded here so a CLI addition cannot disappear into a silent refusal.
+_CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS = {
+    "init": "tracker initialization",
+    "timer": "mixed read/write namespace outside issue orientation",
+    "export": "bulk serialization with a filesystem output option",
+    "import": "bulk tracker mutation",
+    "archive": "mixed read/write namespace outside issue orientation",
+    "milestone": "mixed read/write namespace outside issue orientation",
+    "daemon": "daemon lifecycle namespace",
+    "cpitd": "clone-detection lifecycle namespace",
+    "usage": "mixed read/write accounting namespace",
+    "agent": "agent identity and lock namespace",
+    "locks": "Worklink-owned coordination lifecycle",
+    "sync": "coordination fetch and local lock-state update",
+    "cascade": "use the bounded issue cascade form",
+    "falsify": "dependency mutation",
+}
+
+
+def _chainlink_issue_arguments_match(arguments: list[str]) -> bool:
+    """Admit canonical tracker operations with exact option and operand shapes."""
+    if not arguments:
+        return False
+    subcommand = arguments[0]
+    if subcommand not in _CHAINLINK_QUERY_SUBCOMMANDS | _CHAINLINK_MUTATION_SUBCOMMANDS:
+        return False
+
+    flag_options = set(_CHAINLINK_OUTPUT_OPTIONS)
+    value_options: set[str] = set()
+    repeated_value_options: set[str] = set()
+    positional_shape: tuple[str, ...]
+    if subcommand == "list":
+        value_options = {"-s", "--status", "-p", "--priority"}
+        repeated_value_options = {"-l", "--label"}
+        positional_shape = ()
+    elif subcommand in {"ready", "blocked", "next"}:
+        positional_shape = ()
+    elif subcommand in {"show", "related", "cascade"}:
+        positional_shape = ("id",)
+    elif subcommand == "tree":
+        value_options = {"-s", "--status"}
+        # Current help renders the whole tree; deployed versions also accept a
+        # root issue. Both forms are bounded, read-only queries.
+        positional_shape = ("optional_id",)
+    elif subcommand == "search":
+        positional_shape = ("text",)
+    elif subcommand in {"create", "quick"}:
+        value_options = {
+            "-d", "--description", "-p", "--priority", "-t", "--template",
+        }
+        repeated_value_options = {"-l", "--label"}
+        if subcommand == "create":
+            flag_options.add("-w")
+            flag_options.add("--work")
+        positional_shape = ("text",)
+    elif subcommand == "subissue":
+        value_options = {"-d", "--description", "-p", "--priority"}
+        repeated_value_options = {"-l", "--label"}
+        flag_options.update({"-w", "--work"})
+        positional_shape = ("id", "text")
+    elif subcommand == "update":
+        value_options = {
+            "-t", "--title", "-d", "--description", "-p", "--priority",
+        }
+        positional_shape = ("id",)
+    elif subcommand == "comment":
+        value_options = {"--kind"}
+        positional_shape = ("id", "text")
+    elif subcommand in {"label", "unlabel"}:
+        positional_shape = ("id", "text")
+    elif subcommand in {"block", "unblock", "relate", "unrelate"}:
+        if subcommand in {"relate", "unrelate"}:
+            value_options = {"-t", "--type"}
+        positional_shape = ("id", "id")
+    else:
+        if subcommand == "close":
+            flag_options.add("--no-changelog")
+        positional_shape = ("id",)
+
+    positionals: list[str] = []
+    seen_single_options: set[str] = set()
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in flag_options:
+            index += 1
+            continue
+        if argument in value_options or argument in repeated_value_options:
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("-"):
+                return False
+            if argument in value_options and argument in seen_single_options:
+                return False
+            seen_single_options.add(argument)
+            index += 2
+            continue
+        if argument.startswith("-"):
+            return False
+        positionals.append(argument)
+        index += 1
+
+    if subcommand == "tree" and not positionals:
+        positional_shape = ()
+    if len(positionals) != len(positional_shape):
+        return False
+    return all(
+        kind not in {"id", "optional_id"}
+        or (value.isascii() and value.isdigit() and int(value) > 0)
+        for kind, value in zip(positional_shape, positionals)
+    )
+
+
+def _target_matches_chainlink_command(argv: list[str]) -> bool:
+    if not argv or argv[0] not in _CHAINLINK_EXECUTABLES:
+        return False
+    # Clap marks these options global, so accept them at the executable,
+    # resource, or subcommand level without widening any operand shape.
+    arguments = _chainlink_arguments(argv)
+    if arguments[:1] == ["issue"]:
+        return _chainlink_issue_arguments_match(arguments[1:])
+    if arguments[:2] == ["session", "status"]:
+        return all(option in _CHAINLINK_OUTPUT_OPTIONS for option in arguments[2:])
+    return False
+
+
+def _chainlink_command_is_mutation(argv: list[str]) -> bool:
+    """Classify one admitted Chainlink argv without consulting IFC state."""
+    if not _target_matches_chainlink_command(argv):
+        return False
+    arguments = _chainlink_arguments(argv)
+    return (
+        arguments[:1] == ["issue"]
+        and len(arguments) >= 2
+        and arguments[1] in _CHAINLINK_MUTATION_SUBCOMMANDS
+    )
+
+
+def _chainlink_target_argv(target: str | None) -> list[str] | None:
+    """Parse one bounded Chainlink shell target without consulting IFC state."""
+    if not isinstance(target, str) or set(target) & _SHELL_CONTROL_CHARACTERS:
+        return None
+    try:
+        argv = shlex.split(target)
+    except ValueError:
+        return None
+    return argv if _target_matches_chainlink_command(argv) else None
+
+
+_CHAINLINK_ARMED_WORK_REFUSAL = (
+    "Arming or editing armed Worklink work after untrusted ingest needs a clean "
+    "turn or the operator. File an unarmed issue or comment instead."
+)
+
+
+def _worklink_label(value: str) -> bool:
+    return any(label.startswith("worklink:") for label in value.split(","))
+
+
+def _chainlink_issue_has_worklink_labels(
+    argv: list[str], issue_id: str, requested_cwd: object, *, session_cwd: bool,
+) -> bool:
+    """Read the target's current labels with a bounded query; uncertainty denies."""
+    from .tools.extra import _effective_shell_cwd
+
+    cwd = _effective_shell_cwd(
+        requested_cwd if isinstance(requested_cwd, str) else None,
+        allow_session_state=session_cwd,
+    )
+    if not cwd:
+        raise ValueError("Chainlink issue label lookup has no working directory")
+    result = subprocess.run(
+        [argv[0], "issue", "show", issue_id, "--json"],
+        cwd=cwd, capture_output=True, text=True, timeout=5, check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("Chainlink issue label lookup failed")
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, dict) or str(payload.get("id")) != issue_id:
+        raise ValueError("Chainlink issue label lookup returned the wrong issue")
+    labels = payload.get("labels")
+    if not isinstance(labels, list):
+        raise ValueError("Chainlink issue label lookup omitted labels")
+    for label in labels:
+        name = (
+            label if isinstance(label, str) else
+            label.get("name") if isinstance(label, dict) else None
+        )
+        if not isinstance(name, str):
+            raise ValueError("Chainlink issue label lookup returned invalid labels")
+        if _worklink_label(name):
+            return True
+    return False
+
+
+def _chainlink_armed_work_refusal(
+    argv: list[str], requested_cwd: object, *, session_cwd: bool,
+) -> str | None:
+    """Classify only shell mutations that arm or rewrite armed tracker work."""
+    arguments = _chainlink_arguments(argv)
+    if arguments[:1] != ["issue"] or len(arguments) < 3:
+        return None
+    subcommand = arguments[1]
+    operands = arguments[2:]
+    if subcommand in {"label", "unlabel"}:
+        return _CHAINLINK_ARMED_WORK_REFUSAL if _worklink_label(operands[-1]) else None
+    if subcommand in {"create", "quick", "subissue"}:
+        if any(
+            option in {"-l", "--label"} and _worklink_label(operands[index + 1])
+            for index, option in enumerate(operands[:-1])
+        ):
+            return _CHAINLINK_ARMED_WORK_REFUSAL
+        return None
+    if subcommand == "update":
+        issue_id = next((value for value in operands if value.isascii() and value.isdigit()), None)
+        if issue_id is None:
+            return _CHAINLINK_ARMED_WORK_REFUSAL + " Chainlink issue label lookup failed."
+        try:
+            armed = _chainlink_issue_has_worklink_labels(
+                argv, issue_id, requested_cwd, session_cwd=session_cwd,
+            )
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return _CHAINLINK_ARMED_WORK_REFUSAL + " Chainlink issue label lookup failed; refusing the update."
+        return _CHAINLINK_ARMED_WORK_REFUSAL if armed else None
+    return None
+
+
+#: Refused even when quoted. A newline inside a command string is never a
+#: legitimate argument value. Review bodies belong in the typed PR tools, not
+#: shell arguments or shell body files.
+_REFUSED_INSIDE_ANY_QUOTE = frozenset("\n\r")
+
+#: Single quotes make every character literal, but double quotes do NOT: a shell
+#: still performs ``$(...)`` and backtick substitution inside them. Treating
+#: ``"$(cat /etc/passwd)"`` as a literal because it is quoted would be wrong.
+_EXPANDS_INSIDE_DOUBLE_QUOTES = frozenset("$`")
+
+
+#: Executables that can take code from argv or stdin. They may only be declared
+#: with a pinned ``script``, and never with an option that sources code inline --
+#: otherwise a grant to "run one script" is a grant to run anything.
+_INTERPRETER_EXECUTABLES = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish",
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun",
+    "php", "lua", "Rscript", "awk", "gawk", "env", "xargs", "eval",
+})
+
+#: Options that make an interpreter read code from argv or stdin. Refused on any
+#: declaration, interpreter or not: no admitted command needs them, and one of
+#: them turns a pinned executable back into an arbitrary one.
+_CODE_FROM_ARGV_OPTIONS = frozenset({"-c", "-e", "-m", "--command", "--eval", "-"})
+
+
+@dataclass(frozen=True)
+class DeclaredShellCommand:
+    """One operator-declared command a scheduled job or poller may run.
+
+    Declared where the job itself is defined -- ``scheduler.yaml`` or a poller
+    manifest -- so mimir needs no built-in catalogue of every CLI a deployment
+    might install. What stays in code is the SHAPE: an absolute pinned path, a
+    non-empty subcommand table (so a bare binary is inexpressible, because
+    ``gog gmail search`` and ``gog gmail send`` are the same binary), an option
+    allowlist, and the interpreter rule.
+    """
+
+    executable: str
+    path: Path
+    subcommands: tuple[tuple[str, ...], ...] = ()
+    options: tuple[str, ...] = ()
+    script: Path | None = None
+    pass_env: tuple[str, ...] = ()
+    external_send: bool = False
+    payload_args: tuple[str, ...] = ()
+    # Parsed declarations keep both: exec must use path (not the realpath), while
+    # classification and immutability checks use the resolved executable.
+    resolved_path: Path | None = None
+
+
+class DeclaredShellCommandError(ValueError):
+    """A shell declaration error, classified by whether host state caused it."""
+
+    def __init__(self, message: str, *, environment_dependent: bool = False) -> None:
+        super().__init__(message)
+        self.environment_dependent = environment_dependent
+
+
+def _declaration_error(
+    name: str,
+    detail: str,
+    *,
+    environment_dependent: bool = False,
+) -> DeclaredShellCommandError:
+    return DeclaredShellCommandError(
+        f"shell_commands[{name!r}]: {detail}",
+        environment_dependent=environment_dependent,
+    )
+
+
+def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
+    """Directories the agent can write through its file tools.
+
+    Derived from the same ``MIMIR_FOLDERS`` policy as ``Config.writable_dirs``
+    without constructing a full ``Config``. Path-specific restrictions inside
+    those roots are applied by ``_agent_writable_root_for_path``.
+    """
+    root = Path(home or os.environ.get("MIMIR_HOME", "")).expanduser()
+    if not str(root) or str(root) == ".":
+        return ()
+    root = root.resolve()
+    from .config import configured_writable_dirs
+
+    names = configured_writable_dirs()
+    roots: list[Path] = []
+    for name in names:
+        candidate = (root / name)
+        try:
+            roots.append(candidate.resolve())
+        except OSError:
+            continue
+    # Home folders are not the whole write surface: MIMIR_FILE_TOOL_ROOTS adds
+    # ``path:rw`` routes (and the default /tmp route), and configured repos can
+    # be rw. A declaration under any of them is agent-writable just the same.
+    #
+    # ``_configured_file_write_roots()`` leads with MIMIR_HOME itself -- it is the
+    # backend's write SINK root, not a statement that everything under home is
+    # writable. Unioning it whole classified the entire home as writable, which
+    # made the documented operator-owned ``<home>/scripts/`` undeclarable and
+    # silently negated the per-folder calculation above. Only the external routes
+    # are real write surface; ``Config.folders`` already decides what inside home
+    # is writable, and it lists neither ``scripts`` nor ``prompts`` as rw.
+    external = [
+        candidate for candidate in _configured_file_write_roots()
+        if candidate.resolve() != root
+    ]
+    for extra in (*external, *_configured_repo_write_roots()):
+        try:
+            resolved_extra = Path(extra).resolve()
+        except OSError:
+            continue
+        if resolved_extra not in roots:
+            roots.append(resolved_extra)
+    return tuple(roots)
+
+
+def _agent_writable_root_for_path(
+    path: Path | str,
+    writable_roots: tuple[Path, ...],
+    *,
+    admin_operator_turn: bool,
+) -> Path | None:
+    """Return the root through which this turn may rewrite *path*, if any.
+
+    Only an untainted, trusted admin operator turn may make anything under
+    ``skills/`` writable. This is a file-tool boundary, not a filesystem
+    sandbox: admitted shell commands and subprocesses can still write there.
+    """
+    try:
+        candidate = Path(path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    matching: list[tuple[Path, Path]] = []
+    for raw_root in writable_roots:
+        try:
+            root = Path(raw_root).resolve()
+        except (OSError, RuntimeError):
+            continue
+        try:
+            matching.append((root, candidate.relative_to(root)))
+        except ValueError:
+            continue
+    if not matching:
+        return None
+    if any(root.name == "skills" for root, _relative in matching) and not admin_operator_turn:
+        return None
+    return max((root for root, _relative in matching), key=lambda root: len(root.parts))
+
+
+def _resolve_declared_executable(
+    path: Path, name: str, writable_roots: tuple[Path, ...], *, raw_path: str,
+) -> Path:
+    """Walk in kernel order and reject every agent-writable traversal component.
+
+    Exec re-walks the declared spelling, so even a directory later left via
+    ``..`` must be immutable. Never collapse ``..`` before following a link.
+    """
+    pending = list(path.parts[1:])
+    current = Path("/")
+    hops = 0
+    while pending:
+        component = pending.pop(0)
+        if component == "..":
+            current = current.parent
+            continue
+        link = current / component
+        # The resolved prefix contains no links; its directories were already
+        # checked below. Check each new link location or non-link component.
+        try:
+            mode = link.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                if hops >= 40:
+                    raise _declaration_error(name, "path has a symlink loop or exceeds 40 hops")
+                hops += 1
+                target = Path(os.readlink(link))
+                if target.is_absolute():
+                    current = Path("/")
+                    pending = list(target.parts[1:]) + pending
+                else:
+                    pending = list(target.parts) + pending
+                continue
+        except FileNotFoundError as exc:
+            raise _declaration_error(
+                name, f"path does not exist: {raw_path}",
+                environment_dependent=True,
+            ) from exc
+        except OSError as exc:
+            raise _declaration_error(
+                name, f"path cannot be resolved: {raw_path}",
+                environment_dependent=True,
+            ) from exc
+        writable_root = _agent_writable_root_for_path(
+            link, writable_roots, admin_operator_turn=False,
+        )
+        if writable_root is not None:
+            raise _declaration_error(
+                name, f"path component {link} is inside the agent-writable root {writable_root}",
+            )
+        if pending and not stat.S_ISDIR(mode):
+            raise _declaration_error(
+                name, f"path component is not a directory: {link}",
+                environment_dependent=True,
+            )
+        current = link
+    return current
+
+
+def parse_declared_shell_commands(
+    raw: object, *, writable_roots: tuple[Path, ...] = (),
+) -> tuple[DeclaredShellCommand, ...]:
+    """Validate declared shell grants, or raise ``ValueError``.
+
+    ``writable_roots`` are the directories the agent can write through its file
+    tools (``Config.writable_dirs``). A declared script must lie outside all of
+    them: the danger of an interpreter is *arbitrary* code, not code, so a script
+    the running agent cannot modify is equivalent to a binary the operator
+    installed. Executables retain their declared spelling for exec (including
+    virtualenv links); every traversed directory, link location, and final
+    target must be outside the agent-writable surface.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("shell_commands must be a list")
+    resolved_writable = tuple(Path(root).resolve() for root in writable_roots)
+    out: list[DeclaredShellCommand] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("each shell_commands entry must be a mapping")
+        name = entry.get("exec")
+        if not isinstance(name, str) or not name or "/" in name or name != Path(name).name:
+            raise ValueError(f"shell_commands exec must be a bare command name, got {name!r}")
+        unknown = set(entry) - {
+            "exec", "path", "subcommands", "options", "script", "pass_env",
+            "external_send", "payload_args",
+        }
+        if unknown:
+            raise _declaration_error(name, f"unknown keys {sorted(unknown)}")
+
+        external_send = entry.get("external_send", False)
+        payload_args = entry.get("payload_args", [])
+        if not isinstance(external_send, bool):
+            raise _declaration_error(name, "external_send must be a boolean")
+        if not isinstance(payload_args, list) or not all(
+            isinstance(option, str) and option.startswith("-") for option in payload_args
+        ):
+            raise _declaration_error(name, "payload_args must be a list of option names")
+        if external_send and not payload_args:
+            raise _declaration_error(
+                name, "external_send commands must declare payload_args",
+            )
+
+        pass_env = entry.get("pass_env", [])
+        if not isinstance(pass_env, list) or not all(
+            isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            for key in pass_env
+        ):
+            raise _declaration_error(name, "pass_env must be a list of exact environment variable names")
+        # Credentials must not undo executable/config isolation or gh identity.
+        if any(
+            key in {"PATH", "MIMIR_MODEL_SPEC", "BASH_ENV", "ENV"}
+            or key.startswith(("LD_", "DYLD_", "PYTHON", "GIT_", "GH_"))
+            for key in pass_env
+        ):
+            raise _declaration_error(name, "pass_env cannot override process-control environment")
+
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise _declaration_error(name, "path is required")
+        # Preserve parent components: their meaning depends on preceding links.
+        path = Path(raw_path)
+        if not path.is_absolute():
+            raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
+        resolved_path = _resolve_declared_executable(
+            path, name, resolved_writable, raw_path=raw_path,
+        )
+        if not resolved_path.exists():
+            raise _declaration_error(
+                name,
+                f"path does not exist: {raw_path}",
+                environment_dependent=True,
+            )
+        # The EXECUTABLE gets the same immutability rule as a script. Without
+        # this, declaring a CLI under an agent-writable location lets the agent
+        # replace the binary and run anything through an admitted command shape,
+        # which would make every other check here decorative.
+        if not resolved_path.is_file():
+            raise _declaration_error(
+                name,
+                f"path is not a regular file: {raw_path}",
+                environment_dependent=True,
+            )
+        if not os.access(resolved_path, os.X_OK):
+            raise _declaration_error(
+                name,
+                f"path is not executable: {raw_path}",
+                environment_dependent=True,
+            )
+        # Every traversal component and the final target were checked by
+        # _resolve_declared_executable; no lexical parent check is needed.
+
+        options_raw = entry.get("options") or []
+        if not isinstance(options_raw, list) or not all(isinstance(o, str) for o in options_raw):
+            raise _declaration_error(name, "options must be a list of strings")
+        for option in options_raw:
+            if not option.startswith("-"):
+                raise _declaration_error(name, f"option must start with '-': {option!r}")
+            if option in _CODE_FROM_ARGV_OPTIONS:
+                raise _declaration_error(
+                    name,
+                    f"{option!r} sources code from argv or stdin and is never admitted",
+                )
+
+        subcommands_raw = entry.get("subcommands") or []
+        if not isinstance(subcommands_raw, list):
+            raise _declaration_error(name, "subcommands must be a list of lists")
+        subcommands: list[tuple[str, ...]] = []
+        for item in subcommands_raw:
+            if not isinstance(item, list) or not item or not all(isinstance(s, str) for s in item):
+                raise _declaration_error(name, "each subcommand must be a non-empty list of strings")
+            subcommands.append(tuple(item))
+
+        raw_script = entry.get("script")
+        script: Path | None = None
+        # Check the label, declared argv[0] basename (multi-call dispatch),
+        # and resolved binary name. Any interpreter spelling requires a script.
+        is_interpreter = any(
+            candidate in _INTERPRETER_EXECUTABLES
+            or candidate.rstrip("0123456789.") in _INTERPRETER_EXECUTABLES
+            for candidate in (name, path.name, resolved_path.name)
+        )
+        if raw_script is not None:
+            if not isinstance(raw_script, str) or not raw_script:
+                raise _declaration_error(name, "script must be a non-empty string")
+            script = Path(raw_script)
+            if not script.is_absolute():
+                raise _declaration_error(name, f"script must be absolute, got {raw_script!r}")
+            resolved = script.resolve()
+            if not resolved.exists():
+                raise _declaration_error(name, f"script does not exist: {raw_script}")
+            writable_root = _agent_writable_root_for_path(
+                resolved, resolved_writable, admin_operator_turn=False,
+            )
+            if writable_root is not None:
+                raise _declaration_error(
+                    name,
+                    f"script {raw_script} is inside the agent-writable root {writable_root}; "
+                    "a script the agent can rewrite is arbitrary code execution",
+                )
+            script = resolved
+        if is_interpreter and script is None:
+            raise _declaration_error(
+                name, "an interpreter may only be declared with a pinned 'script'",
+            )
+        if script is None and not subcommands:
+            raise _declaration_error(
+                name, "declare at least one subcommand, or a script for an interpreter",
+            )
+        out.append(DeclaredShellCommand(
+            executable=name,
+            path=path,
+            subcommands=tuple(subcommands),
+            options=tuple(options_raw),
+            script=script,
+            pass_env=tuple(dict.fromkeys(pass_env)),
+            external_send=external_send,
+            payload_args=tuple(dict.fromkeys(payload_args)),
+            resolved_path=resolved_path,
+        ))
+    return tuple(out)
+
+
+def parse_operator_shell_commands(
+    raw: object, *, writable_roots: tuple[Path, ...] = (),
+) -> tuple[DeclaredShellCommand, ...]:
+    """Validate the chat-only, argv-only subset of shell declarations."""
+    if raw is not None and not isinstance(raw, list):
+        raise ValueError("operator_shell_commands must be a list")
+    for entry in raw or ():
+        if not isinstance(entry, dict):
+            raise ValueError("operator_shell_commands entries must be mappings")
+        raw_path = entry.get("path")
+        raw_exec = entry.get("exec")
+        if (isinstance(raw_exec, str) and Path(raw_exec).name.casefold() == "gh"
+                or isinstance(raw_path, str) and raw_path
+                and (Path(raw_path).name.casefold() == "gh"
+                     or Path(raw_path).resolve().name.casefold() == "gh")):
+            raise ValueError(
+                f"operator_shell_commands[{entry.get('exec')!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
+        for key in ("external_send", "payload_args", "script"):
+            if key in entry and (key != "external_send" or entry[key] is True):
+                raise ValueError(
+                    f"operator_shell_commands[{entry.get('exec')!r}]: {key} is not "
+                    "allowed in operator chat; declare read-only argv subcommands only"
+                )
+    try:
+        commands = parse_declared_shell_commands(raw, writable_roots=writable_roots)
+    except ValueError as exc:
+        raise DeclaredShellCommandError(f"operator_shell_commands: {exc}") from exc
+    for command in commands:
+        # Exec wrappers can invoke gh at any depth in a declared prefix.
+        if any(Path(token).name.casefold() == "gh"
+               for prefix in command.subcommands for token in prefix):
+            raise ValueError(
+                f"operator_shell_commands[{command.executable!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
+    return commands
+
+
+def _declared_command_execution_argv(
+    argv: list[str], declared: tuple[DeclaredShellCommand, ...],
+) -> list[str] | None:
+    """Return the pinned argv when *argv* matches a declaration, else ``None``."""
+    if not argv or not declared:
+        return None
+    for command in declared:
+        if argv[0] != command.executable:
+            continue
+        arguments = argv[1:]
+        if command.script is not None:
+            if not arguments or Path(arguments[0]).resolve() != command.script:
+                continue
+            arguments = arguments[1:]
+        elif not any(
+            tuple(arguments[:len(prefix)]) == prefix for prefix in command.subcommands
+        ):
+            continue
+        if not _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset(command.options),
+            option_prefixes=tuple(f"{o}=" for o in command.options if o.startswith("--")),
+        ):
+            continue
+        rest = argv[1:]
+        if command.script is not None:
+            rest = [str(command.script), *rest[1:]]
+        return [str(command.path), *rest]
+    return None
+
+
+def _unquoted_shell_control_characters(target: str) -> list[str]:
+    """Return the metacharacters appearing OUTSIDE quotes in *target*, sorted.
+
+    Quoting is what separates an operator from a value. ``grep -r '<<<<<<<'``
+    searches for a conflict marker; nothing redirects. Scanning the raw string
+    treated the two alike, so a turn whose job was finding merge conflicts in a
+    workspace it had just written could not search for conflict markers -- 60 of
+    190 service-shell refusals measured on muninn, 2026-08-03..06.
+
+    Unquoted metacharacters are still refused, so a real pipe, redirection or
+    command separator is rejected exactly as before. The admitted argv is exec'd
+    with ``shell=False``, so a quoted metacharacter reaches the process as one
+    literal argument and is never parsed by anything.
+    """
+    found: set[str] = set()
+    quote: str | None = None
+    escaped = False
+    for character in target:
+        # Checked FIRST, ahead of escape consumption: a backslash-newline
+        # continuation would otherwise be swallowed by the ``escaped`` branch and
+        # ``shlex.split`` would carry the newline into an argv element, which is
+        # exactly the inline multi-line value this rule exists to refuse.
+        if character in _REFUSED_INSIDE_ANY_QUOTE:
+            found.add(character)
+            escaped = False
+            continue
+        if escaped:
+            escaped = False
+            continue
+        # A backslash escapes the next character everywhere except inside single
+        # quotes, where POSIX shells pass it through literally.
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif quote == '"' and character in _EXPANDS_INSIDE_DOUBLE_QUOTES:
+                found.add(character)
+            continue
+        if character in ("'", '"'):
+            quote = character
+            continue
+        if character in _SHELL_CONTROL_CHARACTERS:
+            found.add(character)
+    return sorted(found)
+
+
+def _arguments_match_allowlist(
+    arguments: list[str],
+    *,
+    exact_options: frozenset[str],
+    option_prefixes: tuple[str, ...] = (),
+) -> bool:
+    """Reject every option not explicitly admitted by a command profile.
+
+    Operands remain available after ``--``. An option-looking operand before
+    that marker is rejected rather than guessed at; this keeps future binary
+    flags from silently widening a trusted service's authority.
+    """
+    options_ended = False
+    for argument in arguments:
+        if options_ended:
+            continue
+        if argument == "--":
+            options_ended = True
+            continue
+        if not argument.startswith("-") or argument == "-":
+            continue
+        if argument in exact_options or argument.startswith(option_prefixes):
+            continue
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class _ShellReadCommandSpec:
+    exact_options: frozenset[str]
+    option_prefixes: tuple[str, ...] = ()
+    value_options: frozenset[str] = frozenset()
+    positional_values_before_paths: int = 0
+    default_path: str | None = None
+    reads_content: bool = True
+
+
+_SHELL_READ_COMMAND_SPECS = {
+    "ls": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
+            "-ld", "-dl", "-lh", "-hl", "--all", "--almost-all", "--directory",
+            "--classify", "--human-readable",
+        }),
+        option_prefixes=("--color=",),
+        reads_content=False,
+    ),
+    "wc": _ShellReadCommandSpec(exact_options=frozenset({
+        "-c", "-l", "-L", "-m", "-w", "--bytes", "--chars",
+        "--lines", "--max-line-length", "--words",
+    })),
+    "grep": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-r", "-s",
+            "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
+            "--files-with-matches", "--ignore-case", "--line-number",
+            "--no-messages", "--quiet", "--recursive", "--invert-match",
+            "--with-filename", "--no-filename", "--word-regexp", "--line-regexp",
+        }),
+        option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
+        positional_values_before_paths=1,
+    ),
+    "jq": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-C", "-M", "-R", "-S", "-c", "-e", "-j", "-r", "-s",
+            "--ascii-output", "--compact-output", "--exit-status",
+            "--join-output", "--monochrome-output", "--null-input",
+            "--raw-input", "--raw-output", "--slurp", "--sort-keys",
+        }),
+        positional_values_before_paths=1,
+    ),
+    "rg": _ShellReadCommandSpec(
+        exact_options=frozenset({
+            "-F", "-H", "-L", "-S", "-g", "-h", "-i", "-l", "-n",
+            "-s", "-u", "-v", "-w", "--case-sensitive", "--files",
+            "--files-with-matches", "--fixed-strings", "--glob", "--hidden",
+            "--ignore-case", "--line-number", "--no-heading", "--no-ignore",
+            "--smart-case", "--type", "--type-not", "--word-regexp",
+        }),
+        option_prefixes=("--glob=", "--type=", "--type-not="),
+        value_options=frozenset({"-g", "--glob", "--type", "--type-not"}),
+        positional_values_before_paths=1,
+        default_path=".",
+    ),
+    "cat": _ShellReadCommandSpec(exact_options=frozenset({
+        "-n", "--number", "-s", "--squeeze-blank", "-E", "--show-ends",
+    })),
+    "head": _ShellReadCommandSpec(
+        exact_options=frozenset({"-q", "-v", "--quiet", "--verbose", "-n", "-c"}),
+        option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        value_options=frozenset({"-n", "-c"}),
+    ),
+    "tail": _ShellReadCommandSpec(
+        exact_options=frozenset({"-q", "-v", "--quiet", "--verbose", "-n", "-c"}),
+        option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        value_options=frozenset({"-n", "-c"}),
+    ),
+    "stat": _ShellReadCommandSpec(
+        exact_options=frozenset({"-t", "--terse", "-L", "--dereference", "-c"}),
+        option_prefixes=("-c", "--format=", "--printf="),
+        value_options=frozenset({"-c"}),
+        reads_content=False,
+    ),
+}
+_READ_ONLY_SHELL_READ_COMMANDS = frozenset({"ls", "wc", "grep", "jq", "rg"})
+
+
+@dataclass(frozen=True)
+class _ShellReadOperandSlots:
+    path_token_indexes: tuple[int, ...]
+    explicit_paths: tuple[str, ...]
+    effective_paths: tuple[str, ...]
+
+
+def _shell_read_operand_slots(argv: list[str]) -> _ShellReadOperandSlots | None:
+    if not argv:
+        return None
+    command = argv[0]
+    if command not in _SHELL_READ_COMMAND_SPECS:
+        if not Path(command).is_absolute() or not _operator_argv_has_current_pin(tuple(argv)):
+            return None
+        command = Path(command).name
+    spec = _SHELL_READ_COMMAND_SPECS.get(command)
+    if spec is None:
+        return None
+    argument_offset = 1
+    arguments = argv[1:]
+    if command == "rg":
+        if not arguments or arguments[0] != "--no-config":
+            return None
+        argument_offset += 1
+        arguments = arguments[1:]
+
+    positional: list[tuple[int, str]] = []
+    options_ended = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if not options_ended and argument == "--":
+            options_ended = True
+            index += 1
+            continue
+        if not options_ended and argument.startswith("-") and argument != "-":
+            if argument in spec.value_options:
+                if index + 1 >= len(arguments):
+                    return None
+                index += 2
+                continue
+            if argument in spec.exact_options or argument.startswith(spec.option_prefixes):
+                index += 1
+                continue
+            return None
+        positional.append((argument_offset + index, argument))
+        index += 1
+
+    skipped = 0 if command == "rg" and "--files" in arguments else spec.positional_values_before_paths
+    if len(positional) < skipped:
+        return None
+    paths = positional[skipped:]
+    effective_paths = tuple(value for _index, value in paths)
+    if (
+        command == "grep"
+        and not effective_paths
+        and any(option in arguments for option in ("-r", "--recursive"))
+    ):
+        effective_paths = (".",)
+    if not effective_paths and spec.default_path is not None:
+        effective_paths = (spec.default_path,)
+    if not effective_paths and command == "ls":
+        effective_paths = (".",)
+    return _ShellReadOperandSlots(
+        tuple(index for index, _value in paths),
+        tuple(value for _index, value in paths),
+        effective_paths,
+    )
+
+
+def _shell_read_path_operands(argv: list[str]) -> tuple[str, ...] | None:
+    """Validate one filesystem reader and return only its path operands."""
+    slots = _shell_read_operand_slots(argv)
+    return slots.explicit_paths if slots is not None else None
+
+
+def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
+    """Validate an argv against the scheduler/poller read-only profile."""
+    if _target_matches_chainlink_command(argv):
+        return True
+    # Do not accept ``/tmp/git`` merely because its basename is allow-listed.
+    # The login shell may resolve bare names through its operator-controlled PATH,
+    # but a model-supplied path must never select an arbitrary executable.
+    command = argv[0]
+    arguments = argv[1:]
+
+    if command == "pwd":
+        return set(arguments) <= {"-L", "-P"}
+    # jq filters are intentionally unconstrained. direct_exec_env() gives the
+    # child a minimal environment instead of trying to denylist its language.
+    # rg requires --no-config so ambient configuration cannot inject --pre.
+    if command in _READ_ONLY_SHELL_READ_COMMANDS:
+        return _shell_read_path_operands(argv) is not None
+    if command != "git" or not arguments:
+        return False
+
+    subcommand = arguments[0]
+    subcommand_arguments = arguments[1:]
+    if subcommand == "status":
+        return _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "-b", "-s", "--ahead-behind", "--branch", "--ignore-submodules",
+                "--long", "--no-ahead-behind", "--porcelain", "--short",
+                "--show-stash", "--untracked-files", "--verbose",
+            }),
+            option_prefixes=("--ignore-submodules=", "--porcelain=", "--untracked-files="),
+        )
+    if subcommand not in {"diff", "log", "show"}:
+        return False
+
+    # These commands can invoke repository-configured helpers unless both
+    # controls are explicit. Requiring them makes the argv safe independently
+    # of .gitconfig/.gitattributes in the inspected checkout.
+    required_safety_options = {"--no-ext-diff", "--no-textconv"}
+    option_arguments = (
+        subcommand_arguments[:subcommand_arguments.index("--")]
+        if "--" in subcommand_arguments
+        else subcommand_arguments
+    )
+    if not required_safety_options.issubset(option_arguments):
+        return False
+    return _arguments_match_allowlist(
+        subcommand_arguments,
+        exact_options=frozenset({
+            "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+            "--exit-code", "--full-index", "--name-only", "--name-status",
+            "--no-color", "--no-ext-diff", "--no-merges", "--no-patch",
+            "--no-textconv", "--oneline", "--quiet", "--raw", "--stat",
+            "--staged",
+        }),
+        option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
+    )
+
+
+def _git_arguments_without_restrictive_global_options(
+    arguments: list[str],
+) -> list[str]:
+    """Strip global Git options that can only make inspection more restrictive."""
+    while arguments[:1] and arguments[0] in {"--no-pager", "--no-ext-diff"}:
+        arguments = arguments[1:]
+    return arguments
+
+
+def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | None:
+    """Bind local-only inspection to an explicit server-owned review root."""
+    if (
+        not argv or argv[0] != "git"
+        or not _repo_review_action_allowed(state, _registered_review_action("inspect"))
+    ):
+        return None
+    root_text = getattr(state, "root", None)
+    if not isinstance(root_text, str) or not root_text or not Path(root_text).is_absolute():
+        return None
+    try:
+        root = Path(root_text).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    git_arguments = _git_arguments_without_restrictive_global_options(argv[1:])
+    if git_arguments[:1] == ["-C"]:
+        if len(git_arguments) < 3 or not Path(git_arguments[1]).is_absolute():
+            return None
+        try:
+            if Path(git_arguments[1]).resolve(strict=True) != root:
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
+        subcommand = git_arguments[2]
+        arguments = git_arguments[3:]
+    elif git_arguments:
+        subcommand = git_arguments[0]
+        arguments = git_arguments[1:]
+    else:
+        return None
+    arguments = list(arguments)
+    if subcommand == "status":
+        allowed = (
+            all(argument.startswith("-") and argument != "--" for argument in arguments)
+            and _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({
+                    "-b", "-s", "--ahead-behind", "--branch",
+                    "--ignore-submodules", "--long", "--no-ahead-behind",
+                    "--porcelain", "--short", "--show-stash",
+                    "--untracked-files",
+                }),
+                option_prefixes=(
+                    "--ignore-submodules=", "--porcelain=", "--untracked-files=",
+                ),
+            )
+        )
+    elif _repo_review_git_read_arguments(subcommand, arguments):
+        allowed = True
+    else:
+        return None
+    if not allowed:
+        return None
+
+    git = _maintenance_resolved_pin("git")
+    if git is None:
+        return None
+    filter_overrides = _maintenance_git_filter_overrides(root, str(git), effective_config=True)
+    if filter_overrides is None:
+        return None
+    safety_options: list[str] = []
+    if subcommand in {"diff", "log", "show"}:
+        safety_options = ["--no-ext-diff", "--no-textconv"]
+    elif subcommand in {"blame", "grep"}:
+        safety_options = ["--no-textconv"]
+    execution_argv = [
+        str(git), "-C", str(root),
+        *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", f"safe.directory={root}",
+        "-c", "credential.helper=",
+        *filter_overrides,
+        "--no-pager", "--no-optional-locks", subcommand, *safety_options, *arguments,
+    ]
+    return execution_argv
+
+
+_GH_REPOSITORY_OPTION_FORMS = (
+    ("--repo", "--repo="),
+    ("-R", "-R"),
+)
+_GH_REPOSITORY_EXACT_OPTIONS = frozenset(
+    option for option, _prefix in _GH_REPOSITORY_OPTION_FORMS
+)
+_GH_REPOSITORY_OPTION_PREFIXES = tuple(
+    prefix for _option, prefix in _GH_REPOSITORY_OPTION_FORMS
+)
+
+
+def _gh_repository_operand(
+    arguments: list[str],
+) -> tuple[str | None, list[str]] | None:
+    """Extract one gh repository selector in any admitted spelling.
+
+    The option names and attached-value prefixes come from the same table used
+    by the command allowlists. Returning the remaining arguments lets custom
+    syntax matchers consume repository options without maintaining an alias list.
+    """
+    repository: str | None = None
+    remaining: list[str] = []
+    index = 0
+    options_ended = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if options_ended:
+            remaining.append(argument)
+            index += 1
+            continue
+        if argument == "--":
+            options_ended = True
+            remaining.append(argument)
+            index += 1
+            continue
+
+        value: str | None = None
+        width = 1
+        for option, prefix in _GH_REPOSITORY_OPTION_FORMS:
+            if argument == option:
+                if index + 1 >= len(arguments):
+                    return None
+                value = arguments[index + 1]
+                width = 2
+                break
+            if argument.startswith(prefix) and argument != option:
+                value = argument[len(prefix):]
+                break
+        if value is None:
+            remaining.append(argument)
+            index += 1
+            continue
+        if (
+            not value
+            or value.startswith(("-", "="))
+            or repository is not None
+        ):
+            return None
+        repository = value
+        index += width
+    return repository, remaining
+
+
+def _gh_issue_view_arguments(arguments: list[str]) -> bool:
+    """Validate the shared session-boundary issue reader's argument shape."""
+    parsed = _gh_repository_operand(arguments)
+    if parsed is None:
+        return False
+    _repository, arguments = parsed
+    if not arguments or arguments[0].startswith("-"):
+        return False
+    index = 1
+    while index < len(arguments):
+        option = arguments[index]
+        if option == "--comments":
+            index += 1
+            continue
+        if option == "--json":
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("-"):
+                return False
+            index += 2
+            continue
+        return False
+    return True
+
+
+def _repo_review_git_read_arguments(subcommand: str, arguments: list[str]) -> bool:
+    # This allowlist is intentionally local-only. In particular, ls-remote is
+    # excluded even though it is read-only: it contacts a remote and would need
+    # a separate authenticated-network policy instead of INSPECT's disabled
+    # credential helper.
+    #
+    # Options such as grep's ``-c`` are parsed only after the subcommand has
+    # already been selected. They cannot become Git's top-level ``-c`` config
+    # injection form.
+    if subcommand == "log":
+        before_separator, separator, pathspecs = arguments, [], []
+        if "--" in arguments:
+            position = arguments.index("--")
+            before_separator = arguments[:position]
+            separator = ["--"]
+            pathspecs = arguments[position + 1:]
+        counts_removed = [
+            value for value in before_separator
+            if not (value.startswith("-") and value[1:].isdigit())
+        ]
+        return (
+            (not separator or bool(pathspecs))
+            and _arguments_match_allowlist(
+                counts_removed,
+                exact_options=frozenset({
+                    "--abbrev-commit", "--decorate", "--name-only", "--name-status",
+                    "--no-color", "--no-merges", "--no-patch", "--oneline", "--stat",
+                }),
+                option_prefixes=("--max-count=", "--since=", "--until="),
+            )
+        )
+    if subcommand in {"diff", "show"}:
+        if subcommand == "diff":
+            # Two file operands can implicitly enable --no-index, even inside
+            # a repository. Admit only one revision and no pathspec separator.
+            operands = [value for value in arguments if not value.startswith("-")]
+            if (
+                "--" in arguments
+                or len(operands) > 1
+                or any(not re.fullmatch(r"(?:HEAD(?:[~^][0-9]*)*|[0-9a-fA-F]{4,40})", value)
+                       for value in operands)
+            ):
+                return False
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                "--exit-code", "--full-index", "--name-only", "--name-status",
+                "--no-color", "--no-merges", "--no-patch", "--oneline",
+                "--quiet", "--raw", "--stat", "--staged",
+            }),
+            option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
+        )
+    if subcommand == "grep":
+        operands = [value for value in arguments if value != "--" and not value.startswith("-")]
+        return bool(operands) and _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-E", "-F", "-I", "-i", "-l", "-n", "-q", "-v", "-w",
+                "--cached", "--extended-regexp", "--files-with-matches",
+                "--fixed-strings", "--ignore-case", "--line-number", "--quiet",
+                "--untracked", "--invert-match", "--word-regexp",
+            }),
+            option_prefixes=("--max-count=",),
+        )
+    if subcommand == "blame":
+        before_separator = arguments
+        pathspecs: list[str] = []
+        if "--" in arguments:
+            position = arguments.index("--")
+            before_separator = arguments[:position]
+            pathspecs = arguments[position + 1:]
+            if len(pathspecs) != 1:
+                return False
+        if any(value == "-L" for value in before_separator):
+            return False
+        operands = [value for value in before_separator if not value.startswith("-")]
+        return (
+            (len(operands) in ({0, 1} if pathspecs else {1, 2}))
+            and _arguments_match_allowlist(
+                before_separator,
+                exact_options=frozenset({
+                    "-b", "-l", "-p", "-s", "-w", "--first-parent",
+                    "--line-porcelain", "--porcelain", "--root", "--show-stats",
+                }),
+                option_prefixes=("-L",),
+            )
+        )
+    if subcommand == "merge-base":
+        if arguments[:1] == ["--is-ancestor"]:
+            arguments = arguments[1:]
+        return len(arguments) == 2 and all(not value.startswith("-") for value in arguments)
+    if subcommand == "rev-list":
+        return (
+            len(arguments) == 2
+            and arguments[0] == "--count"
+            and not arguments[1].startswith("-")
+        )
+    if subcommand == "rev-parse":
+        return bool(arguments) and _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "--abbrev-ref", "--git-dir", "--is-inside-work-tree", "--short",
+                "--show-prefix", "--show-toplevel", "--verify",
+            }),
+            option_prefixes=("--short=",),
+        )
+    if subcommand == "remote":
+        return arguments == ["-v"]
+    if subcommand == "branch":
+        return bool(arguments) and arguments[0] == "--list" and all(
+            not value.startswith("-") for value in arguments[1:]
+        )
+    if subcommand == "worktree":
+        return arguments == ["list", "--porcelain"]
+    return False
+
+
+def _registered_review_action(name: str, auth_context: Any = None) -> Any:
+    selected = getattr(auth_context, "_plugin_slot_policy", None) or selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    return hooks.action_for(name) if hooks is not None else None
+
+
+def _repo_review_action_allowed(review_state: Any, action: Any) -> bool:
+    scope = getattr(review_state, "action_scope", None)
+    return (
+        scope is not None
+        and action is not None
+        and action.value in getattr(scope, "allowed_operations", frozenset())
+    )
+
+
+def _gh_repo_operands_are_configured(arguments: list[str]) -> bool:
+    """Require an explicit gh repository operand to name configured server state.
+
+    The syntax matchers accept ``--repo <value>`` without inspecting the value.
+    The maintenance and session-boundary profiles carry no PR scope, so an
+    unchecked operand would reach any repository the process token can see.
+    """
+    parsed = _gh_repository_operand(arguments)
+    return parsed is not None and (
+        parsed[0] is None or is_configured_github_repo(parsed[0])
+    )
+
+
+def _target_matches_session_boundary_shell_command(argv: list[str]) -> bool:
+    """Admit only tracker operations and the GitHub reads used at session close."""
+    if _target_matches_chainlink_command(argv):
+        return True
+    if argv[:3] == ["gh", "issue", "view"]:
+        return (
+            _gh_issue_view_arguments(argv[3:])
+            and _gh_repo_operands_are_configured(argv[3:])
+        )
+    if argv[:3] == ["gh", "pr", "view"]:
+        parsed_repository = _gh_repository_operand(argv[3:])
+        if parsed_repository is None:
+            return False
+        repository, arguments = parsed_repository
+        return (
+            _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({"--comments", "--json", "--template"}),
+            )
+            and repository is not None
+            and _gh_repo_operands_are_configured(argv[3:])
+        )
+    return False
+
+
+_MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
+    "git": Path("/usr/bin/git"),
+    "gh": Path("/usr/bin/gh"),
+    "npm": Path("/usr/lib/node_modules/npm/bin/npm-cli.js"),
+    "node": Path("/usr/bin/node"),
+    "uv": Path("/usr/local/bin/uv"),
+    "ls": Path("/usr/bin/ls"),
+    "grep": Path("/usr/bin/grep"),
+    "wc": Path("/usr/bin/wc"),
+    "pwd": Path("/usr/bin/pwd"),
+    "jq": Path("/usr/bin/jq"),
+    "rg": Path("/usr/bin/rg"),
+    "chainlink": Path("/usr/local/bin/chainlink"),
+    # Read-only inspection. Admitted because the shipped scheduled-tick prompts
+    # already reach for them and had no admitted equivalent: 59 of 190 service
+    # shell refusals measured on muninn over 2026-08-03..06 were these five.
+    "cat": Path("/usr/bin/cat"),
+    "head": Path("/usr/bin/head"),
+    "tail": Path("/usr/bin/tail"),
+    "stat": Path("/usr/bin/stat"),
+    "date": Path("/usr/bin/date"),
+}
+_MAINTENANCE_PINNED_EXECUTABLES = _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.copy()
+# Ubuntu 26.04 uutils installs these applets as links to its multi-call binary.
+# Only this exact binary location and these read-only applets may use that form.
+_MAINTENANCE_COREUTILS_APPLETS = frozenset({
+    "ls", "grep", "wc", "pwd", "cat", "head", "tail", "stat", "date",
+})
+_MAINTENANCE_COREUTILS_MULTICALL_TARGETS = frozenset({Path("/usr/bin/coreutils")})
+_MAINTENANCE_PINNED_SCRIPT_INTERPRETERS = {
+    "npm": "node",
+}
+_MAINTENANCE_GIT_BASE_OVERRIDES = (
+    "-c", "core.fsmonitor=",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "diff.external=",
+    "-c", "protocol.allow=never",
+)
+_MAINTENANCE_GIT_ENV_DENY_PREFIXES = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_OPTIONAL_LOCKS",
+    "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+)
+
+
+def _maintenance_git_probe_env() -> dict[str, str]:
+    """Return a deterministic environment for authorization-time Git probes."""
+    env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith(_MAINTENANCE_GIT_ENV_DENY_PREFIXES):
+            env.pop(key, None)
+    from .tools._shell_env import GIT_ENV_PINS
+
+    # The executed child receives the same pins (direct_exec_env), so the probe
+    # and execution resolve identical configuration sources.
+    env.update(GIT_ENV_PINS)
+    return env
+
+
+def _maintenance_git_filter_overrides(
+    root: Path, git_executable: str, *, effective_config: bool = False,
+    env: dict[str, str] | None = None,
+) -> list[str] | None:
+    """Return argv overrides that disable configured content filter drivers.
+
+    Git has no generic "disable all filters" switch. A checkout-controlled
+    ``.gitattributes`` file can select any filter driver whose command is defined
+    in repository config, and even a read-only ``diff`` can invoke its clean
+    side. Enumerate the effective command-bearing keys with the same hardened
+    binary/config/environment contract as execution, validate the NUL-delimited
+    names, then shadow each command with an empty command in the final argv.
+    Repo-review opts into effective config (including global and included files);
+    the default preserves the maintenance profile's local-only probe.
+    Callers with a minimal execution environment pass it for the probe too.
+
+    Repo-test snapshots are owned by the controller's ``mimir_uid`` while the
+    suite runs as ``worklink_uid``. Git otherwise rejects this local-config read
+    as dubious ownership. The profile has already bound and authorized ``root``,
+    so trust that exact directory rather than inheriting caller identity.
+    """
+    command = [
+        git_executable, "-C", str(root),
+        *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", f"safe.directory={root}",
+        "--no-pager", "config", *(["--includes"] if effective_config else ["--local"]),
+        "--null", "--name-only",
+        "--get-regexp", r"^filter\..*\.(clean|smudge|process)$",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env=_maintenance_git_probe_env() if env is None else env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode == 1 and not result.stdout:
+        return []
+    if result.returncode != 0:
+        return None
+
+    raw_names = result.stdout.split(b"\0")
+    if raw_names[-1:] == [b""]:
+        raw_names.pop()
+    overrides: list[str] = []
+    for raw_name in raw_names:
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if not re.fullmatch(r"filter\.[^.\x00]+\.(?:clean|smudge|process)", name):
+            return None
+        overrides.extend(("-c", f"{name}="))
+    return overrides
+
+
+def _maintenance_git_subcommand_allowed(arguments: list[str]) -> bool:
+    """Return whether arguments after Git's global options are admitted."""
+    if not arguments:
+        return False
+    subcommand = arguments[0]
+    subcommand_arguments = arguments[1:]
+    if subcommand == "status":
+        # ``--verbose``/``-v`` renders a diff and can execute a configured
+        # textconv/filter helper. Keep maintenance status to metadata-only
+        # forms; the hardened argv still disables fsmonitor and optional locks.
+        return (
+            "--" not in subcommand_arguments
+            and not any(argument.startswith("-v") for argument in subcommand_arguments)
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({
+                    "-b", "-s", "--ahead-behind", "--branch",
+                    "--ignore-submodules", "--long", "--no-ahead-behind",
+                    "--porcelain", "--short", "--show-stash",
+                    "--untracked-files",
+                }),
+                option_prefixes=(
+                    "--ignore-submodules=", "--porcelain=", "--untracked-files=",
+                ),
+            )
+        )
+    if subcommand == "log":
+        # ``-<digits>`` is Git's bounded max-count shorthand used by the
+        # maintenance prompts (for example ``git log --oneline -5``).
+        arguments_without_count_shorthand = [
+            argument
+            for argument in subcommand_arguments
+            if not (argument.startswith("-") and argument[1:].isdigit())
+        ]
+        return (
+            "--" not in subcommand_arguments
+            and _arguments_match_allowlist(
+                arguments_without_count_shorthand,
+                exact_options=frozenset({
+                    "-p", "--abbrev-commit", "--all", "--cached", "--check",
+                    "--decorate", "--exit-code", "--full-index", "--grep",
+                    "--name-only", "--name-status", "--no-color", "--no-ext-diff",
+                    "--no-merges", "--no-patch", "--no-textconv", "--oneline",
+                    "--quiet", "--raw", "--staged", "--stat",
+                }),
+                option_prefixes=(
+                    "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                    "--until=",
+                ),
+            )
+        )
+    if subcommand == "diff":
+        return "--" not in subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                "--exit-code", "--full-index", "--grep", "--name-only",
+                "--name-status", "--no-color", "--no-ext-diff", "--no-merges",
+                "--no-patch", "--no-textconv", "--oneline", "--quiet", "--raw",
+                "--staged", "--stat",
+            }),
+            option_prefixes=(
+                "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                "--until=",
+            ),
+        )
+    if subcommand == "show":
+        return "--" not in subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                "--exit-code", "--full-index", "--grep", "--name-only",
+                "--name-status", "--no-color", "--no-ext-diff", "--no-merges",
+                "--no-patch", "--no-textconv", "--oneline", "--quiet", "--raw",
+                "--staged", "--stat",
+            }),
+            option_prefixes=(
+                "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                "--until=",
+            ),
+        )
+    if subcommand == "rev-parse":
+        return bool(subcommand_arguments) and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    if subcommand == "branch":
+        listing_options = frozenset({
+            "-a", "-r", "--all", "--list", "--remotes", "--show-current",
+        })
+        return (
+            any(argument in listing_options for argument in subcommand_arguments)
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=listing_options,
+            )
+        )
+    if subcommand == "cat-file":
+        return (
+            len(subcommand_arguments) == 2
+            and subcommand_arguments[0] == "-s"
+            and not subcommand_arguments[1].startswith("-")
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({"-s"}),
+            )
+        )
+    if subcommand == "ls-tree":
+        return bool(subcommand_arguments) and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    if subcommand == "ls-files":
+        return not subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    return False
+
+
+def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
+    """Validate maintenance Git input and return its hardened execution argv.
+
+    Git's ostensibly read-only commands can execute helpers selected by checkout
+    configuration and attributes. Bind every invocation to a configured
+    file-tool root, neutralize fsmonitor/external-diff/filter configuration in
+    the returned execution artifact, and append explicit textconv/external-diff
+    disables to diff-producing subcommands.
+    """
+    if not argv or argv[0] != "git":
+        return None
+    pinned_git = _maintenance_pinned_execution_argv(["git"])
+    if pinned_git is None:
+        return None
+
+    arguments = _git_arguments_without_restrictive_global_options(argv[1:])
+    requested_root: str | None = None
+    if arguments[:1] == ["-C"]:
+        if len(arguments) < 3 or arguments[1].startswith("-"):
+            return None
+        requested_root = arguments[1]
+        arguments = arguments[2:]
+    arguments = _git_arguments_without_restrictive_global_options(arguments)
+
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    roots = _configured_maintenance_git_roots()
+    try:
+        root = resolve_within_roots(
+            roots,
+            requested_root if requested_root is not None else str(roots[0]),
+        )
+    except (IndexError, OSError, PathOutsideHomeError, RuntimeError):
+        return None
+
+    if not _maintenance_git_subcommand_allowed(arguments):
+        return None
+    subcommand = arguments[0]
+    subcommand_arguments = arguments[1:]
+
+    filter_overrides = _maintenance_git_filter_overrides(root, pinned_git[0])
+    if filter_overrides is None:
+        return None
+    execution_argv = [
+        pinned_git[0], "-C", str(root),
+        *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", f"safe.directory={root}",
+        "-c", "credential.helper=",
+        *filter_overrides, "--no-pager", "--no-optional-locks",
+        subcommand, *subcommand_arguments,
+    ]
+    if subcommand in {"diff", "log", "show"}:
+        execution_argv.extend(("--no-ext-diff", "--no-textconv"))
+    return execution_argv
+
+
+def _upgrade_workspace_git_execution_argv(argv: list[str]) -> list[str] | None:
+    """Harden read-only Git after binding ``-C`` to ``scratch/proposals``."""
+    if not argv or argv[0] != "git":
+        return None
+    arguments = _git_arguments_without_restrictive_global_options(argv[1:])
+    if arguments[:1] != ["-C"] or len(arguments) < 3:
+        return None
+    requested_root = arguments[1]
+    remaining = arguments[2:]
+    if remaining[:1] == ["--no-pager"]:
+        remaining = remaining[1:]
+
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    proposal_root = _upgrade_proposals_root()
+    if proposal_root is None:
+        return None
+    try:
+        resolve_within_roots([proposal_root], requested_root)
+    except (OSError, PathOutsideHomeError, RuntimeError):
+        return None
+    return _maintenance_git_execution_argv(
+        ["git", "-C", requested_root, *remaining]
+    )
+
+
+def _maintenance_pin_is_service_writable(expected: Path) -> bool:
+    """Return whether a configured service-writable root contains *expected*."""
+    try:
+        resolved = expected.resolve(strict=True)
+        return any(
+            resolved == root or resolved.is_relative_to(root)
+            for root in _static_service_write_roots()
+        )
+    except (OSError, RuntimeError):
+        return True
+
+
+def _maintenance_trusted_multicall_link(command: str, expected: Path, resolved: Path) -> bool:
+    """Allow only a root-controlled applet link to the known uutils binary.
+
+    Reject intermediate links (including in the target path) and writable
+    directories: exec uses the *real target*, not a second traversal through
+    the applet link. Thus neither the link nor its target can be redirected by
+    the service between authorization and execution. Root is the trust anchor.
+    """
+    if (
+        command not in _MAINTENANCE_COREUTILS_APPLETS
+        or expected.name != command
+        or resolved not in _MAINTENANCE_COREUTILS_MULTICALL_TARGETS
+        or not expected.is_absolute()
+    ):
+        return False
+    link_target = Path(os.readlink(expected))
+    if (expected.parent / link_target if not link_target.is_absolute() else link_target) != resolved:
+        return False
+    roots = _static_service_write_roots()
+    for path, terminal_link in ((expected, True), (resolved, False)):
+        component = Path("/")
+        for part in ("", *path.parts[1:]):
+            if part:
+                component /= part
+            metadata = component.lstat()
+            if any(component == root or component.is_relative_to(root) for root in roots):
+                return False
+            if metadata.st_uid != 0:
+                return False
+            if component == path:
+                if terminal_link:
+                    if not stat.S_ISLNK(metadata.st_mode):
+                        return False
+                elif (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or not os.access(component, os.X_OK)
+                ):
+                    return False
+            elif (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                return False
+    return True
+
+
+def _maintenance_resolved_pin(command: str) -> Path | None:
+    """Validate one pin as a trusted executable outside service-writable roots."""
+    expected = _MAINTENANCE_PINNED_EXECUTABLES.get(command)
+    if expected is None:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="shell_exec",
+            boundary="maintenance_pinned_executable",
+            reason="maintenance_executable_pin_missing",
+            target=command,
+        )
+        return None
+    try:
+        resolved = expected.resolve(strict=True)
+        if resolved != expected and not _maintenance_trusted_multicall_link(
+            command, expected, resolved,
+        ):
+            raise OSError("expected a non-symlink executable or trusted coreutils applet link")
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise OSError("expected an executable regular file")
+        if _maintenance_pin_is_service_writable(resolved):
+            raise OSError("pin resolves within a configured service-writable root")
+    except (OSError, RuntimeError) as exc:
+        log.error(
+            "maintenance_pinned_executable_missing command=%s expected=%s error=%s",
+            command, expected, exc,
+        )
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="shell_exec",
+            boundary="maintenance_pinned_executable",
+            reason="maintenance_executable_pin_invalid",
+            target=str(expected),
+        )
+        return None
+    return resolved
+
+
+def _maintenance_pinned_execution_argv_with_reason(
+    argv: list[str],
+) -> tuple[list[str] | None, str]:
+    """Replace an admitted service command with a trusted absolute program.
+
+    Service commands execute with ``shell=False``, but a bare ``argv[0]``
+    would still be selected through PATH. Bind every admitted executable to a
+    fixed regular file outside every configured service-writable root. A trusted
+    uutils applet link executes the validated real binary with the applet name
+    as its first argument; the symlink is never followed again at exec time.
+    Script pins also name their pinned interpreter explicitly, so their shebang cannot
+    reintroduce PATH resolution below the authorized argv.
+
+    Returns the pinned argv and ``""``, or ``None`` and why pinning refused.
+    ``_maintenance_pinned_execution_argv`` is the argv-only view of this.
+    """
+    if not argv:
+        return None, "the command is empty."
+    command = argv[0]
+    expected = _maintenance_resolved_pin(command)
+    if expected is None:
+        return None, (
+            f"the executable {command!r} has no trusted pinned path for service "
+            "execution. A pin must resolve to a regular file (or a trusted "
+            "coreutils applet link) outside every service-writable root, so the "
+            "program cannot be swapped between authorization and execution."
+        )
+    interpreter_command = _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS.get(command)
+    if interpreter_command is not None:
+        interpreter = _maintenance_resolved_pin(interpreter_command)
+        if interpreter is None:
+            return None, (
+                f"the pinned interpreter {interpreter_command!r} required to run "
+                f"the script {command!r} could not be resolved to a trusted path."
+            )
+        return [str(interpreter), str(expected), *argv[1:]], ""
+    if expected != _MAINTENANCE_PINNED_EXECUTABLES[command]:
+        return [str(expected), command, *argv[1:]], ""
+    return [str(expected), *argv[1:]], ""
+
+
+def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
+    """Argv-only view of :func:`_maintenance_pinned_execution_argv_with_reason`."""
+    return _maintenance_pinned_execution_argv_with_reason(argv)[0]
+
+
+def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
+    """Validate read/inspection commands used by scheduled maintenance."""
+    if _target_matches_read_only_shell_command(argv):
+        return True
+    if not argv:
+        return False
+
+    if argv[0] == "git":
+        return _maintenance_git_execution_argv(argv) is not None
+
+    # File inspection. This widens which commands may READ, not what is
+    # readable: ``grep`` and ``rg`` are already admitted and reach the same
+    # bytes. Per-command option allowlists, so nothing here can mutate --
+    # note ``date`` admits no ``-s``/``--set``, which would set the clock.
+    if argv[0] in _SHELL_READ_COMMAND_SPECS:
+        return _shell_read_path_operands(argv) is not None
+    if argv[0] == "date":
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({
+                "-u", "--utc", "-R", "--rfc-email", "-I", "--iso-8601",
+            }),
+            option_prefixes=("-d", "--date=", "--iso-8601=", "--rfc-3339="),
+        )
+
+    if argv[0] == "gh" and len(argv) >= 3 and argv[1] in {"pr", "issue"}:
+        resource = argv[1]
+        subcommand = argv[2]
+        options = {
+            ("pr", "list"): frozenset({
+                "--app", "--assignee", "--author", "--base", "--draft", "--head",
+                "--json", "--label", "--limit", "--search",
+                "--state", "--template",
+            }),
+            ("pr", "view"): frozenset({
+                "--comments", "--json", "--template",
+            }),
+            ("issue", "list"): frozenset({
+                "--app", "--assignee", "--author", "--json", "--label",
+                "--limit", "--mention", "--milestone", "--search",
+                "--state", "--template",
+            }),
+            ("issue", "view"): frozenset({
+                "--comments", "--json", "--template",
+            }),
+        }.get((resource, subcommand))
+        return options is not None and _arguments_match_allowlist(
+            argv[3:], exact_options=options | _GH_REPOSITORY_EXACT_OPTIONS,
+            option_prefixes=_GH_REPOSITORY_OPTION_PREFIXES,
+        ) and _gh_repo_operands_are_configured(argv[3:])
+
+    return False
+
+
+# Appended to refusals a rewrite cannot fix, so the caller is told what shape
+# to use instead of retrying the same one. The three named substitutions are the
+# ones observed in production: ``cd X && cmd``, an inline multi-line ``--body``,
+# and a heredoc.
+_SHELL_PROFILE_SINGLE_ARGV_HINT = (
+    "A trusted-service profile execs one argv directly with shell=False, so "
+    "shell syntax is never admitted and no quoting will change that. Issue one "
+    "command per call; select the working directory with the command's own "
+    "option (for example 'git -C <dir>') rather than 'cd <dir> && ...'. "
+    "Use typed PR tools for review bodies rather than shell body files, inline "
+    "multi-line values, or heredocs."
+)
+
+
+_PROJECT_TEST_CONFIG_ENV = "MIMIR_PROJECT_TEST_COMMAND"
+_PROJECT_TEST_MAX_SELECTORS = 32
+_PROJECT_TEST_MAX_SELECTOR_LENGTH = 256
+_PROJECT_TEST_MAX_SELECTOR_BYTES = 4096
+_PROJECT_TEST_MAX_COMMAND_ARGS = 16
+_PROJECT_TEST_MAX_COMMAND_ARG_LENGTH = 512
+_PROJECT_TEST_SELECTOR_PATTERN = re.compile(r"[A-Za-z0-9._/,:+=-]+", re.ASCII)
+_PROJECT_TEST_INTERPRETER_PATTERN = re.compile(
+    r"(?:python(?:\d+(?:\.\d+)*)?|pypy\d*|node|ruby|perl|php|lua|luajit|"
+    r"[bdkz]?sh|fish|rscript|java|env)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _ProjectTestCommand:
+    argv: tuple[str, ...]
+    cwd: Path
+
+
+def _configured_project_test_command() -> tuple[_ProjectTestCommand | None, str]:
+    """Load the operator-owned fixed test argv and project root from process config."""
+    raw = os.environ.get(_PROJECT_TEST_CONFIG_ENV, "").strip()
+    if not raw:
+        return None, "project_test_not_configured"
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "project_test_config_invalid_json"
+    if not isinstance(value, dict) or set(value) != {"argv", "cwd"}:
+        return None, "project_test_config_invalid_shape"
+    argv = value.get("argv")
+    cwd_text = value.get("cwd")
+    if (
+        not isinstance(argv, list)
+        or not 1 <= len(argv) <= _PROJECT_TEST_MAX_COMMAND_ARGS
+        or any(
+            not isinstance(argument, str)
+            or not argument
+            or len(argument) > _PROJECT_TEST_MAX_COMMAND_ARG_LENGTH
+            or "\x00" in argument
+            or "\n" in argument
+            or "\r" in argument
+            for argument in argv
+        )
+        or not isinstance(cwd_text, str)
+        or not cwd_text
+    ):
+        return None, "project_test_config_invalid_shape"
+    executable = Path(argv[0])
+    if not executable.is_absolute():
+        return None, "project_test_config_executable_not_absolute"
+    if any(
+        _PROJECT_TEST_INTERPRETER_PATTERN.fullmatch(Path(argument).name)
+        for argument in argv
+    ):
+        return None, "project_test_config_interpreter_refused"
+    try:
+        resolved_executable = executable.resolve(strict=True)
+        cwd = Path(cwd_text).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "project_test_config_path_unavailable"
+    if (
+        resolved_executable != executable
+        or not resolved_executable.is_file()
+        or not os.access(resolved_executable, os.X_OK)
+        or _maintenance_pin_is_service_writable(resolved_executable)
+    ):
+        return None, "project_test_config_executable_untrusted"
+    if not cwd.is_dir():
+        return None, "project_test_config_path_unavailable"
+    try:
+        roots = tuple(root.resolve(strict=True) for root in _configured_repo_roots())
+    except (OSError, RuntimeError):
+        return None, "project_test_config_root_unauthorized"
+    if not any(cwd == root or cwd.is_relative_to(root) for root in roots):
+        return None, "project_test_config_root_unauthorized"
+    return _ProjectTestCommand((str(resolved_executable), *argv[1:]), cwd), ""
+
+
+def _project_test_execution_argv(
+    argv: list[str],
+) -> tuple[list[str] | None, str | None, bool]:
+    """Return a configured test argv, refusal name, and whether its prefix matched."""
+    configured, config_reason = _configured_project_test_command()
+    if configured is None:
+        return None, config_reason, False
+    prefix = list(configured.argv)
+    requested_prefix = [str(Path(argv[0]).resolve(strict=False)), *argv[1:len(prefix)]]
+    if len(argv) < len(prefix) or requested_prefix != prefix:
+        return None, None, False
+    selectors = argv[len(prefix):]
+    if len(selectors) > _PROJECT_TEST_MAX_SELECTORS:
+        return None, "project_test_selector_count_exceeded", True
+    if sum(len(selector.encode("utf-8")) for selector in selectors) > _PROJECT_TEST_MAX_SELECTOR_BYTES:
+        return None, "project_test_selectors_too_large", True
+    for selector in selectors:
+        if len(selector) > _PROJECT_TEST_MAX_SELECTOR_LENGTH:
+            return None, "project_test_selector_too_long", True
+        path_text = selector.split("::", 1)[0]
+        if ".." in Path(path_text).parts:
+            return None, "project_test_selector_traversal", True
+        if (
+            not selector.isascii()
+            or not _PROJECT_TEST_SELECTOR_PATTERN.fullmatch(selector)
+            or selector.startswith(("-", "/", "@"))
+            or selector in {".", ".."}
+            or (selector.startswith(".") and not selector.startswith("./"))
+        ):
+            return None, "project_test_selector_invalid", True
+    return [*prefix, *selectors], "", True
+
+
+def configured_project_test_cwd(argv: list[str]) -> str | None:
+    """Return the operator-selected cwd only for an admitted configured test argv."""
+    execution_argv, _reason, matched = _project_test_execution_argv(argv)
+    if not matched or execution_argv is None:
+        return None
+    configured, _reason = _configured_project_test_command()
+    return str(configured.cwd) if configured is not None else None
+
+
+# Display-only vocabulary for refusal messages. A token is echoed back to the
+# caller ONLY if it is literally a member of one of these sets; anything else
+# becomes a placeholder. That makes "no argument value is ever disclosed" a
+# property of construction rather than of a pattern.
+#
+# Pattern matching cannot do this job. An attached short-option value
+# (``-HAuthorization:Bearer-...``) has the same shape as a legitimate long
+# option, and a secret can be bare alphanumerics or a plain-looking path
+# (``private/path/...``), indistinguishable from a subcommand or an API resource.
+#
+# Absence from these sets can only make a message *less specific* — it can never
+# change an authorization decision, admit a command, or deny one. That asymmetry
+# is what makes a hand-maintained display list safe: its worst failure is a
+# vaguer sentence. The executables are derived from the pin map so they cannot
+# drift from the commands that can actually run.
+_SERVICE_SHELL_DISPLAY_COMMANDS = frozenset(_MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS)
+_SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
+    "add", "api", "branch", "checkout", "checks", "close", "comment", "commit",
+    "block", "blocked", "close-all", "create", "delete", "describe", "diff",
+    "fetch", "init", "issue", "label", "list", "lock", "locks", "log",
+    "ls-files", "merge-base", "mv", "pr", "pull", "push", "quick", "ready", "relate",
+    "remote", "reopen", "reset", "rev-list", "rev-parse", "review", "rm", "run", "search", "session", "show",
+    "stash", "status", "subissue", "sync", "test", "unblock", "unlabel", "unrelate",
+    "update", "view",
+})
+_SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
+    "-C", "-a", "-c", "-h", "-l", "-m", "-n", "-p", "-q",
+    "--all", "--app", "--approve", "--assignee", "--author", "--base", "--body",
+    "--body-file", "--branch", "--comment", "--comments", "--draft", "--head",
+    "--description", "--help", "--json", "--jq", "--kind", "--label", "--limit",
+    "--mention", "--milestone", "--no-changelog", "--no-pager", "--oneline",
+    "--priority", "--quiet", "--repo", "--request-changes",
+    "--search", "--short", "--state", "--status", "--template",
+})
+_SERVICE_SHELL_UPGRADE_GIT_WRITES = frozenset({
+    "add", "commit", "stash", "reset", "checkout", "rm", "mv", "push",
+})
+
+_SERVICE_SHELL_LOG_MAX_ARGUMENTS = 32
+_SERVICE_SHELL_LOG_MAX_ARGUMENT_LENGTH = 256
+_SERVICE_SHELL_SECRET_OPTIONS = frozenset({
+    "--api-key", "--apikey", "--auth", "--authorization", "--client-secret",
+    "--credential", "--header", "--password", "--secret", "--token", "-c",
+    "-H", "-t",
+})
+
+
+class ServiceShellBindingRule(StrEnum):
+    """Stable aggregation keys for trusted-service shell binding refusals."""
+
+    SHELL_CONTROL_CHARACTERS = "shell_control_characters"
+    ARGV_UNBALANCED_QUOTING = "argv_unbalanced_quoting"
+    ARGV_EMPTY = "argv_empty"
+    SHELL_HOME_EXPANSION = "shell_home_expansion"
+    PROJECT_TEST_POLICY = "project_test_policy"
+    PROFILE_ALLOWLIST = "profile_allowlist"
+    EXECUTABLE_PIN = "executable_pin"
+    REPOSITORY_REVIEW_STATE = "repository_review_state"
+    UNKNOWN_PROFILE = "unknown_profile"
+    DECLARED_COMMAND_MISMATCH = "declared_command_mismatch"
+    READ_OPERAND_POLICY = "read_operand_policy"
+    OPERATOR_PROJECT_TEST_EXCLUDED = "operator_project_test_excluded"
+    OPERATOR_READER_EXCLUDED = "operator_reader_excluded"
+    OPERATOR_READ_OPERAND_POLICY = "operator_read_operand_policy"
+    OPERATOR_CWD_POLICY = "operator_cwd_policy"
+    OPERATOR_GIT_HARDENING = "operator_git_hardening"
+    OPERATOR_BINDING_MISMATCH = "operator_binding_mismatch"
+    OPERATOR_LIVE_TAINT = "operator_live_taint"
+
+
+_OPERATOR_SHELL_BINDING_ISSUER = object()
+_OPERATOR_SHELL_ARGV_ISSUER = object()
+
+
+@dataclass(frozen=True)
+class _OperatorShellArgvArtifact:
+    argv: tuple[str, ...]
+    family: str
+    resolved_cwd: str
+    _issuer: Any = field(repr=False, compare=False)
+    declaration: DeclaredShellCommand | None = None
+
+
+@dataclass(frozen=True)
+class OperatorShellBinding:
+    profile: str
+    tool_name: str
+    tool_call_id: str
+    command: str
+    requested_cwd: str | None
+    resolved_cwd: str | None
+    argv: tuple[str, ...]
+    chainlink_mutation: bool
+    _request_identity: Any = field(repr=False, compare=False)
+    _auth_context_identity: Any = field(repr=False, compare=False)
+    _issuer: Any = field(repr=False, compare=False)
+    declaration: DeclaredShellCommand | None = None
+
+
+def _operator_argv_has_current_pin(argv: tuple[str, ...]) -> bool:
+    if not argv:
+        return False
+    executable = Path(argv[0])
+    expected = _MAINTENANCE_PINNED_EXECUTABLES.get(executable.name)
+    if expected is None:
+        return False
+    try:
+        return (
+            executable.is_absolute()
+            and executable.resolve(strict=True) == executable
+            and expected.resolve(strict=True) == executable
+            and executable.is_file()
+            and os.access(executable, os.X_OK)
+            and not _maintenance_pin_is_service_writable(executable)
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _operator_declared_pin_matches(
+    argv: tuple[str, ...], declaration: DeclaredShellCommand,
+) -> bool:
+    try:
+        return (
+            bool(argv) and argv[0] == str(declaration.path)
+            and declaration.script is None and not declaration.external_send
+            and not declaration.payload_args
+            and declaration.resolved_path is not None
+            and declaration.path.resolve(strict=True) == declaration.resolved_path
+            and declaration.path.is_file() and os.access(declaration.path, os.X_OK)
+            and _agent_writable_root_for_path(
+                declaration.path, agent_writable_roots(), admin_operator_turn=False,
+            ) is None
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _issue_operator_shell_binding(
+    *,
+    request_identity: Any,
+    auth_context_identity: Any,
+    tool_call_id: str,
+    command: str,
+    requested_cwd: str | None,
+    resolved_cwd: str | None,
+    argv_artifact: _OperatorShellArgvArtifact,
+    tool_name: str = "shell_exec",
+    profile: str = OPERATOR_SHELL_PROFILE,
+) -> OperatorShellBinding | None:
+    if (
+        profile != OPERATOR_SHELL_PROFILE
+        or tool_name != "shell_exec"
+        or not isinstance(tool_call_id, str)
+        or not tool_call_id
+        or not isinstance(command, str)
+        or not command
+        or "\x00" in command
+        or requested_cwd is not None and not isinstance(requested_cwd, str)
+        or not isinstance(resolved_cwd, str)
+        or not resolved_cwd
+        or request_identity is None
+        or auth_context_identity is None
+        or not isinstance(argv_artifact, _OperatorShellArgvArtifact)
+        or argv_artifact._issuer is not _OPERATOR_SHELL_ARGV_ISSUER
+        or argv_artifact.resolved_cwd != resolved_cwd
+        or not (
+            _operator_declared_pin_matches(argv_artifact.argv, argv_artifact.declaration)
+            if argv_artifact.declaration is not None
+            else _operator_argv_has_current_pin(argv_artifact.argv)
+        )
+        or not _operator_final_argv_matches_family(argv_artifact)
+    ):
+        return None
+    if requested_cwd is not None and (
+        not requested_cwd
+        or "\x00" in requested_cwd
+        or not Path(requested_cwd).is_absolute()
+        or ".." in Path(requested_cwd).parts
+    ):
+        return None
+    cwd = (
+        _resolve_operator_declared_cwd() if argv_artifact.declaration is not None
+        else _resolve_operator_bounded_cwd(requested_cwd, git=argv_artifact.family == "git")
+    )
+    if cwd is None or str(cwd) != resolved_cwd:
+        return None
+    classifier_argv = list(argv_artifact.argv)
+    if Path(classifier_argv[0]).name == "chainlink":
+        classifier_argv[0] = "chainlink"
+    return OperatorShellBinding(
+        profile=profile,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        command=command,
+        requested_cwd=requested_cwd,
+        resolved_cwd=resolved_cwd,
+        argv=argv_artifact.argv,
+        chainlink_mutation=_chainlink_command_is_mutation(classifier_argv),
+        _request_identity=request_identity,
+        _auth_context_identity=auth_context_identity,
+        _issuer=_OPERATOR_SHELL_BINDING_ISSUER,
+        declaration=argv_artifact.declaration,
+    )
+
+
+def _operator_shell_binding_matches(
+    binding: OperatorShellBinding | None,
+    *,
+    request_identity: Any,
+    auth_context_identity: Any,
+    tool_name: str,
+    tool_call_id: str | None,
+    command: str | None,
+    requested_cwd: object,
+    final_argv: Iterable[str] | None = None,
+) -> bool:
+    if (
+        not isinstance(binding, OperatorShellBinding)
+        or binding._issuer is not _OPERATOR_SHELL_BINDING_ISSUER
+        or binding.profile != OPERATOR_SHELL_PROFILE
+        or binding.tool_name != "shell_exec"
+        or tool_name != "shell_exec"
+        or request_identity is None
+        or binding._request_identity is not request_identity
+        or auth_context_identity is None
+        or binding._auth_context_identity is not auth_context_identity
+        or not isinstance(tool_call_id, str)
+        or not tool_call_id
+        or binding.tool_call_id != tool_call_id
+        or not isinstance(command, str)
+        or not command
+        or "\x00" in command
+        or binding.command != command
+        or requested_cwd != binding.requested_cwd
+        or not isinstance(binding.resolved_cwd, str)
+        or not binding.resolved_cwd
+        or not binding.argv
+        or not (
+            _operator_declared_pin_matches(binding.argv, binding.declaration)
+            if binding.declaration is not None
+            else _operator_argv_has_current_pin(binding.argv)
+        )
+    ):
+        return False
+    if requested_cwd is not None and (
+        not isinstance(requested_cwd, str)
+        or not requested_cwd
+        or "\x00" in requested_cwd
+        or not Path(requested_cwd).is_absolute()
+        or ".." in Path(requested_cwd).parts
+    ):
+        return False
+    if final_argv is not None:
+        try:
+            if tuple(final_argv) != binding.argv:
+                return False
+        except TypeError:
+            return False
+    artifact = _OperatorShellArgvArtifact(
+        binding.argv,
+        Path(binding.argv[0]).name,
+        binding.resolved_cwd,
+        _OPERATOR_SHELL_ARGV_ISSUER,
+        binding.declaration,
+    )
+    if not _operator_final_argv_matches_family(artifact):
+        return False
+    resolved = (
+        _resolve_operator_declared_cwd() if binding.declaration is not None
+        else _resolve_operator_bounded_cwd(binding.requested_cwd, git=artifact.family == "git")
+    )
+    return resolved is not None and str(resolved) == binding.resolved_cwd
+
+
+_OPERATOR_READ_REFUSAL = "operator shell reader confinement failed"
+_OPERATOR_READER_EXCLUDED_REFUSAL = "operator shell reader is not eligible for binding"
+_OPERATOR_GIT_REFUSAL = "operator shell Git hardening failed"
+_OPERATOR_GIT_EXCLUDED_REFUSAL = "operator shell Git form is not eligible for binding"
+
+
+def _resolve_operator_bounded_cwd(raw_cwd: object, *, git: bool) -> Path | None:
+    if raw_cwd is None:
+        candidate = Path.cwd()
+    elif (
+        not isinstance(raw_cwd, str)
+        or not raw_cwd
+        or "\x00" in raw_cwd
+        or not Path(raw_cwd).is_absolute()
+        or ".." in Path(raw_cwd).parts
+    ):
+        return None
+    else:
+        candidate = Path(raw_cwd)
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_dir():
+            return None
+        if git:
+            roots = tuple(root.resolve(strict=True) for root in _configured_maintenance_git_roots())
+            if not any(resolved == root or resolved.is_relative_to(root) for root in roots):
+                return None
+            return resolved
+        from .read_policy import resolve_non_admin_read_target
+
+        admitted = resolve_non_admin_read_target(
+            str(candidate), allow_home_root=True,
+        )
+        return resolved if admitted == resolved else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _operator_read_target(
+    raw: str, *, resolved_cwd: Path, scan_file: bool,
+) -> Path | None:
+    candidate = Path(raw)
+    if "\x00" in raw or ".." in candidate.parts:
+        return None
+    if not candidate.is_absolute():
+        candidate = resolved_cwd / candidate
+    from .read_policy import resolve_non_admin_read_target
+
+    return resolve_non_admin_read_target(
+        str(candidate), scan_file=scan_file, allow_home_root=not scan_file,
+    )
+
+
+def _resolve_operator_declared_cwd() -> Path | None:
+    """Use an operator-owned working directory, never the model's cwd."""
+    home_raw = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_raw:
+        return None
+    try:
+        home = Path(home_raw).resolve(strict=True)
+        return home if home.is_dir() else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def _operator_recursive_read_preflight(
+    roots: tuple[Path, ...], *, include_hidden: bool,
+) -> bool:
+    entry_count = 0
+    content_bytes = 0
+    for root in roots:
+        if root.is_dir():
+            continue
+        try:
+            content_bytes += root.stat().st_size
+        except OSError:
+            return False
+        if (
+            content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT
+            or _operator_read_target(
+                str(root), resolved_cwd=root.parent, scan_file=True,
+            ) is None
+        ):
+            return False
+    pending = [root for root in roots if root.is_dir()]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not include_hidden and entry.name.startswith("."):
+                        continue
+                    entry_count += 1
+                    if entry_count > _SHELL_RECURSIVE_READ_ENTRY_LIMIT:
+                        return False
+                    child = Path(entry.path)
+                    admitted = _operator_read_target(
+                        str(child), resolved_cwd=directory, scan_file=False,
+                    )
+                    if admitted is None:
+                        return False
+                    try:
+                        is_symlink = entry.is_symlink()
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        return False
+                    if is_symlink:
+                        continue
+                    if is_directory:
+                        pending.append(admitted)
+                        continue
+                    try:
+                        content_bytes += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        return False
+                    if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
+                        return False
+                    if _operator_read_target(
+                        str(child), resolved_cwd=directory, scan_file=True,
+                    ) is None:
+                        return False
+        except OSError:
+            return False
+    return True
+
+
+_OPERATOR_BINDABLE_READ_COMMANDS = frozenset({"ls", "wc", "grep", "rg"})
+
+
+def _operator_read_execution_argv_with_diagnostics(
+    argv: list[str], *, resolved_cwd: str | Path,
+) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+    if not argv:
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    command = Path(argv[0]).name
+    if not _operator_argv_has_current_pin(tuple(argv)):
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.EXECUTABLE_PIN
+    if command == "jq" or command == "rg" and "-L" in argv[1:]:
+        return (
+            None,
+            _OPERATOR_READER_EXCLUDED_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_READER_EXCLUDED,
+        )
+    slots = _shell_read_operand_slots(argv)
+    if command not in _OPERATOR_BINDABLE_READ_COMMANDS or slots is None:
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+    try:
+        cwd = Path(resolved_cwd).resolve(strict=True)
+        if not cwd.is_dir():
+            raise OSError
+    except (OSError, RuntimeError, ValueError):
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    recursive = command == "rg" or any(value in argv[1:] for value in ("-r", "--recursive"))
+    reads_content = command not in {"ls"} and not (
+        command == "rg" and "--files" in argv[1:]
+    )
+    canonical: list[Path] = []
+    for raw in slots.effective_paths:
+        target = _operator_read_target(
+            raw,
+            resolved_cwd=cwd,
+            scan_file=reads_content and not recursive,
+        )
+        if target is None:
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        if target.is_dir() and reads_content and not recursive:
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        if target.is_file() and not recursive and _operator_read_target(
+            str(target), resolved_cwd=cwd, scan_file=True,
+        ) is None:
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+        canonical.append(target)
+
+    # A content reader with no operand reads inherited stdin, not a bound path.
+    # ``effective_paths`` empty means the argv executes verbatim, so ``wc`` or a
+    # non-recursive ``grep`` consumes whatever stdin the agent process holds: an
+    # unbound input surface after active ingest, and a hang until the shell
+    # timeout when nothing is piped. The server issues these argvs, and a
+    # server-issued read always names what it reads. ``ls`` and ``rg --files``
+    # are unaffected -- they do not read content, and their operand defaults to
+    # the resolved cwd below.
+    if reads_content and not canonical:
+        return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    if recursive:
+        include_hidden = command != "rg" or (
+            "--hidden" in argv[1:]
+            or argv[1:].count("-u") >= 2
+            or any(
+                value in {"-g", "--glob"} or value.startswith("--glob=")
+                for value in argv[1:]
+            )
+        )
+        if not _operator_recursive_read_preflight(
+            tuple(canonical), include_hidden=include_hidden,
+        ):
+            return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
+
+    execution = list(argv)
+    if slots.path_token_indexes:
+        for index, target in zip(slots.path_token_indexes, canonical):
+            execution[index] = str(target)
+    elif command in {"ls", "rg"} or command == "grep" and recursive:
+        execution.append(str(canonical[0]))
+    return execution, "", None
+
+
+def _operator_git_execution_argv_with_diagnostics(
+    argv: list[str], *, resolved_cwd: str | Path,
+) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+    if (
+        not argv
+        or Path(argv[0]).name != "git"
+        or len(argv) < 2
+        or not _operator_argv_has_current_pin(tuple(argv))
+    ):
+        return None, _OPERATOR_GIT_REFUSAL, ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+    subcommand = argv[1]
+    arguments = argv[2:]
+    if (
+        subcommand == "status"
+        and any(value == "--verbose" or value.startswith("-v") for value in arguments)
+        or subcommand in {"diff", "log", "show"} and "--" in arguments
+    ):
+        return (
+            None,
+            _OPERATOR_GIT_EXCLUDED_REFUSAL,
+            ServiceShellBindingRule.OPERATOR_GIT_HARDENING,
+        )
+    hardened = _maintenance_git_execution_argv(
+        ["git", "-C", str(resolved_cwd), *argv[1:]],
+    )
+    if hardened is None or subcommand not in {"status", "diff", "log", "show"}:
+        return None, _OPERATOR_GIT_REFUSAL, ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+    return hardened, "", None
+
+
+def _validated_operator_shell_argv_artifact(
+    parsed_argv: list[str],
+    final_argv: list[str],
+    *,
+    resolved_cwd: str | Path,
+    declaration: DeclaredShellCommand | None = None,
+) -> _OperatorShellArgvArtifact | None:
+    if (
+        not parsed_argv
+        or not final_argv
+        or not (
+            _operator_declared_pin_matches(tuple(parsed_argv), declaration)
+            if declaration is not None else _operator_argv_has_current_pin(tuple(parsed_argv))
+        )
+        or not (
+            _operator_declared_pin_matches(tuple(final_argv), declaration)
+            if declaration is not None else _operator_argv_has_current_pin(tuple(final_argv))
+        )
+    ):
+        return None
+    try:
+        cwd = Path(resolved_cwd).resolve(strict=True)
+        if not cwd.is_dir() or str(cwd) != str(resolved_cwd):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    family = Path(parsed_argv[0]).name
+    expected: list[str] | None
+    if declaration is not None:
+        expected = _declared_command_execution_argv(
+            [declaration.executable, *parsed_argv[1:]], (declaration,),
+        )
+    elif family in _OPERATOR_BINDABLE_READ_COMMANDS:
+        expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=cwd,
+        )
+    elif family == "git":
+        expected, _reason, _rule = _operator_git_execution_argv_with_diagnostics(
+            parsed_argv, resolved_cwd=cwd,
+        )
+    elif family == "pwd":
+        bare = ["pwd", *parsed_argv[1:]]
+        expected = parsed_argv if _target_matches_read_only_shell_command(bare) else None
+    elif family == "chainlink":
+        bare = ["chainlink", *parsed_argv[1:]]
+        expected = parsed_argv if _target_matches_chainlink_command(bare) else None
+    else:
+        return None
+    if expected is None or expected != final_argv:
+        return None
+    return _OperatorShellArgvArtifact(
+        tuple(final_argv), family, str(cwd), _OPERATOR_SHELL_ARGV_ISSUER,
+        declaration,
+    )
+
+
+def _operator_final_argv_matches_family(
+    artifact: _OperatorShellArgvArtifact,
+) -> bool:
+    argv = list(artifact.argv)
+    family = artifact.family
+    if not argv or Path(argv[0]).name != family:
+        return False
+    if artifact.declaration is not None:
+        declaration = artifact.declaration
+        return (
+            _operator_declared_pin_matches(tuple(argv), declaration)
+            and _declared_command_execution_argv(
+                [declaration.executable, *argv[1:]], (declaration,),
+            ) == argv
+        )
+    if family in _OPERATOR_BINDABLE_READ_COMMANDS:
+        expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
+            argv, resolved_cwd=artifact.resolved_cwd,
+        )
+        return expected == argv
+    if family == "pwd":
+        return _target_matches_read_only_shell_command(["pwd", *argv[1:]])
+    if family == "chainlink":
+        return _target_matches_chainlink_command(["chainlink", *argv[1:]])
+    if family != "git":
+        return False
+    try:
+        marker = argv.index("--no-optional-locks")
+    except ValueError:
+        return False
+    if marker + 1 >= len(argv) or argv[1:3] != ["-C", artifact.resolved_cwd]:
+        return False
+    arguments = argv[marker + 1:]
+    if arguments[0] in {"diff", "log", "show"}:
+        if arguments[-2:] != ["--no-ext-diff", "--no-textconv"]:
+            return False
+        arguments = arguments[:-2]
+    expected = _maintenance_git_execution_argv(
+        ["git", "-C", artifact.resolved_cwd, *arguments],
+    )
+    return expected == argv
+
+
+def service_shell_argv_for_log(target: str) -> tuple[list[str], bool]:
+    """Return a bounded argv with credential-bearing argument values redacted.
+
+    Redaction covers shared token shapes plus values supplied to credential/header
+    options. Truncation is represented both in the argv and by the returned flag.
+    """
+    from .redaction import redact_text
+
+    try:
+        raw_argv = shlex.split(target)
+    except ValueError:
+        raw_argv = ["<unparseable argv>"]
+
+    redacted: list[str] = []
+    redact_next = False
+    truncated = len(raw_argv) > _SERVICE_SHELL_LOG_MAX_ARGUMENTS
+    for argument in raw_argv[:_SERVICE_SHELL_LOG_MAX_ARGUMENTS]:
+        if redact_next:
+            rendered = "[REDACTED]"
+            redact_next = False
+        else:
+            option, separator, _value = argument.partition("=")
+            if separator and option in _SERVICE_SHELL_SECRET_OPTIONS:
+                rendered = f"{option}=[REDACTED]"
+            elif argument.startswith("-H") and argument != "-H":
+                rendered = "-H[REDACTED]"
+            elif argument.startswith("-t") and argument != "-t":
+                rendered = "-t[REDACTED]"
+            else:
+                rendered = redact_text(argument)
+            redact_next = argument in _SERVICE_SHELL_SECRET_OPTIONS
+        if len(rendered) > _SERVICE_SHELL_LOG_MAX_ARGUMENT_LENGTH:
+            rendered = rendered[:_SERVICE_SHELL_LOG_MAX_ARGUMENT_LENGTH] + "[TRUNCATED]"
+            truncated = True
+        redacted.append(rendered)
+    if len(raw_argv) > _SERVICE_SHELL_LOG_MAX_ARGUMENTS:
+        redacted.append("[TRUNCATED]")
+    return redacted, truncated
+
+
+def _service_shell_git_subcommand(argv: list[str]) -> str | None:
+    """Find a display-safe Git subcommand past global options and their values."""
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token in {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                     "--super-prefix", "--config-env", "--exec-path"}:
+            if index + 1 >= len(argv):
+                return None
+            index += 2
+        elif (token.startswith(("-C", "-c")) and len(token) > 2
+              or token.startswith(("--git-dir=", "--work-tree=", "--namespace=",
+                                   "--super-prefix=", "--config-env=", "--exec-path="))
+              or token in {"--no-pager", "--paginate", "--no-ext-diff",
+                           "--no-replace-objects", "--literal-pathspecs"}):
+            index += 1
+        elif token.startswith("-"):
+            # An unknown option may consume the next token; do not mistake its
+            # value for a subcommand or disclose it in the refusal.
+            return None
+        else:
+            return token if token in _SERVICE_SHELL_DISPLAY_SUBCOMMANDS else "<value>"
+    return None
+
+
+def _service_shell_command_shape(argv: list[str], destination: str) -> str:
+    """Name the refused command surface without echoing any argument value.
+
+    For maintenance and upgrade Git, skip recognized global options and their
+    values before naming the subcommand. Other commands display the executable
+    plus up to two following non-option tokens through the display vocabulary;
+    resource paths and any other values render as ``<value>``.
+    """
+    if destination in {"maintenance", "upgrade_workspace"} and argv[0] == "git":
+        subcommand = _service_shell_git_subcommand(argv)
+        return f"git {subcommand}" if subcommand is not None else "git"
+    shape = [
+        argv[0] if argv[0] in _SERVICE_SHELL_DISPLAY_COMMANDS else "<command>"
+    ]
+    for token in argv[1:]:
+        if token.startswith("-"):
+            break
+        shape.append(
+            token if token in _SERVICE_SHELL_DISPLAY_SUBCOMMANDS else "<value>"
+        )
+        if len(shape) >= 3:
+            break
+    return " ".join(shape)
+
+
+def _service_shell_coding_enabled() -> bool:
+    """Whether the selected owner registered its scoped policy."""
+    from .plugins.registry import selected_first_party_available
+
+    return (selected_policy_registry().policy_consumer_hooks is not None
+            or selected_first_party_available())
+
+
+def _service_shell_typed_tool_guidance(
+    argv: list[str], destination: str,
+) -> str:
+    """Name bounded tools for observed commands that must stay outside the shell."""
+    # Provenance: poller:github-activity refusals recorded in events.jsonl after
+    # argv logging landed were `npm run` (repository script), `python -c ...`
+    # (arbitrary Python), and `python - <<PY ...` (attachment/HTML parsing).
+    # All remain correctly refused: the first must use repo_test when available;
+    # the latter two have no general bounded typed equivalent. `npm ci` and
+    # `npm install` are inferred dependency-install shapes and remain refused
+    # because this profile exposes no typed dependency-install capability.
+    if not argv:
+        return ""
+    executable = Path(argv[0]).name
+    operation = argv[1:2]
+    if destination == "upgrade_workspace":
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+            return (
+                " Python execution is arbitrary code execution and remains denied. "
+                "Use read_file, glob, or grep for bounded inspection beneath the "
+                "proposal workspace; do not retry with python -c or a script."
+            )
+        if executable in {"cat", "grep", "rg", "ls"}:
+            return (
+                " Use the typed read_file, grep, glob, or ls tool for bounded "
+                "inspection beneath the proposal workspace."
+            )
+    if destination in {"maintenance", "upgrade_workspace"} and executable == "git":
+        if (destination == "upgrade_workspace"
+                and _service_shell_git_subcommand(argv) in _SERVICE_SHELL_UPGRADE_GIT_WRITES):
+            return (
+                " Only read-only Git inspection is admitted here: "
+                "`git -C <dir> status`, `git -C <dir> diff`, `git -C <dir> log`, "
+                "`git -C <dir> show`, and `git -C <dir> branch`. "
+                "After editing the proposal worktree, use "
+                "`submit_proposal(..., lane='upgrade')` to stage changes under "
+                "memory/core/ and prompts/, commit, push, and open the proposal PR."
+            )
+        arguments = argv[1:]
+        if destination == "upgrade_workspace":
+            arguments = _git_arguments_without_restrictive_global_options(arguments)
+        if arguments[:1] != ["-C"] and _maintenance_git_subcommand_allowed(arguments):
+            example = {
+                "branch": "git -C <dir> branch --show-current",
+                "diff": "git -C <dir> diff --stat",
+                "log": "git -C <dir> log --oneline",
+                "show": "git -C <dir> show --stat",
+                "status": "git -C <dir> status --short",
+            }[arguments[0]]
+            return (
+                " This Git command is otherwise an admitted inspection shape, but "
+                "the repository must be named in argv with -C; the process working "
+                f"directory is not an authorized target. Use `{example}`."
+            )
+    if destination == "maintenance" and executable == "mimir" and argv[1:3] == [
+        "wiki", "backlinks",
+    ]:
+        return (
+            " `mimir wiki backlinks` remains denied in this shell profile. Wiki "
+            "backlinks are regenerated by the bounded post-turn hook after wiki "
+            "content changes; inspect its generated files with read_file instead "
+            "of retrying this command through shell_exec."
+        )
+    if destination not in {"repo_review", "maintenance"}:
+        return ""
+    if destination == "repo_review" and executable == "npm" and operation in (["run"], ["test"]):
+        if _service_shell_coding_enabled():
+            return (
+                " Repository scripts must run through the typed repo_test tool, "
+                "with suite='frontend' for the configured frontend suite (or frontend "
+                "file selectors for inference), which runs in a contained bound PR "
+                "checkout; shell_exec does not admit npm run or npm test."
+            )
+        return (
+            " Repository scripts remain denied, and this deployment does not expose "
+            "repo_test. Use whatever bounded verification capability the deployment "
+            "provides, and state plainly when the tests could not be run."
+        )
+    if destination == "repo_review" and executable == "npm" and operation in (["ci"], ["install"]):
+        return (
+            " npm dependency installation remains denied and has no typed equivalent "
+            "in this profile; do not retry it through shell_exec."
+        )
+    if (
+        len(argv) >= 2
+        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable)
+        and argv[1] in {"-c", "-"}
+    ):
+        mode = "python -c" if argv[1] == "-c" else "Python stdin/heredoc"
+        guidance = (
+            f" Inline {mode} is arbitrary code execution and remains denied. There "
+            "is no general typed equivalent for arbitrary Python or attachment/HTML "
+            "parsing in this profile. Use read_file or grep only when bounded text "
+            "inspection suffices; otherwise report that the workload cannot be "
+            "performed rather than retrying it through shell_exec."
+        )
+        if destination == "repo_review" and _service_shell_coding_enabled():
+            guidance += " For repository tests only, use the typed repo_test tool."
+        return guidance
+    return ""
+
+
+def _service_shell_not_admitted_reason(
+    argv: list[str], destination: str, *, service: "ServicePrincipal | None" = None,
+) -> str:
+    """Explain that a well-formed command is outside the profile's allowlist."""
+    guidance = ""
+    if service is not None:
+        alternatives = sorted(
+            name for name in service.capabilities
+            if name.startswith(("pr_", "repo_"))
+            or name in {"issue_comment", "read_file", "glob", "grep", "ls"}
+        )
+        guidance = (
+            f" Available typed tools: {', '.join(alternatives)}."
+            if alternatives else ""
+        )
+        guidance += (
+            " If a typed operation is unavailable, use unsupported_operation to report "
+            "the limitation; do not retry through shell or HTTP commands."
+            if "unsupported_operation" in service.capabilities else
+            " If a typed operation is unavailable, report the limitation; "
+            "do not retry through shell or HTTP commands."
+        )
+    if destination == "repo_review":
+        # Name a range operand precisely; keep the review allowlist unchanged.
+        if len(argv) >= 3 and Path(argv[0]).name == "git" and argv[1] == "diff":
+            revision_range = next((token for token in argv[2:]
+                                   if ".." in token and not token.startswith("-")), None)
+            if revision_range is not None:
+                return (
+                    f"revision range {revision_range[:255]} is not bound to this lease; "
+                    "use repo_diff"
+                )
+        return (
+            "The repo_review shell profile admits only hardened local read-only Git "
+            "inspection bound to a server-owned PR state with inspect permission. "
+            "All gh commands, Git mutations and network operations, generic commands, "
+            "and shell test/install commands are refused, including declared-command "
+            "and project-test overrides."
+            + (
+                guidance if service is not None else
+                " Use typed pr_* tools for GitHub reads and "
+                "reviews, issue_comment for issue comments, and typed repo_* tools for "
+                "checkout, fetch, tests, and mutations. Use read_file, glob, grep, or ls "
+                "for bounded filesystem inspection. If a typed operation is unavailable, "
+                "report the limitation; do not retry through shell or HTTP commands."
+                + _service_shell_typed_tool_guidance(argv, destination)
+            )
+        )
+    supplied = [token for token in argv[1:] if token.startswith("-")]
+    named = sorted({
+        token for token in supplied if token in _SERVICE_SHELL_DISPLAY_OPTIONS
+    })
+    # One placeholder stands in for every option that is not a known spelling,
+    # including any that carries its value attached to it.
+    if len(named) != len(set(supplied)):
+        named.append("<option>")
+    option_text = f" Options sent: {', '.join(named)}." if named else ""
+    if argv and argv[0] in _CHAINLINK_EXECUTABLES:
+        operation = argv[1:3]
+        if argv[1:2] == ["locks"]:
+            boundary = (
+                " Lock lifecycle commands are reserved to Worklink because a shell-issued "
+                "claim, steal, or release can orphan an in-flight build; use the coordinated "
+                "Worklink path instead."
+            )
+        elif argv[1:2] == ["init"] or operation in (["issue", "delete"], ["issue", "close-all"]):
+            boundary = (
+                " Tracker initialization, deletion, and bulk close are deliberately denied; "
+                "they can shadow the tracker or cause irreversible or bulk work loss."
+            )
+        else:
+            boundary = ""
+        admitted = (
+            " Admitted Chainlink queries are issue show/list/search/ready/blocked/"
+            "related/cascade/next/tree and session status; "
+            "admitted mutations are issue create/update/comment/label/unlabel/block/unblock/"
+            "relate/unrelate/close/reopen/subissue/quick, using only each command's "
+            "documented bounded options (-q/--quiet and --json included)."
+            " To inspect the CLI's JSON contract, use chainlink issue show <id> --json"
+            " or chainlink issue list --json."
+        )
+    else:
+        boundary = admitted = ""
+    if service is None or (
+        destination == "upgrade_workspace" and argv and argv[0] == "git"
+        and _service_shell_git_subcommand(argv) in _SERVICE_SHELL_UPGRADE_GIT_WRITES
+    ):
+        guidance += _service_shell_typed_tool_guidance(argv, destination)
+    return (
+        f"the {destination!r} trusted-service shell profile does not admit "
+        f"{_service_shell_command_shape(argv, destination)!r}.{option_text} This profile "
+        "admits a fixed set of commands, subcommands and options; anything "
+        "outside it is refused for this principal regardless of how it is "
+        f"written.{boundary}{admitted}{guidance}"
+    )
+
+
+_SHELL_RECURSIVE_READ_ENTRY_LIMIT = 256
+_SHELL_RECURSIVE_READ_BYTE_LIMIT = 8 * 1024 * 1024
+
+
+def _service_shell_read_operand_refusal(
+    service: "ServicePrincipal",
+    argv: list[str],
+    *,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
+    review_state: Any = None,
+) -> str | None:
+    """Apply the typed-read boundary, returning a bounded refusal reason."""
+    operands = _shell_read_path_operands(argv)
+    if operands is None:
+        return None
+    spec = _SHELL_READ_COMMAND_SPECS[argv[0]]
+    base = Path(read_cwd) if read_cwd is not None else None
+    if base is None and review_state is not None:
+        review_root = getattr(review_state, "root", None)
+        if isinstance(review_root, str) and review_root:
+            base = Path(review_root)
+    if base is None:
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        base = Path(home) if home else None
+
+    recursive = argv[0] == "rg" or (
+        argv[0] == "grep" and any(value in argv[1:] for value in ("-r", "--recursive"))
+    )
+    reads_content = spec.reads_content and not (
+        argv[0] == "rg" and "--files" in argv[1:]
+    )
+    include_hidden = argv[0] != "rg" or (
+        "--hidden" in argv[1:]
+        or argv[1:].count("-u") >= 2
+        or any(
+            value in {"-g", "--glob"} or value.startswith("--glob=")
+            for value in argv[1:]
+        )
+    )
+    if argv[0] == "rg" and "-L" in argv[1:]:
+        return "ripgrep symlink following cannot be bounded by the admission walk"
+
+    entry_count = 0
+    content_bytes = 0
+    for raw in operands:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            if base is None:
+                return "a relative filesystem operand has no authoritative execution cwd"
+            candidate = base / candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return "a filesystem operand could not be resolved"
+        tool_name = "ls" if resolved.is_dir() else "read_file" if reads_content else "ls"
+        if not _trigger_service_read_target_is_allowed(
+            service, tool_name, {"path": str(candidate)}, auth_context=auth_context,
+            shell_roots=True,
+        ):
+            return "a filesystem operand is outside the read roots or withheld"
+        if not resolved.is_dir():
+            continue
+        if not recursive:
+            # Content readers do not accept directory operands unless their
+            # admitted recursive mode can be checked entry by entry.
+            if reads_content:
+                return "a content reader needs recursive mode for a directory operand"
+            continue
+
+        # A content reader can print an entire matching line, and options such as
+        # grep -h remove source-path provenance from the result. The result layer
+        # therefore cannot reliably apply the path/content veto after execution.
+        # Preflight only the entries the command may read, but cap that speculative
+        # work by both entry count and candidate content bytes so admission never
+        # scans an unbounded tree or a few enormous files. os.scandir is used
+        # directly because os.walk materializes every child of one directory before
+        # yielding, which would make even an entry cap scale with a wide directory.
+        pending = [resolved]
+        while pending:
+            directory_path = pending.pop()
+            try:
+                with os.scandir(directory_path) as entries:
+                    for entry in entries:
+                        if not include_hidden and entry.name.startswith("."):
+                            continue
+                        entry_count += 1
+                        if entry_count > _SHELL_RECURSIVE_READ_ENTRY_LIMIT:
+                            return (
+                                "recursive read preflight exceeded the "
+                                f"{_SHELL_RECURSIVE_READ_ENTRY_LIMIT}-entry limit at "
+                                f"{directory_path}; narrow the operand or use a typed search tool"
+                            )
+                        child = Path(entry.path)
+                        try:
+                            child_is_directory = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            return f"recursive read preflight could not inspect {child}"
+                        if reads_content and not child_is_directory:
+                            try:
+                                content_bytes += entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                return f"recursive read preflight could not inspect {child}"
+                            if content_bytes > _SHELL_RECURSIVE_READ_BYTE_LIMIT:
+                                return (
+                                    "recursive read preflight exceeded the "
+                                    f"{_SHELL_RECURSIVE_READ_BYTE_LIMIT}-byte content limit at "
+                                    f"{child}; narrow the operand or use a typed search tool"
+                                )
+                        child_tool = "ls" if child_is_directory or not reads_content else "read_file"
+                        if not _trigger_service_read_target_is_allowed(
+                            service,
+                            child_tool,
+                            {"path": str(child)},
+                            auth_context=auth_context,
+                            shell_roots=True,
+                        ):
+                            return f"recursive read preflight withheld {child}"
+                        if child_is_directory:
+                            pending.append(child)
+            except OSError:
+                return f"recursive read preflight could not inspect directory {directory_path}"
+
+        # This is deliberately a point-in-time hardening check, not a claim that
+        # the tree is immutable. Root confinement is re-derived from each resolved
+        # path; a later entry can race the walk, but it cannot widen the principal's
+        # declared roots. A provenance-preserving execution/result filter would be
+        # needed to close that residual race without refusing recursive readers.
+    return None
+
+
+def parse_service_shell_argv_with_diagnostics(
+    target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
+) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+    """Return the admitted argv, refusal reason, and stable rejecting rule.
+
+    The returned argv is both the authorization artifact and the execution
+    artifact. Callers must exec it directly with ``shell=False``; handing the
+    original string to a shell would reintroduce an expansion layer the profile
+    did not validate.
+
+    On refusal the second element says why. It is produced at the same branch
+    that refuses, so an explanation can never disagree with the decision it
+    describes — which is why this is one function with three outputs rather than a
+    separate explainer that could drift out of step with the rule.
+
+    Reasons are deliberately *structural*: metacharacters, the executable, the
+    subcommand and option NAMES. They never quote option values, because a
+    service command can carry a credential (``git -c http.extraheader=...``) and
+    this text is returned to the model and recorded in the turn transcript.
+    """
+    found = _unquoted_shell_control_characters(target)
+    if found:
+        rendered = ", ".join(repr(character) for character in found)
+        try:
+            refused_argv = shlex.split(target)
+        except ValueError:
+            refused_argv = []
+        guidance = _service_shell_typed_tool_guidance(refused_argv, destination)
+        if destination == "repo_review" and refused_argv[:2] == ["git", "show"] and ">" in found:
+            from .plugins.core import selected_policy_registry
+
+            if "repo_restore_file" in selected_policy_registry().tools:
+                guidance += " Use repo_restore_file for byte-exact historical files in the scoped checkout."
+        return None, (
+            f"the command contains shell metacharacters ({rendered}), which the "
+            f"{destination!r} trusted-service shell profile never admits. "
+            + _SHELL_PROFILE_SINGLE_ARGV_HINT
+            + guidance
+        ), ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS
+    try:
+        argv = shlex.split(target)
+    except ValueError:
+        return None, (
+            "the command could not be split into an argv because its quoting is "
+            "unbalanced. Close every quote, or pass the value through a file "
+            "option instead of inline."
+        ), ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING
+    if not argv:
+        return None, "the command is empty.", ServiceShellBindingRule.ARGV_EMPTY
+    # A leading tilde is shell home expansion; an embedded tilde such as
+    # ``HEAD~1`` is a normal Git revision expression and is passed literally.
+    if any(argument.startswith("~") for argument in argv):
+        return None, (
+            "an argument begins with '~', which requires the shell home "
+            "expansion this profile does not perform. Use an absolute path."
+        ), ServiceShellBindingRule.SHELL_HOME_EXPANSION
+
+    if argv[0] == "/usr/local/bin/chainlink":
+        argv[0] = "chainlink"
+
+    # Production cutover: no generic grant may bypass the typed repo/PR tools.
+    # Return on both admission and refusal before project tests or declarations.
+    if destination == "repo_review":
+        git_argv = _repo_review_git_execution_argv(argv, review_state)
+        if git_argv is not None:
+            return git_argv, "", None
+        return (
+            None,
+            _service_shell_not_admitted_reason(argv, destination, service=service),
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        )
+
+    if allow_project_test:
+        test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
+        if test_matched:
+            if test_argv is None:
+                return (
+                    None,
+                    f"configured project test refused: {test_reason}",
+                    ServiceShellBindingRule.PROJECT_TEST_POLICY,
+                )
+            return test_argv, "", None
+
+    # Other profiles retain additive per-job grants before their dispatch.
+    # repo_review is deliberately closed above, regardless of declarations.
+    declared_argv = _declared_command_execution_argv(argv, declared)
+    if declared_argv is not None:
+        return declared_argv, "", None
+
+    if service is not None and _shell_read_path_operands(argv) is not None:
+        read_refusal = _service_shell_read_operand_refusal(
+            service, argv, auth_context=auth_context,
+            read_cwd=read_cwd, review_state=review_state,
+        )
+        if read_refusal is not None:
+            return None, (
+                f"{read_refusal}. The command is refused whole; use a path within "
+                "the declared read scope that contains no protected credential "
+                "material."
+            ), ServiceShellBindingRule.READ_OPERAND_POLICY
+
+    allowed = False
+    if destination == "scheduler_read_only":
+        # Unlike maintenance and repo_review, this profile is not bound to one
+        # server-selected repository: scheduler/custom jobs may select any
+        # authorized cwd. It therefore pins Git and requires effective safety
+        # options in the input, while the root-bound profiles additionally add
+        # -C, config, and discovered-filter overrides in their binders.
+        allowed = _target_matches_read_only_shell_command(argv)
+    elif destination == "maintenance":
+        if argv[0] == "git":
+            git_argv = _maintenance_git_execution_argv(argv)
+            if git_argv is None:
+                return (
+                    None,
+                    _service_shell_not_admitted_reason(argv, destination, service=service),
+                    ServiceShellBindingRule.PROFILE_ALLOWLIST,
+                )
+            return git_argv, "", None
+        allowed = _target_matches_maintenance_shell_command(argv)
+    elif destination == "session_boundary":
+        allowed = _target_matches_session_boundary_shell_command(argv)
+    elif destination == "upgrade_workspace":
+        if argv[0] == "git":
+            git_argv = _upgrade_workspace_git_execution_argv(argv)
+            if git_argv is None:
+                return (
+                    None,
+                    _service_shell_not_admitted_reason(argv, destination, service=service),
+                    ServiceShellBindingRule.PROFILE_ALLOWLIST,
+                )
+            return git_argv, "", None
+        allowed = _target_matches_read_only_shell_command(argv) or (
+            argv[0] == "uv"
+            and argv[1:] in (["lock"], ["sync"])
+        )
+    else:
+        return None, (
+            f"there is no trusted-service shell profile named {destination!r}, "
+            "so no command can be admitted for this principal."
+        ), ServiceShellBindingRule.UNKNOWN_PROFILE
+    if not allowed:
+        return (
+            None,
+            _service_shell_not_admitted_reason(argv, destination, service=service),
+            # Distinguish "this job declared commands and none matched" from
+            # "the profile refused it" so a denial event says which gate spoke.
+            # ``destination`` keeps meaning the profile, so existing shadow-authz
+            # classification is unaffected.
+            ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH if declared
+            else ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        )
+    pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
+    return (
+        (pinned, "", None)
+        if pinned is not None
+        else (None, reason, ServiceShellBindingRule.EXECUTABLE_PIN)
+    )
+
+
+def parse_service_shell_argv_with_reason(
+    target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
+) -> tuple[list[str] | None, str]:
+    """Compatibility view returning only the admitted argv and refusal prose."""
+    argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
+        target, destination, review_state=review_state, declared=declared,
+        service=service, auth_context=auth_context, read_cwd=read_cwd,
+        allow_project_test=allow_project_test,
+    )
+    return argv, reason
+
+
+def parse_service_shell_argv(
+    target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
+    service: "ServicePrincipal | None" = None,
+    auth_context: "AuthContext | None" = None,
+    read_cwd: str | Path | None = None,
+    allow_project_test: bool = True,
+) -> list[str] | None:
+    """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
+    return parse_service_shell_argv_with_reason(
+        target, destination, review_state=review_state, declared=declared,
+        service=service, auth_context=auth_context, read_cwd=read_cwd,
+        allow_project_test=allow_project_test,
+    )[0]
+
+
+def _service_shell_refusal_detail(
+    target: object, policy: "ServiceSinkPolicy | None", review_state: Any = None,
+) -> str | None:
+    """Prose for a shell-profile refusal; ``None`` for every other adapter.
+
+    Recomputes through the same parser the sink adapter just consulted, so the
+    explanation is by construction the one that produced the refusal rather than
+    a second reading of the rule.
+    """
+    if (
+        policy is None
+        or policy.adapter != "shell_profile"
+        or not isinstance(target, str)
+    ):
+        return None
+    argv, reason = parse_service_shell_argv_with_reason(
+        target, policy.destination, review_state=review_state,
+    )
+    return None if argv is not None else reason
+
+
+def _target_matches_shell_profile(target: str, destination: str) -> bool:
+    """Authorization adapter for the service shell profile."""
+    return parse_service_shell_argv(target, destination) is not None
+
+
+def _target_matches_worklink_repo(target: str, destination: str) -> bool:
+    """Authorize Worklink dispatch only to its operator-configured repository."""
+    configured = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not configured:
+        return False
+    try:
+        return Path(target).expanduser().resolve() == Path(configured).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _is_research_proposal_poller(service: ServicePrincipal | None) -> bool:
+    return bool(
+        isinstance(service, ServicePrincipal)
+        and service.trigger == "poller"
+        and service.canonical.startswith("poller:")
+        and service.authority_profile == "research"
+        and set(service.capabilities) & {"open_proposal", "submit_proposal", "abandon_proposal"}
+    )
+
+
+def _active_poller_proposal_root(auth_context: AuthContext | None) -> Path | None:
+    """Grant only the exact workspace opened by the trusted runtime tool."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    if not _is_research_proposal_poller(service):
+        return None
+    from .proposals import PollerProposalScope, poller_worktree_path
+
+    state = getattr(auth_context, "poller_proposal_state", None)
+    scope = getattr(state, "scope", None)
+    worktree = getattr(state, "worktree", None)
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if (
+        not home or getattr(state, "active", False) is not True
+        or not isinstance(scope, PollerProposalScope)
+        or scope.owner != service.canonical
+        or scope.surface != service.proposal_surface
+        or not isinstance(worktree, Path)
+    ):
+        return None
+    try:
+        expected = poller_worktree_path(Path(home), scope)
+        if worktree != expected or expected.resolve(strict=True) != expected:
+            return None
+        return expected if expected.is_dir() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _poller_write_roots_refusal_detail(
+    service: ServicePrincipal, policy: ServiceSinkPolicy | None,
+    auth_context: AuthContext | None,
+) -> str | None:
+    """Describe the research poller's granted roots without changing admission."""
+    if (
+        not _is_research_proposal_poller(service)
+        or policy is None
+        or policy.adapter != "trigger_service_write_roots"
+    ):
+        return None
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    home_root = Path(home).resolve()
+    persist = home_root / "state" / "pollers" / service.canonical.removeprefix("poller:")
+    try:
+        if str(persist) not in json.loads(policy.destination):
+            return None
+    except (TypeError, ValueError):
+        return None
+    roots = [f"`{persist.relative_to(home_root)}/` (drafts and state)"]
+    proposal_root = _active_poller_proposal_root(auth_context)
+    if proposal_root is not None:
+        roots.append(
+            f"`{proposal_root.relative_to(home_root)}/` "
+            "(open proposal worktree; edit only its `state/wiki/`)"
+        )
+    return "Write only under " + " or ".join(roots) + ". Never write to live `state/wiki/`."
+
+
+def _target_matches_poller_proposal(
+    target: str, destination: str, *, auth_context: AuthContext | None = None,
+) -> bool:
+    """Bind the fixed proposal sink to its trusted research-poller owner."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    return bool(_is_research_proposal_poller(service) and destination == service.canonical)
+
+
+def _target_within_trigger_service_write_roots(
+    target: str, destination: str, *, auth_context: AuthContext | None = None,
+) -> bool:
+    """Confine dynamic trigger writes to frozen roots and safe home data paths."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return False
+    home_root = Path(home).resolve()
+    try:
+        raw = json.loads(destination)
+        if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
+            return False
+        roots = [Path(path).resolve() for path in raw]
+        service = get_trusted_service_from_auth_context(auth_context)
+        retained_scope = getattr(auth_context, "retained_factory_scope", None)
+        if (
+            _is_worklink_retained_checkout_service(service, auth_context=auth_context)
+            and retained_scope is not None
+            and retained_scope.resolve_path(target, strict=False) is not None
+        ):
+            return _target_within_retained_factory_scope(target, auth_context)
+        if not roots and not _is_research_proposal_poller(service):
+            return False
+        turn_scratch = (
+            None if _is_research_proposal_poller(service) else current_turn_scratch_root()
+        )
+        if turn_scratch is not None:
+            roots.append(turn_scratch)
+        proposal_root = _active_poller_proposal_root(auth_context)
+        if proposal_root is not None:
+            roots.append(proposal_root)
+        candidate = _resolve_file_tool_target(
+            target, home_root, physical_roots=roots,
+        )
+        if candidate is None:
+            return False
+        scratch_root = (home_root / "scratch").resolve()
+        if (candidate == scratch_root or candidate.is_relative_to(scratch_root)) and (
+            not any(candidate == root or candidate.is_relative_to(root)
+                    for root in (turn_scratch, proposal_root) if root is not None)
+        ):
+            return False
+        memory_root = (home_root / "memory").resolve()
+        lexical_relatives = tuple(
+            (root, candidate.relative_to(root))
+            for root in roots
+            if candidate == root or candidate.is_relative_to(root)
+        )
+        scope = getattr(getattr(auth_context, "poller_proposal_state", None), "scope", None)
+        def allowed_surface(root: Path, relative: Path) -> bool:
+            return bool(root == proposal_root and proposal_root is not None
+                        and getattr(scope, "surface", None) == "social-outbox"
+                        and relative.is_relative_to(scope.surface_root))
+        if is_protected_model_path(candidate) or any(
+            (WriteResourceAdapter._is_protected_path(relative) and not allowed_surface(root, relative))
+            or _is_static_service_protected_write_path(
+                relative,
+                under_memory_root=root == memory_root,
+            )
+            for root, relative in lexical_relatives
+        ):
+            return False
+        resolved = resolve_within_roots(roots, str(candidate))
+        # A symlink must not cross from one grant into another grant.
+        if not any(resolved.is_relative_to(root) for root, _ in lexical_relatives):
+            return False
+        resolved_relatives = tuple(
+            (root, resolved.relative_to(root))
+            for root in roots
+            if resolved == root or resolved.is_relative_to(root)
+        )
+    except (
+        json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError, ValueError,
+    ):
+        return False
+    return bool(resolved_relatives) and not is_protected_model_path(resolved) and not any(
+        (WriteResourceAdapter._is_protected_path(relative) and not allowed_surface(root, relative))
+        or _is_static_service_protected_write_path(
+            relative,
+            under_memory_root=root == memory_root,
+        )
+        for root, relative in resolved_relatives
+    )
+
+
+def _target_within_active_pr_checkout_lease(target: str, review_state: Any) -> bool:
+    """Admit one file target only beneath this turn's exact active lease."""
+    lease = getattr(review_state, "checkout_lease", None)
+    scope = getattr(review_state, "action_scope", None)
+    if lease is None or not getattr(lease, "is_active", False):
+        return False
+    if (
+        getattr(lease, "scope_id", None) != getattr(scope, "scope_id", None)
+        or getattr(lease, "owner", None) != getattr(scope, "principal", None)
+    ):
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    root = Path(lease.path)
+    try:
+        lexical = candidate.relative_to(root)
+        lease_root = Path(lease.lease_root).resolve(strict=True)
+        resolved_root = root.resolve(strict=True)
+        if resolved_root.parent != lease_root or resolved_root == lease_root:
+            return False
+        resolved = candidate.resolve(strict=False)
+        relative = resolved.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return not (
+        WriteResourceAdapter._is_protected_path(lexical)
+        or WriteResourceAdapter._is_protected_path(relative)
+        or _is_static_service_protected_write_path(relative)
+    )
+
+
+def _target_within_retained_factory_scope(
+    target: str, auth_context: AuthContext | None,
+) -> bool:
+    """Admit only an unprotected path in this turn's exact retained sandbox."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    scope = getattr(auth_context, "retained_factory_scope", None)
+    if (
+        not _is_worklink_retained_checkout_service(service, auth_context=auth_context)
+        or scope is None
+    ):
+        return False
+    resolved = scope.resolve_path(target, strict=False)
+    if resolved is None:
+        return False
+    root = Path(scope.sandbox).resolve(strict=True)
+    try:
+        lexical = Path(target).relative_to(Path(scope.sandbox))
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        WriteResourceAdapter._is_protected_path(lexical)
+        or WriteResourceAdapter._is_protected_path(relative)
+        or _is_static_service_protected_write_path(relative)
+    ):
+        return False
+    factory_parts = tuple(part.lower() for part in relative.parts)
+    try:
+        factory_index = factory_parts.index(".factory")
+    except ValueError:
+        return True
+    # The factory owns its control plane. Only slice worktrees below
+    # .factory/<run>/worktrees/<slice>/ contain agent-editable source code.
+    suffix = relative.parts[factory_index + 1:]
+    return (
+        len(suffix) >= 4
+        and suffix[0] == scope.run_id
+        and suffix[1].lower() == "worktrees"
+        and bool(suffix[2])
+    )
+
+
+def resolve_repository_review_state(
+    auth_context: Any,
+    *,
+    command: object = None,
+    cwd: object = None,
+    path: object = None,
+) -> tuple[Any, str | None]:
+    """Resolve one request's PR state without relying on a batched singleton."""
+    argv: list[str] = []
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+    if path is None and argv:
+        service = get_trusted_service_from_auth_context(auth_context)
+        declared = getattr(service, "declared_shell_commands", ()) or ()
+        # These CLI families have no PR binding. Leave admission to the shell
+        # allowlist and IFC guards, even when a cwd or several leases exist.
+        if argv[0] in _CHAINLINK_EXECUTABLES or (
+            argv[0] not in {"git", "gh"}
+            and any(argv[0] == item.executable for item in declared)
+        ):
+            return None, None
+
+    if path is not None:
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        if discovered is not None:
+            state = discovered.resolve_checkout_path(path)
+            if state is not None:
+                return state, None
+
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    constructors = _registered_scope_constructors(auth_context)
+    if constructors is None:
+        return None, None
+    if type(registry) is not constructors.registry:
+        state = getattr(auth_context, "repo_review_state", None)
+        return (state if type(state) is constructors.review else None), None
+
+    if path is not None:
+        state = registry.resolve_checkout_path(path)
+        return state, None if state is not None else "no matching checkout lease was found for the requested path"
+
+    git_arguments = (
+        _git_arguments_without_restrictive_global_options(argv[1:])
+        if argv[:1] == ["git"] else []
+    )
+    if git_arguments[:1] == ["-C"] and len(git_arguments) >= 2:
+        state = registry.resolve_checkout_path(git_arguments[1])
+        return state, None if state is not None else "no matching checkout lease was found for the repository command"
+    if cwd is not None:
+        state = registry.resolve_checkout_path(cwd)
+        return state, None if state is not None else "no matching checkout lease was found for the repository command"
+    if len(registry.review_states) == 1:
+        return registry.review_states[0], None
+    if len(registry.review_states) > 1:
+        return None, (
+            "several checkout leases are active; name the checkout with "
+            "`git -C <lease path>` or an explicit cwd"
+        )
+    return None, "no matching checkout lease was found for the repository command"
+
+
+def _synthesis_channel_target_matches_session(
+    target: str, channel_id: str | None,
+) -> bool:
+    """Bind a channel-memory target to the synthesis turn's session channel."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home or not channel_id:
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    try:
+        resolved = candidate.resolve()
+        relative = resolved.relative_to(
+            (Path(home).resolve() / "memory" / "channels").resolve()
+        )
+    except (OSError, RuntimeError):
+        # Resolution failure cannot prove channel ownership; fail closed.
+        return False
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] == channel_id
+
+
+def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
+    """Prevent one session boundary from mutating another channel's memory."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home or not channel_id:
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    home_root = Path(home).resolve()
+    try:
+        lexical = candidate.relative_to(home_root)
+        resolved = candidate.resolve().relative_to(home_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if lexical.is_relative_to(Path("memory/channels")):
+        return _synthesis_channel_target_matches_session(target, channel_id)
+    # Create-only synthesis capture roots. In particular, the legacy buffer
+    # and its weekly archive directory are not destinations for new learnings.
+    inbox = Path("memory/learnings-inbox")
+    if lexical.is_relative_to(inbox) or resolved.is_relative_to(inbox):
+        return (
+            lexical.parent == inbox and resolved.parent == inbox
+            and lexical.suffix == ".md" and resolved.suffix == ".md"
+        )
+    roots = (
+        Path("memory/issues"),
+        Path("state/wiki/concepts"), Path("state/wiki/topics"),
+    )
+    return any(
+        lexical != root and lexical.is_relative_to(root)
+        and resolved != root and resolved.is_relative_to(root)
+        for root in roots
+    )
+
+
+def resolve_trigger_service_write_target(
+    target: str, destination: str, *, auth_context: AuthContext | None = None,
+) -> Path:
+    """Resolve a trigger-service write exactly as its sink adapter checks it."""
+    from ._paths import PathOutsideHomeError
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise PathOutsideHomeError("MIMIR_HOME is not configured")
+    if not _target_within_trigger_service_write_roots(
+        target, destination, auth_context=auth_context,
+    ):
+        raise PathOutsideHomeError("target is outside trigger-service write grants")
+    scope = getattr(auth_context, "retained_factory_scope", None)
+    retained = _target_within_retained_factory_scope(target, auth_context)
+    candidate = (
+        scope.resolve_path(target, strict=False)
+        if retained else _resolve_file_tool_target(
+            target, home, physical_roots=map(Path, json.loads(destination)),
+        )
+    )
+    if candidate is None:
+        raise PathOutsideHomeError("invalid trigger-service write target")
+    return candidate.resolve()
+
+
+_TRIGGER_SERVICE_PROTECTED_READ_NAMES = frozenset({
+    ".env", ".git", ".mimir", ".venv", "config", "credentials",
+    "identities", ".outbound-privacy-key", "private-terms.txt", "prompts",
+    "secret", "secrets",
+})
+
+
+def _is_trigger_service_protected_read_path(path: Path) -> bool:
+    return any(part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES for part in path.parts)
+
+
+def _is_service_protected_read_path(
+    service: ServicePrincipal | None, root: Path, relative: Path,
+) -> bool:
+    """Apply protected names to the full target, including its matched root."""
+    target = root / relative
+    if is_protected_model_path(target):
+        return True
+    protected = {
+        part.lower() for part in target.parts
+        if part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+    }
+    return bool(protected) and not (
+        service is not None
+        and getattr(service, "canonical", None) == "system"
+        and getattr(service, "trigger", None) == "upgrade"
+        and root == _upgrade_proposals_root()
+        and protected == {"prompts"}
+    )
+
+
+def _trigger_service_read_target_is_allowed(
+    service: ServicePrincipal,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    *,
+    auth_context: "AuthContext | None" = None,
+    shell_roots: bool = False,
+) -> bool:
+    """Authorize a service read against frozen roots and verified ownership."""
+    from .read_policy import (
+        _has_protected_read_name,
+        file_contains_secret,
+        is_own_missing_channel_memory_path,
+        is_memory_read_path,
+        is_memory_read_path_allowed,
+        is_operator_secret_read_path,
+    )
+
+    args = arguments if isinstance(arguments, dict) else {}
+    raw = (
+        args.get("file_path") or args.get("path")
+        if tool_name in {"read_file", "aread"}
+        else args.get("path")
+    )
+    if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+        return False
+    candidate = Path(raw)
+    roots = (
+        service_shell_filesystem_read_roots(service, auth_context=auth_context)
+        if shell_roots
+        else service_filesystem_read_roots(service, auth_context=auth_context)
+    )
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if home:
+        home_root = Path(home).resolve()
+        memory_candidate = candidate
+        if not candidate.is_absolute() or not (
+            candidate == home_root or candidate.is_relative_to(home_root)
+        ):
+            memory_candidate = home_root / raw.lstrip("/")
+        try:
+            resolved_memory_candidate = memory_candidate.resolve(strict=True)
+        except FileNotFoundError:
+            if (
+                tool_name in {"read_file", "aread"}
+                and is_own_missing_channel_memory_path(memory_candidate, auth_context)
+            ):
+                return True
+            resolved_memory_candidate = None
+        except (OSError, RuntimeError):
+            resolved_memory_candidate = None
+        if (
+            resolved_memory_candidate is not None
+            and is_memory_read_path(resolved_memory_candidate)
+        ):
+            if not is_memory_read_path_allowed(
+                memory_candidate, auth_context,
+            ):
+                return False
+            if _is_trigger_service_protected_read_path(
+                resolved_memory_candidate.relative_to(home_root / "memory")
+            ) or is_operator_secret_read_path(resolved_memory_candidate):
+                return False
+            return not (
+                tool_name in {"read_file", "aread"}
+                and (
+                    not resolved_memory_candidate.is_file()
+                    or file_contains_secret(resolved_memory_candidate)
+                )
+            )
+    if home:
+        home_candidate = Path(home) / raw.lstrip("/")
+        if any(
+            home_candidate == root or home_candidate.is_relative_to(root)
+            for root in roots
+        ):
+            candidate = home_candidate
+    if not candidate.is_absolute():
+        return False
+    try:
+        lexical_root, lexical_relative = max(
+            (
+                (root, candidate.relative_to(root))
+                for root in roots
+                if candidate == root or candidate.is_relative_to(root)
+            ),
+            key=lambda item: len(item[0].parts),
+        )
+        artifact_root = framework_large_tool_results_root()
+        lexical_is_artifact = artifact_root is not None and lexical_root == artifact_root
+        if not lexical_is_artifact and _is_service_protected_read_path(
+            service, lexical_root, lexical_relative,
+        ):
+            return False
+        missing_target = False
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            # Admit an ordinary file-not-found only for a bounded file read.
+            # Directory/search and shell scopes retain strict resolution.
+            if (
+                service.authority_profile != "github"
+                or shell_roots
+                or tool_name not in {"read_file", "aread"}
+            ):
+                return False
+            resolved_root = lexical_root.resolve(strict=True)
+            ancestor = candidate.parent
+            while True:
+                try:
+                    resolved_ancestor = ancestor.resolve(strict=True)
+                    break
+                except FileNotFoundError:
+                    if ancestor == ancestor.parent:
+                        return False
+                    ancestor = ancestor.parent
+            if not resolved_ancestor.is_relative_to(resolved_root):
+                return False
+            resolved = candidate.resolve(strict=False)
+            # The common checks below enforce resolved-root containment and
+            # protected names; only missing memory needs a separate rejection.
+            if is_memory_read_path(resolved):
+                return False
+            missing_target = True
+        if service.authority_profile == "github":
+            resolved.relative_to(lexical_root.resolve(strict=True))
+        # Infrastructure roots are created lazily on first use. A missing
+        # sibling root must not invalidate an otherwise valid existing scope.
+        resolved_roots = tuple(root.resolve(strict=False) for root in roots)
+        root = max(
+            (
+                root for root in resolved_roots
+                if resolved == root or resolved.is_relative_to(root)
+            ),
+            key=lambda item: len(item.parts),
+        )
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    resolved_is_artifact = artifact_root is not None and root == artifact_root
+    if resolved_is_artifact:
+        return True
+    # _has_protected_read_name includes exact operator-configured secret
+    # paths, even when absent; do not duplicate that policy check here.
+    if (
+        _is_service_protected_read_path(service, root, relative)
+        or _has_protected_read_name(resolved)
+    ):
+        return False
+    if home:
+        home_root = Path(home).resolve()
+        shared_skill_roots = {
+            home_root / "skills",
+            home_root / ".mimir_builtin_skills",
+        }
+        owned_skill = getattr(service, "owned_skill_directory", None)
+        owned_root = Path(owned_skill).resolve() if owned_skill else None
+        is_owned_skill_path = owned_root is not None and (
+            resolved == owned_root or resolved.is_relative_to(owned_root)
+        )
+        if root in shared_skill_roots and not is_owned_skill_path:
+            if tool_name in {"read_file", "aread"} and resolved.name != "SKILL.md":
+                return False
+            if tool_name not in {"read_file", "aread"} and not resolved.is_dir():
+                return False
+    if missing_target:
+        return True
+    return not (
+        tool_name in {"read_file", "aread"}
+        and (not resolved.is_file() or file_contains_secret(resolved))
+    )
+
+
+def _target_matches_operator_alert(target: str, destination: str) -> bool:
+    """Bind notify-only authority to one operator-selected destination."""
+    configured = resolve_deliver_channel(
+        OPERATOR_CHANNEL_SENTINEL, os.environ.get(destination, ""),
+    )
+    return bool(configured) and target == configured
+
+
+def _target_matches_approved_url(target: str, destination: str) -> bool:
+    """Match an exact or explicitly scoped operator-configured URL."""
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    exact_urls, scopes = _configured_url_approvals(destination)
+    if normalized in exact_urls:
+        return True
+    parsed = urlsplit(normalized)
+    if (
+        "%" in parsed.path
+        or "\\" in parsed.path
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+    ):
+        return False
+    return any(
+        parsed.scheme == scope.scheme
+        and parsed.netloc == scope.netloc
+        and parsed.path.startswith(scope.path_prefix)
+        for scope in scopes
+    )
+
+
+_GITHUB_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
+_GITHUB_PR_API_PATH = re.compile(
+    r"/repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)(?:/(reviews|comments))?\Z"
+)
+_GITHUB_RAW_REPO_PATH = re.compile(r"/([^/]+)/([^/]+)/([^/]+)(?:/(.+))?\Z")
+
+
+def _configured_github_repos(variable: str) -> frozenset[tuple[str, str]]:
+    """Return syntactically safe owner/repo pairs from server-owned config."""
+    repos: set[tuple[str, str]] = set()
+    for item in os.environ.get(variable, "").split(","):
+        parts = item.strip().split("/")
+        if (
+            len(parts) == 2
+            and all(part not in {"", ".", ".."} for part in parts)
+            and all(_GITHUB_REPO_SEGMENT.fullmatch(part) for part in parts)
+        ):
+            repos.add((parts[0].lower(), parts[1].lower()))
+    return frozenset(repos)
+
+
+def _target_matches_github_pr_api(target: str, destination: str) -> bool:
+    """Match bounded GitHub PR API or raw-content reads for configured repos."""
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme != "https"
+        or parsed.query
+        or "%" in parsed.path
+        or "\\" in parsed.path
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+    ):
+        return False
+    if parsed.netloc == "api.github.com":
+        match = _GITHUB_PR_API_PATH.fullmatch(parsed.path)
+    elif parsed.netloc == "raw.githubusercontent.com":
+        match = _GITHUB_RAW_REPO_PATH.fullmatch(parsed.path)
+    else:
+        return False
+    if match is None:
+        return False
+    return (match[1].lower(), match[2].lower()) in _configured_github_repos(destination)
+
+
+@dataclass(frozen=True)
+class _ApprovedURLScope:
+    scheme: str
+    netloc: str
+    path_prefix: str
+
+
+def _url_approval_host_is_bounded(hostname: str | None) -> bool:
+    """Reject empty and public-suffix-shaped hosts while retaining IP literals."""
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.rstrip(".").split(".")
+        return len(labels) >= 2 and all(labels)
+    return True
+
+
+def _configured_url_approvals(
+    variable: str,
+) -> tuple[frozenset[str], frozenset[_ApprovedURLScope]]:
+    """Read exact URLs and explicit ``/*`` URL scopes from operator config."""
+    # Manifest grants are immutable JSON literals; legacy policies name env vars.
+    configured = variable if variable.startswith("[") else os.environ.get(variable, "").strip()
+    if not configured:
+        return frozenset(), frozenset()
+    if configured.startswith("["):
+        try:
+            parsed = json.loads(configured)
+        except json.JSONDecodeError:
+            log.warning("%s contains malformed JSON; no URLs will be approved", variable)
+            return frozenset(), frozenset()
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            log.warning("%s must be a URL or a JSON array of URLs; no URLs will be approved", variable)
+            return frozenset(), frozenset()
+        items = parsed
+    else:
+        if "," in configured:
+            log.warning(
+                "%s contains a comma but is not a JSON array; it will be treated "
+                "as one exact URL. Configure multiple URLs as a JSON array.",
+                variable,
+            )
+        items = [configured]
+
+    urls: set[str] = set()
+    scopes: set[_ApprovedURLScope] = set()
+    for item in items:
+        value = item.strip()
+        if value.endswith("/*"):
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, value[:-1])
+            parsed_scope = urlsplit(normalized) if normalized is not None else None
+            if (
+                parsed_scope is None
+                or parsed_scope.query
+                or not _url_approval_host_is_bounded(parsed_scope.hostname)
+                or "%" in parsed_scope.path
+                or "\\" in parsed_scope.path
+                or any(segment in {".", ".."} for segment in parsed_scope.path.split("/"))
+            ):
+                log.warning("%s rejects malformed or overly broad URL scope %r", variable, item)
+                continue
+            scopes.add(_ApprovedURLScope(
+                scheme=parsed_scope.scheme,
+                netloc=parsed_scope.netloc,
+                path_prefix=parsed_scope.path,
+            ))
+            continue
+        normalized = normalize_sink_destination(SinkCategory.NETWORK, value)
+        normalized_host = urlsplit(normalized).hostname if normalized is not None else None
+        if normalized is None or not _url_approval_host_is_bounded(normalized_host):
+            log.warning("%s rejects malformed URL approval %r", variable, item)
+            continue
+        urls.add(normalized)
+    return frozenset(urls), frozenset(scopes)
+
+
+def _configured_exact_urls(variable: str) -> frozenset[str]:
+    """Return only exact URLs, excluding explicitly host-scoped entries."""
+    return _configured_url_approvals(variable)[0]
+
+
+def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
+    """Return exact fetch destinations authorized by config or this session."""
+    approved = set(_configured_exact_urls("MIMIR_EGRESS_APPROVED_URLS"))
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if policy is not None and policy.adapter == "approved_urls":
+        approved.update(_configured_exact_urls(policy.destination))
+    state = getattr(auth_context, "egress_state", None)
+    if state is not None and callable(getattr(state, "approved_urls", None)):
+        approved.update(state.approved_urls())
+    return frozenset(approved)
+
+
+_INGESTED_HTTPS_URL = re.compile(r"https://[^\s<]+")
+_INGESTED_URL_TRAILING_PUNCTUATION = ".,;:)]}>\"'`"
+
+
+def record_external_ingested_urls(auth_context: Any, text: Any) -> None:
+    """Record URLs from content already vetted as external-origin ingest."""
+    from .models import IngestedURLState
+
+    if not isinstance(text, str):
+        return
+    state = getattr(auth_context, "ingested_url_state", None)
+    if not isinstance(state, IngestedURLState):
+        return
+    for match in _INGESTED_HTTPS_URL.finditer(text):
+        candidate = match.group(0).rstrip(_INGESTED_URL_TRAILING_PUNCTUATION)
+        try:
+            parsed = urlsplit(candidate)
+            port = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+        ):
+            continue
+        without_fragment = urlunsplit((
+            parsed.scheme, parsed.netloc, parsed.path, parsed.query, "",
+        ))
+        normalized = normalize_sink_destination(SinkCategory.NETWORK, without_fragment)
+        if normalized is not None:
+            state.add(normalized)
+
+
+def record_ingested_urls(auth_context: Any, text: Any, labels: Any) -> None:
+    """Record URLs when IFC labels attest untrusted active ingest."""
+    from .models import InformationFlowLabels
+
+    if (
+        not isinstance(labels, InformationFlowLabels)
+        or not labels.has_untrusted_active_ingest
+    ):
+        return
+    record_external_ingested_urls(auth_context, text)
+
+
+def ingested_fetch_urls(auth_context: Any) -> frozenset[str]:
+    """Return the exact turn-local untrusted-ingest URLs, if available."""
+    state = getattr(auth_context, "ingested_url_state", None)
+    urls = getattr(state, "urls", None)
+    return urls() if callable(urls) else frozenset()
+
+
+def _target_is_verbatim_ingest_url(target: str | None, auth_context: Any) -> bool:
+    if target is None:
+        return False
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    state = getattr(auth_context, "ingested_url_state", None)
+    contains = getattr(state, "contains", None)
+    return bool(callable(contains) and contains(normalized))
+
+
+def _target_matches_configured_github_repo_fetch(target: str) -> bool:
+    """Exempt only bounded poller evidence endpoints from the taint gate."""
+    if not _target_within_configured_github_repo(target):
+        return False
+    parsed = urlsplit(target.strip())
+    # No free-form path or query data: immutable SHA or bounded numeric run ID,
+    # and only GitHub's documented page-size range (1..100), once, unencoded.
+    return (
+        parsed.hostname.lower() == "api.github.com"
+        and re.fullmatch(
+            r"/repos/[^/]+/[^/]+/(?:actions/runs/[1-9][0-9]{0,19}/jobs"
+            r"|commits/[0-9a-fA-F]{40}/check-runs)",
+            parsed.path,
+        ) is not None
+        and re.fullmatch(r"(?:per_page=(?:[1-9][0-9]?|100))?", parsed.query) is not None
+        and not parsed.fragment
+    )
+
+
+def _target_within_configured_github_repo(target: str) -> bool:
+    """Match HTTPS API or web reads scoped to a configured GitHub repository."""
+    try:
+        parsed = urlsplit(target.strip())
+        port = parsed.port
+    except (AttributeError, ValueError):
+        return False
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.hostname is None
+        or "%" in parsed.path
+        or "\\" in parsed.path
+    ):
+        return False
+
+    segments = parsed.path.split("/")
+    if any(segment in {".", ".."} for segment in segments):
+        return False
+    host = parsed.hostname.lower()
+    if host == "api.github.com" and len(segments) >= 4 and segments[1] == "repos":
+        owner, repo = segments[2:4]
+    elif host == "github.com" and len(segments) >= 3:
+        owner, repo = segments[1:3]
+    else:
+        return False
+    return is_configured_github_repo(f"{owner}/{repo}")
+
+
+def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
+    """Authorize an exact URL, configured GitHub repo read, or service adapter."""
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if service is not None and service.github_activity:
+        constructors = _registered_scope_constructors(auth_context)
+        # Expanded evidence reads need BOTH manifest authority and the turn's
+        # remediation scope; ambient URL approvals must not bypass either.
+        try:
+            parsed = urlsplit(target)
+            port = parsed.port
+        except ValueError:
+            return False
+        if (
+            not service.has_capability("fetch_url")
+            or parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or "%" in parsed.path
+            or "\\" in parsed.path
+            or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+        ):
+            return False
+        state, refusal = resolve_repository_review_state(auth_context)
+        scope = getattr(state, "action_scope", None)
+        # Preserve ordinary review reads; remediation cannot use that fallback
+        # to inspect another PR or mutable/unrelated raw content.
+        if _target_matches_github_pr_api(target, "GITHUB_REPOS"):
+            if refusal is not None:
+                return False
+            if (constructors is not None and type(scope) is constructors.scope_type
+                    and scope.checkout_ref is None):
+                match = (
+                    _GITHUB_PR_API_PATH.fullmatch(parsed.path)
+                    if parsed.netloc == "api.github.com"
+                    else _GITHUB_RAW_REPO_PATH.fullmatch(parsed.path)
+                )
+                return (
+                    match is not None
+                    and f"{match[1]}/{match[2]}".lower() == scope.canonical_repo.lower()
+                    and match[3].lower() == (
+                        str(scope.pr_number) if parsed.netloc == "api.github.com"
+                        else scope.observed_head_sha.lower()
+                    )
+                )
+            return True
+        if (
+            policy is None
+            or policy.adapter != "approved_urls"
+            or not _target_matches_approved_url(target, policy.destination)
+        ):
+            return False
+        # Job/run IDs do not establish a head binding. Only the poller may
+        # validate those bindings and deliver authenticated, sanitized log tails.
+        match = re.fullmatch(
+            r"/repos/([^/]+)/([^/]+)/commits/([0-9a-fA-F]{40})/check-runs", parsed.path,
+        )
+        return (
+            parsed.netloc.lower() == "api.github.com"
+            and parsed.query in {"", "per_page=100"}
+            and not parsed.fragment
+            and match is not None
+            and refusal is None
+            and constructors is not None and type(scope) is constructors.scope_type
+            and scope.checkout_ref is None
+            and scope.pull_request_author == scope.principal
+            and scope.head_repo.lower() == scope.canonical_repo.lower()
+            and scope.head_remote == "origin"
+            and _repo_review_action_allowed(state, _registered_review_action("commit", auth_context))
+            and f"{match[1]}/{match[2]}".lower() == scope.canonical_repo.lower()
+            and match[3].lower() == scope.observed_head_sha.lower()
+        )
+    if (
+        normalized in approved_fetch_urls(auth_context)
+        or _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
+    ):
+        return True
+    if _target_within_configured_github_repo(target):
+        return True
+    if policy is None:
+        return False
+    adapter = _SERVICE_SINK_ADAPTERS.get(policy.adapter)
+    return adapter is not None and adapter(normalized, policy.destination)
+
+
+def _sink_adapter_admits(
+    adapter: Any,
+    target: str,
+    destination: str,
+    service: "ServicePrincipal | None" = None,
+    *,
+    review_state: Any = None,
+    auth_context: "AuthContext | None" = None,
+) -> bool:
+    """Invoke a sink adapter, handing the shell adapter the principal's grants.
+
+    Static adapters use ``(target, destination) -> bool``. Dynamic proposal and
+    write grants receive the runtime carrier explicitly; shell commands receive
+    the principal's declarations rather than consulting ambient context.
+    """
+    if adapter is None:
+        return False
+    if (
+        adapter is _target_matches_approved_url
+        and service is not None
+        and service.github_activity
+        and _target_matches_github_pr_api(target, "GITHUB_REPOS")
+    ):
+        return True
+    if adapter is _target_within_trigger_service_write_roots:
+        return adapter(target, destination, auth_context=auth_context)
+    if adapter is _target_matches_poller_proposal:
+        return (
+            service == get_trusted_service_from_auth_context(auth_context)
+            and adapter(target, destination, auth_context=auth_context)
+        )
+    if adapter is _target_within_revision_proposal:
+        return service == get_trusted_service_from_auth_context(auth_context) and adapter(
+            target, destination, auth_context=auth_context,
+        )
+    if adapter is _target_within_upgrade_proposals and getattr(auth_context, "proposal_revision", None) is not None:
+        return _target_within_revision_proposal(target, destination, auth_context=auth_context)
+    if adapter is _target_matches_shell_profile:
+        # Authorization validates the argv shape only. Filesystem operands are
+        # resolved once by the execution binder after it has the authoritative
+        # cwd; doing it here both duplicates the admission walk and resolves
+        # relative operands against the wrong base.
+        return parse_service_shell_argv(
+            target, destination, review_state=review_state,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        ) is not None
+    return bool(adapter(target, destination))
+
+
+_SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
+    "configured_file_roots": _target_within_configured_write_roots,
+    "configured_repo_write_roots": _target_within_configured_repo_write_roots,
+    "static_service_write_roots": _target_within_static_service_write_roots,
+    "upgrade_proposals": _target_within_upgrade_proposals,
+    "revision_proposal": _target_within_revision_proposal,
+    "shell_profile": _target_matches_shell_profile,
+    "spawn_workspace": _target_within_configured_write_roots,
+    "worklink_repo": _target_matches_worklink_repo,
+    "trigger_service_write_roots": _target_within_trigger_service_write_roots,
+    "poller_proposal": _target_matches_poller_proposal,
+    "operator_alert": _target_matches_operator_alert,
+    "approved_urls": _target_matches_approved_url,
+    "github_pr_api": _target_matches_github_pr_api,
+}
+
+_ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
+    SinkCategory.SHELL_PROCESS: "shell_process",
+    SinkCategory.SPAWN: "spawn_process",
+    SinkCategory.FILE: "filesystem",
+    SinkCategory.NOTIFICATION: "notification",
+    SinkCategory.HTTP_WEBHOOK: "network",
+    SinkCategory.NETWORK: "network",
+    SinkCategory.EXTERNAL_MCP: "external_mcp",
+}
+
+# Operations in this set have no caller-supplied destination: each writes only
+# fixed, derived paths, so the ordinary target adapter has nothing to validate.
+# Taint gating still applies upstream at the capability-tier gate; membership
+# here bypasses only destination checks. Keep membership narrow: a candidate
+# must accept no caller-selected target and write only fixed derived destinations.
+_FIXED_SERVICE_SINK_OPERATIONS = policy_membership("fixed_service_sinks")
+
+
+# Deliberate single-operator exception: the model-composed web_search query
+# goes to one operator-fixed trusted service. Search results are untrusted
+# active ingest, so gating this channel would cap research at one search.
+# Unlike fetch_url, there is no model-chosen destination or exact-URL mitigation.
+# This and the trusted-operator shell/file allowance require a trusted deployment.
+_TAINT_INDEPENDENT_EGRESS_TOOLS = policy_membership("taint_independent_egress")
+
+
+def _egress_target_requires_taint_gate(
+    tool_name: str, target: str | None, auth_context: Any,
+) -> bool:
+    """Gate egress generally, including fetch targets approved only by scope."""
+    if tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS:
+        return True
+    if tool_name == "web_search":
+        return False
+    if target is None:
+        return False
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    if (
+        normalized in approved_fetch_urls(auth_context)
+        or _target_matches_configured_github_repo_fetch(target)
+        or _target_is_verbatim_ingest_url(target, auth_context)
+    ):
+        return False
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if (
+        policy is not None
+        and policy.adapter != "approved_urls"
+        and _sink_adapter_admits(
+            _SERVICE_SINK_ADAPTERS.get(policy.adapter),
+            normalized,
+            policy.destination,
+            service,
+        )
+    ):
+        return False
+    return fetch_url_is_approved(target, auth_context)
+
+
+_CHAINLINK_TAINT_REFUSAL = (
+    "this turn carries untrusted active ingest, so Chainlink tracker mutations "
+    "are unavailable for this turn. Read-only queries remain admitted: issue "
+    "show, issue list, issue search, issue ready, issue blocked, issue related, "
+    "issue cascade, issue next, issue tree, and session status."
+)
+
+SAGA_TAINT_REFUSAL = (
+    "durable memory mutation refused because this turn is tainted: durable "
+    "memory requires a non-empty source set with no untrusted active ingest. "
+    "Ask the operator to open a fresh user turn, or open a PR for content that "
+    "belongs in the repository."
+)
+
+
+def can_review_commitments(auth_context: Any) -> bool:
+    """Exact server-issued scheduled review grant, read/proposal only."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    return bool(service is not None
+                and auth_context.trigger == "scheduled_tick"
+                and service.channel_memory_directory == "scheduler:commitments-review"
+                and service_can_invoke_operation(service, "commitment_propose_closure")
+                and service_can_invoke_operation(service, "commitment_list"))
+
+
+def can_propose_memory(auth_context: Any) -> bool:
+    """Shared capability gate for the proposal tool and its taint-refusal hint."""
+    return is_admin(auth_context) or service_can_invoke_operation(
+        get_trusted_service_from_auth_context(auth_context), "memory_propose",
+    )
+
+
+def _saga_taint_refusal_for_turn(auth_context: Any) -> str:
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    if turn is None or turn.auth_context is not auth_context:
+        return SAGA_TAINT_REFUSAL
+    if can_propose_memory(auth_context):
+        return SAGA_TAINT_REFUSAL + " Or propose it for operator review with memory_propose."
+    return SAGA_TAINT_REFUSAL
+
+
+def saga_mutation_taint_refusal(
+    auth_context: Any, fallback: Any = None,
+) -> str | None:
+    """Refuse mutation for missing provenance or untrusted active ingest."""
+    from .models import InformationFlowLabels
+
+    if auth_context is None:
+        return _saga_taint_refusal_for_turn(auth_context)
+    state = getattr(auth_context, "ifc_state", None)
+    get_current = getattr(state, "current", None)
+    if not callable(get_current):
+        return _saga_taint_refusal_for_turn(auth_context)
+    try:
+        labels = get_current(
+            fallback if fallback is not None else getattr(auth_context, "ifc_labels", None)
+        )
+    except Exception:
+        log.exception("saga_mutation_integrity_evaluation_failed")
+        return _saga_taint_refusal_for_turn(auth_context)
+    if (
+        not isinstance(labels, InformationFlowLabels)
+        or not labels.sources
+        or _has_untrusted_active_ingest(auth_context, labels, missing_is_tainted=True)
+    ):
+        return _saga_taint_refusal_for_turn(auth_context)
+    return None
+
+
+def _live_untrusted_active_ingest(
+    auth_context: Any, fallback: Any,
+) -> bool | None:
+    """Read taint from the server-owned live IFC state, or report indeterminate.
+
+    Live gates must use this query (or the fail-closed wrapper below), never
+    infer taint from source integrity or a persisted trust summary alone.
+    """
+    state = getattr(auth_context, "ifc_state", None)
+    predicate = getattr(state, "has_untrusted_active_ingest", None)
+    if not callable(predicate):
+        return None
+    try:
+        result = predicate(fallback)
+    except Exception:
+        log.exception("ifc_untrusted_active_ingest_evaluation_failed")
+        return None
+    return result if isinstance(result, bool) else None
+
+
+def _has_untrusted_active_ingest(
+    auth_context: Any, fallback: Any, *, missing_is_tainted: bool = False,
+) -> bool:
+    """Resolve taint consistently, failing closed for indeterminate live state."""
+    state = getattr(auth_context, "ifc_state", None)
+    if callable(getattr(state, "has_untrusted_active_ingest", None)):
+        live_taint = _live_untrusted_active_ingest(auth_context, fallback)
+        return True if live_taint is None else live_taint
+    return missing_is_tainted or bool(
+        getattr(fallback, "has_untrusted_active_ingest", False)
+    )
+
+
+_SCHEDULE_WRITE_TOOLS = policy_membership("schedule_writes")
+_SCHEDULE_WRITE_REFUSAL = (
+    "Scheduled work and autonomous instruction surfaces cannot be changed after "
+    "untrusted ingest; propose this change with open_proposal/submit_proposal; "
+    "the operator merges it."
+)
+
+
+def _live_instruction_surface(home: Path, target: Path) -> bool:
+    """Match resolved *live* HOME instruction files, not proposal/checkouts."""
+    try:
+        relative = target.resolve(strict=False).relative_to(home.resolve(strict=False))
+    except ValueError:
+        return False  # outside the live home (e.g. a PR lease checkout)
+    except (OSError, RuntimeError):
+        # Indeterminate identity cannot establish that an in-home path is safe.
+        return True
+    # APFS/virtiofs live homes preserve the caller's spelling in resolve(),
+    # even when differently cased paths identify the same file. Conservatively
+    # match these surfaces case-insensitively on every filesystem.
+    parts = tuple(part.casefold() for part in relative.parts)
+    if not parts:
+        return False
+    if parts in {("scheduler.yaml",), ("pollers-overrides.yaml",),
+                 ("memory", "index.md")}:
+        return True
+    if len(parts) == 2 and parts[0] == "prompts" and parts[1].endswith(".md"):
+        return True
+    if len(parts) == 3 and parts[:2] == ("memory", "core") and parts[2].endswith(".md"):
+        return True
+    return (
+        len(parts) >= 3 and parts[0] == "skills"
+        and ((parts[2] in {"skill.md", "pollers.json"} and len(parts) == 3)
+             or (parts[2] == "scripts" and len(parts) >= 4))
+    )
+
+
+def _turn_has_untrusted_active_ingest(auth_context: Any, ifc_labels: Any) -> bool:
+    if ifc_labels is None:
+        ifc_labels = getattr(auth_context, "ifc_labels", None)
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    if ifc_labels is None:
+        try:
+            if not callable(current) or current() is None:
+                return True
+        except Exception:
+            return True
+    return _has_untrusted_active_ingest(
+        auth_context, ifc_labels, missing_is_tainted=ifc_labels is None,
+    )
+
+
+def _egress_veto_shadow_verdict(
+    tool_name: str, sink_category: SinkCategory, target: str | None,
+    ifc_labels: Any, auth_context: Any, decision: "ToolAuthorization",
+) -> tuple[str, str] | None:
+    """Compute #1903's proposed veto without participating in authorization."""
+    if not _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
+        return None
+    if not target or decision.reason == "ifc_declassification_approved":
+        return None
+    if tool_name == "fetch_url" and sink_category is SinkCategory.NETWORK:
+        if _target_is_verbatim_ingest_url(target, auth_context):
+            return None
+        if fetch_url_is_approved(target, auth_context):
+            return None
+        return "egress_destination_not_approved", "verbatim_ingest_url,approved_urls"
+    if tool_name == "web_search" and sink_category is SinkCategory.NETWORK:
+        fixed = _fixed_web_search_url()
+        if fixed is not None and normalize_sink_destination(sink_category, target) == fixed:
+            return None
+        return "egress_destination_not_approved", "fixed_web_search_url"
+    if tool_name in {"webhook", "http_request"} and sink_category is SinkCategory.HTTP_WEBHOOK:
+        if _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS"):
+            return None
+        return "egress_destination_not_approved", "MIMIR_EGRESS_APPROVED_URLS"
+    if tool_name == "send_message" and sink_category in {
+        SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE,
+    }:
+        if (ChannelResourceAdapter._resolve_channel(target)
+                == ChannelResourceAdapter._resolve_channel(
+                    getattr(auth_context, "channel_id", None))):
+            return None
+        if decision.reason in {"ifc_allowed", "no_labels"}:
+            return None
+        state = getattr(auth_context, "ifc_state", None)
+        current = getattr(state, "current", None)
+        try:
+            labels = current(ifc_labels) if callable(current) else ifc_labels
+        except Exception:
+            labels = ifc_labels
+        if not any(getattr(source, "sensitivity", None) in {
+            "private", "confidential", "internal",
+        } for source in getattr(labels, "sources", ())):
+            return None
+        # Cross-channel/DM flow has no implicit ACL grant. A consumed operator
+        # approval is recognized above from the original decision, not re-consumed.
+        return "private_source_cross_channel", "source_acl,declassification_or_sink_approval"
+    return None
+
+
+def _egress_shadow_source(auth_context: Any, ifc_labels: Any) -> dict[str, str | None]:
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((item for item in getattr(labels, "sources", ())
+                   if getattr(item, "has_untrusted_active_ingest", False)), None)
+    resource_id = getattr(source, "resource_id", None)
+    # Opaque IDs retain attribution, including repository #pull/N@sha suffixes.
+    # Only actual URLs are reduced to hosts to avoid logging URL secrets.
+    if isinstance(resource_id, str) and "://" in resource_id:
+        try:
+            resource_id = urlsplit(resource_id).hostname
+        except ValueError:
+            resource_id = None
+    return {
+        "domain": getattr(source, "domain", None),
+        "resource_id": resource_id,
+        "source_kind": getattr(source, "source_kind", None),
+    }
+
+
+def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuthorization":
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason=(
+            "skill_write_requires_admin_operator" if skill else
+            "ifc_label_blocked:file" if tool_name in {"write_file", "edit_file", "replace_file"}
+            else "ifc_label_blocked:scheduler"
+        ),
+        required_tier=AccessTier.ADMIN, enforcement_enabled=True,
+        would_block=True, refusal_detail=_SCHEDULE_WRITE_REFUSAL,
+    )
+
+
+_WORKLINK_BUILD_TOOLS = policy_membership("worklink_build_tools")
+_REPO_PUBLISH_TOOLS = policy_membership("repo_publish_tools")
+_REPO_PUBLISH_INGEST_REFUSAL = (
+    "This turn read untrusted outside content, so it cannot create or publish commits. "
+    "Describe the intended change in a PR comment (pr_comment) or a message to the "
+    "operator (send_message), or ask the operator for a fresh clean turn."
+)
+
+
+_TAINTED_TURN_WRITE_TOOLS = policy_membership("tainted_writes")
+_TAINTED_FILE_WRITE_TOOLS = policy_membership("tainted_file_writes")
+_TAINTED_WRITE_REFUSAL = (
+    "This turn read untrusted outside content, so it cannot directly write code "
+    "or live state. Use scratch/ and a proposal PR via open_proposal/submit_proposal "
+    "or memory_propose; the operator merges it. Describe the change with "
+    "pr_comment/send_message, or ask for a fresh clean turn."
+)
+
+
+def tainted_file_write_target(raw_path: Any, home: Path | None = None) -> bool:
+    """Only resolved descendants of the lexical home scratch tree are writable."""
+    try:
+        if home is None:
+            configured = os.environ.get("MIMIR_HOME", "").strip()
+            if not configured:
+                return True
+            home = Path(configured)
+        root = home.resolve()
+        scratch = root / "scratch"
+        # Pin the resolved boundary before admitting descendants. A redirected
+        # scratch root must never turn its live target into a staging area.
+        scratch_root = scratch.resolve()
+        if scratch_root != scratch:
+            return True
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return True
+        candidate = _resolve_file_tool_target(raw_path, home=root)
+        if candidate is None:
+            return True
+        resolved = candidate.resolve(strict=False)
+        return not (resolved != scratch_root and resolved.is_relative_to(scratch_root))
+    except (ValueError, OSError, RuntimeError):
+        return True
+
+
+def tainted_write_target(tool_name: str, target: Any = None) -> bool:
+    return (tool_name in _TAINTED_TURN_WRITE_TOOLS or (
+        tool_name in _TAINTED_FILE_WRITE_TOOLS and tainted_file_write_target(target)
+    ))
+
+
+def _tainted_write_sources(auth_context: Any, ifc_labels: Any) -> dict[str, Any]:
+    """Bound the live taint's identifiers; never forward source content."""
+    from .redaction import redact_text
+
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    sources = []
+    remaining = 0
+    for source in getattr(labels, "sources", ()):
+        if not getattr(source, "has_untrusted_active_ingest", False):
+            continue
+        if len(sources) == 5:
+            remaining += 1
+            continue
+        resource_id = source.resource_id
+        bridge = source.bridge_instance
+        sources.append({
+            "domain": source.domain,
+            "source_kind": source.source_kind,
+            "bridge_instance": (
+                redact_text(bridge)[:256] if isinstance(bridge, str) else None
+            ),
+            "resource_id": (
+                redact_text(resource_id)[:1024] if isinstance(resource_id, str) else None
+            ),
+        })
+    return {"sources": sources, "remaining_sources": remaining}
+
+
+def _tainted_write_denial(
+    tool_name: str, service: Any = None, *, auth_context: Any = None,
+    ifc_labels: Any = None,
+) -> "ToolAuthorization":
+    try:
+        from .event_logger import log_event_sync
+        log_event_sync(
+            "write_blocked_by_untrusted_ingest", tool=tool_name,
+            **_tainted_write_sources(auth_context, ifc_labels),
+        )
+    except Exception:
+        pass
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason="write_blocked_by_untrusted_ingest",
+        service_principal=service, required_tier=AccessTier.ADMIN,
+        enforcement_enabled=True, would_block=True,
+        refusal_detail=_TAINTED_WRITE_REFUSAL,
+    )
+
+
+def _repo_publish_ingest_denial(
+    tool_name: str, auth_context: Any, ifc_labels: Any,
+    service: ServicePrincipal | None, scope: Any,
+) -> "ToolAuthorization":
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((
+        item for item in getattr(labels, "sources", ())
+        if getattr(item, "has_untrusted_active_ingest", False)
+    ), None)
+    try:
+        from .event_logger import log_event_sync
+
+        log_event_sync(
+            "repo_publish_blocked_by_untrusted_ingest",
+            tool=tool_name, scope_id=getattr(scope, "scope_id", None),
+            domain=getattr(source, "domain", None),
+            source_kind=getattr(source, "source_kind", None),
+        )
+    except Exception:  # Telemetry must never change a policy decision.
+        pass
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason="repo_publish_blocked_by_untrusted_ingest",
+        service_principal=service, required_tier=AccessTier.ADMIN,
+        enforcement_enabled=True, would_block=True,
+        refusal_detail=_REPO_PUBLISH_INGEST_REFUSAL,
+    )
+
+
+def _repo_test_ingest_refusal(auth_context: Any, ifc_labels: Any) -> str:
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((
+        item for item in getattr(labels, "sources", ())
+        if getattr(item, "has_untrusted_active_ingest", False)
+    ), None)
+    source_name = (
+        f"{source.source_kind} / {source.domain}" if source is not None
+        else "unknown untrusted source"
+    )
+    return (
+        f"repo_test cannot execute repository code after untrusted active ingest "
+        f"from {source_name}. Review the diff with pr_diff/repo_diff without "
+        "executing it, rely on the PR's CI (pr_checks), or ask the operator for "
+        "a fresh clean turn."
+        + _author_attestation_note(auth_context)
+    )
+
+
+def _worklink_build_denial(
+    tool_name: str, service: ServicePrincipal | None, auth_context: Any,
+    ifc_labels: Any,
+) -> "ToolAuthorization":
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((
+        item for item in getattr(labels, "sources", ())
+        if getattr(item, "has_untrusted_active_ingest", False)
+    ), None)
+    source_name = (
+        f"{source.source_kind} / {source.domain}" if source is not None
+        else "unknown untrusted source"
+    )
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason="worklink_build_blocked_by_untrusted_ingest",
+        service_principal=service, required_tier=AccessTier.ADMIN,
+        enforcement_enabled=True, would_block=True,
+        refusal_detail=(
+            f"Untrusted active ingest from {source_name} is present in this turn. "
+            "Builds cannot be "
+            "started or resumed from a turn that has read untrusted content. Ask the "
+            "operator to arm the leaf for ready-queue dispatch, or to run "
+            "`mimir worklink run` / `mimir worklink resume` from the CLI."
+        ),
+    )
+
+
+def _same_channel_authority(
+    source: Any,
+    triggering_bridge_instance: str | None,
+) -> bool:
+    """Whether a source's channel id is scoped to the triggering authority.
+
+    A normalized channel id is unique within a bridge instance, not globally:
+    two independently scoped workspaces can each hold a channel that
+    normalizes to the same string. The same-channel shortcut admits with no
+    audience lookup, on the reasoning that the channel's own audience has
+    already seen the content -- which holds only if it is the same channel.
+
+    A mismatch declines the shortcut only. The flow stays eligible for the
+    audience arms below, which compare real audiences rather than strings.
+    """
+    source_domain = getattr(source, "domain", "") or ""
+    if source_domain != "channel":
+        # Not a bridge-scoped channel source (e.g. a protected tool result
+        # carrying a "channel_metadata" domain); the shortcut is unaffected.
+        return True
+    source_bridge = getattr(source, "bridge_instance", None)
+    if not source_bridge or not triggering_bridge_instance:
+        # Unknown authority is not proof of the same authority. Treating it as
+        # compatible would let a channel-scoped source with no recorded bridge
+        # take the fast path and skip the audience lookup entirely.
+        return False
+    return source_bridge == triggering_bridge_instance
+
+
+_SOURCE_KIND_SOURCE_ACL = frozenset({SourceKind.AUTO_RECALL, SourceKind.MCP})
+_SOURCE_KIND_OWNER_ATTESTATION = frozenset({
+    SourceKind.RECENT_ACTIVITY_USER, SourceKind.OWNER_ATTESTED_FEEDBACK,
+})
+_SOURCE_KIND_CHANNEL_AUDIENCE = frozenset({
+    SourceKind.PROTECTED_PROMPT, SourceKind.RECENT_ACTIVITY_ASSISTANT,
+})
+_SOURCE_KIND_SAME_CHANNEL_ONLY = frozenset({
+    SourceKind.CHANNEL, SourceKind.CHANNEL_SCOPED_FEEDBACK,
+    SourceKind.CHANNEL_BOUND_UNOWNED_FEEDBACK, SourceKind.FEEDBACK_CHAIN,
+})
+
+# Classify every known kind explicitly; unknown runtime strings remain separate.
+# AGENT_SELF falls through when not trusted/informational. SERVICE depends on
+# domain; the two result kinds allow cross-channel flow after the common guards.
+assert set(SourceKind) == (
+    _SOURCE_KIND_SOURCE_ACL
+    | _SOURCE_KIND_OWNER_ATTESTATION
+    | _SOURCE_KIND_CHANNEL_AUDIENCE
+    | _SOURCE_KIND_SAME_CHANNEL_ONLY
+    | {SourceKind.AGENT_SELF, SourceKind.SERVICE,
+       SourceKind.PROTECTED_TOOL, SourceKind.ACP_HANDS_RESULT}
+), "unclassified SourceKind in triggering-channel flow policy"
+
+
+def _source_is_triggering_channel_compatible(
+    source: Any,
+    *,
+    effective_principal: str,
+    triggering_principal: str | None,
+    resolved_triggering: str | None,
+    audience_provider: Any,
+    cross_platform_pull: bool,
+    admin_operator_cross_channel: bool = False,
+    triggering_bridge_instance: str | None = None,
+) -> bool:
+    """Return whether one IFC source may flow to the triggering channel.
+
+    After completeness and requester-ACL checks, ``agent_self`` permits trusted
+    informational data, while ``auto_recall`` and ``mcp`` require the destination
+    audience to be within their source ACL. All remaining known kinds may use the
+    same-channel shortcut. Otherwise, ``recent_activity_user`` requires an owner
+    attestation and the requester-only destination audience;
+    ``owner_attested_feedback`` requires an attestation and the requester-only
+    canonical human audience; ``protected_prompt`` and
+    ``recent_activity_assistant`` require the destination audience to be within
+    the source channel audience; non-channel ``service`` data and
+    ``protected_tool`` retain their explicit allowances. ``channel``,
+    ``channel_scoped_feedback``, ``channel_bound_unowned_feedback``, and
+    ``feedback_chain`` have no further allowance. Unknown kinds fail closed
+    before the shortcut. The admin-operator cross-channel path remains an
+    explicit bypass for every complete, requester-authorized kind, even unknown
+    kinds, because the operator is deliberately authorizing the flow.
+    """
+    if not getattr(source, "is_complete", False):
+        return False
+    if not effective_principal:
+        return False
+    if effective_principal not in getattr(source, "authorized_principals", ()):
+        return False
+    if admin_operator_cross_channel:
+        return True
+    source_kind = getattr(source, "source_kind", SourceKind.CHANNEL)
+    # Version-skewed records and duck-typed producers can supply unknown strings.
+    # They gain no automatic flow rights, even back to their source channel,
+    # until classified. The deliberate operator bypass above is the exception.
+    if source_kind not in SourceKind._value2member_map_:
+        return False
+    if (
+        source_kind == SourceKind.AGENT_SELF
+        and source.integrity == "trusted"
+        and source.integrity_effect == "informational"
+    ):
+        return True
+    if source_kind in _SOURCE_KIND_SOURCE_ACL:
+        if audience_provider is None or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+        except Exception:
+            return False
+        # Membership above only proves that the requester may read the source.
+        # Both producers mint ACLs containing the requester, so it cannot prove
+        # that every other member of the destination audience may read it.
+        return bool(
+            destination_audience
+            and destination_audience <= source.authorized_principals
+        )
+    source_channel = ChannelResourceAdapter._resolve_channel(source.resource_id)
+    if (
+        source_channel
+        and resolved_triggering
+        and source_channel == resolved_triggering
+        and _same_channel_authority(source, triggering_bridge_instance)
+    ):
+        return True
+    if source_kind in _SOURCE_KIND_OWNER_ATTESTATION:
+        from .models import OwnerAttestation
+
+        attestation = getattr(source, "owner_attestation", None)
+        if not isinstance(attestation, OwnerAttestation):
+            return False
+        if (
+            attestation.source_channel != source.resource_id
+            or attestation.canonical_principal != source.principal
+            or source.principal != effective_principal
+        ):
+            return False
+        if not cross_platform_pull and attestation.raw_author != triggering_principal:
+            return False
+        if audience_provider is None or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+        except Exception:
+            return False
+        if source_kind == SourceKind.RECENT_ACTIVITY_USER:
+            return destination_audience == frozenset({effective_principal})
+        try:
+            resolver = getattr(audience_provider, "identity_resolver", None)
+            identity = getattr(resolver, "identity", None)
+        except Exception:
+            return False
+        if (
+            not callable(identity)
+            or not isinstance(destination_audience, frozenset)
+            or not destination_audience
+        ):
+            return False
+        human_audience: set[str] = set()
+        for value in destination_audience:
+            if not isinstance(value, str) or not value.strip():
+                return False
+            if value.startswith("service:"):
+                continue
+            try:
+                resolved = identity(value)
+                canonical = getattr(resolved, "canonical", None)
+                is_service = getattr(
+                    getattr(resolved, "access", None),
+                    "is_service",
+                    False,
+                )
+            except Exception:
+                return False
+            if resolved is None:
+                return False
+            if not isinstance(canonical, str) or not canonical:
+                return False
+            if is_service:
+                continue
+            if canonical.startswith("service:"):
+                continue
+            human_audience.add(canonical)
+        return frozenset(human_audience) == frozenset({effective_principal})
+    if source_kind in _SOURCE_KIND_SAME_CHANNEL_ONLY:
+        return False
+    if source_kind in _SOURCE_KIND_CHANNEL_AUDIENCE:
+        if audience_provider is None or not source_channel or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+            source_audience = audience_provider.audience_for(
+                source_channel, principal=source.principal,
+            )
+        except Exception:
+            return False
+        return bool(
+            destination_audience
+            and source_audience
+            and destination_audience <= source_audience
+        )
+    if source_kind == SourceKind.SERVICE:
+        return not source.domain.startswith("channel")
+    if source_kind == SourceKind.PROTECTED_TOOL:
+        return True
+    if source_kind == SourceKind.ACP_HANDS_RESULT:
+        return True
+    # agent_self without trusted informational integrity has no further allowance.
+    return False
+
+
+def _ifc_blocking_source(
+    ifc_labels: Any,
+    auth_context: Any,
+    sink_category: SinkCategory,
+    *,
+    forge_scope: Any = None,
+) -> tuple[Any | None, str]:
+    """Classify one source for an IFC refusal and the certainty of the match."""
+    from .models import InformationFlowLabels
+
+    current = ifc_labels
+    state = getattr(auth_context, "ifc_state", None)
+    get_current = getattr(state, "current", None)
+    if callable(get_current):
+        candidate = get_current(ifc_labels)
+        if isinstance(candidate, InformationFlowLabels):
+            current = candidate
+    if not isinstance(current, InformationFlowLabels):
+        raise TypeError("IFC source classifier received invalid labels")
+    if not current.sources:
+        return None, "no_sources"
+
+    if sink_category is SinkCategory.FORGE and forge_scope is not None:
+        lineage = getattr(getattr(auth_context, "ifc_state", None), "own_push_lineage", None)
+        own_push_lineage = lineage() if callable(lineage) else None
+        for source in current.sources:
+            if _forge_repository_scope_mismatch(
+                InformationFlowLabels(sources=(source,)), forge_scope,
+                own_push_lineage=own_push_lineage,
+            ) is not None:
+                return source, "causing_source"
+
+    if sink_category is SinkCategory.SAME_CHANNEL:
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(
+            getattr(auth_context, "channel_id", None)
+        )
+        service = get_trusted_service_from_auth_context(auth_context)
+        effective_principal = (
+            f"service:{service.canonical}"
+            if service is not None
+            else getattr(auth_context, "canonical_principal", None)
+        )
+        if effective_principal and resolved_triggering:
+            for source in current.sources:
+                if not _source_is_triggering_channel_compatible(
+                    source,
+                    effective_principal=effective_principal,
+                    triggering_principal=getattr(auth_context, "principal", None),
+                    resolved_triggering=resolved_triggering,
+                    audience_provider=getattr(auth_context, "audience_provider", None),
+                    cross_platform_pull=getattr(
+                        auth_context, "cross_platform_pull", True,
+                    ),
+                    triggering_bridge_instance=getattr(
+                        auth_context, "bridge_instance", None,
+                    ),
+                ):
+                    return source, "causing_source"
+
+    # This predicate is itself the gate for application egress and disables the
+    # trusted-operator exemptions for shell, file, spawn, and channel sinks.
+    for source in current.sources:
+        if source.has_untrusted_active_ingest:
+            return source, "causing_source"
+
+    # The remaining gate rules evaluate the labels as a set. Preserve a bounded
+    # example without claiming that tuple order identifies the cause.
+    return current.sources[0], "representative_source"
+
+
+def _fixed_web_search_url() -> str | None:
+    from .tools.web_search_destination import web_search_url
+
+    return normalize_sink_destination(
+        SinkCategory.NETWORK,
+        web_search_url(),
+    )
+
+
+_REPOSITORY_RESULT_RESOURCE = re.compile(
+    r"^(?P<repo>.+)#pull/(?P<pr>[1-9][0-9]*)@(?P<head>[0-9a-fA-F]{40})$",
+)
+
+
+def _trusted_forge_repository_source(source: Any) -> bool:
+    """Author-attested repository content needs no destination scope binding."""
+    return (
+        source.domain == "repository"
+        and source.domain_qualifier is None
+        and source.integrity == "trusted"
+        and source.is_complete
+    )
+
+
+def _forge_repository_scope_mismatch(
+    ifc_labels: Any,
+    scope: Any,
+    *,
+    audit_fields: dict[str, Any] | None = None,
+    own_push_lineage: dict[tuple[str, int], frozenset[str]] | None = None,
+) -> tuple[str, str, str] | None:
+    """Return the first repository result that is outside a forge sink scope."""
+    expected_repo = getattr(scope, "canonical_repo", None)
+    expected_issue = getattr(scope, "issue_number", None)
+    expected_pr = getattr(scope, "pr_number", None)
+    expected_head = getattr(scope, "observed_head_sha", None)
+
+    def mismatch(repo: str, pr: str, component: str) -> tuple[str, str, str]:
+        if audit_fields is not None:
+            # Do not reuse the permissive policy parser for audit output. Only
+            # complete, bounded identifiers may cross into the audit record.
+            repo_pattern = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}"
+            safe_source = (
+                re.fullmatch(
+                    rf"({repo_pattern})#pull/([1-9][0-9]{{0,9}})@([0-9a-fA-F]{{40}})",
+                    resource_id,
+                )
+                if isinstance(resource_id, str) and len(resource_id) <= 258
+                else None
+            )
+            audit_fields.update({
+                "component": component,
+                "source_canonical_repo": safe_source[1] if safe_source else None,
+                "source_pr_number": int(safe_source[2]) if safe_source else None,
+                "source_observed_head_sha": safe_source[3] if safe_source else None,
+                "sink_canonical_repo": (
+                    expected_repo if isinstance(expected_repo, str)
+                    and len(expected_repo) <= 201
+                    and re.fullmatch(repo_pattern, expected_repo) else None
+                ),
+                "sink_pr_number": (
+                    expected_pr if type(expected_pr) is int
+                    and 0 < expected_pr < 10**10 else None
+                ),
+                "sink_observed_head_sha": (
+                    expected_head if isinstance(expected_head, str)
+                    and len(expected_head) == 40
+                    and re.fullmatch(r"[0-9a-fA-F]{40}", expected_head) else None
+                ),
+            })
+        return repo, pr, component
+
+    for source in getattr(ifc_labels, "sources", ()):
+        if _trusted_forge_repository_source(source):
+            continue
+        if (
+            getattr(source, "domain", None) != "repository"
+            or getattr(source, "domain_qualifier", None) is not None
+        ):
+            continue
+        resource_id = getattr(source, "resource_id", None)
+        match = (
+            _REPOSITORY_RESULT_RESOURCE.fullmatch(resource_id)
+            if isinstance(resource_id, str) else None
+        )
+        if match is None:
+            return mismatch(str(resource_id or "unknown"), "unknown", "resource_id")
+        source_repo = match.group("repo")
+        source_pr = int(match.group("pr"))
+        source_head = match.group("head")
+        if isinstance(expected_issue, int):
+            if not (
+                isinstance(expected_repo, str)
+                and source_repo.casefold() == expected_repo.casefold()
+            ):
+                return mismatch(source_repo, str(source_pr), "canonical_repo")
+            continue
+        if not isinstance(expected_repo, str) or (
+            source_repo.casefold() != expected_repo.casefold()
+        ):
+            return mismatch(source_repo, str(source_pr), "canonical_repo")
+        if source_pr != expected_pr:
+            return mismatch(source_repo, str(source_pr), "pr_number")
+        if not isinstance(expected_head, str) or (
+            source_head.casefold() != expected_head.casefold()
+            and source_head.casefold() not in (
+                own_push_lineage or {}
+            ).get((expected_repo.casefold(), expected_pr), frozenset())
+        ):
+            return mismatch(source_repo, str(source_pr), "observed_head_sha")
+    return None
+
+
+def _sink_category_capability_turn_id(auth_context: Any) -> str | None:
+    """Resolve reusable authority from the durable AuthContext IFC carrier."""
+    from ._context import get_current_turn
+
+    state = getattr(auth_context, "ifc_state", None)
+    get_bound_turn_id = getattr(state, "sink_category_turn_id", None)
+    if not callable(get_bound_turn_id):
+        return None
+    turn_id = get_bound_turn_id()
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+
+    # Forked SDK/MCP tasks can legitimately lose the ContextVar. The immutable
+    # request binding on the genuine IFC state remains authoritative there. If
+    # ambient turn context is present, retain the stronger cross-check so a
+    # carrier attached to another TurnContext still fails closed.
+    turn = get_current_turn()
+    if turn is None:
+        return turn_id
+    if (
+        getattr(turn, "turn_id", None) != turn_id
+        or getattr(getattr(turn, "auth_context", None), "ifc_state", None) is not state
+    ):
+        return None
+    return turn_id
+
+
+class SinkGate:
+    """Information flow control sink gate (chainlink #871).
+
+    Enforces that private/confidential data cannot flow to incompatible sinks.
+    Unknown labels/destinations fail closed (deny).
+
+    Propagation: Labels propagate to subagents, spawns, continuations, and
+    resumed turns. Same-principal/same-channel flows pass only when every
+    label is destination-compatible.
+    """
+
+    _global_resolver: Any = None
+
+    @classmethod
+    def set_identity_resolver(cls, resolver: Any) -> None:
+        # PRODUCTION-DEAD (chainlink #895): Never called in production.
+        # Retained for API stability; the resolver is not used by check_sink_flow.
+        cls._global_resolver = resolver
+
+    @staticmethod
+    def _service_tier_allows(
+        tool_name: str,
+        ifc_labels: Any,
+        auth_context: Any,
+        service: ServicePrincipal,
+        target: str | None = None,
+        repo_pr_action_scope: Any = None,
+    ) -> tuple[bool, str | None]:
+        """Apply the integrity axis to one exact declared service capability."""
+        if not service.has_capability(tool_name):
+            return False, None
+        capability_tier = TRIGGER_CAPABILITY_TIERS.get(
+            tool_name,
+            _LEGACY_SERVICE_SINK_TIERS.get(tool_name, CapabilityTier.UNBOUNDED),
+        )
+        if tool_name in {"shell_exec", "bash_async"}:
+            chainlink_argv = _chainlink_target_argv(target)
+            if chainlink_argv is not None:
+                has_untrusted_active_ingest = _has_untrusted_active_ingest(
+                    auth_context, getattr(auth_context, "ifc_labels", None),
+                    missing_is_tainted=True,
+                )
+                if (
+                    _chainlink_command_is_mutation(chainlink_argv)
+                    and has_untrusted_active_ingest
+                ):
+                    return False, _CHAINLINK_TAINT_REFUSAL
+                # Bounded tracker queries remain available even where the
+                # surrounding profile's shell is taint-gated.
+                return True, None
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
+        )
+        if capability_tier is CapabilityTier.CODE_EXECUTION:
+            if tool_name == "repo_test":
+                # Checkout output is active ingestion, but this runner is bounded
+                # to the resolved immutable scope rather than arbitrary execution.
+                state = getattr(auth_context, "ifc_state", None)
+                if state is not None:
+                    ifc_labels = state.current(ifc_labels)
+                sources = getattr(ifc_labels, "sources", ())
+                return (
+                    all(
+                        not source.has_untrusted_active_ingest
+                        or (
+                            source.domain == "repository"
+                            and source.domain_qualifier is None
+                        )
+                        for source in sources
+                    )
+                    and _forge_repository_scope_mismatch(
+                        ifc_labels, repo_pr_action_scope,
+                        own_push_lineage=(
+                            state.own_push_lineage() if state is not None else None
+                        ),
+                    ) is None,
+                    None,
+                )
+            return (
+                tool_name in _WORKLINK_BUILD_TOOLS
+                and not has_untrusted_active_ingest,
+                None,
+            )
+        if capability_tier is CapabilityTier.UNBOUNDED:
+            return (
+                not _egress_target_requires_taint_gate(
+                    tool_name, target, auth_context,
+                )
+                or not has_untrusted_active_ingest,
+                None,
+            )
+        return True, None
+
+    @staticmethod
+    def _is_trusted_operator_turn(ifc_labels: Any, auth_context: Any) -> bool:
+        """Recognize a bridge-authenticated operator's own turn ingress."""
+        from .models import Integrity, IntegrityEffect, TurnInteractivity
+
+        if (
+            auth_context is None
+            or get_trusted_service_from_auth_context(auth_context) is not None
+            or getattr(auth_context, "trigger", None) != "user_message"
+            or getattr(auth_context, "interactivity", None) != TurnInteractivity.INTERACTIVE
+            or getattr(auth_context, "event_ingress", None) is not None
+        ):
+            return False
+        principal = getattr(auth_context, "canonical_principal", None)
+        channel = getattr(auth_context, "resource_id", None)
+        domain = getattr(auth_context, "domain", None)
+        bridge = getattr(auth_context, "bridge_instance", None)
+        if not all((principal, channel, domain, bridge)):
+            return False
+        return any(
+            source.source_kind == "channel"
+            and source.principal == principal
+            and source.domain == domain
+            and source.domain_qualifier == getattr(auth_context, "domain_qualifier", None)
+            and source.resource_id == channel
+            and source.bridge_instance == bridge
+            and principal in source.authorized_principals
+            and source.integrity == Integrity.TRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            for source in getattr(ifc_labels, "sources", ())
+        )
+
+    @classmethod
+    def _is_admin_operator_turn(cls, ifc_labels: Any, auth_context: Any) -> bool:
+        """Recognize an untainted, bridge-authenticated admin operator turn."""
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
+        )
+        return (
+            cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            and has_untrusted_active_ingest is False
+            and "admin" in (getattr(auth_context, "roles", ()) or ())
+        )
+
+    @classmethod
+    def check_sink_flow(
+        cls, tool_name: str, target: str | None, ifc_labels: Any,
+        auth_context: Any, *, origin: str = "tool_call", **kwargs: Any,
+    ) -> "ToolAuthorization":
+        """Audit the proposed egress veto after the unchanged sink decision."""
+        decision = cls._check_sink_flow_decision(
+            tool_name, target, ifc_labels, auth_context, **kwargs,
+        )
+        try:
+            category = kwargs.get("sink_category") or get_sink_category(tool_name)
+            shadow_category = category
+            # send_message's descriptor is SAME_CHANNEL; classify its target
+            # only for telemetry, inside the fail-safe boundary.
+            if (tool_name == "send_message" and category is SinkCategory.SAME_CHANNEL
+                    and target and ChannelResourceAdapter._resolve_channel(target)
+                    != ChannelResourceAdapter._resolve_channel(
+                        getattr(auth_context, "channel_id", None))):
+                shadow_category = SinkCategory.CROSS_CHANNEL
+            if (tool_name in {"fetch_url", "web_search", "webhook", "http_request", "send_message"}
+                    and shadow_category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK,
+                                            SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}):
+                verdict = _egress_veto_shadow_verdict(
+                    tool_name, shadow_category, target, ifc_labels, auth_context, decision,
+                )
+                if verdict is not None:
+                    from .event_logger import log_event_sync
+
+                    service = get_trusted_service_from_auth_context(auth_context)
+                    principal = service.canonical if service is not None else None
+                    host = None
+                    if category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK}:
+                        try:
+                            host = urlsplit(target or "").hostname
+                            if host is not None:
+                                try:
+                                    host = host.encode("idna").decode("ascii").lower()
+                                except UnicodeError:
+                                    pass
+                        except ValueError:
+                            pass
+                    log_event_sync(
+                        "egress_veto_would_block",
+                        tool=tool_name, sink_category=shadow_category.value,
+                        origin=origin,
+                        trigger=getattr(auth_context, "trigger", None),
+                        service_principal=principal,
+                        poller=(principal.removeprefix("poller:")
+                                if principal and principal.startswith("poller:") else None),
+                        destination_host=host,
+                        reason=verdict[0], exemption_missed=verdict[1],
+                        source=_egress_shadow_source(auth_context, ifc_labels),
+                        actual_allowed=decision.allowed,
+                    )
+        except Exception:
+            # Best-effort telemetry must never alter the returned decision.
+            log.debug("egress shadow audit unavailable", exc_info=True)
+        return decision
+
+    @classmethod
+    def _check_sink_flow_decision(
+        cls,
+        tool_name: str,
+        target: str | None,
+        ifc_labels: Any,
+        auth_context: Any,
+        *,
+        enforce: bool = False,
+        sink_category: SinkCategory | None = None,
+        allow_untrusted_active_ingest: bool = False,
+        repo_review_state: Any = None,
+        repo_review_state_refusal: str | None = None,
+        repo_pr_action_scope: Any = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_refusal: str | None = None,
+        operator_shell_request_identity: Any = None,
+        tool_call_id: str | None = None,
+        requested_cwd: object = None,
+        client_authorized_host_execution: Any = None,
+        request_identity: Any = None,
+    ) -> "ToolAuthorization":
+        """Check if IFC labels permit flow to the given sink.
+
+        Args:
+            tool_name: Name of the tool being called
+            target: Target destination (channel, file path, URL, etc.)
+            ifc_labels: InformationFlowLabels from the turn context
+            auth_context: AuthContext with principal and roles
+            enforce: Whether to enforce or allow in shadow mode
+
+        Returns:
+            ToolAuthorization with allowed/reason fields populated
+        """
+        from .models import InformationFlowLabels
+
+        sink_category = sink_category or get_sink_category(tool_name)
+        service = get_trusted_service_from_auth_context(auth_context)
+        if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
+            return _scheduled_write_denial(tool_name)
+        # Both service and operator routes need a veto before any shadow allow.
+        # Enforcement already refuses these calls; leave its original decisions,
+        # including destination-denial reasons and refusal details, unchanged.
+        if (not enforce and tool_name in _WORKLINK_BUILD_TOOLS
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return _worklink_build_denial(
+                tool_name, service, auth_context, ifc_labels,
+            )
+        # This veto precedes both shadow allowances and the generic same-PR rule.
+        if (tainted_write_target(tool_name, target)
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return _tainted_write_denial(
+                tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
+            )
+        # Enforcement already refuses all tainted tracker mutations with the
+        # original reason/detail; only shadow mode needs this narrower veto.
+        if (not enforce and tool_name in {"shell_exec", "bash_async"}
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            execution_argv = None
+            refusal = None
+            reason = "chainlink_armed_work_blocked_by_untrusted_ingest"
+            bounded_operator = _operator_shell_binding_matches(
+                operator_shell_binding,
+                request_identity=operator_shell_request_identity,
+                auth_context_identity=auth_context,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                command=target,
+                requested_cwd=requested_cwd,
+            ) and cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            # This veto covers only declared-command paths that execute exact
+            # argv. Unknown service targets are refused by their profile gate,
+            # not by a substring check (which also catches read-only diagnostics).
+            # Generic bash execution cannot be confined by argv inspection; the
+            # shell-wide post-ingest veto below handles unbound execution.
+            if bounded_operator:
+                execution_argv = list(operator_shell_binding.argv)
+            elif service is not None and isinstance(target, str):
+                policy = service.sink_policy_for(tool_name)
+                if policy is not None and policy.adapter == "shell_profile":
+                    execution_argv, _reason, _rule = parse_service_shell_argv_with_diagnostics(
+                        target, policy.destination, review_state=repo_review_state,
+                        declared=getattr(service, "declared_shell_commands", ()) or (),
+                    )
+            if execution_argv:
+                # The gate pins Chainlink before execution. Normalize only that
+                # admitted executable for family classification, never re-parse
+                # the command text: quoted glob characters are literal operands.
+                classifier_argv = list(execution_argv)
+                if Path(classifier_argv[0]).name == "chainlink":
+                    classifier_argv[0] = "chainlink"
+                    if _target_matches_chainlink_command(classifier_argv):
+                        refusal = _chainlink_armed_work_refusal(
+                            execution_argv, requested_cwd, session_cwd=False,
+                        )
+                    else:
+                        # Operator declarations can admit more argv shapes than
+                        # the built-in classifier (notably Clap's `--`). Never
+                        # let an unclassified mutation skip the always-on veto.
+                        # Only an explicit read-only issue namespace is exempt;
+                        # no command text or label substring is consulted.
+                        arguments = _chainlink_arguments(classifier_argv)
+                        if not (arguments[:1] == ["issue"] and len(arguments) >= 2
+                                and arguments[1] in _CHAINLINK_QUERY_SUBCOMMANDS):
+                            refusal = (
+                                _CHAINLINK_ARMED_WORK_REFUSAL
+                                + " Unclassified Chainlink command; refusing the mutation."
+                            )
+            if refusal is not None:
+                return ToolAuthorization(
+                    tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False, reason=reason,
+                    required_tier=AccessTier.ADMIN, enforcement_enabled=True,
+                    would_block=True, refusal_detail=refusal,
+                )
+        # A shell command with no execution binding is not confined by inspecting
+        # its text. Apply this on continuations as well as chat turns. Keep the
+        # enforced route's existing decisions and reasons unchanged.
+        if (not enforce and tool_name in SHELL_PROCESS_TOOL_NAMES
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            bounded_operator = (
+                cls._is_trusted_operator_turn(ifc_labels, auth_context)
+                and _operator_shell_binding_matches(
+                    operator_shell_binding,
+                    request_identity=operator_shell_request_identity,
+                    auth_context_identity=auth_context,
+                    tool_name=tool_name, tool_call_id=tool_call_id,
+                    command=target, requested_cwd=requested_cwd,
+                )
+            )
+            # Trusted services retain their existing profile authorization and
+            # execution binding; a trigger string alone is never service authority.
+            bounded_service = service is not None
+            client_authorized = False
+            if client_authorized_host_execution is not None:
+                from .tools.client_provider import client_authorized_host_execution_matches
+
+                client_authorized = client_authorized_host_execution_matches(
+                    client_authorized_host_execution,
+                    request_identity=request_identity,
+                    auth_context_identity=auth_context,
+                    wrapper_name=tool_name,
+                )
+            if not (bounded_operator or bounded_service or client_authorized):
+                normalized = normalize_sink_destination(sink_category, target)
+                state = getattr(auth_context, "ifc_state", None)
+                principal = getattr(auth_context, "canonical_principal", None)
+                if (normalized is not None and isinstance(principal, str)
+                        and state is not None and state.consume_sink_approval(
+                            current=ifc_labels, sink_category=sink_category.value,
+                            destination=normalized, canonical_principal=principal,
+                            shadow=False,
+                        )):
+                    return ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.OPEN,
+                        allowed=True, reason="ifc_declassification_approved",
+                        service_principal=service, enforcement_enabled=False,
+                    )
+                return ToolAuthorization(
+                    tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False, reason="ifc_label_blocked:shell_process",
+                    service_principal=service, required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=True, would_block=True,
+                    refusal_detail=_generic_shell_ingest_refusal(auth_context),
+                )
+        if not isinstance(ifc_labels, InformationFlowLabels):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="missing_ifc_labels",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=(
+                    resolve_sink_target(tool_name, sink_category, target, service)
+                    if target else None
+                ),
+            )
+
+        if sink_category == SinkCategory.UNKNOWN:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="unknown_sink_category",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+            )
+
+        if tool_name in {"memory_propose", "commitment_propose_closure"}:
+            # Review queue only: no atom is written. Keep normal capability
+            # checks in authorize_tool, but do not impose SAGA's trust gate.
+            return ToolAuthorization(
+                tool_name=tool_name, decision=OperationDecision.OPEN,
+                allowed=True, reason="memory_proposal_queue",
+                service_principal=service, enforcement_enabled=enforce,
+            )
+        if sink_category is SinkCategory.SAGA:
+            taint_refusal = saga_mutation_taint_refusal(auth_context, ifc_labels)
+            if taint_refusal is not None:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="saga_mutation_blocked_by_tainted_turn",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    refusal_detail=taint_refusal,
+                )
+
+        if not target:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="unknown_sink_destination",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                refusal_detail=(
+                    "MIMIR_OPERATOR_ALERT_CHANNEL is not configured"
+                    if tool_name == "operator_alert"
+                    else None
+                ),
+            )
+
+        # Activity-panel payloads are constrained at their producer to fixed
+        # harness metadata (status, sanitized tool names, and counts). They do
+        # not carry turn content, so turn taint is not relevant to this display.
+        if sink_category is SinkCategory.HARNESS_DISPLAY:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                reason="harness_metadata_display",
+                service_principal=service,
+                enforcement_enabled=enforce,
+                resolved_sink_target=resolve_sink_target(
+                    tool_name, sink_category, target, service,
+                ),
+            )
+
+        is_application_egress = sink_category in {
+            SinkCategory.NETWORK,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.EXTERNAL_MCP,
+        }
+        normalized_target = normalize_sink_destination(sink_category, target)
+        resolved_target = resolve_sink_target(
+            tool_name, sink_category, target, service,
+        )
+        # Hands results carry complete, untrusted, active-ingest labels scoped to the
+        # originating ACP channel (see classify_protected_result). The general
+        # untrusted-active-ingest veto and the channel-compatibility predicate already
+        # refuse every sink except a same-channel reply to that origin; a dedicated
+        # branch here was unobservable (mutation-tested) and is deliberately omitted.
+        egress_target_requires_taint_gate = _egress_target_requires_taint_gate(
+            tool_name, target, auth_context,
+        )
+        verbatim_ingest_taint_exempt = (
+            tool_name == "fetch_url"
+            and _target_is_verbatim_ingest_url(target, auth_context)
+        )
+        if (
+            is_application_egress
+            and egress_target_requires_taint_gate
+            and ifc_labels.labels
+            and not ifc_labels.sources
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason=f"ifc_label_blocked:{sink_category.value}",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+            )
+        state = getattr(auth_context, "ifc_state", None)
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
+            missing_is_tainted=tool_name in {"shell_exec", "bash_async"},
+        )
+        client_authorized = False
+        if client_authorized_host_execution is not None:
+            from .tools.client_provider import client_authorized_host_execution_matches
+
+            client_authorized = client_authorized_host_execution_matches(
+                client_authorized_host_execution,
+                request_identity=request_identity,
+                auth_context_identity=auth_context,
+                wrapper_name=tool_name,
+            )
+        operator_binding_matches = _operator_shell_binding_matches(
+            operator_shell_binding,
+            request_identity=operator_shell_request_identity,
+            auth_context_identity=auth_context,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            command=target,
+            requested_cwd=requested_cwd,
+        )
+        if (
+            has_untrusted_active_ingest
+            and cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            and sink_category is SinkCategory.SHELL_PROCESS
+            and operator_binding_matches
+            and operator_shell_binding is not None
+            and operator_shell_binding.chainlink_mutation
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="chainlink_mutation_blocked_by_untrusted_ingest",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+                refusal_detail=_CHAINLINK_TAINT_REFUSAL,
+            )
+        # Shell remains an executable sink for every principal. Preserve only
+        # the existing request-bound operator/client allowances and bounded
+        # tracker queries; these still pass capability/destination checks below.
+        # Neither an admin role nor declassification bypasses this veto.
+        if tool_name in {"shell_exec", "bash_async"} and has_untrusted_active_ingest:
+            chainlink_argv = _chainlink_target_argv(target)
+            mutation = (
+                chainlink_argv is not None
+                and _chainlink_command_is_mutation(chainlink_argv)
+            )
+            bounded_execution = client_authorized or (
+                operator_binding_matches
+                and cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            )
+            if mutation or (chainlink_argv is None and not bounded_execution):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason=(
+                        "chainlink_mutation_blocked_by_untrusted_ingest"
+                        if mutation else "ifc_label_blocked:shell_process"
+                    ),
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                    refusal_detail=_CHAINLINK_TAINT_REFUSAL if mutation else None,
+                )
+        if (
+            is_application_egress
+            and egress_target_requires_taint_gate
+            and not allow_untrusted_active_ingest
+            and not client_authorized
+            and has_untrusted_active_ingest
+        ):
+            canonical_principal = getattr(auth_context, "canonical_principal", None)
+            if (
+                normalized_target is not None
+                and isinstance(canonical_principal, str)
+                and state is not None
+                and state.consume_sink_approval(
+                    current=ifc_labels,
+                    sink_category=sink_category.value,
+                    destination=normalized_target,
+                    canonical_principal=canonical_principal,
+                    shadow=not enforce,
+                )
+            ):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    reason="ifc_declassification_approved",
+                    service_principal=service,
+                    enforcement_enabled=enforce,
+                    resolved_sink_target=resolved_target,
+                )
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason=f"ifc_label_blocked:{sink_category.value}",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+            )
+        if tool_name == "web_search":
+            fixed_web_search_url = _fixed_web_search_url()
+            if fixed_web_search_url is None or normalized_target != fixed_web_search_url:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="egress_destination_not_approved",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                )
+        if tool_name == "fetch_url" and (
+            normalized_target is None
+            or not fetch_url_is_approved(target, auth_context)
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="egress_destination_not_approved",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+            )
+        if tool_name in {"webhook", "http_request"} and (
+            normalized_target is None
+            or not _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="egress_destination_not_approved",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+            )
+        service_policy: ServiceSinkPolicy | None = None
+        if service is not None and sink_category is SinkCategory.SAME_CHANNEL:
+            candidate = service.sink_policy_for(tool_name)
+            if candidate is not None:
+                adapter = _SERVICE_SINK_ADAPTERS.get(candidate.adapter)
+                triggering = getattr(auth_context, "channel_id", None)
+                if target != triggering:
+                    if not _sink_adapter_admits(
+                        adapter, target, candidate.destination, service,
+                        auth_context=auth_context,
+                    ):
+                        return ToolAuthorization(
+                            tool_name=tool_name,
+                            decision=OperationDecision.ADMIN_REQUIRED,
+                            allowed=not enforce,
+                            reason="service_sink_destination_denied",
+                            service_principal=service,
+                            required_tier=AccessTier.ADMIN,
+                            enforcement_enabled=enforce,
+                            is_shadow_decision=not enforce,
+                            would_block=True,
+                            resolved_sink_target=resolved_target,
+                        )
+                    service_policy = candidate
+        if service is not None and (sink_category in {
+            SinkCategory.SHELL_PROCESS,
+            SinkCategory.SPAWN,
+            SinkCategory.FILE,
+            SinkCategory.NOTIFICATION,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.NETWORK,
+            SinkCategory.EXTERNAL_MCP,
+        } or (sink_category is SinkCategory.PROPOSAL and service.trigger == "poller")):
+            tier_allowed, tier_refusal = cls._service_tier_allows(
+                tool_name, ifc_labels, auth_context, service, target,
+            )
+            if not tier_allowed:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason=(
+                        "chainlink_mutation_blocked_by_untrusted_ingest"
+                        if tier_refusal else f"ifc_label_blocked:{sink_category.value}"
+                    ),
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                    refusal_detail=tier_refusal,
+                )
+            service_policy = service.sink_policy_for(tool_name)
+            adapter = (
+                _SERVICE_SINK_ADAPTERS.get(service_policy.adapter)
+                if service_policy is not None
+                else None
+            )
+            review_state = (
+                repo_review_state
+                if repo_review_state is not None
+                else getattr(auth_context, "repo_review_state", None)
+            )
+            service_target_allowed = False
+            if service_policy is not None and adapter is not None:
+                service_target_allowed = (
+                    not (
+                        adapter is _target_matches_shell_profile
+                        and service_policy.destination == "repo_review"
+                        and repo_review_state_refusal is not None
+                    )
+                    and _sink_adapter_admits(
+                        adapter, target, service_policy.destination, service,
+                        review_state=review_state, auth_context=auth_context,
+                    )
+                )
+            if (
+                not service_target_allowed
+                and sink_category is SinkCategory.FILE
+                and service.github_activity
+            ):
+                service_target_allowed = _target_within_active_pr_checkout_lease(
+                    target, review_state,
+                )
+            fixed_file_destination = tool_name in _FIXED_SERVICE_SINK_OPERATIONS
+            synthesis_scope_denied = (
+                service.canonical == "synthesis"
+                and sink_category is SinkCategory.FILE
+                and not fixed_file_destination
+                and resolve_large_tool_results_target(target) is None
+                and not _synthesis_target_matches_session(
+                    target, getattr(auth_context, "channel_id", None),
+                )
+            )
+            github_repo_scope_refusal = None
+            scope = None
+            if (
+                (
+                    service.authority_profile == "github"
+                    # Own-PR heartbeat maintenance repairs conflicts through the
+                    # file tools, so it needs the same active-lease write gate as
+                    # poller remediation. The in-lease write grant
+                    # check and the out-of-lease denial below are unchanged, so
+                    # this widens WHO reaches the gate, never what it permits.
+                    or heartbeat_git_authority_enabled(service)
+                )
+                and sink_category is SinkCategory.FILE
+            ):
+                review_state = (
+                    repo_review_state
+                    if repo_review_state is not None
+                    else getattr(auth_context, "repo_review_state", None)
+                )
+                scope = getattr(review_state, "action_scope", None)
+                target_in_lease = _target_within_active_pr_checkout_lease(
+                    target, review_state,
+                )
+                if target_in_lease:
+                    service_target_allowed = True
+                    if not _repo_review_action_allowed(
+                        review_state, _registered_review_action("write", auth_context),
+                    ):
+                        github_repo_scope_refusal = "repo_pr_write_not_granted"
+                elif scope is not None:
+                    lease = getattr(review_state, "checkout_lease", None)
+                    roots = (
+                        Path(scope.canonical_root),
+                        *(
+                            (Path(lease.lease_root),)
+                            if lease is not None else ()
+                        ),
+                    )
+                    try:
+                        resolved_target_path = Path(target).resolve(strict=False)
+                        targets_pr_checkout_area = any(
+                            resolved_target_path.is_relative_to(root.resolve(strict=True))
+                            for root in roots
+                        )
+                    except (OSError, RuntimeError):
+                        targets_pr_checkout_area = True
+                    if targets_pr_checkout_area:
+                        service_target_allowed = False
+                        github_repo_scope_refusal = (
+                            "repo_pr_target_outside_active_lease"
+                        )
+            if (
+                (adapter is None and not fixed_file_destination)
+                or synthesis_scope_denied
+                or (not service_target_allowed and not fixed_file_destination)
+                or github_repo_scope_refusal is not None
+            ):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason=(
+                        github_repo_scope_refusal
+                        if github_repo_scope_refusal is not None
+                        else "service_sink_destination_denied"
+                    ),
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                    refusal_detail=(
+                        repo_review_state_refusal
+                        or (
+                            _poller_write_roots_refusal_detail(
+                                service, service_policy, auth_context,
+                            )
+                            if sink_category is SinkCategory.FILE
+                            and adapter is _target_within_trigger_service_write_roots
+                            else None
+                        )
+                        or _service_shell_refusal_detail(
+                            target, service_policy, review_state,
+                        )
+                        or (
+                            "MIMIR_OPERATOR_ALERT_CHANNEL is not configured"
+                            if tool_name == "operator_alert"
+                            and not os.environ.get(
+                                "MIMIR_OPERATOR_ALERT_CHANNEL", "",
+                            ).strip()
+                            else None
+                        )
+                    ),
+                    repo_pr_action_scope=scope,
+                )
+
+        if not ifc_labels.labels:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                reason="no_labels",
+                service_principal=service,
+                enforcement_enabled=enforce,
+                resolved_sink_target=resolved_target,
+            )
+
+        if sink_category is SinkCategory.FORGE:
+            forge_scope_mismatch: dict[str, Any] = {}
+            mismatch = (
+                None
+                if _is_registered_retained_scope(repo_pr_action_scope)
+                else _forge_repository_scope_mismatch(
+                    ifc_labels, repo_pr_action_scope,
+                    audit_fields=forge_scope_mismatch,
+                    own_push_lineage=(
+                        auth_context.ifc_state.own_push_lineage()
+                        if getattr(auth_context, "ifc_state", None) is not None else None
+                    ),
+                )
+            )
+            if mismatch is not None:
+                source_repo, source_pr, mismatch_component = mismatch
+                destination_repo = getattr(
+                    repo_pr_action_scope, "canonical_repo", "unknown",
+                )
+                destination_pr = getattr(
+                    repo_pr_action_scope, "pr_number", "unknown",
+                )
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="ifc_label_blocked:forge",
+                    forge_scope_mismatch=forge_scope_mismatch,
+                    repo_pr_action_scope=repo_pr_action_scope,
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                    refusal_detail=(
+                        f"repository result from {source_repo}#{source_pr} cannot "
+                        f"flow to {destination_repo}#{destination_pr}: repository, "
+                        "pull request, and observed head must match "
+                        f"(mismatched component: {mismatch_component})"
+                    ),
+                )
+
+        allowed_sinks = cls._get_allowed_sinks(
+            tool_name,
+            sink_category,
+            auth_context,
+            ifc_labels=ifc_labels,
+            service_policy=service_policy,
+            target=target,
+            operator_shell_binding=operator_shell_binding,
+            operator_shell_request_identity=operator_shell_request_identity,
+            tool_call_id=tool_call_id,
+            requested_cwd=requested_cwd,
+            client_authorized_host_execution=client_authorized,
+            repo_pr_action_scope=repo_pr_action_scope,
+        )
+        effective_target = (
+            ChannelResourceAdapter._resolve_channel(target)
+            if sink_category in {
+                SinkCategory.SAME_CHANNEL,
+                SinkCategory.CROSS_CHANNEL,
+                SinkCategory.DIRECT_MESSAGE,
+            }
+            else target
+        )
+
+        can_flow = ifc_labels.can_flow_to(effective_target or "", allowed_sinks)
+
+        if not can_flow:
+            normalized_target = normalize_sink_destination(sink_category, target)
+            state = getattr(auth_context, "ifc_state", None)
+            canonical_principal = getattr(auth_context, "canonical_principal", None)
+            if (
+                normalized_target is not None
+                and isinstance(canonical_principal, str)
+                and state is not None
+                and state.consume_sink_approval(
+                    current=ifc_labels,
+                    sink_category=sink_category.value,
+                    destination=normalized_target,
+                    canonical_principal=canonical_principal,
+                    turn_id=(
+                        _sink_category_capability_turn_id(auth_context)
+                        if sink_category in _SINK_CATEGORY_CAPABILITY_ELIGIBLE
+                        else None
+                    ),
+                    shadow=not enforce,
+                )
+            ):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    reason="ifc_declassification_approved",
+                    service_principal=service,
+                    enforcement_enabled=enforce,
+                    resolved_sink_target=resolved_target,
+                )
+            reason = f"ifc_label_blocked:{sink_category.value}"
+            is_shadow = not enforce
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason=reason,
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=is_shadow,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+                refusal_detail=(
+                    operator_shell_refusal
+                    if sink_category is SinkCategory.SHELL_PROCESS
+                    and isinstance(operator_shell_refusal, str)
+                    else None
+                ),
+            )
+
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.OPEN,
+            allowed=True,
+            reason=(
+                "taint_gate_exempt:verbatim_ingest_url"
+                if has_untrusted_active_ingest and verbatim_ingest_taint_exempt
+                else "ifc_allowed"
+            ),
+            service_principal=service,
+            enforcement_enabled=enforce,
+            resolved_sink_target=resolved_target,
+        )
+
+    @classmethod
+    def _get_allowed_sinks(
+        cls,
+        tool_name: str,
+        category: SinkCategory,
+        auth_context: Any,
+        *,
+        ifc_labels: Any,
+        service_policy: ServiceSinkPolicy | None = None,
+        target: str | None = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_request_identity: Any = None,
+        tool_call_id: str | None = None,
+        requested_cwd: object = None,
+        client_authorized_host_execution: bool = False,
+        repo_pr_action_scope: Any = None,
+    ) -> frozenset[str]:
+        """Return configured job destinations or label-compatible destinations.
+
+        Ordinary admin authority deliberately does not widen this set. Admins
+        must use the distinct audited declassification action before egress.
+        """
+        from .models import InformationFlowLabels, TurnInteractivity
+
+        if auth_context is None:
+            return frozenset()
+
+        service = get_trusted_service_from_auth_context(auth_context)
+        # A job's delivery grant is operator configuration, not an audience
+        # inference from its context. Selection owns source confidentiality;
+        # even active untrusted work material may be summarized to this set.
+        if (
+            service is not None
+            and service.trigger in {"poller", "scheduled_tick"}
+            and getattr(auth_context, "interactivity", None)
+            is TurnInteractivity.NON_INTERACTIVE
+            and tool_name == "send_message"
+            and category is SinkCategory.SAME_CHANNEL
+        ):
+            delivery = resolve_deliver_channel(
+                service.configured_delivery_channel,
+                os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+            )
+            if delivery:
+                return frozenset(channel for channel in (
+                    ChannelResourceAdapter._resolve_channel(
+                        getattr(auth_context, "channel_id", None),
+                    ),
+                    ChannelResourceAdapter._resolve_channel(delivery),
+                ) if channel)
+        trusted_operator_turn = cls._is_trusted_operator_turn(
+            ifc_labels, auth_context,
+        )
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
+        )
+        triggering_channel = getattr(auth_context, "channel_id", None)
+        resolved_target_channel = (
+            ChannelResourceAdapter._resolve_channel(target)
+            if category in {
+                SinkCategory.SAME_CHANNEL,
+                SinkCategory.CROSS_CHANNEL,
+                SinkCategory.DIRECT_MESSAGE,
+            }
+            else target
+        )
+        if client_authorized_host_execution and target is not None:
+            return frozenset({resolved_target_channel})
+        is_cross_channel_operation = category in {
+            SinkCategory.CROSS_CHANNEL,
+            SinkCategory.DIRECT_MESSAGE,
+            SinkCategory.NOTIFICATION,
+        } or (
+            category is SinkCategory.SAME_CHANNEL
+            and resolved_target_channel
+            != ChannelResourceAdapter._resolve_channel(triggering_channel)
+        )
+        sources = getattr(ifc_labels, "sources", None)
+        if (
+            cls._is_admin_operator_turn(ifc_labels, auth_context)
+            and is_cross_channel_operation
+            and target is not None
+            and isinstance(sources, tuple)
+            and bool(sources)
+            and all(_source_is_triggering_channel_compatible(
+                source,
+                effective_principal=getattr(
+                    auth_context, "canonical_principal", None,
+                ) or "",
+                triggering_principal=getattr(auth_context, "principal", None),
+                resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                    triggering_channel,
+                ),
+                audience_provider=getattr(auth_context, "audience_provider", None),
+                cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
+                admin_operator_cross_channel=True,
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
+            ) for source in sources)
+        ):
+            return frozenset({resolved_target_channel})
+        # As with web_search query egress, this trusted-operator allowance is a
+        # single-operator deployment decision, not a safe multi-user default.
+        if (
+            trusted_operator_turn
+            and not has_untrusted_active_ingest
+            and target is not None
+            and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
+        ):
+            return frozenset({target})
+        if (
+            trusted_operator_turn
+            and has_untrusted_active_ingest
+            and category is SinkCategory.SHELL_PROCESS
+            and target is not None
+            and _operator_shell_binding_matches(
+                operator_shell_binding,
+                request_identity=operator_shell_request_identity,
+                auth_context_identity=auth_context,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                command=target,
+                requested_cwd=requested_cwd,
+            )
+        ):
+            return frozenset({target})
+        if (
+            category is SinkCategory.FORGE
+            and target is not None
+            and isinstance(sources, tuple)
+            and bool(sources)
+            and all(
+                (
+                    (source.domain == "repository" and source.domain_qualifier is None)
+                    or (
+                        service is not None
+                        and service.trigger == "poller"
+                        and service.authority_profile == "github"
+                        and source.domain == "channel"
+                        and source.domain_qualifier is None
+                        and source.source_kind == "service"
+                        and source.bridge_instance == "poller"
+                        and source.resource_id == triggering_channel
+                        and source.principal == f"service:{service.canonical}"
+                        and source.integrity == "trusted"
+                        and source.is_complete
+                    )
+                )
+                or (
+                    _is_registered_retained_scope(repo_pr_action_scope)
+                    and source.domain == "worklink_retained_repository"
+                    and source.resource_id == (
+                        f"{repo_pr_action_scope.repository}"
+                        f"#issue/{repo_pr_action_scope.issue_id}"
+                        f"@retained/{repo_pr_action_scope.scope_id}"
+                    )
+                    and source.integrity == "trusted"
+                )
+                or (
+                    (
+                        (tool_name != "pr_submit_review" and repo_pr_action_scope is not None)
+                        or (
+                            getattr(repo_pr_action_scope, "pr_number", None) is not None
+                            and "admin" in (getattr(auth_context, "roles", ()) or ())
+                        )
+                    )
+                    and cls._is_trusted_operator_turn(
+                        InformationFlowLabels(sources=(source,)), auth_context,
+                    )
+                )
+                for source in sources
+            )
+            and (
+                _is_registered_retained_scope(repo_pr_action_scope)
+                or _forge_repository_scope_mismatch(
+                    ifc_labels,
+                    repo_pr_action_scope,
+                    own_push_lineage=(
+                        auth_context.ifc_state.own_push_lineage()
+                        if getattr(auth_context, "ifc_state", None) is not None else None
+                    ),
+                ) is None
+            )
+        ):
+            # Trusted GitHub poller ingress and author-attested repository results
+            # flow without source scope binding. Other repository results remain
+            # bounded by the PR/head scope; authorization of the action is separate.
+            return frozenset({target})
+        is_triggering_channel_reply = (
+            service is not None
+            and category is SinkCategory.SAME_CHANNEL
+            and service_policy is None
+        )
+        if service is not None and not is_triggering_channel_reply:
+            tier_allowed, _ = cls._service_tier_allows(
+                tool_name, ifc_labels, auth_context, service, target,
+                repo_pr_action_scope=repo_pr_action_scope,
+            )
+            if not tier_allowed:
+                return frozenset()
+
+        if service is not None and target is not None and category in {
+            SinkCategory.SAGA,
+            SinkCategory.SCHEDULER,
+            SinkCategory.PROPOSAL,
+            SinkCategory.FORGE,
+        }:
+            source_channels = getattr(ifc_labels, "source_channels", None)
+            service_channel = getattr(auth_context, "channel_id", None)
+            if (
+                isinstance(source_channels, frozenset)
+                and source_channels
+                and source_channels == frozenset({service_channel})
+            ):
+                return frozenset({target})
+            return frozenset()
+        if service is not None and service_policy is not None and target is not None:
+            source_channels = getattr(ifc_labels, "source_channels", None)
+            service_channel = getattr(auth_context, "channel_id", None)
+            if (
+                isinstance(source_channels, frozenset)
+                and source_channels
+                and service_channel
+                and source_channels == frozenset({service_channel})
+            ):
+                return frozenset({target})
+            return frozenset()
+
+        if category in {
+            SinkCategory.NETWORK,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.EXTERNAL_MCP,
+        } and target is not None:
+            return frozenset({target})
+        if category != SinkCategory.SAME_CHANNEL:
+            return frozenset()
+
+        if not triggering_channel:
+            return frozenset()
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(triggering_channel)
+        if not resolved_triggering:
+            return frozenset()
+
+        if tool_name == "send_message" and target is not None:
+            if _target_matches_operator_alert(
+                resolved_target_channel or "", "MIMIR_OPERATOR_ALERT_CHANNEL",
+            ):
+                return frozenset({resolved_target_channel})
+
+        canonical_principal = getattr(auth_context, "canonical_principal", None)
+        service = get_trusted_service_from_auth_context(auth_context)
+        service_source_principal = (
+            f"service:{service.canonical}" if service is not None else None
+        )
+        resource_id = getattr(auth_context, "resource_id", None)
+        sources = getattr(ifc_labels, "sources", None)
+        effective_principal = service_source_principal or canonical_principal
+        if not all((effective_principal, resource_id)):
+            return frozenset()
+        if not isinstance(sources, tuple) or not sources:
+            return frozenset()
+
+        for source in sources:
+            if not _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_principal,
+                triggering_principal=getattr(auth_context, "principal", None),
+                resolved_triggering=resolved_triggering,
+                audience_provider=getattr(auth_context, "audience_provider", None),
+                cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
+            ):
+                return frozenset()
+        if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
+            return frozenset()
+
+        return frozenset({resolved_triggering})
+
+
+def normalize_sink_destination(
+    sink_category: SinkCategory | str,
+    destination: Any,
+) -> str | None:
+    """Return the canonical exact destination used by approval and enforcement."""
+    try:
+        category = SinkCategory(sink_category)
+    except (TypeError, ValueError):
+        return None
+    if category is SinkCategory.UNKNOWN or not isinstance(destination, str):
+        return None
+    value = destination.strip()
+    if not value or "\x00" in value:
+        return None
+    if category in {SinkCategory.SAME_CHANNEL, SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}:
+        return ChannelResourceAdapter._resolve_channel(value) or None
+    if category in {SinkCategory.FILE, SinkCategory.SPAWN}:
+        try:
+            return str(Path(value).expanduser().resolve())
+        except (OSError, RuntimeError):
+            return None
+    if category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK}:
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                return None
+            if parsed.username is not None or parsed.password is not None:
+                return None
+            port = parsed.port
+            host = parsed.hostname.lower()
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            default_port = 80 if parsed.scheme.lower() == "http" else 443
+            netloc = host if port in {None, default_port} else f"{host}:{port}"
+            return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
+        except ValueError:
+            return None
+    return value
+
+
+def resolve_sink_target(
+    tool_name: str,
+    sink_category: SinkCategory,
+    target: str,
+    service: ServicePrincipal | None,
+) -> str | None:
+    """Return the concrete destination representation evaluated by the gate."""
+    if sink_category is not SinkCategory.SHELL_PROCESS:
+        return normalize_sink_destination(sink_category, target)
+    try:
+        argv = shlex.split(target)
+    except ValueError:
+        return None
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is not None and policy.adapter == "shell_profile":
+        execution_argv = parse_service_shell_argv(
+            target, policy.destination,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        )
+        if execution_argv is not None:
+            argv = execution_argv
+    return json.dumps(argv, ensure_ascii=True) if argv else None
+
+
+def approve_live_declassification(
+    auth_context: Any,
+    *,
+    turn_id: str | None,
+    sink_category: Any,
+    destination: Any,
+    reason: Any,
+) -> tuple[bool, str]:
+    """Approve one exact sink on the exact live admin request carrier."""
+    from ._context import get_current_turn
+    from .models import AuthContext, InformationFlowState
+
+    if not isinstance(auth_context, AuthContext):
+        return False, "missing_auth_context"
+    if "admin" not in auth_context.roles:
+        return False, "admin_required"
+    principal = auth_context.principal
+    canonical_principal = auth_context.canonical_principal
+    if not isinstance(principal, str) or not principal.strip():
+        return False, "missing_authenticated_admin"
+    if not isinstance(canonical_principal, str) or not canonical_principal.strip():
+        return False, "missing_authenticated_admin"
+    if (
+        auth_context.is_service
+        or "service" in auth_context.roles
+        or auth_context.service_authority is not None
+        or any(value.strip().lower().startswith("service:") for value in (principal, canonical_principal))
+    ):
+        return False, "service_identity_forbidden"
+    if (
+        auth_context.trigger != "user_message"
+        or auth_context.origin_trigger not in (None, "user_message", "acp_session")
+        or auth_context.event_ingress is not None
+    ):
+        return False, "user_origin_required"
+    if not isinstance(reason, str) or not reason.strip():
+        return False, "invalid_reason"
+    try:
+        category = SinkCategory(sink_category)
+    except (TypeError, ValueError):
+        return False, "unknown_sink_category"
+    normalized = normalize_sink_destination(category, destination)
+    if normalized is None:
+        return False, "malformed_destination"
+    state = auth_context.ifc_state
+    if not isinstance(state, InformationFlowState):
+        return False, "missing_ifc_state"
+
+    turn = get_current_turn()
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id.strip()
+        or turn is None
+        or turn.turn_id != turn_id
+        or not isinstance(getattr(turn, "auth_context", None), AuthContext)
+        or turn.auth_context.ifc_state is not state
+    ):
+        return False, "missing_live_turn"
+
+    def durable_audit(
+        labels: InformationFlowLabels, issued_at: float, expires_at: float,
+    ) -> bool:
+        source_labels = [
+            {
+                "principal": source.principal,
+                "domain": source.domain,
+                "domain_qualifier": source.domain_qualifier,
+                "resource_id": source.resource_id,
+                "bridge_instance": source.bridge_instance,
+                "sensitivity": source.sensitivity,
+                "authorized_principals": sorted(source.authorized_principals),
+                "source_kind": source.source_kind,
+                "integrity": source.integrity,
+                "integrity_effect": source.integrity_effect,
+            }
+            for source in sorted(
+                labels.sources,
+                key=lambda item: (
+                    str(item.domain),
+                    (item.domain_qualifier is not None, item.domain_qualifier or ""),
+                    str(item.resource_id), str(item.principal),
+                    str(item.sensitivity),
+                ),
+            )
+        ]
+        try:
+            from .event_logger import log_durable_event_sync
+
+            log_durable_event_sync(
+                "ifc_declassification",
+                source_labels=source_labels,
+                labels=sorted(labels.labels),
+                source_channels=sorted(labels.source_channels),
+                authenticated_admin={
+                    "principal": principal,
+                    "canonical_principal": canonical_principal,
+                    "roles": sorted(auth_context.roles),
+                },
+                reason=reason.strip(),
+                destination=normalized,
+                sink_category=category.value,
+                policy_version=IFC_POLICY_VERSION,
+                outcome="approved",
+                use_limit=1,
+                lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
+                issued_at_monotonic=issued_at,
+                expires_at_monotonic=expires_at,
+            )
+        except Exception as exc:
+            log.warning("ifc declassification audit failed: %s", exc)
+            return False
+        return True
+
+    approved = state.approve_sink_once(
+        fallback=auth_context.ifc_labels,
+        sink_category=category.value,
+        destination=normalized,
+        canonical_principal=canonical_principal,
+        lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
+        durable_audit=durable_audit,
+    )
+    if approved and category is SinkCategory.NETWORK:
+        # Destination approval persists for this server-owned session, while
+        # the declassification capability remains one-use and turn-bound.
+        auth_context.egress_state.approve_url(normalized)
+    return (True, "approved") if approved else (False, "approval_failed")
+
+
+class ChannelResourceAdapter:
+    """Resource-scoped adapter for channel messaging tools (chainlink #866).
+
+    Authorizes send_message/react/fetch_channel_history based on server-resolved
+    triggering channel and bridge resources. Same-scope operations (target matches
+    triggering channel) pass; cross-channel/public/unknown operations require admin.
+
+    Key invariants:
+    - Channel equality alone is not authority across bridge instances
+    - Aliases resolve server-side via IdentityResolver
+    - Cross-channel sends cannot inherit triggering-channel authority
+    - Denials are structured and redacted without relying on model-supplied fields
+    """
+
+    _CHANNEL_OPERATIONS = policy_membership("channel_operations")
+
+    _global_resolver: Any = None
+
+    @classmethod
+    def set_identity_resolver(cls, resolver: Any) -> None:
+        cls._global_resolver = resolver
+
+    @classmethod
+    def get_decision(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> OperationDecision | None:
+        """Get resource-scoped decision for channel operations.
+
+        Returns RESOURCE_SCOPED for channel operations, or None to fall through
+        to catalog defaults.
+        """
+        if tool_name not in cls._CHANNEL_OPERATIONS:
+            return None
+
+        return OperationDecision.RESOURCE_SCOPED
+
+    @classmethod
+    def authorize_channel_operation(
+        cls,
+        tool_name: str,
+        target_channel: str | None,
+        auth_context: "AuthContext | None",
+        *,
+        enforce: bool = False,
+        registered_plugin: bool = False,
+    ) -> ToolAuthorization:
+        """Authorize a channel operation against the triggering channel.
+
+        Same-scope (target matches triggering channel after server-side resolution)
+        passes for regular users. Cross-channel or unknown targets require admin.
+
+        Args:
+            tool_name: The channel operation (send_message/react/fetch_channel_history)
+            target_channel: The model-supplied target channel (may be None/empty)
+            auth_context: Server-created AuthContext with triggering channel
+            enforce: Whether to enforce or allow in shadow mode
+
+        Returns:
+            ToolAuthorization with allowed/reason fields populated
+        """
+        if tool_name not in cls._CHANNEL_OPERATIONS and not registered_plugin:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.UNKNOWN,
+                allowed=False,
+                reason="not_a_channel_operation",
+            )
+
+        triggering_channel = None
+        if auth_context is not None:
+            triggering_channel = getattr(auth_context, "channel_id", None)
+
+        if not triggering_channel:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=not enforce,
+                reason="missing_triggering_channel",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+            )
+
+        # Channel tools resolve an omitted/empty target to the current turn's
+        # channel. Authorization must mirror that runtime behavior: an implicit
+        # reply-to-trigger is same-scope, not a missing-resource denial.
+        effective_target = target_channel or triggering_channel
+        resolved_target = cls._resolve_channel(effective_target)
+        resolved_triggering = cls._resolve_channel(triggering_channel)
+
+        same_scope = resolved_target == resolved_triggering
+        service = get_trusted_service_from_auth_context(auth_context)
+        operator_delivery = (
+            tool_name == "send_message"
+            and service_can_invoke_operation(service, "send_message")
+            and _target_matches_operator_alert(
+                resolved_target or "", "MIMIR_OPERATOR_ALERT_CHANNEL",
+            )
+        )
+        if operator_delivery:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                reason="configured_operator_channel",
+                enforcement_enabled=enforce,
+            )
+
+        if same_scope:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                reason="same_scope_channel",
+                enforcement_enabled=enforce,
+            )
+
+        is_admin = False
+        if auth_context is not None:
+            roles = getattr(auth_context, "roles", ()) or ()
+            is_admin = "admin" in roles
+
+        allowed = is_admin if enforce else True
+        is_shadow = not enforce and not is_admin and not same_scope
+        reason = "cross_channel_scope" if not is_admin else None
+
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=allowed,
+            reason=reason,
+            required_tier=AccessTier.ADMIN if not is_admin else AccessTier.USER,
+            enforcement_enabled=enforce,
+            is_shadow_decision=is_shadow,
+            would_block=not is_admin,
+            resolved_sink_target=resolved_target,
+        )
+
+    @classmethod
+    def _resolve_channel(cls, channel_id: str | None) -> str | None:
+        """Resolve channel_id to canonical form using server-side IdentityResolver.
+
+        Unknown channels fall through unchanged - this is intentional so that
+        cross-channel operations to truly unknown channels require admin.
+        """
+        if not channel_id:
+            return None
+
+        if cls._global_resolver is not None:
+            resolved = getattr(cls._global_resolver, "resolve_channel", None)
+            if resolved:
+                return resolved(channel_id)
+
+        return channel_id
+
+
+class WriteResourceAdapter:
+    """Scope write/code operations by the server-authenticated caller axis."""
+
+    _WRITE_OPERATIONS = policy_membership("write_operations")
+    _RESOURCE_OPERATIONS = policy_membership("write_resource_operations")
+    _PROTECTED_NAMES: frozenset[str] = frozenset({
+        ".env", ".git", ".mimir", "memory-proposals.jsonl", "compose.env", "rate_limits.json",
+        "config", "credentials", "identities", "secrets", "secret",
+        "core-memory", "core_memory", "corememory", "prompts",
+    })
+
+    @classmethod
+    def get_decision(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> OperationDecision | None:
+        if tool_name in cls._RESOURCE_OPERATIONS:
+            return OperationDecision.RESOURCE_SCOPED
+        return None
+
+    @classmethod
+    def _is_protected_path(cls, path: Path) -> bool:
+        parts = tuple(part.lower() for part in path.parts)
+        if any(parts[i:i + 2] == ("state", "social-outbox") for i in range(len(parts) - 1)):
+            return True
+        for part in parts:
+            stem = Path(part).stem
+            if (
+                part in cls._PROTECTED_NAMES
+                or stem.split(".", 1)[0] in {
+                    "config", "credentials", "identities", "secret", "secrets",
+                }
+                or part.startswith(".env.")
+                or part.startswith("oauth_") and part.endswith(".json")
+                or Path(part).suffix in {".key", ".pem"}
+            ):
+                return True
+        return any(
+            parts[index:index + 2] == ("memory", "core")
+            for index in range(len(parts) - 1)
+        )
+
+    @classmethod
+    def _human_target_is_allowed(cls, target: str | None) -> bool:
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if not home or not isinstance(target, str) or not target.strip() or "\x00" in target:
+            return False
+        from ._paths import PathOutsideHomeError, resolve_within_roots
+
+        try:
+            home_root = Path(home).resolve()
+            state_root = (Path(home) / "state").resolve()
+            candidate = _resolve_file_tool_target(target, home_root)
+            if candidate is None:
+                return False
+            resolved = resolve_within_roots([home_root], str(candidate))
+            turn_scratch = current_turn_scratch_root()
+            root = next(
+                root for root in (state_root, turn_scratch) if root is not None
+                and (resolved == root or resolved.is_relative_to(root))
+            )
+        except (OSError, PathOutsideHomeError, RuntimeError, ValueError):
+            return False
+        except StopIteration:
+            return False
+        return not is_protected_model_path(candidate) and not cls._is_protected_path(resolved.relative_to(root))
+
+    @classmethod
+    def authorize_skill_write(
+        cls,
+        tool_name: str,
+        target: str | None,
+        auth_context: "AuthContext | None",
+        ifc_labels: Any,
+        *,
+        enforce: bool,
+    ) -> ToolAuthorization | None:
+        """Apply the admin-operator boundary to all file-tool skill writes."""
+        if tool_name not in cls._WRITE_OPERATIONS or not isinstance(target, str):
+            return None
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if not home:
+            return None
+        roots = agent_writable_roots(home)
+        candidate = _resolve_file_tool_target(target, home)
+        if candidate is None:
+            return None
+        writable_for_admin_operator = _agent_writable_root_for_path(
+            candidate, roots, admin_operator_turn=True,
+        )
+        autonomously_writable = _agent_writable_root_for_path(
+            candidate, roots, admin_operator_turn=False,
+        )
+        if writable_for_admin_operator is None or autonomously_writable is not None:
+            return None
+
+        admin_operator_turn = SinkGate._is_admin_operator_turn(
+            ifc_labels, auth_context,
+        )
+        reason = None if admin_operator_turn else "skill_write_requires_admin_operator"
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=admin_operator_turn,
+            reason=reason,
+            required_tier=AccessTier.USER if admin_operator_turn else AccessTier.ADMIN,
+            enforcement_enabled=enforce,
+            is_shadow_decision=False,
+            would_block=not admin_operator_turn,
+            resolved_sink_target=normalize_sink_destination(SinkCategory.FILE, target),
+            refusal_detail=(
+                None
+                if admin_operator_turn
+                else "writes under skills/ require an untainted admin operator turn"
+            ),
+        )
+
+    @classmethod
+    def authorize_operation(
+        cls,
+        tool_name: str,
+        target: str | None,
+        auth_context: "AuthContext | None",
+        *,
+        enforce: bool,
+        service_allowed: bool,
+        ifc_labels: Any = None,
+    ) -> ToolAuthorization:
+        skill_write = cls.authorize_skill_write(
+            tool_name, target, auth_context, ifc_labels, enforce=enforce,
+        )
+        if skill_write is not None:
+            return skill_write
+        roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+        if "admin" in roles or service_allowed:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                service_principal=(
+                    get_trusted_service_from_auth_context(auth_context)
+                    if service_allowed else None
+                ),
+                enforcement_enabled=enforce,
+            )
+
+        from .models import TurnInteractivity
+
+        in_scope = (
+            tool_name in cls._WRITE_OPERATIONS
+            and auth_context is not None
+            and getattr(auth_context, "interactivity", None) == TurnInteractivity.INTERACTIVE
+            and cls._human_target_is_allowed(target)
+        )
+        reason = None if in_scope else (
+            "admin_required" if tool_name in _WORKLINK_BUILD_TOOLS else "write_scope"
+        )
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=in_scope or not enforce,
+            reason=reason,
+            required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and not in_scope,
+            would_block=not in_scope,
+            resolved_sink_target=(
+                normalize_sink_destination(SinkCategory.FILE, target)
+                if target is not None else None
+            ),
+        )
+
+
+class OperationCatalog:
+    """Catalog of tool/operation authorization decisions (chainlink #865).
+
+    Replaces the old allow-through admin-name matching. Unknown native,
+    built-in, dynamic, and external operations are never implicitly open -
+    they are denied by default when enforcement is on.
+    """
+
+    _OPEN_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "open"
+    ))
+
+    _RESOURCE_SCOPED_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "resource_scoped"
+    ))
+
+    _ADMIN_REQUIRED_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "admin_required"
+    ))
+
+    # Global rows from these operations contain protected identities,
+    # configuration, or process metadata and must never become OPEN.
+    _PROTECTED_METADATA_OPERATIONS = policy_membership("protected_metadata_operations")
+
+    _ADMIN_BUILTIN_TOOL_NAMES = policy_membership("catalog_admin_builtin")
+
+    def __init__(self) -> None:
+        self._custom_decisions: dict[str, OperationDecision] = {}
+        self._resource_scoped_operations: dict[str, list[ResourceScope]] = {}
+        self._adapter_hooks: list[Callable[[str, Any], OperationDecision | None]] = []
+
+    def register_operation(
+        self,
+        name: str,
+        decision: OperationDecision,
+        scopes: list[ResourceScope] | None = None,
+    ) -> None:
+        """Register a custom decision for an operation."""
+        saga_mutations = globals().get("_SAGA_MUTATION_OPERATIONS", frozenset())
+        protected_decision = self.get_decision(name, None)
+        if name in saga_mutations:
+            protected_decision = OperationDecision.ADMIN_REQUIRED
+        if protected_decision != OperationDecision.UNKNOWN and decision != protected_decision:
+            raise ValueError(
+                f"cannot downgrade protected operation {name!r} "
+                f"from {protected_decision.value}"
+            )
+        self._custom_decisions[name] = decision
+        if decision == OperationDecision.RESOURCE_SCOPED and scopes:
+            self._resource_scoped_operations[name] = scopes
+
+    def register_adapter_hook(
+        self,
+        hook: Callable[[str, Any], OperationDecision | None],
+    ) -> None:
+        """Register an adapter hook for custom authorization logic.
+
+        The hook receives (tool_name, context) and returns an OperationDecision
+        or None to fall through to catalog defaults.
+        """
+        self._adapter_hooks.append(hook)
+
+    def get_decision(
+        self,
+        tool_name: str,
+        context: Any | None = None,
+    ) -> OperationDecision:
+        """Get the authorization decision for a tool.
+
+        Order of resolution:
+        1. Custom registered decisions
+        2. Adapter hook results
+        3. Built-in OPEN operations
+        4. Built-in ADMIN_REQUIRED operations
+        5. MCP name variations (admin required)
+        6. Unknown operations -> UNKNOWN (fail closed when enforcement on)
+        """
+        if tool_name in self._custom_decisions:
+            return self._custom_decisions[tool_name]
+
+        for hook in self._adapter_hooks:
+            result = hook(tool_name, context)
+            if result is not None:
+                return result
+
+        if tool_name in self._OPEN_OPERATIONS:
+            return OperationDecision.OPEN
+
+        if tool_name in self._RESOURCE_SCOPED_OPERATIONS:
+            return OperationDecision.RESOURCE_SCOPED
+
+        if tool_name in self._ADMIN_REQUIRED_OPERATIONS:
+            return OperationDecision.ADMIN_REQUIRED
+
+        if tool_name in self._ADMIN_BUILTIN_TOOL_NAMES:
+            return OperationDecision.ADMIN_REQUIRED
+
+        if any(
+            tool_name.endswith(f"__{name}") or tool_name.endswith(f"_{name}")
+            for name in self._ADMIN_REQUIRED_OPERATIONS
+        ):
+            return OperationDecision.ADMIN_REQUIRED
+
+        return OperationDecision.UNKNOWN
+
+_global_operation_catalog = OperationCatalog()
+
+_global_operation_catalog.register_adapter_hook(
+    ChannelResourceAdapter.get_decision,
+)
+_global_operation_catalog.register_adapter_hook(
+    WriteResourceAdapter.get_decision,
+)
+
+
+class MCPResourceAdapter:
+    """MCP tool resource adapter for authorization (chainlink #870).
+
+    Handles MCP tool classification:
+    - Missing provenance -> ADMIN_REQUIRED
+    - Tombstoned (drifted) provenance -> ADMIN_REQUIRED
+    - Unclassified MCP tools -> ADMIN_REQUIRED
+    - Resource-scoped classification requires registered adapter
+
+    This ensures bare regular-scoped tier cannot authorize arbitrary
+    MCP arguments without proper classification and provenance.
+    """
+
+    _MCP_TOOL_PREFIX = "mcp_"
+    _global_resolver: Any = None
+
+    @classmethod
+    def set_identity_resolver(cls, resolver: Any) -> None:
+        # PRODUCTION-DEAD (chainlink #895): Never called in production.
+        # Retained for API stability; the resolver is not used by get_decision.
+        cls._global_resolver = resolver
+
+    @classmethod
+    def get_decision(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> OperationDecision | None:
+        """Get decision for MCP tools.
+
+        Returns ADMIN_REQUIRED for MCP tools that have no provenance,
+        tombstoned provenance, or no matching registered classifier.
+        A registered classifier supplies the explicit OPEN,
+        RESOURCE_SCOPED, or ADMIN_REQUIRED decision.
+        Returns None for non-MCP tools to fall through to other adapters.
+        """
+        if not tool_name.startswith(cls._MCP_TOOL_PREFIX):
+            return None
+
+        provenance = cls._get_provenance_from_context(tool_name, context)
+
+        if provenance is None:
+            log.debug(
+                "MCP tool %s has no provenance - requiring admin", tool_name
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        if provenance.is_tombstoned:
+            log.warning(
+                "MCP tool %s has tombstoned provenance (drift detected) - requiring admin",
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        adapter = cls._get_registered_adapter(provenance)
+        if adapter is None:
+            log.debug(
+                "MCP tool %s has no matching registered adapter - requiring admin",
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        classification = getattr(provenance, "classification", "")
+        if classification:
+            try:
+                return OperationDecision(classification)
+            except ValueError:
+                return OperationDecision.ADMIN_REQUIRED
+
+        # Compatibility for pre-policy callers. Production approvals always
+        # carry classification and never authorize resources through this path.
+        try:
+            decision = adapter.classify(tool_name, context)
+        except Exception:
+            log.exception(
+                "MCP adapter %s failed while classifying %s - requiring admin",
+                provenance.adapter_name,
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+
+        if not isinstance(decision, OperationDecision):
+            log.error(
+                "MCP adapter %s returned invalid decision for %s - requiring admin",
+                provenance.adapter_name,
+                tool_name,
+            )
+            return OperationDecision.ADMIN_REQUIRED
+        return decision
+
+    @classmethod
+    def authorize_call(
+        cls,
+        tool_name: str,
+        tool: Any,
+        arguments: dict[str, Any] | None,
+        context: Any | None,
+        *,
+        enforce: bool,
+        ifc_labels: Any = None,
+    ) -> "ToolAuthorization":
+        """Execute the provenance-bound adapter and IFC gate on one invocation."""
+        from .mcp_client import (
+            MCPAuthorizationRequest,
+            MCPAuthorizationResult,
+            get_tool_provenance,
+        )
+
+        provenance = get_tool_provenance(tool) if tool is not None else None
+        if provenance is not None and (
+            tool_name != getattr(tool, "name", None)
+            or tool_name != f"mcp_{provenance.endpoint_identity}_{provenance.original_tool_name}"
+        ):
+            provenance = None
+        decision = OperationDecision.ADMIN_REQUIRED
+        reason = "mcp_missing_provenance"
+        validated_result: MCPAuthorizationResult | None = None
+        flow_direction = ToolFlowDirection.UNKNOWN
+        sink_check: ToolAuthorization | None = None
+        if provenance is not None and provenance.is_tombstoned:
+            reason = "mcp_drift_detected"
+        elif provenance is not None:
+            try:
+                decision = OperationDecision(provenance.classification)
+            except ValueError:
+                reason = "mcp_unclassified"
+            else:
+                adapter = cls._get_registered_adapter(provenance)
+                if adapter is None:
+                    decision = OperationDecision.ADMIN_REQUIRED
+                    reason = "mcp_missing_adapter"
+                elif arguments is None:
+                    decision = OperationDecision.ADMIN_REQUIRED
+                    reason = "mcp_malformed_arguments"
+                else:
+                    try:
+                        flow_direction = ToolFlowDirection(adapter.flow_direction)
+                    except ValueError:
+                        flow_direction = ToolFlowDirection.UNKNOWN
+                    if flow_direction is ToolFlowDirection.UNKNOWN:
+                        decision = OperationDecision.ADMIN_REQUIRED
+                        reason = "mcp_unknown_flow_direction"
+                        adapter = None
+                if adapter is not None and arguments is not None:
+                    try:
+                        result = adapter.classify(MCPAuthorizationRequest(
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            auth_context=context,
+                            provenance=provenance,
+                        ))
+                    except Exception:
+                        log.exception(
+                            "MCP adapter %s failed while authorizing %s",
+                            provenance.adapter_name,
+                            tool_name,
+                        )
+                        decision = OperationDecision.ADMIN_REQUIRED
+                        reason = "mcp_adapter_exception"
+                    else:
+                        if not isinstance(result, MCPAuthorizationResult):
+                            decision = OperationDecision.ADMIN_REQUIRED
+                            reason = "mcp_invalid_adapter_result"
+                        elif result.decision is not decision:
+                            decision = OperationDecision.ADMIN_REQUIRED
+                            reason = "mcp_adapter_decision_mismatch"
+                        elif result.allowed:
+                            expected_source = flow_direction in {
+                                ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
+                            }
+                            expected_sink = flow_direction in {
+                                ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+                            }
+                            if (
+                                bool(result.source_resources) is not expected_source
+                                or bool(result.sink_resources) is not expected_sink
+                            ):
+                                decision = OperationDecision.ADMIN_REQUIRED
+                                reason = "mcp_flow_metadata_mismatch"
+                                result = None
+                        if isinstance(result, MCPAuthorizationResult) and result.allowed:
+                            if ifc_labels is None and context is not None:
+                                ifc_labels = getattr(context, "ifc_labels", None)
+                            if result.sink_resources:
+                                sink_check = SinkGate.check_sink_flow(
+                                    tool_name,
+                                    ",".join(result.sink_resources),
+                                    ifc_labels,
+                                    context,
+                                    enforce=enforce,
+                                    sink_category=SinkCategory.EXTERNAL_MCP,
+                                    allow_untrusted_active_ingest=(
+                                        provenance.argument_egress == "allowed"
+                                    ),
+                                )
+                            if sink_check is not None and not sink_check.allowed:
+                                return sink_check
+                            validated_result = result
+                            if decision is not OperationDecision.ADMIN_REQUIRED:
+                                return ToolAuthorization(
+                                    tool_name=tool_name,
+                                    decision=decision,
+                                    allowed=True,
+                                    reason=(
+                                        sink_check.reason
+                                        if sink_check is not None and sink_check.is_shadow_decision
+                                        else None
+                                    ),
+                                    enforcement_enabled=enforce,
+                                    is_shadow_decision=(
+                                        sink_check.is_shadow_decision if sink_check is not None else False
+                                    ),
+                                    would_block=(
+                                        sink_check.would_block if sink_check is not None else False
+                                    ),
+                                    resolved_sink_target=(
+                                        sink_check.resolved_sink_target
+                                        if sink_check is not None else None
+                                    ),
+                                    protected_source_resources=result.source_resources,
+                                    protected_sink_resources=result.sink_resources,
+                                    flow_direction=flow_direction,
+                                    result_integrity=provenance.result_integrity,
+                                    argument_egress=provenance.argument_egress,
+                                )
+                            reason = "admin_required"
+                        elif isinstance(result, MCPAuthorizationResult) and not result.allowed:
+                            reason = result.reason or "mcp_resource_denied"
+
+        is_admin = decision is OperationDecision.ADMIN_REQUIRED
+        admin = context is not None and "admin" in (getattr(context, "roles", ()) or ())
+        hard_failure = validated_result is None
+        denied_by_policy = hard_failure or (is_admin and not admin)
+        allowed = (admin and not hard_failure) or not enforce
+        shadow_sink = sink_check is not None and sink_check.is_shadow_decision
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=decision,
+            allowed=allowed,
+            reason=(
+                sink_check.reason
+                if shadow_sink
+                else None if admin and not hard_failure else reason
+            ),
+            required_tier=AccessTier.ADMIN if is_admin else AccessTier.USER,
+            enforcement_enabled=enforce,
+            is_shadow_decision=shadow_sink or (not enforce and denied_by_policy),
+            would_block=(
+                sink_check.would_block if shadow_sink and sink_check is not None
+                else denied_by_policy
+            ),
+            resolved_sink_target=(
+                sink_check.resolved_sink_target if sink_check is not None else None
+            ),
+            protected_source_resources=(
+                validated_result.source_resources if validated_result is not None else None
+            ),
+            protected_sink_resources=(
+                validated_result.sink_resources if validated_result is not None else None
+            ),
+            flow_direction=flow_direction,
+            result_integrity=(
+                provenance.result_integrity if validated_result is not None else "untrusted"
+            ),
+            argument_egress=(
+                provenance.argument_egress if validated_result is not None else "taint_gated"
+            ),
+        )
+
+    @staticmethod
+    def _get_registered_adapter(provenance: Any) -> Any | None:
+        """Resolve only the adapter registration named by preserved provenance."""
+        adapter_name = getattr(provenance, "adapter_name", "")
+        adapter_version = getattr(provenance, "adapter_version", "")
+        policy_version = getattr(provenance, "policy_version", "")
+        if not adapter_name or not adapter_version or not policy_version:
+            return None
+
+        from .mcp_client import get_mcp_adapter_info
+
+        adapter = get_mcp_adapter_info(adapter_name)
+        if adapter is None:
+            return None
+        if adapter.version != adapter_version:
+            return None
+        if adapter.policy_version != policy_version:
+            return None
+        return adapter
+
+    @classmethod
+    def _get_provenance_from_context(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> Any | None:
+        """Extract MCP provenance from auth context or tool registry."""
+        if context is not None:
+            provenance = getattr(context, "mcp_provenance", None)
+            if provenance is not None:
+                return provenance
+
+        try:
+            from .mcp_client import get_tool_provenance
+            from .tools.mcp import get_mcp_tools
+
+            for tool in get_mcp_tools():
+                if getattr(tool, "name", None) == tool_name:
+                    return get_tool_provenance(tool)
+        except Exception:
+            pass
+
+        return None
+
+    @classmethod
+    def authorize_mcp_tool(
+        cls,
+        tool_name: str,
+        context: Any | None,
+        *,
+        enforce: bool = False,
+    ) -> "ToolAuthorization":
+        """Authorize an MCP tool call with full provenance checking.
+
+        Args:
+            tool_name: The namespaced MCP tool name (e.g., 'mcp_github_search')
+            context: AuthContext with provenance if available
+            enforce: Whether to enforce or allow in shadow mode
+
+        Returns:
+            ToolAuthorization with decision and reason fields populated
+        """
+        decision = cls.get_decision(tool_name, context)
+
+        if decision is None:
+            if not tool_name.startswith(cls._MCP_TOOL_PREFIX):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False,
+                    reason="non_mcp_tool_name",
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                )
+            decision = OperationDecision.ADMIN_REQUIRED
+
+        provenance = cls._get_provenance_from_context(tool_name, context)
+
+        allowed = decision != OperationDecision.ADMIN_REQUIRED or not enforce
+
+        reason = None
+        if decision == OperationDecision.ADMIN_REQUIRED:
+            if provenance is None:
+                reason = "mcp_missing_provenance"
+            elif provenance.is_tombstoned:
+                reason = "mcp_drift_detected"
+            else:
+                reason = "mcp_unclassified"
+
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=decision,
+            allowed=allowed,
+            reason=reason,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and not allowed,
+            would_block=not allowed,
+        )
+
+
+_global_operation_catalog.register_adapter_hook(
+    MCPResourceAdapter.get_decision,
+)
+
+
+def get_operation_catalog() -> OperationCatalog:
+    """Get the global operation catalog instance."""
+    return _global_operation_catalog
+
+
+@dataclass
+class ToolAuthorization:
+    """Authorization decision for a tool call (chainlink #865).
+
+    Carries the tool name, operation decision, service principal context,
+    and shadow-decision audit fields.
+    """
+    tool_name: str
+    decision: OperationDecision
+    allowed: bool
+    reason: str | None = None
+    service_principal: ServicePrincipal | None = None
+    required_tier: AccessTier = AccessTier.USER
+    enforcement_enabled: bool = False
+    is_shadow_decision: bool = False
+    # Enforcement verdict, independent of whether compatibility mode lets the
+    # current call proceed.
+    would_block: bool = False
+    resolved_sink_target: str | None = None
+    # Why a refusal happened, in prose, for the caller's tool result. Separate
+    # from ``reason`` because that stays a stable machine key the audit
+    # classification groups on; this is the human/agent-facing explanation and
+    # must never be parsed. Populated for shell-profile refusals, where
+    # ``service_sink_destination_denied`` alone renders as "requires an admin
+    # identity" and misdescribes a command-shape problem as a privilege problem.
+    refusal_detail: str | None = None
+    # ``None`` means provenance is unknown; ``()`` authoritatively classifies
+    # the call as not reading a protected MCP source.
+    protected_source_resources: tuple[str, ...] | None = None
+    protected_sink_resources: tuple[str, ...] | None = None
+    flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
+    # Resolved once from immutable authorization provenance. MCP tools and
+    # hands_read consume it without performing a mutable policy lookup.
+    result_integrity: str = "untrusted"
+    argument_egress: str = "taint_gated"
+    repo_pr_action_scope: Any = field(default=None, repr=False)
+    forge_scope_mismatch: dict[str, Any] | None = None
+    policy: Any = field(default=None, repr=False, compare=False)
+
+    def as_log_fields(self) -> dict[str, Any]:
+        """Return fields for audit logging."""
+        scope = self.repo_pr_action_scope
+        return {
+            "tool": self.tool_name,
+            "decision": self.decision.value,
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "required_tier": self.required_tier.value,
+            "service_principal": self.service_principal.canonical if self.service_principal else None,
+            "enforcement_enabled": self.enforcement_enabled,
+            "is_shadow_decision": self.is_shadow_decision,
+            "scope_provenance": getattr(scope, "provenance", None),
+            "scope_id": getattr(scope, "scope_id", None),
+            "granted_actions": sorted(
+                getattr(scope, "allowed_operations", frozenset())
+            ),
+            "refusal_reason": self.reason if not self.allowed else None,
+            "forge_scope_mismatch": self.forge_scope_mismatch,
+        }
+
+
+_SCOPED_PR_ISSUER = object()
+
+
+@dataclass(frozen=True)
+class ScopedPRGrant:
+    owner: str
+    principal: str
+    scope_id: str
+    repository: str
+    pull_request: int
+    head: str
+    action: str
+    turn_nonce: str
+    expires_at: float
+    lease_identity: tuple[str, str] | None
+    _issuer: Any = field(repr=False, compare=False)
+
+
+class ScopedPRGrants:
+    """Turn-local host authority; checkout is consumed before execution."""
+
+    def __init__(self, principal: str, scopes: Iterable[Any], *,
+                 protocols: Mapping[str, Any] | None = None, _issuer: Any) -> None:
+        if _issuer is not _SCOPED_PR_ISSUER:
+            raise ValueError("scoped PR grants require the trusted ingress issuer")
+        self.principal = principal
+        self.nonce = secrets.token_hex(16)
+        # The turn owns the grants. Use its configured model-stream bound as a
+        # defense-in-depth ceiling, with the shipped 60-minute bound as a floor
+        # (repo_test alone can run for 30 minutes, then submission needs time).
+        # A disabled/shortened turn timeout must not shorten tool authority.
+        from .config import DEFAULT_TURN_TIMEOUT_SECONDS, _env_int
+
+        lifetime = max(
+            _env_int("MIMIR_TURN_TIMEOUT_SECONDS", DEFAULT_TURN_TIMEOUT_SECONDS),
+            DEFAULT_TURN_TIMEOUT_SECONDS,
+        )
+        self.expires_at = time.monotonic() + lifetime
+        self._lock = threading.Lock()
+        self._protocols = dict(protocols or {})
+        self._prelease: dict[tuple[str, str], ScopedPRGrant] = {}
+        self._follow: dict[tuple[str, str], dict[str, ScopedPRGrant]] = {}
+        self._pending: dict[tuple[str, str], object] = {}
+        for scope in scopes:
+            self.issue(scope)
+
+    def issue(self, scope: Any) -> None:
+        """Issue only for a host-resolved scope, never for model arguments."""
+        with self._lock:
+            owner = getattr(scope, "owner", None)
+            protocol = self._protocols.get(owner)
+            if protocol is None or protocol.owner != owner:
+                return
+            checkout = getattr(protocol.checkout_action, "value", None)
+            if checkout in scope.allowed_operations:
+                key = (owner, scope.scope_id)
+                if key not in self._prelease and key not in self._pending and key not in self._follow:
+                    self._prelease[key] = self._grant(owner, scope, checkout, None)
+
+    def _grant(self, owner: str, scope: Any, action: str, lease: Any) -> ScopedPRGrant:
+        return ScopedPRGrant(
+            owner, self.principal, scope.scope_id, scope.canonical_repo,
+            scope.pr_number, scope.observed_head_sha, action, self.nonce,
+            self.expires_at,
+            (str(lease.path), lease.recovery_id) if lease is not None else None,
+            _SCOPED_PR_ISSUER,
+        )
+
+    def get(
+        self, owner: str, scope: Any, action: str, *, checkout: bool | None = None,
+    ) -> ScopedPRGrant | None:
+        with self._lock:
+            key = (owner, scope.scope_id)
+            protocol = self._protocols.get(owner)
+            if checkout is None:
+                checkout = protocol is not None and action == getattr(protocol.checkout_action, "value", None)
+            if checkout:
+                return self._prelease.get(key)
+            return self._follow.get(key, {}).get(action)
+
+    def consume_checkout(self, owner: str, scope: Any) -> object | None:
+        with self._lock:
+            key = (owner, scope.scope_id)
+            grant = self._prelease.pop(key, None)
+            if grant is None or time.monotonic() >= grant.expires_at:
+                return None
+            token = object()
+            self._pending[key] = token
+            return token
+
+    def observe_checkout(self, owner: str, scope: Any, lease: Any, token: object) -> bool:
+        with self._lock:
+            key = (owner, scope.scope_id)
+            protocol = self._protocols.get(owner)
+            if token is None or protocol is None or self._pending.get(key) is not token:
+                return False
+            del self._pending[key]
+            self._follow[key] = {
+                action: self._grant(owner, scope, action, lease)
+                for action in scope.allowed_operations
+                if action != protocol.checkout_action.value or getattr(protocol, "checkout_tool", None) is not None
+            }
+            return True
+
+    def observe_push(self, owner: str, scope: Any, lease: Any, previous_head: str) -> bool:
+        """Advance existing grants only for this lease's verified own publication."""
+        with self._lock:
+            key = (owner, scope.scope_id)
+            follow = self._follow.get(key)
+            if (not follow or time.monotonic() >= self.expires_at
+                    or lease.scope_id != scope.scope_id or lease.owner != scope.principal
+                    or lease.head_sha.lower() != scope.observed_head_sha.lower()
+                    or previous_head.lower() == scope.observed_head_sha.lower()
+                    or any(grant.head.lower() != previous_head.lower()
+                           or grant.lease_identity != (str(lease.path), lease.recovery_id)
+                           for grant in follow.values())):
+                return False
+            self._follow[key] = {
+                action: replace(grant, head=scope.observed_head_sha)
+                for action, grant in follow.items()
+            }
+            return True
+
+
+def _valid_scoped_pr_grant(
+    auth_context: AuthContext | None, owner: str | None, action: Any,
+    protocol: Any, scope: Any, review_state: Any, *, tool_name: str | None = None,
+) -> bool:
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    if (not isinstance(grants, ScopedPRGrants)
+              or protocol is None or protocol.owner != owner
+              or grants._protocols.get(owner) is not protocol
+             or type(action) is not protocol.action_type
+              or (getattr(protocol, "trusted_scope", None) is not None
+                  and type(scope) is not protocol.trusted_scope.scope_type)
+              or scope is None or getattr(scope, "owner", None) != owner
+             or grants.principal != getattr(auth_context, "canonical_principal", None)):
+        return False
+    slot_policy = getattr(auth_context, "_plugin_slot_policy", None)
+    if (slot_policy is not None and owner in slot_policy.state_slots
+            and slot_policy.scoped_actions.get(owner) is protocol):
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        registered_state = (
+            registry.resolve(scope.canonical_repo, scope.pr_number)
+            if registry is not None else None
+        )
+        if registered_state is None and discovered is not None:
+            registered_state = discovered.resolve(scope.canonical_repo, scope.pr_number)
+        if registered_state is not review_state or review_state.action_scope is not scope:
+            return False
+    designated_checkout = getattr(protocol, "checkout_tool", None)
+    if designated_checkout is not None and tool_name is None:
+        return False
+    is_checkout = action is protocol.checkout_action and (
+        designated_checkout is None or tool_name == designated_checkout
+    )
+    grant = grants.get(owner, scope, action.value, checkout=is_checkout)
+    if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
+            or grant.owner != owner or grant.principal != grants.principal
+            or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at
+            or grant.scope_id != scope.scope_id or grant.repository != scope.canonical_repo
+            or grant.pull_request != scope.pr_number or grant.head != scope.observed_head_sha):
+        return False
+    if is_checkout:
+        if grant.lease_identity is not None:
+            return False
+    else:
+        live = protocol.live_lease(scope, review_state) if protocol.live_lease is not None else None
+        if live is None or grant.lease_identity != (str(live.path), live.recovery_id):
+            return False
+    try:
+        return protocol.validate_scope(action, scope, grant) is True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def consume_scoped_pr_checkout(auth_context: AuthContext, scope: Any, owner: str) -> object | None:
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    return grants.consume_checkout(owner, scope) if isinstance(grants, ScopedPRGrants) else None
+
+
+def observe_scoped_pr_checkout(
+    auth_context: AuthContext, scope: Any, state: Any, token: object,
+    owner: str, protocol: Any,
+) -> bool:
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    lease = protocol.live_lease(scope, state) if protocol is not None and protocol.live_lease is not None else None
+    if not isinstance(grants, ScopedPRGrants) or lease is None:
+        return False
+    return grants.observe_checkout(owner, scope, lease, token)
+
+
+def resolve_registered_review_state(
+    auth_context: "AuthContext | None", repository: Any, pull_request: Any,
+) -> Any:
+    """Resolve a third-party review only from server-bound turn state."""
+    if (not isinstance(repository, str) or not repository.strip()
+            or type(pull_request) is not int or pull_request < 1):
+        raise ToolException(
+            "pull-request operation rejected: repository must be text and pull_request "
+            "must be a positive integer"
+        )
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    constructors = _registered_scope_constructors(auth_context)
+    state = None
+    if constructors is not None and type(registry) is constructors.registry:
+        state = registry.resolve(repository, pull_request)
+    elif constructors is None and callable(getattr(registry, "resolve", None)):
+        grants = getattr(auth_context, "scoped_pr_grants", None)
+        if isinstance(grants, ScopedPRGrants):
+            candidate = registry.resolve(repository, pull_request)
+            owner = getattr(getattr(candidate, "action_scope", None), "owner", None)
+            if owner in grants._protocols:
+                state = candidate
+    if state is None:
+        raise ToolException("pull-request operation rejected: no bound review state for this target")
+    return state
+
+
+def authorize_repo_pr_tool(
+    tool_name: str,
+    scope: Any,
+    *,
+    service_principal: ServicePrincipal | None,
+    enforce: bool,
+    flow_direction: ToolFlowDirection,
+    required_actions: tuple[str, ...] | None = None,
+    registered_plugin: bool = False,
+    auth_context: AuthContext | None = None,
+    owner: str | None = None,
+    action: Any = None,
+    protocol: Any = None,
+    review_state: Any = None,
+) -> ToolAuthorization:
+    """Make the sole policy decision for one typed PR/repository action."""
+    if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS and not registered_plugin:
+        raise ValueError(f"not a typed pull-request tool: {tool_name}")
+    if _is_registered_retained_scope(scope):
+        in_scope = (
+            tool_name in _RETAINED_REPO_TOOLS
+            and (not registered_plugin or getattr(auth_context, "retained_factory_scope", None) is scope)
+            and isinstance(service_principal, ServicePrincipal)
+            and service_principal.worklink_retained_checkout
+            and service_principal.trigger == "poller"
+            and service_principal.authority_profile == "github"
+            and service_can_invoke_operation(service_principal, tool_name)
+            and (not registered_plugin or _is_worklink_retained_checkout_service(
+                service_principal, auth_context=auth_context,
+            ))
+        )
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=in_scope or not enforce,
+            reason=None if in_scope else "retained_factory_scope_denied",
+            service_principal=service_principal,
+            required_tier=AccessTier.USER,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and not in_scope,
+            would_block=not in_scope,
+            refusal_detail=(
+                None if in_scope
+                else "retained factory scope does not grant this repository operation"
+            ),
+            flow_direction=flow_direction,
+            repo_pr_action_scope=scope,
+            result_integrity="trusted" if in_scope else "untrusted",
+        )
+    if registered_plugin and (required_actions is None or len(required_actions) != 1):
+        raise ValueError("plugin repo/PR tools require one typed action")
+    report_required_actions = required_actions is not None
+    if required_actions is None:
+        required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
+        required_actions = () if required_action is None else (required_action,)
+    granted_actions = getattr(scope, "allowed_operations", frozenset())
+    missing_actions = tuple(
+        action for action in required_actions if action not in granted_actions
+    )
+    grant_valid = not registered_plugin or _valid_scoped_pr_grant(
+        auth_context, owner, action, protocol, scope, review_state, tool_name=tool_name,
+    )
+    in_scope = (
+        scope is not None
+        and not missing_actions
+        and grant_valid
+        and (
+            not heartbeat_git_authority_enabled(service_principal)
+            or (
+                bool(os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip())
+                and scope.principal == os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+                and scope.pull_request_author == scope.principal
+                and is_configured_github_repo(scope.canonical_repo)
+                and service_can_invoke_operation(service_principal, tool_name)
+            )
+        )
+        and (
+            tool_name != "pr_job_log"
+            or (service_principal is not None and service_principal.has_capability("pr_job_log"))
+        )
+    )
+    checkout_first = (
+        registered_plugin and scope is not None and not missing_actions
+        and not grant_valid and protocol is not None and review_state is not None
+        and action is not protocol.checkout_action
+        and getattr(review_state, "checkout_lease", None) is None
+        and _valid_scoped_pr_grant(
+            auth_context, owner, protocol.checkout_action, protocol, scope,
+            review_state, tool_name=protocol.checkout_tool,
+        )
+    )
+    return ToolAuthorization(
+        tool_name=tool_name,
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=in_scope or not enforce,
+        reason=None if in_scope else (
+            "repo_pr_grant_denied" if registered_plugin and (
+                scope is None or missing_actions or not grant_valid
+            ) else "repo_pr_scope_denied" if scope is None or missing_actions
+            else "repo_pr_grant_denied" if not grant_valid else "repo_pr_scope_denied"
+        ),
+        service_principal=service_principal,
+        required_tier=AccessTier.USER,
+        enforcement_enabled=enforce,
+        is_shadow_decision=not enforce and not in_scope,
+        would_block=not in_scope,
+        refusal_detail=(
+            f"scope does not grant {', '.join(missing_actions)}"
+            if report_required_actions and missing_actions
+            else "Call repo_checkout(repository, pull_request) for this repository and PR first."
+            if checkout_first
+            else None
+        ),
+        flow_direction=flow_direction,
+        repo_pr_action_scope=scope,
+    )
+
+
+def _consume_task_exception(task: Any) -> None:
+    """Retrieve background logging failures so asyncio does not warn."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("shadow decision logging failed", exc_info=exc)
+
+
+def _operator_can_invoke_admin_shell(
+    tool_name: str,
+    ifc_labels: Any,
+    auth_context: "AuthContext | None",
+) -> bool:
+    """Widen ``shell_exec`` to authenticated users on their live bridge turn.
+
+    Admin-only tools, including ``hands_shell``, use the ordinary admin-role
+    authorization path instead of this user-level shell exception.
+    """
+    roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+    return (
+        tool_name == "shell_exec"
+        and not getattr(auth_context, "is_service", False)
+        and bool({"user", "admin"}.intersection(roles))
+        and SinkGate._is_trusted_operator_turn(ifc_labels, auth_context)
+    )
+
+
+class ToolRegistry:
+    """Registry of runtime tools for inventory and authorization (chainlink #865).
+
+    Maintains an executable inventory of the final assembled runtime tool surface.
+    Supports shadow-decision audit logging when compatibility enforcement is off.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, dict[str, Any]] = {}
+        self._shadow_logging_enabled: bool = False
+
+    def register_tool(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        category: str | None = None,
+        is_native: bool = False,
+        is_builtin: bool = False,
+        is_dynamic: bool = False,
+        is_external: bool = False,
+    ) -> None:
+        """Register a tool in the runtime inventory."""
+        self._tools[name] = {
+            "name": name,
+            "description": description,
+            "category": category,
+            "is_native": is_native,
+            "is_builtin": is_builtin,
+            "is_dynamic": is_dynamic,
+            "is_external": is_external,
+        }
+
+    def unregister_tool(self, name: str) -> None:
+        """Remove a tool from the inventory."""
+        self._tools.pop(name, None)
+
+    def get_tool(self, name: str) -> dict[str, Any] | None:
+        """Get tool metadata from inventory."""
+        return self._tools.get(name)
+
+    def list_tools(self) -> list[str]:
+        """List all registered tool names."""
+        return list(self._tools.keys())
+
+    def clear(self) -> None:
+        """Clear the inventory before registering a newly assembled surface."""
+        self._tools.clear()
+
+    def register_runtime_tools(self, tools: Any) -> None:
+        """Atomically replace inventory from a model-bound runtime tool sequence.
+
+        Authorization does not consult this observational inventory.  Callers
+        that maintain inventory may therefore publish a complete snapshot
+        without creating a transient empty or partially populated surface.
+        """
+        runtime_tools: dict[str, dict[str, Any]] = {}
+        for tool in tools or ():
+            name = getattr(tool, "name", None)
+            if not isinstance(name, str) or not name:
+                continue
+            runtime_tools[name] = {
+                "name": name,
+                "description": getattr(tool, "description", None),
+                "category": "runtime",
+                "is_native": False,
+                "is_builtin": False,
+                "is_dynamic": False,
+                "is_external": False,
+            }
+        self._tools = runtime_tools
+
+    def list_by_category(self, category: str) -> list[str]:
+        """List tools in a specific category."""
+        return [
+            name for name, meta in self._tools.items()
+            if meta.get("category") == category
+        ]
+
+    @property
+    def tool_count(self) -> int:
+        """Total number of registered tools."""
+        return len(self._tools)
+
+    def enable_shadow_logging(self) -> None:
+        """Enable shadow-decision audit logging."""
+        self._shadow_logging_enabled = True
+
+    def disable_shadow_logging(self) -> None:
+        """Disable shadow-decision audit logging."""
+        self._shadow_logging_enabled = False
+
+    @property
+    def is_shadow_logging_enabled(self) -> bool:
+        """Check if shadow logging is enabled."""
+        return self._shadow_logging_enabled
+
+    def _emit_shadow_decision(
+        self,
+        auth: ToolAuthorization,
+        *,
+        auth_context: "AuthContext | None" = None,
+        target: str | None = None,
+        requested_target: Any = None,
+        arguments: dict[str, Any] | None = None,
+        ifc_labels: Any = None,
+        sink_category: SinkCategory | None = None,
+        operator_shell_audit: Mapping[str, str] | None = None,
+    ) -> None:
+        """Emit a would-block shadow-decision audit log (when enabled)."""
+        if not self._shadow_logging_enabled or not auth.would_block:
+            return
+        try:
+            import asyncio
+
+            from .event_logger import log_event
+            fields = auth.as_log_fields()
+            service = auth.service_principal
+            if service is None and auth_context is not None:
+                service = get_trusted_service_from_auth_context(auth_context)
+            if target is None and auth.protected_sink_resources:
+                target = ",".join(auth.protected_sink_resources)
+            resolved_target = auth.resolved_sink_target
+            if resolved_target is None and target is not None:
+                category = get_sink_category(auth.tool_name)
+                resolved_target = resolve_sink_target(
+                    auth.tool_name, category, target, service,
+                )
+            if auth.reason == "read_scope":
+                requested_target = requested_read_target_from_arguments(
+                    auth.tool_name, arguments,
+                )
+                try:
+                    resolved_target = resolved_read_target_from_arguments(
+                        auth.tool_name, arguments,
+                    )
+                except Exception as exc:
+                    # Audit diagnostics must never change the completed decision.
+                    log.warning("read target audit resolution failed: %s", exc)
+                    resolved_target = None
+            from .redaction import redact_payload
+
+            if sink_category is SinkCategory.SHELL_PROCESS and requested_target is not None:
+                # Both command fields share the durable census sink: mask argv
+                # before serialization/truncation, not just the resolved target.
+                requested_argv, _ = service_shell_argv_for_log(requested_target)
+                redacted_requested_target = json.dumps(requested_argv)
+            else:
+                redacted_requested_target = redact_payload(requested_target)
+            if redacted_requested_target is not None:
+                redacted_requested_target = str(redacted_requested_target)[
+                    :_MAX_REQUESTED_TARGET_LENGTH
+                ]
+            if sink_category is SinkCategory.SHELL_PROCESS:
+                # The renderer needs shell syntax, not the JSON-resolved argv.
+                argv, _ = service_shell_argv_for_log(target or "")
+                redacted_resolved_target = json.dumps(argv)
+            else:
+                redacted_resolved_target = redact_payload(resolved_target)
+            if redacted_resolved_target is not None:
+                redacted_resolved_target = str(redacted_resolved_target)[
+                    :_MAX_REQUESTED_TARGET_LENGTH
+                ]
+
+            if operator_shell_audit is not None:
+                redacted_requested_target = None
+                redacted_resolved_target = SinkCategory.SHELL_PROCESS.value
+                fields.update({
+                    key: operator_shell_audit[key]
+                    for key in (
+                        "shell_profile", "preparation_outcome", "command_family",
+                        "binding_rule",
+                    )
+                    if key in operator_shell_audit
+                })
+
+            if auth.reason and auth.reason.startswith("ifc_label_blocked:"):
+                try:
+                    if sink_category is None:
+                        raise ValueError("IFC sink category was not supplied by gate")
+                    source, scope = _ifc_blocking_source(
+                        ifc_labels,
+                        auth_context,
+                        sink_category,
+                        forge_scope=(
+                            auth.repo_pr_action_scope
+                            if auth.forge_scope_mismatch is not None else None
+                        ),
+                    )
+                    fields["ifc_source_scope"] = scope
+                    if source is not None:
+                        resource_id = redact_payload(source.resource_id)
+                        fields["ifc_source"] = {
+                            "source_kind": source.source_kind,
+                            "domain": source.domain,
+                            "domain_qualifier": source.domain_qualifier,
+                            "integrity": source.integrity,
+                            "integrity_effect": source.integrity_effect,
+                            "resource_id": (
+                                str(resource_id)[:_MAX_REQUESTED_TARGET_LENGTH]
+                                if resource_id is not None else None
+                            ),
+                        }
+                except Exception as exc:
+                    # Diagnostics are best-effort and cannot affect authorization.
+                    fields["ifc_source_scope"] = "classification_failed"
+                    log.warning("IFC source audit classification failed: %s", exc)
+
+            fields.update({
+                # Emission is restricted to calls enforcement would refuse.
+                "would_block": auth.would_block,
+                "target": redacted_resolved_target,
+                # Caller input is evidence only. It is never resolved, compared
+                # with policy, or fed back into an authorization decision.
+                "requested_target": redacted_requested_target,
+                "trigger": (
+                    getattr(auth_context, "origin_trigger", None)
+                    or getattr(auth_context, "trigger", None)
+                ),
+                "service_principal": service.canonical if service else None,
+            })
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                log_event("shadow_tool_decision", **fields)
+            )
+            task.add_done_callback(_consume_task_exception)
+        except RuntimeError:
+            log.debug("shadow decision logging skipped: no running event loop")
+
+    @scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+    def authorize_tool(
+        self,
+        tool_name: str,
+        auth_context: "AuthContext | None" = None,
+        *,
+        enforce: bool = False,
+        target_channel: str | None = None,
+        ifc_labels: Any = None,
+        mcp_tool: Any = None,
+        arguments: dict[str, Any] | None = None,
+        operator_shell_binding: OperatorShellBinding | None = None,
+        operator_shell_refusal: str | None = None,
+        operator_shell_request_identity: Any = None,
+        operator_shell_audit: Mapping[str, str] | None = None,
+        tool_call_id: str | None = None,
+        client_authorized_host_execution: Any = None,
+        request_identity: Any = None,
+        policy: "PolicyRegistry | None" = None,
+    ) -> ToolAuthorization:
+        """Authorize a tool call using the operation catalog.
+
+        When enforce=False (legacy mode), unknown operations are allowed but
+        logged as shadow decisions. When enforce=True, unknown operations
+        are denied.
+
+        For channel operations (send_message, react, fetch_channel_history),
+        resource-scoped authorization always compares the effective target against
+        the triggering channel. An omitted target means reply-to-trigger.
+
+        The ifc_labels parameter enables information flow control sink gate
+        checks (chainlink #871).
+        """
+        sink_target = target_channel
+        requested_target = target_channel
+        sink_category = None
+        shadow_sink = None
+
+        def finish(auth: ToolAuthorization) -> ToolAuthorization:
+            auth.policy = policy if policy is not None else selected_policy_registry()
+            # Shadow mode continues past a sink refusal; enforcement would not.
+            audit_auth = shadow_sink if shadow_sink is not None else auth
+            if not enforce and audit_auth.is_shadow_decision:
+                self._emit_shadow_decision(
+                    audit_auth, auth_context=auth_context, target=sink_target,
+                    requested_target=(
+                        requested_read_target_from_arguments(tool_name, arguments)
+                        if shadow_sink is None and auth.reason == "read_scope"
+                        else requested_target
+                    ),
+                    arguments=arguments,
+                    ifc_labels=ifc_labels, sink_category=sink_category,
+                    operator_shell_audit=operator_shell_audit if shadow_sink is not None else None,
+                )
+            return auth
+
+        service = get_trusted_service_from_auth_context(auth_context)
+        if tool_name in {
+            "read_file", "aread", "write_file", "edit_file", "replace_file",
+            "ls", "als", "glob", "aglob", "grep", "agrep",
+        }:
+            home = os.environ.get("MIMIR_HOME", "").strip()
+            args = arguments or {}
+            raw_path = args.get("file_path") or args.get("path") or target_channel
+            if home and isinstance(raw_path, str) and raw_path.strip():
+                from .memory_proposals import is_protected_model_path
+
+                home_root = Path(home).resolve()
+                candidate = Path(raw_path)
+                # Match the home backend's host, virtual and relative spellings.
+                if not candidate.is_relative_to(home_root):
+                    candidate = home_root / raw_path.lstrip("/")
+                if is_protected_model_path(candidate):
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="protected_memory_proposal_path",
+                        enforcement_enabled=True, would_block=True,
+                    ))
+        if (
+            service is not None
+            and service.authority_profile == "session-boundary"
+            and not service.has_capability(tool_name)
+        ):
+            from ._context import get_current_turn
+
+            turn = get_current_turn()
+            raw_path = (arguments or {}).get("file_path") if isinstance(arguments, dict) else None
+            artifact = (
+                resolve_large_tool_results_target(raw_path)
+                if tool_name == "read_file" and isinstance(raw_path, str) else None
+            )
+            artifact_root = framework_large_tool_results_root()
+            if (
+                turn is not None
+                and artifact_root is not None
+                and artifact is not None
+                and artifact.parent == artifact_root / str(turn.turn_id)
+                and artifact.name in turn.evicted_tool_result_ids
+            ):
+                return finish(ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    enforcement_enabled=True,
+                    would_block=False,
+                ))
+            # Synthesis must not ingest around its trusted-turn input filter,
+            # including through generally available read tools in shadow mode.
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=False,
+                reason="session_boundary_capability_denied",
+                enforcement_enabled=True,
+                would_block=True,
+            ))
+
+        if tool_name == "hands_request_scope":
+            # This can only ask the editor for scope; it neither executes input
+            # nor grants IFC/host-execution authority. Never shadow-allow it.
+            from .tools.client_provider import client_scope_request_allowed
+
+            allowed = client_scope_request_allowed(auth_context, arguments)
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=allowed,
+                reason=None if allowed else "scope request requires an admitted admin ACP Hands principal",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True,
+                would_block=not allowed,
+                flow_direction=ToolFlowDirection.NEITHER,
+            ))
+        if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
+            if ifc_labels is None and auth_context is not None:
+                ifc_labels = getattr(auth_context, "ifc_labels", None)
+            auth = MCPResourceAdapter.authorize_call(
+                tool_name,
+                mcp_tool,
+                arguments,
+                auth_context,
+                enforce=enforce,
+                ifc_labels=ifc_labels,
+            )
+            sink_category = SinkCategory.EXTERNAL_MCP
+            return finish(auth)
+        if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+            auth = ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="mcp_unknown_flow_direction",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+            )
+            return finish(auth)
+
+        policy = policy if policy is not None else selected_policy_registry()
+        if not policy.frozen:
+            raise ValueError("authorization requires a frozen policy")
+        tool_policy = policy.tools.get(tool_name)
+        if (not enforce and tool_name in _WORKLINK_BUILD_TOOLS
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return finish(_worklink_build_denial(
+                tool_name, service, auth_context, ifc_labels,
+            ))
+        plugin_tool = (
+            tool_policy if tool_policy is not None and tool_policy.owner != "core"
+            else None
+        )
+        plugin_channel_target = None
+        plugin_channel_valid = False
+        if plugin_tool is not None and plugin_tool.resource_scope == "channel":
+            extractor = plugin_tool.descriptor.sink_target_extractor
+            try:
+                targets = extractor(tool_name, arguments or {}, auth_context) if extractor else ()
+                plugin_channel_valid = (
+                    len(targets) == 1 and isinstance(targets[0], str)
+                    and bool(targets[0].strip())
+                    and (target_channel is None or target_channel == targets[0])
+                )
+            except (TypeError, ValueError, KeyError, IndexError):
+                plugin_channel_valid = False
+            if plugin_channel_valid:
+                plugin_channel_target = targets[0]
+                if target_channel is None:
+                    target_channel = sink_target = requested_target = plugin_channel_target
+        flow_direction = get_tool_flow_direction(tool_name)
+        sink_category = get_sink_category(tool_name)
+        if ifc_labels is None and auth_context is not None:
+            ifc_labels = getattr(auth_context, "ifc_labels", None)
+        raw_write_target = ((arguments or {}).get("file_path")
+                            or (arguments or {}).get("path") or target_channel)
+        if (tool_name in _TAINTED_FILE_WRITE_TOOLS
+                and tainted_file_write_target(raw_write_target)
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return finish(_tainted_write_denial(
+                tool_name, auth_context=auth_context, ifc_labels=ifc_labels,
+            ))
+        if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
+            return finish(_scheduled_write_denial(tool_name))
+        if (plugin_tool is not None and plugin_tool.writes_code_or_state
+                and "worklink_build_tools" not in plugin_tool.memberships
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return finish(_tainted_write_denial(
+                tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
+            ))
+        if (plugin_tool is not None and plugin_tool.flow in {"sink", "both"}
+                and plugin_tool.resource_scope != "channel"
+                and tool_name != "issue_comment"):
+            extractor = plugin_tool.descriptor.sink_target_extractor
+            try:
+                targets = extractor(tool_name, arguments or {}, auth_context) if extractor else ()
+                valid_target = (
+                    len(targets) == 1 and isinstance(targets[0], str)
+                    and bool(targets[0].strip())
+                    and (target_channel is None or target_channel == targets[0])
+                )
+            except (TypeError, ValueError, KeyError, IndexError):
+                valid_target = False
+            if not valid_target:
+                return finish(ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision(plugin_tool.operation_class),
+                    allowed=not enforce, reason="sink_target_required",
+                    required_tier=AccessTier.ADMIN, enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce, would_block=True,
+                    flow_direction=flow_direction,
+                ))
+            sink_target = target_channel = requested_target = targets[0]
+        if tool_name in {"write_file", "edit_file", "replace_file"}:
+            home = os.environ.get("MIMIR_HOME", "").strip()
+            raw_path = (arguments or {}).get("file_path") or (arguments or {}).get("path") or target_channel
+            if home and isinstance(raw_path, str) and raw_path.strip():
+                root = Path(home).resolve()
+                candidate = Path(raw_path)
+                if not candidate.is_relative_to(root):
+                    candidate = root / raw_path.lstrip("/")
+                try:
+                    scheduler_target = candidate.resolve(strict=False) == (root / "scheduler.yaml").resolve(strict=False)
+                except (OSError, RuntimeError):
+                    # A looping target cannot resolve to the live declaration;
+                    # let the existing filesystem/sink classifier deny it.
+                    scheduler_target = False
+                if scheduler_target:
+                    return finish(_scheduled_write_denial(tool_name))
+                if (_live_instruction_surface(root, candidate)
+                        and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+                    try:
+                        resolved_parts = candidate.resolve(strict=False).relative_to(root).parts
+                        skill = bool(resolved_parts and resolved_parts[0].casefold() == "skills")
+                    except (ValueError, OSError, RuntimeError):
+                        # The classifier deliberately vetoes indeterminate paths;
+                        # do not resolve them again without preserving that denial.
+                        skill = False
+                    return finish(_scheduled_write_denial(tool_name, skill=skill))
+        skill_write = WriteResourceAdapter.authorize_skill_write(
+            tool_name,
+            target_channel,
+            auth_context,
+            ifc_labels,
+            enforce=enforce,
+        )
+        if skill_write is not None:
+            skill_write.flow_direction = flow_direction
+            return finish(skill_write)
+        catalog = get_operation_catalog()
+        preliminary_decision = catalog.get_decision(tool_name, auth_context)
+        preliminary_service = (
+            get_trusted_service_from_auth_context(auth_context, policy=policy)
+            if auth_context is not None
+            else None
+        )
+        repo_pr_action_scope = None
+        repo_review_state = None
+        repo_review_state_refusal = None
+        issue_target = None
+        if auth_context is not None:
+            if (
+                tool_name == "issue_comment"
+                and preliminary_service is not None
+                and not service_can_invoke_operation(preliminary_service, tool_name)
+            ):
+                pass
+            elif tool_name == "issue_comment":
+                repository_sources = tuple(
+                    source for source in getattr(ifc_labels, "sources", ())
+                    if getattr(source, "domain", None) == "repository"
+                    and getattr(source, "domain_qualifier", None) is None
+                )
+                if not repository_sources:
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name,
+                        decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=not enforce,
+                        reason="issue_repository_source_required",
+                        required_tier=AccessTier.ADMIN,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce,
+                        would_block=True,
+                    ))
+                hooks = getattr(policy or selected_policy_registry(), "policy_consumer_hooks", None)
+                if plugin_tool is not None and hooks is not None and hooks.owner == plugin_tool.owner:
+                    resolve_issue_comment_target = hooks.resolve_issue
+                elif plugin_tool is not None:
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="issue_destination_resolution_failed",
+                        enforcement_enabled=enforce, would_block=True,
+                        flow_direction=flow_direction,
+                    ))
+                else:
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="issue_destination_resolution_failed",
+                        enforcement_enabled=True, would_block=True,
+                    ))
+
+                try:
+                    issue_target = resolve_issue_comment_target(
+                        (arguments or {}).get("repository"),
+                        (arguments or {}).get("issue"),
+                    )
+                except ToolException as exc:
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name,
+                        decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=not enforce,
+                        reason="issue_destination_resolution_failed",
+                        required_tier=AccessTier.ADMIN,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce,
+                        would_block=True,
+                        refusal_detail=str(exc),
+                    ))
+                if plugin_tool is not None and not any(
+                    isinstance(source.resource_id, str)
+                    and source.resource_id.split("#", 1)[0].lower() == issue_target.canonical_repo.lower()
+                    for source in repository_sources
+                ):
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="ifc_label_blocked:forge",
+                        enforcement_enabled=enforce, would_block=True,
+                        flow_direction=flow_direction,
+                    ))
+                if plugin_tool is not None:
+                    destination = issue_target.sink_destination
+                    if target_channel is not None and target_channel != destination:
+                        return finish(ToolAuthorization(
+                            tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                            allowed=False, reason="issue_destination_resolution_failed",
+                            enforcement_enabled=enforce, would_block=True,
+                            flow_direction=flow_direction,
+                        ))
+                    sink_target = target_channel = requested_target = destination
+                repo_pr_action_scope = issue_target
+            elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS or (
+                plugin_tool is not None and plugin_tool.resource_scope == "repo_pr"
+            ):
+                tool_arguments = arguments or {}
+                plugin_repo_target = (
+                    isinstance(tool_arguments.get("repository"), str)
+                    and bool(tool_arguments["repository"].strip())
+                    and type(tool_arguments.get("pull_request")) is int
+                    and tool_arguments["pull_request"] > 0
+                )
+                retained_scope = getattr(auth_context, "retained_factory_scope", None)
+                retained_matches = (
+                    _is_registered_retained_scope(retained_scope)
+                    and tool_name in _RETAINED_REPO_TOOLS
+                    and (plugin_tool is None or "retained_repo_tools" in plugin_tool.memberships)
+                    and (plugin_tool is None or plugin_tool.resource_scope == "repo_pr")
+                    and _is_worklink_retained_checkout_service(
+                        preliminary_service, auth_context=auth_context,
+                    )
+                    and tool_arguments.get("repository") == retained_scope.repository
+                    and tool_arguments.get("pull_request") == retained_scope.issue_id
+                )
+                if retained_matches:
+                    repo_pr_action_scope = retained_scope
+                    state = None
+                else:
+                    discovered = getattr(
+                        auth_context, "server_discovered_pr_states", None,
+                    )
+                    state = (
+                        discovered.resolve_for_tool(
+                            tool_name,
+                            tool_arguments.get("repository"),
+                            tool_arguments.get("pull_request"),
+                        )
+                        if discovered is not None
+                        and isinstance(tool_arguments.get("repository"), str)
+                        and isinstance(tool_arguments.get("pull_request"), int)
+                        and (plugin_tool is None or plugin_repo_target)
+                        else None
+                    )
+                if state is None and not retained_matches:
+                    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+                    state = (
+                        registry.resolve(
+                            tool_arguments.get("repository"),
+                            tool_arguments.get("pull_request"),
+                        )
+                        if registry is not None and hasattr(registry, "resolve")
+                        and (plugin_tool is None or plugin_repo_target)
+                        else None
+                    )
+                if plugin_tool is not None and state is not None:
+                    protocol = (policy if policy is not None else selected_policy_registry()).scoped_actions.get(plugin_tool.owner)
+                    constructors = getattr(protocol, "trusted_scope", None)
+                    typed_state = (
+                        type(state) is constructors.review if constructors is not None else
+                        isinstance(getattr(auth_context, "scoped_pr_grants", None), ScopedPRGrants)
+                        and getattr(state, "action_scope", None) is not None
+                    )
+                    if not typed_state or (
+                        state.repo.lower() != tool_arguments["repository"].lower()
+                        or state.pr_number != tool_arguments["pull_request"]
+                    ):
+                        state = None
+                if plugin_tool is not None and state is not None and discovered is not None and (
+                    discovered.resolve(state.repo, state.pr_number) is state
+                ):
+                    grants = getattr(auth_context, "scoped_pr_grants", None)
+                    if isinstance(grants, ScopedPRGrants):
+                        grants.issue(state.action_scope)
+                if not retained_matches:
+                    repo_pr_action_scope = (
+                        state.action_scope if state is not None else None
+                    )
+                if not retained_matches and (heartbeat_git_authority_enabled(preliminary_service) or heartbeat_git_authority_enabled(
+                    getattr(auth_context, "service_authority", None),
+                )):
+                    hooks = getattr(policy or selected_policy_registry(), "policy_consumer_hooks", None)
+                    if plugin_tool is not None and hooks is not None and hooks.owner == plugin_tool.owner:
+                        resolve_review_state_for_context = hooks.resolve_review
+                    elif plugin_tool is not None:
+                        return finish(ToolAuthorization(
+                            tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                            allowed=False, reason="repo_pr_scope_denied",
+                            enforcement_enabled=enforce, would_block=True,
+                            flow_direction=flow_direction,
+                        ))
+                    else:
+                        return finish(ToolAuthorization(
+                            tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                            allowed=False, reason="repo_pr_scope_denied",
+                            enforcement_enabled=True, would_block=True,
+                        ))
+
+                    try:
+                        state = resolve_review_state_for_context(
+                            auth_context,
+                            tool_arguments.get("repository"),
+                            tool_arguments.get("pull_request"),
+                        )
+                    except ToolException as exc:
+                        return finish(ToolAuthorization(
+                            tool_name=tool_name,
+                            decision=OperationDecision.RESOURCE_SCOPED,
+                            allowed=False if plugin_tool is not None else not enforce,
+                            reason="repo_pr_scope_denied",
+                            service_principal=preliminary_service,
+                            enforcement_enabled=enforce,
+                            is_shadow_decision=not enforce,
+                            would_block=True,
+                            refusal_detail=str(exc),
+                            flow_direction=flow_direction,
+                        ))
+                    repo_pr_action_scope = state.action_scope
+            else:
+                repo_pr_action_scope = getattr(
+                    auth_context, "repo_pr_action_scope", None,
+                )
+            if tool_name in {"shell_exec", "bash_async"}:
+                repo_review_state, repo_review_state_refusal = (
+                    resolve_repository_review_state(
+                        auth_context,
+                        command=target_channel,
+                        cwd=(arguments or {}).get("cwd"),
+                    )
+                )
+                if repo_review_state is not None:
+                    repo_pr_action_scope = repo_review_state.action_scope
+            elif tool_name in {"write_file", "edit_file", "replace_file"}:
+                repo_review_state, repo_review_state_refusal = (
+                    resolve_repository_review_state(
+                        auth_context, path=target_channel,
+                    )
+                )
+                if repo_review_state is not None:
+                    repo_pr_action_scope = repo_review_state.action_scope
+        service_capability_denied = (
+            preliminary_service is not None
+            and preliminary_decision == OperationDecision.ADMIN_REQUIRED
+            and not service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
+        )
+        service_allowed_preliminary = (
+            service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
+        )
+        if (
+            preliminary_service is not None
+            and preliminary_service.trigger == "poller"
+            and sink_category is SinkCategory.PROPOSAL
+            and str((arguments or {}).get("lane") or "agent").strip().lower()
+            not in {"agent", "poller"}
+        ):
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="service_sink_destination_denied",
+                service_principal=preliminary_service,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+                would_block=True,
+            ))
+        operator_shell_allowed = _operator_can_invoke_admin_shell(
+            tool_name, ifc_labels, auth_context,
+        )
+        preliminary_admin_denied = (
+            preliminary_decision == OperationDecision.ADMIN_REQUIRED
+            and not service_allowed_preliminary
+            and not operator_shell_allowed
+            and "admin" not in (
+                (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+            )
+        )
+        sink_target = target_channel
+        if issue_target is not None:
+            sink_target = issue_target.sink_destination
+        if (
+            sink_category == SinkCategory.SAME_CHANNEL
+            and not sink_target
+            and auth_context is not None
+        ):
+            sink_target = getattr(auth_context, "channel_id", None)
+        if not sink_target:
+            descriptor = get_tool_descriptor(tool_name)
+            sink_target = descriptor.sink_destination if descriptor else None
+        is_ifc_sink = flow_direction in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        } or (
+            ifc_labels is not None
+            and flow_direction is ToolFlowDirection.UNKNOWN
+            and preliminary_decision == OperationDecision.UNKNOWN
+            and not service_allowed_preliminary
+        )
+        if (
+            is_ifc_sink
+            and not service_capability_denied
+        ):
+            sink_check = SinkGate.check_sink_flow(
+                tool_name,
+                sink_target,
+                ifc_labels,
+                auth_context,
+                enforce=enforce,
+                repo_review_state=repo_review_state,
+                repo_review_state_refusal=repo_review_state_refusal,
+                repo_pr_action_scope=repo_pr_action_scope,
+                operator_shell_binding=operator_shell_binding,
+                operator_shell_refusal=operator_shell_refusal,
+                operator_shell_request_identity=operator_shell_request_identity,
+                tool_call_id=tool_call_id,
+                requested_cwd=(arguments or {}).get("cwd"),
+                client_authorized_host_execution=client_authorized_host_execution,
+                request_identity=request_identity,
+                sink_category=sink_category,
+            )
+            sink_check.repo_pr_action_scope = repo_pr_action_scope
+            if (not enforce and sink_category is SinkCategory.SHELL_PROCESS
+                    and sink_check.reason == "ifc_declassification_approved"
+                    and not preliminary_admin_denied):
+                return finish(sink_check)
+            if (not sink_check.allowed and sink_check.enforcement_enabled
+                    and not preliminary_admin_denied):
+                return finish(sink_check)
+            if sink_check.is_shadow_decision and sink_check.would_block:
+                if preliminary_admin_denied:
+                    # Census both independent refusals without replacing the
+                    # admin denial returned by the authorization gate below.
+                    finish(sink_check)
+                else:
+                    shadow_sink = sink_check
+
+        decision = preliminary_decision
+        service_principal = None
+
+        if auth_context is not None:
+            service_principal = get_trusted_service_from_auth_context(auth_context, policy=policy)
+
+        required_tier = AccessTier.USER
+        reason = None
+        is_shadow = False
+        would_block = False
+        service_allowed = (
+            service_can_invoke_operation(service_principal, tool_name, policy=policy)
+        )
+
+        if decision == OperationDecision.OPEN:
+            allowed = True
+            would_block = False
+        elif decision == OperationDecision.ADMIN_REQUIRED:
+            required_tier = AccessTier.ADMIN
+            if (
+                auth_context
+                and "admin" in (getattr(auth_context, "roles", ()) or ())
+            ) or operator_shell_allowed:
+                allowed = True
+                would_block = False
+            elif service_allowed:
+                allowed = True
+                is_shadow = not enforce
+                would_block = False
+            elif enforce:
+                allowed = False
+                reason = "admin_required"
+                would_block = True
+            else:
+                allowed = True
+                reason = "admin_required"
+                is_shadow = True
+                would_block = True
+        elif decision == OperationDecision.RESOURCE_SCOPED:
+            if plugin_tool is not None:
+                scope_kind = plugin_tool.resource_scope
+                if scope_kind == "channel":
+                    if plugin_channel_valid:
+                        channel_auth = ChannelResourceAdapter.authorize_channel_operation(
+                            tool_name, plugin_channel_target, auth_context, enforce=enforce,
+                            registered_plugin=True,
+                        )
+                        channel_auth.flow_direction = flow_direction
+                        return finish(channel_auth)
+                    reason = "channel_target_required"
+                elif scope_kind == "worklink" and (
+                    "worklink_build_tools" in plugin_tool.memberships
+                    and tool_name in WriteResourceAdapter._RESOURCE_OPERATIONS
+                ):
+                    write_auth = WriteResourceAdapter.authorize_operation(
+                        tool_name, sink_target, auth_context, enforce=enforce,
+                        service_allowed=service_allowed, ifc_labels=ifc_labels,
+                    )
+                    write_auth.flow_direction = flow_direction
+                    return finish(write_auth)
+                elif scope_kind in {"ci_run", "ci_branch"}:
+                    args = arguments or {}
+                    repo, run_id = args.get("repository"), args.get("run_id")
+                    branch, workflow_id = args.get("branch"), args.get("workflow_id")
+                    run_scope = (
+                        isinstance(repo, str) and type(run_id) is int and run_id > 0
+                        and is_configured_github_repo(repo)
+                        and (repo.lower(), run_id) in getattr(auth_context, "ci_run_targets", frozenset())
+                    )
+                    branch_scope = (
+                        isinstance(repo, str) and is_configured_github_repo(repo)
+                        and isinstance(branch, str) and bool(branch)
+                        and (workflow_id is None or type(workflow_id) is int and workflow_id > 0)
+                        and any(r == repo.lower() and b == branch
+                                and (workflow_id is None or workflow_id == w)
+                                for r, b, w in getattr(auth_context, "ci_branch_targets", frozenset()))
+                    )
+                    in_scope = (
+                        (branch_scope if scope_kind == "ci_branch" else run_scope)
+                        and service_principal is not None
+                        and service_principal.has_capability(tool_name)
+                    )
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=decision,
+                        allowed=in_scope or not enforce,
+                        reason=None if in_scope else "ci_run_scope_denied",
+                        required_tier=AccessTier.USER,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce and not in_scope,
+                        would_block=not in_scope, flow_direction=flow_direction,
+                    ))
+                elif scope_kind == "tracker_issue":
+                    external_ref = (arguments or {}).get("external_ref")
+                    in_scope = (
+                        isinstance(external_ref, str)
+                        and any(
+                            external_ref == f"{adapter}:{ref}"
+                            for adapter, ref, _url in getattr(
+                                auth_context, "tracker_issue_targets", frozenset(),
+                            )
+                        )
+                        and service_principal is not None
+                        and service_principal.has_capability(tool_name)
+                    )
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=decision,
+                        allowed=in_scope or not enforce,
+                        reason=None if in_scope else "tracker_scope_denied",
+                        required_tier=AccessTier.USER,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce and not in_scope,
+                        would_block=not in_scope, flow_direction=flow_direction,
+                    ))
+                elif scope_kind == "repo_pr" and _is_registered_retained_scope(repo_pr_action_scope):
+                    return finish(authorize_repo_pr_tool(
+                        tool_name, repo_pr_action_scope,
+                        service_principal=service_principal, enforce=enforce,
+                        flow_direction=flow_direction, registered_plugin=True,
+                        auth_context=auth_context,
+                    ))
+                elif scope_kind == "repo_pr" and (
+                    (protocol := (policy if policy is not None else selected_policy_registry())
+                     .scoped_actions.get(plugin_tool.owner)) is not None
+                    and type(plugin_tool.typed_action) is protocol.action_type
+                ):
+                    repo_auth = authorize_repo_pr_tool(
+                        tool_name, repo_pr_action_scope,
+                        service_principal=service_principal, enforce=enforce,
+                        flow_direction=flow_direction,
+                        required_actions=(plugin_tool.typed_action.value,),
+                        registered_plugin=True,
+                        auth_context=auth_context, owner=plugin_tool.owner,
+                        action=plugin_tool.typed_action, protocol=protocol,
+                        review_state=state,
+                    )
+                    if shadow_sink is None:
+                        sink_target = requested_target = None
+                    return finish(repo_auth)
+                else:
+                    reason = "resource_scope_unknown"
+                return finish(ToolAuthorization(
+                    tool_name=tool_name, decision=decision, allowed=not enforce,
+                    reason=reason, required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce, is_shadow_decision=not enforce,
+                    would_block=True, flow_direction=flow_direction,
+                ))
+            if tool_name == "hands_read":
+                from .tools.client_provider import (
+                    MIMIR_HANDS_V1,
+                    get_turn_capability_context,
+                )
+
+                capability_context = get_turn_capability_context()
+                profile = getattr(capability_context, "profile_policy", None)
+                resource_policy = getattr(profile, "resource_policy", None)
+                resource = canonical_client_file_resource(
+                    (arguments or {}).get("path"),
+                    cwd=getattr(capability_context, "cwd", None),
+                )
+                authenticated_admin = (
+                    auth_context is not None
+                    and isinstance(getattr(auth_context, "principal", None), str)
+                    and bool(auth_context.principal)
+                    and isinstance(
+                        getattr(auth_context, "canonical_principal", None), str
+                    )
+                    and bool(auth_context.canonical_principal)
+                    and "admin" in (getattr(auth_context, "roles", ()) or ())
+                )
+                admitted = (
+                    capability_context is not None
+                    and capability_context.acp_delivery is True
+                    and profile is MIMIR_HANDS_V1
+                    and resource_policy is CLIENT_FILE_RESOURCE_POLICY
+                    and resource is not None
+                    and capability_context.resource_policy.allows(resource)
+                    and getattr(capability_context, "lease", None) is not None
+                    and not getattr(capability_context.lease, "closed", False)
+                )
+                in_scope = authenticated_admin and admitted
+                hands_auth = ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.RESOURCE_SCOPED,
+                    allowed=in_scope or not enforce,
+                    reason=None if in_scope else (
+                        "client_file_scope_denied: session cwd boundary "
+                        f"{getattr(capability_context, 'cwd', None)!r}"
+                    ),
+                    required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce and not in_scope,
+                    would_block=not in_scope,
+                    protected_source_resources=(resource,) if in_scope else (),
+                    flow_direction=flow_direction,
+                    result_integrity="trusted" if in_scope else "untrusted",
+                )
+                if shadow_sink is None:
+                    sink_target = resource
+                    requested_target = (arguments or {}).get("path")
+                return finish(hands_auth)
+            if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
+                forge_auth = authorize_repo_pr_tool(
+                    tool_name,
+                    repo_pr_action_scope,
+                    service_principal=service_principal,
+                    enforce=enforce,
+                    flow_direction=flow_direction,
+                )
+                if shadow_sink is None:
+                    sink_target = requested_target = None
+                return finish(forge_auth)
+            if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS:
+                channel_auth = ChannelResourceAdapter.authorize_channel_operation(
+                    tool_name,
+                    target_channel,
+                    auth_context,
+                    enforce=enforce,
+                )
+                channel_auth.flow_direction = flow_direction
+                return finish(channel_auth)
+            if tool_name in WriteResourceAdapter._RESOURCE_OPERATIONS:
+                write_auth = WriteResourceAdapter.authorize_operation(
+                    tool_name,
+                    sink_target,
+                    auth_context,
+                    enforce=enforce,
+                    service_allowed=service_allowed,
+                    ifc_labels=ifc_labels,
+                )
+                write_auth.flow_direction = flow_direction
+                write_auth.repo_pr_action_scope = repo_pr_action_scope
+                return finish(write_auth)
+            if tool_name in READ_RESOURCE_OPERATIONS:
+                target_in_active_lease = False
+                if (
+                    auth_context is not None
+                    and service_principal is not None
+                    and service_principal.authority_profile == "github"
+                ):
+                    requested_read_target = requested_read_target_from_arguments(
+                        tool_name, arguments,
+                    )
+                    if isinstance(requested_read_target, str):
+                        read_review_state, _read_state_refusal = (
+                            resolve_repository_review_state(
+                                auth_context, path=requested_read_target,
+                            )
+                        )
+                        target_in_active_lease = (
+                            _target_within_active_pr_checkout_lease(
+                                requested_read_target, read_review_state,
+                            )
+                        )
+                if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
+                    allowed = True
+                elif (
+                    service_principal is not None
+                    and tool_name in {
+                        "read_file", "aread", "ls", "als", "glob", "aglob",
+                        "grep", "agrep",
+                    }
+                ):
+                    scoped_read_allowed = _trigger_service_read_target_is_allowed(
+                        service_principal, tool_name, arguments,
+                        auth_context=auth_context,
+                    )
+                    resolved_read_target = resolved_read_target_from_arguments(
+                        tool_name, arguments,
+                    )
+                    from .read_policy import is_memory_read_path
+
+                    targets_memory = (
+                        resolved_read_target is not None
+                        and is_memory_read_path(Path(resolved_read_target))
+                    )
+                    home = os.environ.get("MIMIR_HOME", "").strip()
+                    scratch_root = (
+                        (Path(home).resolve() / "scratch").resolve()
+                        if home else None
+                    )
+                    resolved_target_path = (
+                        Path(resolved_read_target).resolve(strict=False)
+                        if resolved_read_target is not None else None
+                    )
+                    targets_scratch = (
+                        scratch_root is not None
+                        and resolved_target_path is not None
+                        and (
+                            resolved_target_path == scratch_root
+                            or resolved_target_path.is_relative_to(scratch_root)
+                        )
+                    )
+                    allowed = scoped_read_allowed or (
+                        service_allowed
+                        and service_principal.authority_profile != "github"
+                        and not targets_memory
+                        and not targets_scratch
+                        # Attachment access follows scoped roots, not a generic
+                        # read capability (inbound uploads belong to channels).
+                        and not (
+                            home and resolved_target_path is not None
+                            and resolved_target_path.is_relative_to(
+                                Path(home).resolve() / "attachments"
+                            )
+                        )
+                        and not (
+                            service_principal.canonical == "system"
+                            and service_principal.trigger == "upgrade"
+                        )
+                    )
+                elif service_allowed:
+                    allowed = True
+                else:
+                    allowed = (
+                        auth_context is not None
+                        and read_target_from_arguments(tool_name, arguments) is not None
+                    )
+                allowed = allowed or target_in_active_lease
+                required_tier = AccessTier.USER if allowed else AccessTier.ADMIN
+                if not allowed:
+                    reason = "read_scope"
+                    would_block = True
+                    if not enforce:
+                        allowed = True
+                        is_shadow = True
+            else:
+                required_tier = AccessTier.ADMIN
+                if enforce:
+                    allowed = False
+                    reason = "resource_scoped"
+                    would_block = True
+                else:
+                    allowed = True
+                    reason = "resource_scoped"
+                    is_shadow = True
+                    would_block = True
+        else:
+            # Explicit service capabilities are authoritative even if a newly
+            # added operation has not reached the catalog yet. This is a narrow
+            # exception to UNKNOWN's ordinary fail-closed rule: capabilities
+            # are fixed per trusted service principal, not inferred from the
+            # runtime inventory or supplied by the caller.
+            if service_allowed:
+                allowed = True
+                would_block = False
+            elif enforce:
+                allowed = False
+                reason = "unknown_operation"
+                would_block = True
+            else:
+                allowed = True
+                reason = "unknown_operation"
+                is_shadow = True
+                would_block = True
+
+        auth = ToolAuthorization(
+            tool_name=tool_name,
+            decision=decision,
+            allowed=allowed,
+            reason=reason,
+            service_principal=service_principal,
+            required_tier=required_tier,
+            enforcement_enabled=enforce,
+            is_shadow_decision=is_shadow,
+            would_block=would_block,
+            resolved_sink_target=(
+                resolve_sink_target(
+                    tool_name, sink_category, sink_target, service_principal,
+                )
+                if sink_target is not None else None
+            ),
+            flow_direction=flow_direction,
+            repo_pr_action_scope=repo_pr_action_scope,
+        )
+
+        return finish(auth)
+
+
+_PROTECTED_RESULT_DOMAINS: Mapping[str, str] = PolicyMappingView(lambda policy: {
+    name: tool.result_domain for name, tool in policy.tools.items()
+    if tool.result_domain is not None
+})
+
+_ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
+_ACP_HANDS_RESULT_TOOLS = policy_membership("acp_hands_result_tools")
+
+# Independent semantic inventory for tools whose results come from a read
+# backend. Startup rejects drift toward SINK/NEITHER before it can suppress
+# result taint. MCP reads have equivalent adapter/resource parity checks in
+# MCPResourceAdapter.authorize_call.
+_READ_BACKEND_RESULT_TOOLS = PolicySetView(lambda policy: frozenset(
+    name for name, tool in policy.tools.items() if tool.read_backend
+))
+
+_SELF_AUTHORED_FILE_ROOTS = frozenset({
+    ".mimir_builtin_skills",
+    "docs",
+    "memory",
+    "prompts",
+    "skills",
+    "state",
+})
+_UNTRUSTED_REFERENCE_SUBTREES = frozenset({("state", "pollers")})
+_PR_CHECKOUT_LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
+
+
+class LeaseAttestationReason(StrEnum):
+    OK = "ok"
+    NO_AUTHOR_TRUST = "no_author_trust"
+    SCOPE_LEASE_MISMATCH = "scope_lease_mismatch"
+    INACTIVE_LEASE = "inactive_lease"
+    MISSING_EXPECTED_HEAD_OR_BRANCH = "missing_expected_head_or_branch"
+    REVIEW_STATE_MISMATCH = "review_state_mismatch"
+    MISSING_RECORDED_HEAD = "missing_recorded_head"
+    CHECKOUT_STATE_MISMATCH = "checkout_state_mismatch"
+    GIT_TIMEOUT = "git_timeout"
+    GIT_NONZERO_EXIT = "git_nonzero_exit"
+    GIT_MISSING_BINARY = "git_missing_binary"
+    GIT_OUTPUT_LIMIT = "git_output_limit"
+    GIT_MALFORMED_OUTPUT = "git_malformed_output"
+    GIT_SUBPROCESS_ERROR = "git_subprocess_error"
+    LINEAGE_HEAD_MISMATCH = "lineage_head_mismatch"
+    LINEAGE_METADATA_MISMATCH = "lineage_metadata_mismatch"
+    LINEAGE_RECORD_MISSING = "lineage_record_missing"
+    LINEAGE_COMMIT_MISMATCH = "lineage_commit_mismatch"
+    LINEAGE_READ_ERROR = "lineage_read_error"
+    ANCESTRY_FAILURE = "ancestry_failure"
+    COMMIT_IDENTITY_MISMATCH = "commit_identity_mismatch"
+    MERGE_IDENTITY_MISMATCH = "merge_identity_mismatch"
+    MERGE_PARENT_MISMATCH = "merge_parent_mismatch"
+    PATCH_BUDGET_EXCEEDED = "patch_budget_exceeded"
+    PATCH_ID_MISMATCH = "patch_id_mismatch"
+
+
+@dataclass(frozen=True)
+class LeaseAttestation:
+    ok: bool
+    reason: str
+
+
+_lease_refusal_reason: ContextVar[LeaseAttestationReason | None] = ContextVar(
+    "lease_refusal_reason", default=None,
+)
+
+
+def _lease_refuse(reason: LeaseAttestationReason) -> bool:
+    _lease_refusal_reason.set(reason)
+    return False
+
+
+def _lease_git_ok(result: Any) -> bool:
+    if getattr(result, "timed_out", False):
+        return _lease_refuse(LeaseAttestationReason.GIT_TIMEOUT)
+    if getattr(result, "output_limited", False):
+        return _lease_refuse(LeaseAttestationReason.GIT_OUTPUT_LIMIT)
+    if result.returncode != 0:
+        return _lease_refuse(LeaseAttestationReason.GIT_NONZERO_EXIT)
+    return True
+
+
+def _lease_ancestor_ok(result: Any) -> bool:
+    # Ancestry, status and replay merge-base historically inspected only the
+    # exit status. Preserve that decision while diagnosing failed commands.
+    if result.returncode == 0:
+        return True
+    _lease_git_ok(result)
+    return False
+
+
+def _lease_exception_reason(error: BaseException) -> LeaseAttestationReason:
+    if isinstance(error, FileNotFoundError):
+        return LeaseAttestationReason.GIT_MISSING_BINARY
+    if isinstance(error, subprocess.TimeoutExpired):
+        return LeaseAttestationReason.GIT_TIMEOUT
+    return LeaseAttestationReason.GIT_SUBPROCESS_ERROR
+
+
+def _attested_pr_checkout_lease(
+    auth_context: "AuthContext | None",
+    scope: Any,
+    lease: Any,
+) -> bool:
+    """Return whether the lease still contains only author-attested content."""
+    return pr_checkout_lease_attestation(auth_context, scope, lease).ok
+
+
+def pr_checkout_lease_attestation(
+    auth_context: "AuthContext | None", scope: Any, lease: Any,
+) -> LeaseAttestation:
+    """Diagnose a lease refusal without exposing checkout or Git output."""
+    token = _lease_refusal_reason.set(None)
+    try:
+        return _pr_checkout_lease_attestation(auth_context, scope, lease)
+    finally:
+        _lease_refusal_reason.reset(token)
+
+
+def log_pr_checkout_lease_attestation_refused(
+    auth_context: "AuthContext | None", scope: Any, reason: str,
+) -> None:
+    """Log only the scope identifier and fixed reason, once per turn and reason."""
+    scope_id = getattr(scope, "scope_id", None)
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    if ifc_state is not None:
+        with getattr(ifc_state, "_lock", threading.Lock()):
+            seen = getattr(ifc_state, "_lease_attestation_refusals", None)
+            if seen is None:
+                seen = set()
+                setattr(ifc_state, "_lease_attestation_refusals", seen)
+            if (scope_id, reason) in seen:
+                return
+            seen.add((scope_id, reason))
+    from .event_logger import log_event_sync
+
+    try:
+        fields = dict(scope_id=scope_id, reason=reason)
+        if reason == LeaseAttestationReason.NO_AUTHOR_TRUST:
+            from .pollers import bounded_github_author_cause
+
+            verdicts = getattr(ifc_state, "pr_checkout_author_trust", {})
+            if scope_id not in verdicts:
+                cause = "no_turn_verdict"
+            elif verdicts[scope_id] is False:
+                cause = "non_collaborator"
+            else:
+                cause = getattr(ifc_state, "pr_checkout_author_trust_cause", {}).get(
+                    scope_id, "verdict_missing",
+                )
+            fields["cause"] = bounded_github_author_cause(cause)
+        log_event_sync("pr_checkout_lease_attestation_refused", **fields)
+    except RuntimeError:
+        # Standalone policy callers may not initialize the process event logger.
+        pass
+
+
+def _log_repository_result_untrusted_default(
+    auth_context: "AuthContext | None", scope: Any, tool: str, reason: str,
+    mismatched_fields: tuple[str, ...] = (),
+) -> None:
+    """Report an exact-scope provenance fallback once per turn/tool/reason."""
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    if ifc_state is not None:
+        with ifc_state._lock:
+            seen = getattr(ifc_state, "_repository_result_fallbacks", None)
+            if seen is None:
+                seen = set()
+                setattr(ifc_state, "_repository_result_fallbacks", seen)
+            if (tool, reason) in seen:
+                return
+            seen.add((tool, reason))
+    from .event_logger import log_event_sync
+
+    try:
+        fields = dict(
+            tool=tool, scope_id=scope.scope_id, pr_number=scope.pr_number,
+            observed_head_sha=scope.observed_head_sha, reason=reason,
+        )
+        if reason == "provenance_field_mismatch":
+            fields["mismatched_fields"] = list(mismatched_fields)
+        log_event_sync("repository_result_untrusted_default", **fields)
+    except RuntimeError:
+        pass
+
+
+def _pr_checkout_lease_attestation(
+    auth_context: "AuthContext | None", scope: Any, lease: Any,
+) -> LeaseAttestation:
+    def verdict(ok: bool, reason: LeaseAttestationReason | None = None) -> LeaseAttestation:
+        code = (LeaseAttestationReason.OK if ok else
+                reason or _lease_refusal_reason.get() or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
+        return LeaseAttestation(ok, code.value)
+
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    author_trust = getattr(ifc_state, "pr_checkout_author_trust", {})
+    scope_id = getattr(scope, "scope_id", None)
+    if author_trust.get(scope_id) is not True:
+        return verdict(False, LeaseAttestationReason.NO_AUTHOR_TRUST)
+    if (lease is None or scope_id != getattr(lease, "scope_id", None)
+        or getattr(scope, "canonical_repo", "").lower()
+        != getattr(lease, "canonical_repo", "").lower()
+        or getattr(scope, "pr_number", None) != getattr(lease, "pr_number", None)
+    ):
+        return verdict(False, LeaseAttestationReason.SCOPE_LEASE_MISMATCH)
+    if not getattr(lease, "is_active", False):
+        return verdict(False, LeaseAttestationReason.INACTIVE_LEASE)
+
+    expected_head = getattr(scope, "observed_head_sha", "").lower()
+    expected_branch = getattr(scope, "head_ref", None)
+    path = getattr(lease, "path", None)
+    if not expected_head or not expected_branch or path is None:
+        return verdict(False, LeaseAttestationReason.MISSING_EXPECTED_HEAD_OR_BRANCH)
+
+    # Use the same request-specific discovered state as repository admission;
+    # a reminted lease can supersede the original immutable event registry.
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
+    review_state = discovered.resolve_checkout_path(path) if discovered is not None else None
+    if review_state is None:
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        review_state = (
+            registry.resolve_checkout_path(path)
+            if registry is not None
+            else getattr(auth_context, "repo_review_state", None)
+        )
+    attached = getattr(review_state, "checkout_lease", None)
+    if (
+        attached is not lease
+        and getattr(review_state, "git_expected_head", None) == expected_head
+        and getattr(lease, "head_sha", "").lower() == expected_head
+    ):
+        # A file read reconstructs the same lease from metadata. With no local
+        # HEAD advance, the immutable observed commit still suffices; the real
+        # checkout/branch are inspected by the author-attestation predicate.
+        return verdict(_lease_head_is_author_attested(
+            path, expected_branch, expected_head, expected_head,
+            scope=scope, lease=lease, ifc_state=ifc_state,
+        ))
+    if review_state is None or attached is None or any(
+        getattr(attached, key, None) != getattr(lease, key, None) for key in (
+            "path", "scope_id", "head_sha", "base_sha", "recovery_id",
+            "canonical_origin", "owner", "verified_base_sha",
+        )
+    ):
+        # Synthetic callers without a registered review state do not get the
+        # cache, but still fail closed against the immutable attested head.
+        if getattr(lease, "head_sha", "").lower() != expected_head:
+            return verdict(False, LeaseAttestationReason.REVIEW_STATE_MISMATCH)
+        return verdict(_lease_head_is_author_attested(
+            path, expected_branch, expected_head, expected_head,
+            scope=scope, lease=lease, ifc_state=ifc_state,
+        ))
+    recorded_head = getattr(review_state, "git_expected_head", None)
+    if not recorded_head:
+        return verdict(False, LeaseAttestationReason.MISSING_RECORDED_HEAD)
+    observed_state = _observed_checkout_state(path)
+    if observed_state is None:
+        reason = _lease_refusal_reason.get()
+        return verdict(False, reason or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
+    observed_branch, observed_head = observed_state
+    if observed_branch != expected_branch or observed_head != recorded_head.lower():
+        # The checkout can be mutated by processes outside the typed repository
+        # tools. Never reuse a verdict unless the real branch and HEAD still
+        # match the server's recorded state.
+        return verdict(False, LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
+    if observed_head != expected_head or getattr(lease, "head_sha", "").lower() != expected_head:
+        if not _lease_has_clean_lineage(path, lease, scope, expected_head, observed_head):
+            return verdict(False)
+
+    def verify() -> tuple[bool, str]:
+        attestation = verdict(_lease_head_is_author_attested(
+            path, expected_branch, expected_head, observed_head,
+            observed_state=observed_state,
+            scope=scope, lease=lease, ifc_state=ifc_state,
+        ))
+        return attestation.ok, attestation.reason
+
+    ok, reason = review_state.author_attestation_verdict(observed_head, verify)
+    return LeaseAttestation(ok, reason)
+
+
+# Lease attestation spawns one Git process per check, and up to two per PR
+# commit (``show`` plus ``patch-id``). Each timeout is a hang guard, not a
+# latency budget: a refusal fails closed and taints the turn, so a loaded host
+# must not turn a slow-but-healthy Git call into ``git_timeout``.
+_LEASE_GIT_TIMEOUT_S = 10
+
+
+def _lease_has_clean_lineage(
+    path: Path, lease: Any, scope: Any, expected_head: str, current_head: str,
+) -> bool:
+    """Check every local commit against the atomically recorded producing turns."""
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is None:
+        return False
+    _METADATA, _recorded_lineage, _recorded_verified_base = (
+        hooks.lease_metadata, hooks.lineage, hooks.verified_base,
+    )
+    hardened_git_command = hooks.git_command
+
+    try:
+        raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return _lease_refuse(LeaseAttestationReason.LINEAGE_READ_ERROR)
+    try:
+        if current_head != getattr(lease, "head_sha", "").lower():
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_HEAD_MISMATCH)
+        if not isinstance(raw, dict) or any(raw.get(key) != getattr(lease, key) for key in (
+            "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
+        )):
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_METADATA_MISMATCH)
+        lineage = _recorded_lineage(raw)
+        if lineage is None:
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_RECORD_MISSING)
+        base = getattr(lease, "base_sha", "").lower()
+        verified_base = _recorded_verified_base(raw)
+        observed_base = getattr(scope, "observed_base_sha", "").lower()
+        verified = base == observed_base or base == verified_base
+        if verified and base != observed_base:
+            ancestor = hardened_git_command(
+                path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base),
+                timeout=_LEASE_GIT_TIMEOUT_S,
+            )
+            if not _lease_git_ok(ancestor):
+                return False
+        result = hardened_git_command(
+            path, ("rev-list", "--max-count=501", current_head, "--not", expected_head,
+                   *((base,) if verified else ()), "--"), timeout=_LEASE_GIT_TIMEOUT_S,
+        )
+        if not _lease_git_ok(result):
+            return False
+        commits = result.stdout.splitlines()
+        if not (bool(commits) and len(commits) <= 500 and all(
+            lineage.get(commit) is True for commit in commits
+        )):
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_COMMIT_MISMATCH)
+        return True
+    except (OSError, subprocess.SubprocessError) as error:
+        return _lease_refuse(_lease_exception_reason(error))
+    except (ValueError, TypeError):
+        return _lease_refuse(LeaseAttestationReason.LINEAGE_READ_ERROR)
+
+
+def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
+    """Read the checkout's actual branch and HEAD with one hardened Git command."""
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is None:
+        return None
+    hardened_git_command = hooks.git_command
+
+    try:
+        result = hardened_git_command(
+            path,
+            ("status", "--porcelain=v2", "--branch", "--untracked-files=no"),
+            timeout=_LEASE_GIT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        _lease_refuse(_lease_exception_reason(error))
+        return None
+    if not _lease_ancestor_ok(result):
+        return None
+    fields = {}
+    for line in result.stdout.splitlines():
+        if line.startswith("# branch."):
+            key, separator, value = line[2:].partition(" ")
+            if separator:
+                fields[key] = value
+    branch = fields.get("branch.head")
+    head = fields.get("branch.oid", "").lower()
+    if (
+        not branch
+        or branch == "(detached)"
+        or len(head) != 40
+        or any(character not in "0123456789abcdef" for character in head)
+    ):
+        _lease_refuse(LeaseAttestationReason.GIT_MALFORMED_OUTPUT)
+        return None
+    return branch, head
+
+
+def _lease_head_is_author_attested(
+    path: Path,
+    expected_branch: str,
+    expected_head: str,
+    current_head: str,
+    *,
+    observed_state: tuple[str, str] | None = None,
+    scope: Any = None,
+    lease: Any = None,
+    ifc_state: Any = None,
+) -> bool:
+    """Verify HEAD against the attested head and the forge-observed base."""
+    from collections import Counter
+
+    from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is None:
+        return False
+    _BASE_CONFIG, _DEFAULT_GIT = hooks.git_config, hooks.git_binary
+    _sanitized_git_env, hardened_git_command = hooks.git_env, hooks.git_command
+
+    def run(*arguments: str):
+        return hardened_git_command(path, arguments, timeout=_LEASE_GIT_TIMEOUT_S)
+
+    def patch_id(commit: str) -> str | None:
+        # Read only immutable objects with hardened Git; patch-id receives the
+        # bounded diff on stdin, never a shell pipeline or checkout config.
+        # --stable discards whitespace (including semantic Python indentation).
+        # Require --verbatim; unsupported Git versions fail closed.
+        diff = run("show", "--format=", "--root", "--no-ext-diff", "--no-textconv", commit, "--")
+        if not _lease_git_ok(diff):
+            return None
+        result = subprocess.run(
+            [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--verbatim"],
+            input=diff.stdout, capture_output=True, text=True,
+            timeout=_LEASE_GIT_TIMEOUT_S,
+            env=_sanitized_git_env(),
+        )
+        fields = result.stdout.split()
+        if not _lease_git_ok(result):
+            return None
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]):
+            _lease_refuse(LeaseAttestationReason.PATCH_ID_MISMATCH)
+            return None
+        return fields[0]
+
+    try:
+        actual_state = observed_state or _observed_checkout_state(path)
+        if actual_state is None:
+            # Keep the status subprocess reason from the uncached/reconstructed
+            # lease path instead of masking it as a branch mismatch.
+            return False
+        if actual_state != (expected_branch, current_head.lower()):
+            return _lease_refuse(LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
+        if current_head.lower() == expected_head.lower():
+            return True
+        base = getattr(scope, "observed_base_sha", "").lower()
+        verified_base = (
+            len(base) == 40 and all(c in "0123456789abcdef" for c in base)
+            and (
+                base == getattr(lease, "base_sha", "").lower()
+                or (
+                    base == getattr(lease, "scope_base_sha", "").lower()
+                    and getattr(lease, "verified_base_sha", None) == getattr(lease, "base_sha", None)
+                    and _lease_ancestor_ok(run("merge-base", "--is-ancestor", base, lease.base_sha))
+                )
+            )
+        )
+        if verified_base:
+            base = lease.base_sha.lower()
+        head_ancestor = _lease_ancestor_ok(run("merge-base", "--is-ancestor", expected_head, current_head))
+        base_ancestor = verified_base and _lease_ancestor_ok(run(
+            "merge-base", "--is-ancestor", base, current_head,
+        ))
+        if not head_ancestor and not base_ancestor:
+            if _lease_refusal_reason.get() in {
+                LeaseAttestationReason.GIT_TIMEOUT, LeaseAttestationReason.GIT_OUTPUT_LIMIT,
+            }:
+                return False
+            return _lease_refuse(LeaseAttestationReason.ANCESTRY_FAILURE)
+        commits = run(
+            "log", "-z", "--format=%H%x00%P%x00%an%x00%ae%x00%cn%x00%ce",
+            current_head, "--not", expected_head, *((base,) if base_ancestor else ()), "--",
+        )
+        if not _lease_git_ok(commits):
+            return False
+        fields = commits.stdout.split("\x00")
+        if fields[-1] != "":
+            return _lease_refuse(LeaseAttestationReason.GIT_MALFORMED_OUTPUT)
+        fields.pop()
+        if len(fields) % 6:
+            return _lease_refuse(LeaseAttestationReason.GIT_MALFORMED_OUTPUT)
+        original_patches: Counter[str] | None = None
+        for index in range(0, len(fields), 6):
+            commit, parents, author, email, committer, committer_email = fields[index:index + 6]
+            if [committer, committer_email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                return _lease_refuse(LeaseAttestationReason.COMMIT_IDENTITY_MISMATCH)
+            if len(parents.split()) > 1:
+                # Only a server-authored merge of the exact verified base may
+                # introduce another ancestry. Never accept arbitrary side merges.
+                if not base_ancestor or [author, email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                    return _lease_refuse(LeaseAttestationReason.MERGE_IDENTITY_MISMATCH)
+                if any(parent != base and not _lease_ancestor_ok(run("merge-base", "--is-ancestor", expected_head, parent))
+                       for parent in parents.split()):
+                    if _lease_refusal_reason.get() in {
+                        LeaseAttestationReason.GIT_TIMEOUT, LeaseAttestationReason.GIT_OUTPUT_LIMIT,
+                    }:
+                        return False
+                    return _lease_refuse(LeaseAttestationReason.MERGE_PARENT_MISMATCH)
+                continue
+            if [author, email] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                continue
+            if not base_ancestor:
+                return _lease_refuse(LeaseAttestationReason.ANCESTRY_FAILURE)
+            if original_patches is None:
+                merge_base = run("merge-base", expected_head, base)
+                if not _lease_ancestor_ok(merge_base):
+                    return False
+                # Read one beyond the budget so oversized ranges fail closed
+                # before any per-commit show/patch-id subprocess is launched.
+                original = run("rev-list", "--no-merges", "--max-count=501",
+                               f"{merge_base.stdout.strip()}..{expected_head}", "--")
+                if not _lease_git_ok(original):
+                    return False
+                original_commits = original.stdout.splitlines()
+                if len(original_commits) > 500:
+                    return _lease_refuse(LeaseAttestationReason.PATCH_BUDGET_EXCEEDED)
+                original_patches = Counter()
+                for original_commit in original_commits:
+                    original_patch = patch_id(original_commit)
+                    if original_patch is not None:
+                        original_patches[original_patch] += 1
+            replayed_patch = patch_id(commit)
+            if replayed_patch is None or original_patches[replayed_patch] <= 0:
+                if _lease_refusal_reason.get() is not None:
+                    return False
+                return _lease_refuse(LeaseAttestationReason.PATCH_ID_MISMATCH)
+            original_patches[replayed_patch] -= 1
+        return True
+    except (OSError, subprocess.SubprocessError) as error:
+        return _lease_refuse(_lease_exception_reason(error))
+
+
+@dataclass(frozen=True)
+class ProtectedResultProvenance:
+    """Non-model-visible provenance for the exact resources a native read returned."""
+
+    sources: tuple["SourceLabel", ...]
+    content_free_error: str | None = None
+
+
+@dataclass
+class _ProtectedResultCapture:
+    """One tool call's thread-safe, context-propagating provenance window."""
+
+    sources: list["SourceLabel"] = field(default_factory=list)
+    seen: set["SourceLabel"] = field(default_factory=set)
+    published: bool = False
+    invalid: bool = False
+    content_free_error: str | None = None
+    closed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+_ProtectedResultState = ProtectedResultProvenance | _ProtectedResultCapture | None
+
+
+_protected_result_provenance: ContextVar[_ProtectedResultState] = ContextVar(
+    "protected_result_provenance", default=None,
+)
+
+
+def begin_protected_result_capture() -> Token[_ProtectedResultState]:
+    """Start an isolated result-provenance capture around one tool execution."""
+    return _protected_result_provenance.set(_ProtectedResultCapture())
+
+
+def publish_protected_result(
+    sources: tuple["SourceLabel", ...], *, content_free_error: str | None = None,
+) -> None:
+    """Accumulate exact sources in this capture, including authoritative empty."""
+    from .models import SourceLabel
+
+    if not isinstance(sources, tuple) or not all(
+        isinstance(source, SourceLabel) for source in sources
+    ):
+        raise TypeError("protected result provenance must be a tuple of SourceLabel")
+    if content_free_error is not None and (sources or not content_free_error):
+        raise ValueError("content-free error provenance requires an empty source set and error")
+    capture = _protected_result_provenance.get()
+    if isinstance(capture, _ProtectedResultCapture):
+        with capture.lock:
+            if capture.closed:
+                return
+            capture.published = True
+            if content_free_error is not None:
+                capture.content_free_error = content_free_error
+            for source in sources:
+                if source not in capture.seen:
+                    capture.seen.add(source)
+                    capture.sources.append(source)
+        return
+    _protected_result_provenance.set(ProtectedResultProvenance(sources, content_free_error))
+
+
+def invalidate_protected_result_capture() -> None:
+    """Mark the active capture incomplete so partial sources are not authoritative."""
+    capture = _protected_result_provenance.get()
+    if isinstance(capture, _ProtectedResultCapture):
+        with capture.lock:
+            if not capture.closed:
+                capture.invalid = True
+        return
+    _protected_result_provenance.set(None)
+
+
+def end_protected_result_capture(
+    token: Token[_ProtectedResultState],
+) -> ProtectedResultProvenance | None:
+    """Return the captured provenance and restore any enclosing capture."""
+    captured = _protected_result_provenance.get()
+    if isinstance(captured, _ProtectedResultCapture):
+        with captured.lock:
+            captured.closed = True
+            result = (
+                ProtectedResultProvenance(tuple(captured.sources), captured.content_free_error)
+                if captured.published and not captured.invalid
+                else None
+            )
+    else:
+        result = captured
+    _protected_result_provenance.reset(token)
+    return result
+
+
+def protected_result_source(
+    auth_context: "AuthContext | None",
+    *,
+    principal: str | None,
+    domain: str,
+    resource_id: str | None,
+    bridge_instance: str,
+    sensitivity: str = "internal",
+) -> "SourceLabel":
+    """Build a result source from a resource owner and the exact authorized reader."""
+    from .models import SourceLabel
+
+    requester = getattr(auth_context, "canonical_principal", None)
+    if getattr(auth_context, "is_service", False) and requester:
+        requester = f"service:{requester}"
+    # Only clean turns can install schedule metadata or the instructions that
+    # feed it; reading the resulting schedule does not ingest attacker input.
+    integrity = "trusted" if domain == "schedule_metadata" else "untrusted"
+    integrity_effect = "active_ingest"
+    if domain == "filesystem" and isinstance(resource_id, str):
+        hooks = selected_policy_registry().policy_consumer_hooks
+        if hooks is not None:
+            active_pr_checkout_lease_for_path = hooks.active_checkout
+        else:
+            active_pr_checkout_lease_for_path = lambda _path: None
+
+        lease = active_pr_checkout_lease_for_path(resource_id)
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        if registry is not None:
+            review_state = registry.resolve_checkout_path(resource_id)
+            scope = getattr(review_state, "action_scope", None)
+        else:
+            scope = getattr(auth_context, "repo_pr_action_scope", None)
+            if scope is None:
+                review_state = getattr(auth_context, "repo_review_state", None)
+                scope = getattr(review_state, "action_scope", None)
+        # Acquired from head-bound native PR metadata and the same turn-local
+        # author verdict cache as forge reads. No network lookup on file reads.
+        trusted_lease = False
+        if scope is not None or lease is not None:
+            lease_attestation = pr_checkout_lease_attestation(auth_context, scope, lease)
+            trusted_lease = lease_attestation.ok
+            if not trusted_lease:
+                log_pr_checkout_lease_attestation_refused(
+                    auth_context, scope if scope is not None else lease,
+                    lease_attestation.reason,
+                )
+        retained_checkout = False
+        service = get_trusted_service_from_auth_context(auth_context)
+        if _is_worklink_retained_checkout_service(
+            service, auth_context=auth_context,
+        ):
+            try:
+                retained_root = worklink_retained_checkout_root()
+                if retained_root is not None:
+                    retained_resource = Path(resource_id).resolve(strict=True)
+                    retained_checkout = retained_resource.is_relative_to(retained_root.resolve(strict=True))
+            except (OSError, RuntimeError, ValueError):
+                retained_checkout = False
+        anchor = _filesystem_read_trust_anchor(
+            resource_id,
+            author_attested=trusted_lease,
+            retained_checkout=retained_checkout,
+        )
+        integrity, integrity_effect = anchor.integrity
+        # Offload provenance may add original source ACLs at the backend, but
+        # never raises a conversation_history path above its HOME anchor.
+        if anchor is FilesystemReadTrust.AUTHOR_ATTESTATION:
+            principal = requester
+            domain = "repository"
+            resource_id = (
+                f"{lease.canonical_repo}#pull/{lease.pr_number}@{lease.head_sha}"
+            )
+            bridge_instance = "forge"
+    acl = {principal} if principal else set()
+    if requester:
+        acl.add(requester)
+    return SourceLabel(
+        principal=principal,
+        domain=domain,
+        resource_id=resource_id,
+        bridge_instance=bridge_instance,
+        sensitivity=sensitivity,
+        authorized_principals=frozenset(acl),
+        source_kind="protected_tool",
+        integrity=integrity,
+        integrity_effect=integrity_effect,
+    )
+
+
+def _home_reference_integrity(home: Path, relative: Path) -> str:
+    """Classify a resolved HOME-relative path using reference-root policy."""
+    if (
+        not relative.parts
+        or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS
+        or relative.parts[:2] in _UNTRUSTED_REFERENCE_SUBTREES
+    ):
+        return "untrusted"
+    # Reference roots rely on the protected write gate, not writer records.
+    return "trusted"
+
+
+def _filesystem_result_integrity(
+    auth_context: "AuthContext | None",
+    resource_id: str,
+) -> tuple[str, str]:
+    """Project the path-only trust decision onto the existing label fields."""
+    return _filesystem_read_trust_anchor(resource_id).integrity
+
+
+class FilesystemReadTrust(StrEnum):
+    """Trust anchors, or the boundary/default that prevented path trust.
+
+    Author attestation is cached at acquisition and bound to a PR lease's scope
+    and head. Write-side gating excludes tainted writes from self-authored HOME
+    trees (including admin-installed skills). Root membership relies on merge
+    review for the configured source checkout.
+    """
+
+    AUTHOR_ATTESTATION = "author_attestation"
+    RETAINED_CHECKOUT = "retained_checkout"
+    HOME_CARVE_OUT = "home_carve_out"
+    WRITE_SIDE_GATING = "write_side_gating"
+    HOME_UNANCHORED = "home_unanchored"
+    ROOT_MEMBERSHIP = "root_membership"
+    UNANCHORED = "unanchored"
+
+    @property
+    def integrity(self) -> tuple[str, str]:
+        if self in {
+            self.AUTHOR_ATTESTATION, self.RETAINED_CHECKOUT,
+            self.WRITE_SIDE_GATING, self.ROOT_MEMBERSHIP,
+        }:
+            return "trusted", "informational"
+        return "untrusted", "active_ingest"
+
+
+# First applicable rule wins. Attested leases retain their repository identity;
+# all HOME decisions (including denials) override overlapping source checkouts.
+_FILESYSTEM_READ_TRUST_PRECEDENCE = (
+    FilesystemReadTrust.AUTHOR_ATTESTATION,
+    FilesystemReadTrust.RETAINED_CHECKOUT,
+    FilesystemReadTrust.HOME_CARVE_OUT,
+    FilesystemReadTrust.WRITE_SIDE_GATING,
+    FilesystemReadTrust.HOME_UNANCHORED,
+    FilesystemReadTrust.ROOT_MEMBERSHIP,
+    FilesystemReadTrust.UNANCHORED,
+)
+
+
+def _filesystem_read_trust_anchor(
+    resource_id: str, *, author_attested: bool = False,
+    retained_checkout: bool = False,
+) -> FilesystemReadTrust:
+    """Return the winning anchor/boundary for diagnostics and label construction.
+
+    ``author_attested`` must be the scope/head-bound lease verdict computed by
+    ``protected_result_source``, never a caller's claim about a file's author.
+    The reason is deliberately not persisted in SourceLabel: it describes the
+    current read decision, not a transferable authorization for future reads.
+    """
+    applicable = {FilesystemReadTrust.UNANCHORED}
+    if author_attested:
+        applicable.add(FilesystemReadTrust.AUTHOR_ATTESTATION)
+    if retained_checkout:
+        applicable.add(FilesystemReadTrust.RETAINED_CHECKOUT)
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    source_repo_value = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
+    try:
+        home = Path(home_value).resolve(strict=True) if home_value else None
+        resource = Path(resource_id).resolve(strict=True)
+    except (OSError, RuntimeError):
+        pass
+    else:
+        if home is not None and resource.is_relative_to(home):
+            relative = resource.relative_to(home)
+            applicable.add(FilesystemReadTrust.HOME_UNANCHORED)
+            # Download approval and cache metadata never attest returned bytes.
+            if (
+                relative.parts[:2] in _UNTRUSTED_REFERENCE_SUBTREES
+                or relative.parts[:2] == ("attachments", "fetch-cache")
+            ):
+                applicable.add(FilesystemReadTrust.HOME_CARVE_OUT)
+            if _home_reference_integrity(home, relative) == "trusted":
+                applicable.add(FilesystemReadTrust.WRITE_SIDE_GATING)
+        if source_repo_value:
+            try:
+                source_repo = Path(source_repo_value).resolve(strict=True)
+            except (OSError, RuntimeError):
+                pass
+            else:
+                if source_repo.is_dir() and resource.is_relative_to(source_repo):
+                    applicable.add(FilesystemReadTrust.ROOT_MEMBERSHIP)
+    return next(
+        anchor for anchor in _FILESYSTEM_READ_TRUST_PRECEDENCE if anchor in applicable
+    )
+
+
+def _configured_pr_checkout_lease_root() -> Path | None:
+    """Return the validated physical lease root, never an access-only alias."""
+    raw = os.environ.get(_PR_CHECKOUT_LEASE_ROOT_ENV, "").strip()
+    configured = Path(raw) if raw else None
+    if configured is None or not configured.is_absolute() or configured.is_symlink():
+        return None
+    try:
+        resolved = configured.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def publish_framework_files(
+    home: Path,
+    files: Mapping[Path, bytes],
+    publish: Callable[[], None],
+) -> int:
+    """Publish internal package/scaffold files and verify their paths and bytes."""
+    home = home.resolve(strict=True)
+    expected: dict[str, tuple[Path, bytes]] = {}
+    for path, content in files.items():
+        resolved = path.resolve(strict=False)
+        relative = resolved.relative_to(home)
+        if (
+            len(relative.parts) < 2
+            or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS - {"skills"}
+            or relative.parts[:2] in _UNTRUSTED_REFERENCE_SUBTREES
+        ):
+            raise ValueError(f"not a framework scaffold destination: {path}")
+        expected[relative.as_posix()] = (resolved, content)
+
+    publish()
+    for path, content in expected.values():
+        if path.resolve(strict=True) != path or path.read_bytes() != content:
+            raise ValueError(f"framework output changed during publication: {path}")
+    return len(files)
+
+
+def write_framework_file(home: Path, destination: Path, content: bytes) -> None:
+    """Atomically publish and verify one package/template scaffold."""
+    def publish() -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destination.with_name(destination.name + ".tmp")
+        # Exclusive creation refuses a pre-planted temporary symlink.
+        with tmp.open("xb") as stream:
+            stream.write(content)
+        tmp.replace(destination)
+
+    publish_framework_files(home, {destination: content}, publish)
+
+
+def _incomplete_protected_result(
+    domain: str,
+    arguments: dict[str, Any],
+    *,
+    tool_name: str,
+    auth_context: "AuthContext | None",
+) -> "InformationFlowLabels":
+    from .models import InformationFlowLabels, SourceLabel
+
+    resource = next(
+        (
+            arguments.get(key)
+            for key in ("path", "file_path", "turn_id", "atom_id", "job_id")
+            if isinstance(arguments.get(key), str) and arguments.get(key)
+        ),
+        None,
+    )
+    channel = getattr(auth_context, "channel_id", None)
+    bridge = getattr(auth_context, "bridge_instance", None)
+    if resource is None and (
+        bridge == "acp-stdio"
+        or isinstance(channel, str) and channel.startswith("acp:")
+    ):
+        resource = channel
+    if resource is None:
+        resource = f"<unresolved-resource:protected_tool:{tool_name}>"
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=None,
+        domain=domain,
+        resource_id=str(resource),
+        bridge_instance=None,
+        sensitivity="internal",
+        authorized_principals=frozenset(),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+
+
+_held_retained_lease: ContextVar[tuple[object, object, str, list[bool]] | None] = ContextVar(
+    "held_retained_invocation_lease", default=None,
+)
+
+
+@contextmanager
+def _host_retained_invocation(scope: object, context: object):
+    """Bind the live lease held by the host wrapper to this invocation only."""
+    active = [True]
+    identity = secrets.token_hex(16)
+    token = _held_retained_lease.set((scope, context, identity, active))
+    try:
+        yield identity
+    finally:
+        active[0] = False
+        _held_retained_lease.reset(token)
+
+
+def retained_invocation_lease_active(scope: object, context: object) -> bool:
+    held = _held_retained_lease.get()
+    return bool(held and held[0] is scope and held[1] is context and held[3][0])
+
+
+class _RetainedResultReceipt:
+    """One invocation's host-observed output under the live retained lease."""
+
+    def __init__(self, tool: str, context: Any, scope: Any,
+                 result: Any, failed: bool, policy: Any,
+                 *, execution_id: str, head: str,
+                 lease_identity: tuple[str, str, int, int] | tuple[str, str, int, int, str]) -> None:
+        self.tool = tool
+        self.context = context
+        self.scope = scope
+        self.policy = policy
+        self.failed = failed
+        self.result = result
+        self._used = False
+        self._lock = threading.Lock()
+        self.execution_id = execution_id
+        self.head = head
+        self.lease_identity = lease_identity
+        content = getattr(result, "content", None)
+        if not isinstance(content, (str, bytes)):
+            raise ValueError("retained receipt requires captured output bytes")
+        self.digest = hashlib.sha256(content.encode() if isinstance(content, str) else content).digest()
+
+    def consume(self, tool: str, context: Any, scope: Any, result: Any,
+                failed: bool, policy: Any) -> bool:
+        with self._lock:
+            if self._used:
+                return False
+            self._used = True
+        content = getattr(result, "content", None)
+        return (
+            self.tool == tool and self.context is context and self.scope is scope
+            and self.result is result and self.failed == failed and self.policy is policy
+            and not failed and getattr(result, "status", None) != "error"
+            and isinstance(self.execution_id, str) and bool(self.execution_id)
+            and self._live_binding(context, scope, policy)
+            and isinstance(content, (str, bytes))
+            and hashlib.sha256(content.encode() if isinstance(content, str) else content).digest() == self.digest
+        )
+
+    def _live_binding(self, context: Any, scope: Any, policy: Any) -> bool:
+        if len(self.lease_identity) == 5 and not retained_invocation_lease_active(scope, context):
+            return False
+        binding = _retained_checkout_binding(scope)
+        return binding == (self.head, self.lease_identity)
+
+
+def _retained_checkout_binding(
+    scope: Any,
+) -> tuple[str, tuple[str, str, int, int] | tuple[str, str, int, int, str]] | None:
+    """Observe the incident's checkout, never a numerically colliding PR lease."""
+    held = _held_retained_lease.get()
+    selected_lease = getattr(selected_policy_registry(), "retained_effect_lease", None)
+    if selected_lease is None:
+        return None
+    _owner, lease_callback, retained_factory_subprocess_runner = selected_lease
+
+    if held is not None and held[0] is scope and held[3][0]:
+        lease_context = nullcontext(SimpleNamespace(scope=scope))
+    else:
+        lease_context = lease_callback(Path(os.environ.get("MIMIR_HOME", "")), scope)
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    try:
+        with lease_context as lease:
+            if lease.scope is not scope:
+                return None
+            checkout = Path(scope.sandbox)
+            if checkout.resolve(strict=True) != checkout or not checkout.is_dir():
+                return None
+            identity = checkout.stat()
+
+            def git(*args: str) -> str | None:
+                result = retained_factory_subprocess_runner(
+                    ("git", "-C", str(checkout), *args), output_limit=4096,
+                )
+                return result.stdout.decode("ascii", "strict").strip() if result.returncode == 0 else None
+
+            if git("rev-parse", "--show-toplevel") != str(checkout):
+                return None
+            git_dir = git("rev-parse", "--absolute-git-dir")
+            if git_dir is None or not Path(git_dir).resolve(strict=True).is_relative_to(checkout):
+                return None
+            if git("branch", "--show-current") != scope.branch:
+                return None
+            head = git("rev-parse", "--verify", "HEAD^{commit}")
+            if head is None or len(head) != 40 or any(c not in "0123456789abcdef" for c in head.lower()):
+                return None
+            anchor = (str(checkout), scope.scope_id, identity.st_dev, identity.st_ino)
+            if held is not None and held[0] is scope and held[3][0]:
+                return head.lower(), (*anchor, held[2])
+            return head.lower(), anchor
+    except (OSError, RuntimeError, ValueError, UnicodeError):
+        return None
+
+
+def _single_filesystem_result_source(
+    auth_context: "AuthContext | None", args: dict[str, Any], *, existing_file: bool,
+) -> "SourceLabel | None":
+    """Use the same path and lease anchor for successful and failed file reads."""
+    resource = next((
+        args.get(key) for key in ("path", "file_path")
+        if isinstance(args.get(key), str) and args.get(key)
+    ), None)
+    if resource is None:
+        return None
+    try:
+        resolved = Path(resource).resolve(strict=existing_file)
+        if existing_file and not resolved.is_file():
+            return None
+        source = protected_result_source(
+            auth_context, principal="filesystem", domain="filesystem",
+            resource_id=str(resolved), bridge_instance="filesystem",
+        )
+    except Exception:  # noqa: BLE001 — unresolved anchors must fail closed
+        return None
+    return source if source.integrity == "trusted" else None
+
+
+def _acp_failed_tool_error_result(
+    result: Any,
+    auth_context: "AuthContext | None",
+    provenance: ProtectedResultProvenance | None,
+) -> "InformationFlowLabels | None":
+    """Label a rejected ACP provider contract, not tool output, as informational."""
+    from .models import InformationFlowLabels, SourceLabel
+    from .tools.client_provider import ClientProviderResultError
+
+    if provenance is not None or not isinstance(result, ClientProviderResultError):
+        return None
+    if getattr(auth_context, "origin_trigger", None) != "acp_session":
+        return None
+    principal = getattr(auth_context, "canonical_principal", None)
+    channel = getattr(auth_context, "channel_id", None)
+    bridge = getattr(auth_context, "bridge_instance", None)
+    domain = getattr(auth_context, "domain", None)
+    if not all(isinstance(value, str) and value for value in (
+        principal, channel, bridge, domain,
+    )):
+        return None
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=principal,
+        domain=domain,
+        resource_id=channel,
+        domain_qualifier=getattr(auth_context, "domain_qualifier", None),
+        bridge_instance=bridge,
+        sensitivity="private",
+        authorized_principals=frozenset({principal}),
+        source_kind="channel",
+        integrity="untrusted",
+        integrity_effect="informational",
+    ))
+
+
+def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") -> bool:
+    """Return whether the model-visible result contains only this typed refusal."""
+    from langchain_core.messages import ToolMessage
+
+    if not isinstance(result, ToolMessage) or getattr(result, "status", None) != "error":
+        return False
+    content = getattr(result, "content", None)
+    if not isinstance(content, str):
+        return False
+    refusal_text = str(refusal)
+    return content in {refusal_text, f"Error: {refusal_text}"}
+
+
+def _log_retained_repository_failure(tool_name: str, result: Any, repository: str,
+                                     pull_request: int | None, head: str | None) -> None:
+    """Emit only bounded identifiers, never failure content or server error text."""
+    from langchain_core.messages import ToolMessage
+
+    try:
+        from .event_logger import log_event_sync
+
+        code = None
+        if isinstance(result, dict):
+            code = result.get("code")
+        elif isinstance(result, ToolMessage):
+            try:
+                payload = json.loads(result.content) if isinstance(result.content, str) else None
+                code = payload.get("code") if isinstance(payload, dict) else None
+            except (ValueError, TypeError):
+                pass
+        if not isinstance(code, str) or code not in {
+            "tests_failed", "merge_conflict", "rebase_conflict", "push_rejected",
+        }:
+            code = "tool_error"
+        log_event_sync(
+            "repository_failure_provenance_retained", tool=tool_name,
+            code=code, repository=repository, pull_request=pull_request, head=head,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not change classification
+        pass
+
+
+def _provider_pr_lease_result_is_bound(
+    tool_name: str, arguments: dict[str, Any], auth_context: "AuthContext | None",
+    authorization: ToolAuthorization, registered: Any,
+) -> bool:
+    """Admit provider results to the ordinary classifier, not confer result trust.
+
+    The retained factory scope remains a separate receipt-bound authority. This
+    check deliberately ignores success and payload shape: the existing repository
+    classifier validates published provenance for failures and successes alike.
+    """
+    scope = authorization.repo_pr_action_scope
+    if not (
+        ("repo_actions" in registered.memberships
+         or ("forge_actions" in registered.memberships
+             and registered.descriptor.result_origin & ResultOriginKind.REPOSITORY))
+        and registered.resource_scope == "repo_pr"
+        and scope is not None
+        and isinstance(getattr(scope, "canonical_repo", None), str)
+        and type(getattr(scope, "pr_number", None)) is int
+        and isinstance(arguments.get("repository"), str)
+        and arguments["repository"].lower() == scope.canonical_repo.lower()
+        and arguments.get("pull_request") == scope.pr_number
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+    ):
+        return False
+    state = getattr(auth_context, "repo_review_state", None)
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        state = (
+            discovered.resolve_for_tool(tool_name, arguments.get("repository"),
+                                        arguments.get("pull_request"))
+            if discovered is not None and hasattr(discovered, "resolve_for_tool")
+            and isinstance(arguments.get("repository"), str)
+            and type(arguments.get("pull_request")) is int else None
+        )
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        state = (
+            registry.resolve(arguments.get("repository"), arguments.get("pull_request"))
+            if registry is not None and hasattr(registry, "resolve") else None
+        )
+    return (
+        state is not None and getattr(state, "action_scope", None) is scope
+        and _attested_pr_checkout_lease(auth_context, scope, getattr(state, "checkout_lease", None))
+    )
+
+
+_SHELL_CONTENT_NAME = re.compile(
+    r"(?<![\w.-])(?:turns\.jsonl|events\.jsonl|chat_history\.jsonl|triage-dropped\.jsonl|worklink-ready-queue|conversation_history)(?![\w.-])"
+    r"|(?<![\w.-])(?:logs|messages)(?=/|\\)"
+    r"|/(?:logs|messages)(?=['\"\s/\\]|$)"
+)
+
+
+def _shell_search_path(word: str, cwd: Path, home: Path) -> Path:
+    """Expand only known HOME spellings; glob prefixes conservatively bound reads."""
+    word = re.sub(r"\$(?:\{(?:MIMIR_HOME|HOME)\}|(?:MIMIR_HOME|HOME)\b)", str(home), word)
+    if word == "~" or word.startswith("~/"):
+        word = str(home) + word[1:]
+    # Never enumerate a glob: its containing directory is the read boundary.
+    prefix = re.split(r"[?*\[]", word, maxsplit=1)[0]
+    if prefix != word:
+        word = prefix if prefix.endswith("/") else str(Path(prefix).parent)
+    path = Path(word)
+    return (path if path.is_absolute() else cwd / path).resolve()
+
+
+def _shell_search_self_authored(path: Path, home: Path) -> bool:
+    # Unlike a direct file read, searching state/ can descend into state/pollers.
+    return path.is_relative_to(home) and bool(path.relative_to(home).parts) and (
+        path.relative_to(home).parts[0] in _SELF_AUTHORED_FILE_ROOTS - {"state"}
+    )
+
+
+def _shell_search_operands(words: list[str]) -> list[str]:
+    """Separate common search options/patterns from path operands, without execution."""
+    operands: list[str] = []
+    pattern = False
+    options = True
+    index = 0
+    takes_value = {"-e", "--regexp", "-f", "--file", "-d", "--directories",
+                   "--include", "--exclude", "--exclude-dir", "-g", "--glob",
+                   "--iglob", "-t", "--type", "-T", "--type-not", "-m",
+                   "--max-count", "-A", "-B", "-C", "--context", "--encoding"}
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if options and word == "--":
+            options = False
+        elif options and word == "--files":
+            pattern = True
+        elif options and word in takes_value:
+            if word in {"-e", "--regexp", "-f", "--file"}:
+                pattern = True
+            index += 1
+        elif options and word.startswith("-") and word != "-":
+            if word.startswith(("--regexp=", "--file=", "-e", "-f")):
+                pattern = True
+        elif not pattern:
+            pattern = True
+        else:
+            operands.append(word)
+    return operands
+
+
+def _shell_recursive_segment(words: list[str]) -> bool:
+    if not words:
+        return False
+    name = Path(words[0]).name
+    if name in {"rg", "ag"}:
+        return True
+    if name not in {"grep", "egrep", "fgrep"}:
+        return False
+    return any(
+        word == "--recursive" or word == "--directories=recurse"
+        or (word.startswith("-") and not word.startswith("--") and bool(re.search("[rR]", word)))
+        or (word in {"-d", "--directories"} and words[index + 1:index + 2] == ["recurse"])
+        for index, word in enumerate(words[1:], 1)
+    )
+
+
+def _shell_reads_home_content(arguments: dict[str, Any], *, tool_name: str = "shell_exec") -> bool:
+    """Conservative accidental-read classifier, not deliberate-bypass isolation.
+
+    Tokenize pipeline segments so unrelated echo operands do not change search
+    boundaries. No shell expansion, substitution, filesystem globbing or execution.
+    """
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return False
+    if _SHELL_CONTENT_NAME.search(command):
+        return True
+    home_raw = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_raw:
+        return False
+    home = Path(home_raw).resolve()
+    cwd_raw = arguments.get("cwd")
+    if isinstance(cwd_raw, str) and cwd_raw:
+        cwd = _shell_search_path(cwd_raw, home, home)
+    else:
+        from ._context import get_current_turn
+        from .tools.extra import _effective_shell_cwd
+        turn = get_current_turn()
+        cwd = (_effective_shell_cwd() if turn is None or hasattr(turn, "session_id") else home) or home
+    cwd = cwd.resolve()
+    # Nonrecursive reads from a remembered content-store cwd remain protected.
+    if cwd.is_relative_to(home):
+        relative = cwd.relative_to(home)
+        if any(part in {"logs", "messages", "conversation_history", "large_tool_results"}
+               for part in relative.parts) or relative.parts[:2] in {
+                   ("state", "pollers"), ("attachments", "fetch-cache"),
+               }:
+            return True
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        # Malformed quoting must not downgrade a possible HOME search.
+        return bool(re.search(r"\b(?:rg|ag|grep|egrep|fgrep)\b", command))
+    segments: list[list[str]] = [[]]
+    redirect = False
+    for token in tokens:
+        if token and all(char in ";&|()\n" for char in token):
+            segments.append([])
+            redirect = False
+        elif token and all(char in "<>&|" for char in token) and ("<" in token or ">" in token):
+            redirect = True
+            if segments[-1] and segments[-1][-1].isdigit():
+                segments[-1].pop()
+        elif redirect:
+            redirect = False
+        else:
+            segments[-1].append(token)
+    for words in segments:
+        if words[:1] == ["cd"] and len(words) >= 2:
+            cwd = _shell_search_path(words[1], cwd, home)
+        elif _shell_recursive_segment(words):
+            paths = [_shell_search_path(word, cwd, home)
+                     for word in _shell_search_operands(words[1:])] or [cwd]
+            if all(_shell_search_self_authored(path, home) for path in paths):
+                continue
+            if ((cwd.is_relative_to(home) and not _shell_search_self_authored(cwd, home))
+                    or home.is_relative_to(cwd)
+                    or any(path.is_relative_to(home) or home.is_relative_to(path) for path in paths)):
+                return True
+    return False
+
+
+def _bound_tracker_status_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any, result: Any,
+    provenance: ProtectedResultProvenance | None, failed: bool,
+) -> bool:
+    """Recognize the selected tracker writer's bounded, host-produced status only."""
+    from langchain_core.messages import ToolMessage
+
+    if not (
+        registered.owner == "cultivate"
+        and tool_name in {"tracker_file_work", "tracker_comment", "tracker_set_state"}
+        and registered.result_domain == "tracker_status"
+        and registered.resource_scope == "tracker_issue"
+        and registered.flow == "sink"
+        and registered.descriptor is not None
+        and registered.descriptor.result_origin == ResultOriginKind.NON_INGESTING
+        and registered.descriptor.sink_destination == "bound_tracker_issue"
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        and not failed and (provenance is None or not provenance.sources)
+    ):
+        return False
+    external_ref = arguments.get("external_ref")
+    if not isinstance(external_ref, str) or not any(
+        external_ref == f"{adapter}:{ref}"
+        for adapter, ref, _url in getattr(auth_context, "tracker_issue_targets", ())
+    ):
+        return False
+    if isinstance(result, ToolMessage):
+        if result.status != "success" or not isinstance(result.content, str):
+            return False
+        try:
+            result = json.loads(result.content)
+        except ValueError:
+            return False
+    if not isinstance(result, dict):
+        return False
+    statuses = {
+        "tracker_file_work": {"created", "exists", "refused", "error"},
+        "tracker_comment": {"posted", "refused", "error"},
+        "tracker_set_state": {"applied", "already", "unavailable", "unsupported", "refused", "error"},
+    }
+    if (type(result.get("status")) is not str
+            or result["status"] not in statuses[tool_name]
+            or type(result.get("reason")) is not str
+            or len(result["reason"]) > 40
+            or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in result["reason"])):
+        return False
+    if tool_name != "tracker_file_work":
+        return set(result) == {"status", "reason"}
+    return (
+        set(result) == {"status", "reason", "kind", "missing"}
+        and type(result["kind"]) is str
+        and result["kind"] == arguments.get("kind")
+        and result["kind"] in {"leaf", "epic"}
+        and type(result["missing"]) is list
+        and all(type(part) is str and part in {
+            "Goal", "Acceptance criteria", "Review criteria", "Worklink notes",
+            "- Scope", "- Out of scope", "- Suggested test command",
+            "acceptance checklist item",
+        } for part in result["missing"])
+    )
+
+
+def _bound_unsupported_operation_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any, result: Any,
+    provenance: ProtectedResultProvenance | None, failed: bool,
+) -> bool:
+    """Accept only the bound escalation tool's content-free server status."""
+    from langchain_core.messages import ToolMessage
+
+    repository = arguments.get("repository")
+    number = arguments.get("pull_request")
+    if not isinstance(repository, str) or type(number) is not int:
+        return False
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
+    state = registry.resolve(repository, number) if registry is not None else None
+    if state is None and discovered is not None:
+        state = discovered.resolve_for_tool(tool_name, repository, number)
+    scope = getattr(state, "action_scope", None)
+    if not (
+        registered.owner == "cultivate" and tool_name == "unsupported_operation"
+        and registered.resource_scope == "channel" and registered.flow == "sink"
+        and registered.descriptor is not None
+        and registered.descriptor.result_origin == ResultOriginKind.NON_INGESTING
+        and registered.descriptor.sink_destination == "bound_pull_request"
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        and not failed and (provenance is None or not provenance.sources)
+        and scope is not None
+        and repository.lower() == scope.canonical_repo.lower()
+        and number == scope.pr_number
+        and (authorization.repo_pr_action_scope is None
+             or authorization.repo_pr_action_scope is scope)
+    ):
+        return False
+    if isinstance(result, ToolMessage):
+        if result.status != "success" or not isinstance(result.content, str):
+            return False
+        try:
+            result = json.loads(result.content)
+        except ValueError:
+            return False
+    return (
+        type(result) is dict and set(result) == {
+            "status", "escalated", "repository", "pull_request",
+        }
+        and result["status"] == "unsupported_operation"
+        and type(result["escalated"]) is bool
+        and result["repository"] == scope.canonical_repo
+        and type(result["pull_request"]) is int
+        and result["pull_request"] == scope.pr_number
+    )
+
+
+@scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
+def classify_protected_result(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    auth_context: "AuthContext | None",
+    authorization: ToolAuthorization,
+    *,
+    result: Any = None,
+    provenance: ProtectedResultProvenance | None = None,
+    policy_refusal: ToolPolicyRefusal | None = None,
+    failed: bool = False,
+    retained_receipt: _RetainedResultReceipt | None = None,
+) -> "InformationFlowLabels | None":
+    """Return server-authoritative labels for content a protected call may expose.
+
+    The contract is based only on the authorized operation and validated
+    arguments. Tool success text, model assertions, and error wording cannot
+    downgrade it. Unknown provenance is intentionally incomplete and therefore
+    fails closed at every egress gate.
+    """
+    from langchain_core.messages import ToolMessage
+
+    from .models import InformationFlowLabels, SourceLabel
+
+    # Plugin responses are provider-controlled even for sink-only tools and
+    # claimed NON_INGESTING results; they never inherit core refusal exemptions.
+    selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    if registered is None and not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+        return _incomplete_protected_result(
+            "unknown", arguments or {}, tool_name=tool_name,
+            auth_context=auth_context,
+        )
+    retained_verified = False
+    if registered is not None and registered.owner != "core":
+        scope = getattr(auth_context, "retained_factory_scope", None)
+        retained_candidate = (
+            "retained_repo_tools" in registered.memberships
+            and _is_registered_retained_scope(scope)
+            and authorization.repo_pr_action_scope is scope
+            and (arguments or {}).get("repository") == scope.repository
+            and (arguments or {}).get("pull_request") == scope.issue_id
+            and _is_worklink_retained_checkout_service(
+                authorization.service_principal, auth_context=auth_context,
+            )
+            and not authorization.would_block
+            and authorization.allowed
+            and not failed
+            and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        )
+        retained_verified = (
+            retained_candidate
+            and isinstance(retained_receipt, _RetainedResultReceipt)
+            and retained_receipt.consume(tool_name, auth_context, scope, result, failed, selected)
+        )
+        # A PR checkout is a different authority from the retained Worklink
+        # factory scope. Only a provider-declared repository action bound to
+        # the selected review state can use the ordinary repository provenance
+        # classifier; the retained path still requires its one-shot receipt.
+        pr_lease_verified = _provider_pr_lease_result_is_bound(
+            tool_name, arguments or {}, auth_context, authorization, registered,
+        )
+        if not retained_verified and not pr_lease_verified:
+            if _bound_tracker_status_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, result, provenance, failed,
+            ):
+                return None
+            if _bound_unsupported_operation_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, result, provenance, failed,
+            ):
+                return None
+            return _incomplete_protected_result(
+                registered.result_domain or "unknown", arguments or {},
+                tool_name=tool_name, auth_context=auth_context,
+            )
+
+    artifact = getattr(result, "artifact", None)
+    if isinstance(artifact, ProtectedResultProvenance) and (
+        provenance is None or not provenance.sources and artifact.sources
+    ):
+        provenance = artifact
+    if (
+        policy_refusal is not None
+        and provenance is None
+        and _result_matches_policy_refusal(result, policy_refusal)
+    ):
+        return None
+    acp_error_labels = _acp_failed_tool_error_result(
+        result, auth_context, provenance,
+    )
+    if failed and acp_error_labels is not None:
+        return acp_error_labels
+
+    args = arguments or {}
+    if tool_name in {"shell_exec", "bash_async"} and authorization.allowed and _shell_reads_home_content(args, tool_name=tool_name):
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal=principal, domain="shell", resource_id=tool_name,
+            bridge_instance=getattr(auth_context, "bridge_instance", None),
+            sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
+        for source in provenance.sources if provenance is not None else ():
+            labels = labels.with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
+    if tool_name == "chainlink_issue_show" and not failed:
+        issue_id = args.get("issue_id")
+        if type(issue_id) is not int or issue_id < 1:
+            return _incomplete_protected_result(
+                "chainlink", args, tool_name=tool_name, auth_context=auth_context,
+            )
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal, domain="chainlink", resource_id=f"issue/{issue_id}",
+            bridge_instance="chainlink", sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="untrusted",
+            # Match bounded Chainlink shell queries: tracker text is not trusted
+            # instruction, but a read does not taint the next Worklink action.
+            integrity_effect="informational",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
+    retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    if (
+        tool_name in _RETAINED_REPO_TOOLS
+        and retained_scope is not None
+        and args.get("repository") == retained_scope.repository
+        and args.get("pull_request") == retained_scope.issue_id
+        and (registered is None or registered.owner == "core" or retained_verified)
+    ):
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain="worklink_retained_repository",
+            resource_id=(
+                f"{retained_scope.repository}#issue/{retained_scope.issue_id}"
+                f"@retained/{retained_scope.scope_id}"
+            ),
+            bridge_instance="worklink",
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind="protected_tool",
+            integrity="trusted",
+            integrity_effect="active_ingest",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
+    descriptor = get_tool_descriptor(tool_name)
+    if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
+        if (
+            tool_name.startswith("repo_")
+            and failed
+            and isinstance(result, ToolMessage)
+            and result.status == "error"
+            and provenance is not None
+            and not provenance.sources
+            and provenance.content_free_error is not None
+            and result.content in {
+                provenance.content_free_error,
+                f"Error: {provenance.content_free_error}",
+            }
+        ):
+            return None
+        scope = authorization.repo_pr_action_scope
+        if scope is None:
+            return _incomplete_protected_result(
+                "repository", args, tool_name=tool_name, auth_context=auth_context,
+            )
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain="repository",
+            resource_id=(
+                f"{scope.canonical_repo}#pull/{scope.pr_number}"
+                f"@{scope.observed_head_sha}"
+            ),
+            bridge_instance="forge",
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind="protected_tool",
+            integrity="untrusted",
+            # Unknown authorship remains active ingest. Native forge reads may
+            # publish exact-scope, server-attested provenance for every author.
+            integrity_effect="active_ingest",
+        )
+        if provenance is None or not provenance.sources:
+            _log_repository_result_untrusted_default(
+                auth_context, scope, tool_name, "no_published_provenance",
+            )
+        else:
+            fields = (
+                "domain", "domain_qualifier", "resource_id", "principal",
+                "bridge_instance", "sensitivity", "authorized_principals",
+                "source_kind", "integrity_effect",
+            )
+            mismatched = tuple(field for field in fields if any(
+                getattr(item, field) != getattr(source, field)
+                for item in provenance.sources
+            ))
+            if mismatched:
+                _log_repository_result_untrusted_default(
+                    auth_context, scope, tool_name, "provenance_field_mismatch", mismatched,
+                )
+            else:
+                source = replace(
+                    source,
+                    integrity=(
+                        "trusted" if all(item.integrity == "trusted" for item in provenance.sources)
+                        else "untrusted"
+                    ),
+                )
+                if failed and source.integrity == "trusted":
+                    _log_retained_repository_failure(
+                        tool_name, result, scope.canonical_repo, scope.pr_number,
+                        scope.observed_head_sha,
+                    )
+                if source.integrity == "untrusted":
+                    _log_repository_result_untrusted_default(
+                        auth_context, scope, tool_name, "published_untrusted",
+                    )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
+
+    if tool_name == "fetch_channel_history":
+        resource = args.get("channel_id") or getattr(auth_context, "channel_id", None)
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain=getattr(auth_context, "domain", None),
+            domain_qualifier=getattr(auth_context, "domain_qualifier", None),
+            resource_id=ChannelResourceAdapter._resolve_channel(resource),
+            bridge_instance=getattr(auth_context, "bridge_instance", None),
+            sensitivity="private",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="channel",
+            integrity="untrusted",
+            integrity_effect="active_ingest",
+        )
+        return InformationFlowLabels().with_source(source)
+
+    if tool_name in _ACP_HANDS_RESULT_TOOLS:
+        # Error-looking host output is still host output, not a provider failure.
+        if failed and (
+            isinstance(result, BaseException)
+            or isinstance(result, ToolMessage) and result.status == "error"
+        ):
+            error_labels = _acp_failed_tool_error_result(
+                result, auth_context, None,
+            )
+            if error_labels is not None:
+                # An error does not erase sources captured before the failure.
+                for source in provenance.sources if provenance is not None else ():
+                    error_labels = error_labels.with_source(source)
+                return error_labels
+            return _incomplete_protected_result(
+                "client_provider", args,
+                tool_name=tool_name,
+                auth_context=auth_context,
+            )
+        principal = getattr(auth_context, "canonical_principal", None)
+        authenticated_principal = getattr(auth_context, "principal", None)
+        channel = getattr(auth_context, "channel_id", None)
+        resource_id = getattr(auth_context, "resource_id", None)
+        bridge = getattr(auth_context, "bridge_instance", None)
+        resources = authorization.protected_source_resources
+        if tool_name == "hands_edit":
+            edit_resource = canonical_client_file_resource(args.get("path"))
+            resources = (edit_resource,) if edit_resource is not None else None
+        elif tool_name in {"hands_shell", "hands_python"}:
+            resources = (channel,) if isinstance(channel, str) else None
+        if not (
+            authorization.allowed
+            and isinstance(principal, str)
+            and bool(principal)
+            and isinstance(authenticated_principal, str)
+            and bool(authenticated_principal)
+            and isinstance(channel, str)
+            and channel.startswith("acp:")
+            and resource_id == channel
+            and bridge == "acp-stdio"
+            and resources
+        ):
+            return _incomplete_protected_result(
+                "client_provider", args,
+                tool_name=tool_name,
+                auth_context=auth_context,
+            )
+        labels = InformationFlowLabels().with_channel(channel)
+        trusted_result = (
+            tool_name == "hands_read"
+            and authorization.result_integrity == "trusted"
+        )
+        if tool_name in {"hands_shell", "hands_python"}:
+            from .acp.hands_contract import HandsContractError, validate_tool_result
+
+            execution_result = result
+            if isinstance(result, ToolMessage):
+                execution_result = None
+                if result.status == "success" and isinstance(result.content, str):
+                    try:
+                        execution_result = json.loads(result.content)
+                    except ValueError:
+                        pass
+            try:
+                execution_result = validate_tool_result(
+                    tool_name.removeprefix("hands_"), execution_result,
+                )
+            except HandsContractError:
+                execution_result = {}
+            # Launch metadata, never consent or stdout, establishes confinement.
+            # Tainted code can print external data even inside a sandbox.
+            trusted_result = (
+                execution_result.get("executionMode") == "confined"
+                and _live_untrusted_active_ingest(
+                    auth_context, getattr(auth_context, "ifc_labels", None),
+                ) is False
+            )
+        for resource in resources:
+            labels = labels.with_source(SourceLabel(
+                principal=principal,
+                domain="client_provider",
+                resource_id=resource,
+                bridge_instance=bridge,
+                sensitivity="internal",
+                authorized_principals=frozenset({principal}),
+                source_kind=_ACP_HANDS_RESULT_SOURCE_KIND,
+                integrity="trusted" if trusted_result else "untrusted",
+                integrity_effect="active_ingest",
+            ))
+        return labels
+
+    if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+        resources = authorization.protected_source_resources
+        if resources == ():
+            # Direction describes the call, not its remote-controlled response.
+            # With no read resource, attribute output to the configured tool itself.
+            resources = (f"mcp-tool:{tool_name}",)
+        principal = getattr(auth_context, "canonical_principal", None)
+        labels = InformationFlowLabels()
+        integrity = (
+            "trusted"
+            if not failed and resources is not None and authorization.result_integrity == "trusted"
+            else "untrusted"
+        )
+        unresolved = f"<unresolved-resource:mcp:{tool_name}>"
+        for resource in resources or (unresolved,):
+            labels = labels.with_source(SourceLabel(
+                principal=principal if resources is not None else None,
+                domain="mcp",
+                resource_id=resource,
+                bridge_instance=tool_name.split("_", 2)[1] if "_" in tool_name else None,
+                sensitivity="internal",
+                authorized_principals=(
+                    frozenset({principal}) if principal and resources is not None else frozenset()
+                ),
+                source_kind="mcp",
+                integrity=integrity,
+                integrity_effect="active_ingest",
+            ))
+        return labels
+
+    if (
+        (
+            tool_name in {"shell_exec", "bash_job_output", "bash_jobs_list"}
+            or (
+                tool_name == "bash_async"
+                and getattr(auth_context, "repo_review_state", None) is not None
+            )
+        )
+        and authorization.allowed
+        and provenance is None
+        and (not failed or tool_name == "shell_exec")
+    ):
+        # Ordinary authorized shell output is untrusted information, not a new
+        # external ingest that deadlocks the next shell step. bash_job_output is
+        # bash_async's mapped content path; bash_jobs_list belongs here too because
+        # it exposes job status and command excerpts, not a new external source.
+        # A shell_exec exit code is not evidence about the output's integrity.
+        # Explicit source provenance (including inherited job labels) and other
+        # tools' failures retain their conservative classification below;
+        # merging these labels never clears earlier external active ingest.
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal=principal,
+            domain=(
+                "shell_jobs" if tool_name in {"bash_job_output", "bash_jobs_list"}
+                else "shell"
+            ),
+            resource_id=(
+                "repo_review"
+                if getattr(auth_context, "repo_review_state", None) is not None
+                else tool_name
+            ),
+            bridge_instance=getattr(auth_context, "bridge_instance", None),
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind="protected_tool",
+            integrity="untrusted",
+            integrity_effect="informational",
+        ))
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
+
+    domain = _PROTECTED_RESULT_DOMAINS.get(tool_name)
+    if domain is None:
+        # Native aliases may be namespaced by a tool server. Do not apply this
+        # suffix rule to MCP calls, which are classified above from provenance.
+        for candidate, candidate_domain in _PROTECTED_RESULT_DOMAINS.items():
+            if tool_name.endswith(f"__{candidate}"):
+                domain = candidate_domain
+                break
+    if domain is None:
+        if provenance is not None:
+            if not provenance.sources:
+                return None
+            labels = InformationFlowLabels()
+            for source in provenance.sources:
+                labels = labels.with_source(source)
+            return labels
+
+        descriptor = get_tool_descriptor(tool_name)
+        if descriptor and descriptor.result_origin & ResultOriginKind.NON_INGESTING:
+            return None
+        # An ingesting native tool without a confidentiality domain still
+        # introduces model-visible content. Unknown provenance must taint the
+        # turn rather than silently laundering integrity through the tool.
+        domain = "unknown"
+
+    if (
+        domain == "filesystem"
+        and tool_name in {"read_file", "aread", "grep", "agrep", "glob", "aglob", "ls", "als"}
+        and failed
+        and isinstance(result, ToolMessage)
+        and result.status == "error"
+        and provenance is not None
+        and not provenance.sources
+        and provenance.content_free_error is not None
+        and result.content in {
+            provenance.content_free_error,
+            f"Error: {provenance.content_free_error}",
+        }
+    ):
+        # Only the native file backend can attest that this error returned no
+        # content. Unknown or partial provenance still fails closed below.
+        return None
+    if failed:
+        if (
+            domain == "filesystem" and tool_name in {"read_file", "aread"}
+            and provenance is None and isinstance(result, ToolMessage)
+            and result.status == "error"
+        ):
+            source = _single_filesystem_result_source(auth_context, args, existing_file=True)
+            if source is not None:
+                return InformationFlowLabels().with_source(source)
+        return _incomplete_protected_result(
+            domain, args, tool_name=tool_name, auth_context=auth_context,
+        )
+
+    if provenance is not None:
+        if not provenance.sources:
+            return None
+        labels = InformationFlowLabels()
+        for source in provenance.sources:
+            labels = labels.with_source(source)
+        return labels
+
+    if domain == "filesystem":
+        source = _single_filesystem_result_source(auth_context, args, existing_file=False)
+        if source is not None:
+            return InformationFlowLabels().with_source(source)
+
+    return _incomplete_protected_result(
+        domain, args, tool_name=tool_name, auth_context=auth_context,
+    )
+
+
+_global_tool_registry = ToolRegistry()
+
+
+def get_tool_registry() -> ToolRegistry:
+    """Get the global tool registry instance."""
+    return _global_tool_registry
+
+
+_TRUSTED_SERVICE_PRINCIPALS: Mapping[str, ServicePrincipal] = PolicyMappingView(
+    lambda policy: policy.service_principals
+)
+_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset(core_policy_registry().service_principals)
+
+
+# Executable capabilities and information-flow metadata are one policy.
+_OPERATION_READABLE_DOMAIN: Mapping[str, str] = PolicyMappingView(lambda policy: {
+    name: tool.readable_domain for name, tool in policy.tools.items()
+    if tool.readable_domain is not None
+})
+
+_SAGA_MUTATION_OPERATIONS = policy_membership("saga_mutations")
+
+
+class CapabilityMatrixError(Exception):
+    """Raised when enforcement is requested with an incomplete matrix."""
+
+
+def _capability_matrix_errors() -> list[str]:
+    errors: list[str] = []
+    for operation, direction in sorted(_TOOL_FLOW_MAP.items()):
+        if direction not in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
+            continue
+        if get_sink_category(operation) is SinkCategory.UNKNOWN:
+            errors.append(
+                f"IFC {direction.value} operation '{operation}' has no sink category"
+            )
+        descriptor = get_tool_descriptor(operation)
+        if descriptor is None or descriptor.sink_destination is None:
+            errors.append(
+                f"IFC {direction.value} operation '{operation}' has no destination extraction"
+            )
+    for operation, descriptor in sorted(TOOL_DESCRIPTORS.items()):
+        if descriptor.sink_destination is None:
+            continue
+        if get_sink_category(operation) is SinkCategory.UNKNOWN:
+            errors.append(
+                f"Sink operation '{operation}' has no IFC sink category mapping"
+            )
+    for operation in sorted(_SAGA_MUTATION_OPERATIONS):
+        descriptor = get_tool_descriptor(operation)
+        if descriptor is None or descriptor.sink_destination is None:
+            errors.append(
+                f"SAGA mutation '{operation}' has no sink destination mapping"
+            )
+        effective_decision = _global_operation_catalog.get_decision(operation)
+        if effective_decision == OperationDecision.OPEN:
+            errors.append(f"SAGA mutation '{operation}' must not be cataloged OPEN")
+        if effective_decision != OperationDecision.ADMIN_REQUIRED:
+            errors.append(
+                f"SAGA mutation '{operation}' must be cataloged ADMIN_REQUIRED"
+            )
+    for trigger in sorted(
+        _REQUIRED_SERVICE_PRINCIPALS - _TRUSTED_SERVICE_PRINCIPALS.keys()
+    ):
+        errors.append(f"Missing service principal for trigger: {trigger}")
+    for trigger, principal in sorted(_TRUSTED_SERVICE_PRINCIPALS.items()):
+        if principal.trigger != trigger:
+            errors.append(
+                f"Service principal '{principal.canonical}' is registered for "
+                f"{trigger} but declares trigger {principal.trigger}"
+            )
+        if not principal.capabilities:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no capabilities defined"
+            )
+        if not principal.readable_domains:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no readable domains defined"
+            )
+        if not principal.sink_destinations:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) "
+                "has no sink destinations defined"
+            )
+
+        capability_set = set(principal.capabilities)
+        missing = _missing_capability_companions(
+            capability_set, profile=principal.authority_profile,
+        )
+        if missing:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) has "
+                f"capabilities without companions: {', '.join(sorted(missing))}"
+            )
+        if principal.capability_tier is not None:
+            bounded = BOUNDED_PROFILE_CAPABILITIES.get(
+                principal.authority_profile or "", frozenset(),
+            )
+            outside_tier = sorted(
+                operation
+                for operation in capability_set - bounded
+                if operation in TRIGGER_CAPABILITY_TIERS
+                and _CAPABILITY_TIER_RANK[TRIGGER_CAPABILITY_TIERS[operation]]
+                > _CAPABILITY_TIER_RANK[principal.capability_tier]
+            )
+            if outside_tier:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capabilities exceed "
+                    f"declared tier '{principal.capability_tier.value}': "
+                    f"{', '.join(outside_tier)}"
+                )
+        readable_domains = set(principal.readable_domains)
+        sink_destinations = set(principal.sink_destinations)
+        policies_by_operation = {policy.operation: policy for policy in principal.sink_policies}
+        if len(policies_by_operation) != len(principal.sink_policies):
+            errors.append(
+                f"Service principal '{principal.canonical}' has duplicate sink policies"
+            )
+        for policy in principal.sink_policies:
+            if policy.operation not in principal.capabilities:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink policy "
+                    f"'{policy.operation}' has no matching capability"
+                )
+            if policy.adapter not in _SERVICE_SINK_ADAPTERS:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink policy "
+                    f"'{policy.operation}' has no executable destination adapter "
+                    f"'{policy.adapter}'"
+                )
+        policy_sink_destinations = {
+            _ACTIVE_SERVICE_SINK_DESTINATIONS[category]
+            for policy in principal.sink_policies
+            if (category := get_sink_category(policy.operation))
+            in _ACTIVE_SERVICE_SINK_DESTINATIONS
+        }
+        for sink_destination in sorted(
+            sink_destinations & set(_ACTIVE_SERVICE_SINK_DESTINATIONS.values())
+        ):
+            if sink_destination not in policy_sink_destinations:
+                errors.append(
+                    f"Service principal '{principal.canonical}' sink destination "
+                    f"'{sink_destination}' has no executable destination policy"
+                )
+        for operation in sorted(set(principal.capabilities)):
+            required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
+            if required_domain and required_domain not in readable_domains:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' requires readable domain '{required_domain}'"
+                )
+            descriptor = get_tool_descriptor(operation)
+            required_sink = descriptor.sink_destination if descriptor else None
+            if required_sink and required_sink not in sink_destinations:
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' requires sink destination '{required_sink}'"
+                )
+            if get_sink_category(operation) in {
+                SinkCategory.SHELL_PROCESS,
+                SinkCategory.SPAWN,
+                SinkCategory.FILE,
+                SinkCategory.NOTIFICATION,
+                SinkCategory.HTTP_WEBHOOK,
+                SinkCategory.NETWORK,
+                SinkCategory.EXTERNAL_MCP,
+            } and operation not in policies_by_operation and (
+                operation not in _FIXED_SERVICE_SINK_OPERATIONS
+            ):
+                errors.append(
+                    f"Service principal '{principal.canonical}' capability "
+                    f"'{operation}' has no executable destination policy"
+                )
+    return errors
+
+
+def check_capability_matrix_complete(
+    fail_closed: bool = True,
+) -> tuple[bool, list[str]]:
+    """Verify required principals and capability/domain/sink consistency.
+
+    When fail_closed=True (default), returns (False, errors) if any errors exist.
+    When fail_closed=False, still returns (False, errors) if errors exist - the
+    fail_closed parameter only controls whether an exception is raised in the
+    assert_capability_matrix_complete() variant. A matrix with errors is never
+    considered complete, regardless of fail_closed setting.
+    """
+    errors = _capability_matrix_errors()
+    if errors:
+        for error in errors:
+            log.warning("capability_matrix_incomplete: %s", error)
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="startup",
+            boundary="capability_matrix_preflight",
+            reason="capability_matrix_incomplete",
+            target=errors,
+        )
+        return (False, errors)
+    return (True, [])
+
+
+def assert_capability_matrix_complete() -> None:
+    """Raise unless the enforcement matrix is complete and consistent."""
+    errors = _capability_matrix_errors()
+    if errors:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="startup",
+            boundary="capability_matrix_preflight",
+            reason="capability_matrix_incomplete",
+            target=errors,
+        )
+        raise CapabilityMatrixError(
+            "Access-control enforcement blocked by incomplete capability matrix: "
+            + "; ".join(errors)
+        )
+
+
+def _deepagents_builtin_tool_names() -> tuple[str, ...]:
+    """Return the tools injected by the DeepAgents middleware stack."""
+    from deepagents.backends import StateBackend
+    from deepagents.middleware import SubAgentMiddleware
+    from langchain.agents.middleware import TodoListMiddleware
+    from langchain_core.runnables import RunnableLambda
+
+    from .readonly_backend import MimirFilesystemMiddleware
+
+    backend = StateBackend()
+    middleware = (
+        TodoListMiddleware(),
+        MimirFilesystemMiddleware(backend=backend),
+        SubAgentMiddleware(
+            backend=backend,
+            subagents=[{
+                "name": "inventory-assertion",
+                "description": "Inventory assertion placeholder.",
+                "runnable": RunnableLambda(lambda state: state),
+            }],
+        ),
+    )
+    return tuple(tool.name for item in middleware for tool in item.tools)
+
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def assert_model_tool_inventory_cataloged(
+    *,
+    model_spec: str | None = None,
+    policy: "PolicyRegistry | None" = None,
+) -> None:
+    """Raise if the assembled model surface lacks authz or IFC metadata."""
+    from .tools.registry import all_mimir_tools
+    from .plugins.core import core_policy_registry
+
+    policy = policy if policy is not None else selected_policy_registry()
+    if not policy.frozen:
+        raise CapabilityMatrixError("model tool inventory requires a frozen policy")
+    catalog = get_operation_catalog()
+    mimir_tools = all_mimir_tools(
+        model_spec=model_spec,
+        require_provider_available=False,
+        policy=policy,
+        materialize_plugins=False,
+    )
+    tool_names = {
+        *(tool.name for tool in mimir_tools),
+        *_deepagents_builtin_tool_names(),
+    }
+    plugin_tools = {
+        name: tool for name, tool in policy.tools.items()
+        if tool.owner != "core" and tool.factory is not None
+    }
+    for name, tool in plugin_tools.items():
+        if name in tool_names:
+            raise CapabilityMatrixError(f"plugin {tool.owner}: tool {name} collides with model inventory")
+        if (tool.flow is None or tool.operation_class is None or tool.descriptor is None
+                or (tool.flow in {"sink", "both"} and (
+                    tool.descriptor.sink_category is None
+                    or tool.descriptor.sink_destination is None
+                )) or (tool.result_domain is None and not (
+                    tool.descriptor.result_origin & ResultOriginKind.NON_INGESTING
+                ))):
+            raise CapabilityMatrixError(f"plugin {tool.owner}: tool {name} has incomplete model policy")
+    core_names = tool_names
+    unknown_tools = sorted({
+        tool_name for tool_name in core_names
+        if catalog.get_decision(tool_name) == OperationDecision.UNKNOWN
+    })
+    unknown_flows = sorted({
+        tool_name for tool_name in core_names
+        if get_tool_flow_direction(tool_name) == ToolFlowDirection.UNKNOWN
+    })
+    incomplete_sinks = sorted({
+        tool_name for tool_name in core_names
+        if get_tool_flow_direction(tool_name) in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        }
+        and (
+            get_sink_category(tool_name) == SinkCategory.UNKNOWN
+            or (descriptor := get_tool_descriptor(tool_name)) is None
+            or descriptor.sink_destination is None
+        )
+    })
+    misclassified_read_backends = sorted({
+        tool_name for tool_name in core_names & _READ_BACKEND_RESULT_TOOLS
+        if get_tool_flow_direction(tool_name) not in {
+            ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
+        }
+    })
+    unclassified_results = sorted({
+        tool_name for tool_name in core_names
+        # MCP has a total result classifier above, including sink/neither calls
+        # and unresolved failures. It needs no per-tool native inventory entry;
+        # flow direction never exempts its remote response from provenance.
+        if not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX)
+        and tool_name not in _PROTECTED_RESULT_DOMAINS
+        and not (
+            (descriptor := get_tool_descriptor(tool_name))
+            and descriptor.result_origin & ResultOriginKind.NON_INGESTING
+        )
+    })
+    overlapping_result_policies = sorted(
+        tool_name
+        for tool_name in _PROTECTED_RESULT_DOMAINS
+        if tool_name in core_names
+        and (descriptor := get_tool_descriptor(tool_name))
+        and descriptor.result_origin & ResultOriginKind.NON_INGESTING
+    )
+    errors: list[str] = []
+    if unknown_tools:
+        errors.append("UNKNOWN model-bound tools: " + ", ".join(unknown_tools))
+    if unknown_flows:
+        errors.append("model-bound tools without explicit IFC flow metadata: " + ", ".join(unknown_flows))
+    if incomplete_sinks:
+        errors.append("model-bound IFC sinks without category/destination extraction: " + ", ".join(incomplete_sinks))
+    if misclassified_read_backends:
+        errors.append(
+            "read-backend tools must be IFC SOURCE/BOTH: "
+            + ", ".join(misclassified_read_backends)
+        )
+    if unclassified_results:
+        errors.append(
+            "model-bound tools without explicit protected-result classification: "
+            + ", ".join(unclassified_results)
+        )
+    if overlapping_result_policies:
+        errors.append(
+            "model-bound tools both mapped and exempted from result classification: "
+            + ", ".join(overlapping_result_policies)
+        )
+    if errors:
+        raise CapabilityMatrixError(
+            "Access-control enforcement blocked by incomplete model tool inventory: "
+            + "; ".join(errors)
+        )
+
+
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def resolve_access_control_enforcement(
+    requested: bool,
+    *,
+    model_spec: str | None = None,
+    policy: "PolicyRegistry | None" = None,
+) -> bool:
+    """Fail closed at the enforcement enablement boundary."""
+    if requested:
+        assert_capability_matrix_complete()
+        assert_model_tool_inventory_cataloged(
+            model_spec=model_spec,
+            policy=policy,
+        )
+    return requested
+
+
+def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
+    """Generate a report of the current capability matrix for audit purposes.
+
+    Returns:
+        A dictionary mapping trigger names to their principal configuration.
+    """
+    report: dict[str, dict[str, Any]] = {}
+    for trigger, principal in _TRUSTED_SERVICE_PRINCIPALS.items():
+        report[trigger] = {
+            "canonical": principal.canonical,
+            "capabilities": list(principal.capabilities),
+            "readable_domains": list(principal.readable_domains),
+            "sink_destinations": list(principal.sink_destinations),
+            "sink_policies": [
+                {
+                    "operation": policy.operation,
+                    "adapter": policy.adapter,
+                    "destination": policy.destination,
+                }
+                for policy in principal.sink_policies
+            ],
+            "filesystem_read_roots": list(principal.filesystem_read_roots),
+            "saga_full_corpus_read": principal.saga_full_corpus_read,
+            "creation_path": principal.creation_path,
+        }
+    return report
+
+
+def get_service_principal(
+    trigger: str, *, policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal | None:
+    """Get a service principal by trigger."""
+    selected = policy if policy is not None else selected_policy_registry()
+    if policy is None:
+        return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    return selected.service_principals.get(trigger) if selected.frozen else None
+
+
+def get_event_service_principal(
+    event: Any, *, policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal | None:
+    """Resolve static built-ins or an exact per-instance event authority."""
+    carried = getattr(event, "service_authority", None)
+    if (
+        isinstance(carried, ServicePrincipal)
+        and carried.trigger == getattr(event, "trigger", None)
+        and carried.canonical == getattr(event, "service_principal", None)
+    ):
+        return carried
+    return get_service_principal(getattr(event, "trigger", None), policy=policy)
+
+
+def is_admin(auth_context: Any) -> bool:
+    """Check if the auth context has admin role."""
+    if auth_context is None:
+        return False
+    roles = getattr(auth_context, "roles", None)
+    if not roles:
+        return False
+    return "admin" in roles
+
+
+def heartbeat_git_authority_enabled(service: ServicePrincipal | None) -> bool:
+    """Opt in only a server-resolved heartbeat, never model event metadata."""
+    return (
+        _service_shell_coding_enabled()
+        and isinstance(service, ServicePrincipal)
+        and service.trigger == "scheduled_tick"
+        and service.authority_profile == "heartbeat"
+        and service.canonical == "heartbeat"
+    )
+
+
+def can_resolve_forge_review_scope(
+    auth_context: Any,
+    *,
+    stage: str,
+    pr_author: str | None = None,
+    self_login: str | None = None,
+) -> bool:
+    """Authorize one stage of forge review-scope resolution.
+
+    The admitted production turn kinds are explicit here:
+
+    - Authenticated operator ``user_message`` turns may reuse stored scope and
+      discover any configured pull request.
+    - Trusted ``poller`` services that were granted ``pr_metadata`` may reuse
+      stored scope and provisionally fetch an open pull request. Acceptance
+      still requires Mimir's configured forge login and either matching PR
+      authorship or an explicit ``pr_review_others`` capability.
+    - Trusted heartbeat ``scheduled_tick`` services may reuse server discovery.
+      With the operator's heartbeat Git flag, fresh discovery is restricted to
+      the configured identity's own open PRs; the resolver revalidates caches.
+
+    No other turn kind may reuse or discover forge review scope.
+    """
+    if auth_context is None:
+        return False
+    trigger = getattr(auth_context, "trigger", None)
+    ingress = getattr(auth_context, "event_ingress", None)
+    is_service = getattr(auth_context, "is_service", False)
+    principal = getattr(auth_context, "canonical_principal", None)
+    roles = getattr(auth_context, "roles", ())
+    trusted_service = get_trusted_service_from_auth_context(auth_context)
+
+    if heartbeat_git_authority_enabled(trusted_service) and trigger != "scheduled_tick":
+        return False
+
+    operator_user = (
+        trigger == "user_message"
+        and not is_service
+        and ingress is None
+        and bool(principal)
+        and "admin" in roles
+    )
+    poller_service = (
+        trigger == "poller"
+        and trusted_service is not None
+        and trusted_service.has_capability("pr_metadata")
+    )
+    scheduled_service = (
+        trigger == "scheduled_tick"
+        and trusted_service is not None
+        and trusted_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
+    )
+
+    heartbeat_git = (
+        trigger == "scheduled_tick"
+        and heartbeat_git_authority_enabled(trusted_service)
+        and trusted_service.has_capability("pr_metadata")
+    )
+
+    if stage == "stored":
+        return operator_user or poller_service or (
+            scheduled_service and not heartbeat_git_authority_enabled(trusted_service)
+        )
+    if stage == "fetch":
+        return operator_user or poller_service or heartbeat_git
+    if stage == "accept":
+        return (heartbeat_git and bool(self_login) and pr_author == self_login) or operator_user or (
+            poller_service
+            and bool(self_login)
+            and (
+                pr_author == self_login
+                or trusted_service.has_capability("pr_review_others")
+            )
+        )
+    raise ValueError(f"unknown forge review-scope resolution stage: {stage!r}")
+
+
+def get_trusted_service_from_auth_context(
+    auth_context: Any,
+    *, policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal | None:
+    """Resolve a registered service from the server-owned auth carrier.
+
+    Service authority exists only for internally-created events: public HTTP
+    ingress is stamped in ``event_ingress`` and therefore cannot gain service
+    authority merely by choosing a registered trigger string.
+    """
+    if auth_context is None or getattr(auth_context, "event_ingress", None) is not None:
+        return None
+    if not getattr(auth_context, "is_service", False):
+        return None
+    service = getattr(auth_context, "service_authority", None)
+    if not isinstance(service, ServicePrincipal):
+        trigger = getattr(auth_context, "trigger", None)
+        if trigger == "shell_job_complete":
+            # Service identity is provenance; human-request guards use trigger.
+            trigger = getattr(auth_context, "origin_trigger", None)
+        if not isinstance(trigger, str):
+            return None
+        service = get_service_principal(trigger, policy=policy)
+    if service is None or getattr(auth_context, "canonical_principal", None) != service.canonical:
+        return None
+    return service
+
+
+def is_trusted_service(auth_context: Any) -> bool:
+    """Check whether the exact auth carrier maps to a trusted service."""
+    return get_trusted_service_from_auth_context(auth_context) is not None
+
+
+def service_can_invoke_operation(
+    service: ServicePrincipal | None,
+    operation: str,
+    *, policy: "PolicyRegistry | None" = None,
+) -> bool:
+    """Check an exact service capability and its declared flow constraints."""
+    selected = policy if policy is not None else selected_policy_registry()
+    if not selected.frozen or service is None or not service.has_capability(operation):
+        return False
+    if (policy is not None and operation not in selected.capabilities
+            and operation not in selected.tools
+            and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS):
+        return False
+    if policy is None and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS:
+        return False
+    tool = selected.tools.get(operation)
+    required_domain = tool.readable_domain if tool is not None else None
+    if required_domain and not service.can_read_domain(required_domain):
+        return False
+    descriptor = selected.descriptors.get(operation)
+    required_sink = descriptor.sink_destination if descriptor else None
+    if required_sink and not service.can_write_sink(required_sink):
+        return False
+    return True
+
+
+def can_write_saga(auth_context: Any, operation: str) -> bool:
+    """Authorize one canonical SAGA mutation for an admin or service."""
+    if operation not in _SAGA_MUTATION_OPERATIONS:
+        return False
+    if saga_mutation_taint_refusal(auth_context) is not None:
+        return False
+    if is_admin(auth_context):
+        return True
+    service = get_trusted_service_from_auth_context(auth_context)
+    return service_can_invoke_operation(service, operation)
+
+
+def get_provenance_from_auth_context(
+    auth_context: Any,
+) -> dict[str, Any]:
+    """Extract provenance metadata from a frozen AuthContext.
+
+    Returns a dict with:
+    - created_by: canonical principal or service name
+    - trigger: the event trigger
+    - event_ingress: server-owned ingress point
+    - is_service: whether this is a service principal
+    """
+    if auth_context is None:
+        return {}
+    service = get_trusted_service_from_auth_context(auth_context)
+    created_by = (
+        f"service:{service.canonical}"
+        if service is not None
+        else getattr(auth_context, "canonical_principal", None)
+        or getattr(auth_context, "principal", None)
+    )
+    return {
+        "created_by": created_by,
+        "trigger": getattr(auth_context, "trigger", None),
+        "event_ingress": getattr(auth_context, "event_ingress", None),
+        "is_service": service is not None,
+    }
+
+
+@dataclass(frozen=True)
+class AccessDecision:
+    allowed: bool
+    status: AccessStatus
+    required_tier: AccessTier
+    reason: DenialReason | None = None
+    author: str | None = None
+    canonical_author: str | None = None
+    roles: tuple[str, ...] = ()
+    enforcement_enabled: bool = False
+
+    @property
+    def denial_reason(self) -> str | None:
+        return self.reason.value if self.reason else None
+
+    def as_log_fields(self) -> dict[str, object]:
+        return {
+            "allowed": self.allowed,
+            "status": self.status.value,
+            "required_tier": self.required_tier.value,
+            "denial_reason": self.denial_reason,
+            "author": self.author,
+            "canonical_author": self.canonical_author,
+            "roles": list(self.roles),
+            "enforcement_enabled": self.enforcement_enabled,
+        }
+
+
+def _author_from_event(event: "AgentEvent | str | None") -> str | None:
+    if event is None or isinstance(event, str):
+        return event
+    return event.author
+
+
+def _metadata_for(
+    author: str | None,
+    resolver: "IdentityResolver | None",
+) -> tuple[str | None, bool, AccessMetadata]:
+    if author is None:
+        return None, False, AccessMetadata()
+    if resolver is None:
+        return author, False, AccessMetadata()
+    canonical = resolver.resolve(author)
+    return (
+        canonical,
+        resolver.identity(author) is not None,
+        resolver.access_metadata(author),
+    )
+
+
+def authorize(
+    event_or_author: "AgentEvent | str | None",
+    resolver: "IdentityResolver | None" = None,
+    *,
+    required_tier: AccessTier | str = AccessTier.USER,
+    enforce: bool = False,
+) -> AccessDecision:
+    """Authorize an event/author for a user or admin tier.
+
+    ``enforce=False`` is the backwards-compatible default: the decision is
+    allowed even if the author is unknown or lacks roles, while still carrying
+    the stable reason that enforcement would use.
+    """
+    tier = AccessTier(required_tier)
+    author = _author_from_event(event_or_author)
+    canonical, known_identity, access = _metadata_for(author, resolver)
+    roles = access.roles
+
+    reason: DenialReason | None = None
+    if author is None:
+        reason = DenialReason.MISSING_AUTHOR
+    elif resolver is not None and not known_identity:
+        reason = DenialReason.UNKNOWN_AUTHOR
+    elif not access.is_authorized:
+        reason = DenialReason.USER_NOT_ALLOWLISTED
+    elif tier == AccessTier.ADMIN and not access.is_admin:
+        reason = DenialReason.ADMIN_REQUIRED
+
+    allowed = reason is None or not enforce
+    if reason is None:
+        status = (
+            AccessStatus.ADMIN_ALLOWED
+            if access.is_admin
+            else AccessStatus.USER_ALLOWED
+        )
+    elif not enforce:
+        status = AccessStatus.LEGACY_ALLOWED
+    else:
+        status = AccessStatus.DENIED
+
+    return AccessDecision(
+        allowed=allowed,
+        status=status,
+        required_tier=tier,
+        reason=reason,
+        author=author,
+        canonical_author=canonical,
+        roles=roles,
+        enforcement_enabled=enforce,
+    )
+
+
+def authorize_inbound(
+    event: "AgentEvent",
+    resolver: "IdentityResolver | None" = None,
+    *,
+    enforce: bool = False,
+) -> AccessDecision:
+    """Authorize an inbound event at the normal allowlisted-user tier."""
+    return authorize(event, resolver, required_tier=AccessTier.USER, enforce=enforce)
+
+
+def authorize_action(
+    event_or_author: "AgentEvent | str | None",
+    resolver: "IdentityResolver | None" = None,
+    *,
+    admin: bool = False,
+    enforce: bool = False,
+) -> AccessDecision:
+    """Authorize an action-tier operation.
+
+    Set ``admin=True`` for operator/admin-only actions; otherwise the action
+    requires ordinary allowlisted user access.
+    """
+    tier = AccessTier.ADMIN if admin else AccessTier.USER
+    return authorize(event_or_author, resolver, required_tier=tier, enforce=enforce)
+
+
+def create_auth_context(
+    event: "AgentEvent",
+    resolver: "IdentityResolver | None" = None,
+    policy_version: str | None = None,
+    *,
+    enforce: bool = False,
+    event_ingress: str | None = None,
+    ifc_labels: "InformationFlowLabels | None" = None,
+    audience_provider: Any = None,
+    cross_platform_pull: bool = True,
+    policy: "PolicyRegistry | None" = None,
+) -> "AuthContext":
+    """Create a frozen AuthContext from an inbound event (chainlink #864).
+
+    This is the server-owned authorization carrier created at ingress BEFORE
+    model execution. It carries immutable authorization state that cannot be
+    widened or mutated by the model, tools, or downstream handlers.
+
+    Authority is derived ONLY from this carrier - NOT from:
+    - Model-passed session_id
+    - ContextVar fallback heuristics
+    - Single-active-turn heuristics
+    """
+    from .models import AuthContext, TurnInteractivity
+
+    selected = policy if policy is not None else selected_policy_registry()
+    constructors = next(
+        (trusted for protocol in selected.scoped_actions.values()
+         if (trusted := getattr(protocol, "trusted_scope", None)) is not None),
+        None,
+    )
+
+    author = event.author
+    canonical = author
+    roles: tuple[str, ...] = ()
+    is_service = False
+
+    if event_ingress is None and isinstance(event.extra, dict):
+        event_ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
+
+    if author is not None and resolver is not None:
+        canonical = resolver.resolve(author)
+        access = resolver.access_metadata(author)
+        # HTTP body attribution is not proof of identity. Preserve attribution,
+        # but never import its roles on an ingress-stamped turn.
+        roles = access.roles if event_ingress is None else ()
+        is_service = access.is_service
+
+    registered_service = (
+        get_event_service_principal(event, policy=policy)
+        if policy is not None else get_event_service_principal(event)
+    )
+    if (
+        registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and event_ingress is None
+        and not (
+            isinstance(event.extra, dict)
+            and event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is not None
+        )
+    ):
+        canonical = registered_service.canonical
+        is_service = True
+
+    canonical_resource = event.channel_id
+    if resolver is not None:
+        canonical_resource = resolver.resolve_channel(event.channel_id)
+    extra = event.extra if isinstance(event.extra, dict) else {}
+    visibility = extra.get("channel_visibility")
+    domain = "channel"
+    domain_qualifier = visibility if isinstance(visibility, str) and visibility else None
+    bridge_instance = extra.get("bridge_instance")
+    if not isinstance(bridge_instance, str) or not bridge_instance:
+        bridge_instance = event.source
+    if (
+        (not isinstance(bridge_instance, str) or not bridge_instance)
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+    ):
+        bridge_instance = f"service:{registered_service.canonical}"
+
+    repo_pr_scope_registry = (
+        _repo_review_state_from_event(event, registered_service, policy)
+        if registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+        else None
+    )
+    carried_scope = event.repo_pr_action_scope
+    if not (
+        constructors is not None
+        and type(carried_scope) is constructors.scope_type
+        and carried_scope.provenance == "server_discovered"
+        and registered_service is not None
+        and registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
+        and event.trigger == "scheduled_tick"
+        and event.service_principal == registered_service.canonical
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+    ):
+        carried_scope = None
+    if repo_pr_scope_registry is None and carried_scope is not None:
+        repo_pr_scope_registry = constructors.registry((constructors.review(carried_scope),))
+    single_state = (
+        repo_pr_scope_registry.review_states[0]
+        if repo_pr_scope_registry is not None
+        and len(repo_pr_scope_registry.review_states) == 1
+        else None
+    )
+    action_scope = single_state.action_scope if single_state is not None else None
+    scoped_pr_grants = None
+    if (
+        is_service and registered_service is not None
+        and (registered_service.github_activity or
+             registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES)
+        and event_ingress is None and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+        and (policy if policy is not None else selected_policy_registry()).scoped_actions
+    ):
+        scoped_pr_grants = ScopedPRGrants(
+            canonical, (state.action_scope for state in repo_pr_scope_registry.review_states)
+            if repo_pr_scope_registry is not None else (),
+            protocols=(policy if policy is not None else selected_policy_registry()).scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        )
+
+    hooks = getattr(policy or selected_policy_registry(), "policy_consumer_hooks", None)
+    if hooks is not None:
+        derive_retained_factory_scope = hooks.derive_retained_scope
+    else:
+        derive_retained_factory_scope = lambda *_args: SimpleNamespace(scope=None, refusal_reason="provider unavailable")
+
+    retained_resolution = derive_retained_factory_scope(
+        event, registered_service if is_service else None,
+    )
+
+    ci_run_targets: frozenset[tuple[str, int]] = frozenset()
+    ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
+    if (
+        event.trigger == "poller"
+        and event.source == "poller"
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+        and extra.get("poller_name") == "github-ci-watch"
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and registered_service.github_ci_watch
+        and any(registered_service.has_capability(name) for name in (
+            "ci_run_jobs", "ci_run", "ci_recent_runs",
+        ))
+    ):
+        items = extra.get("items")
+        if isinstance(items, list):
+            valid_items = [
+                item
+                for item in items
+                if isinstance(item, dict)
+                and item.get("event_type") in {"ci_failure", "ci_attention"}
+                and isinstance(item.get("repo"), str)
+                and is_configured_github_repo(item["repo"])
+                and type(item.get("run_id")) is int
+                and item["run_id"] > 0
+                and isinstance(item.get("branch"), str)
+                and bool(item["branch"])
+            ]
+            ci_run_targets = frozenset(
+                (item["repo"].lower(), item["run_id"]) for item in valid_items
+            )
+            ci_branch_targets = frozenset(
+                (
+                    item["repo"].lower(), item["branch"],
+                    item.get("workflow_id") if type(item.get("workflow_id")) is int
+                    and item["workflow_id"] > 0 else None,
+                )
+                for item in valid_items
+            )
+
+    tracker_issue_targets: frozenset[tuple[str, str, str]] = frozenset()
+    if (
+        event.trigger == "poller"
+        and event.source == "poller"
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and registered_service.tracker_issues
+    ):
+        items = extra.get("items")
+        if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
+            item = items[0]
+            adapter, ref = safe_adapter(item.get("adapter")), safe_ref(item.get("ref"))
+            url = safe_url(item.get("url"), ref)
+            if (
+                item.get("tracker_attested") is True
+                and adapter is not None and ref is not None and url is not None
+            ):
+                tracker_issue_targets = frozenset({(adapter, ref, url)})
+
+    return AuthContext(
+        principal=author,
+        canonical_principal=canonical,
+        roles=roles,
+        event_ingress=event_ingress,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        policy_version=policy_version,
+        is_service=is_service,
+        service_authority=registered_service if is_service else None,
+        repo_pr_scope_registry=repo_pr_scope_registry,
+        repo_review_state=single_state,
+        repo_pr_action_scope=action_scope,
+        scoped_pr_grants=scoped_pr_grants,
+        ci_run_targets=ci_run_targets,
+        ci_branch_targets=ci_branch_targets,
+        tracker_issue_targets=tracker_issue_targets,
+        retained_factory_scope=retained_resolution.scope,
+        retained_factory_scope_refusal=retained_resolution.refusal_reason,
+        enforcement_enabled=enforce,
+        source_session_acl=(
+            event.source_session_acl
+            if registered_service is not None
+            and event.trigger == "saga_session_end"
+            and event.service_principal == registered_service.canonical
+            and event_ingress is None
+            and not (
+                isinstance(event.extra, dict)
+                and event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is not None
+            )
+            else None
+        ),
+        ifc_labels=ifc_labels,
+        domain=domain,
+        domain_qualifier=domain_qualifier,
+        resource_id=canonical_resource,
+        bridge_instance=bridge_instance,
+        origin_trigger=(
+            f"{registered_service.authority_profile}-poller:{extra.get('poller_name')}"
+            if registered_service is not None
+            and event.trigger == "poller"
+            and registered_service.authority_profile
+            and isinstance(extra.get("poller_name"), str)
+            and extra.get("poller_name")
+            else event.trigger
+        ),
+        origin_ref=event.source_id,
+        audience_provider=audience_provider,
+        cross_platform_pull=cross_platform_pull,
+        _plugin_slot_policy=policy if policy is not None else selected_policy_registry(),
+    )
+
+
+@dataclass(frozen=True)
+class _LocalOperatorResolver:
+    principal: str
+
+    def resolve(self, author: str | None) -> str | None:
+        return author
+
+    def access_metadata(self, author: str | None) -> AccessMetadata:
+        if author == self.principal:
+            return AccessMetadata(roles=("admin",))
+        return AccessMetadata()
+
+    def resolve_channel(self, channel_id: str | None) -> str | None:
+        return channel_id
+
+
+def create_local_operator_auth_context(
+    *,
+    principal: str,
+    trigger: str,
+    channel_id: str | None,
+    enforce: bool = False,
+) -> "AuthContext":
+    from .models import AgentEvent
+
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=channel_id,
+        author=principal,
+    )
+    return create_auth_context(
+        event,
+        _LocalOperatorResolver(principal),
+        enforce=enforce,
+    )

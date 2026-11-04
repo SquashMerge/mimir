@@ -1,0 +1,1121 @@
+"""Per-job shell grants declared where the job itself is defined.
+
+mimir ships no catalogue of the CLIs a deployment might install. A scheduled job
+or poller declares the commands it needs, and what stays in code is the SHAPE a
+declaration must take. These tests pin that shape, because it is the whole
+security content of the feature.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import venv
+from pathlib import Path
+
+import pytest
+
+from mimir import access_control
+from mimir.access_control import (
+    DeclaredShellCommand,
+    ServiceShellBindingRule,
+    agent_writable_roots,
+    parse_declared_shell_commands,
+    parse_service_shell_argv,
+    parse_service_shell_argv_with_diagnostics,
+)
+
+
+@pytest.fixture
+def home(tmp_path: Path) -> Path:
+    """A home with an operator-owned scripts/ and an agent-writable scratch/."""
+    for name in ("scripts", "scratch", "skills", "state"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "scripts" / "todo.py").write_text("print(1)\n")
+    (tmp_path / "scratch" / "evil.py").write_text("print(1)\n")
+    (tmp_path / "skills" / "bundled.py").write_text("print(1)\n")
+    return tmp_path
+
+
+def _gog(**over):
+    entry = {
+        "exec": "gog",
+        "path": "/bin/echo",
+        "subcommands": [["gmail", "search"], ["calendar", "events"]],
+        "options": ["--json", "--limit"],
+    }
+    entry.update(over)
+    return entry
+
+
+@pytest.mark.parametrize("key,value", [
+    ("external_send", True), ("payload_args", ["--body"]),
+    ("script", "/bin/true"),
+])
+def test_operator_declaration_rejects_outbound_and_script_entries(key, value):
+    with pytest.raises(ValueError, match=key):
+        access_control.parse_operator_shell_commands([_gog(**{key: value})])
+
+
+def test_operator_declaration_rejects_interpreter_and_bad_shape():
+    with pytest.raises(ValueError, match="interpreter"):
+        access_control.parse_operator_shell_commands([_gog(exec="python3", path="/usr/bin/python3")])
+    with pytest.raises(ValueError, match="operator_shell_commands must be a list"):
+        access_control.parse_operator_shell_commands({"exec": "gog"})
+
+
+def test_operator_declaration_refuses_base_parser_valid_script(home: Path):
+    entry = {"exec": "python3", "path": sys.executable,
+             "script": str(home / "scripts" / "todo.py")}
+    commands = parse_declared_shell_commands([entry], writable_roots=(home / "scratch",))
+    assert len(commands) == 1 and commands[0].script is not None
+    with pytest.raises(ValueError, match="script"):
+        access_control.parse_operator_shell_commands([entry], writable_roots=(home / "scratch",))
+
+
+@pytest.mark.parametrize("kind,entry_name", [
+    ("exec", "gh"), ("path", "alias"), ("symlink", "alias"),
+    ("named_symlink", "alias"),
+])
+@pytest.mark.parametrize("gh_name", ["gh", "GH", "Gh"])
+def test_operator_declaration_refuses_gh_by_name_path_and_resolved_target(
+    tmp_path: Path, kind: str, entry_name: str, gh_name: str,
+) -> None:
+    if kind == "exec":
+        entry_name = gh_name
+    gh = tmp_path / gh_name
+    alias = tmp_path / "alias"
+    if kind == "named_symlink":
+        alias.write_text("#!/bin/sh\nexit 0\n")
+        alias.chmod(0o755)
+        gh.symlink_to(alias)
+    else:
+        gh.write_text("#!/bin/sh\nexit 0\n")
+        gh.chmod(0o755)
+        if kind == "symlink":
+            alias.symlink_to(gh)
+        else:
+            alias.write_text("#!/bin/sh\nexit 0\n")
+            alias.chmod(0o755)
+    entry = {
+        "exec": entry_name,
+        "path": str(alias if kind in {"exec", "symlink"} else gh),
+        "subcommands": [["issue", "list"]],
+    }
+    # These are otherwise valid job declarations; only operator chat refuses gh.
+    assert len(parse_declared_shell_commands([entry])) == 1
+    pattern = rf"operator_shell_commands\['{entry_name}'\]: gh cannot be declared"
+    with pytest.raises(ValueError, match=pattern) as caught:
+        access_control.parse_operator_shell_commands([entry])
+    assert "fresh untainted turn or the forge tools" in str(caught.value)
+
+
+@pytest.mark.parametrize("wrapper,prefix", [
+    ("nice", []), ("timeout", ["5"]), ("stdbuf", ["-oL"]),
+    ("nohup", []), ("setsid", []), ("ionice", []), ("chrt", ["0"]),
+    ("taskset", ["1"]), ("flock", ["lock"]),
+    ("nice", ["timeout", "5"]),
+])
+@pytest.mark.parametrize("gh_token", [
+    "gh", "GH", "Gh", "/usr/bin/gh", "/usr/bin/GH", "/usr/bin/Gh",
+    "./gh", "./GH", "./Gh", "/usr/bin/../bin/gh", "/usr/bin/../bin/GH",
+])
+def test_operator_declaration_refuses_wrapped_gh_at_any_depth(
+    tmp_path: Path, wrapper: str, prefix: list[str], gh_token: str,
+) -> None:
+    executable = tmp_path / wrapper
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    entry = {"exec": wrapper, "path": str(executable),
+             "subcommands": [["status"], [*prefix, gh_token, "pr", "view"]]}
+    # Service declarations retain their independent authority.
+    assert len(parse_declared_shell_commands([entry])) == 1
+    with pytest.raises(ValueError, match="gh cannot be declared"):
+        access_control.parse_operator_shell_commands([entry])
+
+
+def test_operator_declaration_non_gh_commands_still_match(tmp_path: Path) -> None:
+    entries = []
+    for name, subcommand in (("gog", ["gmail", "search"]),
+                             ("acli", ["jira", "workitem", "search"]),
+                             ("chainlink", ["issue", "show"])):
+        executable = tmp_path / name
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        entries.append({"exec": name, "path": str(executable),
+                        "subcommands": [subcommand]})
+    commands = access_control.parse_operator_shell_commands(entries)
+    assert commands == parse_declared_shell_commands(entries)
+    for entry in entries:
+        command = " ".join((entry["exec"], *entry["subcommands"][0], "query"))
+        argv = parse_service_shell_argv(command, "maintenance", declared=commands)
+        assert argv == [entry["path"], *entry["subcommands"][0], "query"]
+
+
+@pytest.mark.parametrize("gh_name", ["gh", "GH", "Gh"])
+def test_scheduler_refuses_gh_operator_grants_on_load_and_save(
+    tmp_path: Path, gh_name: str,
+) -> None:
+    import yaml
+    from mimir.scheduler import load_jobs, load_operator_shell_commands, write_jobs
+
+    gh = tmp_path / gh_name
+    gh.write_text("#!/bin/sh\nexit 0\n")
+    gh.chmod(0o755)
+    path = tmp_path / "scheduler.yaml"
+    document = {"jobs": [{"name": "read", "prompt": "read", "cron": "0 * * * *"}],
+                "operator_shell_commands": [{"exec": gh_name, "path": str(gh),
+                                             "subcommands": [["issue", "list"]]}]}
+    text = yaml.safe_dump(document)
+    path.write_text(text)
+    jobs, rejections = load_jobs(path)
+    assert jobs == []
+    assert len(rejections) == 1 and rejections[0]["scope"] == "document"
+    assert f"operator_shell_commands[{gh_name!r}]: gh cannot be declared" in rejections[0]["reason"]
+    with pytest.raises(ValueError, match="gh cannot be declared"):
+        load_operator_shell_commands(path)
+    with pytest.raises(ValueError, match="gh cannot be declared"):
+        write_jobs(path, [])
+    assert path.read_text() == text
+
+
+def test_scheduler_unknown_document_key_refuses_jobs_and_chat_grants(tmp_path: Path):
+    import yaml
+    from mimir.scheduler import load_jobs_from_text, load_operator_shell_commands
+
+    text = yaml.safe_dump({
+        "jobs": [{"name": "brief", "cron": "0 * * * *", "prompt": "brief"}],
+        "operator_shell_commands": [_gog()], "unknown_grant": [],
+    })
+    jobs, rejections = load_jobs_from_text(text, source=tmp_path / "scheduler.yaml")
+    assert jobs == []
+    assert len(rejections) == 1 and rejections[0]["scope"] == "document"
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="unknown"):
+        load_operator_shell_commands(path)
+
+
+def test_operator_declaration_refuses_valid_external_send_shape():
+    with pytest.raises(ValueError, match="external_send"):
+        access_control.parse_operator_shell_commands([
+            _gog(external_send=True, payload_args=["--body"], options=["--body"]),
+        ])
+
+
+def test_scheduler_operator_grants_load_and_survive_job_rewrites(tmp_path: Path):
+    import yaml
+    from mimir.scheduler import load_jobs, load_operator_shell_commands, write_jobs
+
+    executable = tmp_path / "gog"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    path = tmp_path / "scheduler.yaml"
+    document = {"jobs": [{"name": "read", "prompt": "read", "cron": "0 * * * *"}],
+                "operator_shell_commands": [{"exec": "gog", "path": str(executable),
+                                              "subcommands": [["gmail", "search"]]}]}
+    path.write_text(yaml.safe_dump(document))
+    jobs, rejections = load_jobs(path)
+    assert not rejections and len(jobs) == 1
+    assert load_operator_shell_commands(path)[0].executable == "gog"
+    write_jobs(path, jobs)
+    rewritten = yaml.safe_load(path.read_text())
+    assert rewritten["operator_shell_commands"] == document["operator_shell_commands"]
+    assert [job["name"] for job in rewritten["jobs"]] == ["read"]
+    document["operator_shell_commands"][0]["external_send"] = True
+    path.write_text(yaml.safe_dump(document))
+    jobs, rejections = load_jobs(path)
+    assert not jobs and rejections[0]["scope"] == "document"
+    assert "external_send" in rejections[0]["reason"]
+
+
+def test_scheduled_service_uses_only_its_job_grant(tmp_path: Path):
+    import yaml
+    from dataclasses import replace
+    from mimir.scheduler import load_jobs, load_operator_shell_commands
+    from mimir.access_control import get_service_principal
+
+    executable = tmp_path / "gog"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    path = tmp_path / "scheduler.yaml"
+    job_grant = {"exec": "gog", "path": str(executable),
+                 "subcommands": [["calendar", "events"]]}
+    chat_grant = {"exec": "gog", "path": str(executable),
+                  "subcommands": [["gmail", "search"]]}
+    path.write_text(yaml.safe_dump({
+        "operator_shell_commands": [chat_grant],
+        "jobs": [{"name": "brief", "cron": "0 * * * *", "prompt": "brief",
+                  "shell_commands": [job_grant]}],
+    }))
+    jobs, rejections = load_jobs(path)
+    assert not rejections
+    service = replace(get_service_principal("scheduled_tick"),
+                      declared_shell_commands=parse_declared_shell_commands(jobs[0].shell_commands))
+    assert parse_service_shell_argv("gog calendar events", "scheduler_read_only",
+                                    declared=service.declared_shell_commands) is not None
+    assert parse_service_shell_argv("gog gmail search", "scheduler_read_only",
+                                    declared=service.declared_shell_commands) is None
+    assert load_operator_shell_commands(path)[0].subcommands == (("gmail", "search"),)
+
+
+@pytest.mark.parametrize("missing_kind", ["final", "intermediate", "dangling_link"])
+def test_missing_executable_component_preserves_raw_diagnostic(
+    tmp_path: Path, missing_kind: str,
+) -> None:
+    missing = tmp_path / "missing"
+    if missing_kind == "dangling_link":
+        link = tmp_path / "entry"
+        link.symlink_to(missing)
+        spelling = link.name
+    elif missing_kind == "intermediate":
+        spelling = "missing/tool"
+    else:
+        spelling = "missing"
+    # Path normalizes duplicate separators; diagnostics must retain the input.
+    raw_path = f"{tmp_path}//{spelling}"
+    with pytest.raises(access_control.DeclaredShellCommandError) as caught:
+        parse_declared_shell_commands([_gog(path=raw_path)], writable_roots=())
+    assert str(caught.value).endswith(f"path does not exist: {raw_path}")
+    assert caught.value.environment_dependent is True
+
+
+def test_unresolvable_executable_component_has_distinct_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocked = tmp_path / "blocked"
+    original_lstat = Path.lstat
+
+    def denied_lstat(path, *args, **kwargs):
+        if path == blocked:
+            raise PermissionError("permission denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+    raw_path = f"{tmp_path}//blocked/tool"
+    with pytest.raises(access_control.DeclaredShellCommandError) as caught:
+        parse_declared_shell_commands([_gog(path=raw_path)], writable_roots=())
+    assert str(caught.value).endswith(f"path cannot be resolved: {raw_path}")
+    assert caught.value.environment_dependent is True
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_declared_read_subcommands_are_admitted(home: Path) -> None:
+    declared = parse_declared_shell_commands([_gog()], writable_roots=())
+    for command in (
+        "gog gmail search newer_than:24h",
+        "gog calendar events --json",
+        "gog gmail search --limit 5 some free query text",
+    ):
+        assert parse_service_shell_argv(
+            command, "maintenance", declared=declared,
+        ) is not None, command
+
+
+def test_the_same_binary_is_refused_for_a_mutating_subcommand(home: Path) -> None:
+    """A grant names subcommands, never a bare binary.
+
+    ``gog gmail search`` and ``gog gmail send`` are one executable. Declaring the
+    binary would grant both, which is why ``subcommands`` is required.
+    """
+    declared = parse_declared_shell_commands([_gog()], writable_roots=())
+    for command in (
+        "gog gmail send --to a@example.com",
+        "gog auth add",
+        "gog gmail delete abc123",
+    ):
+        assert parse_service_shell_argv(
+            command, "maintenance", declared=declared,
+        ) is None, command
+
+
+def test_options_outside_the_allowlist_are_refused(home: Path) -> None:
+    declared = parse_declared_shell_commands([_gog()], writable_roots=())
+    assert parse_service_shell_argv(
+        "gog gmail search --raw-output x", "maintenance", declared=declared,
+    ) is None
+
+
+def test_a_bare_binary_cannot_be_declared() -> None:
+    with pytest.raises(ValueError, match="at least one subcommand"):
+        parse_declared_shell_commands(
+            [{"exec": "gog", "path": "/bin/echo"}], writable_roots=(),
+        )
+
+
+def test_declaration_is_additive_not_a_replacement(home: Path) -> None:
+    """The profile is consulted first; a grant is a second chance, not a swap."""
+    declared = parse_declared_shell_commands([_gog()], writable_roots=())
+    argv, _reason, rule = parse_service_shell_argv_with_diagnostics(
+        "gog gmail send --to a@b.com", "maintenance", declared=declared,
+    )
+    assert argv is None
+    # Attribution distinguishes "this job declared commands, none matched" from
+    # "the profile refused it", while ``destination`` keeps meaning the profile
+    # so existing shadow-authz classification is untouched.
+    assert rule is ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH
+
+    _argv, _reason, rule_without = parse_service_shell_argv_with_diagnostics(
+        "gog gmail send --to a@b.com", "maintenance",
+    )
+    assert rule_without is ServiceShellBindingRule.PROFILE_ALLOWLIST
+
+
+class TestInterpreterRule:
+    """An interpreter is admitted only for a script the agent cannot rewrite."""
+
+    def test_interpreter_requires_a_pinned_script(self) -> None:
+        with pytest.raises(ValueError, match="only be declared with a pinned"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": "/usr/bin/python3",
+                  "subcommands": [["anything"]]}],
+                writable_roots=(),
+            )
+
+    def test_script_outside_writable_roots_is_admitted(self, home: Path) -> None:
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": "/usr/bin/python3",
+              "script": str(home / "scripts" / "todo.py")}],
+            writable_roots=agent_writable_roots(home),
+        )
+        assert parse_service_shell_argv(
+            f"python3 {home / 'scripts' / 'todo.py'}", "maintenance", declared=declared,
+        ) is not None
+
+    def test_skill_owned_script_is_declared_and_admitted_at_exec(
+        self, home: Path,
+    ) -> None:
+        script = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+        script.parent.mkdir(parents=True)
+        script.write_text("console.log('ok')\n", encoding="utf-8")
+
+        declared = parse_declared_shell_commands(
+            [{
+                "exec": "python3",
+                "path": sys.executable,
+                "script": str(script),
+                "options": ["--experimental-strip-types"],
+            }],
+            writable_roots=agent_writable_roots(home),
+        )
+
+        assert parse_service_shell_argv(
+            f"python3 {script} --experimental-strip-types",
+            "maintenance",
+            declared=declared,
+        ) == [
+            os.path.normpath(sys.executable),
+            str(script.resolve()),
+            "--experimental-strip-types",
+        ]
+
+    def test_existing_operator_and_builtin_declarations_still_admit_at_exec(
+        self, home: Path,
+    ) -> None:
+        todo = home / "scripts" / "process_conditional_todos.py"
+        weather = home / ".mimir_builtin_skills" / "weather" / "scripts" / "get_weather.py"
+        todo.write_text("print(1)\n", encoding="utf-8")
+        weather.parent.mkdir(parents=True)
+        weather.write_text("print(1)\n", encoding="utf-8")
+        declared = parse_declared_shell_commands(
+            [
+                {"exec": "python3", "path": "/usr/bin/python3", "script": str(todo)},
+                {"exec": "python3", "path": "/usr/bin/python3", "script": str(weather)},
+            ],
+            writable_roots=agent_writable_roots(home),
+        )
+
+        assert parse_service_shell_argv(
+            f"python3 {todo}", "maintenance", declared=declared,
+        ) == ["/usr/bin/python3", str(todo.resolve())]
+        assert parse_service_shell_argv(
+            f"python3 {weather}", "maintenance", declared=declared,
+        ) == ["/usr/bin/python3", str(weather.resolve())]
+
+    def test_script_inside_an_agent_writable_root_is_refused(self, home: Path) -> None:
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": sys.executable,
+                  "script": str(home / "scratch" / "evil.py")}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_script_at_skill_root_is_declarable(self, home: Path) -> None:
+        """All skill files share the admin-operator file-tool boundary."""
+        skill_root_script = home / "skills" / "ai-news" / "fetch-news.py"
+        skill_root_script.parent.mkdir(parents=True)
+        skill_root_script.write_text("print('safe')\n", encoding="utf-8")
+
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": sys.executable,
+              "script": str(skill_root_script)}],
+            writable_roots=agent_writable_roots(home),
+        )
+
+        assert declared[0].script == skill_root_script.resolve()
+
+    @pytest.mark.parametrize(
+        "root_name",
+        [
+            "state",
+            "memory",
+            "scratch",
+            "attachments",
+            "conversation_history",
+        ],
+    )
+    def test_scripts_in_remaining_home_writable_roots_are_refused(
+        self, home: Path, root_name: str,
+    ) -> None:
+        script = home / root_name / "evil.py"
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("print(1)\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": "/usr/bin/python3", "script": str(script)}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_script_in_tmp_remains_refused(self, home: Path) -> None:
+        script = home.parent / "tmp-agent-script.py"
+        script.write_text("print(1)\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": "/usr/bin/python3", "script": str(script)}],
+                writable_roots=(home.parent.resolve(),),
+            )
+
+    def test_a_symlink_cannot_launder_the_script_path(self, home: Path) -> None:
+        """Resolution happens before the check, or a link would defeat it."""
+        link = home / "scripts" / "link.py"
+        link.symlink_to(home / "scratch" / "evil.py")
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": "/usr/bin/python3", "script": str(link)}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    @pytest.mark.parametrize("option", ["-c", "-e", "-m", "--eval", "-"])
+    def test_code_from_argv_options_are_never_declarable(self, option: str) -> None:
+        with pytest.raises(ValueError, match="sources code from argv"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": "/bin/echo",
+                  "subcommands": [["x"]], "options": [option]}],
+                writable_roots=(),
+            )
+
+    def test_inline_code_is_refused_at_admission_too(self, home: Path) -> None:
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": "/usr/bin/python3",
+              "script": str(home / "scripts" / "todo.py")}],
+            writable_roots=agent_writable_roots(home),
+        )
+        for command in ("python3 -c 'import os'", "python3 -m http.server",
+                        f"python3 {home / 'scratch' / 'evil.py'}"):
+            assert parse_service_shell_argv(
+                command, "maintenance", declared=declared,
+            ) is None, command
+
+
+class TestDeclarationShape:
+    def test_path_must_be_absolute_and_exist(self) -> None:
+        with pytest.raises(ValueError, match="must be absolute"):
+            parse_declared_shell_commands(
+                [_gog(path="bin/echo")], writable_roots=(),
+            )
+        with pytest.raises(ValueError, match="does not exist"):
+            parse_declared_shell_commands(
+                [_gog(path="/nonexistent/gog")], writable_roots=(),
+            )
+
+    def test_exec_must_be_a_bare_name(self) -> None:
+        with pytest.raises(ValueError, match="bare command name"):
+            parse_declared_shell_commands(
+                [_gog(exec="/usr/local/bin/gog")], writable_roots=(),
+            )
+
+    def test_unknown_keys_are_refused(self) -> None:
+        with pytest.raises(ValueError, match="unknown keys"):
+            parse_declared_shell_commands(
+                [dict(_gog(), sudo=True)], writable_roots=(),
+            )
+
+    def test_the_pinned_path_is_what_executes(self) -> None:
+        """A declaration is a pin: PATH never selects the binary."""
+        declared = parse_declared_shell_commands([_gog()], writable_roots=())
+        argv = parse_service_shell_argv(
+            "gog gmail search x", "maintenance", declared=declared,
+        )
+        assert argv is not None
+        assert argv[0] == "/bin/echo"
+        assert declared[0].resolved_path == Path("/bin/echo").resolve()
+        assert Path(argv[0]).is_absolute()
+
+    def test_non_symlink_path_preserves_parent_components(self, tmp_path: Path) -> None:
+        executable = tmp_path / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        (tmp_path / "subdir").mkdir()
+        declared_path = tmp_path / "subdir" / ".." / "gog"
+        parsed = parse_declared_shell_commands(
+            [_gog(path=str(declared_path))], writable_roots=(),
+        )
+        assert parsed[0].path == declared_path
+        assert parsed[0].resolved_path == executable.resolve()
+        assert access_control._declared_command_execution_argv(
+            ["gog", "gmail", "search"], parsed,
+        ) == [str(declared_path), "gmail", "search"]
+
+    def test_missing_parent_component_is_not_lexically_skipped(self, tmp_path: Path) -> None:
+        executable = tmp_path / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        with pytest.raises(ValueError, match="does not exist"):
+            parse_declared_shell_commands(
+                [_gog(path=str(tmp_path / "missing" / ".." / "gog"))],
+                writable_roots=(),
+            )
+
+    def test_parent_component_requires_a_directory(self, tmp_path: Path) -> None:
+        executable = tmp_path / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        with pytest.raises(ValueError, match="not a directory"):
+            parse_declared_shell_commands(
+                [_gog(path=str(executable / ".." / "gog"))], writable_roots=(),
+            )
+
+    def test_absent_declaration_is_a_no_op(self) -> None:
+        assert parse_declared_shell_commands(None, writable_roots=()) == ()
+        assert parse_declared_shell_commands([], writable_roots=()) == ()
+
+
+def test_shell_metacharacters_are_still_refused_for_declared_commands() -> None:
+    """Grants widen the allowlist, never the argv binding."""
+    declared = parse_declared_shell_commands([_gog()], writable_roots=())
+    for command in (
+        "gog gmail search x | tee /tmp/out",
+        "gog gmail search x && rm -rf /",
+        "gog gmail search $(whoami)",
+    ):
+        assert parse_service_shell_argv(
+            command, "maintenance", declared=declared,
+        ) is None, command
+
+
+class TestSchedulerWiring:
+    """A scheduler.yaml job's grants must reach its own principal."""
+
+    def test_job_carries_declarations_from_yaml(self) -> None:
+        from mimir.scheduler import load_jobs_from_text
+
+        jobs, rejections = load_jobs_from_text(
+            "- name: morning-briefing\n"
+            "  prompt_file: morning-briefing.md\n"
+            "  cron: 0 8 * * *\n"
+            "  shell_commands:\n"
+            "    - exec: gog\n"
+            "      path: /bin/echo\n"
+            "      subcommands: [[gmail, search]]\n"
+            "      pass_env: [GOG_ACCOUNT, GOG_KEYRING_PASSWORD]\n"
+        )
+        assert rejections == []
+        assert jobs[0].shell_commands == [
+            {"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]],
+             "pass_env": ["GOG_ACCOUNT", "GOG_KEYRING_PASSWORD"]},
+        ]
+
+    def test_a_job_without_declarations_is_unchanged(self) -> None:
+        from mimir.scheduler import load_jobs_from_text
+
+        jobs, rejections = load_jobs_from_text(
+            "- name: reflect\n  prompt_file: r.md\n  cron: 0 6 * * 0\n"
+        )
+        assert rejections == []
+        assert jobs[0].shell_commands is None
+
+
+class TestPollerWiring:
+    def test_manifest_may_declare_shell_commands(self, tmp_path: Path) -> None:
+        from mimir.pollers import _parse_poller_authority
+
+        state = tmp_path / "state" / "pollers" / "demo"
+        state.mkdir(parents=True)
+        principal = _parse_poller_authority(
+            {
+                "profile": "custom",
+                "tier": "code-execution",
+                "capabilities": ["shell_exec", "bash_jobs_list", "bash_job_output"],
+                "scoped_roots": ["state"],
+                "shell_commands": [
+                    {"exec": "gog", "path": "/bin/echo",
+                     "subcommands": [["gmail", "search"]],
+                     "pass_env": ["GOG_ACCOUNT", "GOG_KEYRING_PASSWORD"]},
+                ],
+            },
+            name="demo",
+            persist_dir=state,
+            state_root=tmp_path / "state" / "pollers",
+            manifest_path=tmp_path / "skills" / "demo" / "pollers.json",
+        )
+        assert [d.executable for d in principal.declared_shell_commands] == ["gog"]
+        assert principal.declared_shell_commands[0].pass_env == (
+            "GOG_ACCOUNT", "GOG_KEYRING_PASSWORD",
+        )
+
+    def test_shell_commands_without_shell_exec_is_refused(self, tmp_path: Path) -> None:
+        """The capability gate runs first; grants without it would be inert."""
+        from mimir.pollers import _parse_poller_authority
+
+        state = tmp_path / "state" / "pollers" / "demo"
+        state.mkdir(parents=True)
+        with pytest.raises(ValueError, match="without the shell_exec capability"):
+            _parse_poller_authority(
+                {
+                    "profile": "research",
+                    "tier": "scoped-with-provenance",
+                    "capabilities": ["read_file"],
+                    "scoped_roots": ["state"],
+                    "shell_commands": [
+                        {"exec": "gog", "path": "/bin/echo",
+                         "subcommands": [["gmail", "search"]]},
+                    ],
+                },
+                name="demo",
+                persist_dir=state,
+                state_root=tmp_path / "state" / "pollers",
+                manifest_path=tmp_path / "skills" / "demo" / "pollers.json",
+            )
+
+    def test_existing_manifests_without_the_key_still_register(self, tmp_path: Path) -> None:
+        """shell_commands is optional; the required-key check must not demand it.
+
+        The validator used to compare the authority block against an exact key
+        set. Adding a required key that way would have unregistered every poller
+        already deployed.
+        """
+        from mimir.pollers import _parse_poller_authority
+
+        state = tmp_path / "state" / "pollers" / "demo"
+        state.mkdir(parents=True)
+        principal = _parse_poller_authority(
+            {
+                "profile": "research",
+                "tier": "scoped-with-provenance",
+                "capabilities": ["read_file"],
+                "scoped_roots": ["state"],
+            },
+            name="demo",
+            persist_dir=state,
+            state_root=tmp_path / "state" / "pollers",
+            manifest_path=tmp_path / "skills" / "demo" / "pollers.json",
+        )
+        assert principal.declared_shell_commands == ()
+
+
+class TestReviewFindings:
+    """Regressions for the privilege-escalation findings on PR #1402."""
+
+    def test_executable_inside_a_writable_root_is_refused(self, home: Path) -> None:
+        """Finding 1. The pin is only a pin if the agent cannot replace the file.
+
+        The script rule was applied to ``script`` but not to ``path``, so a CLI
+        declared under an agent-writable location could be rewritten and then run
+        through an otherwise-admitted command shape.
+        """
+        fake = home / "scratch" / "gog"
+        fake.write_text("#!/bin/sh\necho hi\n")
+        fake.chmod(0o755)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(fake), "subcommands": [["gmail", "search"]]}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_executable_symlink_into_a_writable_root_is_refused(self, home: Path) -> None:
+        target = home / "scratch" / "gog"
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+        link = home / "scripts" / "gog"
+        link.symlink_to(target)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(link), "subcommands": [["gmail", "search"]]}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_venv_interpreter_executes_through_declared_link(self, home: Path) -> None:
+        venv_dir = home / "venv"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(venv_dir)
+        interpreter = venv_dir / "bin" / "python3"
+        assert interpreter.is_symlink()
+        script = home / "scripts" / "todo.py"
+        script.write_text("import sys; print(sys.prefix)\n")
+        parsed = parse_declared_shell_commands([{
+            "exec": "python3", "path": str(interpreter), "script": str(script),
+        }], writable_roots=agent_writable_roots(home))
+        argv = access_control._declared_command_execution_argv(
+            ["python3", str(script)], parsed,
+        )
+        assert argv == [str(interpreter), str(script)]
+        assert parsed[0].resolved_path == interpreter.resolve()
+        result = subprocess.run(argv, capture_output=True, text=True, check=True)
+        assert result.stdout.strip() == str(venv_dir)
+
+    def test_link_in_writable_root_cannot_point_outside(self, home: Path) -> None:
+        link = home / "scratch" / "gog"
+        link.symlink_to("/bin/echo")
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands([_gog(path=str(link))],
+                                          writable_roots=agent_writable_roots(home))
+
+    def test_middle_link_in_writable_root_cannot_launder_path(self, home: Path) -> None:
+        middle = home / "scratch" / "middle"
+        middle.symlink_to("/bin/echo")
+        first = home / "scripts" / "gog"
+        first.symlink_to(middle)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands([_gog(path=str(first))],
+                                          writable_roots=agent_writable_roots(home))
+
+    def test_declared_parent_inside_writable_root_cannot_launder_path(self, home: Path) -> None:
+        # The declared executable is not a symlink; its parent leads through one.
+        directory = home / "scratch" / "safe"
+        directory.symlink_to(home / "scripts", target_is_directory=True)
+        executable = home / "scripts" / "gog"
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands([_gog(path=str(directory / "gog"))],
+                                          writable_roots=agent_writable_roots(home))
+
+    @pytest.mark.parametrize("declared_link", [False, True])
+    def test_writable_directory_traversal_is_refused_even_when_left(
+        self, home: Path, declared_link: bool,
+    ) -> None:
+        executable = home / "scripts" / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        traversal = home / "scratch" / ".." / "scripts" / "gog"
+        if declared_link:
+            link = home / "scripts" / "entry"
+            link.symlink_to(traversal)
+            traversal = link
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [_gog(path=str(traversal))],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_missing_writable_component_is_not_normalized_away(self, home: Path) -> None:
+        executable = home / "scripts" / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        link = home / "scripts" / "entry"
+        link.symlink_to(home / "scratch" / "missing" / ".." / ".." / "scripts" / "gog")
+        # Refuse at the writable directory itself, regardless of whether later
+        # components exist. No execution or subsequent mutation is needed.
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [_gog(path=str(link))], writable_roots=agent_writable_roots(home),
+            )
+
+    @pytest.mark.parametrize("declared_link", [False, True])
+    def test_parent_components_follow_resolved_directory_prefix(
+        self, home: Path, declared_link: bool,
+    ) -> None:
+        safe = home / "scripts"
+        (safe / "nested").mkdir()
+        executable = safe / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        directory = home / "directory"
+        directory.symlink_to(safe / "nested", target_is_directory=True)
+        traversal = directory / ".." / "gog"
+        if declared_link:
+            link = home / "entry"
+            link.symlink_to(traversal)
+            traversal = link
+        parsed = parse_declared_shell_commands(
+            [_gog(path=str(traversal))], writable_roots=(),
+        )
+        assert parsed[0].path == traversal
+        assert parsed[0].resolved_path == executable.resolve()
+        assert parsed[0].resolved_path == traversal.resolve()
+
+    @pytest.mark.parametrize("basename", ["sh", "python3.12"])
+    def test_declared_interpreter_basename_requires_script(
+        self, home: Path, basename: str,
+    ) -> None:
+        binary = home / "scripts" / "tool"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        link = home / "scripts" / basename
+        link.symlink_to(binary)
+        with pytest.raises(ValueError, match="only be declared with a pinned"):
+            parse_declared_shell_commands(
+                [_gog(exec="tool", path=str(link))], writable_roots=(),
+            )
+
+    def test_symlink_loop_and_over_40_hops_are_refused(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Detect a missing bound promptly, rather than waiting for pytest's
+        # global timeout to interrupt an infinite resolver loop.
+        readlink = os.readlink
+        calls = 0
+
+        def bounded_readlink(path):
+            nonlocal calls
+            # macOS may also resolve the host /tmp -> /private/tmp prefix.
+            if Path(path).name == "loop" or Path(path).name.startswith("hop"):
+                calls += 1
+                assert calls <= 40, "resolver exceeded its symlink hop budget"
+            return readlink(path)
+
+        monkeypatch.setattr(access_control.os, "readlink", bounded_readlink)
+        link = home / "scripts" / "loop"
+        link.symlink_to(link)
+        with pytest.raises(ValueError, match="symlink loop or exceeds 40 hops"):
+            parse_declared_shell_commands([_gog(path=str(link))], writable_roots=())
+
+        calls = 0
+        target = Path("/bin/echo").resolve()
+        for i in range(41):
+            (home / "scripts" / f"hop{i}").symlink_to(
+                home / "scripts" / f"hop{i + 1}" if i < 40 else target
+            )
+        calls = 0
+        with pytest.raises(ValueError, match="symlink loop or exceeds 40 hops"):
+            parse_declared_shell_commands(
+                [_gog(path=str(home / "scripts" / "hop0"))], writable_roots=(),
+            )
+
+    def test_path_must_be_a_regular_executable_file(self, home: Path) -> None:
+        with pytest.raises(ValueError, match="not a regular file"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(home / "scripts"),
+                  "subcommands": [["gmail", "search"]]}],
+                writable_roots=(),
+            )
+
+    def test_interpreter_cannot_be_hidden_behind_an_exec_alias(self, home: Path) -> None:
+        """Finding 2. Classification follows the resolved binary, not the label.
+
+        ``exec`` and ``path`` need not share a name, so classifying on ``exec``
+        let ``exec: gog`` with ``path: /usr/bin/python3`` present as an ordinary
+        CLI and skip the pinned-script rule entirely.
+        """
+        with pytest.raises(ValueError, match="only be declared with a pinned"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": "/usr/bin/python3",
+                  "subcommands": [["/tmp/whatever.py"]]}],
+                writable_roots=(),
+            )
+
+    def test_scheduler_declaration_does_not_widen_unrelated_authority(self) -> None:
+        """Finding 3. A grant adds the declared argv and nothing else.
+
+        Rebuilding the principal from the heartbeat profile would have handed any
+        job that declared one command the full heartbeat capability set --
+        send_message, fetch_url, and the typed repo/PR mutation tools.
+        """
+        import dataclasses
+
+        from mimir.access_control import get_service_principal
+
+        base = get_service_principal("scheduled_tick")
+        assert base is not None
+        declared = parse_declared_shell_commands(
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            writable_roots=(),
+        )
+        extended = dataclasses.replace(base, declared_shell_commands=declared)
+
+        assert extended.capabilities == base.capabilities
+        assert extended.sink_policies == base.sink_policies
+        assert extended.readable_domains == base.readable_domains
+        assert extended.filesystem_read_roots == base.filesystem_read_roots
+        assert extended.capability_tier == base.capability_tier
+        assert extended.declared_shell_commands != base.declared_shell_commands
+
+    def test_scheduler_yaml_round_trip_preserves_declarations(self) -> None:
+        """Finding 4. Any mutation rewrites the file; unemitted grants vanish."""
+        from mimir.scheduler import load_jobs_from_text
+        import yaml
+
+        text = (
+            "- name: morning-briefing\n"
+            "  prompt_file: morning-briefing.md\n"
+            "  cron: 0 8 * * *\n"
+            "  shell_commands:\n"
+            "    - exec: gog\n"
+            "      path: /bin/echo\n"
+            "      subcommands: [[gmail, search]]\n"
+            "      pass_env: [GOG_ACCOUNT, GOG_KEYRING_PASSWORD]\n"
+        )
+        job = load_jobs_from_text(text)[0][0]
+        round_tripped = load_jobs_from_text(
+            yaml.safe_dump([job.to_yaml_entry()])
+        )[0][0]
+        assert round_tripped.shell_commands == job.shell_commands
+
+    @pytest.mark.parametrize(
+        "profile",
+        ["maintenance", "scheduler_read_only", "upgrade_workspace"],
+    )
+    def test_declarations_are_additive_under_non_review_profiles(self, profile: str) -> None:
+        """Other profiles retain additive grants after the repo-review cutover."""
+        declared = parse_declared_shell_commands(
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            writable_roots=(),
+        )
+        assert parse_service_shell_argv(
+            "gog gmail search x", profile, declared=declared,
+        ) is not None
+
+    def test_ambient_home_does_not_make_scripts_undeclarable(
+        self, home: Path, monkeypatch,
+    ) -> None:
+        """The operator-owned <home>/scripts/ must stay declarable.
+
+        ``_configured_file_write_roots()`` leads with MIMIR_HOME itself, so
+        unioning it whole classified everything under home as agent-writable --
+        including the one location the interpreter rule documents as the place a
+        pinned script should live. The earlier success test missed it because its
+        fixture home differed from the ambient MIMIR_HOME; this one sets them
+        equal, which is the real deployment shape.
+        """
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        roots = agent_writable_roots(home)
+        assert home.resolve() not in roots, "the home sink root is not itself writable"
+        assert (home / "scratch").resolve() in roots, "but its rw folders are"
+
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": "/usr/bin/python3",
+              "script": str(home / "scripts" / "todo.py")}],
+            writable_roots=roots,
+        )
+        assert declared[0].script == (home / "scripts" / "todo.py").resolve()
+
+    def test_symlinked_home_does_not_make_scripts_undeclarable(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        real_home = tmp_path / "real-home"
+        for name in ("scripts", "scratch", "skills", "state"):
+            (real_home / name).mkdir(parents=True)
+        script = real_home / "scripts" / "todo.py"
+        script.write_text("print(1)\n")
+        home = tmp_path / "home"
+        home.symlink_to(real_home, target_is_directory=True)
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+
+        roots = agent_writable_roots(home)
+        assert home.resolve() not in roots, "the resolved home sink root is excluded"
+        assert (home / "scratch").resolve() in roots, "but its rw folders are"
+
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": "/usr/bin/python3",
+              "script": str(home / "scripts" / "todo.py")}],
+            writable_roots=roots,
+        )
+        assert declared[0].script == script.resolve()
+
+    def test_external_rw_roots_count_as_writable(
+        self, home: Path, tmp_path_factory, monkeypatch,
+    ) -> None:
+        """Finding 1b. MIMIR_FILE_TOOL_ROOTS rw routes are part of the surface.
+
+        The root must sit OUTSIDE the home -- an overlapping entry is rejected by
+        config itself, so an in-home directory would not exercise this at all.
+        """
+        external = tmp_path_factory.mktemp("external_repo")
+        binary = external / "gog"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:rw")
+        roots = agent_writable_roots(home)
+        assert external.resolve() in roots, roots
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(binary), "subcommands": [["gmail", "search"]]}],
+                writable_roots=roots,
+            )
+
+
+@pytest.mark.parametrize("raw", [{}, "", 0, False])
+def test_malformed_falsey_scheduler_declaration_is_not_silently_ignored(raw) -> None:
+    """A falsey malformed shape must reach validation, not skip it.
+
+    `Scheduler._fire` branched on truthiness, so `shell_commands: {}` or `: ""`
+    stored fine, skipped validation entirely, and the job fired with no
+    declaration and no error — silent misconfiguration, which is the failure
+    this feature exists to prevent. Found by documenting the contract.
+    """
+    with pytest.raises(ValueError, match="must be a list"):
+        parse_declared_shell_commands(raw, writable_roots=())
+
+
+def test_an_explicit_empty_list_is_valid_and_means_nothing_declared() -> None:
+    """Distinct from malformed: `shell_commands: []` is a legitimate no-op."""
+    assert parse_declared_shell_commands([], writable_roots=()) == ()
+    assert parse_declared_shell_commands(None, writable_roots=()) == ()
+
+
+@pytest.mark.parametrize(("executable", "pin", "arguments"), [
+    ("gog", "ls", ["query"]),
+    ("git", "git", ["push", "origin", "worklink/7:worklink/7"]),
+    ("git-alias", "git", ["push", "origin", "worklink/7:worklink/7"]),
+    ("gh", "gh", ["pr", "view", "7"]),
+    ("forge-alias", "gh", ["pr", "view", "7"]),
+])
+def test_repo_review_declarations_and_binary_aliases_cannot_bypass_cutover(
+    executable: str, pin: str, arguments: list[str], repo_review_state,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.access_control import (
+        CapabilityTier, ToolRegistry, build_trigger_service_principal, create_auth_context,
+    )
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.tools.budget_gate import _request_for_authorized_execution
+    from langchain.agents.middleware import ToolCallRequest
+    from types import SimpleNamespace
+    from dataclasses import replace
+
+    declared = parse_declared_shell_commands([{
+        "exec": executable, "path": str(maintenance_pinned_executables[pin]),
+        "subcommands": [arguments[:1]],
+    }], writable_roots=())
+    command = " ".join([executable, *arguments])
+    # A working grant, not an invalid declaration that would fail everywhere.
+    assert parse_service_shell_argv(command, "maintenance", declared=declared) == [
+        str(maintenance_pinned_executables[pin]), *arguments,
+    ]
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        declared_shell_commands=declared, creation_path="test",
+    )
+    auth = replace(create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels()), repo_review_state=repo_review_state)
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+    )
+    assert not decision.allowed
+    assert "typed repo_* tools" in decision.refusal_detail
+    request = ToolCallRequest(
+        tool_call={"name": "shell_exec", "args": {"command": command}, "id": "cutover", "type": "tool_call"},
+        tool=None, state={}, runtime=SimpleNamespace(context=auth),
+    )
+    bound = _request_for_authorized_execution(request, "shell_exec", auth).tool_call["args"]
+    assert bound["mimir_direct_argv"] == [
+        "/usr/bin/false", "trusted-service shell argv binding failed closed",
+    ]
+    assert "binding_rule=profile_allowlist" in bound["mimir_shell_refusal"]

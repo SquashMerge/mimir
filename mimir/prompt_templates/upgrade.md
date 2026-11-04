@@ -1,0 +1,39 @@
+---
+name: upgrade
+description: Version-triggered reconciliation of bundled prompts/core defaults. Runs when startup opens an upgrade-lane proposal worktree after shipped defaults changed.
+---
+
+# Upgrade defaults reconciliation
+
+Startup opened an upgrade-lane proposal for mimir-agent version `{version}`.
+
+Proposal branch: `{branch}`
+Proposal worktree: `{worktree}`
+Startup action: `{action}`
+Conflict markers present: `{conflicts}`
+
+Your job:
+
+The fixed filesystem operation required by this workflow is:
+
+- `read_file {worktree}/memory/core/30-reflection-policy.md`
+
+Other proposal reads are confined to changed files in the same proposal worktree.
+
+{changed_docs_section}
+
+1. Read the changed files under `{worktree}/memory/core/` and `{worktree}/prompts/`.
+2. Review the staged diff with `proposal_diff(lane='upgrade')`.
+3. If any file contains conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), resolve them deliberately:
+   - preserve local/operator customizations that are still load-bearing;
+   - incorporate shipped-default changes that update policy, workflows, or safety boundaries;
+   - remove the conflict markers before submission.
+4. If the clean merge is already acceptable, do not churn the files just to touch them.
+5. Submit the proposal with `submit_proposal(title, rationale, lane='upgrade')` so the operator gets a PR. Approval is still the merge.
+6. Notify the operator so the PR doesn't sit unreviewed: call `send_message` on the operator alert channel — pass an explicit `channel_id` (this is a non-interactive turn, so a channel-less `send_message` errors) — with the PR URL `submit_proposal` returned and a one-line summary of what you reconciled. If no operator alert channel is configured, skip this step.
+
+Suggested title: `Upgrade mimir defaults to {version}`
+
+Suggested rationale: `Reconciles bundled mimir-agent {version} prompt/core-memory defaults with this home's existing customizations. Approval = merge; live files update only after the proposal PR merges.`
+
+Do not edit live `memory/core/*` or `prompts/*` directly. Work only in the proposal worktree above.

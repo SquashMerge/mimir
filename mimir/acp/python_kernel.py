@@ -1,0 +1,798 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import asyncio
+import builtins
+import json
+import os
+import shutil
+import secrets
+import socket
+import struct
+import sys
+import tempfile
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Coroutine
+from collections.abc import Iterable
+
+from .confinement import prepare_command, ConfinementUnavailable
+from .execution_scope import ScopeApproval, UNCONFINED_WARNING
+
+
+STREAM_LIMIT_BYTES = 65_536
+TEXT_LIMIT_BYTES = 16_384
+IDLE_SECONDS = 1_800
+MAX_KERNELS = 8
+_FRAME_LIMIT_BYTES = 16 * 1024 * 1024
+_FILENAME = "<mimir-hands-python>"
+_REAP_TIMEOUT_SECONDS = 5
+_EXIT_CONFIRMATION_SECONDS = 0.1
+
+
+class PythonKernelUnavailable(RuntimeError):
+    pass
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    retained = encoded[:limit]
+    while retained:
+        try:
+            result = retained.decode("utf-8")
+            break
+        except UnicodeDecodeError as exc:
+            retained = retained[: exc.start]
+    else:
+        result = ""
+    omitted = len(encoded) - len(retained)
+    if omitted:
+        result += f"\n…[truncated {omitted} bytes]"
+    return result
+
+
+def _read_exact(stream: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = stream.recv(size - len(chunks))
+        if not chunk:
+            raise EOFError("kernel control channel closed")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _read_frame(stream: socket.socket) -> dict[str, Any]:
+    length = struct.unpack("!I", _read_exact(stream, 4))[0]
+    if length > _FRAME_LIMIT_BYTES:
+        raise ValueError("kernel control frame is too large")
+    value = json.loads(_read_exact(stream, length))
+    if not isinstance(value, dict):
+        raise ValueError("kernel control frame is not an object")
+    return value
+
+
+def _write_frame(stream: socket.socket, value: dict[str, Any]) -> None:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    if len(payload) > _FRAME_LIMIT_BYTES:
+        raise ValueError("kernel control frame is too large")
+    stream.sendall(struct.pack("!I", len(payload)) + payload)
+
+
+def _execute(code: str, namespace: dict[str, Any]) -> tuple[bool, str, str]:
+    try:
+        tree = ast.parse(code, filename=_FILENAME, mode="exec")
+        value = ""
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            statements = ast.Module(body=tree.body[:-1], type_ignores=tree.type_ignores)
+            if statements.body:
+                exec(compile(statements, _FILENAME, "exec"), namespace, namespace)
+            expression = ast.Expression(tree.body[-1].value)
+            value = repr(eval(compile(expression, _FILENAME, "eval"), namespace, namespace))
+        else:
+            exec(compile(tree, _FILENAME, "exec"), namespace, namespace)
+        return True, _bounded_text(value, TEXT_LIMIT_BYTES), ""
+    except BaseException:
+        exception = traceback.format_exc()
+        return False, "", _bounded_text(exception, TEXT_LIMIT_BYTES)
+
+
+def worker(control_fd: int) -> None:
+    channel = socket.socket(fileno=control_fd)
+    baseline = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(baseline, 1)
+    os.dup2(baseline, 2)
+    os.close(baseline)
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(write_through=True)
+    namespace: dict[str, Any] = {"__name__": "__main__", "__builtins__": builtins}
+    _write_frame(channel, {"ready": True})
+    while True:
+        try:
+            request = _read_frame(channel)
+        except EOFError:
+            return
+        code = request.get("code")
+        stdout_path = request.get("stdout")
+        stderr_path = request.get("stderr")
+        if not all(isinstance(item, str) for item in (code, stdout_path, stderr_path)):
+            raise ValueError("invalid kernel execution request")
+        saved_stdout = os.dup(1)
+        saved_stderr = os.dup(2)
+        try:
+            with open(stdout_path, "ab", buffering=0) as stdout_stream, open(
+                stderr_path, "ab", buffering=0
+            ) as stderr_stream:
+                os.dup2(stdout_stream.fileno(), 1)
+                os.dup2(stderr_stream.fileno(), 2)
+                ok, value, exception = _execute(code, namespace)
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except BaseException:
+                    pass
+        finally:
+            os.dup2(saved_stdout, 1)
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stdout)
+            os.close(saved_stderr)
+        _write_frame(channel, {"ok": ok, "value": value, "exception": exception})
+
+
+@dataclass(slots=True)
+class _Worker:
+    process: asyncio.subprocess.Process
+    pgid: int
+    channel: socket.socket
+    approved_paths: tuple[ScopeApproval, ...] = ()
+    execution_mode: str = "unknown"
+    usable: bool = False
+    signalled: bool = False
+    reaper: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class _Kernel:
+    owner: str | None = None
+    directory: Path | None = None
+    approved_paths: tuple[ScopeApproval, ...] = ()
+    allow_unconfined: bool = False
+    execution_mode: str = "unknown"
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    waiters: int = 0
+    worker: _Worker | None = None
+    last_activity: float = 0.0
+    idle_task: asyncio.Task[None] | None = None
+
+
+class PythonKernelManager:
+    def __init__(self) -> None:
+        self._kernels: dict[str, _Kernel] = {}
+        self._admission = asyncio.Lock()
+        self._processes: dict[asyncio.subprocess.Process, int] = {}
+        self._reapers: set[asyncio.Task[None]] = set()
+        self._directory: Path | None = None
+        self._output_descriptors: dict[Path, int] = {}
+        self._directory_descriptors: dict[Path, int] = {}
+        self._closed = False
+
+    async def execute(
+        self,
+        session_id: str,
+        cwd: str | os.PathLike[str],
+        code: str,
+        timeout: int | float = 60,
+        *, approved_paths: Iterable[ScopeApproval] = (),
+        allow_unconfined: bool = False,
+    ) -> dict[str, Any]:
+        # Warning attribution stays call-local, under the project kernel lock.
+        # A session-id lookup would miss adopted kernels, and a post-call lookup
+        # would lose state after crash/timeout cleanup (or observe a new owner).
+        if self._closed:
+            raise PythonKernelUnavailable("kernel manager is closed")
+        key = str(Path(cwd).resolve())
+        command = code.strip()
+        if command == "%kernels":
+            return self._control_result(json.dumps(self.kernels()))
+        async with self._admission:
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
+            state = self._kernels.get(key)
+            if state is not None and state.owner not in (None, session_id):
+                raise PythonKernelUnavailable(
+                    f"kernel for {key} is owned by session {state.owner}; refused; "
+                    "release it with %kernel release in the owning session"
+                )
+            if command == "%kernel kill":
+                await self.retire(key)
+                return self._control_result("kernel terminated; namespace state lost")
+            if command == "%kernel release":
+                if state is not None:
+                    async with state.lock:
+                        state.owner = None
+                return self._control_result("kernel released")
+            if state is None:
+                if len(self._kernels) >= MAX_KERNELS:
+                    candidates = [
+                        (item.last_activity, path)
+                        for path, item in self._kernels.items()
+                        if item.owner is None
+                        and not item.lock.locked()
+                        and item.waiters == 0
+                    ]
+                    if not candidates:
+                        raise PythonKernelUnavailable(
+                            "kernel capacity reached; all kernels are owned; refused"
+                        )
+                    await self.retire(min(candidates)[1])
+                state = self._kernels.setdefault(key, _Kernel())
+            state.owner = session_id
+            state.waiters += 1
+        try:
+            await state.lock.acquire()
+        except BaseException:
+            state.waiters -= 1
+            raise
+        state.waiters -= 1
+        self._cancel_idle(state)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        stdout_path: Path | None = None
+        stderr_path: Path | None = None
+        kernel_state = "fresh"
+        result: dict[str, Any] | None = None
+        state.execution_mode = "unknown"
+        startup_mode = "unknown"
+        try:
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
+            # Preserve the permission-time recursion bit; never re-stat paths.
+            policy = tuple(sorted(set(approved_paths)))
+            prepared = await asyncio.to_thread(prepare_command, (sys.executable,), cwd=Path(cwd),
+                                       approved_paths=policy,
+                                       allow_unconfined=allow_unconfined)
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
+            startup_mode = prepared.execution_mode
+            state.allow_unconfined = allow_unconfined
+            # Check the actual worker's spawn-time profile on EVERY reuse,
+            # including adoption by a different session after release.
+            if state.worker is not None and (state.worker.approved_paths != policy
+                    or state.worker.execution_mode != prepared.execution_mode):
+                await self._discard(state, state.worker)
+            state.approved_paths = policy
+            if state.directory is None:
+                if self._directory is None:
+                    self._directory = Path(tempfile.mkdtemp(prefix="mimir-python-kernel-"))
+                    self._directory.chmod(0o700)
+                state.directory = Path(tempfile.mkdtemp(dir=self._directory)).resolve()
+                state.directory.chmod(0o700)
+                self._directory_descriptors[state.directory] = os.open(
+                    state.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+            if state.worker is not None:
+                state.execution_mode = state.worker.execution_mode
+                if state.worker.process.returncode is not None:
+                    result = await self._crashed(state, state.worker, None, None)
+                    state.last_activity = loop.time()
+                    return result
+                kernel_state = "reused"
+            else:
+                state.worker = await self._spawn(Path(key), deadline, state)
+            try:
+                stdout_path = self._output_path(state.directory)
+                stderr_path = self._output_path(state.directory)
+            except OSError as exc:
+                await self._discard(state, state.worker)
+                raise PythonKernelUnavailable(str(exc)) from None
+            request = {
+                "code": code,
+                "stdout": str(stdout_path),
+                "stderr": str(stderr_path),
+            }
+            try:
+                await self._send(state.worker.channel, request, deadline)
+                response = await self._response(state.worker, deadline)
+            except TimeoutError:
+                await self._discard(state, state.worker)
+                result = self._timeout_result(timeout, stdout_path, stderr_path)
+                state.last_activity = loop.time()
+                return result
+            except asyncio.CancelledError:
+                await self._discard(state, state.worker)
+                raise
+            except _ProcessExited as exc:
+                result = await self._crashed(
+                    state,
+                    state.worker,
+                    stdout_path,
+                    stderr_path,
+                    returncode=exc.returncode,
+                )
+                state.last_activity = loop.time()
+                return result
+            except EOFError:
+                result = await self._crashed(
+                    state, state.worker, stdout_path, stderr_path
+                )
+                state.last_activity = loop.time()
+                return result
+            except OSError:
+                result = await self._crashed(
+                    state, state.worker, stdout_path, stderr_path
+                )
+                state.last_activity = loop.time()
+                return result
+            except (ValueError, json.JSONDecodeError) as exc:
+                await self._discard(state, state.worker)
+                raise PythonKernelUnavailable(str(exc)) from None
+            if set(response) != {"ok", "value", "exception"}:
+                await self._discard(state, state.worker)
+                raise PythonKernelUnavailable("invalid kernel response")
+            if (
+                type(response["ok"]) is not bool
+                or not isinstance(response["value"], str)
+                or not isinstance(response["exception"], str)
+            ):
+                await self._discard(state, state.worker)
+                raise PythonKernelUnavailable("invalid kernel response")
+            result = {
+                "ok": response["ok"],
+                "stdout": self._bounded_output(stdout_path, STREAM_LIMIT_BYTES),
+                "stderr": self._bounded_output(stderr_path, STREAM_LIMIT_BYTES),
+                "value": response["value"],
+                "exception": response["exception"],
+                "timedOut": False,
+                "kernel": kernel_state,
+            }
+            state.last_activity = loop.time()
+            return result
+        except TimeoutError:
+            if state.worker is not None:
+                await self._discard(state, state.worker)
+            result = self._timeout_result(timeout, stdout_path, stderr_path)
+            state.last_activity = loop.time()
+            return result
+        except (OSError, ConfinementUnavailable, PythonKernelUnavailable) as exc:
+            if state.worker is not None:
+                await self._discard(state, state.worker)
+            # Preserve startup risk warnings without treating an attempted launch
+            # as evidence of execution in structured results.
+            warning_mode = state.execution_mode if state.execution_mode != "unknown" else startup_mode
+            prefix = UNCONFINED_WARNING + " " if warning_mode == "unconfined" else ""
+            raise PythonKernelUnavailable(prefix + str(exc)) from None
+        except asyncio.CancelledError:
+            if state.worker is not None:
+                await self._discard(state, state.worker)
+            raise
+        finally:
+            # Label this call's result before retiring/removing its state; looking
+            # up the project after cleanup loses the mode on crash and timeout.
+            if result is not None:
+                result["executionMode"] = state.execution_mode
+                if state.execution_mode == "unconfined":
+                    result["stderr"] = UNCONFINED_WARNING + "\n" + result["stderr"]
+            try:
+                for path in (stdout_path, stderr_path):
+                    if path is not None:
+                        descriptor = self._output_descriptors.pop(path, None)
+                        try:
+                            if descriptor is not None:
+                                os.close(descriptor)
+                        finally:
+                            try:
+                                os.unlink(path.name, dir_fd=self._directory_descriptors[path.parent])
+                            except OSError:
+                                # Worker-controlled entries may now be directories.
+                                # Never recurse, and never let cleanup retain the lock.
+                                pass
+            finally:
+                state.lock.release()
+                if state.worker is not None and state.waiters == 0:
+                    self._arm_idle(key, state, state.worker)
+                elif state.worker is None and state.waiters == 0:
+                    self._kernels.pop(key, None)
+                    self._close_directory(state)
+
+    @staticmethod
+    def _control_result(value: str) -> dict[str, Any]:
+        return {
+            "ok": True, "stdout": "", "stderr": "", "value": value,
+            "exception": "", "timedOut": False, "kernel": "reused",
+            "executionMode": "unknown",
+        }
+
+    def kernels(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "cwd": key, "owner": state.owner, "pid": state.worker.process.pid,
+                "idle_seconds": max(
+                    0, asyncio.get_running_loop().time() - state.last_activity
+                ),
+            }
+            for key, state in sorted(self._kernels.items())
+            if state.worker is not None
+        ]
+
+    async def release(self, session_id: str) -> None:
+        async with self._admission:
+            for state in tuple(self._kernels.values()):
+                if state.owner == session_id:
+                    async with state.lock:
+                        state.owner = None
+
+    async def retire_owned(self, session_id: str) -> None:
+        async with self._admission:
+            for key, state in tuple(self._kernels.items()):
+                if state.owner == session_id:
+                    await self.retire(key)
+
+    async def retire(self, cwd: str | os.PathLike[str]) -> None:
+        key = str(Path(cwd).resolve())
+        state = self._kernels.get(key)
+        if state is None:
+            return
+        self._cancel_idle(state)
+        async with state.lock:
+            self._cancel_idle(state)
+            if state.worker is not None:
+                await self._discard(state, state.worker)
+        if state.waiters == 0 and self._kernels.get(key) is state:
+            self._kernels.pop(key, None)
+            self._close_directory(state)
+
+    def _close_directory(self, state: _Kernel) -> None:
+        if state.directory is not None:
+            descriptor = self._directory_descriptors.pop(state.directory, None)
+            if descriptor is not None:
+                os.close(descriptor)
+            state.directory = None
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        async with self._admission:
+            await asyncio.gather(*(self.retire(key) for key in tuple(self._kernels)))
+        if self._reapers:
+            reapers = tuple(self._reapers)
+            await asyncio.gather(*reapers)
+            self._reapers.difference_update(reapers)
+        for descriptor in self._directory_descriptors.values():
+            os.close(descriptor)
+        self._directory_descriptors.clear()
+        if self._directory is not None:
+            await asyncio.to_thread(shutil.rmtree, self._directory, True)
+            self._directory = None
+
+    def terminate_owned_children(self) -> None:
+        processes = tuple(self._processes.items())
+        self.kill_owned_process_groups()
+        for process, _ in processes:
+            try:
+                os.waitpid(process.pid, 0)
+            except (ChildProcessError, ProcessLookupError):
+                pass
+            self._processes.pop(process, None)
+
+    def kill_owned_process_groups(self) -> None:
+        processes = tuple(self._processes.items())
+        for process, pgid in processes:
+            try:
+                os.killpg(pgid, 9)
+            except (ProcessLookupError, PermissionError):
+                # A departed group or a group no longer signalable by this uid
+                # must not throw through synchronous signal/atexit cleanup.
+                pass
+
+    async def _spawn(self, cwd: str | os.PathLike[str], deadline: float, state: _Kernel) -> _Worker:
+        parent, child = socket.socketpair()
+        parent.setblocking(False)
+        try:
+            prepared = await asyncio.to_thread(
+                prepare_command,
+                (sys.executable, "-m", "mimir.acp.python_kernel", "--control-fd", str(child.fileno())),
+                cwd=Path(cwd), approved_paths=state.approved_paths,
+                scratch_paths=(state.directory,),
+                allow_unconfined=state.allow_unconfined,
+            )
+            if self._closed:
+                raise PythonKernelUnavailable("kernel manager is closed")
+            process = await self._before_deadline(
+                deadline,
+                asyncio.create_subprocess_exec(
+                    *prepared.argv,
+                    pass_fds=(child.fileno(),),
+                    cwd=cwd,
+                    env=prepared.env,
+                    start_new_session=True,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                ),
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            parent.close()
+            child.close()
+            raise
+        except Exception as exc:
+            parent.close()
+            child.close()
+            raise PythonKernelUnavailable(str(exc)) from None
+        # Record only a confirmed launch, before handshake/cleanup can fail.
+        state.execution_mode = prepared.execution_mode
+        child.close()
+        worker_state = _Worker(
+            process, process.pid, parent,
+            approved_paths=state.approved_paths, execution_mode=prepared.execution_mode,
+        )
+        self._processes[process] = process.pid
+        try:
+            handshake = await self._response(worker_state, deadline, handshake=True)
+            if handshake != {"ready": True}:
+                raise PythonKernelUnavailable("invalid kernel handshake")
+            worker_state.usable = True
+            return worker_state
+        except TimeoutError:
+            await self._terminate(worker_state)
+            raise
+        except _ProcessExited as exc:
+            await self._terminate(worker_state)
+            raise PythonKernelUnavailable(
+                f"kernel process exited with code {exc.returncode}"
+            ) from None
+        except asyncio.CancelledError:
+            await self._terminate(worker_state)
+            raise
+        except Exception as exc:
+            await self._terminate(worker_state)
+            if isinstance(exc, PythonKernelUnavailable):
+                raise
+            raise PythonKernelUnavailable(str(exc)) from None
+
+    async def _response(
+        self, worker_state: _Worker, deadline: float, *, handshake: bool = False
+    ) -> dict[str, Any]:
+        read_task = asyncio.create_task(self._receive(worker_state.channel))
+        exit_task = asyncio.create_task(worker_state.process.wait())
+        try:
+            async with asyncio.timeout_at(deadline):
+                done, _ = await asyncio.wait(
+                    (read_task, exit_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                if read_task in done:
+                    return read_task.result()
+                raise _ProcessExited(exit_task.result())
+        finally:
+            for task in (read_task, exit_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(read_task, exit_task, return_exceptions=True)
+
+    async def _receive(self, channel: socket.socket) -> dict[str, Any]:
+        header = await self._socket_exact(channel, 4)
+        length = struct.unpack("!I", header)[0]
+        if length > _FRAME_LIMIT_BYTES:
+            raise ValueError("kernel control frame is too large")
+        value = json.loads(await self._socket_exact(channel, length))
+        if not isinstance(value, dict):
+            raise ValueError("kernel control frame is not an object")
+        return value
+
+    async def _send(
+        self, channel: socket.socket, value: dict[str, Any], deadline: float
+    ) -> None:
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        if len(payload) > _FRAME_LIMIT_BYTES:
+            raise ValueError("kernel control frame is too large")
+        await self._before_deadline(
+            deadline,
+            asyncio.get_running_loop().sock_sendall(
+                channel, struct.pack("!I", len(payload)) + payload
+            ),
+        )
+
+    async def _socket_exact(self, channel: socket.socket, size: int) -> bytes:
+        chunks = bytearray()
+        loop = asyncio.get_running_loop()
+        while len(chunks) < size:
+            chunk = await loop.sock_recv(channel, size - len(chunks))
+            if not chunk:
+                raise EOFError("kernel control channel closed")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    async def _before_deadline(
+        self, deadline: float, awaitable: Coroutine[Any, Any, Any]
+    ) -> Any:
+        async with asyncio.timeout_at(deadline):
+            return await awaitable
+
+    def _output_path(self, directory: Path) -> Path:
+        name = secrets.token_hex(16)
+        descriptor = os.open(
+            name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=self._directory_descriptors[directory],
+        )
+        path = directory / name
+        self._output_descriptors[path] = descriptor
+        return path
+
+    def _bounded_output(self, path: Path, limit: int) -> str:
+        # The worker can replace directory entries. Never reopen its path in the
+        # unconfined parent: read the inode retained at mkstemp instead.
+        descriptor = self._output_descriptors[path]
+        retained = os.pread(descriptor, limit, 0)
+        total = os.fstat(descriptor).st_size
+        result = retained.decode("utf-8", errors="replace")
+        omitted = total - len(retained)
+        if omitted > 0:
+            result += f"\n…[truncated {omitted} bytes]"
+        return result
+
+    def _timeout_result(
+        self,
+        timeout: int | float,
+        stdout_path: Path | None,
+        stderr_path: Path | None,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "stdout": self._bounded_output(stdout_path, STREAM_LIMIT_BYTES)
+            if stdout_path is not None
+            else "",
+            "stderr": self._bounded_output(stderr_path, STREAM_LIMIT_BYTES)
+            if stderr_path is not None
+            else "",
+            "value": "",
+            "exception": f"execution timed out after {timeout} seconds; namespace state lost",
+            "timedOut": True,
+            "kernel": "timed_out",
+        }
+
+    async def _crashed(
+        self,
+        state: _Kernel,
+        worker_state: _Worker,
+        stdout_path: Path | None,
+        stderr_path: Path | None,
+        *,
+        returncode: int | None = None,
+    ) -> dict[str, Any]:
+        await self._discard(state, worker_state)
+        if returncode is None:
+            returncode = worker_state.process.returncode
+        if returncode is None:
+            returncode = -9
+        return {
+            "ok": False,
+            "stdout": self._bounded_output(stdout_path, STREAM_LIMIT_BYTES)
+            if stdout_path is not None
+            else "",
+            "stderr": self._bounded_output(stderr_path, STREAM_LIMIT_BYTES)
+            if stderr_path is not None
+            else "",
+            "value": "",
+            "exception": f"kernel process exited with code {returncode}; namespace state lost",
+            "timedOut": False,
+            "kernel": "crashed",
+        }
+
+    async def _discard(self, state: _Kernel, worker_state: _Worker) -> None:
+        if state.worker is worker_state:
+            state.worker = None
+        await self._terminate(worker_state)
+
+    async def _terminate(self, worker_state: _Worker) -> None:
+        worker_state.channel.close()
+        if not worker_state.signalled:
+            try:
+                os.killpg(worker_state.pgid, 9)
+            except ProcessLookupError:
+                pass
+            except PermissionError as denied:
+                if worker_state.process.returncode is None:
+                    # macOS may deny signaling a dying process group before
+                    # asyncio observes the exit. Confirm reaping, rather than
+                    # treating an initial denied signal as successful cleanup.
+                    try:
+                        await asyncio.wait_for(
+                            worker_state.process.wait(), _EXIT_CONFIRMATION_SECONDS
+                        )
+                    except TimeoutError:
+                        raise denied
+                    if worker_state.process.returncode is None:
+                        raise denied
+            # Keep this across cancelled waits: never signal the same worker
+            # twice after a successful signal or a confirmed process exit.
+            worker_state.signalled = True
+        reaper = worker_state.reaper
+        if reaper is None:
+            reaper = asyncio.create_task(self._reap(worker_state.process))
+            worker_state.reaper = reaper
+            self._reapers.add(reaper)
+            reaper.add_done_callback(self._reapers.discard)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(reaper), timeout=_REAP_TIMEOUT_SECONDS
+            )
+        except (ProcessLookupError, TimeoutError):
+            pass
+
+    async def _reap(self, process: asyncio.subprocess.Process) -> None:
+        try:
+            await process.wait()
+        except ProcessLookupError:
+            pass
+        finally:
+            self._processes.pop(process, None)
+
+    def _cancel_idle(self, state: _Kernel) -> None:
+        if state.idle_task is not None:
+            state.idle_task.cancel()
+            state.idle_task = None
+
+    def _arm_idle(
+        self, session_id: str, state: _Kernel, worker_state: _Worker
+    ) -> None:
+        self._cancel_idle(state)
+        state.idle_task = asyncio.create_task(
+            self._retire_when_idle(session_id, state, worker_state)
+        )
+
+    async def _retire_when_idle(
+        self, session_id: str, state: _Kernel, worker_state: _Worker
+    ) -> None:
+        try:
+            deadline = state.last_activity + IDLE_SECONDS
+            await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()))
+            # Admission and retirement must not hand out a state being removed.
+            async with self._admission:
+                if (
+                    self._kernels.get(session_id) is state
+                    and state.worker is worker_state
+                    and state.waiters == 0
+                    and not state.lock.locked()
+                    and asyncio.get_running_loop().time() >= deadline
+                ):
+                    async with state.lock:
+                        await self._discard(state, worker_state)
+                        self._kernels.pop(session_id, None)
+                        self._close_directory(state)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if state.idle_task is asyncio.current_task():
+                state.idle_task = None
+
+
+class _ProcessExited(Exception):
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--control-fd", type=int, required=True)
+    args = parser.parse_args()
+    worker(args.control_fd)
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "IDLE_SECONDS",
+    "PythonKernelManager",
+    "PythonKernelUnavailable",
+    "STREAM_LIMIT_BYTES",
+    "TEXT_LIMIT_BYTES",
+]

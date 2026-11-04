@@ -1,0 +1,24 @@
+import { afterEach } from "vitest";
+import { configure } from "@testing-library/react";
+
+import { useChatStore } from "./chatStore";
+import { useUiState } from "./uiState";
+
+// Async utility timeout is a hang guard for parallel full-suite load, not a latency assertion.
+configure({ asyncUtilTimeout: 5000 });
+
+// chainlink #564: the Zustand UI store (collapsedRegions, detailsPanelOpen,
+// selectedChatMessageId) is a module singleton. Without a reset, collapse
+// state set by one test case (e.g. a fireEvent.click toggling a section)
+// bleeds into the next, making default-collapsed assertions order-dependent —
+// it flaked in CI as "expected 'true' to be 'false'". Snapshot the initial
+// state once and restore it after every test so each case starts deterministic.
+const initialUiState = useUiState.getInitialState();
+// github #567: the chat timeline is now a module store too (persists across tab
+// switches), so reset it between tests the same way or messages leak forward.
+const initialChatState = useChatStore.getInitialState();
+
+afterEach(() => {
+  useUiState.setState(initialUiState, true);
+  useChatStore.setState(initialChatState, true);
+});

@@ -1,0 +1,2318 @@
+from __future__ import annotations
+
+import ast
+import asyncio
+import inspect
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import FrozenInstanceError, fields
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, get_args, get_origin
+
+import pytest
+
+from mimir import runtime
+
+
+class _Notifier:
+    def __init__(self, events: list[tuple[str, Any]] | None = None) -> None:
+        self.events = events
+
+    async def notify_operator(self, **kwargs: Any) -> None:
+        if self.events is not None:
+            self.events.append(("notify_operator", kwargs))
+
+    async def notify_pending_cap_reached(self, **kwargs: Any) -> None:
+        if self.events is not None:
+            self.events.append(("notify_cap", kwargs))
+
+    async def maybe_reply_dm(self, **kwargs: Any) -> None:
+        if self.events is not None:
+            self.events.append(("reply_dm", kwargs))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel,conversation_type", [
+    ("dm-slack-D1", None), ("dm-slack-D1", "multi_user"),
+    ("dm-slack-C1", "multi_user"),
+])
+async def test_runtime_pairing_callback_rechecks_policy_before_writing(
+    tmp_path, monkeypatch, channel, conversation_type,
+):
+    import mimir.identities_populator as pop
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    called = []
+    monkeypatch.setattr(pop, "request_pairing_with_code", lambda *a, **k: called.append((a, k)))
+    deliveries = []
+    def policy(platform, delivery):
+        deliveries.append(delivery)
+        return "ignore"
+
+    resolver = SimpleNamespace(reload=lambda: 0, unknown_sender_mode=policy)
+    core = runtime.CoreServices(identity_resolver=resolver, aliases_loaded=0,
+        saga_db_path=tmp_path / ".mimir" / "saga.db", chat_skill_registry=object())
+    adapters = _adapters(events)
+    bundle = await runtime.create_agent_runtime(_config(tmp_path), core, adapters)
+    try:
+        event = SimpleNamespace(author="slack-U1", author_id="U1", author_display="Unknown",
+            source="slack", channel_id=channel,
+            extra={"channel_conversation_type": conversation_type})
+        decision = SimpleNamespace(canonical_author="slack-U1", denial_reason="unknown_author")
+        await adapters.dispatcher._on_pairing_required(event, decision)
+        assert deliveries == ["channel" if conversation_type == "multi_user" else "dm"]
+        assert called == []
+        assert not (tmp_path / "state" / "identities.yaml").exists()
+    finally:
+        await bundle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,channel,conversation_type", [
+    ("discord", "dm-discord-101", None),
+    ("discord", "discord-201", None),
+    ("slack", "dm-slack-D1", None),
+    ("slack", "slack-C1", None),
+    ("slack", "dm-slack-G1", "multi_user"),
+    ("slack", "dm-slack-C1", "multi_user"),
+    ("slack", "dm-slack-D1", "multi_user"),
+])
+@pytest.mark.parametrize("mode", ["ignore", "decline"])
+async def test_factory_unknown_sender_real_delivery(
+    tmp_path, monkeypatch, platform, channel, conversation_type, mode,
+):
+    """Keep factory callbacks, dispatcher, notifier and bridge delivery real."""
+    from dataclasses import replace
+    from unittest.mock import AsyncMock, Mock
+
+    import yaml
+    from mimir.bridges.discord import DiscordBridge, _ALLOWED_MENTIONS
+    from mimir.bridges.slack import SlackBridge
+    from mimir.channel_registry import ChannelRegistry
+    from mimir.config import Config
+    from mimir.dispatcher import Dispatcher
+    from mimir.identities import IdentityResolver
+    from mimir.models import AgentEvent
+    from mimir.server import _PairingNotifier
+
+    events = []
+    _patch_factory(monkeypatch, events)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    cfg = replace(Config.from_env(), operator_alert_channel="slack-COPS",
+                  access_control_enforced=True,
+                  pairing_operator_digest_delay_seconds=3600,
+                  pairing_dm_auto_reply_interval_seconds=0)
+    refusal = "No @everyone @here <@123> <!channel> <!here> <@U1>"
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    path = state / "identities.yaml"
+    path.write_text(yaml.safe_dump({"people": [], "intake": {
+        "unknown_senders": {platform: {
+            "dm": "pair" if conversation_type == "multi_user" else mode,
+            "channel": mode,
+        }},
+        "decline_text": refusal,
+    }}))
+    original = path.read_bytes()
+    import mimir.event_logger as event_logger
+
+    monkeypatch.setattr(event_logger, "_logger", None)
+    event_logger.init_logger(tmp_path / "logs" / "events.jsonl", "test-intake")
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    dispatcher = Dispatcher(cfg, resolver=resolver)
+    channels = ChannelRegistry()
+    slack = SlackBridge(bot_token="x", app_token="x", enqueue=dispatcher.enqueue)
+    post = AsyncMock(return_value={"ok": True, "ts": "1"})
+    ephemeral = AsyncMock(return_value={"ok": True})
+    slack._app = SimpleNamespace(client=SimpleNamespace(
+        chat_postMessage=post, chat_postEphemeral=ephemeral))
+    discord = DiscordBridge(token="x", enqueue=dispatcher.enqueue)
+    dm_send = AsyncMock(return_value=SimpleNamespace(id=1))
+    public_send = AsyncMock(return_value=SimpleNamespace(id=2))
+    dm = SimpleNamespace(id=101, send=dm_send)
+    user = SimpleNamespace(dm_channel=None, create_dm=AsyncMock(return_value=dm))
+    discord._client = SimpleNamespace(
+        is_closed=lambda: False,
+        get_channel=lambda cid: dm if cid == 101 else SimpleNamespace(send=public_send),
+        get_user=Mock(return_value=user),
+    )
+    channels.register(slack)
+    channels.register(discord)
+    notifier = _PairingNotifier(cfg, channels)
+    core = runtime.CoreServices(identity_resolver=resolver, aliases_loaded=0,
+        saga_db_path=tmp_path / ".mimir" / "saga.db", chat_skill_registry=object())
+    adapters = replace(_adapters(events), dispatcher=dispatcher,
+                       channels=channels, pairing_notifier=notifier)
+    bundle = await runtime.create_agent_runtime(cfg, core, adapters)
+    author_id = "123" if platform == "discord" else "U1"
+    event = AgentEvent(trigger="user_message", source=platform, channel_id=channel,
+        author=f"{platform}-{author_id}", author_id=author_id,
+        author_display="PRIVATE DISPLAY", content="PRIVATE CONTENT",
+        extra={"channel_conversation_type": conversation_type})
+    try:
+        assert not dispatcher.intake_admits(event)
+        assert not await dispatcher.enqueue(event)
+        assert not await dispatcher.enqueue(event)
+        await asyncio.wait_for(notifier._dm_reply_queue.join(), timeout=5)
+        await notifier.flush_operator_alerts()
+        assert dispatcher._queues == {}
+        assert not any(kind == "run" for kind, _ in events)
+        assert path.read_bytes() == original
+        public_send.assert_not_awaited()
+        if mode == "ignore":
+            dm_send.assert_not_awaited()
+            ephemeral.assert_not_awaited()
+            post.assert_awaited_once()
+            payload = post.await_args.kwargs
+            assert payload["channel"] == "COPS"
+            assert payload["text"].startswith("Unknown sender intake:")
+            assert payload["text"].count("ignored unknown sender") == 1
+            assert "PRIVATE" not in payload["text"]
+        elif platform == "discord":
+            post.assert_not_awaited()
+            ephemeral.assert_not_awaited()
+            dm_send.assert_awaited_once()
+            text = dm_send.await_args.args[0]
+            assert "@everyone" not in text and "@here" not in text and "<@123>" not in text
+            mentions = dm_send.await_args.kwargs["allowed_mentions"]
+            assert mentions is _ALLOWED_MENTIONS
+            assert not mentions.everyone and not mentions.roles
+            # Individual mentions are disabled by the fixed-text sanitizer;
+            # the shared bridge policy deliberately allows normal user mentions.
+            assert user.create_dm.await_count == (0 if channel.startswith("dm-") else 1)
+        else:
+            dm_send.assert_not_awaited()
+            if channel == "dm-slack-D1" and conversation_type != "multi_user":
+                post.assert_awaited_once()
+                ephemeral.assert_not_awaited()
+                payload = post.await_args.kwargs
+                assert payload["channel"] == "D1"
+            else:
+                post.assert_not_awaited()
+                ephemeral.assert_awaited_once()
+                payload = ephemeral.await_args.kwargs
+                assert payload["channel"] == channel.removeprefix("dm-slack-").removeprefix("slack-")
+                assert payload["user"] == "U1"
+            assert "<!channel>" not in payload["text"] and "<!here>" not in payload["text"]
+            assert "<@U1>" not in payload["text"]
+            assert "@channel" in payload["text"] and "&lt;@U1>" in payload["text"]
+    finally:
+        await notifier.aclose()
+        await bundle.aclose()
+
+
+@pytest.mark.parametrize("platform,channel", [
+    ("slack", "dm-slack-C1"), ("slack", "dm-slack-D1"),
+    ("discord", "dm-discord-101"),
+])
+def test_private_pairing_dm_multi_user_override(platform, channel):
+    from mimir.identities_populator import is_private_pairing_dm
+
+    assert not is_private_pairing_dm(platform, channel, conversation_type="multi_user")
+    assert is_private_pairing_dm(platform, channel) == (channel != "dm-slack-C1")
+
+
+class _Dispatcher:
+    def __init__(self, events: list[tuple[str, Any]]) -> None:
+        self.events = events
+        self._run_turn = None
+        self._on_channel_idle = None
+        self._on_inject = None
+        self._notice_sender = None
+        self._on_event = None
+        self._on_pairing_required = None
+        self._on_unknown_sender = None
+
+    def set_run_turn(self, value: Any) -> None:
+        self._run_turn = value
+        self.events.append(("run_turn", value))
+
+    def set_on_channel_idle(self, value: Any) -> None:
+        self._on_channel_idle = value
+        self.events.append(("channel_idle", value))
+
+    def set_on_inject(self, value: Any) -> None:
+        self._on_inject = value
+        self.events.append(("inject", value))
+
+    def set_notice_sender(self, value: Any) -> None:
+        self._notice_sender = value
+        self.events.append(("notice_sender", value))
+
+    def set_on_event(self, value: Any) -> None:
+        self._on_event = value
+        self.events.append(("event", value))
+
+    def set_on_pairing_required(self, value: Any) -> None:
+        self._on_pairing_required = value
+        self.events.append(("pairing", value))
+
+    def set_on_unknown_sender(self, value: Any) -> None:
+        self._on_unknown_sender = value
+        self.events.append(("unknown_sender", value))
+
+    def is_channel_busy(self, channel_id: str) -> bool:
+        return channel_id == "busy"
+
+    async def enqueue(self, event: Any) -> bool:
+        self.events.append(("enqueue", event))
+        return True
+
+
+class _Scheduler:
+    def __init__(self, events: list[tuple[str, Any]]) -> None:
+        self.events = events
+        self._started = False
+        self._scheduler = SimpleNamespace(running=False)
+        self._arbiter = None
+
+    def set_arbiter(self, value: Any) -> None:
+        self._arbiter = value
+        self.events.append(("scheduler_arbiter", value))
+
+
+class _Channels:
+    def find(self, channel_id: str) -> None:
+        return None
+
+    async def send(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+def _config(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        home=tmp_path,
+        turns_log=tmp_path / "logs" / "turns.jsonl",
+        max_turns_kept=100,
+        history_global_max=50,
+        history_per_channel_max=25,
+        cross_platform_pull=True,
+        saga_session_idle_minutes=10,
+        saga_session_max_turns=10,
+        commitments_log=tmp_path / ".mimir" / "commitments.jsonl",
+        operator_alert_channel="",
+        pairing_pending_max=100,
+    )
+
+
+def _core(tmp_path: Path) -> runtime.CoreServices:
+    resolver = SimpleNamespace(
+        reload=lambda: 0,
+        dm_channel=lambda author, platform: None,
+        unknown_sender_mode=lambda platform, delivery: "pair",
+    )
+    return runtime.CoreServices(
+        identity_resolver=resolver,
+        aliases_loaded=0,
+        saga_db_path=tmp_path / ".mimir" / "saga.db",
+        chat_skill_registry=object(),
+    )
+
+
+def _adapters(events: list[tuple[str, Any]]) -> runtime.RuntimeAdapters:
+    def spawn(coroutine: Any, name: str) -> asyncio.Task[Any]:
+        return asyncio.create_task(coroutine, name=name)
+
+    return runtime.RuntimeAdapters(
+        dispatcher=_Dispatcher(events),
+        scheduler=_Scheduler(events),
+        channels=_Channels(),
+        pairing_notifier=_Notifier(),
+        spawn_background_task=spawn,
+    )
+
+
+def _patch_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[tuple[str, Any]],
+    *,
+    failing_closers: frozenset[str] = frozenset(),
+) -> None:
+    import mimir.agent
+    import mimir.commitments
+    import mimir.history
+    import mimir.index
+    import mimir.saga_client
+    import mimir.search
+    import mimir.session_manager
+    import mimir.tools
+    import mimir.turn_event_bus
+    import mimir.turn_logger
+
+    class TurnLogger:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            events.append(("construct", "turn_logger"))
+
+    class MessageBuffer:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            events.append(("construct", "message_buffer"))
+
+        def replay(self) -> int:
+            events.append(("call", "replay"))
+            return 7
+
+        def evict_channel(self, channel_id: str) -> bool:
+            return True
+
+    class IndexGenerator:
+        def __init__(self, home: Path) -> None:
+            events.append(("construct", "indexes"))
+
+        def mark_dirty(self, target: str) -> None:
+            events.append(("mark_dirty", target))
+
+    class SagaClient:
+        async def close(self) -> None:
+            events.append(("close", "saga"))
+            if "saga" in failing_closers:
+                raise ValueError("saga cleanup failed")
+
+    def make_saga_client(*, db_path: Path) -> SagaClient:
+        events.append(("construct", ("saga", db_path)))
+        return SagaClient()
+
+    class Indexer:
+        def __init__(self, home: Path) -> None:
+            events.append(("construct", "indexer"))
+
+        async def stop(self) -> None:
+            events.append(("close", "indexer"))
+            if "indexer" in failing_closers:
+                raise RuntimeError("indexer cleanup failed")
+
+    class SessionManager:
+        def __init__(self, **kwargs: Any) -> None:
+            self.on_idle = None
+            self.is_busy = None
+            events.append(("construct", "sessions"))
+
+        def set_on_idle(self, value: Any) -> None:
+            self.on_idle = value
+            events.append(("session_idle", value))
+
+        def set_is_busy(self, value: Any) -> None:
+            self.is_busy = value
+            events.append(("session_busy", value))
+
+        async def shutdown(self) -> None:
+            events.append(("close", "sessions"))
+            if "sessions" in failing_closers:
+                raise OSError("sessions cleanup failed")
+
+    class CommitmentsStore:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            events.append(("construct", "commitments"))
+
+        def migrate_ownership(self) -> int:
+            events.append(("call", "migrate_ownership"))
+            return 3
+
+    class TurnEventBus:
+        def __init__(self) -> None:
+            events.append(("construct", "turn_event_bus"))
+
+    class Agent:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            self._arbiter = object()
+            self._shell_jobs = object()
+            self._handle_shell_job_complete = lambda job: None
+            self._memory_client = object()
+            mimir.tools.set_memory_client(self._memory_client)
+            kwargs["scheduler"].set_arbiter(self._arbiter)
+            events.append(("construct", "agent"))
+
+        async def run_turn(self, event: Any) -> None:
+            events.append(("run", event))
+
+        async def on_message_injected(self, event: Any) -> None:
+            events.append(("injected", event))
+
+    monkeypatch.setattr(mimir.turn_logger, "TurnLogger", TurnLogger)
+    monkeypatch.setattr(mimir.history, "MessageBuffer", MessageBuffer)
+    monkeypatch.setattr(mimir.index, "IndexGenerator", IndexGenerator)
+    monkeypatch.setattr(mimir.saga_client, "make_saga_client", make_saga_client)
+    monkeypatch.setattr(mimir.search, "Indexer", Indexer)
+    monkeypatch.setattr(mimir.session_manager, "SessionManager", SessionManager)
+    monkeypatch.setattr(mimir.commitments, "CommitmentsStore", CommitmentsStore)
+    monkeypatch.setattr(mimir.turn_event_bus, "TurnEventBus", TurnEventBus)
+    monkeypatch.setattr(mimir.agent, "Agent", Agent)
+    monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: events.append(("tools", kwargs)))
+
+
+def _assert_runtime_globals_cleared() -> None:
+    import mimir.history
+    import mimir.tools.extra
+    import mimir.tools.mcp
+    import mimir.tools.memory
+    import mimir.tools.registry
+    import mimir.tools.shell_async
+    import mimir.tools.web
+
+    assert mimir.tools.memory._MEMORY_STATE == {"client": None}
+    assert mimir.tools.extra._SEARCH_STATE == {"indexer": None}
+    assert mimir.tools.extra._INDEX_GEN_STATE == {"generator": None}
+    assert mimir.tools.extra._TURN_STATE == {"turns_log_path": None}
+    assert mimir.tools.registry._STATE == {
+        "channel_registry": None,
+        "identity_resolver": None,
+        "dispatcher": None,
+        "scheduler": None,
+        "commitments_store": None,
+        "spawn_config": None,
+        "arbiter": None,
+    }
+    assert mimir.history.get_global_buffer() is None
+    assert mimir.tools.shell_async._REGISTRY is None
+    assert mimir.tools.shell_async._ON_COMPLETE is None
+    assert mimir.tools.web._home is None
+    assert mimir.tools.mcp.get_mcp_tools() == []
+
+
+def _assert_runtime_callbacks_cleared(
+    adapters: runtime.RuntimeAdapters,
+    sessions: Any | None = None,
+) -> None:
+    assert adapters.dispatcher._run_turn is None
+    assert adapters.dispatcher._on_channel_idle is None
+    assert adapters.dispatcher._on_inject is None
+    assert adapters.dispatcher._notice_sender is None
+    assert adapters.dispatcher._on_event is None
+    assert adapters.dispatcher._on_pairing_required is None
+    if sessions is not None:
+        assert sessions.on_idle is None
+        assert sessions.is_busy is None
+    assert adapters.scheduler._arbiter is None
+
+
+def test_runtime_public_two_phase_api() -> None:
+    assert [field.name for field in fields(runtime.CoreServices)] == [
+        "identity_resolver",
+        "aliases_loaded",
+        "saga_db_path",
+        "chat_skill_registry",
+    ]
+    assert [field.name for field in fields(runtime.RuntimeAdapters)] == [
+        "dispatcher",
+        "scheduler",
+        "channels",
+        "pairing_notifier",
+        "spawn_background_task",
+    ]
+    assert [field.name for field in fields(runtime.AgentRuntimeBundle)] == [
+        "config",
+        "core",
+        "adapters",
+        "agent",
+        "turn_logger",
+        "message_buffer",
+        "indexes",
+        "indexer",
+        "saga_client",
+        "sessions",
+        "commitments_store",
+        "turn_event_bus",
+        "replayed_messages",
+        "migrated_commitments",
+        "_owned_closers",
+        "_runtime_background_tasks",
+        "_close_task",
+        "trace_controller",
+    ]
+    assert runtime.CoreServices.__dataclass_params__.frozen is True
+    assert runtime.RuntimeAdapters.__dataclass_params__.frozen is True
+    assert runtime.AgentRuntimeBundle.__dataclass_params__.frozen is False
+    assert "__dict__" not in runtime.CoreServices.__slots__
+    assert "__dict__" not in runtime.RuntimeAdapters.__slots__
+    assert "__dict__" not in runtime.AgentRuntimeBundle.__slots__
+
+    core = runtime.CoreServices(object(), 2, Path("/tmp/saga.db"), object())
+    with pytest.raises(FrozenInstanceError):
+        core.aliases_loaded = 3
+    adapters = runtime.RuntimeAdapters(object(), object(), object(), _Notifier(), lambda coro, name: None)
+    with pytest.raises(FrozenInstanceError):
+        adapters.dispatcher = object()
+
+    assert runtime.PairingNotifier._is_protocol is True
+    assert str(inspect.signature(runtime.PairingNotifier.notify_operator)) == (
+        "(self, *, canonical: 'str', display: 'str', platform: 'str', "
+        "channel_id: 'str', delivery: 'str') -> 'None'"
+    )
+    assert str(inspect.signature(runtime.PairingNotifier.notify_pending_cap_reached)) == (
+        "(self, *, platform: 'str', channel_id: 'str', delivery: 'str') -> 'None'"
+    )
+    assert str(inspect.signature(runtime.PairingNotifier.maybe_reply_dm)) == (
+        "(self, *, canonical: 'str', dm_channel_id: 'str', code: 'str') -> 'None'"
+    )
+    assert get_origin(runtime.BackgroundTaskSpawner).__name__ == "Callable"
+    spawner_args = get_args(runtime.BackgroundTaskSpawner)
+    assert spawner_args[0][1] is str
+    assert get_origin(spawner_args[0][0]).__name__ == "Coroutine"
+    assert get_origin(spawner_args[1]) is asyncio.Task
+
+    core_signature = inspect.signature(runtime.create_core_services)
+    assert list(core_signature.parameters) == ["config"]
+    assert core_signature.parameters["config"].annotation == "Config"
+    assert core_signature.return_annotation == "CoreServices"
+    factory_signature = inspect.signature(runtime.create_agent_runtime)
+    assert list(factory_signature.parameters) == ["config", "core", "adapters"]
+    assert [parameter.annotation for parameter in factory_signature.parameters.values()] == [
+        "Config",
+        "CoreServices",
+        "RuntimeAdapters",
+    ]
+    assert factory_signature.return_annotation == "AgentRuntimeBundle"
+    assert inspect.signature(runtime.AgentRuntimeBundle.install_mcp_tools).return_annotation == "None"
+    assert inspect.signature(runtime.AgentRuntimeBundle.aclose).return_annotation == "None"
+    assert runtime.RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS == 10.0
+    source_path = Path(runtime.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imported.update(
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    )
+    assert "aiohttp" not in imported
+    assert "mimir.server" not in imported
+    assert not any(name.endswith(".server") for name in imported)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import mimir.runtime; assert 'aiohttp' not in sys.modules; assert 'mimir.server' not in sys.modules",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_runtime_import_does_not_load_saga() -> None:
+    """Observe the import graph in a fresh process, not pytest's shared cache."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import mimir.runtime; "
+            "assert not any(name == 'mimir.saga' or name.startswith('mimir.saga.') "
+            "for name in sys.modules), 'runtime eagerly imported Saga'",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_core_phase_contains_only_adapter_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.chat_skills
+    import mimir.identities
+
+    calls: list[Any] = []
+
+    class Resolver:
+        def __init__(self, *, home: Path) -> None:
+            calls.append(("resolver", home))
+
+        def reload(self) -> int:
+            calls.append("reload")
+            return 11
+
+    registry = object()
+    previous_saga_config = os.environ.get("SAGA_CONFIG")
+    monkeypatch.setenv("SAGA_CONFIG", previous_saga_config or "temporary")
+    monkeypatch.delenv("SAGA_CONFIG")
+    monkeypatch.setattr(mimir.identities, "IdentityResolver", Resolver)
+    monkeypatch.setattr(
+        mimir.chat_skills.ChatSkillRegistry,
+        "from_config",
+        lambda config: calls.append(("registry", config)) or registry,
+    )
+    config = _config(tmp_path)
+    (tmp_path / "saga.toml").write_text(
+        '[storage]\ndb_path = "data/saga.sqlite"\n', encoding="utf-8"
+    )
+
+    core = runtime.create_core_services(config)
+
+    assert calls == [("resolver", tmp_path), "reload", ("registry", config)]
+    assert core.aliases_loaded == 11
+    assert core.chat_skill_registry is registry
+    assert core.saga_db_path == tmp_path / ".mimir" / "data" / "saga.sqlite"
+    assert "SAGA_CONFIG" not in os.environ
+
+
+def test_core_phase_does_not_construct_runtime_or_entrypoint_collaborators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The synchronous cycle breaker must not assemble any runtime graph."""
+    import mimir.agent
+    import mimir.channel_registry
+    import mimir.chat_skills
+    import mimir.commitments
+    import mimir.dispatcher
+    import mimir.history
+    import mimir.identities
+    import mimir.index
+    import mimir.saga_client
+    import mimir.scheduler
+    import mimir.search
+    import mimir.session_manager
+    import mimir.turn_event_bus
+    import mimir.turn_logger
+    from mimir.saga import _config_io
+
+    class Resolver:
+        def __init__(self, *, home: Path) -> None:
+            self.home = home
+
+        def reload(self) -> int:
+            return 2
+
+    def forbidden(label: str) -> Any:
+        def construct(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError(f"core phase constructed prohibited {label}")
+
+        return construct
+
+    monkeypatch.setattr(mimir.identities, "IdentityResolver", Resolver)
+    monkeypatch.setattr(
+        mimir.chat_skills.ChatSkillRegistry,
+        "from_config",
+        lambda config: "chat-registry",
+    )
+    monkeypatch.setattr(_config_io, "get_config", lambda: lambda *args: "saga.db")
+    for module, attribute in (
+        (mimir.agent, "Agent"),
+        (mimir.channel_registry, "ChannelRegistry"),
+        (mimir.commitments, "CommitmentsStore"),
+        (mimir.dispatcher, "Dispatcher"),
+        (mimir.history, "MessageBuffer"),
+        (mimir.index, "IndexGenerator"),
+        (mimir.saga_client, "make_saga_client"),
+        (mimir.scheduler, "Scheduler"),
+        (mimir.search, "Indexer"),
+        (mimir.session_manager, "SessionManager"),
+        (mimir.turn_event_bus, "TurnEventBus"),
+        (mimir.turn_logger, "TurnLogger"),
+    ):
+        monkeypatch.setattr(module, attribute, forbidden(attribute))
+
+    core = runtime.create_core_services(_config(tmp_path))
+
+    assert core.aliases_loaded == 2
+    assert core.chat_skill_registry == "chat-registry"
+    assert core.saga_db_path == tmp_path / ".mimir" / "saga.db"
+
+
+@pytest.mark.parametrize("db_name", [None, "relative.db", "/elsewhere/absolute.db"])
+def test_core_preserves_saga_config_and_db_path_behavior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    db_name: str | None,
+) -> None:
+    import mimir.chat_skills
+    import mimir.identities
+
+    class Resolver:
+        def __init__(self, *, home: Path) -> None:
+            self.home = home
+
+        def reload(self) -> int:
+            return 0
+
+    monkeypatch.setattr(mimir.identities, "IdentityResolver", Resolver)
+    monkeypatch.setattr(
+        mimir.chat_skills.ChatSkillRegistry,
+        "from_config",
+        lambda config: object(),
+    )
+    config = _config(tmp_path)
+    saga_toml = tmp_path / "saga.toml"
+    saga_toml.write_text(
+        "[storage]\n" + (f'db_path = "{db_name}"\n' if db_name else ""),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    core = runtime.create_core_services(config)
+    expected = Path(db_name or "saga.db")
+    assert core.saga_db_path == tmp_path / ".mimir" / expected
+    assert "SAGA_CONFIG" not in os.environ
+
+
+def test_resolve_saga_config_lazy_wrapper_preserves_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    assert runtime.resolve_saga_config(tmp_path) == (None, "defaults")
+    home_config = tmp_path / "saga.toml"
+    home_config.write_text('[storage]\ndb_path = "home.db"\n')
+    assert runtime.resolve_saga_config(tmp_path) == (home_config, "home")
+    operator_config = tmp_path / "operator.toml"
+    monkeypatch.setenv("SAGA_CONFIG", str(operator_config))
+    assert runtime.resolve_saga_config(tmp_path) == (operator_config, "env")
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_resolve_saga_db_path_lazy_wrapper_forwards_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absolute: bool,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    db_path = tmp_path / "explicit.db" if absolute else Path("nested/explicit.db")
+    expected = db_path if absolute else tmp_path / ".mimir" / db_path
+    assert runtime.resolve_saga_db_path(tmp_path, db_path=db_path) == expected
+    assert not expected.exists()
+    assert not (tmp_path / ".mimir").exists()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_resolve_saga_db_path_is_independent_of_home_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reverse: bool,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    homes = [tmp_path / "a", tmp_path / "b"]
+    names = ["first.db", "second.db"]
+    for home, name in zip(homes, names):
+        home.mkdir()
+        (home / "saga.toml").write_text(f'[storage]\ndb_path = "{name}"\n')
+    cases = list(zip(homes, names))
+    if reverse:
+        cases.reverse()
+    for home, name in cases + cases[::-1]:
+        assert runtime.resolve_saga_db_path(home) == home / ".mimir" / name
+    assert "SAGA_CONFIG" not in os.environ
+
+
+def test_resolve_saga_db_path_operator_config_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "home.db"\n')
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/home.db"
+    operator_config = tmp_path / "operator.toml"
+    operator_config.write_text('[storage]\ndb_path = "operator.db"\n')
+    monkeypatch.setenv("SAGA_CONFIG", str(operator_config))
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/operator.db"
+    assert os.environ["SAGA_CONFIG"] == str(operator_config)
+
+
+def test_resolve_saga_db_path_does_not_use_or_change_cached_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.saga import _config_io
+
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    cached = {"storage": {"db_path": "cached.db"}}
+    monkeypatch.setattr(_config_io, "_config", cached)
+    monkeypatch.setattr(_config_io, "_config_loaded", True)
+    (tmp_path / "saga.toml").write_text('[storage]\ndb_path = "home.db"\n')
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/home.db"
+    assert _config_io.get_config()("storage", "db_path") == "cached.db"
+    assert runtime.resolve_saga_db_path(tmp_path / "no-config") == (
+        tmp_path / "no-config/.mimir/saga.db"
+    )
+
+
+def test_resolve_saga_db_path_invalid_toml_uses_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text("[storage\n")
+    assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/saga.db"
+    assert "Using defaults." in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_runtime_enforces_fresh_adapter_preconditions(tmp_path: Path) -> None:
+    events: list[tuple[str, Any]] = []
+    adapters = _adapters(events)
+    adapters.dispatcher._run_turn = object()
+    with pytest.raises(ValueError, match="run_turn=None"):
+        await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+
+    adapters = _adapters(events)
+    adapters.dispatcher._on_event = object()
+    with pytest.raises(ValueError, match="runtime callbacks"):
+        await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+
+    adapters = _adapters(events)
+    adapters.dispatcher._notice_sender = object()
+    with pytest.raises(ValueError, match="runtime callbacks"):
+        await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+
+    adapters = _adapters(events)
+    adapters.scheduler._started = True
+    with pytest.raises(ValueError, match="must not have been started"):
+        await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+
+    adapters = _adapters(events)
+    adapters.scheduler._scheduler.running = True
+    assert adapters.scheduler._started is False
+    with pytest.raises(ValueError, match="must not have been started"):
+        await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_ledger", [False, True])
+async def test_agent_collaborator_parity_and_final_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_ledger: bool,
+) -> None:
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    adapters = _adapters(events)
+    core = _core(tmp_path)
+
+    metadata = tmp_path / ".mimir/file-integrity.json"
+    if legacy_ledger:
+        metadata.parent.mkdir(exist_ok=True)
+        metadata.write_text("{broken")
+    config = _config(tmp_path)
+    bundle = await runtime.create_agent_runtime(config, core, adapters)
+
+    if legacy_ledger:
+        assert metadata.read_text() == "{broken"
+    else:
+        assert not metadata.exists()
+    assert bundle.replayed_messages == 7
+    assert bundle.migrated_commitments == 3
+    assert bundle.agent.args == (
+        bundle.config,
+        bundle.turn_logger,
+        bundle.message_buffer,
+        bundle.indexes,
+    )
+    assert bundle.agent.kwargs == {
+        "indexer": bundle.indexer,
+        "saga_client": bundle.saga_client,
+        "session_manager": bundle.sessions,
+        "scheduler": adapters.scheduler,
+        "channel_registry": adapters.channels,
+        "dispatcher": adapters.dispatcher,
+        "commitments_store": bundle.commitments_store,
+        "turn_event_bus": bundle.turn_event_bus,
+        "chat_skill_registry": core.chat_skill_registry,
+        "trace_controller": None,
+    }
+    assert [value for kind, value in events if kind == "construct"] == [
+        "turn_logger",
+        "message_buffer",
+        "indexes",
+        ("saga", core.saga_db_path),
+        "indexer",
+        "sessions",
+        "commitments",
+        "turn_event_bus",
+        "agent",
+    ]
+    assert events[-1][0] == "run_turn"
+    assert adapters.dispatcher._run_turn != bundle.agent.run_turn
+
+    await bundle.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_preflight_recovers_after_bounded_transient_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    import mimir.event_logger
+    from mimir_cultivate.forge import (
+        GitHubIdentityFailureKind,
+        GitHubIdentityVerificationError,
+    )
+    from mimir_cultivate import forge as forge_tools
+    from mimir.plugins.manager import load_plugins
+
+    events: list[tuple[str, Any]] = []
+    original_initialize = forge_tools.initialize_github_forge_identity
+    _patch_factory(monkeypatch, events)
+    monkeypatch.setattr(
+        forge_tools, "initialize_github_forge_identity", original_initialize,
+    )
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(forge_tools, "_default_client", None)
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    attempts: list[int] = []
+
+    class Client:
+        def verify_identity(self, declared_login: str) -> str:
+            attempts.append(len(attempts) + 1)
+            if len(attempts) <= 3:
+                raise GitHubIdentityVerificationError(
+                    f"unrelated provider message {len(attempts)}",
+                    declared_login=declared_login,
+                    failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+                )
+            return declared_login
+
+    monkeypatch.setattr(forge_tools, "GitHubForgeClient", Client)
+    now = [0.0]
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
+    logged: list[tuple[str, dict[str, Any]]] = []
+    interleave_degradation_on_recovery = [False]
+    monkeypatch.setattr(
+        mimir.event_logger,
+        "log_event_sync",
+        lambda name, **kwargs: logged.append((name, kwargs)),
+    )
+
+    async def log_event(name: str, **kwargs: Any) -> None:
+        logged.append((name, kwargs))
+        if (
+            name == "github_identity_recovered"
+            and interleave_degradation_on_recovery[0]
+        ):
+            interleave_degradation_on_recovery[0] = False
+            forge_tools._latch_github_identity_degraded(
+                GitHubIdentityVerificationError(
+                    "failure during recovery event write",
+                    declared_login="reviewer",
+                    failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+                )
+            )
+
+    monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
+
+    sent: list[str] = []
+
+    class Channels(_Channels):
+        async def send(self, channel_id: str, text: str, **kwargs: Any) -> None:
+            sent.append(channel_id)
+
+    adapters = _adapters(events)
+    adapters = runtime.RuntimeAdapters(
+        dispatcher=adapters.dispatcher,
+        scheduler=adapters.scheduler,
+        channels=Channels(),
+        pairing_notifier=adapters.pairing_notifier,
+        spawn_background_task=adapters.spawn_background_task,
+    )
+    config = _config(tmp_path)
+    config.plugin_manager = load_plugins(enable="cultivate")
+    config.operator_alert_channel = "ops"
+    bundle = await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
+
+    assert attempts == [1]
+    assert forge_tools.github_identity_recovery_pending() is True
+    assert sent == []
+    await adapters.dispatcher._run_turn(object())
+    assert attempts == [1]
+
+    now[0] = 60.0
+    await adapters.dispatcher._run_turn(object())
+    assert attempts == [1, 2]
+    assert sent == []
+    now[0] = 120.0
+    await adapters.dispatcher._run_turn(object())
+    await asyncio.sleep(0)
+    assert attempts == [1, 2, 3]
+    assert sent == ["ops"]
+
+    now[0] = 180.0
+    await adapters.dispatcher._run_turn(object())
+
+    assert attempts == [1, 2, 3, 4]
+    assert forge_tools.github_identity_is_degraded() is False
+    assert isinstance(forge_tools._default_client, Client)
+
+    for failure in range(3):
+        forge_tools._latch_github_identity_degraded(
+            GitHubIdentityVerificationError(
+                f"second outage {failure + 1}",
+                declared_login="reviewer",
+                failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+            )
+        )
+    await asyncio.sleep(0)
+
+    assert [name for name, _ in logged].count("github_identity_degraded") == 2
+    assert sent == ["ops", "ops"]
+
+    now[0] = 240.0
+    interleave_degradation_on_recovery[0] = True
+    await adapters.dispatcher._run_turn(object())
+
+    assert attempts == [1, 2, 3, 4, 5]
+    assert forge_tools.github_identity_is_degraded() is True
+    recovery_events = [
+        details for name, details in logged if name == "github_identity_recovered"
+    ]
+    assert recovery_events == [{"attempts": 3}, {"attempts": 3}]
+
+    degraded_events = [name for name, _ in logged].count("github_identity_degraded")
+    forge_tools._latch_github_identity_degraded(
+        GitHubIdentityVerificationError(
+            "another failure after interleaved degradation",
+            declared_login="reviewer",
+            failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+        )
+    )
+    assert [name for name, _ in logged].count("github_identity_degraded") == degraded_events
+    await bundle.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_preflight_never_retries_permanent_identity_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    import mimir.event_logger
+    from mimir_cultivate.forge import GitHubIdentityVerificationError
+    from mimir_cultivate import forge as forge_tools
+    from mimir.plugins.manager import load_plugins
+
+    events: list[tuple[str, Any]] = []
+    original_initialize = forge_tools.initialize_github_forge_identity
+    _patch_factory(monkeypatch, events)
+    monkeypatch.setattr(
+        forge_tools, "initialize_github_forge_identity", original_initialize,
+    )
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    attempts: list[str] = []
+
+    class Client:
+        def verify_identity(self, declared_login: str) -> str:
+            attempts.append(declared_login)
+            raise GitHubIdentityVerificationError(
+                "changed mismatch wording",
+                declared_login=declared_login,
+                authenticated_login="other-bot",
+            )
+
+    monkeypatch.setattr(forge_tools, "GitHubForgeClient", Client)
+    monkeypatch.setattr(mimir.event_logger, "log_event_sync", lambda *a, **kw: None)
+    config = _config(tmp_path)
+    config.plugin_manager = load_plugins(enable="cultivate")
+    config.coding_enabled = True
+    bundle = await runtime.create_agent_runtime(
+        config, _core(tmp_path), _adapters(events),
+    )
+
+    await bundle.adapters.dispatcher._run_turn(object())
+    await bundle.adapters.dispatcher._run_turn(object())
+
+    assert attempts == ["reviewer"]
+    assert forge_tools.github_identity_is_degraded() is True
+    assert forge_tools.github_identity_recovery_pending() is False
+    assert any(
+        kind == "tools" and options.get("policy") is config.plugin_manager.policy
+        for kind, options in events if isinstance(options, dict)
+    )
+    await bundle.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_registers_closers_as_resources_are_constructed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.search
+    import mimir.session_manager
+
+    for failure_point, expected_closes in (
+        ("indexer", ["saga"]),
+        ("sessions", ["indexer", "saga"]),
+    ):
+        events: list[tuple[str, Any]] = []
+        with monkeypatch.context() as isolated:
+            _patch_factory(isolated, events)
+            original = LookupError(f"{failure_point} construction failed")
+            if failure_point == "indexer":
+                class FailingIndexer:
+                    def __init__(self, home: Path) -> None:
+                        raise original
+
+                isolated.setattr(mimir.search, "Indexer", FailingIndexer)
+            elif failure_point == "sessions":
+                class FailingSessions:
+                    def __init__(self, **kwargs: Any) -> None:
+                        raise original
+
+                isolated.setattr(mimir.session_manager, "SessionManager", FailingSessions)
+            with pytest.raises(LookupError) as caught:
+                await runtime.create_agent_runtime(
+                    _config(tmp_path),
+                    _core(tmp_path),
+                    _adapters(events),
+                )
+
+            assert caught.value is original
+            assert [value for kind, value in events if kind == "close"] == expected_closes
+            _assert_runtime_globals_cleared()
+
+
+@pytest.mark.asyncio
+async def test_runtime_installs_notice_sender_from_adapters_and_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    import mimir.tools
+    from mimir.bridges.base import SendResult
+    from mimir.config import Config
+    from mimir.dispatcher import Dispatcher
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    deliveries = []
+
+    class Channels(_Channels):
+        async def send(self, channel_id, text, *, final=True):
+            deliveries.append((channel_id, text, final))
+            return SendResult(sent=True)
+
+    dispatcher = Dispatcher(replace(Config.from_env(), home=tmp_path))
+    adapters = replace(_adapters(events), dispatcher=dispatcher, channels=Channels())
+    bundle = await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+    try:
+        assert dispatcher._notice_sender is not None
+        # Tool lifecycle changes must not disconnect runtime-owned notices.
+        mimir.tools.set_channel_registry(None)
+        await dispatcher._send_approval_notice("slack-C1", "no pending request mp-aaaa")
+        assert deliveries == [("slack-C1", "no pending request mp-aaaa", False)]
+    finally:
+        await bundle.aclose()
+    assert dispatcher._notice_sender is None
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_and_session_callback_parity_and_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control
+    import mimir.event_logger
+    import mimir.identities_populator
+    import mimir.models
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+
+    class Resolver:
+        def __init__(self) -> None:
+            self.reload_count = 0
+
+        def reload(self) -> int:
+            self.reload_count += 1
+            return self.reload_count
+
+        def dm_channel(self, author: str, platform: str) -> None:
+            return None
+
+        def unknown_sender_mode(self, platform: str, delivery: str) -> str:
+            return "pair"
+
+    class Bridge:
+        async def resolve_dm_channel(self, author_id: str) -> str:
+            events.append(("resolve_dm", author_id))
+            return "D-captured"
+
+    class Channels(_Channels):
+        def find(self, channel_id: str) -> Bridge:
+            events.append(("find", channel_id))
+            return Bridge()
+
+    async def direct_to_thread(function: Any, *args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+
+    async def log_event(name: str, **kwargs: Any) -> None:
+        events.append(("log_event", (name, kwargs)))
+
+    def capture(*args: Any, **kwargs: Any) -> bool:
+        events.append(("capture_dm", (args, kwargs)))
+        return True
+
+    def request(*args: Any, **kwargs: Any) -> tuple[str, str]:
+        events.append(("request_pairing", (args, kwargs)))
+        return "changed", "ABCDEFGH"
+
+    monkeypatch.setattr(runtime.asyncio, "to_thread", direct_to_thread)
+    monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
+    monkeypatch.setattr(mimir.identities_populator, "capture_dm_channel", capture)
+    monkeypatch.setattr(mimir.identities_populator, "request_pairing_with_code", request)
+    monkeypatch.setattr(
+        mimir.access_control,
+        "builtin_trigger_service_principal",
+        lambda name, home: (name, home),
+    )
+    monkeypatch.setattr(
+        mimir.models,
+        "AgentEvent",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    resolver = Resolver()
+    core = runtime.CoreServices(
+        identity_resolver=resolver,
+        aliases_loaded=0,
+        saga_db_path=tmp_path / ".mimir" / "saga.db",
+        chat_skill_registry=object(),
+    )
+    dispatcher = _Dispatcher(events)
+    scheduler = _Scheduler(events)
+    notifier = _Notifier(events)
+    adapters = runtime.RuntimeAdapters(
+        dispatcher=dispatcher,
+        scheduler=scheduler,
+        channels=Channels(),
+        pairing_notifier=notifier,
+        spawn_background_task=lambda coroutine, name: asyncio.create_task(coroutine, name=name),
+    )
+    config = _config(tmp_path)
+    bundle = await runtime.create_agent_runtime(config, core, adapters)
+
+    bindings = [
+        kind
+        for kind, value in events
+        if value is not None
+        and kind in {"channel_idle", "inject", "notice_sender", "event", "pairing", "unknown_sender", "session_idle", "session_busy"}
+    ]
+    assert bindings == [
+        "channel_idle",
+        "inject",
+        "notice_sender",
+        "event",
+        "pairing",
+        "unknown_sender",
+        "session_idle",
+        "session_busy",
+    ]
+    assert events[-1][0] == "run_turn"
+    assert events[-1][1] != bundle.agent.run_turn
+
+    assert dispatcher._on_channel_idle("channel-1") is True
+    injected_event = object()
+    await dispatcher._on_inject(injected_event)
+    assert ("injected", injected_event) in events
+
+    inbound = SimpleNamespace(
+        author="alice",
+        author_id="U123",
+        author_display="Alice",
+        source="slack",
+        channel_id="dm-slack-D123",
+    )
+    await dispatcher._on_event(inbound)
+    assert ("resolve_dm", "U123") in events
+    assert any(kind == "capture_dm" for kind, _ in events)
+    assert resolver.reload_count == 1
+
+    decision = SimpleNamespace(canonical_author="alice-canonical", denial_reason="unknown")
+    await dispatcher._on_pairing_required(inbound, decision)
+    assert any(kind == "request_pairing" for kind, _ in events)
+    assert ("notify_operator", {
+        "canonical": "alice-canonical",
+        "display": "Alice",
+        "platform": "slack",
+        "channel_id": "dm-slack-D123",
+        "delivery": "dm",
+    }) in events
+    assert ("reply_dm", {
+        "canonical": "alice-canonical",
+        "dm_channel_id": "dm-slack-D123",
+        "code": "ABCDEFGH",
+    }) in events
+    assert resolver.reload_count == 2
+
+    session = SimpleNamespace(
+        channel_id="session-channel",
+        saga_session_id="saga-session",
+        source_acl={"operator"},
+        ifc_state=SimpleNamespace(current=lambda: frozenset({"private"})),
+    )
+    config.turns_log.parent.mkdir(parents=True, exist_ok=True)
+    config.turns_log.write_text(json.dumps({
+        "turn_id": "trusted-session-turn",
+        "ts": "2026-08-30T10:00:00+00:00",
+        "saga_session_id": "saga-session",
+        "channel_id": "session-channel",
+        "integrity": "trusted",
+    }))
+    await bundle.sessions.on_idle(session)
+    queued = [value for kind, value in events if kind == "enqueue"][-1]
+    assert queued.trigger == "saga_session_end"
+    assert queued.channel_id == "session-channel"
+    assert queued.extra == {"saga_session_id": "saga-session"}
+    assert queued.source_session_acl == {"operator"}
+    assert queued.ifc_labels is None
+    assert bundle.sessions.is_busy("busy") is True
+    assert bundle.sessions.is_busy("idle") is False
+
+    await bundle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,author,channel", [
+    ("discord", "discord-123", "dm-discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123"),
+])
+async def test_runtime_pairing_multi_user_metadata_overrides_private_channel(
+    tmp_path, monkeypatch, platform, author, channel,
+):
+    from dataclasses import replace
+
+    import yaml
+    import mimir.event_logger
+    import mimir.identities_populator
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    requests = []
+    real_request = mimir.identities_populator.request_pairing_with_code
+
+    def request(*args, **kwargs):
+        requests.append(kwargs.copy())
+        return real_request(*args, **kwargs)
+
+    async def log_event(name, **kwargs):
+        events.append(("log_event", (name, kwargs)))
+
+    monkeypatch.setattr(mimir.identities_populator, "request_pairing_with_code", request)
+    monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
+    adapters = replace(_adapters(events), pairing_notifier=_Notifier(events))
+    bundle = await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+    inbound = SimpleNamespace(
+        author=author, author_id="123", author_display="Unknown",
+        source=platform, channel_id=channel,
+        extra={"channel_conversation_type": "multi_user"},
+    )
+    decision = SimpleNamespace(canonical_author=author, denial_reason="unknown_author")
+    try:
+        # Deliberately use a private-looking ID: the lower-level mint gate
+        # accepts it, so only runtime's metadata backstop can reject it.
+        assert mimir.identities_populator.is_private_pairing_dm(platform, channel)
+        await adapters.dispatcher._on_pairing_required(inbound, decision)
+        assert len(requests) == 1
+        assert requests[0]["is_dm"] is False
+        person = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]
+        assert person["pairing"]["status"] == "pending"
+        assert person["pairing"]["delivery"] == "public_shared_channel"
+        assert "code_hash" not in person["pairing"]
+        assert not any(kind == "reply_dm" for kind, _ in events)
+        assert [value[1]["code_issued"] for kind, value in events
+                if kind == "log_event" and value[0] == "pairing_requested"] == [False]
+
+        # Positive control: the same ID without multi-user metadata can mint
+        # and reach the notifier. No notifier destination check masks runtime.
+        inbound.extra = {}
+        await adapters.dispatcher._on_pairing_required(inbound, decision)
+        assert len(requests) == 2
+        assert requests[1]["is_dm"] is True
+        replies = [value for kind, value in events if kind == "reply_dm"]
+        assert len(replies) == 1
+        assert replies[0]["canonical"] == author
+        assert replies[0]["dm_channel_id"] == channel
+        assert replies[0]["code"]
+    finally:
+        await bundle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,author,channel", [
+    ("discord", "discord-123", "dm-discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123"),
+])
+async def test_runtime_denied_dm_issues_private_code_only(
+    tmp_path, monkeypatch, caplog, platform, author, channel,
+):
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+    from mimir.config import Config
+    from mimir.event_logger import EventLogger
+    from mimir.server import _PairingNotifier
+    import mimir.event_logger
+    import mimir.server
+    import mimir.identities_populator
+    import yaml
+
+    events = []
+    _patch_factory(monkeypatch, events)
+
+    class Clock(datetime):
+        current = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(mimir.identities_populator, "datetime", Clock)
+    sent = []
+
+    class Channels(_Channels):
+        async def send(self, channel_id, text, *, final=True):
+            from mimir.bridges.base import SendResult
+            sent.append((channel_id, text))
+            return SendResult(sent=True)
+
+    channels = Channels()
+    cfg = replace(Config.from_env(), home=tmp_path, operator_alert_channel="dm-slack-OPS",
+                  pairing_operator_digest_delay_seconds=0,
+                  pairing_dm_auto_reply_interval_seconds=0)
+    notifier = _PairingNotifier(cfg, channels)
+    event_path = tmp_path / "logs" / "events.jsonl"
+    logger = EventLogger(event_path, "pairing-test")
+    monkeypatch.setattr(mimir.event_logger, "log_event", logger.log)
+    monkeypatch.setattr(mimir.server, "log_event", logger.log)
+    adapters = replace(_adapters(events), channels=channels, pairing_notifier=notifier)
+    config = _config(tmp_path)
+    config.operator_alert_channel = "dm-slack-OPS"
+    config.pairing_pending_max = 1
+    bundle = await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
+    inbound = SimpleNamespace(author=author, author_id="123", author_display="Lookalike",
+                              source=platform, channel_id=channel)
+    decision = SimpleNamespace(canonical_author=author, denial_reason="unknown_author")
+    try:
+        with caplog.at_level("DEBUG"):
+            await adapters.dispatcher._on_pairing_required(inbound, decision)
+            await notifier._dm_reply_queue.join()
+            dm = [text for destination, text in sent if destination == channel]
+            assert len(dm) == 1
+            code = re.search(r"`([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8})`", dm[0]).group(1)
+            person = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]
+            assert person["pairing"]["status"] == "pending"
+            assert all(field in person["pairing"] for field in ("code_hash", "code_salt", "code_expires_at"))
+            assert code not in (tmp_path / "state" / "identities.yaml").read_text()
+            assert code not in event_path.read_text()
+            assert code not in caplog.text
+            assert code not in "\n".join(text for destination, text in sent if destination == "dm-slack-OPS")
+            await adapters.dispatcher._on_pairing_required(inbound, decision)
+            await notifier._dm_reply_queue.join()
+            assert len([text for destination, text in sent if destination == channel]) == 1
+            first_hash = person["pairing"]["code_hash"]
+            Clock.current += timedelta(minutes=10)
+            await adapters.dispatcher._on_pairing_required(inbound, decision)
+            await notifier._dm_reply_queue.join()
+            dm = [text for destination, text in sent if destination == channel]
+            assert len(dm) == 2
+            second_code = re.search(r"`([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8})`", dm[1]).group(1)
+            assert second_code != code
+            refreshed = (tmp_path / "state" / "identities.yaml").read_text()
+            assert yaml.safe_load(refreshed)["people"][0]["pairing"]["code_hash"] != first_hash
+            assert second_code not in refreshed + event_path.read_text() + caplog.text
+            assert second_code not in "\n".join(text for destination, text in sent if destination == "dm-slack-OPS")
+            public = SimpleNamespace(**{**vars(inbound), "channel_id": f"{platform}-C1"})
+            await adapters.dispatcher._on_pairing_required(public, decision)
+            await notifier._dm_reply_queue.join()
+            assert len([text for destination, text in sent if destination == channel]) == 2
+            capped = SimpleNamespace(**{**vars(inbound), "author": f"{platform}-other"})
+            await adapters.dispatcher._on_pairing_required(capped, decision)
+            assert len(yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"]) == 1
+            assert "pairing_pending_cap_reached" in event_path.read_text()
+            group_channel = "dm-slack-G123" if platform == "slack" else "discord-456"
+            group = SimpleNamespace(**{**vars(inbound), "channel_id": group_channel,
+                                      "extra": {"channel_conversation_type": "multi_user"}})
+            await adapters.dispatcher._on_pairing_required(group, decision)
+            await notifier._dm_reply_queue.join()
+            assert not any(destination == group_channel for destination, _ in sent)
+            group_person = yaml.safe_load(refreshed)["people"][0]
+            # Existing private code is not rotated by shared-channel traffic.
+            assert yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["pairing"]["code_hash"] == group_person["pairing"]["code_hash"]
+    finally:
+        await notifier.aclose()
+        await bundle.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_global_matrix_is_installed_and_reset_in_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.history
+    import mimir.tools
+    import mimir.tools.extra
+    import mimir.tools.mcp
+    import mimir.tools.memory
+    import mimir.tools.registry
+    import mimir.tools.shell_async
+    import mimir.tools.web
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    stale = object()
+    mimir.tools.set_memory_client(stale)
+    mimir.tools.set_indexer(stale)
+    mimir.tools.set_index_generator(stale)
+    mimir.tools.set_turns_log_path(Path("/stale"))
+    mimir.tools.set_channel_registry(stale)
+    mimir.tools.set_identity_resolver(stale)
+    mimir.tools.set_dispatcher(stale)
+    mimir.tools.set_scheduler(stale)
+    mimir.tools.set_arbiter(stale)
+    mimir.history.set_global_buffer(stale)
+    mimir.tools.set_commitments_store(stale)
+    mimir.tools.set_spawn_config(stale)
+    mimir.tools.set_shell_job_registry(stale, on_complete=stale)
+    mimir.tools.web.set_home(Path("/stale"))
+    mimir.tools.set_mcp_tools([stale])
+    events.clear()
+
+    calls: list[tuple[str, Any]] = []
+
+    def wrap(module: Any, attribute: str, label: str) -> None:
+        original = getattr(module, attribute)
+
+        def recorder(value: Any, *args: Any, **kwargs: Any) -> Any:
+            calls.append((label, (value, args, kwargs) if args or kwargs else value))
+            return original(value, *args, **kwargs)
+
+        monkeypatch.setattr(module, attribute, recorder)
+
+    wrap(mimir.tools, "set_memory_client", "memory")
+    wrap(mimir.tools, "set_indexer", "indexer")
+    wrap(mimir.tools, "set_index_generator", "indexes")
+    wrap(mimir.tools, "set_turns_log_path", "turns")
+    wrap(mimir.tools, "set_channel_registry", "channels")
+    wrap(mimir.tools, "set_identity_resolver", "resolver")
+    wrap(mimir.tools, "set_dispatcher", "dispatcher")
+    wrap(mimir.tools, "set_scheduler", "scheduler")
+    wrap(mimir.tools, "set_arbiter", "arbiter")
+    wrap(mimir.history, "set_global_buffer", "buffer")
+    wrap(mimir.tools, "set_commitments_store", "commitments")
+    wrap(mimir.tools, "set_spawn_config", "spawn")
+    wrap(mimir.tools, "set_shell_job_registry", "shell")
+    wrap(mimir.tools.web, "set_home", "web")
+    wrap(mimir.tools, "set_mcp_tools", "mcp")
+
+    reset_labels = [
+        "memory",
+        "indexer",
+        "indexes",
+        "turns",
+        "channels",
+        "resolver",
+        "dispatcher",
+        "scheduler",
+        "arbiter",
+        "buffer",
+        "commitments",
+        "spawn",
+        "shell",
+        "web",
+        "mcp",
+    ]
+    config = _config(tmp_path)
+    adapters = _adapters(events)
+    core = _core(tmp_path)
+    bundle = await runtime.create_agent_runtime(config, core, adapters)
+
+    assert [label for label, _ in calls[:15]] == reset_labels
+    assert all(value is None for _, value in calls[:14])
+    assert calls[14] == ("mcp", [])
+    install_labels = [label for label, _ in calls[15:]]
+    assert install_labels == [
+        "memory",
+        "indexer",
+        "indexes",
+        "turns",
+        "channels",
+        "resolver",
+        "dispatcher",
+        "scheduler",
+        "arbiter",
+        "buffer",
+        "commitments",
+        "spawn",
+        "shell",
+        "web",
+        "mcp",
+    ]
+
+    assert mimir.tools.memory._MEMORY_STATE["client"] is bundle.agent._memory_client
+    assert mimir.tools.extra._SEARCH_STATE["indexer"] is bundle.indexer
+    assert mimir.tools.extra._INDEX_GEN_STATE["generator"] is bundle.indexes
+    assert mimir.tools.extra._TURN_STATE["turns_log_path"] == config.turns_log
+    assert mimir.tools.registry._STATE == {
+        "channel_registry": adapters.channels,
+        "identity_resolver": core.identity_resolver,
+        "dispatcher": adapters.dispatcher,
+        "scheduler": adapters.scheduler,
+        "commitments_store": bundle.commitments_store,
+        "spawn_config": {
+            "default_cwd": config.home,
+        },
+        "arbiter": bundle.agent._arbiter,
+    }
+    assert adapters.scheduler._arbiter is bundle.agent._arbiter
+    assert mimir.history.get_global_buffer() is bundle.message_buffer
+    assert mimir.tools.shell_async._REGISTRY is bundle.agent._shell_jobs
+    assert mimir.tools.shell_async._ON_COMPLETE == bundle.agent._handle_shell_job_complete
+    assert mimir.tools.web._home == config.home
+    assert mimir.tools.mcp.get_mcp_tools() == []
+
+    mcp_tools = [object(), object()]
+    bundle.install_mcp_tools(mcp_tools)
+    assert mimir.tools.mcp.get_mcp_tools() == mcp_tools
+    calls_before_close = len(calls)
+    await bundle.aclose()
+
+    close_calls = calls[calls_before_close:]
+    assert [label for label, _ in close_calls] == reset_labels
+    assert all(value is None for _, value in close_calls[:14])
+    assert close_calls[14] == ("mcp", [])
+    _assert_runtime_globals_cleared()
+
+
+@pytest.mark.asyncio
+async def test_bundle_aclose_is_idempotent_and_reverses_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    adapters = _adapters(events)
+    bundle = await runtime.create_agent_runtime(
+        _config(tmp_path),
+        _core(tmp_path),
+        adapters,
+    )
+
+    await asyncio.gather(bundle.aclose(), bundle.aclose(), bundle.aclose())
+    await bundle.aclose()
+
+    assert [value for kind, value in events if kind == "close"] == [
+        "sessions",
+        "indexer",
+        "saga",
+    ]
+    assert adapters.dispatcher._run_turn is None
+    assert adapters.dispatcher._on_channel_idle is None
+    assert adapters.dispatcher._on_inject is None
+    assert adapters.dispatcher._notice_sender is None
+    assert adapters.dispatcher._on_event is None
+    assert adapters.dispatcher._on_pairing_required is None
+    assert bundle.sessions.on_idle is None
+    assert bundle.sessions.is_busy is None
+    assert adapters.scheduler._arbiter is None
+
+
+@pytest.mark.asyncio
+async def test_bundle_does_not_close_entrypoint_adapters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    lifecycle_calls: list[str] = []
+
+    class Dispatcher(_Dispatcher):
+        async def aclose(self) -> None:
+            lifecycle_calls.append("dispatcher")
+
+    class Scheduler(_Scheduler):
+        async def stop(self) -> None:
+            lifecycle_calls.append("scheduler")
+
+    class Channels(_Channels):
+        async def disconnect_all(self) -> None:
+            lifecycle_calls.append("channels")
+
+    class Notifier(_Notifier):
+        async def aclose(self) -> None:
+            lifecycle_calls.append("notifier")
+
+    adapters = runtime.RuntimeAdapters(
+        dispatcher=Dispatcher(events),
+        scheduler=Scheduler(events),
+        channels=Channels(),
+        pairing_notifier=Notifier(),
+        spawn_background_task=lambda coroutine, name: asyncio.create_task(coroutine, name=name),
+    )
+    bundle = await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+
+    assert bundle.adapters is adapters
+    await bundle.aclose()
+
+    assert lifecycle_calls == []
+    _assert_runtime_callbacks_cleared(adapters, bundle.sessions)
+
+
+@pytest.mark.asyncio
+async def test_bundle_aclose_continues_and_aggregates_cleanup_failures() -> None:
+    events: list[str] = []
+
+    async def saga_close() -> None:
+        events.append("saga")
+        raise ValueError("saga failed")
+
+    async def indexer_close() -> None:
+        events.append("indexer")
+        raise RuntimeError("indexer failed")
+
+    async def sessions_close() -> None:
+        events.append("sessions")
+
+    adapters = _adapters([])
+    sessions = SimpleNamespace(
+        set_on_idle=lambda value: None,
+        set_is_busy=lambda value: None,
+    )
+    bundle = SimpleNamespace(
+        adapters=adapters,
+        sessions=sessions,
+        _runtime_background_tasks=set(),
+        _owned_closers=[
+            ("saga client", saga_close),
+            ("indexer", indexer_close),
+            ("sessions", sessions_close),
+        ],
+    )
+
+    with pytest.raises(ExceptionGroup, match="agent runtime cleanup failed") as caught:
+        await runtime._close_bundle(bundle)
+
+    assert events == ["sessions", "indexer", "saga"]
+    assert [type(exc) for exc in caught.value.exceptions] == [RuntimeError, ValueError]
+
+
+@pytest.mark.asyncio
+async def test_bundle_aclose_times_out_each_resource_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    release = asyncio.Event()
+
+    async def resistant(name: str) -> None:
+        events.append(name)
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    adapters = _adapters([])
+    sessions = SimpleNamespace(
+        set_on_idle=lambda value: None,
+        set_is_busy=lambda value: None,
+    )
+    bundle = SimpleNamespace(
+        adapters=adapters,
+        sessions=sessions,
+        _runtime_background_tasks=set(),
+        _owned_closers=[
+            ("saga client", lambda: resistant("saga")),
+            ("indexer", lambda: resistant("indexer")),
+            ("sessions", lambda: resistant("sessions")),
+        ],
+    )
+    monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        with pytest.raises(ExceptionGroup) as caught:
+            await runtime._close_bundle(bundle)
+        assert events == ["sessions", "indexer", "saga"]
+        assert len(caught.value.exceptions) == 3
+        assert all(isinstance(exc, TimeoutError) for exc in caught.value.exceptions)
+        assert all("0.01 seconds" in str(exc) for exc in caught.value.exceptions)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_aclose_task_timeout_continues_reverse_closers_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.background_tasks
+
+    factory_events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, factory_events)
+    bundle = await runtime.create_agent_runtime(
+        _config(tmp_path),
+        _core(tmp_path),
+        _adapters(factory_events),
+    )
+    events: list[str] = []
+    release = asyncio.Event()
+    task_started = asyncio.Event()
+
+    async def resistant_task() -> None:
+        task_started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            events.append("runtime task cancelled")
+            await release.wait()
+
+    async def resistant_closer(name: str) -> None:
+        events.append(name)
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            events.append(f"{name} cancelled")
+            await release.wait()
+
+    async def failing_indexer() -> None:
+        events.append("indexer")
+        raise RuntimeError("indexer close failed")
+
+    background_task = asyncio.create_task(resistant_task(), name="resistant-runtime-task")
+    bundle._runtime_background_tasks.add(background_task)
+    await task_started.wait()
+    bundle._owned_closers = [
+        ("saga client", lambda: resistant_closer("saga")),
+        ("indexer", failing_indexer),
+        ("sessions", lambda: resistant_closer("sessions")),
+    ]
+    monkeypatch.setattr(
+        mimir.background_tasks,
+        "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        results = await asyncio.gather(
+            bundle.aclose(),
+            bundle.aclose(),
+            bundle.aclose(),
+            return_exceptions=True,
+        )
+        assert all(isinstance(result, ExceptionGroup) for result in results)
+        assert results[0] is results[1] is results[2]
+        group = results[0]
+        assert isinstance(group, ExceptionGroup)
+        with pytest.raises(ExceptionGroup) as later:
+            await bundle.aclose()
+        assert later.value is group
+        assert [type(exc) for exc in group.exceptions] == [
+            TimeoutError,
+            TimeoutError,
+            RuntimeError,
+            TimeoutError,
+        ]
+        assert "resistant-runtime-task" in str(group.exceptions[0])
+        assert "sessions did not close within 0.01 seconds" in str(group.exceptions[1])
+        assert str(group.exceptions[2]) == "indexer close failed"
+        assert "saga client did not close within 0.01 seconds" in str(group.exceptions[3])
+        assert events == [
+            "runtime task cancelled",
+            "sessions",
+            "sessions cancelled",
+            "indexer",
+            "saga",
+            "saga cancelled",
+        ]
+        assert bundle._runtime_background_tasks == set()
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_factory_rollback_closes_registered_resources_and_reraises_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    import mimir.commitments
+
+    original = LookupError("commitments unavailable")
+
+    class FailingCommitmentsStore:
+        def __init__(self, **kwargs: Any) -> None:
+            raise original
+
+    monkeypatch.setattr(mimir.commitments, "CommitmentsStore", FailingCommitmentsStore)
+    adapters = _adapters(events)
+
+    with pytest.raises(LookupError) as caught:
+        await runtime.create_agent_runtime(
+            _config(tmp_path),
+            _core(tmp_path),
+            adapters,
+        )
+
+    assert caught.value is original
+    assert [value for kind, value in events if kind == "close"] == [
+        "sessions",
+        "indexer",
+        "saga",
+    ]
+    assert adapters.dispatcher._run_turn is None
+
+
+@pytest.mark.asyncio
+async def test_factory_rollback_task_timeout_continues_reverse_closers_and_reraises_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    import mimir.background_tasks
+    import mimir.event_logger
+    import mimir.saga_client
+    import mimir.search
+    import mimir.session_manager
+    import mimir.tools
+    from mimir_cultivate import forge as selected_forge
+    from mimir.plugins.manager import load_plugins
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant_runtime_task() -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            events.append(("cancelled", "runtime task"))
+            await release.wait()
+
+    runtime_task = asyncio.create_task(
+        resistant_runtime_task(),
+        name="factory-resistant-task",
+    )
+    await started.wait()
+
+    async def resistant_close(name: str) -> None:
+        events.append(("close", name))
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            events.append(("cancelled", name))
+            await release.wait()
+
+    class SagaClient:
+        async def close(self) -> None:
+            await resistant_close("saga")
+
+    monkeypatch.setattr(
+        mimir.saga_client,
+        "make_saga_client",
+        lambda *, db_path: SagaClient(),
+    )
+    base_indexer = mimir.search.Indexer
+
+    class FailingIndexer(base_indexer):
+        async def stop(self) -> None:
+            events.append(("close", "indexer"))
+            raise RuntimeError("indexer rollback failed")
+
+    monkeypatch.setattr(mimir.search, "Indexer", FailingIndexer)
+    base_sessions = mimir.session_manager.SessionManager
+    sessions_instances: list[Any] = []
+
+    class ResistantSessions(base_sessions):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            sessions_instances.append(self)
+
+        async def shutdown(self) -> None:
+            await resistant_close("sessions")
+
+    monkeypatch.setattr(mimir.session_manager, "SessionManager", ResistantSessions)
+    set_callback = selected_forge.set_github_identity_degraded_callback
+
+    def invoke_current(callback: Any, *, notify_current: bool = False) -> None:
+        set_callback(callback)
+        if callback is not None and notify_current:
+            callback(RuntimeError("forge degraded"))
+
+    monkeypatch.setattr(
+        selected_forge,
+        "set_github_identity_degraded_callback",
+        invoke_current,
+    )
+    monkeypatch.setattr(selected_forge, "initialize_github_forge_identity", lambda: True)
+    monkeypatch.setattr(mimir.event_logger, "log_event_sync", lambda *args, **kwargs: None)
+
+    async def log_event(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
+    original = LookupError("global publication failed")
+    set_scheduler = mimir.tools.set_scheduler
+    failed = False
+
+    def fail_scheduler(value: Any) -> None:
+        nonlocal failed
+        set_scheduler(value)
+        if value is not None and not failed:
+            failed = True
+            raise original
+
+    monkeypatch.setattr(mimir.tools, "set_scheduler", fail_scheduler)
+    monkeypatch.setattr(
+        mimir.background_tasks,
+        "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
+    config = _config(tmp_path)
+    config.plugin_manager = load_plugins(enable="cultivate")
+    config.operator_alert_channel = "ops"
+    adapters = _adapters(events)
+
+    def spawn(coroutine: Any, name: str) -> asyncio.Task[Any]:
+        coroutine.close()
+        runtime_task.set_name(name)
+        return runtime_task
+
+    adapters = runtime.RuntimeAdapters(
+        dispatcher=adapters.dispatcher,
+        scheduler=adapters.scheduler,
+        channels=adapters.channels,
+        pairing_notifier=adapters.pairing_notifier,
+        spawn_background_task=spawn,
+    )
+
+    try:
+        with pytest.raises(LookupError) as caught:
+            await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
+        assert caught.value is original
+        assert [value for kind, value in events if kind == "close"] == [
+            "sessions",
+            "indexer",
+            "saga",
+        ]
+        notes = getattr(caught.value, "__notes__", [])
+        assert len(notes) == 1
+        assert "rollback had 4 cleanup failure(s)" in notes[0]
+        assert "factory-resistant-task" in notes[0] or "github-identity-degraded-alert" in notes[0]
+        assert "sessions did not close within 0.01 seconds" in notes[0]
+        assert "RuntimeError: indexer rollback failed" in notes[0]
+        assert "saga client did not close within 0.01 seconds" in notes[0]
+        _assert_runtime_callbacks_cleared(adapters, sessions_instances[0])
+        _assert_runtime_globals_cleared()
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["post_agent", "dispatcher_callback", "session_callback", "global_install"],
+)
+async def test_intermediate_construction_and_wiring_failures_are_fully_compensated(
+    failure_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.session_manager
+    import mimir.tools
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events, failing_closers=frozenset({"indexer"}))
+    adapters = _adapters(events)
+    sessions_instances: list[Any] = []
+    base_sessions = mimir.session_manager.SessionManager
+    original = LookupError(f"{failure_stage} failed")
+
+    class CapturingSessions(base_sessions):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            sessions_instances.append(self)
+            self.failed_busy_binding = False
+
+        def set_is_busy(self, value: Any) -> None:
+            super().set_is_busy(value)
+            if (
+                failure_stage == "session_callback"
+                and value is not None
+                and not self.failed_busy_binding
+            ):
+                self.failed_busy_binding = True
+                raise original
+
+    monkeypatch.setattr(mimir.session_manager, "SessionManager", CapturingSessions)
+
+    if failure_stage == "post_agent":
+        def fail_bundle(**kwargs: Any) -> None:
+            raise original
+
+        monkeypatch.setattr(runtime, "AgentRuntimeBundle", fail_bundle)
+    elif failure_stage == "dispatcher_callback":
+        set_on_event = adapters.dispatcher.set_on_event
+        failed = False
+
+        def fail_event_binding(value: Any) -> None:
+            nonlocal failed
+            set_on_event(value)
+            if value is not None and not failed:
+                failed = True
+                raise original
+
+        adapters.dispatcher.set_on_event = fail_event_binding
+    elif failure_stage == "global_install":
+        set_scheduler = mimir.tools.set_scheduler
+        failed = False
+
+        def fail_scheduler_install(value: Any) -> None:
+            nonlocal failed
+            set_scheduler(value)
+            if value is not None and not failed:
+                failed = True
+                raise original
+
+        monkeypatch.setattr(mimir.tools, "set_scheduler", fail_scheduler_install)
+
+    with pytest.raises(LookupError) as caught:
+        await runtime.create_agent_runtime(
+            _config(tmp_path),
+            _core(tmp_path),
+            adapters,
+        )
+
+    assert caught.value is original
+    assert [value for kind, value in events if kind == "close"] == [
+        "sessions",
+        "indexer",
+        "saga",
+    ]
+    notes = getattr(caught.value, "__notes__", [])
+    assert len(notes) == 1
+    assert "rollback had 1 cleanup failure(s)" in notes[0]
+    assert "RuntimeError: indexer cleanup failed" in notes[0]
+    _assert_runtime_callbacks_cleared(adapters, sessions_instances[0])
+    _assert_runtime_globals_cleared()
+
+
+@pytest.mark.asyncio
+async def test_non_web_entrypoint_builds_and_closes_real_agent_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:test")
+    from mimir.channel_registry import ChannelRegistry
+    from mimir.config import Config
+    from mimir.dispatcher import Dispatcher
+    from mimir.scheduler import Scheduler
+    from mimir.saga import _config_io
+
+    _config_io.reload_config()
+    config = Config.from_env()
+    core = runtime.create_core_services(config)
+    dispatcher = Dispatcher(config, resolver=core.identity_resolver)
+    scheduler = Scheduler(
+        config.home / "scheduler.yaml",
+        dispatcher.enqueue,
+        home=config.home,
+        scheduler_tz=config.scheduler_tz,
+    )
+    owner_tasks: set[asyncio.Task[Any]] = set()
+
+    def spawn(coroutine: Any, name: str) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coroutine, name=name)
+        owner_tasks.add(task)
+        task.add_done_callback(owner_tasks.discard)
+        return task
+
+    adapters = runtime.RuntimeAdapters(
+        dispatcher=dispatcher,
+        scheduler=scheduler,
+        channels=ChannelRegistry(),
+        pairing_notifier=_Notifier(),
+        spawn_background_task=spawn,
+    )
+
+    server_was_loaded = "mimir.server" in sys.modules
+    bundle = await runtime.create_agent_runtime(config, core, adapters)
+    assert bundle.agent.__class__.__name__ == "Agent"
+    assert dispatcher._run_turn != bundle.agent.run_turn
+    assert ("mimir.server" in sys.modules) is server_was_loaded
+
+    await bundle.aclose()
+    assert dispatcher._run_turn is None
+    assert scheduler._arbiter is None
+    assert not owner_tasks
+
+
+def test_non_web_runtime_construction_does_not_import_server_in_fresh_process() -> None:
+    """Construction, not merely importing ``runtime``, stays web-independent."""
+    script = """
+import asyncio
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+home = Path(tempfile.mkdtemp())
+os.environ[\"MIMIR_HOME\"] = str(home)
+os.environ[\"MIMIR_MODEL_SPEC\"] = \"anthropic:test\"
+os.environ.pop(\"MIMIR_PLUGINS\", None)
+os.environ[\"MIMIR_CODING_ENABLED\"] = \"true\"
+
+from mimir import runtime
+from mimir.channel_registry import ChannelRegistry
+from mimir.config import Config
+from mimir.dispatcher import Dispatcher
+from mimir.saga import _config_io
+from mimir.scheduler import Scheduler
+
+assert \"mimir.server\" not in sys.modules
+_config_io.reload_config()
+config = Config.from_env()
+assert not config.plugin_manager.plugins
+assert not any(name == \"mimir_cultivate\" or name.startswith(\"mimir_cultivate.\") for name in sys.modules)
+core = runtime.create_core_services(config)
+dispatcher = Dispatcher(config, resolver=core.identity_resolver)
+scheduler = Scheduler(
+    config.home / \"scheduler.yaml\",
+    dispatcher.enqueue,
+    home=config.home,
+    scheduler_tz=config.scheduler_tz,
+)
+
+async def main():
+    bundle = await runtime.create_agent_runtime(
+        config,
+        core,
+        runtime.RuntimeAdapters(
+            dispatcher=dispatcher,
+            scheduler=scheduler,
+            channels=ChannelRegistry(),
+            pairing_notifier=object(),
+            spawn_background_task=lambda coroutine, name: asyncio.create_task(coroutine, name=name),
+        ),
+    )
+    assert \"mimir.server\" not in sys.modules
+    await bundle.aclose()
+    assert not any(name == \"mimir_cultivate\" or name.startswith(\"mimir_cultivate.\") for name in sys.modules)
+
+asyncio.run(main())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr

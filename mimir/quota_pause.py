@@ -1,0 +1,720 @@
+"""Mid-turn quota exhaustion handling (SPEC §4.9 / §16 item 18).
+
+Background: the homeostatic arbiter (``mimir/budget.py``) pre-suppresses
+scheduled ticks when plan-window utilization crosses 0.80 (configurable).
+That covers the "we know we'd exhaust" case. It does NOT cover the
+"started at 78%, mid-turn jump to 100%, got a 429 from the upstream
+model" case — a long turn (large spawn, lots of tool calls) can blow
+through the remaining budget before the next pre-check fires.
+
+When that happens, the model call surfaces as a ``RateLimitError`` /
+HTTP 429 / equivalent provider-specific exception. Pre-fix the
+exception just landed in the generic ``except Exception`` in
+``agent.run_turn`` — logged + dropped, no signal to the arbiter, no
+operator-facing event with the reset time.
+
+This module provides the missing piece: a persistent
+``QuotaPauseTracker`` that the agent's exception handler writes to,
+and that the arbiter consults BEFORE its utilization check. While
+paused:
+
+- Scheduled ticks are suppressed (arbiter returns ``fire=False`` with
+  reason ``quota_exhausted_pause``).
+- User-message turns still run — interactive responsiveness wins over
+  quota conservation per §4.9. The model call will fail again with
+  429 if quota is still 100%; the agent surfaces that to the operator
+  via send_message rather than vanishing into a logged exception.
+- A ``quota_recovered`` event fires the first time ``is_paused()`` is
+  consulted past the reset timestamp (lazy expiry — no scheduler
+  wakeup needed).
+
+State persists at ``<home>/.mimir/quota_pause.json`` so a container
+restart mid-pause doesn't lose the pause and immediately retry.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import re
+import threading
+from dataclasses import dataclass
+
+try:
+    import fcntl  # POSIX advisory file locks (Linux/macOS)
+except ImportError:  # pragma: no cover - non-POSIX (Windows): lock degrades to no-op
+    fcntl = None  # type: ignore[assignment]
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from ._atomic import atomic_write_json
+from ._provider_errors import classify_provider_error
+
+log = logging.getLogger(__name__)
+
+_failure_state_lock = threading.Lock()
+_active_persistence_failures: set[tuple[Path, str]] = set()
+
+
+# Fallback pause length when the exception carries no usable reset
+# info. Matches Anthropic's 5-hour rolling window so we don't pause
+# longer than the actual reset cycle.
+_DEFAULT_PAUSE_HOURS = 5
+
+# Maximum window we'll accept from a parsed reset timestamp. Longer
+# values indicate a malformed/garbage header (e.g. "9999-01-01") that
+# would wedge the agent indefinitely. Anthropic's longest real window
+# is 7 days; clamp to that.
+_MAX_RESET_WINDOW_DAYS = 7
+
+# Transient-vs-cap policy (chainlink: quota-pause backoff). A 429 that
+# carries NO parseable reset (no Anthropic header, no Retry-After, no
+# ISO timestamp in the message — e.g. Codex's bare "HTTP 429: Rate limit
+# exceeded") is far more likely a momentary burst/requests-rate limit
+# than a genuine usage-window cap (a real cap almost always ships a
+# reset hint). Treat it as transient: a SHORT backoff that escalates on
+# repeat so a real, header-less cap eventually backs off to the window
+# length instead of being hammered. The escalation decays — if no 429
+# has landed within ``_TRANSIENT_DECAY_SECONDS`` of the previous
+# backoff EXPIRING (end-anchored, chainlink #413 — record-anchored, the
+# longer ladder rungs outlasted the decay window and escalation could
+# never be sustained), the counter resets, so isolated blips hours
+# apart each get the cheap 60s treatment rather than accumulating.
+_TRANSIENT_BASE_SECONDS = 60
+_TRANSIENT_FACTOR = 4
+_TRANSIENT_MAX_SECONDS = _DEFAULT_PAUSE_HOURS * 3600  # cap at one window
+_TRANSIENT_DECAY_SECONDS = 30 * 60
+
+
+def _transient_backoff_seconds(consecutive: int) -> int:
+    """Escalating backoff for header-less 429s: 60s, 4m, 16m, ~1h, …
+    capped at one quota window. ``consecutive`` is the number of
+    back-to-back (un-decayed) header-less 429s seen so far."""
+    n = max(0, consecutive)
+    return int(min(_TRANSIENT_BASE_SECONDS * (_TRANSIENT_FACTOR ** n), _TRANSIENT_MAX_SECONDS))
+
+
+def _clamp_reset_at(reset: datetime, now: datetime) -> datetime:
+    """Return *reset* clamped to ``[now + 1s, now + _MAX_RESET_WINDOW_DAYS]``.
+
+    A parsed reset-at that lies more than ``_MAX_RESET_WINDOW_DAYS``
+    in the future (e.g. from a garbage ``9999-01-01`` header) is
+    silently clamped to the maximum. A value in the past or equal to
+    *now* is clamped up to ``now + 1s`` so we always record a
+    forward-looking pause.
+    """
+    max_reset = now + timedelta(days=_MAX_RESET_WINDOW_DAYS)
+    if reset > max_reset:
+        return max_reset
+    min_reset = now + timedelta(seconds=1)
+    if reset < min_reset:
+        return min_reset
+    return reset
+
+
+@dataclass(frozen=True)
+class PauseStatus:
+    """Result of ``QuotaPauseTracker.is_paused()``."""
+
+    paused: bool
+    reset_at: datetime | None
+    reason: str | None
+
+
+class QuotaPauseTracker:
+    """File-backed pause-state tracker. Single-instance per home."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._reset_at: datetime | None = None
+        self._reason: str | None = None
+        self._provider: str | None = None
+        # When the current pause was recorded. Lets the early-recovery
+        # recheck (scheduler) distinguish quota observations made AFTER
+        # the 429 from stale pre-pause readings. None on state files
+        # written before this field existed — the recheck then falls
+        # back to plain reset-at expiry.
+        self._recorded_at: datetime | None = None
+        # Transient-backoff escalation state (see _transient_backoff_seconds).
+        # ``_last_transient_at`` tracks the last *header-less/transient*
+        # backoff only — authoritative caps deliberately leave it untouched
+        # (cleared) so they don't seed the burst escalation.
+        self._consecutive: int = 0
+        self._last_transient_at: datetime | None = None
+        self.last_load_ok = self._load()
+        self.last_save_ok: bool | None = None
+
+    @property
+    def state_path(self) -> Path:
+        return self._path
+
+    @property
+    def reset_at(self) -> datetime | None:
+        """The recorded reset timestamp, if any, WITHOUT lazy-expiry.
+
+        Unlike :meth:`is_paused`, reading this never clears the pause —
+        it lets the scheduler peek at when to arm a recovery wake on
+        startup without consuming the recovery transition."""
+        return self._reset_at
+
+    @property
+    def provider(self) -> str | None:
+        """The provider label recorded with the current pause, if any."""
+        return self._provider
+
+    @property
+    def recorded_at(self) -> datetime | None:
+        """When the current pause was recorded, if known. None for
+        pauses persisted before this field existed."""
+        return self._recorded_at
+
+    # ── persistence ─────────────────────────────────────────────────
+
+    def _transition_failure(self, event_type: str, exc: BaseException) -> None:
+        key = (self._path, event_type)
+        with _failure_state_lock:
+            if key in _active_persistence_failures:
+                return
+            _active_persistence_failures.add(key)
+        try:
+            from .event_logger import log_event_sync
+            log_event_sync(
+                event_type,
+                path=str(self._path),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:  # noqa: BLE001
+            with _failure_state_lock:
+                _active_persistence_failures.discard(key)
+            log.debug("quota pause failure event could not be emitted", exc_info=True)
+
+    def _clear_failure(self, event_type: str) -> None:
+        with _failure_state_lock:
+            _active_persistence_failures.discard((self._path, event_type))
+
+    def _load(self) -> bool:
+        if not self._path.is_file():
+            # Absent file = no pause on disk. Fully clear in-memory state so a
+            # reload under the record_rate_limit lock of a since-cleared file
+            # (another process called clear()) doesn't keep reporting a stale
+            # authoritative cap via the don't-shorten guard (#692 review).
+            # An unreadable/corrupt file below is left as-is on purpose — a
+            # transient read error shouldn't drop a live pause.
+            self._reset_at = None
+            self._reason = None
+            self._provider = None
+            self._recorded_at = None
+            self._consecutive = 0
+            self._last_transient_at = None
+            self._clear_failure("quota_pause_state_unreadable")
+            self.last_load_ok = True
+            return True
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("quota_pause: state file unreadable: %s", exc)
+            self._transition_failure("quota_pause_state_unreadable", exc)
+            self.last_load_ok = False
+            return False
+        if not isinstance(data, dict):
+            exc = ValueError("state file root is not an object")
+            log.warning("quota_pause: state file unreadable: %s", exc)
+            self._transition_failure("quota_pause_state_unreadable", exc)
+            self.last_load_ok = False
+            return False
+        # Reset the timestamp fields first so a reload (e.g. under the
+        # record_rate_limit lock) fully reflects the file — an absent field
+        # means "cleared", not "keep the stale in-memory value" (#484).
+        self._reset_at = None
+        self._recorded_at = None
+        self._last_transient_at = None
+        raw_reset = data.get("reset_at")
+        if isinstance(raw_reset, str):
+            try:
+                # ``datetime.fromisoformat`` rejects trailing 'Z' on
+                # Python ≤ 3.11; normalize to ``+00:00``.
+                self._reset_at = datetime.fromisoformat(
+                    raw_reset.replace("Z", "+00:00"),
+                )
+            except ValueError:
+                self._reset_at = None
+        self._reason = data.get("reason") or None
+        self._provider = data.get("provider") or None
+        raw_recorded = data.get("recorded_at")
+        if isinstance(raw_recorded, str):
+            try:
+                self._recorded_at = datetime.fromisoformat(
+                    raw_recorded.replace("Z", "+00:00"),
+                )
+            except ValueError:
+                self._recorded_at = None
+        raw_consecutive = data.get("consecutive")
+        self._consecutive = raw_consecutive if isinstance(raw_consecutive, int) and raw_consecutive >= 0 else 0
+        raw_last = data.get("last_transient_at")
+        if isinstance(raw_last, str):
+            try:
+                self._last_transient_at = datetime.fromisoformat(raw_last.replace("Z", "+00:00"))
+            except ValueError:
+                self._last_transient_at = None
+        self._clear_failure("quota_pause_state_unreadable")
+        self.last_load_ok = True
+        return True
+
+    def _save(self) -> bool:
+        payload: dict[str, Any] = {
+            "reset_at": self._reset_at.isoformat() if self._reset_at else None,
+            "reason": self._reason,
+            "provider": self._provider,
+            "recorded_at": self._recorded_at.isoformat() if self._recorded_at else None,
+            "consecutive": self._consecutive,
+            "last_transient_at": self._last_transient_at.isoformat() if self._last_transient_at else None,
+        }
+        # chainlink #239: shared atomic-write helper applies the CR#7
+        # invariant (fsync file + fsync parent dir). Prior shape only
+        # fsynced the file — a crash between rename and writeback could
+        # revert the pause state. The helper raises on failure; we log
+        # + report here because a missed quota_pause.json write self-
+        # heals at the next pause_until call but must not be presented as saved.
+        try:
+            atomic_write_json(self._path, payload)
+        except OSError as exc:
+            log.warning("quota_pause: state write failed: %s", exc)
+            self._transition_failure("quota_state_write_failed", exc)
+            self.last_save_ok = False
+            return False
+        self._clear_failure("quota_state_write_failed")
+        self.last_save_ok = True
+        return True
+
+    # ── public API ──────────────────────────────────────────────────
+
+    def pause_until(
+        self,
+        reset_at: datetime,
+        *,
+        reason: str = "quota_exhausted",
+        provider: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Record that the agent should treat itself as quota-paused
+        until ``reset_at``. Idempotent — overwrites any existing pause
+        (the newest pause wins, since it has the freshest reset info).
+        ``now`` (tests) overrides the ``recorded_at`` stamp.
+
+        Does NOT touch the transient-backoff escalation clock
+        (``_consecutive`` / ``_last_transient_at``) — only
+        :meth:`record_rate_limit`'s header-less branch advances that, so
+        an authoritative cap can't be mistaken for a transient burst."""
+        self._reset_at = reset_at
+        self._reason = reason
+        self._provider = provider
+        self._recorded_at = now or datetime.now(tz=timezone.utc)
+        return self._save()
+
+    @contextlib.contextmanager
+    def _exclusive_lock(self):
+        """Cross-process exclusive lock around the pause-file read-modify-write,
+        so concurrent 429s from parallel turns (each with its own tracker
+        instance/process) can't lost-update an authoritative cap (#484).
+        Best-effort: degrades to no locking where fcntl or the lock file is
+        unavailable rather than failing the 429 handler."""
+        if fcntl is None:
+            yield
+            return
+        lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(lock_path, "w")
+        except OSError:
+            yield
+            return
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
+    def record_rate_limit(
+        self, exc: BaseException, *, now: datetime | None = None,
+    ) -> tuple[datetime, str]:
+        """Classify a 429 and record an appropriate pause. Returns
+        ``(reset_at, reason)``.
+
+        - If the exception carries an authoritative reset (header /
+          Retry-After / ISO timestamp in the message, or a Codex window
+          at cap), pause exactly until then with reason ``quota_exhausted``
+          — and CLEAR the transient escalation clock, because an
+          authoritative cap is not part of a header-less burst chain.
+        - Otherwise (a header-less 429 — e.g. Codex's bare "HTTP 429:
+          Rate limit exceeded") treat it as a likely-transient burst:
+          a short, escalating backoff (reason ``rate_limited_backoff``)
+          that escalates only when the PREVIOUS transient backoff was
+          recent. The escalation decays after ``_TRANSIENT_DECAY_SECONDS``
+          of quiet (or an authoritative pause clearing it) so isolated
+          blips reset to the 60s floor."""
+        now = now or datetime.now(tz=timezone.utc)
+        # Serialize the read-modify-write across processes and reload fresh, so a
+        # header-less 429 can't clobber a live authoritative cap recorded by a
+        # concurrent turn down to the 60s transient floor — the guard below must
+        # test the current on-disk state, not this instance's snapshot (#484).
+        with self._exclusive_lock():
+            self._load()
+            return self._record_rate_limit_locked(exc, now=now)
+
+    def _record_rate_limit_locked(
+        self, exc: BaseException, *, now: datetime,
+    ) -> tuple[datetime, str]:
+        parsed_reset, provider = extract_reset_at(exc)
+        if parsed_reset is not None:
+            # Authoritative cap — clear the transient clock so a later
+            # header-less 429 starts at the 60s floor, not mid-escalation.
+            self._consecutive = 0
+            self._last_transient_at = None
+            self.pause_until(parsed_reset, reason="quota_exhausted", provider=provider, now=now)
+            return parsed_reset, "quota_exhausted"
+
+        # A header-less 429 carries no reset info, so it must NOT shorten or
+        # downgrade an already-active authoritative cap whose real reset is
+        # known and still in the future. While such a cap is unexpired, leave
+        # it intact and report it — the bare 429 is subsumed by the cap (and
+        # doesn't seed transient escalation). Without this, a user-message
+        # turn's 429 during an active cap (user turns run while scheduled ticks
+        # are suppressed) would overwrite the global pause down to the 60s
+        # floor and re-enable S4 work minutes before the cap actually resets.
+        if (
+            self._reset_at is not None
+            and self._reason == "quota_exhausted"
+            and self._reset_at > now
+        ):
+            return self._reset_at, "quota_exhausted"
+
+        # Header-less 429 → transient backoff. Escalate only when this
+        # 429 arrives within the decay window of the previous transient
+        # backoff's END; an authoritative pause (or >30 min of quiet
+        # after the backoff expired) leaves _last_transient_at
+        # None/stale, so this starts fresh at the floor.
+        #
+        # chainlink #413: the stamp is the backoff's END (its reset_at),
+        # NOT the record time. Measured from record time the ladder
+        # self-defeated: scheduled work is fully suppressed during the
+        # pause, so the next header-less 429 necessarily lands AFTER the
+        # backoff expires — and the n=3 backoff (64m) is longer than the
+        # decay window (30m), so `now - record_time > decay` always held
+        # and the escalation reset to the 60s floor every cycle,
+        # hammering a real header-less cap in a 60s/4m/16m/64m loop
+        # forever. End-anchored, a 429 right after expiry (the cap is
+        # still on) escalates toward _TRANSIENT_MAX_SECONDS as the
+        # module docstring always promised; a mid-pause 429 (user turns
+        # still run while paused) yields a negative delta and escalates
+        # too, which is correct — the burst is plainly still on.
+        if (
+            self._last_transient_at is not None
+            and (now - self._last_transient_at).total_seconds() <= _TRANSIENT_DECAY_SECONDS
+        ):
+            consecutive = self._consecutive + 1
+        else:
+            consecutive = 0
+        self._consecutive = consecutive
+        reset_at = now + timedelta(seconds=_transient_backoff_seconds(consecutive))
+        self._last_transient_at = reset_at
+        self.pause_until(reset_at, reason="rate_limited_backoff", provider=provider, now=now)
+        return reset_at, "rate_limited_backoff"
+
+    def _mark_recovered(self) -> bool:
+        """Clear the active pause on lazy-expiry but KEEP the transient
+        escalation state (``_consecutive`` / ``_last_transient_at``), so a
+        real header-less cap that recovers and immediately 429s again keeps
+        escalating instead of resetting to the 60s floor every cycle. The
+        decay in :meth:`record_rate_limit` is what eventually resets it."""
+        previous = (self._reset_at, self._reason, self._provider, self._recorded_at)
+        self._reset_at = None
+        self._reason = None
+        self._provider = None
+        self._recorded_at = None
+        if self._save():
+            return True
+        self._reset_at, self._reason, self._provider, self._recorded_at = previous
+        return False
+
+    def clear_if_current(self, *, recorded_at: datetime) -> bool:
+        """Consume recovery evidence only for the pause it was checked against.
+
+        A newer 429 may land while the scheduler checks provider snapshots. The
+        locked reload and identity check prevent stale evidence clearing it.
+        """
+        with self._exclusive_lock():
+            if not self._load():
+                return False
+            if (
+                self._reset_at is None
+                or recorded_at is None
+                or self._recorded_at != recorded_at
+            ):
+                return False
+            return self._mark_recovered()
+
+    def clear(self) -> bool:
+        """Drop the pause AND the escalation state unconditionally —
+        for tests and explicit resets. (Lazy-expiry uses
+        :meth:`_mark_recovered`, which preserves escalation state.)"""
+        with self._exclusive_lock():
+            self._reset_at = None
+            self._reason = None
+            self._provider = None
+            self._recorded_at = None
+            self._consecutive = 0
+            self._last_transient_at = None
+            try:
+                self._path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("quota_pause: state delete failed: %s", exc)
+                self._transition_failure("quota_state_write_failed", exc)
+                self.last_save_ok = False
+                return False
+            self._clear_failure("quota_state_write_failed")
+            self.last_save_ok = True
+            return True
+
+    def is_paused(self, *, now: datetime | None = None) -> PauseStatus:
+        """Return current pause status. Lazy-expires when ``now`` is
+        past the recorded reset — caller can branch on
+        ``result.paused`` and (when False but reset_at is non-None)
+        emit ``quota_recovered``."""
+        if self._reset_at is None:
+            return PauseStatus(paused=False, reset_at=None, reason=None)
+        when = now or datetime.now(tz=timezone.utc)
+        if when < self._reset_at:
+            return PauseStatus(
+                paused=True, reset_at=self._reset_at, reason=self._reason,
+            )
+        # Lazy-expiry transition. Caller (the arbiter) is responsible for the
+        # ``quota_recovered`` algedonic emit since this is a sync method.
+        #
+        # #489: consume it atomically. The arbiter's _check_quota_pause, the
+        # scheduler recovery recheck, and _fire_quota_recovery each build their
+        # OWN tracker over this same file; without coordination, two could both
+        # observe the transition and emit duplicate quota_recovered (double
+        # catch-up heartbeat). Take the cross-process lock and reload fresh, so
+        # exactly one observer clears-and-signals; the rest see the cleared
+        # state (reset_at=None) and emit nothing. Only the rare expiry read
+        # pays the lock — the fast paths above stay lock-free.
+        with self._exclusive_lock():
+            self._load()
+            if self._reset_at is None:
+                # Another observer already consumed the recovery.
+                return PauseStatus(paused=False, reset_at=None, reason=None)
+            if when < self._reset_at:
+                # A newer pause landed since our snapshot — still paused.
+                return PauseStatus(
+                    paused=True, reset_at=self._reset_at, reason=self._reason,
+                )
+            saved_reset = self._reset_at
+            saved_reason = self._reason
+            if not self._mark_recovered():
+                return PauseStatus(
+                    paused=True, reset_at=saved_reset, reason=saved_reason,
+                )
+            return PauseStatus(
+                paused=False, reset_at=saved_reset, reason=saved_reason,
+            )
+
+
+# ── exception → reset-at extraction ─────────────────────────────────
+
+
+def _parse_retry_after_header(value: str | None) -> int | None:
+    """``Retry-After`` is either a seconds-int or an HTTP-date. We
+    only care about the seconds case in practice (Anthropic sends
+    seconds); HTTP-date support is left as a future addition."""
+    if not value:
+        return None
+    try:
+        secs = int(value.strip())
+        return secs if secs > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+_ANTHROPIC_RESET_HEADERS = (
+    # Newer Anthropic headers (precise reset timestamps).
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-reset",
+    "anthropic-ratelimit-input-tokens-reset",
+    "anthropic-ratelimit-output-tokens-reset",
+)
+
+
+# A Codex 429 surfaces both quota windows (langchain-codex-plus >= 0.0.3).
+# Only trust a window's reset as authoritative when that window is
+# genuinely near its cap — a 429 while utilization is low is far more
+# likely a transient burst limit (→ short escalating backoff), which is
+# exactly the "usage graph wasn't near quota" case. The headers turn the
+# transient-vs-cap guess into a real signal.
+_CODEX_CAP_THRESHOLD = 90.0
+
+
+def _codex_window_reset(rate_limits: Any, now: datetime) -> datetime | None:
+    """Reset datetime of the binding (most-utilized) Codex window when it
+    is at/near its cap, else ``None``.
+
+    Reads the parsed ``CodexRateLimits`` surfaced on a ``CodexResponseError``
+    (``primary`` / ``secondary`` windows, each with ``used_percent`` +
+    ``reset_at`` (unix ts) / ``reset_after_seconds``)."""
+    best_used = -1.0
+    best_when: datetime | None = None
+    # #490: a window can carry a usable reset hint but no parseable
+    # used_percent (undocumented/best-effort headers). Scoring that 0.0 made
+    # it fail the >=90 gate, so a genuine cap 429 was misread as a header-less
+    # transient and hammered with the 60s/4m/16m ladder. Track the earliest
+    # reset from any percent-less window and respect it when no near-cap window
+    # gives a more confident signal.
+    unknown_pct_when: datetime | None = None
+    for win in (getattr(rate_limits, "primary", None), getattr(rate_limits, "secondary", None)):
+        if win is None:
+            continue
+        raw_used = getattr(win, "used_percent", None)
+        used = float(raw_used) if isinstance(raw_used, (int, float)) else None
+        reset_at = getattr(win, "reset_at", None)
+        reset_after = getattr(win, "reset_after_seconds", None)
+        when: datetime | None = None
+        if isinstance(reset_at, (int, float)):
+            try:
+                when = datetime.fromtimestamp(int(reset_at), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                when = None
+        elif isinstance(reset_after, (int, float)):
+            when = now + timedelta(seconds=int(reset_after))
+        if when is None:
+            continue
+        if used is None:
+            # Reset hint but no parseable percent — candidate authoritative.
+            if unknown_pct_when is None or when < unknown_pct_when:
+                unknown_pct_when = when
+        elif used > best_used:
+            best_used, best_when = used, when
+    # A window we can see is near its cap is the most confident signal.
+    if best_when is not None and best_used >= _CODEX_CAP_THRESHOLD:
+        return best_when
+    # No near-cap window, but one shipped a reset without a usable percent:
+    # respect it rather than downgrading a real cap to the transient floor.
+    # (A window with a PARSEABLE low percent stays transient — that's the
+    # genuine "429 while utilization is low" burst case.)
+    if unknown_pct_when is not None:
+        return unknown_pct_when
+    return None
+
+
+def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
+    """Best-effort: parse a real ``reset_at`` datetime from a 429
+    exception. Returns ``(reset_at, provider_label)`` — ``reset_at`` is
+    ``None`` when no authoritative reset could be parsed.
+
+    Strategy:
+    1. If the exception carries an ``httpx.Response`` (anthropic /
+       openai SDKs do), check its headers for a reset timestamp or
+       ``Retry-After`` seconds value.
+    2. Codex Plus (``langchain-codex-plus`` >= 0.0.3) surfaces the parsed
+       ``x-codex-*`` windows on the exception — use the binding window's
+       reset, but only when it's genuinely at cap (otherwise the 429 is a
+       transient burst and the caller's backoff is the right response).
+    3. Otherwise scrape the exception message for an ISO timestamp.
+    4. Failing all, return ``(None, None)``. The caller decides the
+       backoff — a header-less 429 is treated as transient (short,
+       escalating) rather than blindly pausing for a full window, which
+       is what the old ``now + _DEFAULT_PAUSE_HOURS`` default did.
+    """
+    now = datetime.now(tz=timezone.utc)
+    raw = getattr(exc, "raw", None)
+    error = raw.get("error", raw) if isinstance(raw, dict) else None
+    if (
+        getattr(exc, "status_code", None) == 429
+        and isinstance(error, dict)
+        and (getattr(exc, "type", None) or error.get("type")) == "usage_limit_reached"
+    ):
+        raw_reset = error.get("resets_at")
+        reset: datetime | None = None
+        if isinstance(raw_reset, str):
+            try:
+                reset = datetime.fromisoformat(raw_reset.replace("Z", "+00:00"))
+            except ValueError:
+                reset = None
+        elif isinstance(raw_reset, (int, float)) and not isinstance(raw_reset, bool):
+            try:
+                reset = datetime.fromtimestamp(raw_reset, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                reset = None
+        reset_seconds = error.get("resets_in_seconds")
+        if reset is None and isinstance(reset_seconds, (int, float)) and not isinstance(reset_seconds, bool):
+            reset = now + timedelta(seconds=max(0, reset_seconds))
+        if reset is not None:
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
+            return _clamp_reset_at(reset, now), "codex-plus"
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) if response is not None else None
+
+    if headers is not None:
+        # Anthropic-style: ISO timestamps in dedicated reset headers.
+        for header_name in _ANTHROPIC_RESET_HEADERS:
+            raw = headers.get(header_name) if hasattr(headers, "get") else None
+            if not raw:
+                continue
+            try:
+                reset = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
+            return _clamp_reset_at(reset, now), "anthropic"
+        # Generic Retry-After (seconds).
+        retry_after = (
+            headers.get("retry-after") if hasattr(headers, "get") else None
+        )
+        seconds = _parse_retry_after_header(retry_after)
+        if seconds is not None:
+            return _clamp_reset_at(now + timedelta(seconds=seconds), now), None
+
+    # Codex Plus: parsed x-codex-* windows surfaced on the exception.
+    rate_limits = getattr(exc, "rate_limits", None)
+    if rate_limits is not None:
+        reset = _codex_window_reset(rate_limits, now)
+        if reset is not None:
+            return _clamp_reset_at(reset, now), "codex-plus"
+    codex_headers = getattr(exc, "headers", None)
+    if isinstance(codex_headers, dict):
+        # Direct Retry-After fallback if the parsed windows weren't usable.
+        ra = _parse_retry_after_header(codex_headers.get("retry-after"))
+        if ra is not None:
+            return _clamp_reset_at(now + timedelta(seconds=ra), now), "codex-plus"
+
+    # Fallback parse: scrape the exception message for an ISO-ish
+    # timestamp. ChatClaudeCode surfaces 429s as plain text from the
+    # subprocess; a regex-fallback covers that path opportunistically.
+    msg = str(exc)
+    m = re.search(
+        r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+        msg,
+    )
+    if m:
+        try:
+            reset = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
+            return _clamp_reset_at(reset, now), None
+        except ValueError:
+            pass
+
+    return (None, None)
+
+
+# ── exception classification ────────────────────────────────────────
+
+
+def is_quota_exhaustion(exc: BaseException) -> bool:
+    """Return whether an upstream refusal should activate quota pause."""
+    return classify_provider_error(exc).quota_exhausted

@@ -1,0 +1,2111 @@
+"""CommitmentsStore — append-only lifecycle + replay + status-aware trim."""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from tests.timing import HANG_GUARD_SECONDS
+
+from mimir.models import AuthContext
+from mimir.commitments import (
+    CommitmentKind,
+    CommitmentRecord,
+    CommitmentSensitivity,
+    CommitmentStatus,
+    CommitmentVisibility,
+    CommitmentsStore,
+    make_commitment_id,
+    make_dedupe_key,
+)
+from mimir.commitments.models import CommitmentOwnershipProvenance
+from mimir.commitments.store import run_store_io
+
+
+# ─── make_dedupe_key ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["replay_async", "current_state_async", "complete", "alarm_pileup", "trim"])
+async def test_replay_leaves_loop_and_default_pool_free(tmp_path, monkeypatch, operation):
+    store = CommitmentsStore(tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(id="owned", channel_id="c1", text="Follow up"))
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    replay = store.replay
+    run_in_executor = loop.run_in_executor
+    executors = []
+
+    def submit(executor, func, *args):
+        executors.append(executor)
+        assert executor is not None
+        return run_in_executor(executor, func, *args)
+
+    def blocked_replay():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "loop did not release replay"
+        return replay()
+
+    monkeypatch.setattr(loop, "run_in_executor", submit)
+    monkeypatch.setattr(store, "replay", blocked_replay)
+    args = ("owned",) if operation in {"complete", "alarm_pileup"} else ()
+    task = asyncio.create_task(getattr(store, operation)(*args))
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert executors
+    finally:
+        release.set()
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_run_store_io_cancellation_waits_and_wins(cancel, fails):
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    lock = asyncio.Lock()
+    error = TimeoutError("commitments writer lock busy; retry")
+
+    def worker():
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(5), "loop did not release worker"
+            if fails:
+                raise error
+            return 42
+        finally:
+            finished.set()
+
+    async def caller():
+        async with lock:
+            return await run_store_io(worker)
+
+    task = asyncio.create_task(caller())
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        if cancel:
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+        assert not task.done()
+        assert lock.locked()
+        assert not finished.is_set()
+    finally:
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            if fails:
+                assert isinstance(caught.value.__cause__, TimeoutError)
+                assert caught.value.__cause__.args == error.args
+            assert task.cancelled()
+        elif fails:
+            with pytest.raises(TimeoutError) as caught:
+                await task
+            assert caught.value.args == error.args
+        else:
+            assert await task == 42
+    assert finished.is_set()
+    assert not lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("operation", ["add", "complete"])
+async def test_append_awaits_locked_flush_fsync(tmp_path, monkeypatch, cancel, operation):
+    store = CommitmentsStore(tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(id="owned", channel_id="c1", text="Follow up"))
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    fsync = os.fsync
+
+    def blocked_fsync(fd):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "loop did not release fsync"
+        fsync(fd)
+
+    monkeypatch.setattr("mimir.commitments.store.os.fsync", blocked_fsync)
+    arg = CommitmentRecord(id="new", channel_id="c1", text="Check result") if operation == "add" else "owned"
+    task = asyncio.create_task(getattr(store, operation)(arg))
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        # Bytes are flushed, but neither lock nor await may finish before fsync.
+        assert len(store.path.read_text().splitlines()) == 2
+        with store.path.with_suffix(".jsonl.lock").open("a") as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+        assert not task.done()
+        assert store._lock.locked()
+    finally:
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+    assert not store._lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "complete"])
+async def test_writer_timeout_propagates_while_loop_progresses(tmp_path, monkeypatch, operation):
+    store = CommitmentsStore(tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(id="owned", channel_id="c1", text="Follow up"))
+    loop = asyncio.get_running_loop()
+    contended = asyncio.Event()
+    flock = fcntl.flock
+
+    def observe_flock(fd, flags):
+        try:
+            return flock(fd, flags)
+        except BlockingIOError:
+            loop.call_soon_threadsafe(contended.set)
+            raise
+
+    with store.path.with_suffix(".jsonl.lock").open("a") as lock:
+        flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr("mimir.commitments.store.fcntl.flock", observe_flock)
+        arg = CommitmentRecord(id="new", channel_id="c1", text="Check result") if operation == "add" else "owned"
+        started = time.monotonic()
+        task = asyncio.create_task(getattr(store, operation)(arg))
+        try:
+            await asyncio.wait_for(contended.wait(), HANG_GUARD_SECONDS)
+            assert not task.done()
+        finally:
+            with pytest.raises(TimeoutError, match="writer lock busy"):
+                await task
+        assert time.monotonic() - started >= 0.25
+    assert len(store.path.read_text().splitlines()) == 1
+    assert not store._inflight_lifecycle_ids
+
+
+def test_dedupe_key_stable_for_same_inputs():
+    k1 = make_dedupe_key(channel_id="c1", text="Review PR", due_window_start_unix=None)
+    k2 = make_dedupe_key(channel_id="c1", text="Review PR", due_window_start_unix=None)
+    assert k1 == k2
+
+
+def test_dedupe_key_normalizes_whitespace_and_case():
+    k1 = make_dedupe_key(channel_id="c1", text="Review PR", due_window_start_unix=None)
+    k2 = make_dedupe_key(channel_id="c1", text="  REVIEW   pr  ", due_window_start_unix=None)
+    assert k1 == k2
+
+
+def test_dedupe_key_distinguishes_channels():
+    k1 = make_dedupe_key(channel_id="c1", text="Review PR", due_window_start_unix=None)
+    k2 = make_dedupe_key(channel_id="c2", text="Review PR", due_window_start_unix=None)
+    assert k1 != k2
+
+
+def test_dedupe_key_buckets_by_day_not_second():
+    """Same due day → same key. Different days → different keys."""
+    base = 1_715_000_000.0  # arbitrary unix
+    k1 = make_dedupe_key(channel_id="c1", text="X", due_window_start_unix=base)
+    k2 = make_dedupe_key(channel_id="c1", text="X", due_window_start_unix=base + 3600)
+    k3 = make_dedupe_key(channel_id="c1", text="X", due_window_start_unix=base + 86400 * 2)
+    assert k1 == k2  # same day
+    assert k1 != k3  # different day
+
+
+def test_dedupe_key_none_due_bucket_is_consistent():
+    k1 = make_dedupe_key(channel_id="c1", text="X", due_window_start_unix=None)
+    k2 = make_dedupe_key(channel_id="c1", text="X", due_window_start_unix=None)
+    assert k1 == k2
+
+
+def test_dedupe_key_distinguishes_recipients():
+    """Same channel + same text but different recipients are distinct
+    commitments — without this, "remind Alice about X" and "remind Bob
+    about X" in the same channel would dedupe together and the second
+    would lose its addressee on extraction."""
+    k_alice = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+        recipient_identity="alice",
+    )
+    k_bob = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+        recipient_identity="bob",
+    )
+    k_none = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+    )
+    assert k_alice != k_bob
+    assert k_alice != k_none
+    assert k_bob != k_none
+
+
+# ─── Basic add + replay ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_add_and_replay_round_trips(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Review PR #111",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+        suggested_reminder="PR #111 awaiting review",
+    )
+    saved = await store.add(rec)
+
+    state = store.current_state()
+    assert saved.id in state
+    out = state[saved.id]
+    assert out.text == "Review PR #111"
+    assert out.status == CommitmentStatus.PENDING.value
+    assert out.kind == CommitmentKind.AGENT_PROMISE.value
+    assert out.dedupe_key  # auto-filled
+    assert out.created_at_unix > 0  # auto-filled
+
+
+@pytest.mark.asyncio
+async def test_ownership_provenance_round_trips_as_typed_enum(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Review PR #111",
+        owner_principal="user:alice",
+        ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
+    ))
+
+    added_event = json.loads(store.path.read_text().splitlines()[0])
+    assert added_event["record"]["ownership_provenance"] == "extraction_acl"
+    replayed = store.current_state()[rec.id]
+    assert (
+        replayed.ownership_provenance
+        is CommitmentOwnershipProvenance.EXTRACTION_ACL
+    )
+
+
+@pytest.mark.parametrize("persisted_value", ["missing", "unknown"])
+def test_historical_ownership_provenance_defaults_to_none_without_rewrite(
+    tmp_path: Path, persisted_value: str,
+):
+    path = tmp_path / f"{persisted_value}.jsonl"
+    record = CommitmentRecord(
+        id=f"c-{persisted_value}", channel_id="ch-1", text="Historical",
+    ).to_dict()
+    if persisted_value == "missing":
+        record.pop("ownership_provenance")
+    else:
+        record["ownership_provenance"] = "copied_owner"
+    path.write_text(json.dumps({
+        "type": "commitment_added",
+        "id": record["id"],
+        "record": record,
+    }) + "\n")
+    before = path.read_bytes()
+
+    replayed = CommitmentsStore(path=path).current_state()[record["id"]]
+
+    assert replayed.ownership_provenance is None
+    assert path.read_bytes() == before
+
+
+def test_lifecycle_replay_cannot_set_clear_or_replace_ownership_provenance():
+    lifecycle_events = {
+        "commitment_pileup_alarmed": {"at_unix": 1.0},
+        "commitment_delivered": {"at_unix": 1.0},
+        "commitment_completed": {"at_unix": 1.0, "message_id": "m-1"},
+        "commitment_snoozed": {"until_unix": 2.0, "reason": "later"},
+        "commitment_dismissed": {"at_unix": 1.0, "reason": "done"},
+        "commitment_expired": {"at_unix": 1.0},
+    }
+    provenance_cases = (
+        (CommitmentOwnershipProvenance.EXTRACTION_ACL, None),
+        (None, CommitmentOwnershipProvenance.EXTRACTION_ACL.value),
+        (CommitmentOwnershipProvenance.EXTRACTION_ACL, "unknown"),
+    )
+
+    for event_type, payload in lifecycle_events.items():
+        for initial, attempted in provenance_cases:
+            record = CommitmentRecord(
+                id=f"c-{event_type}",
+                channel_id="ch-1",
+                text="X",
+                ownership_provenance=initial,
+            )
+            records = {record.id: record}
+            CommitmentsStore._apply_event(records, {
+                "type": event_type,
+                "id": record.id,
+                "ownership_provenance": attempted,
+                **payload,
+            })
+
+            assert records[record.id].ownership_provenance is initial
+            if event_type == "commitment_pileup_alarmed":
+                assert records[record.id].pileup_alarmed_at_unix == 1.0
+            else:
+                assert records[record.id].status != CommitmentStatus.PENDING.value
+
+
+def test_ownerless_migration_uses_only_authoritative_session_acl(tmp_path: Path):
+    commitments_path = tmp_path / "commitments.jsonl"
+    saga_path = tmp_path / "saga.db"
+    conn = sqlite3.connect(saga_path)
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT, owner_principal TEXT, "
+        "origin_channel TEXT, origin_domain TEXT, visibility TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+        ("session-alice", "user:alice", "ch-1", "discord", "private"),
+    )
+    conn.commit()
+    conn.close()
+    records = [
+        CommitmentRecord(
+            id="c-authoritative", channel_id="ch-1", text="Alice secret",
+            saga_session_id="session-alice",
+        ),
+        CommitmentRecord(
+            id="c-unknown", channel_id="ch-2", text="Unknown secret",
+            saga_session_id="missing-session",
+        ),
+    ]
+    events = [
+        {"type": "commitment_added", "id": record.id, "record": record.to_dict()}
+        for record in records
+    ]
+    commitments_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n"
+    )
+
+    store = CommitmentsStore(
+        path=commitments_path, provenance_db_path=saga_path,
+    )
+    assert store.migrate_ownership() == 2
+    state = store.current_state()
+    assert state["c-authoritative"].owner_principal == "user:alice"
+    assert state["c-authoritative"].originating_channel == "ch-1"
+    assert state["c-authoritative"].origin_domain == "discord"
+    assert state["c-authoritative"].visibility == "private"
+    assert state["c-unknown"].owner_principal == "legacy_admin"
+    assert state["c-unknown"].visibility == "service"
+    assert store.list(
+        auth_context=AuthContext(
+            principal="legacy_admin", canonical_principal="legacy_admin", roles=(),
+            event_ingress=None, trigger="user_message", channel_id="ch-2",
+            interactivity=None,
+        )
+    ) == []
+
+
+def test_ownership_migration_is_atomic_preserves_malformed_and_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commitments_path = tmp_path / "commitments.jsonl"
+    record = CommitmentRecord(
+        id="c-legacy", channel_id="ch-1", text="Legacy task",
+        saga_session_id="missing-session",
+    )
+    malformed = b"{ malformed ownership event }\r\n"
+    event = {
+        "type": "commitment_added", "id": record.id, "record": record.to_dict(),
+    }
+    commitments_path.write_bytes(malformed + json.dumps(event).encode() + b"\n")
+    store = CommitmentsStore(
+        path=commitments_path,
+        provenance_db_path=tmp_path / "missing-saga.db",
+    )
+
+    fsync_calls: list[int] = []
+    replace_calls: list[tuple[Path, Path]] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def _fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        real_fsync(fd)
+
+    def _replace(source: str | Path, destination: str | Path) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr("mimir.commitments.store.os.fsync", _fsync)
+    monkeypatch.setattr("mimir.commitments.store.os.replace", _replace)
+
+    assert store.migrate_ownership() == 1
+    migrated = commitments_path.read_bytes()
+    assert migrated.startswith(malformed)
+    assert fsync_calls
+    assert len(replace_calls) == 1
+    source, destination = replace_calls[0]
+    assert source.parent == commitments_path.parent
+    assert source.name.startswith(commitments_path.name + ".")
+    assert source.suffix == ".tmp"
+    assert destination == commitments_path
+    assert not source.exists()
+    assert store.current_state()[record.id].owner_principal == "legacy_admin"
+
+    replace_calls.clear()
+    assert store.migrate_ownership() == 0
+    assert commitments_path.read_bytes() == migrated
+    assert replace_calls == []
+
+
+@pytest.mark.parametrize("provenance_kind", ["missing", "unreadable"])
+def test_ownership_migration_missing_or_unreadable_db_fails_closed(
+    tmp_path: Path, provenance_kind: str,
+) -> None:
+    commitments_path = tmp_path / "commitments.jsonl"
+    provenance_path = tmp_path / "saga.db"
+    if provenance_kind == "unreadable":
+        provenance_path.write_bytes(b"not a sqlite database")
+    record = CommitmentRecord(
+        id=f"c-{provenance_kind}", channel_id="public-channel",
+        text="Must remain admin-only", saga_session_id="session-alice",
+    )
+    commitments_path.write_text(json.dumps({
+        "type": "commitment_added", "id": record.id, "record": record.to_dict(),
+    }) + "\n")
+
+    store = CommitmentsStore(
+        path=commitments_path, provenance_db_path=provenance_path,
+    )
+    assert store.migrate_ownership() == 1
+    migrated = store.current_state()[record.id]
+    assert migrated.owner_principal == "legacy_admin"
+    assert migrated.visibility == CommitmentVisibility.SERVICE.value
+    assert migrated.originating_channel is None
+
+
+@pytest.mark.asyncio
+async def test_add_persists_recipient_identity(tmp_path: Path):
+    """The recipient field round-trips through JSONL → replay."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Remind Alice about deploy outcome",
+        kind=CommitmentKind.USER_REQUEST.value,
+        recipient_identity="alice",
+    ))
+    state = store.current_state()
+    assert state[rec.id].recipient_identity == "alice"
+
+
+@pytest.mark.asyncio
+async def test_add_autogenerated_dedupe_key_includes_recipient(tmp_path: Path):
+    """Same channel + same text + different recipients → different
+    auto-generated dedupe keys (so neither suppresses the other on
+    extraction)."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    r1 = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        recipient_identity="alice",
+    ))
+    r2 = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        recipient_identity="bob",
+    ))
+    assert r1.dedupe_key != r2.dedupe_key
+
+
+@pytest.mark.asyncio
+async def test_add_coerces_initial_status_to_pending(tmp_path: Path):
+    """A caller copy-pasting status=completed on add() must NOT poison
+    the store — the contract is that add() starts pending."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="X",
+        status=CommitmentStatus.COMPLETED.value,  # wrong; should be coerced
+    )
+    saved = await store.add(rec)
+    assert saved.status == CommitmentStatus.PENDING.value
+    state = store.current_state()
+    assert state[saved.id].status == CommitmentStatus.PENDING.value
+
+
+# ─── Lifecycle transitions ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_deliver_bumps_attempts_and_sets_status(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.deliver(rec.id)
+    await store.deliver(rec.id)
+
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.DELIVERED.value
+    assert state[rec.id].attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_deliver_is_coalesced(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+
+    results = await asyncio.gather(store.deliver(rec.id), store.deliver(rec.id))
+
+    assert sorted(results) == [False, True]
+    assert store.current_state()[rec.id].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_complete_and_expire_append_one_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_current_state = store.current_state_async
+
+    async def paused_current_state():
+        entered.set()
+        await release.wait()
+        return await real_current_state()
+
+    monkeypatch.setattr(store, "current_state_async", paused_current_state)
+    complete = asyncio.create_task(store.complete(rec.id, message_id="m-1"))
+    await asyncio.wait_for(entered.wait(), timeout=HANG_GUARD_SECONDS)
+    expire = asyncio.create_task(store.expire(rec.id))
+    await asyncio.sleep(0)
+    assert not complete.done()
+    release.set()
+
+    results = await asyncio.gather(complete, expire)
+    events = [json.loads(line) for line in store.path.read_text().splitlines()]
+    transitions = [event for event in events if event["type"] != "commitment_added"]
+
+    assert sorted(results) == [False, True]
+    assert len(transitions) == 1
+    assert transitions[0]["type"] == "commitment_completed"
+    state = store.current_state()[rec.id]
+    assert state.status == CommitmentStatus.COMPLETED.value
+    assert state.completion_message_id == "m-1"
+
+
+@pytest.mark.asyncio
+async def test_complete_is_terminal(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.complete(rec.id, message_id="m-42")
+
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+    assert state[rec.id].completion_message_id == "m-42"
+    assert state[rec.id].is_terminal()
+
+
+@pytest.mark.asyncio
+async def test_snooze_slides_due_window_start(tmp_path: Path):
+    """Snoozing should push the due_window_start so surfacing logic
+    knows the next earliest-deliver anchor."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    original_start = 1_000_000.0
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        due_window_start_unix=original_start,
+        due_window_end_unix=original_start + 86400,
+    ))
+    new_start = original_start + 7 * 86400
+    await store.snooze(rec.id, until_unix=new_start, reason="not yet")
+
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.SNOOZED.value
+    assert state[rec.id].snoozed_until_unix == new_start
+    assert state[rec.id].due_window_start_unix == new_start
+    assert state[rec.id].snooze_reason == "not yet"
+
+
+@pytest.mark.asyncio
+async def test_dismiss_with_reason(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.dismiss(rec.id, reason="no longer relevant")
+
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.DISMISSED.value
+    assert state[rec.id].dismiss_reason == "no longer relevant"
+    assert state[rec.id].is_terminal()
+
+
+@pytest.mark.asyncio
+async def test_expire(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.expire(rec.id)
+
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.EXPIRED.value
+    assert state[rec.id].is_terminal()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_event_for_unknown_id_is_skipped(tmp_path: Path):
+    """Replay must tolerate lifecycle events whose add was trimmed
+    away — log + skip, not crash."""
+    path = tmp_path / "c.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Write a delivered event without a preceding add.
+    with path.open("w") as f:
+        f.write(json.dumps({
+            "type": "commitment_delivered",
+            "id": "c-orphan",
+            "at_unix": time.time(),
+        }) + "\n")
+    store = CommitmentsStore(path=path)
+    state = store.current_state()
+    assert state == {}  # nothing created, no crash
+
+
+# ─── List filters ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_channel(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(id=make_commitment_id(), channel_id="ch1", text="X1"))
+    await store.add(CommitmentRecord(id=make_commitment_id(), channel_id="ch2", text="X2"))
+    await store.add(CommitmentRecord(id=make_commitment_id(), channel_id=None, text="X3-unbound"))
+
+    rows_ch1 = store.list(channel_id="ch1")
+    # ch1-bound + unbound (per design rule "unbound surfaces everywhere")
+    assert {r.text for r in rows_ch1} == {"X1", "X3-unbound"}
+
+    rows_ch1_strict = store.list(channel_id="ch1", include_unbound=False)
+    assert {r.text for r in rows_ch1_strict} == {"X1"}
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_status(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    r1 = await store.add(CommitmentRecord(id=make_commitment_id(), channel_id="c1", text="X1"))
+    r2 = await store.add(CommitmentRecord(id=make_commitment_id(), channel_id="c1", text="X2"))
+    await store.complete(r1.id)
+
+    pending = store.list(status=CommitmentStatus.PENDING.value)
+    completed = store.list(status=CommitmentStatus.COMPLETED.value)
+    assert {r.text for r in pending} == {"X2"}
+    assert {r.text for r in completed} == {"X1"}
+
+
+@pytest.mark.asyncio
+async def test_list_sorted_by_created_at(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    base = time.time()
+    r1 = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="first",
+        created_at_unix=base,
+    ))
+    r2 = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="second",
+        created_at_unix=base + 100,
+    ))
+    r3 = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="third",
+        created_at_unix=base + 50,
+    ))
+    rows = store.list()
+    assert [r.text for r in rows] == ["first", "third", "second"]
+
+
+# ─── find_by_dedupe_key ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_find_by_dedupe_key_returns_active(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Review PR #1",
+    ))
+    found = store.find_by_dedupe_key(rec.dedupe_key)
+    assert found is not None
+    assert found.id == rec.id
+
+
+@pytest.mark.asyncio
+async def test_find_by_dedupe_key_ignores_terminal(tmp_path: Path):
+    """A completed/dismissed commitment shouldn't dedupe a fresh extraction
+    — the new one is a re-emergence, treat as new."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Review PR #1",
+    ))
+    await store.complete(rec.id)
+    assert store.find_by_dedupe_key(rec.dedupe_key) is None
+
+
+# ─── Status-aware trim ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_trim_drops_terminal_records_older_than_retention(tmp_path: Path):
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    now = time.time()
+    # Old completed record (40 days ago) — should drop.
+    r_old = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="old",
+        created_at_unix=now - 40 * 86400,
+    ))
+    await store.complete(r_old.id)
+    # Hand-rewrite to backdate the completed event so trim sees it as
+    # old. (The store writes its own at_unix=time.time(); to test trim
+    # we need to manipulate the event after the fact.)
+    path = tmp_path / "c.jsonl"
+    new_lines = []
+    for line in path.read_text().splitlines():
+        d = json.loads(line)
+        if d.get("type") == "commitment_completed" and d.get("id") == r_old.id:
+            d["at_unix"] = now - 40 * 86400
+        new_lines.append(json.dumps(d))
+    path.write_text("\n".join(new_lines) + "\n")
+
+    # Recent completed record (1 day ago) — should keep.
+    r_recent = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="recent",
+    ))
+    await store.complete(r_recent.id)
+
+    dropped = await store.trim(now_unix=now)
+    assert dropped == 1
+    state = store.current_state()
+    assert r_old.id not in state
+    assert r_recent.id in state
+
+
+@pytest.mark.asyncio
+async def test_trim_never_drops_pending_no_matter_how_old(tmp_path: Path):
+    """A 60-day pending commitment survives every trim."""
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="long-deadline",
+        created_at_unix=now - 60 * 86400,
+        due_window_start_unix=now + 30 * 86400,
+    ))
+    dropped = await store.trim(now_unix=now)
+    assert dropped == 0
+    assert rec.id in store.current_state()
+
+
+@pytest.mark.asyncio
+async def test_trim_retains_terminal_record_without_terminal_timestamp(tmp_path: Path):
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="imported",
+    ))
+    with store.path.open("a") as f:
+        f.write(json.dumps({
+            "type": "commitment_completed",
+            "id": rec.id,
+            "at_unix": None,
+        }) + "\n")
+
+    dropped = await store.trim(now_unix=time.time() + 365 * 86400)
+
+    assert dropped == 0
+    assert rec.id in store.current_state()
+
+
+@pytest.mark.asyncio
+async def test_trim_never_drops_snoozed_indefinitely(tmp_path: Path):
+    """Snoozed-far-into-future is still active; trim must leave it."""
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="snoozed-out",
+    ))
+    await store.snooze(rec.id, until_unix=now + 365 * 86400)
+    dropped = await store.trim(now_unix=now)
+    assert dropped == 0
+    assert rec.id in store.current_state()
+
+
+@pytest.mark.asyncio
+async def test_trim_empty_file_returns_zero(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    assert await store.trim() == 0
+
+
+# ─── Path / file behavior ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("operation", ["trim", "migrate_ownership"])
+def test_rewrite_preserves_concurrent_process_append(tmp_path, monkeypatch, operation):
+    """Pause after copying, and complete a live commitment in another process.
+
+    The unguarded read/fsync/replace implementation loses this exact append.
+    The child must finish while preparation is paused, not wait out a rewrite.
+    """
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    for rid in ("old", "live"):
+        asyncio.run(store.add(CommitmentRecord(id=rid, text=rid, channel_id="c1")))
+    store._append_line_sync({
+        "type": "commitment_completed", "id": "old", "at_unix": 1,
+    })
+    real_fsync = os.fsync
+    appended = False
+
+    def append_during_fsync(fd):
+        nonlocal appended
+        real_fsync(fd)
+        assert not appended
+        child = subprocess.run(
+            [sys.executable, "-c", """
+import asyncio, sys
+from pathlib import Path
+from mimir.commitments.store import CommitmentsStore
+store = CommitmentsStore(path=Path(sys.argv[1]))
+assert asyncio.run(store.complete('live', message_id='sibling-completion'))
+""", str(store.path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert child.returncode == 0, child.stderr
+        appended = True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", append_during_fsync)
+        try:
+            if operation == "trim":
+                asyncio.run(store.trim())
+            else:
+                store.migrate_ownership()
+        except BlockingIOError as exc:
+            assert "changed during rewrite" in str(exc)
+
+    assert appended
+    state = store.current_state()
+    assert state["live"].status == "completed"
+    assert state["live"].completion_message_id == "sibling-completion"
+    assert not list(tmp_path.glob("*.tmp"))
+    # A quiet retry succeeds, without losing the now-durable completion.
+    if operation == "trim":
+        assert asyncio.run(store.trim()) == 1
+    else:
+        assert store.migrate_ownership() == 2
+    assert store.current_state()["live"].status == "completed"
+
+
+@pytest.mark.parametrize("operation", ["append", "trim", "migrate_ownership"])
+def test_writer_lock_is_bounded_and_released_on_process_death(tmp_path, operation):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    asyncio.run(store.add(CommitmentRecord(id="old", text="old", channel_id="c1")))
+    store._append_line_sync({
+        "type": "commitment_completed", "id": "old", "at_unix": 1,
+    })
+    before = store.path.read_bytes()
+    child = subprocess.Popen(
+        [sys.executable, "-c", """
+import sys
+from pathlib import Path
+from mimir.commitments.store import CommitmentsStore
+with CommitmentsStore(path=Path(sys.argv[1]))._writer_lock():
+    print('locked', flush=True)
+    sys.stdin.read()
+""", str(store.path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "locked"
+        start = time.monotonic()
+        with pytest.raises(TimeoutError, match="writer lock busy"):
+            if operation == "append":
+                store._append_line_sync({"type": "test", "id": "new"})
+            elif operation == "trim":
+                asyncio.run(store.trim())
+            else:
+                store.migrate_ownership()
+        from mimir.commitments.store import _WRITE_LOCK_TIMEOUT_SECS
+        assert time.monotonic() - start < _WRITE_LOCK_TIMEOUT_SECS + 5
+        assert store.path.read_bytes() == before
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        child.kill()
+        child.communicate(timeout=10)
+    store._append_line_sync({"type": "test", "id": "after-crash"})
+    assert json.loads(store.path.read_text().splitlines()[-1])["id"] == "after-crash"
+
+
+def test_rewrite_rejects_same_size_sibling_replacement(tmp_path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    store.path.write_text("old\n")
+    before = store.path.stat()
+    with store._rewrite_target() as ours, store._rewrite_target() as sibling:
+        assert ours != sibling
+        ours.write_text("our\n")
+        sibling.write_text("new\n")
+        store._publish_rewrite(sibling, before)
+        with pytest.raises(BlockingIOError, match="changed during rewrite"):
+            store._publish_rewrite(ours, before)
+    assert store.path.read_text() == "new\n"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_missing_file_yields_empty_state(tmp_path: Path):
+    """Replay on a never-written file is fine — returns empty dict."""
+    store = CommitmentsStore(path=tmp_path / "nonexistent.jsonl")
+    assert store.current_state() == {}
+    assert store.list() == []
+
+
+@pytest.mark.asyncio
+async def test_add_creates_parent_directory(tmp_path: Path):
+    """Store path can include intermediate dirs that don't exist yet."""
+    store = CommitmentsStore(path=tmp_path / ".mimir" / "subdir" / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    assert store.path.is_file()
+    assert rec.id in store.current_state()
+
+
+@pytest.mark.asyncio
+async def test_jsonl_format_is_one_event_per_line(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    r1 = await store.add(CommitmentRecord(id=make_commitment_id(), channel_id="c1", text="X1"))
+    await store.deliver(r1.id)
+    await store.complete(r1.id)
+
+    lines = store.path.read_text().splitlines()
+    assert len(lines) == 3
+    for line in lines:
+        json.loads(line)  # each line is valid JSON
+
+
+# ─── PR #120 review fixes: lifecycle guards ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_transitions_from_terminal_state(tmp_path: Path):
+    """PR #120 review #1: a lifecycle event arriving for a record
+    already in a terminal state (completed/dismissed/expired) must NOT
+    silently flip the status. The VALID_TRANSITIONS adjacency rejects
+    it; the original terminal state stands."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.complete(rec.id, message_id="m-1")
+    # Late-arriving expire (the Phase 2 expire-poller scenario).
+    await store.expire(rec.id)
+
+    state = store.current_state()
+    # Still completed; expire was rejected.
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+    assert state[rec.id].completion_message_id == "m-1"
+    assert state[rec.id].expired_at_unix is None
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_dismiss_after_complete(tmp_path: Path):
+    """Same shape — once completed, any further transition is rejected."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.complete(rec.id)
+    await store.dismiss(rec.id, reason="too late")
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+    assert state[rec.id].dismiss_reason is None
+
+
+@pytest.mark.asyncio
+async def test_replay_allows_redelivery(tmp_path: Path):
+    """Self-transition DELIVERED → DELIVERED is allowed (attempt bump
+    on each delivery). The guard rejects only non-listed transitions."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.deliver(rec.id)
+    await store.deliver(rec.id)
+    await store.deliver(rec.id)
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.DELIVERED.value
+    assert state[rec.id].attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_replay_allows_resnooze(tmp_path: Path):
+    """SNOOZED → SNOOZED is allowed; pushing out further."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.snooze(rec.id, until_unix=time.time() + 86400)
+    await store.snooze(rec.id, until_unix=time.time() + 7 * 86400)
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.SNOOZED.value
+
+
+@pytest.mark.asyncio
+async def test_replay_duplicate_add_keeps_first(tmp_path: Path):
+    """PR #120 review #2: a second commitment_added for the same id
+    must NOT overwrite in-progress state. The replay keeps the first
+    add + accumulated lifecycle progress; the duplicate is a no-op."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    cid = make_commitment_id()
+    rec = await store.add(CommitmentRecord(
+        id=cid, channel_id="c1", text="original",
+        ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
+    ))
+    await store.deliver(rec.id)
+    await store.deliver(rec.id)
+    # Caller-bug: adds the same id again with different text.
+    duplicate = CommitmentRecord(id=cid, channel_id="c1", text="DUPLICATE")
+    await store.add(duplicate)
+
+    state = store.current_state()
+    # Original text preserved; lifecycle progress (attempts=2) intact.
+    assert state[cid].text == "original"
+    assert state[cid].status == CommitmentStatus.DELIVERED.value
+    assert state[cid].attempts == 2
+    assert (
+        state[cid].ownership_provenance
+        is CommitmentOwnershipProvenance.EXTRACTION_ACL
+    )
+
+
+# ─── Snooze due-window bumping (review #3) ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_snooze_bumps_end_when_start_exceeds_it(tmp_path: Path):
+    """PR #120 review #3: a snooze that pushes ``start`` past the
+    existing ``end`` must bump ``end`` so the window stays positive.
+    Without this guard, downstream surfacing would see start > end
+    and have to defensively reject."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    start = time.time()
+    end = start + 86400  # 1-day window
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        due_window_start_unix=start,
+        due_window_end_unix=end,
+    ))
+    # Snooze 30 days out — well past the original 1-day end.
+    new_start = start + 30 * 86400
+    await store.snooze(rec.id, until_unix=new_start)
+    state = store.current_state()
+    assert state[rec.id].due_window_start_unix == new_start
+    # End bumped to new_start + 7 days (DEFAULT_SNOOZE_WINDOW_SECS).
+    assert state[rec.id].due_window_end_unix == new_start + 7 * 86400
+
+
+@pytest.mark.asyncio
+async def test_snooze_preserves_longer_existing_end(tmp_path: Path):
+    """If the existing end is already further out than start + default
+    window, leave it alone — don't shorten the window."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    start = time.time()
+    end = start + 365 * 86400  # 1-year window
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        due_window_start_unix=start,
+        due_window_end_unix=end,
+    ))
+    new_start = start + 30 * 86400
+    await store.snooze(rec.id, until_unix=new_start)
+    state = store.current_state()
+    # End untouched (still the original 1-year mark, which is further
+    # out than new_start + 7 days).
+    assert state[rec.id].due_window_end_unix == end
+
+
+@pytest.mark.asyncio
+async def test_snooze_sets_end_when_none(tmp_path: Path):
+    """If the original record had no end (open-ended), snooze sets one
+    so the post-snooze record is well-formed."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+        # No due_window_start_unix / due_window_end_unix.
+    ))
+    new_start = time.time() + 86400
+    await store.snooze(rec.id, until_unix=new_start)
+    state = store.current_state()
+    assert state[rec.id].due_window_start_unix == new_start
+    assert state[rec.id].due_window_end_unix == new_start + 7 * 86400
+
+
+# ─── Trim fsync (review #4a) ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_trim_fsyncs_before_replace(tmp_path: Path, monkeypatch):
+    """PR #120 review #4a: trim must flush + fsync the tmp file before
+    os.replace, so the durability claim ("interrupted trim never
+    leaves the store half-written") actually holds. Monkeypatch
+    os.fsync to verify it's called on the tmp file's fd."""
+    import os as _os
+    fsynced_fds: list[int] = []
+    original_fsync = _os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        fsynced_fds.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr(_os, "fsync", tracking_fsync)
+
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    await store.complete(rec.id)
+    # Backdate so trim picks it up.
+    path = tmp_path / "c.jsonl"
+    lines = []
+    for line in path.read_text().splitlines():
+        d = json.loads(line)
+        if d.get("type") == "commitment_completed":
+            d["at_unix"] = now - 40 * 86400
+        lines.append(json.dumps(d))
+    path.write_text("\n".join(lines) + "\n")
+
+    dropped = await store.trim(now_unix=now)
+    assert dropped == 1
+    # fsync was called at least once during the trim's write path.
+    assert len(fsynced_fds) >= 1
+
+
+# ─── PR #120 re-review N1 + N2 ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_write_methods_return_false_on_terminal_rejection(tmp_path: Path):
+    """PR #120 re-review N2: write-path methods now return bool. A
+    write against an already-terminal record returns False AND skips
+    the JSONL append, instead of appending a no-op event that replay
+    would silently reject. Saves JSONL bloat + gives the CLI a signal
+    to surface to the operator."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    assert await store.complete(rec.id) is True
+    # Now-terminal record rejects further transitions at the write path.
+    assert await store.complete(rec.id) is False
+    assert await store.dismiss(rec.id) is False
+    assert await store.expire(rec.id) is False
+    assert await store.snooze(rec.id, until_unix=time.time() + 86400) is False
+    assert await store.deliver(rec.id) is False
+    # JSONL only has the original add + complete — no no-op events.
+    lines = store.path.read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["type"] == "commitment_added"
+    assert json.loads(lines[1])["type"] == "commitment_completed"
+
+
+@pytest.mark.asyncio
+async def test_write_methods_return_false_on_unknown_id(tmp_path: Path):
+    """Unknown id → False on every lifecycle method, no events appended."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    assert await store.complete("c-nonexistent") is False
+    assert await store.dismiss("c-nonexistent") is False
+    assert await store.expire("c-nonexistent") is False
+    assert await store.deliver("c-nonexistent") is False
+    assert await store.snooze("c-nonexistent", until_unix=time.time()) is False
+    # No file created (no appends happened).
+    assert not store.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_methods_return_true_on_valid_transitions(tmp_path: Path):
+    """Sanity: the bool return is True for legitimate transitions."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    assert await store.deliver(rec.id) is True
+    assert await store.deliver(rec.id) is True  # re-deliver allowed
+    assert await store.snooze(rec.id, until_unix=time.time() + 86400) is True
+    assert await store.complete(rec.id) is True
+
+
+@pytest.mark.asyncio
+async def test_find_trim_candidates_shares_predicate_with_trim(tmp_path: Path):
+    """PR #120 re-review N1: ``find_trim_candidates`` is the single
+    source of truth for the trim predicate; trim() uses it for the
+    drop set, the CLI dry-run uses it for the preview. Same input
+    must yield the same output, by construction."""
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    now = time.time()
+    # Two terminals: one old (should be a candidate), one fresh (not).
+    r_old = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="old",
+    ))
+    await store.complete(r_old.id)
+    r_fresh = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="fresh",
+    ))
+    await store.complete(r_fresh.id)
+    # Plus one active that should never be a candidate.
+    r_active = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="active",
+    ))
+    # Backdate r_old's terminal event.
+    new_lines = []
+    for line in store.path.read_text().splitlines():
+        d = json.loads(line)
+        if d.get("type") == "commitment_completed" and d.get("id") == r_old.id:
+            d["at_unix"] = now - 40 * 86400
+        new_lines.append(json.dumps(d))
+    store.path.write_text("\n".join(new_lines) + "\n")
+
+    candidates = store.find_trim_candidates(now_unix=now)
+    candidate_ids = {rid for rid, _ in candidates}
+    assert candidate_ids == {r_old.id}
+    assert r_fresh.id not in candidate_ids  # too recent
+    assert r_active.id not in candidate_ids  # not terminal
+
+    # trim() with the same inputs drops the same set.
+    dropped = await store.trim(now_unix=now)
+    assert dropped == 1
+    state = store.current_state()
+    assert r_old.id not in state
+    assert r_fresh.id in state
+    assert r_active.id in state
+
+
+def test_find_trim_candidates_returns_record_objects(tmp_path: Path):
+    """``find_trim_candidates`` returns ``list[tuple[str, CommitmentRecord]]``
+    so the CLI dry-run can print rich per-record info without a second
+    lookup."""
+    import asyncio
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+
+    async def setup():
+        rec = await store.add(CommitmentRecord(
+            id=make_commitment_id(), channel_id="c1",
+            text="payload", kind=CommitmentKind.AGENT_PROMISE.value,
+        ))
+        await store.complete(rec.id)
+        # Backdate.
+        now = time.time()
+        new_lines = []
+        for line in store.path.read_text().splitlines():
+            d = json.loads(line)
+            if d.get("type") == "commitment_completed":
+                d["at_unix"] = now - 40 * 86400
+            new_lines.append(json.dumps(d))
+        store.path.write_text("\n".join(new_lines) + "\n")
+        return rec.id
+
+    rid = asyncio.run(setup())
+    out = store.find_trim_candidates()
+    assert len(out) == 1
+    cid, rec = out[0]
+    assert cid == rid
+    assert rec.text == "payload"
+    assert rec.kind == CommitmentKind.AGENT_PROMISE.value
+
+
+# ─── chainlink #82 sub #86: JSONL schema version envelope ───────────
+
+
+@pytest.mark.asyncio
+async def test_append_stamps_schema_version_on_every_event(tmp_path: Path):
+    """Every event written through ``_append`` carries the current
+    schema version under the ``v`` key — covers all 7 lifecycle event
+    types (commitment_added, _delivered, _completed, _snoozed,
+    _dismissed, _expired, _pileup_alarmed). Chainlink #82 sub #86.
+
+    PR #137 review nit: original version of this test exercised only
+    5 of 7 event types on a single record (after complete() the record
+    is terminal so dismiss/expire are rejected). Split across three
+    records so every event type round-trips through _append at least
+    once.
+    """
+    from mimir.commitments.store import COMMITMENTS_JSONL_SCHEMA_VERSION
+
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+
+    # Record A: add → deliver → snooze → alarm_pileup → complete
+    # Exercises: added, delivered, snoozed, pileup_alarmed, completed
+    rec_a = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1", text="A",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+    ))
+    await store.deliver(rec_a.id)
+    await store.snooze(rec_a.id, until_unix=time.time() + 60)
+    await store.alarm_pileup(rec_a.id)
+    await store.complete(rec_a.id)
+
+    # Record B: add → dismiss. Exercises: dismissed.
+    rec_b = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1", text="B",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+    ))
+    await store.dismiss(rec_b.id, reason="no longer relevant")
+
+    # Record C: add → expire. Exercises: expired.
+    rec_c = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1", text="C",
+        kind=CommitmentKind.AGENT_PROMISE.value,
+    ))
+    await store.expire(rec_c.id)
+
+    lines = store.path.read_text().splitlines()
+    # Tight count: A produces 5 events (add + 4 lifecycle); B produces 2
+    # (add + dismiss); C produces 2 (add + expire). Total = 9.
+    assert len(lines) == 9, f"expected 9 events, got {len(lines)}"
+    event_types: set[str] = set()
+    for line in lines:
+        event = json.loads(line)
+        assert event.get("v") == COMMITMENTS_JSONL_SCHEMA_VERSION, (
+            f"missing/wrong v on event {event!r}"
+        )
+        event_types.add(event["type"])
+    # All 7 event types reached _append.
+    assert event_types == {
+        "commitment_added",
+        "commitment_delivered",
+        "commitment_snoozed",
+        "commitment_pileup_alarmed",
+        "commitment_completed",
+        "commitment_dismissed",
+        "commitment_expired",
+    }, f"missing event types; saw {sorted(event_types)}"
+
+
+@pytest.mark.asyncio
+async def test_replay_treats_missing_v_as_current_version(tmp_path: Path):
+    """Legacy events (appended before chainlink #82 sub #86 landed)
+    have no ``v`` key. Replay must treat them as the current schema —
+    that's the backward-compat guarantee."""
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    rec_data = {
+        "id": rid,
+        "channel_id": "c1",
+        "text": "legacy",
+        "kind": CommitmentKind.AGENT_PROMISE.value,
+        "status": CommitmentStatus.PENDING.value,
+        "created_at_unix": time.time(),
+        "dedupe_key": make_dedupe_key(
+            channel_id="c1", text="legacy", due_window_start_unix=None,
+        ),
+    }
+    # Legacy: no v field
+    legacy_event = {
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": rec_data,
+    }
+    path.write_text(json.dumps(legacy_event) + "\n")
+    store = CommitmentsStore(path=path)
+    state = store.current_state()
+    assert rid in state
+    assert state[rid].text == "legacy"
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_future_schema_version(tmp_path: Path, caplog):
+    """Events stamped with v greater than this build's schema version
+    are skipped on replay (the new event might rely on fields this
+    build doesn't know about — replaying as-is risks corrupt state).
+    A warning is logged so the operator sees the version skew."""
+    import logging
+    from mimir.commitments.store import COMMITMENTS_JSONL_SCHEMA_VERSION
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    future_event = {
+        "v": COMMITMENTS_JSONL_SCHEMA_VERSION + 1,
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid, "channel_id": "c1", "text": "from-future",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+    path.write_text(json.dumps(future_event) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid not in state  # future event dropped
+    assert any(
+        "future schema" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_malformed_v(tmp_path: Path, caplog):
+    """A ``v`` field that isn't parseable as int (e.g. dict, list,
+    non-numeric string) gets skipped with a warning. Defensive against
+    a corrupt write."""
+    import logging
+    path = tmp_path / "c.jsonl"
+    rid = make_commitment_id()
+    bad_v_event = {
+        "v": {"unexpected": "shape"},
+        "type": "commitment_added",
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid, "channel_id": "c1", "text": "bad-v",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+    path.write_text(json.dumps(bad_v_event) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid not in state
+    assert any(
+        "malformed v" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_part_c_current_state_reports_corrupt_line_count(tmp_path: Path, caplog):
+    import logging
+
+    path = tmp_path / "c.jsonl"
+    path.write_text("{bad\n{also bad\n", encoding="utf-8")
+    store = CommitmentsStore(path=path)
+
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        replay = store.replay()
+
+    assert replay.records == {}
+    assert replay.corrupt_line_count == 2
+    assert any("skipped 2 corrupt jsonl line(s)" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_non_positive_v(tmp_path: Path, caplog):
+    """PR #137 review: ``v: 0`` / ``v: -1`` parse as int but aren't
+    legitimate schema versions (versions start at 1). The defensive
+    gate logs a warning and drops the event rather than silently
+    falling through to the v1 replay path."""
+    import logging
+    path = tmp_path / "c.jsonl"
+    rid_zero = make_commitment_id()
+    rid_neg = make_commitment_id()
+    events = [
+        {
+            "v": 0,
+            "type": "commitment_added",
+            "ts_unix": time.time(),
+            "id": rid_zero,
+            "record": {
+                "id": rid_zero, "channel_id": "c1", "text": "zero-v",
+                "kind": CommitmentKind.AGENT_PROMISE.value,
+                "status": CommitmentStatus.PENDING.value,
+                "created_at_unix": time.time(),
+            },
+        },
+        {
+            "v": -1,
+            "type": "commitment_added",
+            "ts_unix": time.time(),
+            "id": rid_neg,
+            "record": {
+                "id": rid_neg, "channel_id": "c1", "text": "neg-v",
+                "kind": CommitmentKind.AGENT_PROMISE.value,
+                "status": CommitmentStatus.PENDING.value,
+                "created_at_unix": time.time(),
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        state = store.current_state()
+    assert rid_zero not in state
+    assert rid_neg not in state
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("non-positive schema" in m for m in msgs) == 2, (
+        f"expected 2 non-positive warnings; got {msgs}"
+    )
+
+
+def test_commitments_init_exports_schema_version_constant():
+    """PR #137 review: ``COMMITMENTS_JSONL_SCHEMA_VERSION`` is part of
+    the package's ``__all__`` so future migration code can
+    ``from mimir.commitments import COMMITMENTS_JSONL_SCHEMA_VERSION``
+    without reaching into ``.store``."""
+    from mimir import commitments
+    assert "COMMITMENTS_JSONL_SCHEMA_VERSION" in commitments.__all__
+    assert isinstance(commitments.COMMITMENTS_JSONL_SCHEMA_VERSION, int)
+    assert commitments.COMMITMENTS_JSONL_SCHEMA_VERSION >= 1
+
+
+# ─── Scale warning tests (chainlink #106) ───────────────────────────────
+
+
+def _make_pending_event(n: int) -> dict:
+    """Return a minimal ``commitment_added`` event for scale-warning tests."""
+    rid = f"c-scale-{n:05d}"
+    return {
+        "type": "commitment_added",
+        "v": 1,
+        "ts_unix": time.time(),
+        "id": rid,
+        "record": {
+            "id": rid,
+            "channel_id": "c1",
+            "text": f"scale test {n}",
+            "kind": CommitmentKind.AGENT_PROMISE.value,
+            "status": CommitmentStatus.PENDING.value,
+            "created_at_unix": time.time(),
+        },
+    }
+
+
+def test_current_state_no_warning_below_threshold(tmp_path: Path, caplog):
+    """Stores with few events produce no scale warning."""
+    import logging
+    from mimir.commitments.store import _LARGE_STORE_WARN_THRESHOLD
+
+    path = tmp_path / "commitments.jsonl"
+    # Write exactly _LARGE_STORE_WARN_THRESHOLD events (threshold, not over).
+    events = [_make_pending_event(i) for i in range(_LARGE_STORE_WARN_THRESHOLD)]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        store.current_state()
+
+    scale_warnings = [
+        r for r in caplog.records
+        if "store has" in r.getMessage() and "threshold" in r.getMessage()
+    ]
+    assert len(scale_warnings) == 0, (
+        f"expected no scale warning at or below threshold; got {scale_warnings}"
+    )
+
+
+def test_current_state_warns_once_above_threshold(tmp_path: Path, caplog):
+    """Stores exceeding the threshold emit exactly one warning, even across
+    multiple ``current_state()`` calls (the per-instance flag deduplicates)."""
+    import logging
+    from mimir.commitments.store import _LARGE_STORE_WARN_THRESHOLD
+
+    path = tmp_path / "commitments.jsonl"
+    # Write _LARGE_STORE_WARN_THRESHOLD + 1 events to cross the threshold.
+    over = _LARGE_STORE_WARN_THRESHOLD + 1
+    events = [_make_pending_event(i) for i in range(over)]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+    store = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        store.current_state()
+        store.current_state()  # second call must not emit a duplicate
+
+    scale_warnings = [
+        r for r in caplog.records
+        if "store has" in r.getMessage() and "threshold" in r.getMessage()
+    ]
+    assert len(scale_warnings) == 1, (
+        f"expected exactly 1 scale warning for {over} events; got {scale_warnings}"
+    )
+    assert str(over) in scale_warnings[0].getMessage(), (
+        "warning should include the actual event count"
+    )
+
+
+def test_current_state_warning_flag_per_instance(tmp_path: Path, caplog):
+    """Two separate ``CommitmentsStore`` instances with the same large file
+    each warn independently (the flag is per-instance, not module-global)."""
+    import logging
+    from mimir.commitments.store import _LARGE_STORE_WARN_THRESHOLD
+
+    path = tmp_path / "commitments.jsonl"
+    over = _LARGE_STORE_WARN_THRESHOLD + 1
+    events = [_make_pending_event(i) for i in range(over)]
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+    store_a = CommitmentsStore(path=path)
+    store_b = CommitmentsStore(path=path)
+    with caplog.at_level(logging.WARNING, logger="mimir.commitments.store"):
+        store_a.current_state()
+        store_b.current_state()
+
+    scale_warnings = [
+        r for r in caplog.records
+        if "store has" in r.getMessage() and "threshold" in r.getMessage()
+    ]
+    assert len(scale_warnings) == 2, (
+        f"expected 2 scale warnings (one per instance); got {scale_warnings}"
+    )
+
+
+# ─── Ownership and authorization (chainlink #867) ───────────────────────
+
+
+def test_dedupe_key_includes_owner():
+    """Same channel + text + recipient but different owners must produce
+    different dedupe keys — different owners cannot dedupe together."""
+    k_alice = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+        owner_principal="alice",
+    )
+    k_bob = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+        owner_principal="bob",
+    )
+    k_no_owner = make_dedupe_key(
+        channel_id="c1", text="X", due_window_start_unix=None,
+    )
+    assert k_alice != k_bob
+    assert k_alice != k_no_owner
+    assert k_bob != k_no_owner
+
+
+@pytest.mark.asyncio
+async def test_add_persists_owner_principal(tmp_path: Path):
+    """Owner principal round-trips through JSONL → replay."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Review PR #111",
+        owner_principal="user:alice",
+    ))
+    state = store.current_state()
+    assert state[rec.id].owner_principal == "user:alice"
+
+
+@pytest.mark.asyncio
+async def test_add_persists_visibility(tmp_path: Path):
+    """Visibility field round-trips through JSONL → replay."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Service task",
+        visibility=CommitmentVisibility.SERVICE.value,
+        service_name="poller",
+    ))
+    state = store.current_state()
+    assert state[rec.id].visibility == CommitmentVisibility.SERVICE.value
+    assert state[rec.id].service_name == "poller"
+
+
+@pytest.mark.asyncio
+async def test_add_persists_recipient_principal(tmp_path: Path):
+    """Recipient principal round-trips through JSONL → replay."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-1",
+        text="Remind about deploy",
+        recipient_identity="alice",
+        recipient_principal="user:alice@example.com",
+    ))
+    state = store.current_state()
+    assert state[rec.id].recipient_principal == "user:alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_add_persists_originating_channel(tmp_path: Path):
+    """Originating channel round-trips through JSONL → replay."""
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="chan-2",
+        text="Migrated task",
+        originating_channel="chan-1",
+    ))
+    state = store.current_state()
+    assert state[rec.id].originating_channel == "chan-1"
+
+
+@pytest.mark.asyncio
+async def test_authorization_rejects_recipient_mutation(tmp_path: Path):
+    """Recipient identity does NOT grant mutation authority. Only owner
+    (or service actor) can mutate a commitment."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="X",
+        owner_principal="user:alice",
+        recipient_principal="user:bob",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:bob")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_authorization_allows_owner_mutation(tmp_path: Path):
+    """Owner principal CAN mutate their own commitments."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="X",
+        owner_principal="user:alice",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:alice")
+    assert ok is True
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "deliver"])
+async def test_legacy_admin_literal_principal_cannot_mutate_legacy_owner(
+    tmp_path: Path, operation: str,
+) -> None:
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    record = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Migrated legacy task",
+        owner_principal="legacy_admin",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+
+    mutate = getattr(store, operation)
+    assert await mutate(record.id, actor_principal="legacy_admin") is False
+    assert store.current_state()[record.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_authorization_rejects_cross_service_mutation(tmp_path: Path):
+    """A service prefix does not grant authority over another owner."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="Scheduler task",
+        owner_principal="service:scheduler",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    ok = await store.complete(rec.id, actor_principal="service:poller")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_authorization_service_owner_and_admin_matrix(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    poller = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Poller task",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    synthesis = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Synthesis task",
+        owner_principal="service:synthesis",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+
+    assert await store.complete(
+        synthesis.id, actor_principal="service:scheduler",
+    ) is False
+    assert await store.complete(
+        poller.id, actor_principal="service:poller",
+    ) is True
+    assert await store.complete(
+        synthesis.id, actor_principal="user:admin", actor_is_admin=True,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_authorization_rejects_private_without_owner(tmp_path: Path):
+    """Private visibility requires owner or service actor."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="X",
+        owner_principal="user:alice",
+        visibility=CommitmentVisibility.PRIVATE.value,
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:bob")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_service_visibility_requires_service_actor(tmp_path: Path):
+    """Service visibility requires service actor for mutation."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="Service task",
+        visibility=CommitmentVisibility.SERVICE.value,
+        service_name="poller",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:alice")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_owner(tmp_path: Path):
+    """List can filter by owner principal."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Alice task",
+        owner_principal="user:alice",
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Bob task",
+        owner_principal="user:bob",
+    ))
+    alice_rows = store.list(owner_principal="user:alice")
+    bob_rows = store.list(owner_principal="user:bob")
+    assert {r.text for r in alice_rows} == {"Alice task"}
+    assert {r.text for r in bob_rows} == {"Bob task"}
+
+
+@pytest.mark.asyncio
+async def test_include_service_does_not_grant_ownerless_service_access(
+    tmp_path: Path,
+):
+    """The category opt-in cannot expose an ownerless service record."""
+    from mimir.commitments import CommitmentVisibility
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Public task",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Service task",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    rows = store.list()
+    assert {r.text for r in rows} == {"Public task"}
+    rows_with_service = store.list(include_service=True)
+    assert {r.text for r in rows_with_service} == {"Public task"}
+
+
+@pytest.mark.asyncio
+async def test_find_by_dedupe_key_respects_owner(tmp_path: Path):
+    """find_by_dedupe_key with owner_principal only returns matches with same owner."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    r1 = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Same text",
+        owner_principal="user:alice",
+    ))
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Same text",
+        owner_principal="user:bob",
+    ))
+    found = store.find_by_dedupe_key(r1.dedupe_key, owner_principal="user:alice")
+    assert found is not None
+    assert found.id == r1.id
+    found_bob = store.find_by_dedupe_key(r1.dedupe_key, owner_principal="user:bob")
+    assert found_bob is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_record_no_owner_is_admin_only(tmp_path: Path):
+    """Records without owner_principal are treated as legacy/ambiguous and
+    require an explicit admin actor for mutation."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="c1",
+        text="Legacy task",
+    ))
+    ok = await store.complete(rec.id, actor_principal="user:any")
+    assert ok is False
+    state = store.current_state()
+    assert state[rec.id].status == CommitmentStatus.PENDING.value
+    ok_service = await store.complete(rec.id, actor_principal="service:admin")
+    assert ok_service is False
+    ok_admin = await store.complete(
+        rec.id, actor_principal="user:admin", actor_is_admin=True,
+    )
+    assert ok_admin is True
+
+
+@pytest.mark.asyncio
+async def test_poller_lifecycle_is_cross_owner_but_owner_mutations_are_not(
+    tmp_path: Path,
+):
+    """The poller sweeps lifecycle state without becoming the record owner."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    ownerless_due = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Ownerless due",
+    ))
+    user_due = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Alice due",
+        owner_principal="user:alice",
+    ))
+    ownerless_expired = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Ownerless expired",
+    ))
+
+    assert await store.deliver(
+        ownerless_due.id, actor_principal="service:poller",
+    ) is True
+    assert await store.deliver(
+        user_due.id, actor_principal="service:poller",
+    ) is True
+    assert await store.expire(
+        ownerless_expired.id, actor_principal="service:poller",
+    ) is True
+    assert await store.complete(
+        user_due.id, actor_principal="service:poller",
+    ) is False
+    assert await store.deliver(
+        ownerless_due.id, actor_principal="service:scheduler",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_service_list_is_exact_owner_scoped(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    poller = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Poller private",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    scheduler = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Scheduler protected",
+        owner_principal="service:scheduler",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+    public = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="User public",
+        owner_principal="user:alice",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    ownerless_public = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Ownerless public",
+        visibility=CommitmentVisibility.PUBLIC.value,
+    ))
+    legacy = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Ownerless service",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+
+    rows = store.list(
+        actor_principal="service:poller", include_service=True,
+    )
+    assert {row.id for row in rows} == {poller.id}
+    assert scheduler.id not in {row.id for row in rows}
+    assert public.id not in {row.id for row in rows}
+    assert ownerless_public.id not in {row.id for row in rows}
+    assert legacy.id not in {row.id for row in rows}
+
+    admin_rows = store.list(
+        actor_principal="user:admin", include_service=True,
+        actor_is_admin=True,
+    )
+    assert {row.id for row in admin_rows} == {
+        poller.id, scheduler.id, public.id, ownerless_public.id, legacy.id,
+    }
+
+@pytest.mark.asyncio
+async def test_admin_can_mutate_legacy_and_service_commitments(tmp_path: Path):
+    """Admin authority is explicit, not inferred from a service-like name."""
+    from mimir.commitments import CommitmentVisibility
+
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    legacy = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Legacy task",
+    ))
+    service = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Poller task",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+        service_name="poller",
+    ))
+
+    assert await store.complete(
+        legacy.id, actor_principal="user:jason", actor_is_admin=True,
+    ) is True
+    assert await store.dismiss(
+        service.id, actor_principal="user:jason", actor_is_admin=True,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_admin_list_can_view_other_owner_private_and_service(tmp_path: Path):
+    from mimir.commitments import CommitmentVisibility
+
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    private = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Alice private",
+        owner_principal="user:alice",
+        visibility=CommitmentVisibility.PRIVATE.value,
+    ))
+    service = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id=None, text="Service private",
+        owner_principal="service:poller",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+
+    rows = store.list(
+        actor_principal="user:jason",
+        include_service=True,
+        actor_is_admin=True,
+    )
+    assert {row.id for row in rows} == {private.id, service.id}

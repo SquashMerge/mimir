@@ -1,0 +1,867 @@
+"""Web search + URL fetch tools (gated on LLM provider).
+
+Two tools, ported from open-strix's ``tools.py``:
+
+* ``web_search`` — Tavily HTTP API. Returns compact YAML results.
+* ``fetch_url``  — download a URL into ``<home>/attachments/fetch-cache/``
+  and return the virtual path + metadata; the agent then re-reads
+  the body via the standard Read tool.
+
+These are added to ``all_mimir_tools()`` only when the configured
+LLM provider is **not** ``claude_code`` — Claude Code subprocesses
+get WebSearch/WebFetch natively from the SDK, so layering Tavily
+on top would be both redundant and stylistically inconsistent.
+For external providers (anthropic API, openai-compat, voyage, …)
+these tools are how the agent reaches the open web.
+
+``web_search`` additionally requires ``TAVILY_API_KEY``. ``fetch_url``
+does not — it's a thin urllib wrapper. Operators can disable
+``fetch_url`` independently via ``MIMIR_FETCH_URL_DISABLED=1``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import http.client
+import ipaddress
+import json
+import logging
+import os
+import re
+import socket
+from contextvars import ContextVar, Token
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlparse, urlsplit
+from http import HTTPStatus
+from urllib.request import (
+    HTTPRedirectHandler,
+    HTTPHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
+
+import yaml
+from langchain_core.tools import ToolException, tool
+from pypdf import PdfReader
+
+from .web_search_destination import web_search_url
+
+log = logging.getLogger(__name__)
+
+FETCH_CHUNK_SIZE_BYTES = 64 * 1024
+FETCH_PDF_MAX_PAGES_DEFAULT = 100
+FETCH_PDF_MAX_TEXT_BYTES_DEFAULT = 1_000_000
+FETCH_CONTENT_TYPE_MAX_CHARS = 127
+FETCH_CONTENT_TYPE_FALLBACK = "application/octet-stream"
+FETCH_MAX_AGE_SECONDS_DEFAULT = 300
+UTC = timezone.utc
+
+# ─── Module-level dependency injection ─────────────────────────────
+# Set once at server startup; tools read these at invocation time so
+# tests can override without monkeypatching the @tool decorators.
+
+_home: Path | None = None
+_authorized_fetch_urls: ContextVar[frozenset[str] | None] = ContextVar(
+    "mimir_authorized_fetch_urls", default=None,
+)
+_fetched_body_recorder: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "mimir_fetched_body_recorder", default=None,
+)
+
+
+def set_home(home: Path | None) -> None:
+    """Mimir home path. Used to compute the fetch-cache directory."""
+    global _home
+    _home = home
+
+
+def begin_authorized_fetch(urls: frozenset[str]) -> Token:
+    """Bind the exact URLs authorized for one middleware-controlled fetch."""
+    return _authorized_fetch_urls.set(urls)
+
+
+def end_authorized_fetch(token: Token) -> None:
+    _authorized_fetch_urls.reset(token)
+
+
+def begin_fetched_body_recording(recorder: Callable[[str], None] | None) -> Token:
+    """Bind the server-owned callback for one authorized fetch_url execution."""
+    return _fetched_body_recorder.set(recorder)
+
+
+def end_fetched_body_recording(token: Token) -> None:
+    _fetched_body_recorder.reset(token)
+
+
+def _record_fetched_body(body: bytes) -> None:
+    recorder = _fetched_body_recorder.get()
+    if recorder is not None:
+        recorder(body.decode("utf-8", errors="replace"))
+
+
+def _fetch_cache_dir() -> Path:
+    if _home is None:
+        raise RuntimeError(
+            "mimir.tools.web: set_home(...) was never called — "
+            "it is wired by mimir.runtime.create_agent_runtime(); "
+            "build the agent runtime before using fetch tools."
+        )
+    from ..turn_stores import turn_store
+
+    prefix = turn_store("attachments/fetch-cache")
+    from .._context import get_current_turn
+    if prefix is None and get_current_turn() is not None:
+        raise RuntimeError("fetch_url requires a valid turn scratch")
+    return _home / prefix.lstrip("/") if prefix else _home / "attachments" / "fetch-cache"
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _pdf_content_type(content_type: object) -> bool:
+    return str(content_type).partition(";")[0].strip().lower() == "application/pdf"
+
+
+def _parsed_content_type(value: object) -> str:
+    """Return one bounded RFC media type, never raw header text."""
+    media_type = str(value).partition(";")[0].strip().lower()
+    token = r"[!#$%&'*+.^_`|~0-9a-z-]+"
+    if (
+        len(media_type) <= FETCH_CONTENT_TYPE_MAX_CHARS
+        and re.fullmatch(rf"{token}/{token}", media_type)
+    ):
+        return media_type
+    return FETCH_CONTENT_TYPE_FALLBACK
+
+
+def _inline_pdf_extraction(value: object) -> dict[str, Any] | None:
+    """Rebuild nested PDF metadata from fixed strings and typed scalars."""
+    if not isinstance(value, dict):
+        return None
+
+    payload: dict[str, Any] = {}
+    status = value.get("status")
+    if isinstance(status, str) and status in {"success", "failed"}:
+        payload["status"] = status
+
+    for key in (
+        "max_pages", "max_output_bytes", "pages_extracted",
+        "total_pages", "output_bytes",
+    ):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            payload[key] = item
+
+    truncated = value.get("truncated")
+    if isinstance(truncated, bool):
+        payload["truncated"] = truncated
+
+    truncation_reasons = value.get("truncation_reasons")
+    if isinstance(truncation_reasons, list):
+        allowed_reasons = {"page_limit", "output_byte_limit"}
+        payload["truncation_reasons"] = [
+            reason for reason in truncation_reasons
+            if isinstance(reason, str) and reason in allowed_reasons
+        ]
+
+    reason = value.get("reason")
+    if isinstance(reason, str) and reason in {
+        "PDF contains no extractable text", "PDF extraction failed",
+    }:
+        payload["reason"] = reason
+
+    return payload
+
+
+def _inline_fetch_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Build the model-visible fetch result from the server-owned schema."""
+    keys = (
+        "url", "status", "content_type", "bytes", "sha256",
+        "file_path", "metadata_path", "text_path", "cached", "fetched_at",
+    )
+    payload = {key: metadata[key] for key in keys if key in metadata}
+    payload["content_type"] = _parsed_content_type(payload.get("content_type", ""))
+    pdf_extraction = _inline_pdf_extraction(metadata.get("pdf_extraction"))
+    if pdf_extraction is not None:
+        payload["pdf_extraction"] = pdf_extraction
+    return payload
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _extract_pdf_text(
+    body_path: Path,
+    text_path: Path,
+    *,
+    max_pages: int,
+    max_text_bytes: int,
+) -> dict[str, Any]:
+    """Extract bounded text without changing or replacing the fetched PDF."""
+    result: dict[str, Any] = {
+        "status": "failed",
+        "max_pages": max_pages,
+        "max_output_bytes": max_text_bytes,
+    }
+    try:
+        text_path.unlink(missing_ok=True)
+        reader = PdfReader(body_path)
+        total_pages = len(reader.pages)
+        parts: list[str] = []
+        output_bytes = 0
+        output_truncated = False
+        pages_extracted = 0
+        for page in reader.pages[:max_pages]:
+            page_text = page.extract_text() or ""
+            if parts and page_text:
+                page_text = "\n\n" + page_text
+            remaining = max_text_bytes - output_bytes
+            bounded, truncated = _truncate_utf8(page_text, remaining)
+            if bounded:
+                parts.append(bounded)
+                output_bytes += len(bounded.encode("utf-8"))
+            pages_extracted += 1
+            if truncated or output_bytes >= max_text_bytes:
+                output_truncated = truncated or pages_extracted < min(total_pages, max_pages)
+                break
+
+        text = "".join(parts)
+        if not text.strip():
+            result["reason"] = "PDF contains no extractable text"
+            return result
+
+        truncation_reasons: list[str] = []
+        if total_pages > max_pages:
+            truncation_reasons.append("page_limit")
+        if output_truncated:
+            truncation_reasons.append("output_byte_limit")
+        text_path.write_text(text, encoding="utf-8")
+        result.update({
+            "status": "success",
+            "pages_extracted": pages_extracted,
+            "total_pages": total_pages,
+            "output_bytes": output_bytes,
+            "truncated": bool(truncation_reasons),
+            "truncation_reasons": truncation_reasons,
+        })
+        return result
+    except Exception:
+        try:
+            text_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        result["reason"] = "PDF extraction failed"
+        return result
+
+
+async def _add_pdf_extraction(
+    metadata: dict[str, Any],
+    *,
+    body_path: Path,
+    text_path: Path,
+) -> None:
+    max_pages = _positive_env_int(
+        "MIMIR_FETCH_PDF_MAX_PAGES", FETCH_PDF_MAX_PAGES_DEFAULT,
+    )
+    max_text_bytes = _positive_env_int(
+        "MIMIR_FETCH_PDF_MAX_TEXT_BYTES", FETCH_PDF_MAX_TEXT_BYTES_DEFAULT,
+    )
+    extraction = await asyncio.to_thread(
+        _extract_pdf_text,
+        body_path,
+        text_path,
+        max_pages=max_pages,
+        max_text_bytes=max_text_bytes,
+    )
+    metadata["pdf_extraction"] = extraction
+    if extraction["status"] == "success" and _home is not None:
+        metadata["text_path"] = _virtual_path(text_path, root=_home)
+    else:
+        metadata.pop("text_path", None)
+
+
+# ─── HTTP helpers (verbatim port from open-strix) ──────────────────
+
+
+def _virtual_path(path: Path, *, root: Path) -> str:
+    return "/" + path.relative_to(root).as_posix()
+
+
+def _sanitize_download_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
+    if not cleaned:
+        return "download.bin"
+    if len(cleaned) <= 120:
+        return cleaned
+    suffix = Path(cleaned).suffix
+    stem = Path(cleaned).stem[: max(1, 120 - len(suffix))]
+    return f"{stem}{suffix}"
+
+
+def _name_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    raw_name = Path(unquote(parsed.path)).name
+    if not raw_name:
+        raw_name = "index.html" if parsed.path in {"", "/"} else "download.bin"
+    name = _sanitize_download_name(raw_name)
+    if "." not in name:
+        return f"{name}.bin"
+    return name
+
+
+class SSRFBlocked(ValueError):
+    """Raised when a fetch target resolves to a non-public address.
+
+    Subclass of ValueError so the existing exception handling on
+    fetch_url / web_search picks it up — but distinct enough that
+    callers can re-raise / log specifically if needed.
+    """
+
+
+def _validate_public_host(hostname: str) -> tuple[str, ...]:
+    """Reject SSRF-shaped targets before any network call.
+
+    Resolves ``hostname`` via ``getaddrinfo`` and asserts every returned
+    address is a public unicast IP — private RFC1918, loopback,
+    link-local (``169.254.0.0/16`` covers AWS/GCP metadata),
+    site-local, multicast, reserved, and the literal ``localhost``
+    string all reject. Defends against prompt-controlled URLs pivoting
+    the agent into the operator's internal network.
+
+    The returned addresses are the only permitted dial targets. The
+    connection handlers pin every hop while retaining the original Host
+    header and TLS server name.
+    """
+    if not hostname or hostname.lower() in ("localhost", "localhost.localdomain"):
+        raise SSRFBlocked(f"fetch target host {hostname!r} is not allowed")
+    # Resolve. If the host is an IP literal getaddrinfo just echoes it.
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise SSRFBlocked(f"DNS resolution failed for {hostname!r}: {exc}") from exc
+    addresses = []
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise SSRFBlocked(
+                f"could not parse resolved address {ip_str!r} for {hostname!r}"
+            ) from None
+        # Reject every category that could land traffic inside the
+        # network perimeter or against a service-meta endpoint.
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+            or not ip.is_global
+        ):
+            raise SSRFBlocked(
+                f"fetch target {hostname!r} resolves to non-public address {ip_str}"
+            )
+        addresses.append(ip_str)
+    if not addresses:
+        raise SSRFBlocked(f"no addresses resolved for {hostname!r}")
+    return tuple(addresses)
+
+
+def _validate_fetch_url(url: str) -> tuple[str, ...]:
+    """Run SSRF + scheme checks on a candidate URL."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise SSRFBlocked(f"only http/https URLs are allowed (got {parsed.scheme!r})")
+    if not parsed.hostname:
+        raise SSRFBlocked("fetch target has no hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise SSRFBlocked("credentials in fetch URL are not allowed")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise SSRFBlocked("invalid fetch port") from exc
+    return _validate_public_host(parsed.hostname)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, *, addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._addresses = addresses
+
+    def connect(self):
+        # Never fall back to resolving the hostname, including on connection
+        # failure: trying another vetted address is safe, falling back is not.
+        self.sock = socket.create_connection((self._addresses[0], self.port), self.timeout,
+                                             self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *, addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._addresses = addresses
+
+    def connect(self):
+        self.sock = socket.create_connection((self._addresses[0], self.port), self.timeout,
+                                             self.source_address)
+        # Preserve both SNI and certificate hostname verification; never use
+        # the dialed IP as the TLS identity.
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+class _PinnedHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        addresses = _validate_fetch_url(req.full_url)
+        return self.do_open(lambda host, **kw: _PinnedHTTPConnection(host, addresses=addresses, **kw), req)
+
+
+class _PinnedHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        addresses = _validate_fetch_url(req.full_url)
+        return self.do_open(lambda host, **kw: _PinnedHTTPSConnection(
+            host, addresses=addresses, context=self._context, **kw), req)
+
+
+class _SSRFCheckingRedirectHandler(HTTPRedirectHandler):
+    """``HTTPRedirectHandler`` that re-runs ``_validate_fetch_url`` on every hop.
+
+    Without this, a whitelisted public URL can ``Location:``-redirect to
+    ``http://169.254.169.254/...`` (AWS metadata service) — the initial
+    validation passed but the second hop is unchecked. Re-validating on
+    each redirect closes the cross-hop bypass.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        # Will raise SSRFBlocked if the redirect target is unsafe.
+        _validate_fetch_url(newurl)
+        allowed = _authorized_fetch_urls.get()
+        if allowed is not None:
+            from ..access_control import SinkCategory, normalize_sink_destination
+
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, newurl)
+            if normalized not in allowed:
+                raise SSRFBlocked(
+                    f"redirect target host {urlsplit(newurl).hostname!r} needs approval "
+                    f"for exact URL {newurl!r}"
+                )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(request: Request, timeout: int):
+    """Open a URL with the SSRF-checking redirect handler installed."""
+    # Ignore environment proxies: a proxy would resolve the original hostname
+    # outside our pinned transport, bypassing the SSRF boundary.
+    opener = build_opener(ProxyHandler({}), _PinnedHTTPHandler(), _PinnedHTTPSHandler(),
+                          _SSRFCheckingRedirectHandler())
+    return opener.open(request, timeout=timeout)  # noqa: S310
+
+
+def _download_url_bytes(
+    *,
+    url: str,
+    target_path: Path,
+    timeout_seconds: int,
+    max_bytes: int,
+) -> dict[str, Any]:
+    request = Request(url=url, headers={"User-Agent": "mimir/fetch_url"})
+    with _open_url(request, timeout=timeout_seconds) as response:
+        status = int(response.getcode() or 0)
+        content_type = _parsed_content_type(response.headers.get("Content-Type", ""))
+        # Content-Length pre-check: refuse the download before writing
+        # a single byte if the server advertises a size beyond max_bytes.
+        # The streaming check below remains the source of truth for
+        # responses without Content-Length or with lying headers.
+        advertised_len = response.headers.get("Content-Length")
+        if advertised_len is not None:
+            try:
+                advertised = int(advertised_len)
+            except (TypeError, ValueError):
+                # Unparseable Content-Length: fall back to the streaming check.
+                advertised = None
+            if advertised is not None and advertised > max_bytes:
+                raise ValueError("download exceeded max_bytes")
+        total_bytes = 0
+        hasher = hashlib.sha256()
+        with target_path.open("wb") as f:
+            while True:
+                chunk = response.read(FETCH_CHUNK_SIZE_BYTES)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise ValueError("download exceeded max_bytes")
+                hasher.update(chunk)
+                f.write(chunk)
+    return {
+        "status": status,
+        "content_type": content_type,
+        "bytes": total_bytes,
+        "sha256": hasher.hexdigest(),
+    }
+
+
+def _post_json(
+    *,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout_seconds: int,
+    max_bytes: int = 2_000_000,
+) -> dict[str, Any]:
+    request_bytes = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "mimir/web_search",
+        **headers,
+    }
+    # Tavily endpoint is a public API but we still gate it through the
+    # SSRF check — operator-overridden TAVILY_SEARCH_URL could point
+    # anywhere and the same defenses apply.
+    _validate_fetch_url(url)
+    request = Request(url=url, data=request_bytes, headers=request_headers, method="POST")
+    with _open_url(request, timeout=timeout_seconds) as response:
+        status = int(response.getcode() or 0)
+        body = response.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            raise ValueError(f"response exceeded max_bytes={max_bytes} for url={url}")
+        decoded = body.decode("utf-8", errors="replace")
+        parsed = json.loads(decoded)
+        return {
+            "status": status,
+            "json": parsed,
+            "response_bytes": len(body),
+            "final_url": str(response.geturl()),
+        }
+
+
+# ─── Tools ─────────────────────────────────────────────────────────
+
+
+@tool("web_search")
+async def web_search(
+    query: str,
+    limit: int = 5,
+    topic: str = "general",
+    time_range: str | None = None,
+    timeout_seconds: int = 20,
+) -> str:
+    """Search the web via Tavily and return compact YAML-formatted results.
+
+    Args:
+        query: Search text. Required.
+        limit: Max results to return (1-10). Defaults to 5.
+        topic: One of ``general``, ``news``, ``finance``.
+        time_range: Optional ``day``, ``week``, ``month``, or ``year``.
+        timeout_seconds: HTTP timeout. Must be > 0.
+
+    Returns YAML with rank/title/url/snippet/score per hit. Snippets
+    are truncated at 800 chars.
+    """
+    normalized_query = query.strip()
+    if not normalized_query:
+        raise ToolException("query is required.")
+    if limit <= 0:
+        raise ToolException("limit must be > 0.")
+    if limit > 10:
+        limit = 10
+
+    normalized_topic = topic.strip().lower()
+    if normalized_topic not in {"general", "news", "finance"}:
+        raise ToolException("topic must be one of: general, news, finance.")
+
+    normalized_time_range = time_range.strip().lower() if time_range else None
+    if normalized_time_range and normalized_time_range not in {"day", "week", "month", "year"}:
+        raise ToolException("time_range must be one of: day, week, month, year.")
+    if timeout_seconds <= 0:
+        raise ToolException("timeout_seconds must be > 0.")
+
+    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        raise ToolException("web_search is disabled (TAVILY_API_KEY not set).")
+
+    search_url = web_search_url()
+
+    payload: dict[str, Any] = {
+        "query": normalized_query,
+        "topic": normalized_topic,
+        "max_results": limit,
+        "search_depth": "basic",
+        "include_answer": False,
+        "include_raw_content": False,
+        "include_images": False,
+    }
+    if normalized_time_range:
+        payload["time_range"] = normalized_time_range
+
+    try:
+        response = await asyncio.to_thread(
+            _post_json,
+            url=search_url,
+            payload=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout_seconds=timeout_seconds,
+        )
+    except HTTPError as exc:
+        raise ToolException(f"web_search failed: HTTP {exc.code} ({exc.reason})") from exc
+    except URLError as exc:
+        raise ToolException(f"web_search failed: {getattr(exc, 'reason', exc)}") from exc
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ToolException(f"web_search failed: {exc}") from exc
+
+    raw = response["json"]
+    rows = raw.get("results")
+    if not isinstance(rows, list):
+        rows = []
+
+    compact: list[dict[str, Any]] = []
+    for idx, item in enumerate(rows[:limit], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        url = str(item.get("url", "")).strip()
+        snippet = str(item.get("content", "")).strip()
+        if len(snippet) > 800:
+            snippet = snippet[:800].rstrip() + "..."
+        compact.append(
+            {"rank": idx, "title": title, "url": url, "snippet": snippet, "score": item.get("score")},
+        )
+
+    return yaml.safe_dump(
+        {
+            "query": normalized_query,
+            "topic": normalized_topic,
+            "time_range": normalized_time_range,
+            "count": len(compact),
+            "results": compact,
+            "response_time": raw.get("response_time"),
+        },
+        sort_keys=False,
+    )
+
+
+@tool("fetch_url")
+async def fetch_url(
+    url: str,
+    timeout_seconds: int = 20,
+    max_bytes: int = 2_000_000,
+    max_age_seconds: int = FETCH_MAX_AGE_SECONDS_DEFAULT,
+    refresh: bool = False,
+) -> str:
+    """Download a URL to a cache file and return the virtual path + metadata.
+
+    The body is written to ``<home>/attachments/fetch-cache/<digest>-<name>``;
+    a sidecar ``.meta.json`` records URL, status, content-type, sha256,
+    and bytes. For ``application/pdf``, bounded extracted text is written
+    alongside the unchanged body and returned as ``text_path``. The agent
+    re-reads the appropriate returned path via the standard Read tool.
+
+    Args:
+        url: HTTP/HTTPS URL.
+        timeout_seconds: Socket timeout. Must be > 0.
+        max_bytes: Hard cap on body size; the download aborts if exceeded.
+        max_age_seconds: Cache freshness TTL, default 300 seconds (5 minutes).
+            Reuses repeated reads without indefinitely hiding changing pages.
+            Must be >= 0; 0 always downloads. Missing/invalid legacy timestamps
+            are stale. Disk retention is separate: the daily scratch janitor
+            removes files older than MIMIR_SCRATCH_TTL_DAYS (default 1 day),
+            but retains fetch-cache files while any turn is active.
+        refresh: Force a download regardless of cache age. Defaults to False.
+
+    Results include cached (whether this call reused a body) and fetched_at
+    (UTC ISO-8601 download time, unchanged on cache hits).
+    """
+    normalized_url = url.strip()
+    if not normalized_url:
+        raise ToolException("url is required.")
+    if timeout_seconds <= 0:
+        raise ToolException("timeout_seconds must be > 0.")
+    if max_bytes <= 0:
+        raise ToolException("max_bytes must be > 0.")
+    if max_age_seconds < 0:
+        raise ToolException("max_age_seconds must be >= 0.")
+
+    # SSRF + scheme validation. Surface a bounded tool error instead of letting
+    # SSRFBlocked escape as a generic "ValueError: ..." result.
+    try:
+        _validate_fetch_url(normalized_url)
+    except SSRFBlocked as exc:
+        raise ToolException(f"fetch_url failed: {exc}") from exc
+
+    cache_dir = _fetch_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    base_name = _name_from_url(normalized_url)
+    digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()[:12]
+    # Stable URL keys bound disk growth; freshness comes from the sidecar,
+    # never its mtime (cache hits may rewrite sanitized metadata).
+    body_path = cache_dir / f"{digest}-{base_name}"
+    meta_path = cache_dir / f"{body_path.name}.meta.json"
+    text_path = cache_dir / f"{body_path.name}.txt"
+    if not refresh and max_age_seconds > 0 and body_path.is_file() and meta_path.is_file():
+        try:
+            existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_meta = None
+        age = None
+        if isinstance(existing_meta, dict) and existing_meta.get("url") == normalized_url:
+            try:
+                fetched_at = datetime.fromisoformat(existing_meta["fetched_at"])
+                age = (datetime.now(UTC) - fetched_at).total_seconds()
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        if age is not None and 0 <= age < max_age_seconds:
+            existing_meta["cached"] = True
+            existing_meta["fetched_at"] = fetched_at.astimezone(UTC).isoformat()
+            extraction = existing_meta.get("pdf_extraction")
+            needs_extraction = not isinstance(extraction, dict) or (
+                extraction.get("status") == "success" and not text_path.is_file()
+            )
+            existing_meta["content_type"] = _parsed_content_type(
+                existing_meta.get("content_type", "")
+            )
+            if _pdf_content_type(existing_meta["content_type"]) and needs_extraction:
+                await _add_pdf_extraction(
+                    existing_meta, body_path=body_path, text_path=text_path,
+                )
+            cache_root = _home
+            existing_meta["file_path"] = _virtual_path(body_path, root=cache_root)
+            existing_meta["metadata_path"] = _virtual_path(meta_path, root=cache_root)
+            extraction = existing_meta.get("pdf_extraction")
+            if (
+                isinstance(extraction, dict)
+                and extraction.get("status") == "success"
+                and text_path.is_file()
+            ):
+                existing_meta["text_path"] = _virtual_path(text_path, root=cache_root)
+            else:
+                existing_meta.pop("text_path", None)
+            cached_payload = _inline_fetch_metadata(existing_meta)
+            meta_path.write_text(
+                json.dumps(cached_payload, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return yaml.safe_dump(cached_payload, sort_keys=False)
+
+    # A failed refresh must not leave metadata blessing a partial replacement.
+    meta_path.unlink(missing_ok=True)
+    text_path.unlink(missing_ok=True)
+    try:
+        fetched = await asyncio.to_thread(
+            _download_url_bytes,
+            url=normalized_url,
+            target_path=body_path,
+            timeout_seconds=timeout_seconds,
+            max_bytes=max_bytes,
+        )
+    except HTTPError as exc:
+        # The server controls exc.reason; use the local status table rather
+        # than echoing potentially adversarial response text into the turn.
+        reason = HTTPStatus(exc.code).phrase if exc.code in HTTPStatus._value2member_map_ else "HTTP error"
+        raise ToolException(f"fetch_url failed: HTTP {exc.code} {reason}.") from None
+    except URLError:
+        raise ToolException("fetch_url failed: URL request failed.") from None
+    except ValueError as exc:
+        body_path.unlink(missing_ok=True)
+        raise ToolException(f"fetch_url failed: {exc}") from exc
+    except OSError:
+        body_path.unlink(missing_ok=True)
+        raise ToolException("fetch_url failed: could not write downloaded content.") from None
+
+    try:
+        downloaded_body = body_path.read_bytes()
+    except OSError:
+        body_path.unlink(missing_ok=True)
+        raise ToolException("fetch_url failed: could not read downloaded content.") from None
+    if hashlib.sha256(downloaded_body).hexdigest() != fetched["sha256"]:
+        body_path.unlink(missing_ok=True)
+        raise ToolException("fetch_url failed: downloaded content changed before verification.")
+
+    if _home is None:
+        raise ToolException("fetch_url failed: home dir not configured.")
+
+    body_virtual_path = _virtual_path(body_path, root=_home)
+    meta_virtual_path = _virtual_path(meta_path, root=_home)
+    meta_payload = {
+        "url": normalized_url,
+        "cached": False,
+        "fetched_at": datetime.now(UTC).isoformat(),
+        "status": fetched["status"],
+        "content_type": fetched["content_type"],
+        "bytes": fetched["bytes"],
+        "sha256": fetched["sha256"],
+        "file_path": body_virtual_path,
+        "metadata_path": meta_virtual_path,
+    }
+    if _pdf_content_type(fetched["content_type"]):
+        await _add_pdf_extraction(
+            meta_payload, body_path=body_path, text_path=text_path,
+        )
+    meta_payload = _inline_fetch_metadata(meta_payload)
+    meta_path.write_text(
+        json.dumps(meta_payload, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _record_fetched_body(downloaded_body)
+    return yaml.safe_dump(meta_payload, sort_keys=False)
+
+
+web_search.handle_tool_error = True
+fetch_url.handle_tool_error = True
+
+
+# ─── Provider gating ───────────────────────────────────────────────
+
+
+def _provider_from_model_spec(model_spec: str | None) -> str:
+    """Extract the provider prefix from a ``MIMIR_MODEL_SPEC`` value.
+
+    The spec format is ``provider:model`` (e.g. ``claude-code:claude-sonnet-4-6``,
+    ``anthropic:claude-haiku-4-5``, ``openai:gpt-5.4-nano``). Falls back to
+    ``"claude_code"`` when unparseable — matches mimir's default model_spec.
+    Both ``claude-code`` and ``claude_code`` are normalized to ``claude_code``.
+    """
+    if not model_spec:
+        return "claude_code"
+    head, _, _ = model_spec.partition(":")
+    return head.strip().lower().replace("-", "_") or "claude_code"
+
+
+def web_tools_enabled(model_spec: str | None = None) -> tuple[bool, bool]:
+    """Return ``(web_search_enabled, fetch_url_enabled)`` for the active provider.
+
+    * ``web_search`` is enabled only when the provider is not ``claude_code``
+      AND ``TAVILY_API_KEY`` is set.
+    * ``fetch_url`` is enabled only when the provider is not ``claude_code``
+      AND ``MIMIR_FETCH_URL_DISABLED`` is not truthy.
+
+    Claude Code path already exposes native WebSearch/WebFetch tools via
+    the subprocess SDK; adding Tavily on top would duplicate (and possibly
+    conflict with) the native surface.
+    """
+    spec = model_spec if model_spec is not None else os.environ.get("MIMIR_MODEL_SPEC", "")
+    provider = _provider_from_model_spec(spec)
+    if provider == "claude_code":
+        return (False, False)
+    web_search_on = bool(os.environ.get("TAVILY_API_KEY", "").strip())
+    fetch_url_on = os.environ.get("MIMIR_FETCH_URL_DISABLED", "").strip().lower() not in (
+        "1", "true", "yes", "on",
+    )
+    return (web_search_on, fetch_url_on)

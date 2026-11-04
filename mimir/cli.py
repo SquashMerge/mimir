@@ -1,0 +1,939 @@
+"""Command-line entrypoint for mimir.
+
+Subcommands:
+- ``mimir setup [--home DIR]`` — scaffold or refresh an agent home (dirs, .env
+  template, scheduler, skills, subagents, and managed git defaults).
+- ``mimir run [--home DIR]``   — run the server (default if no subcommand).
+- ``mimir identities {list,add,remove,resolve}`` — manage identity
+  reconciliation entries (FUTURE_WORK §6.1).
+
+Both run/setup commands export ``MIMIR_HOME`` to the resolved path before
+loading ``Config.from_env()``, so the CLI flag and the env var converge.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
+
+log = logging.getLogger(__name__)
+
+
+def _egress_since(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone required")
+        return parsed.astimezone(timezone.utc)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--since requires a timezone-aware ISO timestamp") from exc
+
+
+def _print_egress_shadow_report(events_path: Path, since: datetime | None) -> None:
+    """Stream a read-only count of the dedicated shadow event by operator pivot."""
+    counts: Counter[tuple[str, str, str, str, str, str]] = Counter()
+    if events_path.is_file():
+        with events_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                    if not isinstance(event, dict) or event.get("type") != "egress_veto_would_block":
+                        continue
+                    if since is not None:
+                        stamp = datetime.fromisoformat(
+                            event["timestamp"].replace("Z", "+00:00"),
+                        )
+                        if stamp.tzinfo is None or stamp.astimezone(timezone.utc) < since:
+                            continue
+                    key = tuple(str(event.get(field) or "-") for field in (
+                        "tool", "destination_host", "trigger", "poller", "reason", "origin",
+                    ))
+                    counts[key] += 1
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+    print("Egress veto shadow would-blocks:")
+    if not counts:
+        print("  (no events recorded)")
+    for (tool, host, trigger, poller, reason, origin), count in sorted(counts.items()):
+        print(f"  {count}  tool={tool} host={host} trigger={trigger} poller={poller} reason={reason} origin={origin}")
+
+# ---------------------------------------------------------------------------
+# Re-exports from commands.setup (backward compatibility — tests and external
+# code that imports from mimir.cli continue to work unchanged).
+# ---------------------------------------------------------------------------
+from .commands.setup import (  # noqa: E402
+    setup_home,
+    _print_setup_report,
+    regenerate_api_key,
+    _skill_env_summary,
+    EMBEDDING_PRESETS,
+    DEFAULT_EMBEDDING_PRESET,
+    DEFAULT_ENV_TEMPLATE,
+    DEFAULT_HEARTBEAT_BACKLOG,
+    DEFAULT_HEARTBEAT_PATTERNS,
+    DEFAULT_VSM_TERMS,
+    DEFAULT_REFLECTION_POLICY,
+    DEFAULT_LEARNED_BEHAVIORS,
+    DEFAULT_FILING_RULES,
+    DEFAULT_ISSUES_README,
+    DEFAULT_PROPOSED_CHANGES,
+    DEFAULT_IDENTITY_MD,
+    DEFAULT_NON_GOALS,
+    DEFAULT_ACTION_BOUNDARIES,
+    DEFAULT_WIKI_AGENTS_MD,
+    DEFAULT_WIKI_INDEX_MD,
+    DEFAULT_WIKI_LOG_MD,
+    DEFAULT_IDENTITIES_YAML,
+)
+
+# Re-exports from commands.identities (backward compatibility for any
+# callers that import the private helpers from mimir.cli).
+from .commands.identities import (  # noqa: E402
+    _identities_load,
+    _identities_list_cmd,
+    _identities_add_cmd,
+    _identities_remove_cmd,
+    _identities_resolve_cmd,
+)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    # Every CLI process may inherit credentials, including watchdog/worklink
+    # siblings. Protect them before parsing or dispatching any subcommand.
+    # server.main reapplies this after the pending-update exec path, since exec
+    # resets dumpability.
+    from .tools._shell_env import disable_process_dumpability
+
+    disable_process_dumpability()
+    words = list(argv) if argv is not None else sys.argv[1:]
+    parser = argparse.ArgumentParser(
+        prog="mimir",
+        description="Memory-centric agent harness on the Claude Agent SDK. "
+                    "See `mimir plugins list` for installed providers and their commands; "
+                    "operator commands work without selecting the provider.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # `mimir setup` — delegate to commands.setup
+    from .commands import setup as _setup_cmd
+    setup_p = _setup_cmd.add_argparse(sub)
+
+    run_p = sub.add_parser("run", help="Run the mimir server (default).")
+    run_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME). Required: `run` refuses to "
+             "start if neither --home nor MIMIR_HOME is set.",
+    )
+
+    # `mimir identities {list,add,remove,resolve}` — delegate to commands.identities
+    from .commands import identities as _identities_cmd
+    id_p = _identities_cmd.add_argparse(sub)
+
+    # `mimir reflection <action>` — delegate to commands.reflection
+    from .commands import reflection as _reflection_cmd
+    refl_p = _reflection_cmd.add_argparse(sub)
+
+    # `mimir memory <action>` — delegate to commands.memory (core-memory PR workflow)
+    from .commands import memory as _memory_cmd
+    mem_p = _memory_cmd.add_argparse(sub)
+
+    regen_p = sub.add_parser(
+        "regenerate-api-key",
+        help="Rotate MIMIR_API_KEY in <home>/.env. Prints the new value.",
+    )
+    regen_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
+    # `mimir stats` — operator-facing usage report.
+    stats_p = sub.add_parser(
+        "stats",
+        help="Show usage stats (cost, tokens, cache hit rate) over recent windows.",
+    )
+    stats_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    stats_p.add_argument(
+        "--tools",
+        action="store_true",
+        help="Also show per-tool call/error counts from logs/events.jsonl.",
+    )
+    stats_p.add_argument(
+        "--egress-shadow", action="store_true",
+        help="Report #1903 would-block counts from logs/events.jsonl (read-only).",
+    )
+    stats_p.add_argument(
+        "--since", type=_egress_since, default=None,
+        help="Start of egress-shadow report (timezone-aware ISO timestamp).",
+    )
+
+    # `mimir verify-cred` / `mimir verify-creds`
+    verify_cred_p = sub.add_parser(
+        "verify-cred",
+        help="Verify a single credential by name (e.g. GITHUB_TOKEN).",
+    )
+    verify_cred_p.add_argument(
+        "name", help="Credential name from the registry (see ``mimir verify-creds``).",
+    )
+    verify_creds_p = sub.add_parser(
+        "verify-creds",
+        help="Verify all registered credentials (optionally filtered by type).",
+    )
+    verify_creds_p.add_argument(
+        "--type", choices=["A", "B", "C", "D"], default=None,
+        dest="cred_type",
+        help="Only run probes for this consumer type (see docs/credentials.md).",
+    )
+
+    # ``mimir viability-report``
+    viability_p = sub.add_parser(
+        "viability-report",
+        help="Generate the collapse-detection + curation-rate viability report.",
+    )
+    viability_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    viability_p.add_argument(
+        "--collapse-window-days", type=int, default=7,
+        help="Trailing window for collapse indicators (default: 7).",
+    )
+    viability_p.add_argument(
+        "--curation-window-days", type=int, default=28,
+        help="Trailing window for curation rates (default: 28).",
+    )
+    viability_p.add_argument(
+        "--no-write", action="store_true",
+        help="Print only; don't write to state/reports/viability-YYYY-MM-DD.md.",
+    )
+
+    # ``mimir verify-index``
+    verify_index_p = sub.add_parser(
+        "verify-index",
+        help="Check SQLite + FTS5 + embedding-dim integrity of the file-corpus and SAGA indexes.",
+    )
+    verify_index_p.add_argument(
+        "--db", choices=["index", "saga"], default=None,
+        help="Run only one database's checks (default: both).",
+    )
+    verify_index_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
+    # ``mimir rotate``
+    rotate_p = sub.add_parser(
+        "rotate",
+        help="Rotate a single env credential — compose.env edit + recreate + verify.",
+    )
+    rotate_p.add_argument(
+        "--env", required=True, dest="env_name",
+        help="Env var name to rotate (e.g. GITHUB_TOKEN).",
+    )
+    rotate_p.add_argument(
+        "--from-file", default=None, dest="from_file",
+        help="Read new value from this file. Default: read one line from stdin (getpass'd if a TTY).",
+    )
+    rotate_p.add_argument(
+        "--service", default=None,
+        help="Compose service name to recreate + verify against. Auto-detected if only one service.",
+    )
+    rotate_p.add_argument(
+        "--deployment-dir", default=None, dest="deployment_dir",
+        help="Directory containing compose.env + compose.yml. Default: cwd.",
+    )
+    rotate_p.add_argument(
+        "--no-recreate", action="store_true", dest="skip_recreate",
+        help="Skip docker compose recreate + verify; only update compose.env.",
+    )
+
+    loops_p = sub.add_parser(
+        "loops",
+        help="Show feedback-loop inventory + last-fire status (FUTURE_WORK §12.6b).",
+    )
+    loops_p.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+
+    # `mimir update` — delegate to commands.update
+    from .commands import update as _update_cmd
+    _update_cmd.add_argparse(sub)
+
+    pred_p = sub.add_parser(
+        "predictions",
+        help="Predictions tracking CLI (skills/predictions/scripts/predictions_cli.py).",
+    )
+    from .skills.predictions.scripts import predictions_cli as _predictions_script
+    _predictions_script.add_argparse(pred_p)
+
+    # `mimir wiki <action>`
+    wiki_p = sub.add_parser(
+        "wiki",
+        help="Wiki maintenance helpers (backlinks, future lint passes).",
+    )
+    wiki_sub = wiki_p.add_subparsers(dest="wiki_action")
+    wiki_bl_p = wiki_sub.add_parser(
+        "backlinks",
+        help=(
+            "Walk state/wiki/, write orphans.md / dangling-links.md / "
+            "backlinks-index.md. Emits wiki_backlinks_unhealthy event "
+            "when the wiki has orphans or dangling links."
+        ),
+    )
+    from . import wiki_backlinks as _wiki_backlinks
+    _wiki_backlinks.add_argparse(wiki_bl_p)
+
+    # `mimir skills <action>` — delegate to commands.skills
+    from .commands import skills as _skills_cmd
+    skills_p = _skills_cmd.add_argparse(sub)
+
+    # Static metadata only; do not construct Config or the runtime for listing.
+    from .commands import plugins as _plugins_cmd
+    plugins_p = _plugins_cmd.add_argparse(sub)
+
+    # `mimir scaffold-docker`
+    scaffold_docker_p = sub.add_parser(
+        "scaffold-docker",
+        help=(
+            "Generate Dockerfile + compose.yml + compose.env + start.sh "
+            "into an agent home. Pulls per-skill dockerfile.fragment "
+            "snippets so installed pollers' system deps (gog, social-cli, "
+            "etc.) get baked into the image. Idempotent — re-run after "
+            "skills change to refresh."
+        ),
+    )
+    from . import scaffold_docker as _scaffold_docker
+    _scaffold_docker.add_argparse(scaffold_docker_p)
+
+    # `mimir commitments`
+    commitments_p = sub.add_parser(
+        "commitments",
+        help=(
+            "Manage durable commitments (list/add/complete/snooze/"
+            "dismiss/trim). Phase 1 = operator-driven; extraction + "
+            "surfacing land in Phase 2/3."
+        ),
+    )
+    from .commitments import cli as _commitments_cli
+    _commitments_cli.add_argparse(commitments_p)
+
+    # `mimir feedback {mark-resolved,emit}` — delegate to commands.feedback
+    from .commands import feedback as _feedback_cmd
+    feedback_p = _feedback_cmd.add_argparse(sub)
+
+    # `mimir reindex`
+    reindex_p = sub.add_parser(
+        "reindex",
+        help=(
+            "Re-embed saga atoms and/or file_search chunks under the "
+            "currently-configured embedding provider. Use after "
+            "switching providers (e.g. mimir setup --embedding voyage) "
+            "to migrate existing data into the new vector space. "
+            "Dry-run by default; pass --apply to actually write."
+        ),
+    )
+    from . import reindex as _reindex
+    _reindex.add_argparse(reindex_p)
+
+    # ``mimir migrate-memory``
+    migrate_p = sub.add_parser(
+        "migrate-memory",
+        help=(
+            "Migrate saga.db (or MSAM snapshot) to mimir.saga.db. "
+            "One-way; new DB lives alongside the old until cutover."
+        ),
+    )
+    migrate_p.add_argument(
+        "--source", type=Path, required=True,
+        help="Path to saga.db or MSAM snapshot",
+    )
+    migrate_p.add_argument(
+        "--dest", type=Path, required=True,
+        help="Output mimir.saga.db (won't overwrite without --force)",
+    )
+    migrate_p.add_argument(
+        "--force", action="store_true",
+        help="Overwrite --dest if it exists",
+    )
+
+    reembed_p = sub.add_parser(
+        "saga-reembed",
+        help="Offline repair of stale-dimension atom and session embeddings.",
+    )
+    reembed_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (overrides MIMIR_HOME; default: cwd).",
+    )
+    reembed_p.add_argument("--batch-size", type=int, default=50)
+    reembed_p.add_argument(
+        "--batch-delay", type=float, default=0.0,
+        help="Nonnegative seconds between provider batches (default: 0).",
+    )
+    reembed_p.add_argument("--dry-run", action="store_true")
+
+    acl_inventory_p = sub.add_parser(
+        "saga-acl-inventory",
+        help="Classify atom ACLs by persisted writer-path evidence (read-only).",
+    )
+    acl_inventory_p.add_argument(
+        "--db", type=Path, required=True, help="Path to the SAGA SQLite database",
+    )
+    acl_inventory_p.add_argument(
+        "--include-tombstoned", action="store_true",
+        help="Include tombstoned atoms (default: live atoms only).",
+    )
+
+    enforcement_replay_p = sub.add_parser(
+        "saga-enforcement-replay",
+        help="Measure strict-scope recall losses from a privileged replay trace.",
+    )
+    enforcement_replay_p.add_argument("--db", type=Path, required=True)
+    enforcement_replay_p.add_argument("--trace", type=Path, required=True)
+    enforcement_replay_p.add_argument(
+        "--cutover", required=True, help="Provenance-fix ISO-8601 timestamp.",
+    )
+
+    legacy_migration_p = sub.add_parser(
+        "saga-migrate-legacy-acl",
+        help="Migrate attributable historical rows on a new database copy.",
+    )
+    legacy_migration_p.add_argument("--source", type=Path, required=True)
+    legacy_migration_p.add_argument(
+        "--output", type=Path, help="New copy to modify; omit for dry-run.",
+    )
+    legacy_migration_p.add_argument("--cutover", required=True)
+    legacy_migration_p.add_argument(
+        "--channel-owner", action="append", default=[], metavar="CHANNEL=PRINCIPAL",
+    )
+
+    # chainlink #507: out-of-process dead-man's-switch. Run as a compose
+    # sidecar or cron — it alerts (ntfy / webhook) when the agent's liveness
+    # beat goes stale, which the agent itself can't do once it's dead/wedged.
+    watchdog_p = sub.add_parser(
+        "watchdog",
+        help=(
+            "Out-of-process liveness watchdog: alert via ntfy / webhook when "
+            "the agent's liveness beat goes stale. Run as a sidecar or cron."
+        ),
+    )
+    watchdog_p.add_argument(
+        "--home", type=Path, default=None,
+        help="Agent home (default: MIMIR_HOME or cwd).",
+    )
+    watchdog_p.add_argument(
+        "--interval", type=float, default=60.0,
+        help="Seconds between checks in loop mode (default 60).",
+    )
+    watchdog_p.add_argument(
+        "--stale-after", type=float, default=180.0,
+        help="Beat age (seconds) that counts as down (default 180).",
+    )
+    watchdog_p.add_argument(
+        "--once", action="store_true",
+        help="Check once and exit (for cron); exit code 1 if the agent is down.",
+    )
+    watchdog_p.add_argument(
+        "--restart-on-stale", action="store_true",
+        help="When the beat goes stale, kill the agent (by its beat PID) so the "
+             "supervisor (s6 / Docker restart) restarts it. In-container wedge "
+             "recovery. One attempt per outage.",
+    )
+    watchdog_p.add_argument(
+        "--restart-grace", type=float, default=10.0,
+        help="Seconds between SIGTERM and SIGKILL when restarting (default 10).",
+    )
+
+    # ``mimir notify-restart`` — push a one-shot 'service failed/restarting'
+    # alert via ntfy / webhook. Designed for a systemd ``OnFailure=`` hook
+    # (see deploy/systemd/): self-contained, no live agent or event logger
+    # needed, so it works precisely when the agent is down.
+    notify_restart_p = sub.add_parser(
+        "notify-restart",
+        help="Push an out-of-band 'service failed/restarting' alert (systemd OnFailure= hook).",
+    )
+    notify_restart_p.add_argument(
+        "--unit", default=None, help="systemd unit name, for the message (e.g. %%n).",
+    )
+    notify_restart_p.add_argument(
+        "--detail", default=None, help="Optional extra context line for the alert.",
+    )
+
+    # -----------------------------------------------------------------------
+    # Dispatch
+    # -----------------------------------------------------------------------
+
+    def handle_setup(args: argparse.Namespace) -> None:
+        home = (args.home or Path.cwd()).resolve()
+        if args.home is None and (home / ".git").exists() and not (home / ".mimir").is_dir():
+            print(
+                f"error: refusing bare `mimir setup` in unrelated git repository {home}; "
+                "pass `--home DIR` to explicitly name the intended mimir home",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        status = setup_home(
+            home,
+            embedding=args.embedding,
+            model=args.model,
+            subscription=args.subscription,
+            restore_docs=args.restore_docs,
+        )
+        _print_setup_report(status)
+        return
+
+    def handle_identities(args: argparse.Namespace) -> None:
+        code = _identities_cmd.dispatch(args, id_p)
+        if code:
+            sys.exit(code)
+        return
+
+    def handle_memory(args: argparse.Namespace) -> None:
+        code = _memory_cmd.dispatch(args, mem_p)
+        if code:
+            sys.exit(code)
+        return
+
+    def handle_watchdog(args: argparse.Namespace) -> None:
+        import asyncio
+        from .liveness import run_watchdog
+        home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+        down = asyncio.run(
+            run_watchdog(
+                Path(home_arg).resolve(),
+                interval=args.interval,
+                stale_after=args.stale_after,
+                once=args.once,
+                restart_on_stale=args.restart_on_stale,
+                restart_grace=args.restart_grace,
+            )
+        )
+        if args.once and down:
+            sys.exit(1)
+        return
+
+    def handle_notify_restart(args: argparse.Namespace) -> None:
+        import asyncio
+        from .liveness import notify_service_event
+        asyncio.run(notify_service_event(unit=args.unit, detail=args.detail))
+        return
+
+    def handle_stats(args: argparse.Namespace) -> None:
+        if args.since is not None and not args.egress_shadow:
+            stats_p.error("--since requires --egress-shadow")
+        if args.egress_shadow:
+            home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+            _print_egress_shadow_report(Path(home_arg) / "logs" / "events.jsonl", args.since)
+            return
+        from .config import Config as _Config
+        from .rate_limits import RateLimitStore
+        from .stats_block import assemble_stats_block
+        home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+        os.environ["MIMIR_HOME"] = str(Path(home_arg).resolve())
+        cfg = _Config.from_env()
+        store = RateLimitStore(path=cfg.home / ".mimir" / "rate_limits.json")
+        result = assemble_stats_block(cfg, store)
+        if result.body is None:
+            print("(no turns recorded yet)")
+        else:
+            print(result.body)
+        alert = result.alert
+        from .billing import detect_billing_mode, BillingMode
+        from .config import _oauth_credentials_path
+        oauth_path = _oauth_credentials_path()
+        billing_mode = detect_billing_mode(
+            explicit=os.environ.get("MIMIR_BILLING_MODE") or None,
+            oauth_credentials_path=oauth_path,
+        )
+        print(f"\nBilling mode (auto-detected): {billing_mode.value}")
+        if alert is not None:
+            event_name = (
+                "cost_rate_advisory"
+                if billing_mode == BillingMode.QUOTA
+                else "cost_rate_alert"
+            )
+            print(
+                f"On the agent loop, this would emit: {event_name} "
+                f"(reason={alert.reason})"
+            )
+        if getattr(args, "tools", False):
+            from .ops_dashboard import build_dashboard_payload
+            payload = build_dashboard_payload(cfg.home / "logs" / "events.jsonl", days=7)
+            tools = payload.get("tools") or []
+            print("\nTool calls (last 7d):")
+            if not tools:
+                print("  (no tool_call events recorded)")
+            else:
+                for row in tools[:30]:
+                    rate = float(row.get("failure_rate") or 0.0) * 100.0
+                    avg = float(row.get("avg_duration_ms") or 0.0)
+                    print(
+                        f"  {row.get('tool')}: {row.get('calls', 0)} calls, "
+                        f"{row.get('errors', 0)} errors ({rate:.1f}%), "
+                        f"avg {avg:.0f}ms"
+                    )
+        return
+
+    def handle_regenerate_api_key(args: argparse.Namespace) -> None:
+        home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+        home = Path(home_arg).resolve()
+        env_path = home / ".env"
+        if not env_path.is_file():
+            print(
+                f"error: no .env at {env_path}; run `mimir setup` first",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            new_key = regenerate_api_key(home)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(new_key)
+        print(
+            f"\nWrote to {env_path}. Restart `mimir run` for the new key to take effect.",
+            file=sys.stderr,
+        )
+        return
+
+    def handle_verify_cred(args: argparse.Namespace) -> None:
+        from .cred_verify import run_verify_cred_cmd
+        sys.exit(run_verify_cred_cmd(args.name))
+
+    def handle_verify_creds(args: argparse.Namespace) -> None:
+        from .cred_verify import run_verify_creds_cmd
+        sys.exit(run_verify_creds_cmd(only_type=args.cred_type))
+
+    def handle_verify_index(args: argparse.Namespace) -> None:
+        from .index_integrity import run_verify_index_cmd
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        sys.exit(run_verify_index_cmd(home=home, db=args.db))
+
+    def handle_viability_report(args: argparse.Namespace) -> None:
+        from .viability_metrics import run_viability_report_cmd
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        warning_count = run_viability_report_cmd(
+            home=home,
+            collapse_window_days=args.collapse_window_days,
+            curation_window_days=args.curation_window_days,
+            write_to_disk=not args.no_write,
+        )
+        sys.exit(0 if warning_count == 0 else 1)
+
+    def handle_rotate(args: argparse.Namespace) -> None:
+        from .cred_rotate import run_rotate
+        new_value: str | None = None
+        if args.from_file:
+            try:
+                new_value = Path(args.from_file).read_text(encoding="utf-8").rstrip("\n")
+            except OSError as exc:
+                print(f"can't read --from-file: {exc}", file=sys.stderr)
+                sys.exit(2)
+        dep = Path(args.deployment_dir).resolve() if args.deployment_dir else None
+        sys.exit(run_rotate(
+            env_name=args.env_name,
+            new_value=new_value,
+            deployment_dir=dep,
+            service=args.service,
+            skip_recreate=args.skip_recreate,
+        ))
+
+    def handle_loops(args: argparse.Namespace) -> None:
+        from .loops_cmd import run_loops_cmd
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        sys.exit(run_loops_cmd(home))
+
+    def handle_update(args: argparse.Namespace) -> None:
+        sys.exit(_update_cmd.dispatch(args))
+
+    def handle_predictions(args: argparse.Namespace) -> None:
+        from .skills.predictions.scripts import predictions_cli as _predictions_script
+        sys.exit(_predictions_script.run(args))
+
+    def handle_wiki(args: argparse.Namespace) -> None:
+        if args.wiki_action == "backlinks":
+            from . import wiki_backlinks as _wiki_backlinks
+            sys.exit(_wiki_backlinks.cmd_backlinks(args))
+        wiki_p.print_help()
+        sys.exit(1)
+
+    def handle_skills(args: argparse.Namespace) -> None:
+        sys.exit(_skills_cmd.dispatch(args, skills_p))
+
+    def handle_plugins(args: argparse.Namespace) -> None:
+        code = _plugins_cmd.dispatch(args, plugins_p)
+        if code:
+            sys.exit(code)
+        return
+
+    def handle_scaffold_docker(args: argparse.Namespace) -> None:
+        # _scaffold_docker was already imported at subparser-registration
+        # time (parser.add_argument requires the module to wire ``cmd``).
+        # Reuse the existing scaffold_docker_cmd reference set via
+        # ``parser.set_defaults`` rather than re-importing here.
+        sys.exit(args.scaffold_docker_cmd(args))
+
+    def handle_commitments(args: argparse.Namespace) -> None:
+        if args.commitments_action is None:
+            commitments_p.print_help()
+            sys.exit(1)
+        from .commitments import cli as _commitments_cli
+        sys.exit(_commitments_cli.dispatch(args))
+
+    def handle_feedback(args: argparse.Namespace) -> None:
+        sys.exit(_feedback_cmd.dispatch(args, feedback_p))
+
+    def handle_reindex(args: argparse.Namespace) -> None:
+        from . import reindex as _reindex
+        sys.exit(_reindex.dispatch(args))
+
+    def handle_migrate_memory(args: argparse.Namespace) -> None:
+        from .saga.migrate import migrate as _migrate_memory
+        try:
+            _migrate_memory(
+                source=args.source,
+                dest=args.dest,
+                force=args.force,
+                log=print,
+            )
+        except FileExistsError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    def handle_saga_reembed(args: argparse.Namespace) -> None:
+        import math
+        import sqlite3
+        from .config import _load_home_dotenv
+
+        if args.batch_size <= 0:
+            parser.error("--batch-size must be positive")
+        if not math.isfinite(args.batch_delay) or args.batch_delay < 0:
+            parser.error("--batch-delay must be finite and nonnegative")
+        home = Path(args.home or os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
+        os.environ["MIMIR_HOME"] = str(home)
+        _load_home_dotenv(home)
+        from .runtime import resolve_saga_config, resolve_saga_db_path
+        from .saga._config_io import install_saga_config
+        from .saga.reembed import reembed
+
+        install_saga_config(resolve_saga_config(home)[0])
+        db_path = resolve_saga_db_path(home)
+        if not args.dry_run:
+            print("OFFLINE ONLY: stop mimir and all Saga writers before running.", flush=True)
+        try:
+            report = reembed(
+                db_path, batch_size=args.batch_size, dry_run=args.dry_run,
+                batch_delay=args.batch_delay,
+                progress=lambda message: print(message, flush=True),
+            )
+        except KeyboardInterrupt:
+            print("Interrupted. Committed batches are preserved; rerun to resume.", file=sys.stderr)
+            sys.exit(130)
+        except (OSError, sqlite3.Error, ValueError, RuntimeError, TypeError, OverflowError) as exc:
+            print(f"ERROR: {exc}. Committed batches are preserved; rerun to resume.", file=sys.stderr)
+            sys.exit(1)
+        if not args.dry_run and (report["atoms_unrepaired"] or report["sessions_unrepaired"]):
+            sys.exit(1)
+        return
+
+    def handle_saga_acl_inventory(args: argparse.Namespace) -> None:
+        from .saga.acl_inventory import inventory_path
+        import json
+        import sqlite3
+
+        try:
+            report = inventory_path(
+                args.db, include_tombstoned=args.include_tombstoned,
+            )
+        except (FileNotFoundError, OSError, sqlite3.Error) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    def handle_saga_enforcement_replay(args: argparse.Namespace) -> None:
+        from .saga.enforcement_replay import analyze_paths
+        import json
+        import sqlite3
+
+        try:
+            report = analyze_paths(db=args.db, trace=args.trace, cutover=args.cutover)
+        except (FileNotFoundError, OSError, sqlite3.Error, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    def handle_saga_migrate_legacy_acl(args: argparse.Namespace) -> None:
+        from .saga.legacy_acl_migration import migrate_copy
+        import json
+        import sqlite3
+
+        try:
+            mappings = dict(item.split("=", 1) for item in args.channel_owner)
+            report = migrate_copy(
+                source=args.source,
+                output=args.output,
+                cutover=args.cutover,
+                channel_owners=mappings,
+            )
+        except (
+            FileExistsError, FileNotFoundError, OSError, sqlite3.Error, ValueError,
+        ) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    def handle_reflection(args: argparse.Namespace) -> None:
+        sys.exit(_reflection_cmd.dispatch(args, refl_p))
+
+    def handle_run(args: argparse.Namespace) -> None:
+        home_arg = getattr(args, "home", None)
+        if home_arg is not None:
+            os.environ["MIMIR_HOME"] = str(Path(home_arg).resolve())
+        # The agent home must be EXPLICIT. Refuse to start with neither
+        # ``--home`` nor ``MIMIR_HOME`` rather than silently defaulting to the
+        # process cwd: a cwd-home scatters state/skills/memory wherever the
+        # process happened to launch and makes the agent chase container-shaped
+        # paths that don't exist on the box (the classic non-Docker failure).
+        if not os.environ.get("MIMIR_HOME"):
+            print(
+                "error: MIMIR_HOME is not set.\n"
+                "  The agent home must be explicit. Either:\n"
+                "    mimir run --home /path/to/agent-home\n"
+                "  or export MIMIR_HOME=/path/to/agent-home before `mimir run`.\n"
+                "  (Refusing to default to the current directory.)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Defer import — server pulls in aiohttp/SDK; keep `mimir setup`
+        # snappy and importable in environments where the runtime isn't
+        # fully wired up yet.
+        from .acp.daemon import AcpDaemonError, acp_enabled_from_env
+
+        try:
+            acp_enabled_from_env()
+        except AcpDaemonError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        from .server import main as run_server
+
+        run_server()
+        return
+
+    from .plugins.cli_registry import CommandRegistry
+
+    commands = CommandRegistry()
+    core_commands = {
+        "setup": (setup_p, handle_setup),
+        "run": (run_p, handle_run),
+        "identities": (id_p, handle_identities),
+        "reflection": (refl_p, handle_reflection),
+        "memory": (mem_p, handle_memory),
+        "regenerate-api-key": (regen_p, handle_regenerate_api_key),
+        "stats": (stats_p, handle_stats),
+        "verify-cred": (verify_cred_p, handle_verify_cred),
+        "verify-creds": (verify_creds_p, handle_verify_creds),
+        "viability-report": (viability_p, handle_viability_report),
+        "verify-index": (verify_index_p, handle_verify_index),
+        "rotate": (rotate_p, handle_rotate),
+        "loops": (loops_p, handle_loops),
+        "update": (sub.choices["update"], handle_update),
+        "predictions": (pred_p, handle_predictions),
+        "wiki": (wiki_p, handle_wiki),
+        "skills": (skills_p, handle_skills),
+        "plugins": (plugins_p, handle_plugins),
+        "scaffold-docker": (scaffold_docker_p, handle_scaffold_docker),
+        "commitments": (commitments_p, handle_commitments),
+        "feedback": (feedback_p, handle_feedback),
+        "reindex": (reindex_p, handle_reindex),
+        "migrate-memory": (migrate_p, handle_migrate_memory),
+        "saga-reembed": (reembed_p, handle_saga_reembed),
+        "saga-acl-inventory": (acl_inventory_p, handle_saga_acl_inventory),
+        "saga-enforcement-replay": (enforcement_replay_p, handle_saga_enforcement_replay),
+        "saga-migrate-legacy-acl": (legacy_migration_p, handle_saga_migrate_legacy_acl),
+        "watchdog": (watchdog_p, handle_watchdog),
+        "notify-restart": (notify_restart_p, handle_notify_restart),
+    }
+    for name, (core_parser, handler) in core_commands.items():
+        commands.add_core(name, core_parser, handler)
+
+    # Inspection paths use installed-distribution metadata only, even if the
+    # operator has selected plugins. In particular, list never imports a provider.
+    inspecting = words[:2] in (["plugins", "list"], ["plugins", "dockerfile"])
+    selection = os.environ.get("MIMIR_PLUGINS", "").strip()
+    if not inspecting and selection:
+        from .plugins.manager import load_plugins
+
+        manager = load_plugins(enable=selection)
+        commands.add_selected(manager.policy.cli_commands, sub)
+
+    # Inspect manifests only for a command word not already registered. Never
+    # load an unselected provider while building a core parser (especially run).
+    if words and words[0] not in sub.choices and not words[0].startswith("-"):
+        from .plugins.discovery import discover_plugins
+        from .plugins.registry import PolicyRegistrationError
+
+        candidates = discover_plugins(enable=selection)
+        owners = [candidate for candidate in candidates
+                  if candidate.diagnostic is None and candidate.manifest is not None
+                  and words[0] in (candidate.manifest.cli_commands or {})]
+        if len(owners) > 1:
+            parser.error(f"CLI command {words[0]!r} is claimed by multiple installed plugins")
+        if owners:
+            candidate = owners[0]
+            if not candidate.manifest.cli_commands[words[0]]:
+                parser.error(f"{words[0]!r} belongs to plugin {candidate.name!r}; "
+                             f"select it with MIMIR_PLUGINS={candidate.name}")
+            from .plugins.manager import load_plugins
+
+            # This is an operator-only CLI process; the server path above has
+            # no route through this branch. Verify the live registration agrees
+            # with the inert manifest before exposing the parser or dispatch.
+            operator = load_plugins(enable=candidate.name).policy.cli_commands.get(words[0])
+            if operator is None or operator.owner != candidate.name or operator.operator is not True:
+                raise PolicyRegistrationError(
+                    f"{candidate.name}: operator command {words[0]!r} does not match its manifest"
+                )
+            commands.add_selected({words[0]: operator}, sub)
+        else:
+            # Older manifests lack command metadata. Provide an actionable
+            # selection hint without loading any disabled provider, even on a
+            # misspelled word. Never guess which provider owns the word.
+            unselected = [candidate.name for candidate in candidates
+                          if not candidate.enabled and candidate.diagnostic is None
+                          and candidate.manifest is not None
+                          and candidate.manifest.cli_commands is None]
+            if unselected:
+                hints = ", ".join(f"MIMIR_PLUGINS={name}" for name in unselected)
+                parser.error(f"unknown command {words[0]!r}; installed unselected plugins: "
+                             f"{', '.join(unselected)}. To use their commands, select {hints}; "
+                             "see `mimir plugins list` for advertised commands")
+
+    args = parser.parse_args(words)
+    if args.command is None:
+        args.command = "run"
+    result = commands.dispatch(args)
+    if result:
+        sys.exit(result)
+
+
+if __name__ == "__main__":
+    main()

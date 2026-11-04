@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mimir turns</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f1117;--surface:#1a1d27;--surface2:#22263a;--border:#2e3348;
+  --accent:#6c8ef7;--accent2:#a78bfa;
+  --text:#e2e6f0;--text2:#8b92a8;--text3:#5a6080;
+  --green:#4ade80;--red:#f87171;--yellow:#fbbf24;
+  --rb:#1e1a2e;--rbd:#5b4daa;
+  --tb:#172434;--tbd:#2563eb;
+  --trb:#1a2d1a;--trbd:#16a34a;
+  --treb:#2d1a1a;--trebd:#dc2626;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.header{padding:10px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-shrink:0}
+.header h1{font-size:1.4rem;font-weight:600}
+.header-links{margin-left:auto;display:flex;gap:1rem;font-size:0.9rem}
+.header-links a{color:var(--accent);text-decoration:none}
+.header-links a:hover{text-decoration:underline}
+.turn-count{font-size:12px;color:var(--text2)}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
+.status-dot.live{animation:pulse 2s infinite}
+.status-dot.stale{background:var(--text3)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.filters{padding:10px 20px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex-shrink:0}
+.filter-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.05em}
+.filter-group{display:flex;gap:4px;align-items:center}
+.tab{padding:4px 12px;border-radius:20px;border:1px solid var(--border);background:transparent;color:var(--text2);font-size:13px;cursor:pointer;transition:all .15s}
+.tab:hover{border-color:var(--accent);color:var(--text)}
+.tab.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.search-input{padding:4px 12px;border-radius:20px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;outline:none;width:180px}
+.search-input:focus{border-color:var(--accent)}
+.search-input::placeholder{color:var(--text3)}
+.table-wrapper{flex:1;overflow-y:auto}
+table{width:100%;border-collapse:collapse}
+thead{position:sticky;top:0;z-index:10;background:var(--surface2)}
+th{padding:9px 14px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text3);border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:9px 14px;border-bottom:1px solid var(--border);vertical-align:top}
+tr:hover td{background:var(--surface2);cursor:pointer}
+.col-time{width:155px;color:var(--text2);font-size:12px;font-family:monospace;white-space:nowrap}
+.col-trigger{width:130px}
+.col-channel{width:100px}
+.col-events{width:65px;text-align:center;color:var(--text2);font-size:12px}
+.col-duration{width:80px;text-align:right;color:var(--text2);font-size:12px;font-family:monospace;white-space:nowrap}
+.truncated{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px;color:var(--text2);font-size:13px}
+.empty-state{padding:60px;text-align:center;color:var(--text3)}
+.empty-state p{margin-top:8px;font-size:13px}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;letter-spacing:.03em}
+.badge-user_message{background:#1e3a5f;color:#60a5fa}
+.badge-scheduled_tick{background:#3b2d14;color:#fbbf24}
+.badge-saga_session_end{background:#2d1e3a;color:#c084fc}
+.badge-poller{background:#103838;color:#5eead4}
+.badge-claude_code_spawn{background:#3a230f;color:#fb923c}
+.badge-shell_job_complete{background:#1f2d1f;color:#86efac}
+.badge-react_received{background:#3a1c2e;color:#f472b6}
+.badge-unknown{background:var(--surface2);color:var(--text2);border:1px dashed var(--border)}
+.badge-channel{background:var(--surface2);color:var(--text2);border:1px solid var(--border)}
+.badge-kind{background:transparent;color:var(--text3);font-weight:500;border:1px solid var(--border);margin-left:4px}
+.detail-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100;display:none}
+.detail-overlay.open{display:block}
+.detail-panel{position:fixed;top:0;right:0;bottom:0;width:660px;max-width:90vw;background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;z-index:101;transform:translateX(100%);transition:transform .2s ease;display:flex;flex-direction:column}
+.detail-panel.open{transform:translateX(0)}
+.detail-header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:10px;flex-shrink:0;background:var(--surface);position:sticky;top:0;z-index:5}
+.detail-meta{flex:1;min-width:0}
+.detail-ts{font-size:12px;color:var(--text3);font-family:monospace}
+.detail-trigger-row{display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap}
+.close-btn{background:none;border:none;color:var(--text3);font-size:20px;cursor:pointer;padding:0 4px;line-height:1;flex-shrink:0}
+.close-btn:hover{color:var(--text)}
+.detail-body{padding:18px;display:flex;flex-direction:column;gap:18px}
+.section{display:flex;flex-direction:column;gap:8px}
+.section-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text3)}
+.msg-box{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-size:13px;color:var(--text);line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto}
+.msg-box.output{border-color:var(--accent2);background:#1a1a2e}
+.events-list{display:flex;flex-direction:column;gap:6px}
+.event{border-radius:8px;overflow:hidden}
+.event-hdr{padding:7px 12px;display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;cursor:pointer;user-select:none}
+.event-hdr:hover{filter:brightness(1.1)}
+.event-toggle{font-size:10px;margin-left:auto;opacity:.7}
+.event-bdy{padding:10px 12px;font-size:12px;font-family:'SF Mono','Fira Code',monospace;white-space:pre-wrap;word-break:break-word;line-height:1.5;max-height:360px;overflow-y:auto}
+.ev-reasoning{background:var(--rb);border:1px solid var(--rbd)}
+.ev-reasoning .event-hdr{background:var(--rbd);color:#c4b5fd}
+.ev-reasoning .event-bdy{color:#ddd6fe;font-family:inherit;font-style:italic;font-size:13px}
+.ev-tool_call{background:var(--tb);border:1px solid var(--tbd)}
+.ev-tool_call .event-hdr{background:var(--tbd);color:#93c5fd}
+.ev-tool_call .event-bdy{color:#bfdbfe}
+.ev-tool_result{background:var(--trb);border:1px solid var(--trbd)}
+.ev-tool_result .event-hdr{background:var(--trbd);color:#bbf7d0}
+.ev-tool_result .event-bdy{color:#d1fae5}
+.ev-tool_result.is-error{background:var(--treb);border-color:var(--trebd)}
+.ev-tool_result.is-error .event-hdr{background:var(--trebd);color:#fecaca}
+.ev-tool_result.is-error .event-bdy{color:#fee2e2}
+.ev-saga{background:#1f1b2e;border:1px solid #3b2d54}
+.ev-saga .event-hdr{background:#3b2d54;color:#d8b4fe}
+.ev-saga .event-bdy{color:#e9d5ff}
+.ev-injected{background:#2a1f12;border:1px solid #5a3d1a}
+.ev-injected .event-hdr{background:#5a3d1a;color:#fcd9a8}
+.ev-injected .event-bdy{color:#fde9cf}
+.ev-saga.is-error{background:var(--treb);border-color:var(--trebd)}
+.ev-saga.is-error .event-hdr{background:var(--trebd);color:#fecaca}
+.ev-saga.is-error .event-bdy{color:#fee2e2}
+.ev-saga .saga-latency{font-family:monospace;opacity:.6;font-size:11px;margin-left:auto}
+.t-marker{font-family:monospace;opacity:.45;font-size:10px;margin-left:auto}
+.event-hdr > .t-marker ~ .event-toggle{margin-left:0}
+.no-events{color:var(--text3);font-size:13px;font-style:italic}
+.error-box{background:var(--treb);border:1px solid var(--trebd);border-radius:8px;padding:12px 14px;font-size:13px;color:#fecaca;white-space:pre-wrap;word-break:break-word}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text3)}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>mimir <span style="color:var(--accent)">turns</span></h1>
+  <span class="turn-count" id="turnCount"></span>
+  <div class="status-dot stale" id="statusDot" title="Connecting&hellip;"></div>
+  <nav class="header-links">
+    <a href="/ops" title="Live ops dashboard">ops</a>
+    <a href="/saga" title="SAGA memory dashboard">saga</a>
+    <a href="/state" title="State + file-memory dashboard">state</a>
+    <a href="#" id="reset-key-link" style="display:none" onclick="event.preventDefault();window.__mimir_resetApiKey()" title="Clear the stored MIMIR_API_KEY and re-prompt — useful when the server-side key was rotated">↻ reset key</a>
+  </nav>
+</div>
+
+<div class="filters">
+  <span class="filter-label">Trigger</span>
+  <div class="filter-group" id="triggerTabs">
+    <button class="tab active" data-trigger="all">All</button>
+    <button class="tab" data-trigger="user_message">User</button>
+    <button class="tab" data-trigger="scheduled_tick">Heartbeat</button>
+    <button class="tab" data-trigger="saga_session_end">Synthesis</button>
+    <button class="tab" data-trigger="poller">Poller</button>
+    <button class="tab" data-trigger="claude_code_spawn">Spawn</button>
+    <button class="tab" data-trigger="shell_job_complete">Job</button>
+  </div>
+  <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer;margin-left:12px">
+    <input type="checkbox" id="hidePollersToggle" style="cursor:pointer"> hide pollers
+  </label>
+  <div class="filter-group" style="margin-left:auto">
+    <input class="search-input" id="searchInput" type="text" placeholder="Search input / output&hellip;">
+  </div>
+</div>
+
+<div class="table-wrapper" id="tableWrapper">
+  <table>
+    <thead>
+      <tr>
+        <th class="col-time">Time</th>
+        <th class="col-trigger">Trigger</th>
+        <th class="col-channel">Channel</th>
+        <th class="col-events">Events</th>
+        <th class="col-duration">Duration</th>
+        <th>Input</th>
+        <th>Output</th>
+      </tr>
+    </thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+  <div class="empty-state" id="emptyState" style="display:none">
+    <div style="font-size:32px">&#x1F4CB;</div>
+    <p id="emptyMsg">Waiting for turns&hellip;</p>
+  </div>
+</div>
+
+<div class="detail-overlay" id="detailOverlay"></div>
+<div class="detail-panel" id="detailPanel">
+  <div class="detail-header">
+    <div class="detail-meta">
+      <div class="detail-ts" id="detailTs"></div>
+      <div class="detail-trigger-row">
+        <span id="detailTrigger"></span>
+        <span id="detailChannel"></span>
+        <span style="font-size:11px;color:var(--text3);margin-left:auto;font-family:monospace" id="detailDuration"></span>
+      </div>
+      <div style="font-size:10px;color:var(--text3);font-family:monospace;margin-top:2px" id="detailTurnId"></div>
+    </div>
+    <button class="close-btn" id="closeBtn">&#x2715;</button>
+  </div>
+  <div class="detail-body">
+    <div class="section">
+      <div class="section-label">Input</div>
+      <div class="msg-box" id="detailInput"></div>
+    </div>
+    <div class="section" id="detailInjectedSection" style="display:none">
+      <div class="section-label">Injected mid-turn (<span id="detailInjectedCount">0</span>)</div>
+      <div class="msg-box" id="detailInjected"></div>
+    </div>
+    <div class="section" id="detailErrorSection" style="display:none">
+      <div class="section-label">Error</div>
+      <div class="error-box" id="detailError"></div>
+    </div>
+    <div class="section" id="detailSagaCallsSection" style="display:none">
+      <div class="section-label">Saga calls (<span id="detailSagaCallsCount">0</span>)</div>
+      <div class="events-list" id="detailSagaCalls"></div>
+    </div>
+    <div class="section">
+      <div class="section-label">Events (<span id="detailEventsCount">0</span>)<span id="detailSagaInline" style="display:none">, <span id="detailSagaInlineCount">0</span> saga</span></div>
+      <div class="events-list" id="detailEvents"></div>
+    </div>
+    <div class="section">
+      <div class="section-label">Output</div>
+      <div class="msg-box output" id="detailOutput"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/app/auth.js"></script>
+<script>
+(function() {
+var allTurns = [];                 // loaded turns, newest-first (NOT the whole file)
+// Progressive loading: start with the newest PAGE_SIZE turns, fetch older pages
+// on scroll, and poll only for turns newer than what we have. Avoids pulling the
+// entire (140MB+) turns.jsonl up front on every 5s refresh.
+var PAGE_SIZE = 200;
+var oldestId = null;               // turn_id of the oldest loaded turn (scroll-back cursor)
+var newestId = null;               // turn_id of the newest loaded turn (live-poll cursor)
+var allOlderLoaded = false;        // true once a scroll-back page returns < PAGE_SIZE
+var loadingMore = false;           // in-flight guard for loadOlder
+// activeTrigger and hidePollers persist in localStorage so a refresh
+// during dev (the viewer is typically left open in a browser tab)
+// keeps the operator's chosen view rather than snapping back to the
+// All / show-everything default.
+var LS_PREFIX = 'mimir.viewer.';
+function lsGet(key, fallback) {
+  try { var v = localStorage.getItem(LS_PREFIX + key); return v == null ? fallback : v; }
+  catch (e) { return fallback; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(LS_PREFIX + key, value); } catch (e) { /* private mode / quota */ }
+}
+
+var authedFetch = window.MimirAuth.authedFetch;
+var getApiKey = window.MimirAuth.getApiKey;
+var promptApiKey = window.MimirAuth.promptApiKey;
+window.__mimir_resetApiKey = function() {
+  window.MimirAuth.reset('manual rotation');
+  if (typeof loadInitial === 'function') loadInitial();
+};
+window.MimirAuth.wireResetLink('reset-key-link', function() {
+  if (typeof loadInitial === 'function') loadInitial();
+});
+var activeTrigger = lsGet('activeTrigger', 'all');
+var searchQuery = '';
+var openTurnId = null;
+var pollInterval = null;
+// "hide pollers" suppresses trigger=poller rows from the All view.
+// Most useful default depends on workload; off by default so new
+// users see all activity, with the toggle as the noise-cut hatch.
+var hidePollers = lsGet('hidePollers', '0') === '1';
+// Known triggers — the badge CSS knows about these. Anything else
+// renders with badge-unknown so it's visually flagged for follow-up.
+var KNOWN_TRIGGERS = {
+  user_message: 1, scheduled_tick: 1, saga_session_end: 1,
+  poller: 1, claude_code_spawn: 1, shell_job_complete: 1,
+  react_received: 1,
+};
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function fmtTime(ts) {
+  if (!ts) return '\u2014';
+  var d = new Date(ts);
+  if (isNaN(d.getTime())) return esc(ts);
+  var p = function(n){return n<10?'0'+n:''+n;};
+  var mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return mo[d.getMonth()]+' '+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+
+function triggerBadge(t, kind) {
+  var label = t || 'unknown';
+  var cls = KNOWN_TRIGGERS[label] ? 'badge-'+esc(label) : 'badge-unknown';
+  var html = '<span class="badge '+cls+'" title="'+esc(label)+'">'+esc(label)+'</span>';
+  // ``kind`` disambiguates rows that share a trigger but represent
+  // different work (e.g. claude_code_spawn rows carry kind="claude_code_spawn"
+  // for the spawn-completion turn vs scheduler ticks). Surface it inline
+  // when present and not redundant with the trigger itself.
+  if (kind && kind !== label) {
+    html += '<span class="badge badge-kind" title="kind">'+esc(kind)+'</span>';
+  }
+  return html;
+}
+function channelBadge(c) {
+  return c ? '<span class="badge badge-channel">'+esc(c)+'</span>' : '';
+}
+function fmtDuration(ms) {
+  if (ms == null) return '<span style="color:var(--text3)">\u2014</span>';
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  var seconds = Math.round(ms / 1000);
+  return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
+}
+
+function trunc(str, n) {
+  n = n||120;
+  if (!str) return '<span style="color:var(--text3);font-style:italic">\u2014</span>';
+  str = str.trim();
+  return str.length > n ? esc(str.slice(0,n))+'<span style="color:var(--text3)">\u2026</span>' : esc(str);
+}
+
+function filterTurns() {
+  return allTurns.filter(function(t) {
+    if (activeTrigger !== 'all' && t.trigger !== activeTrigger) return false;
+    // hidePollers only fires on the All view — explicit Poller tab
+    // overrides (operator opted in to seeing them).
+    if (hidePollers && activeTrigger === 'all' && t.trigger === 'poller') return false;
+    if (searchQuery) {
+      var q = searchQuery.toLowerCase();
+      // chainlink #376: search mid-turn injected inputs too, so a follow-up
+      // sent during a turn is findable even though it isn't in `input`.
+      // Entries are {t_ms, text} (PR 4); tolerate PR-3-era bare strings.
+      var injectedHit = (t.injected_inputs||[]).some(function(m){
+        var txt = (typeof m === 'string') ? m : (m && m.text) || '';
+        return txt.toLowerCase().indexOf(q) !== -1;
+      });
+      if (((t.input||'').toLowerCase().indexOf(q)===-1)
+          && ((t.output||'').toLowerCase().indexOf(q)===-1)
+          && !injectedHit) return false;
+    }
+    return true;
+  });
+}
+
+function _syncBounds() {
+  newestId = allTurns.length ? allTurns[0].turn_id : null;
+  oldestId = allTurns.length ? allTurns[allTurns.length - 1].turn_id : null;
+}
+
+function setTurns(turns) {            // initial / replace
+  allTurns = turns.slice().reverse(); // server sends oldest-first; we want newest-first
+  _syncBounds();
+  render();
+}
+
+function appendOlder(turns) {         // scroll-back page (older than oldestId)
+  if (!turns.length) return;
+  allTurns = allTurns.concat(turns.slice().reverse());  // older turns go after (newest-first)
+  _syncBounds();
+  render();
+}
+
+function prependNew(turns) {          // live poll (newer than newestId)
+  if (!turns.length) return;
+  allTurns = turns.slice().reverse().concat(allTurns);  // newer turns go on top
+  _syncBounds();
+  render();
+}
+
+function render() {
+  renderTriggerTabs();
+  renderTable();
+}
+
+function renderTriggerTabs() {
+  document.querySelectorAll('#triggerTabs .tab').forEach(function(btn) {
+    btn.classList.toggle('active', btn.getAttribute('data-trigger') === activeTrigger);
+  });
+}
+
+function renderTable() {
+  var turns = filterTurns();
+  var tbody = document.getElementById('tableBody');
+  var empty = document.getElementById('emptyState');
+  var more = allOlderLoaded ? '' : ' (scroll for more)';
+  document.getElementById('turnCount').textContent =
+    allTurns.length === turns.length
+      ? allTurns.length+' turns'+more
+      : turns.length+' / '+allTurns.length+' loaded'+more;
+
+  if (!turns.length) {
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    document.getElementById('emptyMsg').textContent =
+      allTurns.length === 0 ? 'No turns recorded yet.' : 'No turns match the current filter.';
+    return;
+  }
+  empty.style.display = 'none';
+
+  tbody.innerHTML = turns.map(function(t, i) {
+    var errMark = t.error ? ' style="color:var(--red)"' : '';
+    return '<tr data-idx="'+i+'">'+
+      '<td class="col-time"'+errMark+'>'+fmtTime(t.ts)+'</td>'+
+      '<td class="col-trigger">'+triggerBadge(t.trigger, t.kind)+'</td>'+
+      '<td class="col-channel">'+channelBadge(t.channel_id)+'</td>'+
+      '<td class="col-events">'+((t.events||[]).length)+'</td>'+
+      '<td class="col-duration">'+fmtDuration(t.duration_ms)+'</td>'+
+      '<td><div class="truncated">'+trunc(t.input)+'</div></td>'+
+      '<td><div class="truncated"'+errMark+'>'+trunc(t.error || t.output)+'</div></td>'+
+      '</tr>';
+  }).join('');
+
+  tbody.querySelectorAll('tr').forEach(function(row) {
+    row.addEventListener('click', function() {
+      openDetail(turns[parseInt(row.getAttribute('data-idx'),10)]);
+    });
+  });
+
+  if (openTurnId) {
+    var match = turns.find(function(t){ return t.turn_id === openTurnId; });
+    if (match) openDetail(match);
+    else openTurnId = null;
+  }
+}
+
+// Format a t_ms value (milliseconds since turn start) for display:
+// integer ms under 10s, seconds-with-1-decimal beyond. Empty string
+// for null/undefined so legacy turns render without a stray marker.
+function fmtTMs(t) {
+  if (typeof t !== 'number') return '';
+  if (t < 10000) return Math.round(t) + 'ms';
+  return (t / 1000).toFixed(1) + 's';
+}
+
+function renderEvent(e, i) {
+  var tHtml = e.t_ms != null
+    ? '<span class="t-marker" title="ms since turn start">'+fmtTMs(e.t_ms)+'</span>'
+    : '';
+  if (e.type === 'reasoning') {
+    return '<div class="event ev-reasoning">'+
+      '<div class="event-hdr"><span>&#x1F4AD; Reasoning #'+(i+1)+'</span>'+tHtml+
+      '<span class="event-toggle">&#x25B2;</span></div>'+
+      '<div class="event-bdy">'+esc(e.content||'')+'</div></div>';
+  }
+  if (e.type === 'tool_call') {
+    var args=''; try{args=JSON.stringify(e.args,null,2);}catch(ex){args=String(e.args);}
+    return '<div class="event ev-tool_call">'+
+      '<div class="event-hdr"><span>&#x2699;&#xFE0F; '+esc(e.name||'unknown')+'</span>'+
+      '<span style="font-family:monospace;opacity:.5;font-size:11px">'+esc((e.id||'').slice(0,12))+'</span>'+
+      tHtml+
+      '<span class="event-toggle">&#x25B2;</span></div>'+
+      '<div class="event-bdy">'+esc(args)+'</div></div>';
+  }
+  if (e.type === 'tool_result') {
+    var errCls=e.is_error?' is-error':'', icon=e.is_error?'&#x274C;':'&#x2705;';
+    return '<div class="event ev-tool_result'+errCls+'">'+
+      '<div class="event-hdr"><span>'+icon+' Result'+(e.is_error?' (error)':'')+'</span>'+
+      '<span style="font-family:monospace;opacity:.5;font-size:11px">'+esc((e.id||'').slice(0,12))+'</span>'+
+      tHtml+
+      '<span class="event-toggle">&#x25B2;</span></div>'+
+      '<div class="event-bdy">'+esc(e.content||'')+'</div></div>';
+  }
+  return '<div style="border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text3);font-size:12px">Unknown: '+esc(e.type)+'</div>';
+}
+
+// Saga call icon by call_type. Falls back to a generic disc for unknown
+// types so a future call_type (e.g. "mark_contributions") shows up
+// rather than getting silently mis-rendered.
+var SAGA_ICONS = {
+  query: '\u{1F50D}',         // magnifying glass
+  store: '\u{1F4BE}',         // floppy disk
+  feedback: '\u{1F44D}',      // thumbs up
+  outcome: '\u{1F3AF}',       // bullseye
+  end_session: '\u{1F3C1}',   // checkered flag
+  consolidate: '\u{1F501}',   // counterclockwise arrows
+  decay: '\u{231B}',          // hourglass
+  forget: '\u{1F5D1}️'   // wastebasket
+};
+
+function renderSagaCall(c, i) {
+  var t = c.call_type || 'unknown';
+  var icon = SAGA_ICONS[t] || '\u{2022}';
+  var lat = c.latency_ms != null ? Math.round(c.latency_ms) + 'ms' : '';
+  var errCls = c.error ? ' is-error' : '';
+  var tHtml = c.t_ms != null
+    ? '<span class="t-marker" title="ms since turn start">'+fmtTMs(c.t_ms)+'</span>'
+    : '';
+  // Body shows args + result side-by-side as JSON. The summarizer in
+  // saga_client.py keeps strings under 200 chars so this stays bounded.
+  var argsStr='', resultStr='';
+  try { argsStr = JSON.stringify(c.args, null, 2); } catch (ex) { argsStr = String(c.args); }
+  try { resultStr = JSON.stringify(c.result, null, 2); } catch (ex) { resultStr = String(c.result); }
+  var body = 'args:\n' + argsStr + '\n\nresult:\n' + resultStr;
+  if (c.error) body = 'error: ' + c.error + '\n\n' + body;
+  return '<div class="event ev-saga'+errCls+'">'+
+    '<div class="event-hdr"><span>'+icon+' '+esc(t)+(c.error?' (error)':'')+'</span>'+
+    '<span class="saga-latency">'+lat+'</span>'+
+    tHtml+
+    '<span class="event-toggle">&#x25B2;</span></div>'+
+    '<div class="event-bdy">'+esc(body)+'</div></div>';
+}
+
+// chainlink #376: a mid-turn user message folded into the turn at a
+// model-call boundary. Rendered as a timeline entry (same .event shell so
+// it gets toggle + scroll-preservation for free) placed at its t_ms — so
+// it reads in chronological order next to the replies it interleaved with.
+function renderInjected(inj) {
+  var tHtml = inj.t_ms != null
+    ? '<span class="t-marker" title="ms since turn start">'+fmtTMs(inj.t_ms)+'</span>'
+    : '';
+  return '<div class="event ev-injected">'+
+    '<div class="event-hdr"><span>&#x21AA;&#xFE0F; Mid-turn user message</span>'+
+    tHtml+
+    '<span class="event-toggle">&#x25B2;</span></div>'+
+    '<div class="event-bdy">'+esc(inj.text||'')+'</div></div>';
+}
+
+// Populate (or hide) the standalone "Injected mid-turn" section — the
+// fallback for entries that can't be woven into the timeline (legacy turns
+// with no t_ms). Modern turns weave into the event list instead.
+function showInjectedSection(list) {
+  var section = document.getElementById('detailInjectedSection');
+  if (list && list.length) {
+    section.style.display = '';
+    document.getElementById('detailInjectedCount').textContent = list.length;
+    document.getElementById('detailInjected').textContent =
+      list.map(function(i){ return i.text; }).join('\n\n— — —\n\n');
+  } else {
+    section.style.display = 'none';
+  }
+}
+
+// Attach click-to-toggle to all .event-hdr children of ``container``.
+// Used by both the model-event list and the saga-call list — same
+// expand/collapse behavior, same indicator glyph.
+function bindEventToggles(container) {
+  container.querySelectorAll('.event-hdr').forEach(function(h) {
+    h.addEventListener('click', function() {
+      var body=h.nextElementSibling, toggle=h.querySelector('.event-toggle');
+      var hidden=body.style.display==='none';
+      body.style.display=hidden?'':'none';
+      toggle.innerHTML=hidden?'&#x25B2;':'&#x25BC;';
+    });
+  });
+}
+
+// Preserve scroll position across re-renders for every ``.event-bdy``
+// box (reasoning, tool_call, tool_result, saga). The CSS has each of
+// these capped at ``max-height:360px`` with ``overflow-y:auto`` — so
+// they're independently scrollable. The 5-second poll's
+// ``innerHTML = ...`` destroys + rebuilds them, which without this
+// pair would reset every box's scrollTop to 0 mid-read.
+//
+// Index-within-container is the key. New events append at the end, so
+// existing indices stay stable; a freshly-arrived event gets a default
+// scrollTop=0 (correct), and the boxes you were reading keep their
+// position.
+function captureEventBdyScrolls(container) {
+  if (!container) return [];
+  return Array.prototype.map.call(
+    container.querySelectorAll('.event-bdy'),
+    function(b) { return b.scrollTop; }
+  );
+}
+function restoreEventBdyScrolls(container, saved) {
+  if (!container || !saved || !saved.length) return;
+  // rAF: same reason the outer-panel restore uses one — wait for the
+  // browser to commit the new layout before setting scrollTop, else
+  // the assignment races against layout and silently no-ops.
+  requestAnimationFrame(function() {
+    var boxes = container.querySelectorAll('.event-bdy');
+    var n = Math.min(boxes.length, saved.length);
+    for (var i = 0; i < n; i++) {
+      if (saved[i] > 0) boxes[i].scrollTop = saved[i];
+    }
+  });
+}
+
+function openDetail(turn) {
+  if (!turn) return;
+  // Preserve scroll position across re-renders for the SAME turn —
+  // the polling loop (pollNew, every 5s) calls openDetail again
+  // for the currently-open turn so freshly-arrived events render
+  // mid-stream. Without this, the panel scroll-resets to top on
+  // every poll, making it impossible to read further down. First
+  // click on a row IS a fresh open (different turn_id), so the
+  // scroll starts at top — that's the right user-expected behavior.
+  var detailPanel = document.getElementById('detailPanel');
+  var isRefresh = (openTurnId === turn.turn_id);
+  var savedScrollTop = isRefresh && detailPanel ? detailPanel.scrollTop : 0;
+  openTurnId = turn.turn_id;
+  document.getElementById('detailTs').textContent = fmtTime(turn.ts);
+  document.getElementById('detailTrigger').innerHTML = triggerBadge(turn.trigger, turn.kind);
+  document.getElementById('detailChannel').innerHTML = channelBadge(turn.channel_id);
+  document.getElementById('detailDuration').innerHTML = turn.duration_ms != null ? fmtDuration(turn.duration_ms) : '';
+  document.getElementById('detailTurnId').textContent = turn.turn_id ? 'turn: '+turn.turn_id : '';
+  document.getElementById('detailInput').textContent = turn.input||'(empty)';
+  document.getElementById('detailOutput').textContent = turn.output||'(empty)';
+
+  // chainlink #376: mid-turn messages the user sent while this turn was
+  // running, folded in at a model-call boundary. Normalize to {t_ms, text}
+  // (PR-3-era records were bare strings, no timing); timed entries get woven
+  // into the event timeline below at their fold point, untimed ones fall back
+  // to the standalone section.
+  var injected = (turn.injected_inputs||[]).map(function(m){
+    return (typeof m === 'string')
+      ? {t_ms: null, text: m}
+      : {t_ms: (typeof m.t_ms === 'number' ? m.t_ms : null), text: m.text||''};
+  });
+
+  var errorSection = document.getElementById('detailErrorSection');
+  if (turn.error) {
+    errorSection.style.display = '';
+    document.getElementById('detailError').textContent = turn.error;
+  } else {
+    errorSection.style.display = 'none';
+  }
+
+  // Interleave saga_calls with events on one chronological timeline
+  // when both carry ``t_ms`` (relative ms from turn start). Falls back
+  // to the legacy two-section layout for old turns that don't have
+  // t_ms — same render functions, just split into two lists.
+  var events = turn.events||[];
+  var sagaCalls = turn.saga_calls||[];
+  var canInterleave = sagaCalls.length > 0
+    && sagaCalls.every(function(c){ return typeof c.t_ms === 'number'; })
+    && events.every(function(e){ return typeof e.t_ms === 'number'; });
+
+  // chainlink #376 (PR 4): weave timed injected messages into the event
+  // timeline at their t_ms (works whether or not saga interleaving is on, as
+  // long as the events carry t_ms). Untimed (legacy) entries can't be placed,
+  // so they go to the standalone section.
+  var eventsTimed = events.length === 0
+    || events.every(function(e){ return typeof e.t_ms === 'number'; });
+  var injectedTimed = injected.filter(function(i){ return typeof i.t_ms === 'number'; });
+  var weaveInjected = injectedTimed.length > 0 && eventsTimed;
+  showInjectedSection(weaveInjected
+    ? injected.filter(function(i){ return i.t_ms === null; })
+    : injected);
+
+  var sagaSection = document.getElementById('detailSagaCallsSection');
+  var sagaInlineCount = document.getElementById('detailSagaInline');
+  if (canInterleave) {
+    // Single chronological list. Hide the separate saga-calls section;
+    // events section header shows "(N events, M saga)" so operators
+    // who think in saga-call count don't lose visibility.
+    sagaSection.style.display = 'none';
+    var combined = events.map(function(e){ return {kind:'event', t:e.t_ms, item:e}; })
+      .concat(sagaCalls.map(function(c){ return {kind:'saga', t:c.t_ms, item:c}; }));
+    if (weaveInjected) {
+      combined = combined.concat(injectedTimed.map(function(i){
+        return {kind:'injected', t:i.t_ms, item:i}; }));
+    }
+    // Stable sort by t_ms — JS Array.prototype.sort is stable in
+    // modern engines. Ties preserve insertion order, which keeps
+    // tool_call + saga + tool_result for the same MCP saga_query
+    // dispatch in the natural read order even though their t_ms
+    // may collide on the same message.
+    combined.sort(function(a,b){ return a.t - b.t; });
+    document.getElementById('detailEventsCount').textContent = events.length;
+    sagaInlineCount.style.display = '';
+    document.getElementById('detailSagaInlineCount').textContent = sagaCalls.length;
+    var evList = document.getElementById('detailEvents');
+    var savedEvScrolls = isRefresh ? captureEventBdyScrolls(evList) : [];
+    var seq = {ev: 0, saga: 0};
+    evList.innerHTML = combined.map(function(entry){
+      if (entry.kind === 'event') {
+        var html = renderEvent(entry.item, seq.ev);
+        seq.ev += 1;
+        return html;
+      } else if (entry.kind === 'saga') {
+        var html = renderSagaCall(entry.item, seq.saga);
+        seq.saga += 1;
+        return html;
+      } else {
+        return renderInjected(entry.item);
+      }
+    }).join('') || '<div class="no-events">No events recorded for this turn.</div>';
+    bindEventToggles(evList);
+    restoreEventBdyScrolls(evList, savedEvScrolls);
+  } else {
+    // Legacy layout: separate saga-calls section above events. Used
+    // for pre-t_ms turns (any turn recorded before the schema added
+    // t_ms to events + saga_calls).
+    sagaInlineCount.style.display = 'none';
+    if (sagaCalls.length) {
+      sagaSection.style.display = '';
+      document.getElementById('detailSagaCallsCount').textContent = sagaCalls.length;
+      var sagaList = document.getElementById('detailSagaCalls');
+      var savedSagaScrolls = isRefresh ? captureEventBdyScrolls(sagaList) : [];
+      sagaList.innerHTML = sagaCalls.map(renderSagaCall).join('');
+      bindEventToggles(sagaList);
+      restoreEventBdyScrolls(sagaList, savedSagaScrolls);
+    } else {
+      sagaSection.style.display = 'none';
+    }
+
+    document.getElementById('detailEventsCount').textContent = events.length;
+    var evList = document.getElementById('detailEvents');
+    var savedEvScrolls = isRefresh ? captureEventBdyScrolls(evList) : [];
+    if (weaveInjected) {
+      // No saga interleave here, but still place injected messages on the
+      // event timeline at their t_ms (PR 4).
+      var evItems = events.map(function(e){ return {kind:'event', t:e.t_ms, item:e}; })
+        .concat(injectedTimed.map(function(i){ return {kind:'injected', t:i.t_ms, item:i}; }));
+      evItems.sort(function(a,b){ return a.t - b.t; });
+      var seqL = {ev: 0};
+      evList.innerHTML = evItems.map(function(entry){
+        if (entry.kind === 'event') { var h = renderEvent(entry.item, seqL.ev); seqL.ev += 1; return h; }
+        return renderInjected(entry.item);
+      }).join('') || '<div class="no-events">No events recorded for this turn.</div>';
+    } else {
+      evList.innerHTML = events.length===0
+        ? '<div class="no-events">No events recorded for this turn.</div>'
+        : events.map(renderEvent).join('');
+    }
+    bindEventToggles(evList);
+    restoreEventBdyScrolls(evList, savedEvScrolls);
+  }
+
+  document.getElementById('detailPanel').classList.add('open');
+  document.getElementById('detailOverlay').classList.add('open');
+
+  // Restore scroll position for refresh-re-renders. requestAnimationFrame
+  // waits for the browser to commit the new DOM before we set scrollTop;
+  // setting it synchronously here would race against the layout pass and
+  // not stick. The saved value is 0 on first open (fresh turn), so this
+  // is a no-op for that case — only the same-turn refresh path actually
+  // restores a non-zero scroll.
+  if (isRefresh && savedScrollTop > 0 && detailPanel) {
+    requestAnimationFrame(function() {
+      detailPanel.scrollTop = savedScrollTop;
+    });
+  }
+}
+
+function closeDetail() {
+  openTurnId = null;
+  document.getElementById('detailPanel').classList.remove('open');
+  document.getElementById('detailOverlay').classList.remove('open');
+}
+
+document.getElementById('closeBtn').addEventListener('click', closeDetail);
+document.getElementById('detailOverlay').addEventListener('click', closeDetail);
+document.addEventListener('keydown', function(e){ if(e.key==='Escape') closeDetail(); });
+
+document.querySelectorAll('#triggerTabs .tab').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    activeTrigger = btn.getAttribute('data-trigger');
+    lsSet('activeTrigger', activeTrigger);
+    render();
+  });
+});
+
+// Restore the persisted UI state on load, so the initial render
+// matches the variables that filterTurns() reads. The .active tab
+// class is also re-synced here to avoid a brief flash of "All"
+// before the first data-load triggers render() (which itself
+// re-syncs the class from activeTrigger).
+document.getElementById('hidePollersToggle').checked = hidePollers;
+document.querySelectorAll('#triggerTabs .tab').forEach(function(btn) {
+  btn.classList.toggle('active', btn.getAttribute('data-trigger') === activeTrigger);
+});
+document.getElementById('hidePollersToggle').addEventListener('change', function(e) {
+  hidePollers = e.target.checked;
+  lsSet('hidePollers', hidePollers ? '1' : '0');
+  renderTable();
+});
+
+document.getElementById('searchInput').addEventListener('input', function(e) {
+  searchQuery = e.target.value;
+  renderTable();
+});
+
+// ── Data loading ──────────────────────────────────────────────────────────
+var dot = document.getElementById('statusDot');
+
+function _live() { dot.className = 'status-dot live'; dot.title = 'Live \u2014 auto-updating'; }
+function _stale() { dot.className = 'status-dot stale'; dot.title = 'Disconnected'; }
+
+// Initial page: newest PAGE_SIZE turns only.
+function loadInitial() {
+  authedFetch('/api/turns?limit=' + PAGE_SIZE)
+    .then(function(r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function(data) {
+      var turns = data.turns || [];
+      allOlderLoaded = turns.length < PAGE_SIZE;
+      setTurns(turns);
+      _live();
+      maybeLoadMore();   // top up if the first page doesn't fill the viewport
+    })
+    .catch(_stale);
+}
+
+// Scroll-back: fetch the page of turns older than what we have.
+function loadOlder() {
+  if (allOlderLoaded || loadingMore || !oldestId) return;
+  loadingMore = true;
+  authedFetch('/api/turns?before=' + encodeURIComponent(oldestId) + '&limit=' + PAGE_SIZE)
+    .then(function(r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function(data) {
+      var older = data.turns || [];
+      if (older.length < PAGE_SIZE) allOlderLoaded = true;
+      appendOlder(older);
+      loadingMore = false;
+      maybeLoadMore();   // keep filling if pages are small
+    })
+    .catch(function() { loadingMore = false; _stale(); });
+}
+
+// Live poll: only turns newer than what we have (tiny payload, every 5s).
+function pollNew() {
+  if (!newestId) { loadInitial(); return; }
+  authedFetch('/api/turns?after=' + encodeURIComponent(newestId))
+    .then(function(r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(function(data) { prependNew(data.turns || []); _live(); })
+    .catch(_stale);
+}
+
+// Load another older page if the content doesn't fill the scroll area (small
+// dataset / short viewport), so there's always something to scroll for.
+function maybeLoadMore() {
+  if (allOlderLoaded || loadingMore) return;
+  var w = document.getElementById('tableWrapper');
+  if (w && w.scrollHeight <= w.clientHeight + 100) loadOlder();
+}
+
+document.getElementById('tableWrapper').addEventListener('scroll', function() {
+  // Near the bottom -> pull the next older page.
+  if (this.scrollTop + this.clientHeight >= this.scrollHeight - 300) loadOlder();
+});
+
+// First-load: if no key is stored, prompt once before the initial fetch.
+// Subsequent visits with a saved key skip the prompt and go straight to
+// loading. If the server has MIMIR_API_KEY unset, an empty key still
+// works (the middleware short-circuits when expected_key is empty).
+if (!getApiKey()) promptApiKey('first visit');
+loadInitial();
+pollInterval = setInterval(pollNew, 5000);
+})();
+</script>
+</body>
+</html>

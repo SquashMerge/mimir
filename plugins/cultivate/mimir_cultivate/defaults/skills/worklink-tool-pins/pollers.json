@@ -1,0 +1,23 @@
+{
+  "pollers": [
+    {
+      "name": "worklink-tool-pins",
+      "command": "python3 scripts/poller.py",
+      "cron": "0 8 * * 0",
+      "priority": "low",
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "saga_full_corpus_read": true,
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message"],
+        "scoped_roots": ["state"]
+      },
+      "pass_env": [
+        "MIMIR_HOME",
+        "WORKLINK_CONFIG",
+        "CHAINLINK_CWD",
+        "CHAINLINK_BIN"
+      ]
+    }
+  ]
+}
