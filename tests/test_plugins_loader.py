@@ -71,7 +71,7 @@ def test_nested_config_namespace_rejected_before_provider_import(monkeypatch, re
     def candidate(name, key):
         manifest = parse_manifest((
             f'name = "{name}"\nversion = "1.0"\nlicense = "MIT"\n'
-            'requires_mimir = ">=0.9,<1"\n'
+            'requires_mimir = ">=0"\n'
             f'[config.{key}]\ntype = "string"\n'
         ).encode(), entry_name=name)
         return SimpleNamespace(
@@ -97,7 +97,7 @@ def test_config_namespace_longest_selected_prefix_owns_key(monkeypatch, nested_s
     def candidate(name, key):
         manifest = parse_manifest((
             f'name = "{name}"\nversion = "1.0"\nlicense = "MIT"\n'
-            'requires_mimir = ">=0.9,<1"\n'
+            'requires_mimir = ">=0"\n'
             f'[config.{key}]\ntype = "string"\n'
         ).encode(), entry_name=name)
         return SimpleNamespace(
@@ -198,7 +198,7 @@ def test_disabled_provider_is_not_imported_by_loader_in_child_process(tmp_path):
         root = tmp_path / name
         root.mkdir()
         (root / "mimir-plugin.toml").write_text(
-            f'name = "{name}"\nversion = "1.2.3"\nlicense = "MIT"\nrequires_mimir = ">=0.9,<1"\n'
+            f'name = "{name}"\nversion = "1.2.3"\nlicense = "MIT"\nrequires_mimir = ">=0"\n'
         )
     script = """
 import importlib

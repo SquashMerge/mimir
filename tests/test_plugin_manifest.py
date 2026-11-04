@@ -20,7 +20,7 @@ def _toml(**fields: str) -> bytes:
         "name": "alpha",
         "version": "1.2.3",
         "license": "MIT",
-        "requires_mimir": ">=0.9,<1",
+        "requires_mimir": ">=0",
         **fields,
     }
     return "".join(f'{key} = "{value}"\n' for key, value in values.items()).encode()
