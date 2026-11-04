@@ -94,7 +94,10 @@ otel = [
 ]
 local-embeddings = [
     "sentence-transformers>=5.1",
-    "transformers>=4.56,<5",
+    # >=5.10: every transformers release below it is affected by at least one of
+    # GHSA-29pf-2h5f-8g72, -fgcw-684q-jj6r, -xrqw-3rrv-vx5w, -x9r9-c232-4q39 or
+    # -69w3-r845-3855. voyage-4-nano verified under 5.22.1 (PR #3).
+    "transformers>=5.10,<6",
     "torch>=2.2",
 ]
 acp = []
