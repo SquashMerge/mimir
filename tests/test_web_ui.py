@@ -72,7 +72,7 @@ def _selected_web_manager(tmp_path: Path, monkeypatch, *, plugins: tuple[dict, .
         (root / "private.txt").write_text("private")
         (root / "mimir-plugin.toml").write_text(
             f'name = "{name}"\nversion = "1.2.3"\nlicense = "MIT"\n'
-            'requires_mimir = ">=0.9,<1"\nthemes = ["skin.json"]\n'
+            'requires_mimir = ">=0"\nthemes = ["skin.json"]\n'
             '[frontend]\napi_major = 1\nmodule = "module.js"\ncss = "bundle.css"\n'
             f'[config.MIMIR_PLUGIN_{name.upper()}_LABEL]\ntype = "string"\n'
             f'[config.MIMIR_PLUGIN_{name.upper()}_TOKEN]\ntype = "string"\nsecret = true\nsecurity = true\n'

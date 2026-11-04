@@ -54,7 +54,7 @@ def test_plugins_list_human_and_json(monkeypatch, capsys):
 def test_plugins_list_ignores_home_dotenv_and_does_not_load_provider(tmp_path):
     (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\n")
     (tmp_path / "mimir-plugin.toml").write_text(
-        'name = "alpha"\nversion = "1.2.3"\nlicense = "MIT"\nrequires_mimir = ">=0.9,<1"\n'
+        'name = "alpha"\nversion = "1.2.3"\nlicense = "MIT"\nrequires_mimir = ">=0"\n'
     )
     script = """
 import importlib.metadata as metadata

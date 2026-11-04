@@ -386,7 +386,7 @@ This repository is split across three licenses:
 - **Mimir core** (everything not listed below) — MIT; see [LICENSE](./LICENSE).
   Copyright © 2026 Jason Carreira <jason@squashmerge.ai>.
 - **Cultivate**, the coding plugin in [`plugins/cultivate/`](./plugins/cultivate/)
-  and published as `mimir-cultivate` — Business Source License 1.1; see
+  and packaged as `mimir-cultivate`, installed from this repository rather than PyPI — Business Source License 1.1; see
   [plugins/cultivate/LICENSE](./plugins/cultivate/LICENSE). Each version converts
   to Apache 2.0 three years after it is first publicly distributed.
 - **SquashMerge brand assets** in [`brand/`](./brand/) — all rights reserved; see
