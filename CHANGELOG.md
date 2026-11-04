@@ -8,6 +8,186 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc1] — 2026-11-04
+
+- **Release candidate for 1.0.0, and the first release from [SquashMerge/mimir](https://github.com/SquashMerge/mimir).** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly (`mimir-agent==1.0.0rc1` or `--prerelease allow`).
+  - **Plugin architecture.** Coding, Worklink and the feature factory moved out of core into the optional Cultivate plugin (`mimir-cultivate`, under the Business Source License 1.1). Core mimir stays MIT and runs without it.
+  - **Licensing.** Core is MIT; `plugins/cultivate` is BSL 1.1 and converts to Apache 2.0 three years after first public distribution; brand assets are all rights reserved. See the README's License section.
+  - **Repository move.** `jasoncarreira/mimir` is now `SquashMerge/mimir`. Update git remotes, `MIMIR_GIT_URL` overrides and pinned install URLs.
+
+- Move coding and Worklink into the optional BSL-licensed Cultivate plugin; keep MIT core usable without coding and add separate core and selected-provider CI coverage (#1949).
+
+- Prune and vacuum redundant OpenCode streaming events when Cultivate factory runs park or complete, and remove their runtime stores with expired checkouts.
+
+- Add forge-tagged optional plugin skills with CLI listing, installation, and backed-up restoration.
+
+- Do not charge Worklink claim attempts for verified factory clean parks (#1985).
+
+- Repark factory runs after a verified-dead driver misses the startup deadline, so autonomous dispatch can resume them (#1986).
+
+- Refresh retained factory runs from live status before deciding whether recovery can resume (#1987).
+
+- Bump feature-factory and opencode-feature-factory to 0.12.1 (handoffs, `grant-remediation` and `override-validator`), and document finishing a run after a Gate 3 NO-GO (#1988).
+
+- Remove unreachable core CI-tool classification branches; Cultivate continues to own CI authorization and result trust.
+
+- Scope leaf Worklink worker Git trust to the issued checkout without writing Git configuration files.
+
+- Restore attested Cultivate PR-lease repository result labels so verified-base merges no longer block subsequent remediation writes (#2000). Shared checkout attestation resolves server-discovered/reminted lease state before the original event registry, preserving attestation after clean remediation commits advance a reminted lease; real-Git regression and predicate-removal controls pin that lookup and authorization/repository binding without broadening retained factory authority.
+
+- Deliver plugin skill upgrades through `mimir skills install --restore` with historical seed detection, packaged poller fallback, and operator and agent notices. Unreadable inventories fail closed even before event-logger startup, diagnostics are once per process per skill, and upgrade events identify the target release.
+
+- Fix false Cultivate poller seed warnings during startup and admin discovery by using the active plugin policy (#2006).
+
+- Ship a pinned Chainlink CLI in Cultivate-selected Docker images for Worklink claims and continuation (#2007).
+
+- Add `mimir cultivate setup` for guided, provenance-pinned Cultivate Docker deployments with credential checks and first-start verification.
+
+- Verify Cultivate setup tokens can push before starting the agent and clarify fine-grained PAT permissions (#2009).
+
+- Ship a checksum-verified, pinned GitHub CLI in Cultivate images and preserve the MCP extra during setup (#2010).
+
+- Configure Cultivate memory models and local embeddings during setup, with safe credential routing and explicit fallback diagnostics. Check embedding dimensions at the runtime-resolved database path without creating directories or breaking provider initialization when the database is unavailable.
+
+- Expose installed Cultivate setup to operators without selecting its agent plugin, and give actionable selection hints for other plugin commands.
+
+- Keep Cultivate's prefetched local Saga embedding model on the persistent cache volume across agent restarts (#2013).
+
+- Default saga memory calls to gpt-6-luna or Claude Haiku 5.5 at low effort, omitting unsupported sampling temperatures while preserving legacy custom sampling.
+
+- Cultivate now defaults to pinned local Voyage 4 nano embeddings at 1024 dimensions, with a compatible keyless Voyage 4 fallback and CPU-only optional dependencies.
+
+- Cultivate setup now provisions a Chainlink agent and dedicated Worklink base and config for ready-leaf dispatch.
+
+- Close qualifying reviewed Worklink leaves merged into any branch of their declared repository, audit the actual completion branch, and leave open PRs quiet without new configuration.
+
+- Initialize Chainlink before Cultivate Worklink provisioning on fresh installs and identify failing Docker setup steps (#2018).
+
+- Fix false Worklink executor source drift in Cultivate installs by reading the controller image's recorded commit (#2019).
+
+- Cultivate OpenCode accepts API-key deployments and reconciles Codex OAuth credentials before and after Worklink runs.
+
+- Align Worklink attempt checkouts and executor validation on `WORKLINK_CHECKOUT_ROOT`, including fresh Cultivate installations.
+
+- Run Cultivate setup verification as the agent user so executor and OpenCode credential checks use the correct identity and home (#2022).
+
+- Resolve Worklink leaf OpenCode from the image installation or controller PATH and verify executable access during Cultivate setup (#2023).
+
+- Configure Cultivate attempt commits with the deployment bot's Git identity and refuse missing identities (#2024).
+
+- Use the PR's repository instead of a fixed repository in Cultivate's shipped GitHub skills (#2025).
+
+- Fix Cultivate PR reviews by checking out before reads, surfacing a checkout remedy, and retaining attested forge-result integrity.
+
+- Fix Cultivate setup's OpenCode model verification and Worklink's reporting of OpenCode startup errors; update the image to OpenCode 1.19.4.
+
+- Fail Cultivate setup on toolchain installation errors and verify the detected tools as the Worklink user before reporting ready.
+
+- Install native build tools in Cultivate language layers and verify linking during setup (#2029).
+
+- Fix mixed-case GitHub repository URLs tainting Cultivate PR checks and blocking reviews.
+
+- Match authorized PR repository names case-insensitively when binding Cultivate tool-result provenance, preventing trusted mixed-case review reads from acquiring spurious untrusted taint; include bounded, redacted sources in plugin blocked-write events.
+
+- Link every rustup proxy into the Cultivate worker PATH and verify Cargo formatting and lint subcommands (#2033).
+
+- Add common developer tools to Cultivate images and support verified, persistent repo-specific Debian packages during setup (#2034).
+
+- Cultivate records GitHub issue activity as owner-visible notices instead of starting unsupported issue review turns.
+
+- Cultivate setup can configure durable web, Discord, or Slack operator alerts and verify delivery.
+
+- Resolve repository-relative Cultivate test runners from the PR checkout and refuse runners that escape it.
+
+- Exclude Worklink gate byproducts from publication and block bulk untracked build output.
+
+- Isolate Cultivate GitHub identity degradation state between tests (#2040).
+
+- Give Worklink commits and pull requests descriptive, tracker-safe text with configurable attribution and path-free run identifiers.
+
+- Require green head-specific CI for Cultivate approvals and follow up on withheld reviews when PR checks complete.
+
+- Keep Cultivate PR check reads trusted when invalid check fields can be withheld, and accept matrix job names (#2044).
+
+- Route trusted feedback on the bot's own pull requests to deduplicated remediation turns instead of review requests (#2045).
+
+- Admit trusted GitHub poller and author-attested repository content at forge sinks in enforced mode without source PR scope binding.
+
+- Keep scoped pull-request grants valid through long test runs within their turn, with a configured hard ceiling (#2047).
+
+- Allow Cultivate setup to upgrade a deployment in place while preserving state and refusing edited files or active work.
+
+- Let Cultivate reviews use per-repository targeted, full, or CI-only test policies while retaining full local verification for remediation and Worklink (#2049).
+
+- Add an opt-in Worklink CI gate that publishes draft PRs after a quick local check, repairs failed CI on the same branch, and marks green PRs ready for review.
+
+- Add Cultivate setup options for Worklink gate settings and provisioning without starting the agent (#2051).
+
+- Cultivate supports per-repository requested-only PR reviews through setup and repository policy.
+
+- Cultivate setup now upgrades inventoried default skills with backups and refuses modified skills unless forced.
+
+- Deliver tracker transition notices without a resolvable issue URL, with an explicit no-URL marker (#2062).
+
+- Remove unnecessary tracker issue IDs from Cultivate builder and coding-status prompts.
+
+- Upgrade installed default Cultivate skills on setup re-runs, preserving modified trees unless forced (#2065).
+
+- Clarify that Worklink publishes pull requests and tracker triage keeps publication requests out of build acceptance criteria.
+
+- Preserve trusted tracker triage turns after fixed-shape tracker status results so follow-up comments and Saga synthesis can proceed (#2067).
+
+- Let Worklink's CI gate finish a trusted review-ready handoff and reconcile a PR merged during CI or its handoff block (#2069).
+
+- Schedule Worklink stale-claim recovery and merged-leaf closure by default on Cultivate homes, while preserving operator cron overrides (#2070).
+
+- Port lease-bound historical file restores and paged revision reads to Cultivate.
+
+- Preserve factory run outcomes when post-run Codex authentication reconciliation fails, and deliver worker-owned rotated tokens through the attempt-bound worker control path.
+
+- Cultivate setup supports isolated Codex subscription logins without requiring a model API key.
+
+- Keep scoped PR remediation grants live through recorded local commits and verified pushes, and prevent unsupported-operation escalation statuses from tainting trusted turns.
+
+- Publish feature-factory park snapshots after Worklink-initiated budget parks so parked runs can resume.
+
+- Keep workspace-only benchmark dependencies out of published mimir-agent extras and check wheel metadata for leaks.
+
+- Isolate tests from host-installed coding CLIs so container-green suites behave the same in CI.
+
+- Keep factory issues in review when a published PR advances on the verified commit, and block rewritten PR heads instead of re-queueing duplicate builds (#2081).
+
+- Fix the Cultivate Chainlink orchestrator skill's planner prompt path (#2082).
+
+- Name refused Git subcommands after global options and guide upgrade proposals to submit_proposal for staging and publication (#2083).
+
+- Fix AuthContext serializer warnings from unbound tool runtime annotations (#2084).
+
+- Reuse saturated JSONL snapshots for windows covered by the cache; read the file only when older records are needed (#2085).
+
+- Preserve stopped PR remediation checkout results when live preflight finds nothing left to remediate (#2086).
+
+- Give agents lane-scoped revision turns for collaborator changes-requested reviews on their home state-repo proposal PRs.
+
+- Include trusted follow-up PR comments in home proposal revision feedback; filter irrelevant/deleted-author comments before validating renderable content, accept file-level feedback, diagnose unusable payloads, and namespace untrusted notice IDs (#2088).
+
+- Fold completed background shell jobs into their originating turn when possible, and bound and coalesce follow-up turns when not (#2089).
+
+- Isolate service-shell pin validation tests from host executable layout while retaining checks for unsafe production paths, symlinks, missing or non-executable files, and writable-root pins.
+
+- Add metadata-only plugin inventory and operator-owned plugin enablement documentation (#1947).
+
+- Extend trusted plugins with host, prompt, UI, Docker service, defaults, configuration and typed-state contributions while preserving process-only selection and core policy checks.
+
+- Add opt-in OpenTelemetry GenAI tracing configuration and an OTLP HTTP extra; keep Cultivate out of core development dependencies, reject credential-bearing remote plain-HTTP export, and expose a turn-local usage observer with cancellation coverage.
+
+- The factory's repository verify now runs through `scripts/heavy_run.sh`. When a host sets `MIMIR_HEAVY_LOCK_FILE` and has `lockf` and `gtimeout`, the verify queues on that shared heavy-run lock, under a `gtimeout` backstop. Otherwise it runs directly. `verify_timeout_ms` is raised to cover time spent waiting for the lock.
+
+- Cultivate can triage issues assigned to the bot in GitHub Issues, Linear and Jira: `mimir cultivate setup --tracker github-issues|linear|jira` (repeatable) installs the optional `tracker-poller` skill, writes the `tracker:` section of `worklink.yaml`, stores the Linear and Jira credentials in `compose.env` (`--linear-api-key-file`, `--jira-email-file`, `--jira-api-token-file` and their `-stdin` forms, or a plain `--jira-email`) and remembers the selection on later runs. Only threads whose latest activity comes from a trusted person reach the agent. Setup rewrites an unedited `worklink.yaml` when the tracker selection changes; a hand-edited file still needs `--force`.
+- Worklink now rewrites builder-written closing keywords (for example `Fixes` or `Resolves` followed by an issue reference becomes `Refs`) on every leaf pull request Worklink opens, so only the tracker-linked `Closes` line closes an issue. Epic pull requests are written by the feature factory; once the factory completes and its pull request is verified, Worklink cleans that pull request whether or not the epic is tracker-linked: it removes the factory issue-key decoration and Chainlink ids, applies the same rewrite, and adds the tracker line only when a tracker record exists. Because the whole epic body is model-written, the scrub covers all of it, including quoted commands and counts that match the Chainlink id. If the edit fails, the epic still moves to review and the operator gets a `factory_publication_degraded` notice naming the pull request and the reason. The tracker line closes the issue only through the tracker's own GitHub integration, which acts on a merge to the default branch, so an epic that targets a feature branch still relies on the `close_on_merge` backstop to close its issue.
+
+- Keep internal tracker references out of Worklink PRs and commits; reconcile merged PRs from durable publication evidence.
+
 ## [0.9.11] — 2026-11-01
 
 - **0.9.11 is the last release with Worklink and the feature factory bundled.** From the next release, coding work (Worklink, the feature factory and the related skills) ships separately as the Cultivate plugin, and `mimir-agent` no longer includes it.

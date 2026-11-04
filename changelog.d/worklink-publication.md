@@ -1,1 +1,0 @@
-- Keep internal tracker references out of Worklink PRs and commits; reconcile merged PRs from durable publication evidence.

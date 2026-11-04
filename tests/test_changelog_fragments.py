@@ -48,9 +48,9 @@ def release_tree(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _run(root: Path) -> subprocess.CompletedProcess[str]:
+def _run(root: Path, version: str = "1.2.3") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(root / "scripts" / "changelog_collect.py"), "1.2.3", "--date", "2026-10-09"],
+        [sys.executable, str(root / "scripts" / "changelog_collect.py"), version, "--date", "2026-10-09"],
         capture_output=True, text=True,
     )
 
@@ -121,3 +121,32 @@ def test_collector_refuses_bad_fragment_without_changes(release_tree: Path, bad:
     assert "must start with a Markdown bullet" in result.stderr
     assert (release_tree / "CHANGELOG.md").read_text() == BASE
     assert fragment.exists()
+
+
+@pytest.mark.parametrize("version", ["1.0.0rc1", "1.0.0a2", "1.0.0b1"])
+def test_collects_a_pep440_prerelease_section(release_tree: Path, version: str) -> None:
+    (release_tree / "changelog.d" / "a.md").write_text("- Candidate item\n")
+    assert _run(release_tree, version).returncode == 0
+    assert f"## [{version}] — 2026-10-09\n\n- Candidate item\n\n" in (release_tree / "CHANGELOG.md").read_text()
+
+
+@pytest.mark.parametrize("version", ["1.0", "1.0.0-rc1", "1.0.0rc", "1.0.0.dev1", "v1.0.0"])
+def test_rejects_versions_that_are_not_release_or_prerelease(release_tree: Path, version: str) -> None:
+    (release_tree / "changelog.d" / "a.md").write_text("- Item\n")
+    result = _run(release_tree, version)
+    assert result.returncode != 0
+    assert "version must be" in result.stderr
+    assert (release_tree / "CHANGELOG.md").read_text() == BASE
+
+
+@pytest.mark.parametrize(("version", "prerelease"), [
+    ("1.0.0rc1", True), ("1.0.0a2", True), ("1.0.0b1", True), ("1.0.0", False), ("0.9.11", False),
+])
+def test_publish_workflow_marks_only_prereleases(version: str, prerelease: bool) -> None:
+    """A pre-release tag must not become the repo's "Latest" GitHub release."""
+    workflow = (ROOT / ".github" / "workflows" / "publish.yml").read_text()
+    pattern = re.search(r"""grep -Eq '([^']+)'; then\n\s+prerelease=\(--prerelease\)""", workflow)
+    assert pattern, "publish.yml pre-release detection changed; update this contract check"
+    assert workflow.count('--verify-tag "${prerelease[@]}"') == 2
+    matched = subprocess.run(["grep", "-Eq", pattern.group(1)], input=f"{version}\n", text=True).returncode == 0
+    assert matched is prerelease

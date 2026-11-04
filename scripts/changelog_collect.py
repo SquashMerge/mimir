@@ -12,8 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def collect(root: Path, version: str, release_date: str) -> None:
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        raise ValueError("version must be X.Y.Z")
+    # Final X.Y.Z, or a PEP 440 pre-release such as 1.0.0rc1 / 1.0.0a2 / 1.0.0b1.
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?", version):
+        raise ValueError("version must be X.Y.Z or X.Y.Z{a,b,rc}N")
     if date.fromisoformat(release_date).isoformat() != release_date:
         raise ValueError("date must be YYYY-MM-DD")
 
@@ -58,7 +59,7 @@ def collect(root: Path, version: str, release_date: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("version", help="release version X.Y.Z")
+    parser.add_argument("version", help="release version X.Y.Z or X.Y.Z{a,b,rc}N")
     parser.add_argument("--date", default=date.today().isoformat(), help="release date YYYY-MM-DD")
     args = parser.parse_args()
     try:
