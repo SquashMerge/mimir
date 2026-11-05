@@ -472,6 +472,34 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
             })
 
 
+def _merge_reconciliation_action(notice: dict, facts: dict) -> str:
+    """Recommend from observed evidence without overriding identity/lifecycle refusals."""
+    reason = notice["reason"]
+    if notice.get("retriable"):
+        passes = notice.get("observations", 0)
+        if passes < MERGE_RETRY_PASSES:
+            return "none — will retry automatically"
+        return f"operator: inspect — still retrying {reason} after {passes} passes"
+
+    # A merged PR alone cannot discharge a terminal identity/lifecycle refusal
+    # or authorize replaying a mutation whose outcome is uncertain.
+    inspect = f"operator: inspect {reason}"
+    if reason != "reconciliation_read_failed":
+        return inspect
+    issue_id = notice.get("issue_id")
+    merge_sha = facts.get("pr_merge_commit_sha")
+    base = facts.get("pr_base_ref")
+    if (
+        facts.get("pr_state") == "merged"
+        and isinstance(merge_sha, str) and re.fullmatch(r"[0-9a-fA-F]{7,64}", merge_sha)
+        and isinstance(base, str) and base
+        and type(issue_id) is int and issue_id > 0
+        and facts.get("issue_lifecycle_labels") == ["worklink:review"]
+    ):
+        return f"close issue #{issue_id} after confirming merge {merge_sha} on {base}"
+    return inspect
+
+
 def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> None:
     """Offer durable merge refusals without changing dispatch eligibility."""
     for notice in pending_merge_reconciliation_notices(state_dir):
@@ -497,7 +525,7 @@ def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> 
                     "pr_merge_commit_sha": None, "pr_merged_at": None,
                     "issue_lifecycle_labels": None,
                 }
-                action = f"operator: inspect {current['reason']}"
+                action = _merge_reconciliation_action(current, facts)
                 _emit({
                     "prompt": (
                         "Worklink merge reconciliation observation. Do not auto-close the Chainlink "

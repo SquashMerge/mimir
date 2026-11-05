@@ -7116,12 +7116,81 @@ def test_merge_open_pr_is_held_then_delivered_once_with_observed_facts(
     assert len(emitted) == 1
     assert emitted[0]["facts"] == fields["facts"]
     assert emitted[0]["retriable"] is True
-    assert emitted[0]["recommended_action"] == "operator: inspect pr_open"
+    assert emitted[0]["recommended_action"] == (
+        f"operator: inspect — still retrying pr_open after {failures.MERGE_RETRY_PASSES} passes"
+    )
+    assert f"Recommended action: {emitted[0]['recommended_action']}" in emitted[0]["prompt"]
     _write_delivery_receipt(state, entry["delivery_key"])
     consumer._deliver_merge_reconciliations(state, budget)
     consumer._deliver_merge_reconciliations(state, budget)
     assert len(emitted) == 1
     assert failures.load_failure_state(state)["merge_reconciliations"]["notices"][entry["delivery_key"]]["notified"]
+
+
+@pytest.mark.parametrize("reason, retriable, observations, changes, expected", [
+    ("reconciliation_read_failed", False, 1, {},
+     "close issue #1304 after confirming merge " + "b" * 40 + " on release/next"),
+    ("pr_open", True, 1, {"pr_state": "open"},
+     "none — will retry automatically"),
+    ("pr_open", True, 5, {"pr_state": "open"},
+     "operator: inspect — still retrying pr_open after 5 passes"),
+    ("repository_identity_mismatch", False, 1, {},
+     "operator: inspect repository_identity_mismatch"),
+    ("merge_identity_changed", False, 1, {},
+     "operator: inspect merge_identity_changed"),
+    ("review_lifecycle_required", False, 1, {},
+     "operator: inspect review_lifecycle_required"),
+    ("competing_lifecycle_label:worklink:blocked", False, 1, {},
+     "operator: inspect competing_lifecycle_label:worklink:blocked"),
+    ("audit_outcome_uncertain", False, 1, {},
+     "operator: inspect audit_outcome_uncertain"),
+    ("reconciliation_read_failed", False, 1, {"pr_merge_commit_sha": None},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1, {"pr_base_ref": None},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1, {"pr_state": "open"},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1, {"issue_lifecycle_labels": None},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1,
+     {"issue_lifecycle_labels": ["worklink:in-progress"]},
+     "operator: inspect reconciliation_read_failed"),
+])
+def test_merge_reconciliation_action_uses_reason_and_facts(
+    worklink_receipt_consumer, reason, retriable, observations, changes, expected,
+):
+    facts = {"pr_state": "merged", "pr_merge_commit_sha": "b" * 40,
+             "pr_base_ref": "release/next", "issue_lifecycle_labels": ["worklink:review"]}
+    facts.update(changes)
+    assert worklink_receipt_consumer._merge_reconciliation_action(
+        {"reason": reason, "issue_id": 1304, "retriable": retriable,
+         "observations": observations}, facts,
+    ) == expected
+
+
+def test_merge_merged_pr_notice_delivers_close_action(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, _, _ = worklink_receipts
+    consumer = worklink_receipt_consumer
+    emitted = []
+    monkeypatch.setattr(consumer, "_emit", emitted.append)
+    failures.record_merge_reconciliation_notice(
+        state, issue_id=1304, repository="example/project",
+        pr_url="https://github.com/example/project/pull/42",
+        reason="reconciliation_read_failed", detail="reconciliation observation unavailable",
+        facts={"pr_url": "https://github.com/example/project/pull/42",
+               "pr_state": "merged", "pr_draft": False,
+               "pr_head_sha": "a" * 40, "pr_base_ref": "release/next",
+               "pr_merge_commit_sha": "b" * 40, "pr_merged_at": "2026-11-05T04:00:00Z",
+               "issue_lifecycle_labels": ["worklink:review"]},
+    )
+    consumer._deliver_merge_reconciliations(state, SimpleNamespace(hard_exhausted=lambda: False))
+    [event] = emitted
+    expected = "close issue #1304 after confirming merge " + "b" * 40 + " on release/next"
+    assert event["recommended_action"] == expected
+    assert f"Recommended action: {expected}" in event["prompt"]
+    assert "they do not require a GitHub read" in event["prompt"]
 
 
 def test_merge_notice_observed_facts_use_shared_redaction(worklink_receipts):
