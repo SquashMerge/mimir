@@ -11437,9 +11437,15 @@ def protected_result_source(
             active_pr_checkout_lease_for_path = lambda _path: None
 
         lease = active_pr_checkout_lease_for_path(resource_id)
+        # Repository tools prefer the turn-local server-discovered state over
+        # the original event registry (which may hold an older checkout).
+        # File reads must resolve the very same lease before attesting it.
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        review_state = discovered.resolve_checkout_path(resource_id) if discovered is not None else None
         registry = getattr(auth_context, "repo_pr_scope_registry", None)
-        if registry is not None:
+        if review_state is None and registry is not None:
             review_state = registry.resolve_checkout_path(resource_id)
+        if review_state is not None or registry is not None:
             scope = getattr(review_state, "action_scope", None)
         else:
             scope = getattr(auth_context, "repo_pr_action_scope", None)
