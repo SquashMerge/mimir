@@ -28,6 +28,7 @@ import warnings
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from mimir._atomic import atomic_write_json
+from mimir.github_identity import same_github_pr_url, same_github_repo
 from mimir._rmtree import rmtree_missing_ok
 from mimir_cultivate.forge import GitHubForgeClient, GitHubIdentityVerificationError
 from .ci_gate import ready_pr, rerun_infrastructure, wait_for_ci
@@ -4876,7 +4877,7 @@ async def _verify_factory_completion(
         if match is None:
             raise WorklinkError("factory completed with a noncanonical PR URL")
         expected_repo = f"{match.group(1)}/{match.group(2)}".lower()
-        if expected_repo != record.repository.lower():
+        if not same_github_repo(expected_repo, record.repository):
             raise WorklinkError("factory PR repository mismatch")
         sandbox = Path(record.sandbox)
         from .worker_client import factory_checkout_for_path
@@ -4997,17 +4998,17 @@ async def _verify_factory_completion(
         base_ref = _require_pr_string(base_data, "ref")
         head_ref = _require_pr_string(head_data, "ref")
         head_sha = _require_pr_string(head_data, "sha")
-        if html_url != status.pr_url:
+        if not same_github_pr_url(html_url, status.pr_url):
             raise WorklinkError("GitHub PR URL mismatch")
         if state != "open":
             raise WorklinkError("GitHub PR is not open")
         if draft:
             raise WorklinkError("GitHub PR is draft")
-        if base_name.lower() != record.repository.lower():
+        if not same_github_repo(base_name, record.repository):
             raise WorklinkError("GitHub PR base repository mismatch")
         if base_ref != record.base_ref:
             raise WorklinkError("GitHub PR base ref mismatch")
-        if head_name.lower() != record.repository.lower():
+        if not same_github_repo(head_name, record.repository):
             raise WorklinkError("GitHub PR head repository mismatch")
         if head_ref != record.branch:
             raise WorklinkError("GitHub PR head ref mismatch")

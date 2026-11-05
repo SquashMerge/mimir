@@ -108,7 +108,7 @@ def test_deferred_review_resumes_once_when_checks_conclude(
     assert ("approve without a full re-review" if conclusion != "failure" else "Request changes") in event["prompt"]
     assert event["head_sha"] == HEAD
     assert event["requested_reviewer"] == "mimir-bot"
-    assert event["dedup_scope"] == "head_sha,reviewer"
+    assert event["dedup_scope"] == "head_sha,reviewer,failed_checks"
     assert cursor["42:review_ci"]["completed_reviews"] == [event["delivery_key"]]
     for hours in (1, 24):
         poller._check_pr_ci_failures(
@@ -131,6 +131,140 @@ def test_terminal_review_does_not_resume_for_ci(monkeypatch, captured_emits, sta
     ))
     count, _ = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
     assert count == 0 and captured_emits == []
+
+
+@pytest.mark.parametrize("review_kind", ["ci_only", "code_finding", "wrong_marker",
+                                         "wrong_head_cursor", "approved_with_marker"])
+def test_failed_ci_review_resumes_only_its_own_ci_only_request_on_green(
+    monkeypatch, tmp_path, capsys, review_kind,
+):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    pr = _pr("contributor")
+    checks = [_check()]
+    reviews = [_deferred_review()]
+    monkeypatch.setattr(poller, "_gh_api", _api(pr, checks, reviews=reviews))
+
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    first = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+             if '"event_type": "pr_checks_completed"' in line]
+    assert count == 2 and len(first) == 1  # The external failure signal is independent.
+    assert "Request changes" in first[0]["prompt"]
+    marker = cursor["42:review_ci"]["ci_failure_marker"]
+    assert marker == "ci-only:" + hashlib.sha256(first[0]["delivery_key"].encode()).hexdigest()[:16]
+    assert marker in first[0]["prompt"]
+    assert first[0]["delivery_key"] not in first[0]["prompt"]
+    assert '99:2026-08-16T10:01:00Z:failure' in first[0]["delivery_key"]
+
+    reviews.append(_deferred_review(
+        state="APPROVED" if review_kind == "approved_with_marker" else "CHANGES_REQUESTED",
+        submitted_at="2026-08-16T10:01:30Z",
+        body=(marker if review_kind in {"ci_only", "wrong_head_cursor", "approved_with_marker"}
+              else "CI failed, and there is a code finding" if review_kind == "code_finding"
+              else "CI-only follow-up [unrelated]"),
+    ))
+    checks[:] = [_check(completed_at="2026-08-16T10:02:00Z")]
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    red_events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert not [e for e in red_events if e.get("reason") == "checks_concluded"]
+    assert cursor["42:review_ci"]["ci_failure_marker"] == marker
+
+    checks[:] = [_check("success", completed_at="2026-08-16T10:04:00Z")]
+    if review_kind == "wrong_head_cursor":
+        cursor["42:review_ci"]["head_sha"] = "c" * 40
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    followups = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    if review_kind != "ci_only":
+        assert count == 0 and not [e for e in followups if e.get("reason") == "checks_concluded"]
+        return
+    green = [e for e in followups if e.get("reason") == "checks_concluded"]
+    assert count == 1 and len(green) == 1
+    assert "CI is green; approve without a full re-review" in green[0]["prompt"]
+    assert green[0]["delivery_key"] != first[0]["delivery_key"]
+    assert green[0]["delivery_key"] in cursor["42:review_ci"]["completed_reviews"]
+    assert cursor["42:review_ci"]["ci_failure_marker"] is None
+
+    count, cursor = poller._check_pr_ci_failures(
+        "o/r", SINCE, "token", "mimir-bot", json.loads(json.dumps(cursor)),
+    )
+    assert count == 0 and capsys.readouterr().out == ""
+
+
+def test_new_failed_check_snapshot_gets_a_new_followup_for_deferred_review(
+    monkeypatch, tmp_path, capsys,
+):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    pr = _pr("contributor")
+    checks = [_check()]
+    monkeypatch.setattr(poller, "_gh_api", _api(pr, checks, reviews=[_deferred_review()]))
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    capsys.readouterr()
+    checks[0]["completed_at"] = "2026-08-16T10:05:00Z"
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    followups = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+                 if '"event_type": "pr_checks_completed"' in line]
+    assert len(followups) == 1
+    assert len(cursor["42:review_ci"]["completed_reviews"]) == 2
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert "checks_concluded" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("conclusion", ["success", "failure"])
+def test_legacy_completion_baselines_current_snapshot_without_reemitting(
+    monkeypatch, tmp_path, capsys, conclusion,
+):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    pr = _pr("contributor")
+    checks = [_check(conclusion)]
+    monkeypatch.setattr(poller, "_gh_api", _api(pr, checks, reviews=[_deferred_review()]))
+    legacy = f"o/r:42:{HEAD}:mimir-bot:review_ci_completed"
+    other = f"o/r:42:{'c' * 40}:mimir-bot:review_ci_completed"
+    cursor = {"42:review_ci": {
+        "completed_reviews": [legacy, other], "head_sha": HEAD,
+        "rerun_attempted": True, "rerun_ok": False,
+    }}
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert "checks_concluded" not in capsys.readouterr().out
+    entry = cursor["42:review_ci"]
+    assert legacy not in entry["completed_reviews"]
+    assert other in entry["completed_reviews"]
+    assert len(entry["completed_reviews"]) == 2
+    assert entry["rerun_attempted"] is True and entry["rerun_ok"] is False
+
+    # Persist/reload the migrated cursor: an unchanged observation stays quiet.
+    monkeypatch.setattr(poller, "CURSOR_FILE", tmp_path / "cursor.json")
+    poller._save_cursor({"pr_ci_failures": {"o/r": cursor}})
+    restored = poller._load_cursor()["pr_ci_failures"]["o/r"]
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", restored)
+    assert capsys.readouterr().out == ""
+
+    # A later failure snapshot is new work, not covered forever by the old key.
+    checks[:] = [_check(completed_at="2026-08-16T10:05:00Z")]
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    followups = [e for e in events if e.get("reason") == "checks_concluded"]
+    assert len(followups) == 1
+    assert followups[0]["delivery_key"] in cursor["42:review_ci"]["completed_reviews"]
+    poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("component", ["repo", "number", "head", "reviewer"])
+def test_unrelated_legacy_completion_does_not_suppress_followup(
+    monkeypatch, captured_emits, component,
+):
+    parts = {"repo": "o/r", "number": 42, "head": HEAD, "reviewer": "mimir-bot"}
+    parts[component] = {"repo": "other/repo", "number": 43, "head": "c" * 40,
+                        "reviewer": "other-bot"}[component]
+    legacy = (f"{parts['repo']}:{parts['number']}:{parts['head']}:"
+              f"{parts['reviewer']}:review_ci_completed")
+    monkeypatch.setattr(poller, "_gh_api", _api(
+        _pr("contributor"), [_check("success")], reviews=[_deferred_review()],
+    ))
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {
+        "42:review_ci": {"completed_reviews": [legacy], "head_sha": HEAD},
+    })
+    assert count == 1 and len(captured_emits) == 1
+    assert legacy in cursor["42:review_ci"]["completed_reviews"]
 
 
 def test_completion_dedup_is_per_head_and_reviewer(monkeypatch, captured_emits):

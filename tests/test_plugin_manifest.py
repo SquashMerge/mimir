@@ -15,6 +15,13 @@ from mimir.plugins import PluginDiscoveryError, PluginManifestError, discover_pl
 from mimir.plugins.manifest import _SKIN_TOKENS, parse_manifest
 
 
+
+def _plugin_entry_points(fake):
+    """Fake only the mimir.plugins group; other groups (e.g. pydantic's) stay real."""
+    import importlib.metadata as _metadata
+    real = _metadata.entry_points
+    return lambda *, group: fake() if group == "mimir.plugins" else real(group=group)
+
 def _toml(**fields: str) -> bytes:
     values = {
         "name": "alpha",
@@ -69,7 +76,7 @@ def _skin_candidate(tmp_path, monkeypatch, skins: dict[str, dict], *, extra_file
     files = ["pkg/mimir-plugin.toml", *(f"pkg/{name}" for name in skins),
              *(f"pkg/{name}" for name in extra_files)]
     entry = _entry(tmp_path, files=files)
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: [entry]))
     return discover_plugins(enable="")[0]
 
 
@@ -222,7 +229,7 @@ def test_malformed_skin_nested_values_become_discovery_diagnostics(tmp_path, mon
     (skin if location == "skin" else skin[location])[key] = None if location == "skin" else ["invalid"]
     (root / "skin.json").write_text(json.dumps(skin))
     entry = _entry(tmp_path, files=["pkg/mimir-plugin.toml", "pkg/skin.json", "pkg/avatar.png"])
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: [entry]))
     (candidate,) = discover_plugins(enable="")
     assert not candidate.enabled and candidate.diagnostic.startswith("themes:")
     with pytest.raises(PluginDiscoveryError, match="plugin 'alpha' from provider-alpha: themes:"):
@@ -237,7 +244,7 @@ def test_character_asset_requires_explicit_href(tmp_path, monkeypatch):
     skin["characterRenderer"]["assets"][0].pop("href")
     (root / "skin.json").write_text(json.dumps(skin))
     entry = _entry(tmp_path, files=["pkg/mimir-plugin.toml", "pkg/skin.json"])
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: [entry]))
     (candidate,) = discover_plugins(enable="")
     assert candidate.diagnostic is not None and "invalid character asset" in candidate.diagnostic
     with pytest.raises(PluginDiscoveryError, match="invalid character asset"):
@@ -296,7 +303,7 @@ def test_duplicate_listed_theme_resource_is_rejected(tmp_path, monkeypatch):
     root.mkdir()
     (root / "mimir-plugin.toml").write_bytes(_toml() + b'themes = ["skin.json", "skin.json"]\n')
     entry = _entry(tmp_path)
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: [entry]))
     (candidate,) = discover_plugins(enable="")
     assert candidate.diagnostic == "themes: duplicate package resource"
     with pytest.raises(PluginDiscoveryError, match="themes: duplicate package resource"):
@@ -311,7 +318,7 @@ def test_malformed_config_type_is_diagnostic_when_disabled_and_rejected_when_sel
         _toml() + f'[config.MIMIR_PLUGIN_ALPHA_TOKEN]\ntype = {value}\n'.encode()
     )
     entry = _entry(tmp_path)
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: [entry]))
     (candidate,) = discover_plugins(enable="")
     assert not candidate.enabled and candidate.diagnostic == "config: invalid schema for MIMIR_PLUGIN_ALPHA_TOKEN"
     with pytest.raises(PluginDiscoveryError, match="config: invalid schema for MIMIR_PLUGIN_ALPHA_TOKEN"):
@@ -323,7 +330,7 @@ def test_discovery_reads_only_the_owning_distribution(tmp_path, monkeypatch):
     provider.mkdir()
     (provider / "mimir-plugin.toml").write_bytes(_toml())
     entry = _entry(tmp_path)
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: [entry]))
     monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     (candidate,) = discover_plugins()
     assert (candidate.name, candidate.version, candidate.license, candidate.distribution, candidate.enabled) == (
@@ -380,7 +387,7 @@ def test_invalid_disabled_distribution_is_diagnostic(tmp_path, monkeypatch, file
             path = tmp_path / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("invalid = [")
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [_entry(tmp_path, files=files)])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: [_entry(tmp_path, files=files)]))
     (candidate,) = discover_plugins(enable="")
     assert not candidate.enabled and diagnostic in candidate.diagnostic
     with pytest.raises(PluginDiscoveryError, match="plugin 'alpha' from provider-alpha"):
@@ -389,7 +396,7 @@ def test_invalid_disabled_distribution_is_diagnostic(tmp_path, monkeypatch, file
 
 def test_duplicate_and_missing_enabled_names(tmp_path, monkeypatch):
     entries = [_entry(tmp_path, source=name, files=[]) for name in ("first", "second")]
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: reversed(entries))
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: reversed(entries)))
     candidates = discover_plugins(enable="")
     assert [item.distribution for item in candidates] == ["first", "second"]
     assert {item.diagnostic for item in candidates} == {"duplicate entry-point name"}
@@ -411,7 +418,8 @@ from mimir.plugins import discover_plugins
 root = Path(sys.argv[1])
 dist = SimpleNamespace(files=[Path('mimir-plugin.toml')], metadata={'Name': 'poison'}, locate_file=lambda p: root / p)
 ep = SimpleNamespace(name='alpha', value='poison_provider:register', dist=dist)
-metadata.entry_points = lambda *, group: [ep]
+_real_entry_points = metadata.entry_points
+metadata.entry_points = lambda *, group: [ep] if group == 'mimir.plugins' else _real_entry_points(group=group)
 assert discover_plugins(enable='')[0].name == 'alpha'
 assert 'poison_provider' not in sys.modules
 """
