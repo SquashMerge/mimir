@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -150,6 +151,35 @@ async def test_stop_child_reports_finite_kill_failure(monkeypatch: pytest.Monkey
     with pytest.raises(SshError, match="did not stop"):
         await stop_child(process)
     assert process.terminated == process.killed == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_child_accepts_reap_after_old_kill_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir.acp import ssh
+
+    class LateProcess(Process):
+        async def wait(self) -> int:
+            if not self.killed:
+                await asyncio.Future()
+            return await super().wait()
+
+    process = LateProcess([0])
+    observed: list[float] = []
+
+    async def simulated_wait(awaitable: object, timeout: float) -> int:
+        observed.append(timeout)
+        if not process.killed or timeout <= 1.0:
+            awaitable.close()
+            raise TimeoutError
+        return await awaitable
+
+    monkeypatch.setattr(ssh, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "wait_for": simulated_wait,
+    }))
+    await stop_child(process)
+    assert process.terminated == process.killed == 1
+    assert process.returncode == 0
+    assert observed == [ssh.WAIT_TIMEOUT, ssh.TERMINATE_TIMEOUT, ssh.KILL_TIMEOUT]
 
 
 class Output:
@@ -351,6 +381,13 @@ async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
     observed: list[int] = []
+    processes: list[asyncio.subprocess.Process] = []
+    spawn = asyncio.create_subprocess_exec
+
+    async def capture_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await spawn(*args, **kwargs)
+        processes.append(process)
+        return process
 
     async def route(
         client_reader: object,
@@ -381,17 +418,23 @@ async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
         lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)),
     )
     monkeypatch.setattr("mimir.acp.ssh.run_router", route)
-    await run_ssh_proxy(
-        profile,
-        "secret",
-        output,
-        _ssh_path=ssh,
-        _environment={
-            "PATH": os.environ.get("PATH", ""),
-            "MIMIR_ACP_TIMEOUT": "1",
-        },
-    )
+    monkeypatch.setattr("mimir.acp.ssh.asyncio.create_subprocess_exec", capture_spawn)
+    # The selected profile timeout is checked in route; this guards startup and reap.
+    async with asyncio.timeout(120):
+        await run_ssh_proxy(
+            profile,
+            "secret",
+            output,
+            _ssh_path=ssh,
+            _environment={
+                "PATH": os.environ.get("PATH", ""),
+                "MIMIR_ACP_TIMEOUT": "1",
+            },
+        )
     assert observed == [23]
+    assert len(processes) == 1 and processes[0].returncode == 0
+    with pytest.raises(ProcessLookupError):
+        os.kill(processes[0].pid, 0)
 
 
 @pytest.mark.asyncio
@@ -671,7 +714,7 @@ while True: time.sleep(1)
             while not Path(str(marker) + ".ready").exists():
                 await asyncio.sleep(0.01)
             release_pipes.set()
-            await asyncio.wait_for(parent_ready.wait(), 10)
+            await parent_ready.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -737,7 +780,7 @@ while True: time.sleep(1)
             await parent_ready.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 10)
+                await task
             assert terminated.is_file()
             assert json.loads(marker.read_text()) == marker_data
             with pytest.raises(ProcessLookupError):
@@ -781,7 +824,7 @@ async def test_cancellation_during_writer_cleanup_reaps_child(monkeypatch: pytes
             await closing.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 10)
+                await task
             assert processes[0].returncode is not None
             with pytest.raises(ProcessLookupError):
                 os.kill(processes[0].pid, 0)
@@ -831,11 +874,11 @@ while True:
                     break
                 except (OSError, ValueError):
                     await asyncio.sleep(0.01)
-            await asyncio.sleep(0.05)
-            assert not task.done()
+            # Startup speed is not part of cleanup; the child publishes its
+            # pid before filling the unread output pipe.
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, 10)
+                await task
             with pytest.raises(ProcessLookupError):
                 os.kill(pid, 0)
         finally:

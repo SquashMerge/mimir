@@ -131,6 +131,65 @@ async def test_terminate_process_killpg_einval_propagates(
     process.wait.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_terminate_process_accepts_late_reap_after_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = Mock(spec=asyncio.subprocess.Process)
+    process.returncode = None
+
+    async def reaped() -> int:
+        process.returncode = -9
+        return -9
+
+    process.wait = AsyncMock(side_effect=reaped)
+
+    async def simulated_wait(awaitable: object, timeout: float) -> int:
+        if timeout <= 1.0:
+            awaitable.close()
+            raise TimeoutError
+        return await awaitable
+
+    monkeypatch.setattr(hosted, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "wait_for": simulated_wait,
+    }))
+    killpg = Mock()
+    monkeypatch.setattr(hosted.os, "killpg", killpg)
+    provider = HostedHandsProvider()
+    provider._processes[process] = 12345
+    await provider._terminate_process(process, 12345)
+    killpg.assert_called_once_with(12345, 9)
+    assert process.returncode == -9
+    assert provider._processes == {}
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_unreaped_child_keeps_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = Mock(spec=asyncio.subprocess.Process)
+    process.returncode = None
+    process.wait = AsyncMock()
+
+    async def expired(awaitable: object, timeout: float) -> None:
+        assert timeout == hosted.SHELL_REAP_TIMEOUT
+        awaitable.close()
+        raise TimeoutError
+
+    monkeypatch.setattr(hosted, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "wait_for": expired,
+    }))
+    killpg = Mock()
+    monkeypatch.setattr(hosted.os, "killpg", killpg)
+    provider = HostedHandsProvider()
+    provider._processes[process] = 12345
+    with pytest.raises(HostedMcpError, match="child did not stop"):
+        await provider._terminate_process(process, 12345)
+    killpg.assert_called_once_with(12345, 9)
+    assert provider._processes == {process: 12345}
+    assert provider._signalled_processes == {process}
+
+
 @pytest.fixture
 def shell_timers(monkeypatch):
     timers = []
@@ -822,6 +881,7 @@ async def test_shell_cancel_and_close_kill_pipe_holding_owned_grandchild(
         assert pgid != os.getpgrp()
         await _assert_process_stopped(pid)
         assert not provider._processes
+        assert not provider._signalled_processes
     finally:
         call.cancel()
         await asyncio.gather(call, return_exceptions=True)
