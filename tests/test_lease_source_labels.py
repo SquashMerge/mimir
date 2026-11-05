@@ -19,6 +19,7 @@ from mimir.access_control import (
     OperationDecision,
     ProtectedResultProvenance,
     SinkGate,
+    SinkCategory,
     ToolAuthorization,
     ToolRegistry,
     begin_protected_result_capture,
@@ -230,6 +231,105 @@ def _real_attested_lease(
     state.attach_checkout_lease(lease)
     auth = replace(_auth(scope=scope), repo_review_state=state)
     return auth, scope, lease, target, (DEFAULT_USER_NAME, DEFAULT_USER_EMAIL)
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("tool_name", ["read_file", "grep", "glob", "ls"])
+@pytest.mark.parametrize("boundary", [
+    "trusted", "discovered_only", "untrusted_author", "sibling", "expired", "outside",
+])
+def test_review_turn_filesystem_reads_bind_discovered_lease_before_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str, boundary: str,
+) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.plugins.core import selected_policy_registry
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+    from mimir_cultivate.policy import RepoPRScopeRegistry, ServerDiscoveredPRStates
+
+    auth, scope, lease, target, _ = _real_attested_lease(tmp_path)
+    # The immutable poller registry still contains an earlier review state;
+    # repository tools use the live state discovered for this turn instead.
+    old_state = RepoReviewState(scope)
+    discovered = ServerDiscoveredPRStates()
+    discovered.remember(auth.repo_review_state)
+    auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((old_state,)),
+                   server_discovered_pr_states=discovered, repo_review_state=old_state)
+    assert old_state.checkout_lease is None
+    assert discovered.resolve_checkout_path(target) is not None
+
+    if boundary == "discovered_only":
+        stale_scope = replace(scope, observed_head_sha="b" * 40)
+        auth = replace(auth, repo_pr_scope_registry=None,
+                       repo_review_state=RepoReviewState(stale_scope),
+                       repo_pr_action_scope=stale_scope)
+
+    if boundary == "untrusted_author":
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    if boundary == "expired":
+        lease.is_active = False
+    sibling_lease = None
+    if boundary in {"sibling", "outside"}:
+        directory = tmp_path / boundary
+        directory.mkdir()
+        target = directory / "work.py"
+        target.write_text("attested\n", encoding="utf-8")
+        if boundary == "sibling":
+            sibling_lease = SimpleNamespace(**{**vars(lease), "path": directory})
+
+    selected = selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        hooks, active_checkout=lambda path: (
+            lease if Path(path).resolve().is_relative_to(lease.path) else
+            sibling_lease if sibling_lease is not None and Path(path).resolve().is_relative_to(sibling_lease.path)
+            else None
+        ),
+    ))
+    backend = _RootAwareFilesystemBackend(root_dir=tmp_path, virtual_mode=False)
+    read_path = target.parent if tool_name in {"grep", "glob", "ls"} else target
+    args = {"file_path" if tool_name == "read_file" else "path": str(read_path)}
+    token = set_current_turn(SimpleNamespace(auth_context=auth, turn_id="review"))
+    capture = begin_protected_result_capture()
+    try:
+        if tool_name == "read_file":
+            result = backend.read(str(read_path))
+        elif tool_name == "grep":
+            result = backend.grep("attested", str(read_path))
+        elif tool_name == "glob":
+            result = backend.glob("*.py", str(read_path))
+        else:
+            result = backend.ls(str(read_path))
+    finally:
+        provenance = end_protected_result_capture(capture)
+        reset_current_turn(token)
+    assert result.error is None
+    assert provenance is not None and provenance.sources
+    labels = classify_protected_result(
+        tool_name, args, auth,
+        ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True),
+        result=result, provenance=provenance,
+    )
+    assert labels is not None
+    trusted = boundary in {"trusted", "discovered_only"}
+    assert all(source.integrity == ("trusted" if trusted else "untrusted")
+               for source in labels.sources)
+    if trusted:
+        assert all(source.domain == "repository" and source.resource_id == (
+            f"owner/repo#pull/7@{scope.observed_head_sha}"
+        ) for source in labels.sources)
+    current_labels = auth.ifc_state.merge(labels)
+    review = SinkGate.check_sink_flow(
+        "pr_submit_review", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        current_labels, auth, enforce=True, sink_category=SinkCategory.FORGE,
+        repo_pr_action_scope=scope,
+    )
+    assert review.allowed is trusted, review.reason
+    if not trusted:
+        assert review.reason == "ifc_label_blocked:forge"
+        edit = SinkGate.check_sink_flow(
+            "edit_file", str(lease.path / "work.py"), current_labels, auth, enforce=False,
+        )
+        assert not edit.allowed and edit.reason == "write_blocked_by_untrusted_ingest"
 
 
 def _record_clean_head(lease, *commits: str) -> None:
