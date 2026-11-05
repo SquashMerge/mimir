@@ -928,6 +928,91 @@ async def test_reconcile_completed_hard_refusal_without_charging_attempt(
     ]
 
 
+@pytest.mark.parametrize("with_inflight", [False, True])
+async def test_reconcile_prunes_expired_and_malformed_settled_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_inflight: bool,
+) -> None:
+    now = datetime(2026, 11, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: now)
+    cutoff = now - timedelta(hours=poller_recovery.SETTLED_REFUSAL_TTL_HOURS)
+    recent = (now - timedelta(hours=1)).isoformat()
+    if with_inflight:
+        await poller_recovery.stash_enqueued_event(tmp_path, _make_event(
+            "duplicate", channel_id="poller:github-activity", items=[{
+                "event_type": "pr_review_requested", "recovery_key": "recent",
+            }],
+        ))
+    state = poller_recovery._load_state(tmp_path)
+    state["settled_refusals"] = {
+        "review:old": (cutoff - timedelta(seconds=1)).isoformat(),
+        "review:boundary": cutoff.isoformat(),
+        "review:recent": recent,
+        "review:malformed": "not-a-timestamp",
+        "review:naive": now.replace(tzinfo=None).isoformat(),
+        "review:missing": None,
+        "review:wrong-type": 123,
+    }
+    poller_recovery._save_state(tmp_path, state)
+    enqueue = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id="poller:github-activity",
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        recover_failed_turns=False,
+    )
+    saved = poller_recovery._load_state(tmp_path)
+    assert saved["settled_refusals"] == {
+        "review:boundary": cutoff.isoformat(), "review:recent": recent,
+    }
+    assert saved["inflight"] == {}
+    assert summary["stale_dropped"] == int(with_inflight)
+    assert enqueue.calls == []
+
+
+async def test_first_reconcile_drops_preexisting_completed_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = "a" * 40
+    event = _make_event("old-completion", channel_id="poller:github-activity", items=[{
+        "event_type": "pr_review_requested", "repo": "o/r", "number": 42,
+        "head_sha": head, "requested_reviewer": "review-bot",
+        "review_request_at": _ts(60),
+    }])
+    await poller_recovery.stash_enqueued_event(tmp_path, event, enqueued_at=_ts(50))
+    state = poller_recovery._load_state(tmp_path)
+    state["last_reconciled"] = _ts(10)
+    entry = state["inflight"][event.source_id]
+    entry.update(last_outcome_at=_ts(20), attempts=1, outcome_disposition="charge")
+    # Pre-upgrade entries have no newly introduced recovery_event_at field.
+    entry["event"]["extra"].pop("recovery_event_at")
+    poller_recovery._save_state(tmp_path, state)
+    calls = []
+
+    def attest(endpoint, token):
+        calls.append(endpoint)
+        if endpoint == "repos/o/r/pulls/42":
+            return 200, {"state": "open"}
+        assert endpoint == "repos/o/r/pulls/42/reviews?per_page=100"
+        return 200, [{
+            "user": {"login": "REVIEW-BOT"}, "commit_id": head,
+            "submitted_at": _ts(30), "state": "APPROVED",
+        }]
+
+    monkeypatch.setattr(pollers, "_github_api_attestation", attest)
+    enqueue = _FakeEnqueue()
+    # No new outcomes: the completion was consumed before this first cycle.
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        recover_failed_turns=False,
+        relevance_check=poller_hooks.github_recovery_relevance_check("token", "review-bot"),
+    )
+    assert summary["completed"] == 0
+    assert summary["stale_dropped"] == 1
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+    assert calls == ["repos/o/r/pulls/42", "repos/o/r/pulls/42/reviews?per_page=100"]
+    assert enqueue.calls == []
+
+
 @pytest.mark.parametrize("outcome_type", ["turn_completed", "turn_failed"])
 async def test_live_refusal_settles_after_two_deliveries_per_activity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome_type: str,

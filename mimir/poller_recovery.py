@@ -127,6 +127,10 @@ DEFAULT_MAX_DEFER_SECONDS = 15 * 60.0
 #: is abandoned, not in-flight.
 DEFAULT_STASH_TTL_HOURS = 48.0
 
+#: Settled review activities suppress repeat deliveries for at most two days.
+#: New heads and review requests have independent keys and need not wait.
+SETTLED_REFUSAL_TTL_HOURS = 48.0
+
 #: Pending initial deliveries bypass the abandoned-turn TTL. Keep at most
 #: 1,000 per poller: over a day of a 5-batch/10-minute source outpacing
 #: 3 deliveries/hour (27 net/hour), while also bounding same-tick bursts.
@@ -863,6 +867,15 @@ async def reconcile_failed_turns(
     now_dt = _utc_now()
     now_iso = now_dt.isoformat()
     transient_max, transient_base, transient_cap = _transient_config()
+
+    # Prune before the empty-inflight fast path too: settled activities must
+    # not grow the whole-file recovery ledger for the deployment's lifetime.
+    settled_cutoff = now_dt - timedelta(hours=SETTLED_REFUSAL_TTL_HOURS)
+    for key, timestamp in list(settled.items()):
+        settled_at = _parse_iso(timestamp)
+        if (settled_at is None or settled_at.tzinfo is None
+                or settled_at < settled_cutoff):
+            del settled[key]
 
     # GC abandoned entries first so a vanished turn can't pin the stash
     # forever (#310).
