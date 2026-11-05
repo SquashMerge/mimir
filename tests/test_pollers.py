@@ -6460,15 +6460,94 @@ async def test_worklink_receipt_growth_reclaimed_without_replaying_acknowledged_
 
 
 @pytest.fixture
-def worklink_receipt_consumer(monkeypatch):
+def worklink_receipt_consumer(monkeypatch, selected_cultivate_policy):
     path = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py"
     spec = importlib.util.spec_from_file_location("_receipt_worklink_consumer_test", path)
     consumer = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, consumer)
-    # This script owns import-path repair. Keep that mutation local to the test.
+    # The shipped script repairs sys.path and may import the source-only plugin.
+    # Scope both mutations, including when exec_module fails during setup.
     monkeypatch.setattr(sys, "path", sys.path.copy())
-    spec.loader.exec_module(consumer)
-    return consumer
+    modules_before = set(sys.modules)
+    try:
+        spec.loader.exec_module(consumer)
+        yield consumer
+    finally:
+        for name in tuple(sys.modules):
+            if name not in modules_before and (
+                name == "mimir_cultivate" or name.startswith("mimir_cultivate.")
+            ):
+                sys.modules.pop(name, None)
+
+
+def test_worklink_receipt_consumer_skips_without_cultivate_distribution(
+    request, monkeypatch,
+):
+    from importlib import metadata
+
+    original_version = metadata.version
+
+    def missing_cultivate(name):
+        if name == "mimir-cultivate":
+            raise metadata.PackageNotFoundError(name)
+        return original_version(name)
+
+    # Own and restore the plugin-module namespace so installed/full-suite runs
+    # exercise the same absent-distribution prerequisite as a core-only worker.
+    with monkeypatch.context() as patch:
+        for name in tuple(sys.modules):
+            if name == "mimir_cultivate" or name.startswith("mimir_cultivate."):
+                patch.delitem(sys.modules, name)
+        patch.setattr(metadata, "version", missing_cultivate)
+        exec_probe = Mock(side_effect=AssertionError("poller loaded without Cultivate"))
+        patch.setattr(importlib.util, "spec_from_file_location", exec_probe)
+        with pytest.raises(pytest.skip.Exception, match="requires installed Cultivate"):
+            request.getfixturevalue("worklink_receipt_consumer")
+        exec_probe.assert_not_called()
+        assert not any(
+            name == "mimir_cultivate" or name.startswith("mimir_cultivate.")
+            for name in sys.modules
+        )
+
+
+@pytest.mark.parametrize("setup_fails", [False, True])
+def test_worklink_receipt_consumer_scopes_added_plugin_modules(monkeypatch, setup_fails):
+    # Exercise the fixture's actual loader/teardown independently of plugin
+    # discovery, with a controlled loader that owns these exact module entries.
+    from types import ModuleType
+
+    existing_name = "mimir_cultivate._receipt_existing"
+    added_name = "mimir_cultivate._receipt_added"
+    unrelated_name = "_receipt_unrelated"
+    existing = ModuleType(existing_name)
+    added = ModuleType(added_name)
+    unrelated = ModuleType(unrelated_name)
+    monkeypatch.setitem(sys.modules, existing_name, existing)
+    monkeypatch.delitem(sys.modules, added_name, raising=False)
+    monkeypatch.delitem(sys.modules, unrelated_name, raising=False)
+
+    def exec_consumer(_consumer):
+        monkeypatch.setitem(sys.modules, added_name, added)
+        monkeypatch.setitem(sys.modules, unrelated_name, unrelated)
+        if setup_fails:
+            raise RuntimeError("consumer setup failed")
+
+    spec = importlib.util.spec_from_loader("_receipt_isolation_test", loader=None)
+    spec.loader = SimpleNamespace(
+        create_module=lambda _spec: None, exec_module=exec_consumer,
+    )
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", lambda *_args: spec)
+    fixture = worklink_receipt_consumer.__wrapped__(monkeypatch, None)
+    if setup_fails:
+        with pytest.raises(RuntimeError, match="consumer setup failed"):
+            next(fixture)
+    else:
+        next(fixture)
+        assert sys.modules[added_name] is added
+        fixture.close()
+    assert added_name not in sys.modules
+    assert sys.modules[existing_name] is existing
+    assert sys.modules[unrelated_name] is unrelated
 
 
 @pytest.mark.parametrize("kind", ["factory_start", "factory_success", "factory_publication_degraded"])

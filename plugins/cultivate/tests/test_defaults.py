@@ -72,7 +72,7 @@ def test_current_github_poller_release_hash(relative):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["2097-merge-reconciliation-main-merged"]["github-poller"][relative]
+    expected = releases["2095-checkout-observation-merged"]["github-poller"][relative]
     actual = hashlib.sha256((SKILLS / "github-poller" / relative).read_bytes()).hexdigest()
     assert actual == expected, f"{relative}: actual sha256={actual}"
 
@@ -85,7 +85,7 @@ def test_current_github_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "github-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2097-merge-reconciliation-main-merged"]["github-poller"]
+    assert skill_inventory(skill) == releases["2095-checkout-observation-merged"]["github-poller"]
 
 
 def test_history_file_defaults_are_released_for_both_pollers():
@@ -97,7 +97,7 @@ def test_history_file_defaults_are_released_for_both_pollers():
         # Keep historical release evidence intact; each poller can advance
         # independently after the shared history-file release.
         release = {
-            "github-poller": "2097-merge-reconciliation-main-merged",
+            "github-poller": "2095-checkout-observation-merged",
             "github-ci-watch": "2072-history-files",
         }[skill.name]
         assert skill_inventory(skill) == releases[release][skill.name]

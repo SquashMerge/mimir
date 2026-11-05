@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue runs the required checks on the merged result
+  # (main + the PRs ahead of it) before merging. GITHUB_REF is then
+  # refs/heads/gh-readonly-queue/main/pr-<n>-<sha>, a real branch on origin, so
+  # the image proofs' fetch-by-ref works unchanged.
+  merge_group:
   workflow_dispatch:
 
 # Least-privilege at the workflow level. First workflow in the repo →
@@ -20,8 +25,9 @@ env:
   PYTEST_EVIDENCE_DIR_NAME: mimir-pytest-evidence-${{ github.run_id }}-${{ github.run_attempt }}
 
 # Cancel in-flight runs for the same ref when a new commit lands. Saves
-# minutes on PR force-pushes; main-branch runs use ref=refs/heads/main
-# so cancel-in-progress only fires on PR events.
+# minutes on PR force-pushes; main-branch runs use ref=refs/heads/main, and
+# each merge-queue entry has its own gh-readonly-queue ref, so cancel-in-progress
+# only fires on PR events.
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

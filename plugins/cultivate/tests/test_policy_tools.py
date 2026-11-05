@@ -15,7 +15,7 @@ from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
 from mimir.tool_descriptors import _PAYLOAD_EXTRACTOR_UNDECLARED, _TARGET_EXTRACTOR_UNDECLARED
 from mimir.tools.registry import all_mimir_tools
-from mimir_cultivate.policy import CODING_TOOLS, CULTIVATE_TOOL_NAMES, TRACKER_TOOL_NAMES
+from mimir_cultivate.policy import CODING_TOOLS, CULTIVATE_TOOL_NAMES, TRACKER_TOOL_NAMES, RepoPRAction
 from tests.test_plugin_policy_parity import (
     CODING_WRITES_CODE_OR_STATE, _canonical, _extractor, _extractor_results, _prepare_inputs,
 )
@@ -53,7 +53,13 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
             ("write_resource_operations", tables["write_resource_operations"]),
         ):
             assert (membership in after.memberships) == (name in members), (name, membership)
-        if name in tables["forge_actions"] or name in tables["repo_actions"]:
+        if name == "unsupported_operation":
+            # Escalation now accepts the existing inspection grant for a live PR;
+            # the legacy channel-scoped stale-snapshot escalation remains available.
+            assert tables["forge_actions"].get(name) is None
+            assert after.typed_action == RepoPRAction.INSPECT
+            assert after.resource_scope == "channel"
+        elif name in tables["forge_actions"] or name in tables["repo_actions"]:
             assert (after.typed_action.value if after.typed_action else None) == (
                 tables["forge_actions"].get(name, tables["repo_actions"].get(name))
             )
