@@ -206,7 +206,11 @@ def test_explicitly_selected_missing_provider_is_refused(monkeypatch) -> None:
     from mimir.plugins import discovery
     from mimir.plugins.manager import load_plugins
 
-    monkeypatch.setattr(discovery.metadata, "entry_points", lambda **_kwargs: ())
+    real_entry_points = discovery.metadata.entry_points
+    monkeypatch.setattr(
+        discovery.metadata, "entry_points",
+        lambda **kwargs: () if kwargs.get("group") == "mimir.plugins" else real_entry_points(**kwargs),
+    )
     with pytest.raises(discovery.PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
         load_plugins(enable="cultivate")
 

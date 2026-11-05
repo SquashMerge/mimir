@@ -71,7 +71,8 @@ class Entry:
     dist = SimpleNamespace(files=[Path('mimir-plugin.toml')], metadata={'Name': 'provider-alpha'}, locate_file=lambda path: root / path)
     def load(self):
         raise AssertionError('provider loaded')
-metadata.entry_points = lambda *, group: [Entry()]
+_real_entry_points = metadata.entry_points
+metadata.entry_points = lambda *, group: [Entry()] if group == 'mimir.plugins' else _real_entry_points(group=group)
 os.environ['MIMIR_HOME'] = str(root)
 os.environ.pop('MIMIR_PLUGINS', None)
 from mimir.cli import main
@@ -104,7 +105,8 @@ class Entry:
     def load(self):
         raise AssertionError('disabled provider loaded')
 
-metadata.entry_points = lambda *, group: [Entry()]
+_real_entry_points = metadata.entry_points
+metadata.entry_points = lambda *, group: [Entry()] if group == 'mimir.plugins' else _real_entry_points(group=group)
 os.environ.pop('MIMIR_PLUGINS', None)
 from mimir.cli import main
 try:

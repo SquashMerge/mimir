@@ -521,47 +521,62 @@ def register_action_protocol(
     )
 
 
-def _live_scoped_pr_lease(scope: object, review_state: object) -> object | None:
+def _live_scoped_pr_lease(
+    scope: object, review_state: object, *, diagnostics: list[str] | None = None,
+) -> object | None:
+    def refuse(reason: str) -> None:
+        if diagnostics is not None:
+            diagnostics.append(reason)
+        return None
+
     attached = getattr(review_state, "checkout_lease", None)
     if attached is None or not getattr(attached, "is_active", False):
-        return None
+        return refuse("checkout lease absent or inactive")
     try:
         root = Path(os.environ["MIMIR_PR_CHECKOUT_LEASE_ROOT"])
         if not root.is_absolute() or root.is_symlink():
-            return None
+            return refuse("configured lease root is relative or a symlink")
         root = root.resolve(strict=True)
         path = Path(attached.path)
         if path.is_symlink() or path.resolve(strict=True).parent != root:
-            return None
+            return refuse("checkout leaf is a symlink or resolves outside configured lease root")
+        if Path(attached.lease_root).resolve(strict=True) != root:
+            return refuse("attached lease root differs from configured lease root")
         metadata = path / ".git/mimir-pr-checkout-lease.json"
         if (metadata.is_symlink() or metadata.parent.is_symlink()
                 or (path / ".git/mimir-pr-checkout-lease-reclamation.json").exists()):
-            return None
+            return refuse("metadata symlink or reclaimed checkout")
         raw = json.loads(metadata.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
-            return None
-        if any(raw.get(field) != str(getattr(attached, field)) for field in ("path", "lease_root")):
-            return None
+            return refuse("lease metadata is not an object")
+        # The creator records canonical paths, while an attached lease can retain
+        # a lexical spelling through an ancestor alias (e.g. /var on macOS).
+        # Compare resolved identities only after confining the checkout to root.
+        if any(not Path(raw[field]).is_absolute()
+               or Path(raw[field]).resolve(strict=True) != Path(getattr(attached, field)).resolve(strict=True)
+               for field in ("path", "lease_root")):
+            return refuse("lease metadata path or root differs from attached lease")
         if any(raw.get(field) != getattr(attached, field) for field in (
             "recovery_id", "scope_id", "owner", "head_sha", "canonical_origin",
             "canonical_repo", "pr_number", "destination_ref",
         )):
-            return None
+            return refuse("lease metadata identity differs from attached lease")
         expires = datetime.fromisoformat(raw["expires_at"])
         if expires.tzinfo is None or expires <= datetime.now(UTC) or expires != attached.expires_at:
-            return None
-    except (OSError, KeyError, ValueError, TypeError, AttributeError):
-        return None
+            return refuse("lease metadata expiry is invalid, elapsed or differs from attached lease")
+    except (OSError, KeyError, ValueError, TypeError, AttributeError) as exc:
+        return refuse(f"lease metadata or path could not be read: {type(exc).__name__}: {exc}")
     if (attached.scope_id != scope.scope_id or attached.owner != scope.principal
             or attached.canonical_repo.lower() != scope.canonical_repo.lower()
             or attached.pr_number != scope.pr_number
             or attached.destination_ref != scope.destination_ref
             or getattr(review_state, "action_scope", None) is not scope):
-        return None
-    if _observed_checkout_state(path) != (
+        return refuse("lease identity or bound review state differs from scope")
+    observed = _observed_checkout_state(path)
+    if observed != (
         scope.head_ref, getattr(review_state, "git_expected_head", None)
     ):
-        return None
+        return refuse(f"checkout Git state differs from scope: {observed!r}")
     if attached.head_sha.lower() != scope.observed_head_sha.lower():
         from mimir.access_control import _lease_has_clean_lineage
         from .repository import hardened_git_command
@@ -574,7 +589,7 @@ def _live_scoped_pr_lease(scope: object, review_state: object) -> object | None:
                 or not _lease_has_clean_lineage(
                     path, attached, scope, scope.observed_head_sha.lower(), attached.head_sha.lower(),
                 )):
-            return None
+            return refuse("checkout head ancestry or clean lineage differs from scope")
     return attached
 
 

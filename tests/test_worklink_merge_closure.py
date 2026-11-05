@@ -739,6 +739,91 @@ def test_invalid_pr_reads_refuse(defect: str) -> None:
         closure.read_pr_snapshot(PR_URL, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)))
 
 
+@pytest.mark.parametrize(("ledger_slug", "forge_slug"), [
+    ("squashmerge/mimir", "SquashMerge/mimir"),
+    ("SquashMerge/mimir", "squashmerge/mimir"),
+])
+def test_pr_snapshot_accepts_only_repo_casing_difference(ledger_slug: str, forge_slug: str) -> None:
+    ledger = f"https://github.com/{ledger_slug}/pull/7"
+    payload = {
+        "number": 7, "html_url": f"https://github.com/{forge_slug}/pull/7",
+        "state": "closed", "merged": True, "merged_at": MERGED_AT,
+        "merge_commit_sha": MERGE_SHA,
+        "base": {"repo": {"full_name": forge_slug}, "ref": "main"},
+    }
+
+    def read() -> closure.PrSnapshot:
+        return closure.read_pr_snapshot(ledger, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)))
+
+    assert read().number == 7  # Replacing the URL comparison with exact equality fails here.
+    for url in (
+        f"https://github.com/{forge_slug}-old/pull/7",
+        f"https://github.com/{forge_slug}/pull/8",
+        f"https://other.example/{forge_slug}/pull/7",
+    ):
+        payload["html_url"] = url
+        with pytest.raises(closure.ClosureReadError, match="identity mismatch"):
+            read()
+    payload["html_url"] = f"https://github.com/{forge_slug}/pull/7"
+    for number in (True, 7.0, 8):
+        payload["number"] = number
+        with pytest.raises(closure.ClosureReadError, match="identity mismatch"):
+            read()
+
+
+@pytest.mark.parametrize(("issue_id", "pr_number"), [(2090, 8), (2091, 7)])
+def test_lowercase_notice_reconciles_canonical_case_merge_without_renotification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, issue_id: int, pr_number: int,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    (home / "worklink.yaml").write_text("repository: squashmerge/mimir\n")
+    (home / "repositories.yaml").write_text(
+        "repositories:\n  - slug: squashmerge/mimir\n"
+        f"    root: {repo}\n    mode: rw\n"
+        "    origin: https://github.com/SquashMerge/mimir.git\n"
+        "    base_branch: main\n"
+    )
+    ledger_url = f"https://github.com/squashmerge/mimir/pull/{pr_number}"
+    evidence(home, issue_id, url=ledger_url)
+    state_dir = dispatch_failure_state_dir(home)
+    notice = dispatch_failures.record_merge_reconciliation_notice(
+        state_dir, issue_id=issue_id, repository="squashmerge/mimir", pr_url=ledger_url,
+        reason="reconciliation_read_failed", detail="PR snapshot identity mismatch",
+    )
+    dispatch_failures.mark_merge_reconciliation_notified(state_dir, notice["delivery_key"])
+    tracker = Tracker(issue_id)
+
+    def gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        assert list(args) == ["gh", "api", f"repos/squashmerge/mimir/pulls/{pr_number}"]
+        payload = {
+            "number": pr_number,
+            "html_url": f"https://github.com/SquashMerge/mimir/pull/{pr_number}",
+            "state": "closed", "merged": True, "merged_at": MERGED_AT,
+            "merge_commit_sha": MERGE_SHA,
+            "base": {"repo": {"full_name": "SquashMerge/mimir"}, "ref": "main"},
+        }
+        return cp(stdout=json.dumps(payload))
+
+    def git(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[-2:] == ["rev-parse", "--show-toplevel"]:
+            return cp(stdout=f"{repo}\n")
+        if list(args)[-3:] == ["remote", "get-url", "origin"]:
+            return cp(stdout="https://github.com/SquashMerge/mimir.git\n")
+        return cp(1)
+
+    assert [outcome.issue_id for outcome in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git,
+    )] == [issue_id]
+    assert tracker.status == "closed"
+    assert unresolved_reasons(home) == []
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git,
+    ) == []
+    notices = load_failure_state(state_dir)["merge_reconciliations"]["notices"]
+    assert list(notices) == [notice["delivery_key"]]
+    assert notices[notice["delivery_key"]]["notified"] is True
+
+
 def test_unmerged_pr_with_merged_at_refuses() -> None:
     payload = {
         "number": 42, "html_url": PR_URL, "body": "Closes chainlink #14.",
