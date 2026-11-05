@@ -21,6 +21,7 @@ POLLER_NAME = "worklink-ready-queue"
 INITIAL_BACKOFF_MINUTES = 15
 MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
+MERGE_RETRY_PASSES = 3
 # A fresh attempt can repair a failing gate; spec and operational incidents
 # require changed external state and therefore remain operator-gated.
 AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted"})
@@ -410,6 +411,7 @@ def _validate_merge_reconciliations(value: Any) -> dict[str, dict[str, Any]]:
             )
         notice_repository = entry.get("repository") if isinstance(entry, dict) else None
         notice_url = entry.get("pr_url") if isinstance(entry, dict) else None
+        facts = entry.get("facts") if isinstance(entry, dict) else None
         if (
             not isinstance(key, str)
             or not key.startswith("worklink-merge-reconciliation:")
@@ -422,6 +424,24 @@ def _validate_merge_reconciliations(value: Any) -> dict[str, dict[str, Any]]:
             or not aware_time(entry.get("created_at"))
             or type(entry.get("notified")) is not bool
             or type(entry.get("resolved")) is not bool
+            or (facts is not None and (
+                not isinstance(facts, dict)
+                or set(facts) != {"pr_url", "pr_state", "pr_draft", "pr_head_sha",
+                                  "pr_base_ref", "pr_merge_commit_sha", "pr_merged_at",
+                                  "issue_lifecycle_labels"}
+                or any(value is not None and not isinstance(value, str)
+                       for name, value in facts.items()
+                       if name not in {"pr_draft", "issue_lifecycle_labels"})
+                or facts["pr_draft"] is not None and type(facts["pr_draft"]) is not bool
+                or facts["issue_lifecycle_labels"] is not None and (
+                    not isinstance(facts["issue_lifecycle_labels"], list)
+                    or not all(isinstance(label, str) for label in facts["issue_lifecycle_labels"])
+                )
+            ))
+            or ("retriable" in entry and type(entry["retriable"]) is not bool)
+            or ("observations" in entry and (
+                type(entry["observations"]) is not int or entry["observations"] < 1
+            ))
             or not (
                 entry.get("issue_id") is None
                 or (type(entry["issue_id"]) is int and entry["issue_id"] > 0)
@@ -498,6 +518,8 @@ def record_merge_reconciliation_notice(
     pr_url: str | None,
     reason: str,
     detail: str,
+    facts: dict[str, Any] | None = None,
+    retriable: bool = False,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Persist one immutable, permanently deduplicated reconciliation refusal."""
@@ -517,12 +539,28 @@ def record_merge_reconciliation_notice(
                 "pr_url": pr_url,
                 "reason": reason,
                 "detail": redact_text(detail)[:1000],
+                "facts": {name: redact_text(value) if isinstance(value, str) else (
+                    [redact_text(label) for label in value] if isinstance(value, list) else value
+                ) for name, value in facts.items()} if facts is not None else None,
+                "retriable": retriable,
+                "observations": 1,
                 "created_at": created_at,
                 "notified": False,
                 "resolved": False,
             }
             reconciliations["notices"][key] = entry
         else:
+            if not entry["notified"]:
+                if retriable:
+                    entry["observations"] = (
+                        entry.get("observations", 0) + 1
+                        if entry.get("retriable") and not entry["resolved"] else 1
+                    )
+                if retriable or entry.get("retriable") != retriable:
+                    entry["facts"] = {name: redact_text(value) if isinstance(value, str) else (
+                        [redact_text(label) for label in value] if isinstance(value, list) else value
+                    ) for name, value in facts.items()} if facts is not None else None
+                entry["retriable"] = retriable
             entry["resolved"] = False
         return dict(entry)
 
@@ -534,7 +572,12 @@ def pending_merge_reconciliation_notices(state_dir: Path) -> list[dict[str, Any]
             dict(entry)
             for _, entry in sorted(reconciliations["notices"].items())
             if not entry["notified"] and (
-                not entry["resolved"] or delivery_receipt_exists(state_dir, entry["delivery_key"])
+                delivery_receipt_exists(state_dir, entry["delivery_key"]) or (
+                    not entry["resolved"] and (
+                        not entry.get("retriable") or
+                        entry.get("observations", 0) >= MERGE_RETRY_PASSES
+                    )
+                )
             )
         ]
 
