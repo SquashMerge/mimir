@@ -190,7 +190,7 @@ def _select_excerpt(output, limit: int, token: str) -> bytes:
             elif in_failures and re.match(rb"^=+ .+ =+\s*$", payload):
                 in_failures = False
             elif in_failures:
-                if re.match(rb"^_{3,} .+ _{3,}\s*$", payload):
+                if re.match(rb"^_+ .+ _+\s*$", payload):
                     group += 1
                     label = "header"
                 elif re.match(rb"^\s*E\s+", payload):

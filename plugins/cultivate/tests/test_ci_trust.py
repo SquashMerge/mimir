@@ -139,6 +139,50 @@ def test_provider_ci_timestamped_pytest_failure_keeps_detail_and_summary(monkeyp
     assert len(excerpt) <= 2048
 
 
+def test_provider_ci_single_underscore_headers_survive_budget_pressure():
+    # First header copied from GitHub job 126998030272. Long parametrized
+    # names leave pytest only one padding underscore on each side.
+    headers = (
+        b"2026-11-05T02:09:44.2272590Z _ test_emitted_json_through_framework_attestation_and_checkout_grant[plain-issue_comment] _\n",
+        b"2026-11-05T02:09:45.2272590Z _ test_emitted_json_through_framework_attestation_and_checkout_grant[plain-pr_review_comment] _\n",
+    )
+    errors = (
+        b"2026-11-05T02:09:44.4049980Z E               AssertionError: ['checkout protocol absent or live lease returned None']\n",
+        b"2026-11-05T02:09:45.4049980Z E               AssertionError: second failure detail\n",
+    )
+    section = b"2026-11-05T02:09:44.2169640Z =================================== FAILURES ===================================\n"
+    prefix = b"2026-11-05T02:09:44.3000000Z "
+    frames = tuple(
+        prefix + f"tests/test_checkout.py:{index + 10}: in test_case_{index}\n".encode()
+        for index in range(2)
+    )
+    summary = (
+        prefix + b"=========================== short test summary info ============================\n"
+        + prefix + b"FAILED tests/test_checkout.py::test_case_0 - AssertionError: ['ch\n"
+        + prefix + b"FAILED tests/test_checkout.py::test_case_1 - AssertionError: second\n"
+        + prefix + b"============================== 2 failed in 1.00s ===============================\n"
+    )
+    payload = (prefix + b"setup\n") * 100 + section
+    for header, frame, error in zip(headers, frames, errors):
+        payload += (
+            header + (prefix + b"distant traceback context\n") * 300
+            + frame + error + (prefix + b"following traceback context\n") * 300
+        )
+    payload += summary
+
+    excerpt = ci._select_excerpt(BytesIO(payload), 2048, "")
+    for header, frame, error in zip(headers, frames, errors):
+        assert header in excerpt
+        assert frame in excerpt
+        assert error in excerpt
+        assert excerpt.index(header) < excerpt.index(error) < excerpt.index(summary)
+    assert section in excerpt
+    assert summary in excerpt
+    assert excerpt.index(errors[0]) < excerpt.index(headers[1])
+    assert ci.TRUNCATION_MARKER in excerpt
+    assert len(excerpt) <= 2048
+
+
 def test_provider_ci_non_pytest_excerpt_keeps_error_fallback_and_tail():
     fallback = b"start\ncontext\nfatal: deployment failed\nfollowing\n"
     assert ci._select_excerpt(BytesIO(fallback), 2048, "") == fallback
