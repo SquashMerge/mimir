@@ -573,6 +573,8 @@ def _live_scoped_pr_lease(
             or getattr(review_state, "action_scope", None) is not scope):
         return refuse("lease identity or bound review state differs from scope")
     observed = _observed_checkout_state(path)
+    if isinstance(observed, str):
+        return refuse(f"checkout Git state differs from scope: {observed}")
     if observed != (
         scope.head_ref, getattr(review_state, "git_expected_head", None)
     ):
@@ -593,8 +595,8 @@ def _live_scoped_pr_lease(
     return attached
 
 
-def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
-    """Read branch and HEAD without a worktree/index scan or user Git config."""
+def _observed_checkout_state(path: Path) -> tuple[str, str] | str:
+    """Read branch and HEAD, or return a command-specific failure reason."""
     env = {
         "PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8",
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
@@ -606,8 +608,12 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
             "-c", "protocol.allow=never", "-c", "submodule.recurse=false",
             "--no-pager", "--no-optional-locks")
     values = []
+    # One bound for both ref-only calls: a loaded macOS CI host can stall past
+    # five seconds, while 30 seconds still bounds a stalled checkout check.
+    deadline = time.monotonic() + 30
     for args in (("symbolic-ref", "--quiet", "--short", "HEAD"),
                  ("rev-parse", "--verify", "HEAD")):
+        command = f"git {' '.join(args)}"
         output = bytearray()
         try:
             process = subprocess.Popen(
@@ -621,12 +627,11 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
                     for stream in (process.stdout, process.stderr):
                         os.set_blocking(stream.fileno(), False)
                         selector.register(stream, selectors.EVENT_READ)
-                    deadline = time.monotonic() + 5
                     remaining_bytes = 1024
                     while selector.get_map():
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            return None
+                            return f"{command} timed out"
                         for key, _ in selector.select(min(remaining, 0.1)):
                             stream = key.fileobj
                             chunk = os.read(stream.fileno(), min(65_536, remaining_bytes + 1))
@@ -634,12 +639,16 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
                                 selector.unregister(stream)
                                 continue
                             if len(chunk) > remaining_bytes:
-                                return None
+                                return f"{command} exceeded 1024-byte output budget"
                             remaining_bytes -= len(chunk)
                             if stream is process.stdout:
                                 output.extend(chunk)
-                    if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
-                        return None
+                    try:
+                        exit_code = process.wait(timeout=max(0, deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired:
+                        return f"{command} timed out"
+                    if exit_code != 0:
+                        return f"{command} exited with code {exit_code}"
             finally:
                 if process.poll() is None:
                     try:
@@ -649,13 +658,14 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
                 process.wait()
                 process.stdout.close()
                 process.stderr.close()
-        except (OSError, subprocess.SubprocessError):
-            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"{command} failed: {type(exc).__name__}: {exc}"
         values.append(output.decode("utf-8", errors="replace").strip())
     branch, head = values[0], values[1].lower()
-    if (not branch or branch == "(detached)" or len(head) != 40
-            or any(char not in "0123456789abcdef" for char in head)):
-        return None
+    if not branch or branch == "(detached)":
+        return "git symbolic-ref --quiet --short HEAD returned invalid branch"
+    if len(head) != 40 or any(char not in "0123456789abcdef" for char in head):
+        return "git rev-parse --verify HEAD returned invalid head"
     return branch, head
 
 
