@@ -709,6 +709,26 @@ def _review_recovery_state(
     )
 
 
+def _review_recovery_key(extras: dict, reviewer: str) -> str:
+    """Identify this review activity across poll fires, without sharing PR budgets."""
+    identity = (
+        extras.get("repo"), extras.get("number"), extras.get("event_type"),
+        extras.get("head_sha") or extras.get("new_head"), reviewer,
+        extras.get("review_request_at") if extras.get("event_type") == "pr_review_requested"
+        else extras.get("delivery_key", ""),
+    )
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _review_refusal_settled(key: str) -> bool:
+    try:
+        state = json.loads((STATE_DIR / _RECOVERY_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    settled = state.get("settled_refusals") if isinstance(state, dict) else None
+    return isinstance(settled, dict) and "review:" + key in settled
+
+
 def _resolve_token() -> str:
     """Get a GitHub PAT from env or ``gh auth token``."""
     token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -2423,6 +2443,16 @@ def _emit_pr_review_needed(
         )
     if reviewed:
         return False
+    if extras.get("event_type") in {
+        "pr_review_requested", "pr_synchronize", "pr_checks_completed",
+    }:
+        if (extras.get("event_type") == "pr_review_requested"
+                and isinstance(repo, str) and number is not None and reviewer):
+            extras["review_request_at"] = _latest_review_request_at(repo, number, reviewer, token)
+        key = _review_recovery_key(extras, reviewer)
+        if _review_refusal_settled(key):
+            return False
+        extras["recovery_key"] = key
     _emit(prompt, **extras)
     return True
 
@@ -3224,10 +3254,38 @@ def _check_pr_ci_failures(
         if me and not pr.get("draft") and checks_concluded:
             entry = prior.get(review_ci_key)
             completed_reviews = list(entry.get("completed_reviews", [])) if isinstance(entry, dict) else []
-            completion_key = f"{repo}:{number}:{head_sha}:{me}:review_ci_completed"
+            failed = [check for check in checks if check.get("conclusion") not in {
+                "success", "neutral", "skipped",
+            }]
+            failure_snapshot = sorted(
+                f"{check.get('id')}:{check.get('completed_at')}:{check.get('conclusion')}"
+                for check in failed
+            )
+            completion_key = (
+                f"{repo}:{number}:{head_sha}:{me}:"
+                f"{json.dumps(failure_snapshot, separators=(',', ':'))}:review_ci_completed"
+            )
+            legacy_completion_key = f"{repo}:{number}:{head_sha}:{me}:review_ci_completed"
+            if legacy_completion_key in completed_reviews:
+                # Old cursors covered the whole head, without a failure snapshot.
+                # Baseline the first observed snapshot silently, then retire the
+                # legacy key so later check changes can still trigger follow-ups.
+                completed_reviews.remove(legacy_completion_key)
+                if completion_key not in completed_reviews:
+                    completed_reviews.append(completion_key)
+                new[review_ci_key] = {**entry, "completed_reviews": completed_reviews}
             if completion_key not in completed_reviews:
                 review = _latest_current_head_review(repo, number, head_sha, me, token)
-                if review and str(review.get("state") or "").upper() == "COMMENTED":
+                state = str(review.get("state") or "").upper() if review else ""
+                ci_only_review = (
+                    state == "CHANGES_REQUESTED"
+                    and not failed
+                    and isinstance(entry, dict)
+                    and entry.get("head_sha") == head_sha
+                    and isinstance(entry.get("ci_failure_marker"), str)
+                    and entry["ci_failure_marker"] in str(review.get("body") or "")
+                )
+                if state == "COMMENTED" or ci_only_review:
                     status_data = _gh_api(f"repos/{repo}/commits/{head_sha}/status", token)
                     if (
                         isinstance(status_data, dict)
@@ -3241,17 +3299,10 @@ def _check_pr_ci_failures(
                             {"check_runs": checks, "total_count": len(checks)}, status_data,
                         )
                         if not reason or reason.startswith("CI checks not green:"):
-                            failed = [check for check in checks if check.get("conclusion") not in {
-                                "success", "neutral", "skipped",
-                            }]
                             evidence = _remediation_logs(repo, pr, token, failed) if failed else ""
                             infrastructure = any(
                                 check.get("conclusion") == "startup_failure" for check in failed
                             ) or bool(re.search(r"toomanyrequests|HTTP 429|runner startup failure", evidence, re.I))
-                            failure_snapshot = sorted(
-                                f"{check.get('id')}:{check.get('completed_at')}:{check.get('conclusion')}"
-                                for check in failed
-                            )
                             rerun_attempted = bool(
                                 isinstance(entry, dict) and entry.get("head_sha") == head_sha
                                 and entry.get("rerun_attempted")
@@ -3289,8 +3340,24 @@ def _check_pr_ci_failures(
                                     f"Request changes naming failed checks ({names or reason}) and "
                                     "the first failing test or log excerpt. "
                                 )
+                                if failed:
+                                    ci_failure_marker = (
+                                        "ci-only:" + hashlib.sha256(completion_key.encode()).hexdigest()[:16]
+                                    )
+                                    prompt += (
+                                        "If this review has no code findings, put the following marker "
+                                        "on its own line in the review body: "
+                                        f"{ci_failure_marker}. Do not include it for code findings. "
+                                    )
                             else:
                                 prompt += "CI is green; approve without a full re-review. "
+                            review_extras = dict(
+                                repo=repo, number=number, event_type="pr_checks_completed",
+                                head_sha=head_sha, delivery_key=completion_key,
+                            )
+                            recovery_key = _review_recovery_key(review_extras, me)
+                            if _review_refusal_settled(recovery_key):
+                                continue
                             _emit(
                                 prompt + f"\n{pr.get('html_url', '')}" + evidence,
                                 event_type="pr_checks_completed", reason="checks_concluded",
@@ -3301,7 +3368,8 @@ def _check_pr_ci_failures(
                                 followup_action=("operator_comment" if infrastructure and rerun_attempted
                                                  else "review"),
                                 requested_reviewer=me, checks_concluded=True,
-                                delivery_key=completion_key, dedup_scope="head_sha,reviewer",
+                                delivery_key=completion_key, dedup_scope="head_sha,reviewer,failed_checks",
+                                recovery_key=recovery_key,
                             )
                             count += 1
                             completed_reviews.append(completion_key)
@@ -3311,6 +3379,8 @@ def _check_pr_ci_failures(
                                 "rerun_ok": bool(isinstance(entry, dict) and entry.get("rerun_ok")),
                                 "rerun_baseline": (entry.get("rerun_baseline")
                                                    if isinstance(entry, dict) else None),
+                                "ci_failure_marker": (ci_failure_marker if reason and failed and not infrastructure
+                                                      else None),
                             }
         cancelled = [
             run for run in runs

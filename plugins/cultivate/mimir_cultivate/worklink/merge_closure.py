@@ -17,6 +17,7 @@ from typing import Callable, Sequence
 import yaml
 
 from mimir.redaction import redact_text
+from mimir.github_identity import same_github_pr_url, same_github_repo
 from ..repository import RepositoryConfig, RepositoryInventory
 from ..tracker.lifecycle import request_merge_closure
 from .backends.registry import WorklinkConfig
@@ -191,7 +192,7 @@ def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryCo
     )
     if origin.returncode != 0 or origin.stdout.strip() != repository.origin:
         raise ClosureReadError("repository trust unavailable: local origin differs from inventory")
-    if _origin_slug(repository.origin) != repository.slug:
+    if not same_github_repo(_origin_slug(repository.origin), repository.slug):
         raise ClosureReadError("repository trust unavailable: origin identity differs from inventory")
     from dataclasses import replace
     return replace(repository, root=selected_root)
@@ -282,7 +283,7 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
     if (
         type(payload_number) is not int
         or payload_number != number
-        or payload.get("html_url") != canonical_url
+        or not same_github_pr_url(payload.get("html_url"), canonical_url)
     ):
         raise ClosureReadError("PR snapshot identity mismatch")
     # The PR body is display-only; even a null/missing body must not veto a
@@ -491,7 +492,7 @@ def _request_epic_closure(
         if association.reason or association.pr_url is None:
             return
         pr = read_pr_snapshot(association.pr_url, gh_bin=gh_bin, runner=gh_runner)
-        if pr.merged and pr.slug == repository.slug and pr.base_slug == repository.slug:
+        if pr.merged and same_github_repo(pr.slug, repository.slug) and same_github_repo(pr.base_slug, repository.slug):
             _queue_tracker_closure(home, issue, pr.url)
     except Exception as exc:
         _LOGGER.warning("tracker_closure_request_failed %s", type(exc).__name__)
@@ -520,9 +521,9 @@ def _validate_qualification(
         return reason
     if association.reason and not ci_merged:
         return association.reason
-    if (association.pr_url if not ci_merged else association.ci_handoff_url) != pr.url:
+    if not same_github_pr_url(association.pr_url if not ci_merged else association.ci_handoff_url, pr.url):
         return "association_changed"
-    if pr.slug != repository.slug or pr.base_slug != repository.slug:
+    if not same_github_repo(pr.slug, repository.slug) or not same_github_repo(pr.base_slug, repository.slug):
         return "repository_identity_mismatch"
     if not pr.merged:
         return "pr_open" if pr.state == "open" else "pr_closed_unmerged"
@@ -568,7 +569,12 @@ def _persist_intent(state_dir: Path, key: str, identity: dict[str, object]) -> d
         existing = intents.get(key)
         if existing is None:
             intents[key] = {**identity, "stage": "discovered", "result_finalized": False}
-        elif any(existing.get(field) != value for field, value in identity.items()):
+        elif any(
+            not (same_github_repo(existing.get(field), value) if field == "repository" else
+                 same_github_pr_url(existing.get(field), value) if field == "pr_url" else
+                 existing.get(field) == value)
+            for field, value in identity.items()
+        ):
             raise ClosureReadError("persisted merge identity changed")
         return dict(intents[key])
 
@@ -663,7 +669,12 @@ def _process_intent(
         "merged_at": pr.merged_at,
         "source_digests": list(association.evidence_digests),
     }
-    if any(entry.get(field) != value for field, value in persisted_identity.items()):
+    if any(
+        not (same_github_repo(entry.get(field), value) if field == "repository" else
+             same_github_pr_url(entry.get(field), value) if field == "pr_url" else
+             entry.get(field) == value)
+        for field, value in persisted_identity.items()
+    ):
         _notice(
             state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
             reason="merge_identity_changed", detail="persisted merge or source identity changed",
@@ -892,6 +903,17 @@ def reconcile_merged_leaves(
                     association = discover_associations(home, issue)
                     ci_candidate = (association.ci_handoff_head is not None and
                                     bool(issue.labels & {"worklink:blocked", "worklink:in-progress"}))
+                    # The active attempt owns publication and the transition to
+                    # review. Only an attested merged CI handoff may bypass it.
+                    if issue.is_open and "worklink:in-progress" in issue.labels:
+                        if not ci_candidate:
+                            continue
+                        assert association.ci_handoff_url is not None
+                        ci_pr = read_pr_snapshot(
+                            association.ci_handoff_url, gh_bin=gh_bin, runner=gh_runner,
+                        )
+                        if not ci_pr.merged:
+                            continue
                     if association.pr_url is None and not ci_candidate and association.reason == "missing_pr_association":
                         if not dry_run:
                             resolve_merge_reconciliation_notices(
