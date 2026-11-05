@@ -594,67 +594,65 @@ def _live_scoped_pr_lease(
 
 
 def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
-    """Inspect the current checkout without inheriting user Git configuration."""
+    """Read branch and HEAD without a worktree/index scan or user Git config."""
     env = {
         "PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C.UTF-8",
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_ATTR_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
     }
-    output = bytearray()
-    try:
-        process = subprocess.Popen(
-            ("/usr/bin/git", "-C", str(path), "-c", "core.fsmonitor=",
-             "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat",
-             "-c", "protocol.allow=never", "-c", "submodule.recurse=false",
-             "--no-pager", "--no-optional-locks", "status", "--porcelain=v2",
-             "--branch", "--untracked-files=no"),
-            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, close_fds=True, start_new_session=True,
-        )
+    base = ("/usr/bin/git", "-C", str(path), "-c", "core.fsmonitor=",
+            "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat",
+            "-c", "protocol.allow=never", "-c", "submodule.recurse=false",
+            "--no-pager", "--no-optional-locks")
+    values = []
+    for args in (("symbolic-ref", "--quiet", "--short", "HEAD"),
+                 ("rev-parse", "--verify", "HEAD")):
+        output = bytearray()
         try:
-            assert process.stdout is not None and process.stderr is not None
-            with selectors.DefaultSelector() as selector:
-                for stream in (process.stdout, process.stderr):
-                    os.set_blocking(stream.fileno(), False)
-                    selector.register(stream, selectors.EVENT_READ)
-                deadline = time.monotonic() + 5
-                remaining_bytes = 1_048_576
-                while selector.get_map():
-                    remaining_time = deadline - time.monotonic()
-                    if remaining_time <= 0:
-                        return None
-                    for key, _ in selector.select(min(remaining_time, 0.1)):
-                        stream = key.fileobj
-                        chunk = os.read(stream.fileno(), min(65_536, remaining_bytes + 1))
-                        if not chunk:
-                            selector.unregister(stream)
-                            continue
-                        if len(chunk) > remaining_bytes:
+            process = subprocess.Popen(
+                (*base, *args), env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, start_new_session=True,
+            )
+            try:
+                assert process.stdout is not None and process.stderr is not None
+                with selectors.DefaultSelector() as selector:
+                    for stream in (process.stdout, process.stderr):
+                        os.set_blocking(stream.fileno(), False)
+                        selector.register(stream, selectors.EVENT_READ)
+                    deadline = time.monotonic() + 5
+                    remaining_bytes = 1024
+                    while selector.get_map():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
                             return None
-                        remaining_bytes -= len(chunk)
-                        if stream is process.stdout:
-                            output.extend(chunk)
-                if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
-                    return None
-        finally:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            process.wait()
-            process.stdout.close()
-            process.stderr.close()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    fields = {}
-    for line in output.decode("utf-8", errors="replace").splitlines():
-        if line.startswith("# branch."):
-            key, separator, value = line[2:].partition(" ")
-            if separator:
-                fields[key] = value
-    branch, head = fields.get("branch.head"), fields.get("branch.oid", "").lower()
+                        for key, _ in selector.select(min(remaining, 0.1)):
+                            stream = key.fileobj
+                            chunk = os.read(stream.fileno(), min(65_536, remaining_bytes + 1))
+                            if not chunk:
+                                selector.unregister(stream)
+                                continue
+                            if len(chunk) > remaining_bytes:
+                                return None
+                            remaining_bytes -= len(chunk)
+                            if stream is process.stdout:
+                                output.extend(chunk)
+                    if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                        return None
+            finally:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait()
+                process.stdout.close()
+                process.stderr.close()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        values.append(output.decode("utf-8", errors="replace").strip())
+    branch, head = values[0], values[1].lower()
     if (not branch or branch == "(detached)" or len(head) != 40
             or any(char not in "0123456789abcdef" for char in head)):
         return None
