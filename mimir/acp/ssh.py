@@ -74,13 +74,6 @@ async def stop_child(process: Any) -> None:
             await asyncio.wait_for(close_writer(process.stdin), FORCE_CLOSE_TIMEOUT)
         except TimeoutError:
             pass
-    # A paused, unread stdout pipe can keep asyncio's process.wait() pending
-    # after the OS has reaped the child. The router is stopped before teardown;
-    # release its read transports so wait() can finish even under backpressure.
-    for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
-        transport = getattr(stream, "_transport", None)
-        if transport is not None:
-            transport.close()
     if process.returncode is not None:
         await process.wait(); return
     try:
