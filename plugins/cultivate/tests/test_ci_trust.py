@@ -29,6 +29,167 @@ def test_provider_ci_summary_survives_cleanup(monkeypatch):
     assert len(excerpt) <= ci.LOG_EXCERPT_BYTES
 
 
+def test_provider_ci_pytest_failure_detail_and_summary_survive_long_preamble(monkeypatch):
+    token = "private-token"
+    secret = "ghp_" + "A" * 36
+    summary = b"= short test summary info =\nFAILED tests/test_checkout.py::test_lease - AssertionError: ['ch\n1 failed\n"
+    failure = (
+        b"= FAILURES =\n"
+        b"________________________ test_lease ________________________\n"
+        b"tests/test_checkout.py:84: in test_lease\n"
+        + f"E   AssertionError: ['checkout protocol absent or live lease returned None', {token}, {secret}]\n".encode()
+        + b"tests/test_checkout.py:84: AssertionError\n"
+    )
+
+    def run(argv, **kwargs):
+        kwargs["stdout"].write(b"setup\n" * 35000 + failure + summary + b"cleanup\n" * 1000)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(ci.subprocess, "run", run)
+    excerpt, error = ci.capture_job_log("o/r", 101, token=token, timeout=5)
+    assert error == ""
+    assert b"test_lease ________________________" in excerpt
+    assert b"tests/test_checkout.py:84: in test_lease" in excerpt
+    assert b"E   AssertionError: ['checkout protocol absent or live lease returned None'" in excerpt
+    assert summary in excerpt
+    assert excerpt.index(b"E   AssertionError") < excerpt.index(summary)
+    assert token.encode() not in excerpt
+    assert secret.encode() not in excerpt
+    assert b"[REDACTED]" in excerpt
+    assert len(excerpt) <= ci.LOG_EXCERPT_BYTES
+
+
+def test_provider_ci_pytest_budget_prioritizes_each_header_and_error():
+    failure = b"= FAILURES =\n"
+    for index in range(3):
+        failure += (
+            f"________________ test_case_{index} ________________\n".encode()
+            + b"deep traceback context\n" * 900
+            + f"tests/test_checkout.py:{index + 10}: in test_case_{index}\n".encode()
+            + f"E   AssertionError: distinct detail {index}\n".encode()
+            + b"more traceback context\n" * 900
+        )
+    summary = b"= short test summary info =\n" + b"".join(
+        f"FAILED tests/test_checkout.py::test_case_{index} - AssertionError: dist\n".encode()
+        for index in range(3)
+    ) + b"3 failed\n"
+    excerpt = ci._select_excerpt(BytesIO(b"setup\n" * 1000 + failure + summary), 4096, "")
+    for index in range(3):
+        assert f"test_case_{index} ________________".encode() in excerpt
+        assert f"E   AssertionError: distinct detail {index}".encode() in excerpt
+        assert f"tests/test_checkout.py:{index + 10}: in test_case_{index}".encode() in excerpt
+    assert summary in excerpt
+    assert ci.TRUNCATION_MARKER in excerpt
+    assert len(excerpt) <= 4096
+
+
+def test_provider_ci_pytest_error_section_keeps_traceback_and_summary():
+    failure = (
+        b"= ERRORS =\n"
+        b"________ ERROR at setup of test_database ________\n"
+        b"tests/test_database.py:27: in database\n"
+        b"E   RuntimeError: connection refused\n"
+    )
+    summary = b"= short test summary info =\nERROR tests/test_database.py::test_database - RuntimeError: con\n1 error\n"
+    excerpt = ci._select_excerpt(BytesIO(b"setup\n" * 10000 + failure + summary), 2048, "")
+    assert failure + summary in excerpt
+
+
+@pytest.mark.parametrize("prefix", [
+    b"2026-11-05T02:09:44.2169640Z ",
+    b"2026-11-05T02:09:44Z ",
+])
+def test_provider_ci_timestamped_pytest_failure_keeps_detail_and_summary(monkeypatch, prefix):
+    # The section and assertion below are the real lines quoted from GitHub
+    # job 126998030272 in PR #12's review. Surrounding context is synthetic
+    # to force header/error prioritization rather than retaining the whole block.
+    section = b"2026-11-05T02:09:44.2169640Z =================================== FAILURES ===================================\n"
+    assertion = b"2026-11-05T02:09:44.4049980Z E               AssertionError: ['checkout protocol absent or live lease returned None']\n"
+    header = prefix + b"________________________ test_lease ________________________\n"
+    context = prefix + b"tests/test_checkout.py:84: in test_lease\n"
+    summary = (
+        prefix + b"=========================== short test summary info ============================\n"
+        + prefix + b"FAILED tests/test_checkout.py::test_lease - AssertionError: ['ch\n"
+        + prefix + b"============================== 1 failed in 1.00s ===============================\n"
+    )
+    payload = (
+        (prefix + b"setup\n") * 1000
+        + section + header
+        + (prefix + b"distant traceback context\n") * 1000
+        + context + assertion
+        + (prefix + b"following traceback context\n") * 1000
+        + summary + (prefix + b"cleanup\n") * 1000
+    )
+
+    def run(argv, **kwargs):
+        kwargs["stdout"].write(payload)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(ci.subprocess, "run", run)
+    excerpt, error = ci.capture_job_log("o/r", 101, token="", timeout=5, limit=2048)
+    assert error == ""
+    assert section in excerpt
+    assert header in excerpt
+    assert context in excerpt
+    assert assertion in excerpt
+    assert summary in excerpt
+    assert excerpt.index(assertion) < excerpt.index(summary)
+    assert b"cleanup" not in excerpt
+    assert ci.TRUNCATION_MARKER in excerpt
+    assert len(excerpt) <= 2048
+
+
+def test_provider_ci_single_underscore_headers_survive_budget_pressure():
+    # First header copied from GitHub job 126998030272. Long parametrized
+    # names leave pytest only one padding underscore on each side.
+    headers = (
+        b"2026-11-05T02:09:44.2272590Z _ test_emitted_json_through_framework_attestation_and_checkout_grant[plain-issue_comment] _\n",
+        b"2026-11-05T02:09:45.2272590Z _ test_emitted_json_through_framework_attestation_and_checkout_grant[plain-pr_review_comment] _\n",
+    )
+    errors = (
+        b"2026-11-05T02:09:44.4049980Z E               AssertionError: ['checkout protocol absent or live lease returned None']\n",
+        b"2026-11-05T02:09:45.4049980Z E               AssertionError: second failure detail\n",
+    )
+    section = b"2026-11-05T02:09:44.2169640Z =================================== FAILURES ===================================\n"
+    prefix = b"2026-11-05T02:09:44.3000000Z "
+    frames = tuple(
+        prefix + f"tests/test_checkout.py:{index + 10}: in test_case_{index}\n".encode()
+        for index in range(2)
+    )
+    summary = (
+        prefix + b"=========================== short test summary info ============================\n"
+        + prefix + b"FAILED tests/test_checkout.py::test_case_0 - AssertionError: ['ch\n"
+        + prefix + b"FAILED tests/test_checkout.py::test_case_1 - AssertionError: second\n"
+        + prefix + b"============================== 2 failed in 1.00s ===============================\n"
+    )
+    payload = (prefix + b"setup\n") * 100 + section
+    for header, frame, error in zip(headers, frames, errors):
+        payload += (
+            header + (prefix + b"distant traceback context\n") * 300
+            + frame + error + (prefix + b"following traceback context\n") * 300
+        )
+    payload += summary
+
+    excerpt = ci._select_excerpt(BytesIO(payload), 2048, "")
+    for header, frame, error in zip(headers, frames, errors):
+        assert header in excerpt
+        assert frame in excerpt
+        assert error in excerpt
+        assert excerpt.index(header) < excerpt.index(error) < excerpt.index(summary)
+    assert section in excerpt
+    assert summary in excerpt
+    assert excerpt.index(errors[0]) < excerpt.index(headers[1])
+    assert ci.TRUNCATION_MARKER in excerpt
+    assert len(excerpt) <= 2048
+
+
+def test_provider_ci_non_pytest_excerpt_keeps_error_fallback_and_tail():
+    fallback = b"start\ncontext\nfatal: deployment failed\nfollowing\n"
+    assert ci._select_excerpt(BytesIO(fallback), 2048, "") == fallback
+    tail = b"setup\ncomplete\n"
+    assert ci._select_excerpt(BytesIO(tail), 2048, "") == tail
+
+
 def test_provider_ci_refuses_oversized_secret_line():
     payload = b"password=" + b"x" * (65537 - len(b"password="))
     excerpt = ci._select_excerpt(BytesIO(payload + b"secret-tail\nFAILED safe\n"), 2048, "")
