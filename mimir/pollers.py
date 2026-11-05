@@ -91,6 +91,7 @@ import urllib.request
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from .background_io import run_in_pool
+from .github_identity import same_github_pr_url, same_github_repo, same_github_url
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -763,8 +764,8 @@ def _github_content_author(
     path = [urllib.parse.unquote(value) for value in parsed.path.split("/") if value]
     if len(parts) != 2 or parsed.hostname not in {"github.com", "www.github.com"}:
         return None
-    if (len(path) < 4 or [value.casefold() for value in path[:2]]
-        != [value.casefold() for value in parts] or path[2] not in {"issues", "pull"}):
+    if (len(path) < 4 or not same_github_repo("/".join(path[:2]), repo)
+        or path[2] not in {"issues", "pull"}):
         return None
     number = path[3]
     if not number.isdigit():
@@ -845,7 +846,7 @@ def _github_content_author(
     elif event_type == "pr_review" and isinstance(payload, list):
         matching = [
             review for review in payload
-            if isinstance(review, dict) and review.get("html_url") == url
+            if isinstance(review, dict) and same_github_url(review.get("html_url"), url)
         ]
         if not matching:
             return None
@@ -911,21 +912,22 @@ def _github_framework_trigger_is_trusted(
     head_repo = head.get("repo") if isinstance(head, dict) else None
     return bool(
         pull_request.get("state") == "open"
-        and pull_request.get("number") == number
+        and type(pull_request.get("number")) is int
+        and pull_request["number"] == number
         and isinstance(user, dict)
         and user.get("login") == self_login
         and extras.get("author") == self_login
         and isinstance(head, dict)
         and isinstance(head_repo, dict)
-        and head_repo.get("full_name") == repo
-        and extras.get("head_repo") == repo
+        and same_github_repo(head_repo.get("full_name"), repo)
+        and same_github_repo(extras.get("head_repo"), repo)
         and extras.get("head_remote") == "origin"
         and extras.get("head_ref") == head.get("ref")
         and extras.get("head_sha") == head.get("sha")
         and isinstance(base, dict)
         and extras.get("base_ref") == base.get("ref")
         and extras.get("base_sha") == base.get("sha")
-        and extras.get("url") == pull_request.get("html_url")
+        and same_github_pr_url(extras.get("url"), pull_request.get("html_url"))
     )
 
 

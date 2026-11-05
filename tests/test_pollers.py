@@ -4230,6 +4230,53 @@ def test_github_framework_trigger_trust_requires_matching_live_self_pr(
     ) is False
 
 
+@pytest.mark.parametrize(("event_repo", "forge_repo"), [
+    ("squashmerge/mimir", "SquashMerge/mimir"),
+    ("SquashMerge/mimir", "squashmerge/mimir"),
+])
+def test_framework_trigger_attests_case_insensitive_repository_and_exact_pr(
+    monkeypatch: pytest.MonkeyPatch, event_repo: str, forge_repo: str,
+) -> None:
+    from mimir import pollers
+
+    url = f"https://github.com/{event_repo}/pull/7"
+    item = {
+        "event_type": "pr_changes_requested_stale", "number": 7, "url": url,
+        "author": "mimir-bot", "head_repo": event_repo, "head_remote": "origin",
+        "head_ref": "worklink/7", "head_sha": "a" * 40,
+        "base_ref": "main", "base_sha": "b" * 40,
+    }
+    live = {
+        "state": "open", "number": 7,
+        "html_url": f"https://github.com/{forge_repo}/pull/7",
+        "user": {"login": "mimir-bot"},
+        "head": {"ref": "worklink/7", "sha": "a" * 40,
+                 "repo": {"full_name": forge_repo}},
+        "base": {"ref": "main", "sha": "b" * 40},
+    }
+    monkeypatch.setattr(pollers, "_github_api_attestation", lambda *args: (200, live))
+
+    def trusted() -> bool:
+        return pollers._github_framework_trigger_is_trusted(event_repo, item, "token", "mimir-bot")
+
+    assert trusted() is True
+    for different in (f"{forge_repo}-old", "other/mimir"):
+        live["head"]["repo"]["full_name"] = different
+        assert trusted() is False
+    live["head"]["repo"]["full_name"] = forge_repo
+    for different_url in (
+        f"https://github.com/{forge_repo}-old/pull/7",
+        f"https://github.com/{forge_repo}/pull/8",
+        f"https://other.example/{forge_repo}/pull/7",
+    ):
+        live["html_url"] = different_url
+        assert trusted() is False
+    live["html_url"] = f"https://github.com/{forge_repo}/pull/7"
+    for number in (True, 7.0, 8):
+        live["number"] = number
+        assert trusted() is False
+
+
 @pytest.mark.parametrize("mode", ["distinct", "same", "changed", "framework-first", "actor-first"])
 @pytest.mark.asyncio
 async def test_github_fire_attestation_network_budget(

@@ -17,7 +17,7 @@ from mimir import access_control
 from mimir.models import SourceLabel
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
-from mimir_cultivate.policy import RepoPRAction, RepoPRScopeProvenance
+from mimir_cultivate.policy import RepoPRAction, RepoPRScopeProvenance, _live_scoped_pr_lease
 
 REPO = "owner/repo"
 BOT = "mimir-bot"
@@ -211,8 +211,9 @@ def test_noncomment_self_review_is_stopped_before_http(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["issue_comment", "pr_review_comment", "pr_review"])
+@pytest.mark.parametrize("root_kind", ["plain", "symlinked_parent"])
 async def test_emitted_json_through_framework_attestation_and_checkout_grant(
-    monkeypatch, tmp_path, capsys, kind,
+    monkeypatch, tmp_path, capsys, kind, root_kind,
 ):
     """Real fire -> HTTP actor attestation -> ingress scope -> hard tool boundary.
 
@@ -247,7 +248,14 @@ async def test_emitted_json_through_framework_attestation_and_checkout_grant(
             (str(source), fixture_scope.canonical_origin), (str(source),), 1,
         ),
     )
-    lease_root = tmp_path / "leases"
+    if root_kind == "symlinked_parent":
+        physical = tmp_path / "physical"
+        physical.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        lease_root = alias / "leases"
+    else:
+        lease_root = tmp_path / "leases"
     lease_root.mkdir()
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
@@ -387,9 +395,20 @@ async def test_emitted_json_through_framework_attestation_and_checkout_grant(
             scope, owner=BOT, lease_root=lease_root, review_state=state,
         )
         try:
-            assert access_control.observe_scoped_pr_checkout(
+            if root_kind == "symlinked_parent":
+                # The record is written with canonical paths; a caller can retain
+                # the /var-style lexical spelling of the same checkout instead.
+                state.attach_checkout_lease(replace(
+                    lease, path=lease_root / lease.path.name, lease_root=lease_root,
+                ))
+            diagnostics = []
+            observed = access_control.observe_scoped_pr_checkout(
                 auth, scope, state, token, "cultivate", selected.scoped_actions["cultivate"],
+                diagnostics=diagnostics,
             )
+            if not observed and "checkout protocol absent or live lease returned None" in diagnostics:
+                _live_scoped_pr_lease(scope, state, diagnostics=diagnostics)
+            assert observed, diagnostics
             admitted = registry.authorize_tool(
                 "pr_comments", auth, arguments=args, enforce=True, policy=selected,
             )
