@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -34,7 +35,7 @@ from mimir.tool_descriptors import ResultOriginKind
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir_cultivate.policy import (
     RepoPRAction, RepoPRScopeRegistry, RepoReviewState, ServerDiscoveredPRStates,
-    register_action_protocol, validate_scoped_pr_action,
+    _live_scoped_pr_lease, register_action_protocol, validate_scoped_pr_action,
 )
 from tests.test_pr_checkout_lease import _repo_and_scope
 from tests.test_access_control import _github_scope_test_setup
@@ -574,6 +575,102 @@ def test_checkout_action_follow_on_is_bound_to_designated_tool_and_live_lease(
         auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
         tool_name="scoped_fetch",
     )
+
+
+def test_checkout_observation_refuses_symlink_escape_from_lease_root(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        outside = tmp_path / "outside"
+        shutil.copytree(lease.path, outside / lease.path.name)
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+        escaped_path = root / "escape" / lease.path.name
+        metadata = escaped_path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text(encoding="utf-8"))
+        raw["path"] = str(escaped_path)
+        metadata.write_text(json.dumps(raw), encoding="utf-8")
+        state.attach_checkout_lease(replace(lease, path=escaped_path))
+        diagnostics = []
+        assert _live_scoped_pr_lease(scope, state, diagnostics=diagnostics) is None
+        assert diagnostics == ["checkout leaf is a symlink or resolves outside configured lease root"]
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+        )
+        assert ("cultivate", scope.scope_id) in auth.scoped_pr_grants._pending
+    finally:
+        lease.revoke()
+
+
+@pytest.mark.parametrize("invalid", ["attached_root", "metadata_path", "metadata_root", "metadata_relative"])
+def test_checkout_observation_refuses_different_root_or_metadata_path(
+    policy, tmp_path, monkeypatch, invalid,
+):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        if invalid == "attached_root":
+            state.attach_checkout_lease(replace(lease, lease_root=other))
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text(encoding="utf-8"))
+        if invalid == "metadata_relative":
+            monkeypatch.chdir(root)
+            raw["path"] = lease.path.name
+        else:
+            raw["path" if invalid == "metadata_path" else "lease_root"] = str(other)
+        metadata.write_text(json.dumps(raw), encoding="utf-8")
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        reasons = []
+        assert _live_scoped_pr_lease(scope, state, diagnostics=reasons) is None
+        assert reasons == [
+            "attached lease root differs from configured lease root" if invalid == "attached_root"
+            else "lease metadata path or root differs from attached lease"
+        ]
+        assert diagnostics == ["checkout protocol absent or live lease returned None"]
+        assert ("cultivate", scope.scope_id) in auth.scoped_pr_grants._pending
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_reports_wrong_pending_token(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, object(), "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        assert diagnostics == ["pending checkout token differs from consumed token"]
+        assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"])
+    finally:
+        lease.revoke()
 
 
 def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(tmp_path, monkeypatch):
