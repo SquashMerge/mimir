@@ -153,7 +153,7 @@ def test_actual_selected_cli_bootstraps_and_missing_provider_fails(tmp_path: Pat
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "home/.config/opencode/opencode.json").is_file()
 
-    code = ("import importlib.metadata as metadata; metadata.entry_points = lambda **kw: (); "
+    code = ("import importlib.metadata as metadata; _real = metadata.entry_points; metadata.entry_points = lambda **kw: () if kw.get('group') == 'mimir.plugins' else _real(**kw); "
             "from mimir.cli import main; main()")
     missing = subprocess.run([sys.executable, "-c", code, "opencode-bootstrap", "--home", str(tmp_path)],
                              cwd=ROOT, env=env, capture_output=True, text=True)
