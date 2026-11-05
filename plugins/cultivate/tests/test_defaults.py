@@ -66,12 +66,13 @@ def test_current_repository_skill_release_hash(name):
     "scripts/poller.py", "tests/test_github_poller_auto_review.py",
     "tests/test_github_poller_pr_pushes.py",
     "tests/test_github_poller_withhold.py", "tests/test_github_poller_issue_notices.py",
+    "tests/test_github_poller_ci_failures.py",
 ])
 def test_current_github_poller_release_hash(relative):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["2060-requested-comments"]["github-poller"][relative]
+    expected = releases["2091-ci-followup"]["github-poller"][relative]
     actual = hashlib.sha256((SKILLS / "github-poller" / relative).read_bytes()).hexdigest()
     assert actual == expected, f"{relative}: actual sha256={actual}"
 
@@ -84,7 +85,7 @@ def test_current_github_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "github-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2072-history-files"]["github-poller"]
+    assert skill_inventory(skill) == releases["2091-ci-followup"]["github-poller"]
 
 
 def test_history_file_defaults_are_released_for_both_pollers():
@@ -93,7 +94,8 @@ def test_history_file_defaults_are_released_for_both_pollers():
     for skill in skills:
         if skill.name not in {"github-poller", "github-ci-watch"}:
             continue
-        assert skill_inventory(skill) == releases["2072-history-files"][skill.name]
+        version = "2091-ci-followup" if skill.name == "github-poller" else "2072-history-files"
+        assert skill_inventory(skill) == releases[version][skill.name]
         capabilities = json.loads((SKILLS / skill.name / "pollers.json").read_text())["pollers"][0]["authority"]["capabilities"]
         assert {"repo_restore_file", "repo_file_at_revision"} <= set(capabilities)
 
@@ -122,7 +124,7 @@ def test_current_chainlink_orchestrator_release_inventory_is_complete():
                if item.name == "chainlink-orchestrator"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     assert skill_inventory(skill) == releases["2082-planner-prompt-path"]["chainlink-orchestrator"]
-    assert list(releases)[-1] == "2082-planner-prompt-path"
+    assert list(releases)[-1] == "2091-ci-followup"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.

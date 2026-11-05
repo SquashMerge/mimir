@@ -3235,6 +3235,15 @@ def _check_pr_ci_failures(
                 f"{repo}:{number}:{head_sha}:{me}:"
                 f"{json.dumps(failure_snapshot, separators=(',', ':'))}:review_ci_completed"
             )
+            legacy_completion_key = f"{repo}:{number}:{head_sha}:{me}:review_ci_completed"
+            if legacy_completion_key in completed_reviews:
+                # Old cursors covered the whole head, without a failure snapshot.
+                # Baseline the first observed snapshot silently, then retire the
+                # legacy key so later check changes can still trigger follow-ups.
+                completed_reviews.remove(legacy_completion_key)
+                if completion_key not in completed_reviews:
+                    completed_reviews.append(completion_key)
+                new[review_ci_key] = {**entry, "completed_reviews": completed_reviews}
             if completion_key not in completed_reviews:
                 review = _latest_current_head_review(repo, number, head_sha, me, token)
                 state = str(review.get("state") or "").upper() if review else ""
@@ -3302,7 +3311,9 @@ def _check_pr_ci_failures(
                                     "the first failing test or log excerpt. "
                                 )
                                 if failed:
-                                    ci_failure_marker = f"CI-only follow-up [{completion_key}]"
+                                    ci_failure_marker = (
+                                        "ci-only:" + hashlib.sha256(completion_key.encode()).hexdigest()[:16]
+                                    )
                                     prompt += (
                                         "If this review has no code findings, put the following marker "
                                         "on its own line in the review body: "
