@@ -101,6 +101,58 @@ def clean_log_tail(output, limit: int = LOG_EXCERPT_BYTES) -> bytes:
     return bytes(tail).decode("utf-8", errors="ignore").encode("utf-8")
 
 
+def _pytest_excerpt(clean, failures, summary, size: int, limit: int) -> bytes:
+    """Keep the summary and every failure's identity/assertion before context."""
+    # A summary can itself exceed the budget; in that case retain its beginning.
+    budget = limit - len(TRUNCATION_MARKER)
+    selected = [summary] if summary and summary[1] - summary[0] <= budget else []
+
+    def fits(span):
+        ordered = sorted((*selected, span))
+        length = sum(end - start for start, end in ordered)
+        length += sum(
+            len(TRUNCATION_MARKER)
+            for (_, end), (start, _) in zip(ordered, ordered[1:]) if end < start
+        )
+        return length <= budget
+
+    # The first pass reserves room for every test header and pytest's E lines.
+    # Only then spend remaining space on traceback lines closest to those E lines.
+    for kind in ("header", "error", "section"):
+        for start, end, label, _ in failures:
+            span = (start, end)
+            if label == kind and fits(span):
+                selected.append(span)
+
+    anchors = {}
+    for index, (_, _, label, group) in enumerate(failures):
+        if label == "error":
+            anchors.setdefault(group, []).append(index)
+    context = []
+    for index, (start, end, label, group) in enumerate(failures):
+        if label != "context":
+            continue
+        points = anchors.get(group, ())
+        distance = min((abs(index - point) for point in points), default=len(failures))
+        context.append((distance, index, (start, end)))
+    for _, _, span in sorted(context):
+        if fits(span):
+            selected.append(span)
+
+    selected.sort()
+    result = bytearray()
+    for index, (start, end) in enumerate(selected):
+        if index and selected[index - 1][1] < start:
+            result.extend(TRUNCATION_MARKER)
+        clean.seek(start)
+        result.extend(clean.read(end - start))
+    if not selected or selected[0][0] > 0 or selected[-1][1] < size or any(
+        left[1] < right[0] for left, right in zip(selected, selected[1:])
+    ):
+        result.extend(TRUNCATION_MARKER)
+    return bytes(result)
+
+
 def _select_excerpt(output, limit: int, token: str) -> bytes:
     with tempfile.TemporaryFile() as clean:
         for chunk in _clean_chunks(output):
@@ -113,6 +165,9 @@ def _select_excerpt(output, limit: int, token: str) -> bytes:
         following = 0
         in_summary = False
         oversized = False
+        in_failures = False
+        failures = []
+        group = 0
         while True:
             start = clean.tell()
             line = clean.readline(_CHUNK_BYTES + 1)
@@ -123,6 +178,21 @@ def _select_excerpt(output, limit: int, token: str) -> bytes:
                 recent.clear()
                 continue
             end = clean.tell()
+            if re.match(rb"^=+ (?:FAILURES|ERRORS) =+\s*$", line):
+                in_failures = True
+                group += 1
+                failures.append((start, end, "section", group))
+            elif in_failures and re.match(rb"^=+ .+ =+\s*$", line):
+                in_failures = False
+            elif in_failures:
+                if re.match(rb"^_{3,} .+ _{3,}\s*$", line):
+                    group += 1
+                    label = "header"
+                elif re.match(rb"^\s*E\s+", line):
+                    label = "error"
+                else:
+                    label = "context"
+                failures.append((start, end, label, group))
             if b"short test summary info" in line:
                 summary = (start, end)
                 in_summary = True
@@ -145,16 +215,20 @@ def _select_excerpt(output, limit: int, token: str) -> bytes:
                 fallback = (fallback[0], end)
                 following -= 1
             recent.append(start)
-        start, end = summary or fallback or (0, size)
-        clean.seek(start)
-        selected = bytearray()
-        omitted = start > 0 or end < size
-        while clean.tell() < end:
-            line = clean.readline(_CHUNK_BYTES + 1)
-            if len(line) > _CHUNK_BYTES or len(selected) + len(line) > LOG_EXCERPT_BYTES:
-                omitted = True
-                break
-            selected.extend(line)
+        if failures and (not summary or summary[1] - summary[0] <= limit - len(TRUNCATION_MARKER)):
+            selected = _pytest_excerpt(clean, failures, summary, size, limit)
+            omitted = False
+        else:
+            start, end = summary or fallback or (0, size)
+            clean.seek(start)
+            selected = bytearray()
+            omitted = start > 0 or end < size
+            while clean.tell() < end:
+                line = clean.readline(_CHUNK_BYTES + 1)
+                if len(line) > _CHUNK_BYTES or len(selected) + len(line) > LOG_EXCERPT_BYTES:
+                    omitted = True
+                    break
+                selected.extend(line)
         text = selected.decode("utf-8", errors="replace")
         if token:
             text = text.replace(token, "[REDACTED]")
