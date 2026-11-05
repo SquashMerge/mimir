@@ -89,7 +89,7 @@ def _auth(policy, state, enforce, *, discovered=False):
     )
 
 
-def _remediation_turn(tmp_path, monkeypatch):
+def _remediation_turn(tmp_path, monkeypatch, *, discovered=False):
     from mimir import access_control
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import policy_scope
@@ -102,7 +102,7 @@ def _remediation_turn(tmp_path, monkeypatch):
     policy = load_plugins(enable="cultivate").policy
     labels = InformationFlowLabels()
     auth = replace(
-        _auth(policy, state, True),
+        _auth(policy, state, True, discovered=discovered),
         ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
         _plugin_slot_policy=policy,
     )
@@ -276,17 +276,73 @@ def test_unsupported_escalation_preserves_trusted_turn_for_pr_comment(tmp_path, 
     ).reason != "write_blocked_by_untrusted_ingest"
 
 
+@pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
+def test_unsupported_operation_allows_remediation_writes(tmp_path, monkeypatch, discovered):
+    from mimir import event_logger
+    from mimir.access_control import classify_protected_result
+    from mimir.plugins.core import policy_scope
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, discovered=discovered)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(event_logger, "log_durable_event_sync", lambda *_args, **_kw: None)
+    with policy_scope(auth._plugin_slot_policy):
+        escalation_auth = ToolRegistry().authorize_tool(
+            "unsupported_operation", auth,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            enforce=True, policy=auth._plugin_slot_policy,
+        )
+    assert escalation_auth.allowed and not escalation_auth.would_block
+    assert escalation_auth.repo_pr_action_scope is scope
+    # The former channel route shadows this PR destination in a poller turn.
+    # It can execute outside enforcement, but its would_block decision must not
+    # exempt a result from the protected-source classifier.
+    with policy_scope(auth._plugin_slot_policy):
+        shadow = ToolRegistry().authorize_tool(
+            "unsupported_operation", replace(auth, scoped_pr_grants=None),
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            enforce=False, policy=auth._plugin_slot_policy,
+        )
+    assert shadow.allowed and shadow.would_block and shadow.reason == "cross_channel_scope"
+    status = {"status": "unsupported_operation", "escalated": True,
+              "repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    with policy_scope(auth._plugin_slot_policy):
+        shadow_labels = classify_protected_result(
+            "unsupported_operation", {"repository": scope.canonical_repo,
+                                      "pull_request": scope.pr_number}, auth, shadow, result=status,
+        )
+    assert shadow_labels is not None and shadow_labels.has_untrusted_active_ingest
+    escalated = invoke(
+        "unsupported_operation", description="Need unsupported test flags",
+        attempted_operations=["repo_test lacks this flag"],
+    )
+    assert escalated.status == "success", escalated.content
+    assert json.loads(escalated.content)["status"] == "unsupported_operation"
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    _commit_remediation(state, invoke, "verified fix")
+    with policy_scope(auth._plugin_slot_policy):
+        comment = ToolRegistry().authorize_tool(
+            "pr_comment", auth,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                       "body": "Verified fix"}, enforce=True, policy=auth._plugin_slot_policy,
+        )
+    assert comment.allowed, comment.reason
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+
+
 @pytest.mark.parametrize("invalid", [
     "extra_content", "failed", "wrong_pr", "untrusted_provenance", "other_owner",
     "result_repository", "result_pr", "result_status", "disallowed", "would_block",
+    "missing_field", "wrong_decision", "error_message", "malformed_message",
+    "wrong_scope", "wrong_repository", "wrong_origin", "wrong_sink", "wrong_scope_kind",
 ])
-def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypatch, invalid):
+@pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
+def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypatch, invalid, discovered):
     from mimir.access_control import (
         ProtectedResultProvenance, ToolAuthorization, classify_protected_result,
     )
     from mimir.plugins.core import policy_scope
 
-    _, scope, _, auth, _ = _remediation_turn(tmp_path, monkeypatch)
+    _, scope, _, auth, _ = _remediation_turn(tmp_path, monkeypatch, discovered=discovered)
     arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
     result = {"status": "unsupported_operation", "escalated": True,
               "repository": scope.canonical_repo, "pull_request": scope.pr_number}
@@ -297,14 +353,25 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
         tool_name="unsupported_operation", decision="resource_scoped", allowed=True,
         repo_pr_action_scope=scope, policy=policy,
     )
-    if invalid == "other_owner":
+    if invalid in {"other_owner", "wrong_origin", "wrong_sink", "wrong_scope_kind"}:
         # Copy the selected registry: never mutate the shared plugin policy.
         from copy import copy
         policy = copy(policy)
         policy._tools = dict(policy.tools)
-        policy._tools["unsupported_operation"] = replace(
-            policy.tools["unsupported_operation"], owner="other_plugin",
-        )
+        registered = policy.tools["unsupported_operation"]
+        if invalid == "other_owner":
+            registered = replace(registered, owner="other_plugin")
+        elif invalid == "wrong_scope_kind":
+            registered = replace(registered, resource_scope="repo_pr")
+        elif invalid == "wrong_origin":
+            registered = replace(registered, descriptor=replace(
+                registered.descriptor, result_origin=ResultOriginKind.REPOSITORY,
+            ))
+        else:
+            registered = replace(registered, descriptor=replace(
+                registered.descriptor, sink_destination="another_destination",
+            ))
+        policy._tools["unsupported_operation"] = registered
         authorization = replace(authorization, policy=policy)
     elif invalid == "result_repository":
         result["repository"] = "other/repo"
@@ -316,8 +383,20 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
         authorization = replace(authorization, allowed=False)
     elif invalid == "would_block":
         authorization = replace(authorization, would_block=True)
+    elif invalid == "wrong_decision":
+        authorization = replace(authorization, decision="admin_required")
+    elif invalid == "wrong_scope":
+        authorization = replace(authorization, repo_pr_action_scope=replace(scope, observed_head_sha="f" * 40))
+    elif invalid == "wrong_repository":
+        arguments["repository"] = "another/repository"
     elif invalid == "extra_content":
         result["description"] = "externally sourced text"
+    elif invalid == "missing_field":
+        result.pop("escalated")
+    elif invalid == "error_message":
+        result = ToolMessage(content=json.dumps(result), tool_call_id="unsupported_operation", status="error")
+    elif invalid == "malformed_message":
+        result = ToolMessage(content="not a status", tool_call_id="unsupported_operation")
     elif invalid == "failed":
         failed = True
     elif invalid == "wrong_pr":
@@ -335,6 +414,20 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
         )
     assert labels is not None
     assert labels.has_untrusted_active_ingest
+    assert any(source.resource_id == "<unresolved-resource:protected_tool:unsupported_operation>"
+               for source in labels.sources)
+    auth.ifc_state.merge(labels)
+    with policy_scope(policy):
+        for name, extras in (
+            ("repo_commit", {"paths": ("tracked.txt",), "message": "verified fix"}),
+            ("pr_comment", {"body": "Verified fix"}),
+        ):
+            decision = ToolRegistry().authorize_tool(
+                name, auth,
+                arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                           **extras}, enforce=True, policy=policy,
+            )
+            assert not decision.allowed, (name, decision)
 
 
 @pytest.mark.parametrize("invalid", [

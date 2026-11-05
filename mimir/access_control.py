@@ -10135,6 +10135,7 @@ class ToolRegistry:
         repo_pr_action_scope = None
         repo_review_state = None
         repo_review_state_refusal = None
+        state = None
         issue_target = None
         if auth_context is not None:
             if (
@@ -10217,7 +10218,9 @@ class ToolRegistry:
                     sink_target = target_channel = requested_target = destination
                 repo_pr_action_scope = issue_target
             elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS or (
-                plugin_tool is not None and plugin_tool.resource_scope == "repo_pr"
+                plugin_tool is not None and (
+                    plugin_tool.resource_scope == "repo_pr" or tool_name == "unsupported_operation"
+                )
             ):
                 tool_arguments = arguments or {}
                 plugin_repo_target = (
@@ -10489,6 +10492,23 @@ class ToolRegistry:
             if plugin_tool is not None:
                 scope_kind = plugin_tool.resource_scope
                 if scope_kind == "channel":
+                    if (tool_name == "unsupported_operation" and state is not None
+                            and repo_pr_action_scope is not None
+                            and (protocol := policy.scoped_actions.get(plugin_tool.owner)) is not None
+                            and type(plugin_tool.typed_action) is protocol.action_type
+                            and _valid_scoped_pr_grant(
+                                auth_context, plugin_tool.owner, plugin_tool.typed_action,
+                                protocol, repo_pr_action_scope, state, tool_name=tool_name,
+                            )):
+                        return finish(authorize_repo_pr_tool(
+                            tool_name, repo_pr_action_scope,
+                            service_principal=service_principal, enforce=enforce,
+                            flow_direction=flow_direction,
+                            required_actions=(plugin_tool.typed_action.value,),
+                            registered_plugin=True, auth_context=auth_context,
+                            owner=plugin_tool.owner, action=plugin_tool.typed_action,
+                            protocol=protocol, review_state=state,
+                        ))
                     if plugin_channel_valid:
                         channel_auth = ChannelResourceAdapter.authorize_channel_operation(
                             tool_name, plugin_channel_target, auth_context, enforce=enforce,

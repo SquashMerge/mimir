@@ -879,7 +879,7 @@ _MEMBERSHIPS = MappingProxyType({
 _ACTIONS = MappingProxyType({
     **{name: RepoPRAction.INSPECT for name in _names("""pr_metadata pr_spec pr_files
         pr_diff pr_file_content pr_checks pr_job_log pr_reviews pr_comments pr_review_requests
-        repo_status repo_diff repo_file_at_revision repo_unmerged""")},
+        repo_status repo_diff repo_file_at_revision repo_unmerged unsupported_operation""")},
     **{name: RepoPRAction.CHECKOUT for name in _names("repo_checkout repo_cleanup repo_fetch")},
     "repo_test": RepoPRAction.TEST,
     **{name: RepoPRAction.WRITE for name in _names("repo_restore_file repo_stage repo_merge_abort repo_rebase_abort repo_revert_abort")},
@@ -1048,6 +1048,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
                 "tracker_issue" if name in TRACKER_TOOL_NAMES else
                 "ci_branch" if name == "ci_recent_runs" else
                 "ci_run" if name in {"ci_run", "ci_run_jobs"} else
+                "channel" if name == "unsupported_operation" else
                 "repo_pr" if declaration.operation_class == "resource_scoped" and action is not None
                 else "channel" if declaration.operation_class == "resource_scoped" else None
             ),
