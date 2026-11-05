@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir import event_logger, poller_recovery, pollers
+from mimir import event_logger, poller_hooks, poller_recovery, pollers
 from mimir.access_control import (
     CapabilityTier, SinkGate, build_trigger_service_principal, create_auth_context,
 )
@@ -926,6 +926,190 @@ async def test_reconcile_completed_hard_refusal_without_charging_attempt(
     assert entry["hard_refusals"] == [
         {"boundary": "service_scope", "reason": "service_scope_denied"}
     ]
+
+
+@pytest.mark.parametrize("outcome_type", ["turn_completed", "turn_failed"])
+async def test_live_refusal_settles_after_two_deliveries_per_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome_type: str,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    notices = []
+
+    async def record(kind, **fields):
+        notices.append((kind, fields))
+
+    monkeypatch.setattr(poller_recovery, "log_event", record)
+    item = {
+        "event_type": "pr_review_requested", "repo": "o/r", "number": 42,
+        "url": "https://github.com/o/r/pull/42", "head_sha": "a" * 40,
+        "recovery_key": "request-on-a",
+    }
+    for index in range(2):
+        source_id = f"delivery-{index}"
+        await poller_recovery.stash_enqueued_event(
+            tmp_path, _make_event(source_id, channel_id="poller:github-activity", items=[item]),
+            enqueued_at=_ts(20 - 5 * index),
+        )
+        _write_outcome(
+            events, type_=outcome_type, channel_id="poller:github-activity",
+            source_id=source_id, ts=_ts(18 - 5 * index),
+            attempt_disposition="exempt_hard_refusal",
+            attempt_reason="protected_name_match, unsupported_operation",
+            hard_refusals=[{"reason": "protected_name_match"}, {"reason": "unsupported_operation"}],
+        )
+        summary = await poller_recovery.reconcile_failed_turns(
+            poller_name="github-activity", channel_id="poller:github-activity",
+            persist_dir=tmp_path, events_path=events, enqueue=_FakeEnqueue(),
+            recover_failed_turns=False,
+        )
+        state = poller_recovery._load_state(tmp_path)
+        assert summary["gave_up"] == index
+        if index == 0:
+            assert state["inflight"][source_id]["attempts"] == 0
+        else:
+            assert state["inflight"] == {}
+            assert "review:request-on-a" in state["settled_refusals"]
+
+    [(kind, fields)] = notices
+    assert kind == "poller_turn_gave_up"
+    assert fields["source_id"] == "delivery-1"
+    assert "pr_review_requested" in fields["detail"]
+    assert "pull/42" in fields["detail"]
+    assert "protected_name_match" in fields["detail"]
+    assert "unsupported_operation" in fields["detail"]
+
+    # An already-queued duplicate is retired without a turn or second notice;
+    # another event on this PR (e.g. a later request/head) is independent.
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, _make_event("late-duplicate", channel_id="poller:github-activity", items=[item]),
+    )
+    newer = {**item, "recovery_key": "new-request-on-a"}
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, _make_event("new-request", channel_id="poller:github-activity", items=[newer]),
+    )
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id="poller:github-activity",
+        persist_dir=tmp_path, events_path=events, enqueue=_FakeEnqueue(),
+        recover_failed_turns=False,
+    )
+    assert list(poller_recovery._load_state(tmp_path)["inflight"]) == ["new-request"]
+    assert len(notices) == 1
+
+
+@pytest.mark.parametrize("event_type", [
+    "pr_review_requested", "pr_synchronize", "pr_checks_completed",
+])
+async def test_live_review_satisfaction_requires_submitted_review_after_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_type: str,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    head = "a" * 40
+    item = {
+        "event_type": event_type, "repo": "o/r", "number": 42,
+        "head_sha": head, "requested_reviewer": "review-bot",
+    }
+    event = _make_event("review-event", channel_id="poller:github-activity", items=[item])
+    await poller_recovery.stash_enqueued_event(tmp_path, event, enqueued_at=_ts(30))
+    _write_outcome(
+        events, type_="turn_completed", channel_id=event.channel_id,
+        source_id=event.source_id, ts=_ts(20), attempt_disposition="charge",
+    )
+    submitted_at = _ts(10)
+    review_data = []
+
+    def attest(endpoint, token):
+        assert token == "token"
+        if endpoint.endswith("/reviews?per_page=100"):
+            return 200, review_data
+        return 200, {"state": "open", "head": {"sha": head}}
+
+    monkeypatch.setattr(pollers, "_github_api_attestation", attest)
+
+    async def reconcile():
+        return await poller_recovery.reconcile_failed_turns(
+            poller_name="github-activity", channel_id=event.channel_id,
+            persist_dir=tmp_path, events_path=events, enqueue=_FakeEnqueue(),
+            recover_failed_turns=False,
+            relevance_check=poller_hooks.github_recovery_relevance_check("token", "review-bot"),
+        )
+
+    await reconcile()
+    assert poller_recovery._load_state(tmp_path)["inflight"][event.source_id]["attempts"] == 1
+    # An older review, a different reviewer, or the wrong head cannot settle it.
+    review_data.extend([
+        {"user": {"login": "review-bot"}, "commit_id": head,
+         "submitted_at": _ts(40), "state": "CHANGES_REQUESTED"},
+        {"user": {"login": "someone-else"}, "commit_id": head,
+         "submitted_at": submitted_at, "state": "APPROVED"},
+        {"user": {"login": "review-bot"}, "commit_id": "b" * 40,
+         "submitted_at": submitted_at, "state": "APPROVED"},
+        {"user": {"login": "review-bot"}, "commit_id": head,
+         "submitted_at": submitted_at, "state": "PENDING"},
+    ])
+    await reconcile()
+    assert event.source_id in poller_recovery._load_state(tmp_path)["inflight"]
+    review_data.append({
+        "user": {"login": "review-bot"}, "commit_id": head,
+        "submitted_at": submitted_at, "state": "CHANGES_REQUESTED",
+    })
+    if event_type == "pr_review_requested":
+        # A re-request after the submitted review is new activity on this head.
+        state = poller_recovery._load_state(tmp_path)
+        stashed = state["inflight"][event.source_id]["event"]["extra"]["items"][0]
+        stashed["review_request_at"] = _ts(5)
+        poller_recovery._save_state(tmp_path, state)
+        await reconcile()
+        assert event.source_id in poller_recovery._load_state(tmp_path)["inflight"]
+        stashed["review_request_at"] = _ts(30)
+        poller_recovery._save_state(tmp_path, state)
+    summary = await reconcile()
+    assert summary["stale_dropped"] == 1
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+async def test_closed_pr_still_drops_completed_review(tmp_path: Path, monkeypatch):
+    event = _make_event("closed", channel_id="poller:github-activity", items=[{
+        "event_type": "pr_review_requested", "repo": "o/r", "number": 42,
+        "head_sha": "a" * 40, "requested_reviewer": "review-bot",
+    }])
+    await poller_recovery.stash_enqueued_event(tmp_path, event, enqueued_at=_ts(30))
+    events = tmp_path / "events.jsonl"
+    _write_outcome(events, type_="turn_completed", channel_id=event.channel_id,
+                   source_id=event.source_id, ts=_ts(20))
+    monkeypatch.setattr(pollers, "_github_api_attestation",
+                        lambda *args: (200, {"state": "closed"}))
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=events, enqueue=_FakeEnqueue(),
+        recover_failed_turns=False,
+        relevance_check=poller_hooks.github_recovery_relevance_check("token", "review-bot"),
+    )
+    assert summary["stale_dropped"] == 1
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+async def test_refusal_cap_is_not_shared_by_other_event_on_same_pr(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    for index, key in enumerate(("request-a", "request-b")):
+        event = _make_event(
+            f"event-{index}", channel_id="poller:github-activity", items=[{
+                "event_type": "pr_review_requested", "repo": "o/r", "number": 42,
+                "head_sha": "a" * 40, "recovery_key": key,
+            }],
+        )
+        await poller_recovery.stash_enqueued_event(tmp_path, event, enqueued_at=_ts(20 - index))
+        _write_outcome(
+            events, type_="turn_completed", channel_id=event.channel_id,
+            source_id=event.source_id, ts=_ts(10 - index),
+            attempt_disposition="exempt_hard_refusal", attempt_reason="protected_name_match",
+        )
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id="poller:github-activity",
+        persist_dir=tmp_path, events_path=events, enqueue=_FakeEnqueue(),
+        recover_failed_turns=False,
+    )
+    assert summary["gave_up"] == 0
+    assert set(poller_recovery._load_state(tmp_path)["inflight"]) == {"event-0", "event-1"}
 
 
 @pytest.mark.parametrize("outcome_type", ["turn_completed", "turn_failed"])

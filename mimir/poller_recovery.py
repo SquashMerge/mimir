@@ -81,6 +81,9 @@ RECOVERY_STATE_FILE = ".recovery.json"
 #: Mirrors github-poller's ``REVIEW_REQUEST_MAX_ATTEMPTS`` (#516) — same
 #: wedge-guard intent: a persistently-failing item can't re-fire forever.
 DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
+#: Total deliveries of one live-state review event ending in exempt hard refusal.
+#: This is separate from the charged failure budget; a refusal is never charged.
+MAX_LIVE_REFUSAL_DELIVERIES = 2
 DEFAULT_TURN_TRANSIENT_RETRY_MAX = 5
 DEFAULT_TURN_TRANSIENT_RETRY_BASE_S = 120.0
 DEFAULT_TURN_TRANSIENT_RETRY_MAX_S = 1800.0
@@ -214,6 +217,7 @@ def _load_state(persist_dir: Path) -> dict:
             # cannot discard stashed events, unlike coercing malformed inflight.
             "last_reconciled": last if isinstance(last, str) else "",
             "inflight": inflight if isinstance(inflight, dict) else {},
+            "settled_refusals": data.get("settled_refusals", {}),
         }
     log.warning("poller recovery: state has invalid shape at %s", p)
     return {
@@ -326,6 +330,10 @@ async def stash_enqueued_event(
         ).isoformat(),
         "event": _event_to_stash(event),
     }
+    # The first delivery, not a later replay, defines the review activity.
+    state["inflight"][event.source_id]["event"]["extra"]["recovery_event_at"] = (
+        enqueued_at or stashed_at
+    )
     if pending_enqueue:
         state["inflight"][event.source_id]["pending_enqueue"] = True
         await _bound_pending_enqueue(
@@ -696,10 +704,21 @@ async def _emit_gave_up(poller_name: str, channel_id: str, entry: dict, source_i
     items = extra.get("items") if isinstance(extra, dict) else None
     detail = poller_name
     if isinstance(items, list) and items and isinstance(items[0], dict):
-        ref = items[0].get("url") or items[0].get("repo") or items[0].get("event_type")
+        item = items[0]
+        ref = item.get("url") or (
+            f"{item['repo']} PR #{item['number']}"
+            if item.get("repo") and item.get("number") else item.get("repo")
+        ) or item.get("event_type")
         if ref:
             more = f" +{len(items) - 1} more" if len(items) > 1 else ""
-            detail = f"{poller_name} ({ref}{more})"
+            detail = f"{poller_name} ({item.get('event_type', 'event')} {ref}{more})"
+    if entry.get("outcome_disposition") == "exempt_hard_refusal":
+        reasons = entry.get("hard_refusals")
+        reasons = [str(r.get("reason"))[:240] for r in reasons
+                   if isinstance(r, dict) and r.get("reason")] if isinstance(reasons, list) else []
+        if not reasons:
+            reasons = [str(entry.get("outcome_reason") or "hard_boundary_refusal")[:240]]
+        detail += f"; hard refusal: {', '.join(dict.fromkeys(reasons))}"
     await log_event(
         "poller_turn_gave_up",
         poller=poller_name,
@@ -709,6 +728,47 @@ async def _emit_gave_up(poller_name: str, channel_id: str, entry: dict, source_i
         detail=detail,
         items=items,
     )
+
+
+def _refusal_key(entry: dict, source_id: str) -> str:
+    """A poller-issued review activity key, or the individual source ID."""
+    ev = entry.get("event")
+    extra = ev.get("extra") if isinstance(ev, dict) else None
+    items = extra.get("items") if isinstance(extra, dict) else None
+    if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
+        key = items[0].get("recovery_key")
+        if isinstance(key, str) and key and len(key) <= 128:
+            return "review:" + key
+    return "source:" + source_id
+
+
+async def _record_live_refusal(
+    inflight: dict, settled: dict, source_id: str, entry: dict,
+    poller_name: str, channel_id: str,
+) -> bool:
+    """Retire an event after two refused deliveries, with one give-up signal."""
+    key = _refusal_key(entry, source_id)
+    entry["refusal_deliveries"] = int(entry.get("refusal_deliveries", 0)) + 1
+    total = sum(
+        int(other.get("refusal_deliveries", 0))
+        for sid, other in inflight.items()
+        if isinstance(other, dict) and _refusal_key(other, sid) == key
+    )
+    if total < MAX_LIVE_REFUSAL_DELIVERIES:
+        return False
+    if key not in settled:
+        try:
+            await _emit_gave_up(poller_name, channel_id, entry, source_id)
+        except Exception as exc:  # noqa: BLE001 — settlement must not strand the event
+            log.warning("poller recovery: refusal notice failed for %s: %s", source_id, exc)
+        # Only poller-provided activity keys need a tombstone: the poller can
+        # produce another source_id for the same still-open review request.
+        if key.startswith("review:"):
+            settled[key] = _utc_now_iso()
+    for sid, other in list(inflight.items()):
+        if isinstance(other, dict) and _refusal_key(other, sid) == key:
+            del inflight[sid]
+    return True
 
 
 async def _is_stale(event: AgentEvent, relevance_check: RelevanceFn | None) -> bool:
@@ -752,8 +812,11 @@ async def reconcile_failed_turns(
     For each turn-outcome event (since the last reconcile) whose
     ``source_id`` is still in-flight:
       * ``turn_completed`` → drop it for generic recovery; retain and charge it
-        for live-state pollers, which verify the external transition themselves.
-        A hard-boundary-refusal disposition remains exempt from that charge.
+        for live-state pollers until the source verifies the transition.
+        A hard-boundary refusal remains exempt from the charged budget, but
+        after two deliveries of the same review activity is settled with a
+        one-shot notice. A durable activity-key tombstone prevents a later poll
+        fire (which has a different source_id) from repeating that activity.
       * ``turn_failed`` with ``result_subtype=tool_budget_exhausted`` →
         drop it without retry. The failure is deterministic under an
         unchanged budget, so replay would repeat partial work and spend
@@ -794,6 +857,9 @@ async def reconcile_failed_turns(
     state = await asyncio.to_thread(_load_state, persist_dir)
     summary["state_unreadable"] = state.get("_unreadable_path", "")
     inflight: dict = state["inflight"]
+    settled = state.setdefault("settled_refusals", {})
+    if not isinstance(settled, dict):
+        settled = state["settled_refusals"] = {}
     now_dt = _utc_now()
     now_iso = now_dt.isoformat()
     transient_max, transient_base, transient_cap = _transient_config()
@@ -807,6 +873,12 @@ async def reconcile_failed_turns(
     # Pending entries have a separate count ceiling, including legacy ledgers
     # that grew before this bound existed. Run before any replay can defer.
     summary["gave_up"] += await _bound_pending_enqueue(inflight, poller_name, channel_id)
+
+    # A second delivery can already be queued when the first one settles.
+    for sid, entry in list(inflight.items()):
+        if isinstance(entry, dict) and _refusal_key(entry, sid) in settled:
+            del inflight[sid]
+            summary["stale_dropped"] += 1
 
     # Fast path: nothing stashed → nothing to reconcile. Advance the
     # watermark so the first real reconcile after events accrue doesn't
@@ -847,6 +919,10 @@ async def reconcile_failed_turns(
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
                     if recover_failed_turns or not _is_live_state_poller(poller_name):
                         del inflight[source_id]
+                    elif await _record_live_refusal(
+                        inflight, settled, source_id, entry, poller_name, channel_id,
+                    ):
+                        summary["gave_up"] += 1
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
@@ -876,6 +952,10 @@ async def reconcile_failed_turns(
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
                     if recover_failed_turns or not _is_live_state_poller(poller_name):
                         del inflight[source_id]
+                    elif await _record_live_refusal(
+                        inflight, settled, source_id, entry, poller_name, channel_id,
+                    ):
+                        summary["gave_up"] += 1
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
@@ -1036,6 +1116,17 @@ async def reconcile_failed_turns(
             # ``isoformat()`` strings, so lexicographic ``max`` orders
             # them chronologically.
             watermark = max(watermark, ts)
+
+    # Live-state completion is only charged until the source confirms the
+    # transition. Check even when there are no new outcomes this cycle.
+    if _is_live_state_poller(poller_name) and relevance_check is not None:
+        for source_id, entry in list(inflight.items()):
+            if not isinstance(entry, dict) or not entry.get("last_outcome_at"):
+                continue
+            event = _event_from_stash(entry.get("event"))
+            if event is not None and await _is_stale(event, relevance_check):
+                del inflight[source_id]
+                summary["stale_dropped"] += 1
 
     # Scheduled retries are durable, independent of the outcome watermark.
     # Do not sleep inside a poll cycle or count an enqueue rejected by headroom.
