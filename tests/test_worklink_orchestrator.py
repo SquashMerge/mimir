@@ -11374,6 +11374,59 @@ def test_factory_completion_requires_entire_success_conjunction(
     assert evidence["head_sha"] == "a" * 40
 
 
+@pytest.mark.parametrize(("status_repo", "forge_repo"), [
+    ("owner/repo", "Owner/repo"), ("Owner/repo", "owner/repo"),
+])
+def test_factory_completion_matches_forge_pr_casing_but_not_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_completion_sandbox: Path,
+    status_repo: str, forge_repo: str,
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    sandbox = factory_completion_sandbox
+    record = _completion_record(sandbox)
+    status_url = f"https://github.com/{status_repo}/pull/42"
+    object.__setattr__(record, "status", parse_factory_status({
+        **record.status.to_json(), "pr_url": status_url,
+    }))
+    validation = _completion_validation(sandbox)
+    validation = replace(validation, evidence=replace(validation.evidence, pr_url=status_url))
+
+    async def observed(**kwargs: object) -> EvidenceValidation:
+        return validation
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+    base_runner = _completion_runner(sandbox, case="success")
+    live_url = f"https://github.com/{forge_repo}/pull/42"
+
+    def runner(args: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        result = base_runner(args, **kwargs)
+        if list(args)[:2] == ["gh", "api"]:
+            payload = json.loads(result.stdout)
+            payload["html_url"] = live_url
+            payload["base"]["repo"]["full_name"] = forge_repo
+            payload["head"]["repo"]["full_name"] = forge_repo
+            return cp(args, stdout=json.dumps(payload))
+        return result
+
+    def verify() -> tuple[Path, str]:
+        return asyncio.run(orchestrator._verify_factory_completion(
+            home=tmp_path,
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            record=record, test_command="pytest -q",
+            started_at=datetime.now(UTC), runner=runner,
+        ))
+
+    assert verify()[1] == status_url
+    for live_url in (
+        f"https://github.com/{forge_repo}-old/pull/42",
+        f"https://github.com/{forge_repo}/pull/43",
+        f"https://other.example/{forge_repo}/pull/42",
+    ):
+        with pytest.raises(WorklinkError, match="GitHub PR URL mismatch"):
+            verify()
+
+
 @pytest.mark.parametrize("pr_base", [None, "develop"])
 def test_factory_completion_rejects_unbound_base_before_external_verification(
     tmp_path: Path,

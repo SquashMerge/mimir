@@ -20,12 +20,43 @@ from collections.abc import Callable
 from enum import StrEnum
 
 _LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_REPO_URL = re.compile(
+    r"https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"(?P<rest>/.*)"
+)
+_PR_PATH = re.compile(r"/pull/[1-9][0-9]*")
 _USER_URL = "https://api.github.com/user"
 _USER_MAX_BYTES = 65_536
 _USER_TIMEOUT_SECONDS = 20.0
 
 _identity_lock = threading.Lock()
 _verified_identity: tuple[str, str] | None = None
+
+
+def same_github_repo(a: object, b: object) -> bool:
+    """Compare complete GitHub owner/repo slugs, case-insensitively."""
+    return (isinstance(a, str) and isinstance(b, str)
+            and _REPO.fullmatch(a) is not None and _REPO.fullmatch(b) is not None
+            and a.casefold() == b.casefold())
+
+
+def same_github_url(a: object, b: object) -> bool:
+    """Allow only the owner/repo casing to differ in HTTPS GitHub URLs."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    left, right = _REPO_URL.fullmatch(a), _REPO_URL.fullmatch(b)
+    return bool(left and right and same_github_repo(left['repo'], right['repo'])
+                and left['rest'] == right['rest'])
+
+
+def same_github_pr_url(a: object, b: object) -> bool:
+    """Match canonical pull URLs with exact path shape and PR number."""
+    if not same_github_url(a, b):
+        return False
+    assert isinstance(a, str)
+    match = _REPO_URL.fullmatch(a)
+    return match is not None and _PR_PATH.fullmatch(match['rest']) is not None
 
 
 class GitHubIdentityFailureKind(StrEnum):
