@@ -4230,6 +4230,53 @@ def test_github_framework_trigger_trust_requires_matching_live_self_pr(
     ) is False
 
 
+@pytest.mark.parametrize(("event_repo", "forge_repo"), [
+    ("squashmerge/mimir", "SquashMerge/mimir"),
+    ("SquashMerge/mimir", "squashmerge/mimir"),
+])
+def test_framework_trigger_attests_case_insensitive_repository_and_exact_pr(
+    monkeypatch: pytest.MonkeyPatch, event_repo: str, forge_repo: str,
+) -> None:
+    from mimir import pollers
+
+    url = f"https://github.com/{event_repo}/pull/7"
+    item = {
+        "event_type": "pr_changes_requested_stale", "number": 7, "url": url,
+        "author": "mimir-bot", "head_repo": event_repo, "head_remote": "origin",
+        "head_ref": "worklink/7", "head_sha": "a" * 40,
+        "base_ref": "main", "base_sha": "b" * 40,
+    }
+    live = {
+        "state": "open", "number": 7,
+        "html_url": f"https://github.com/{forge_repo}/pull/7",
+        "user": {"login": "mimir-bot"},
+        "head": {"ref": "worklink/7", "sha": "a" * 40,
+                 "repo": {"full_name": forge_repo}},
+        "base": {"ref": "main", "sha": "b" * 40},
+    }
+    monkeypatch.setattr(pollers, "_github_api_attestation", lambda *args: (200, live))
+
+    def trusted() -> bool:
+        return pollers._github_framework_trigger_is_trusted(event_repo, item, "token", "mimir-bot")
+
+    assert trusted() is True
+    for different in (f"{forge_repo}-old", "other/mimir"):
+        live["head"]["repo"]["full_name"] = different
+        assert trusted() is False
+    live["head"]["repo"]["full_name"] = forge_repo
+    for different_url in (
+        f"https://github.com/{forge_repo}-old/pull/7",
+        f"https://github.com/{forge_repo}/pull/8",
+        f"https://other.example/{forge_repo}/pull/7",
+    ):
+        live["html_url"] = different_url
+        assert trusted() is False
+    live["html_url"] = f"https://github.com/{forge_repo}/pull/7"
+    for number in (True, 7.0, 8):
+        live["number"] = number
+        assert trusted() is False
+
+
 @pytest.mark.parametrize("mode", ["distinct", "same", "changed", "framework-first", "actor-first"])
 @pytest.mark.asyncio
 async def test_github_fire_attestation_network_budget(
@@ -7225,6 +7272,33 @@ def test_merge_notice_same_reason_becomes_terminal_without_waiting(worklink_rece
     assert terminal["retriable"] is False
     assert [notice["delivery_key"] for notice in
             failures.pending_merge_reconciliation_notices(state)] == [held["delivery_key"]]
+
+
+@pytest.mark.parametrize("retriable", [False, True])
+@pytest.mark.parametrize("resolved", [False, True])
+@pytest.mark.parametrize("has_receipt", [False, True])
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_pending_merge_notices_preserve_retry_gate_and_receipt_recovery(
+    worklink_receipts, retriable, resolved, has_receipt, exhausted,
+):
+    failures, state, _, _ = worklink_receipts
+    entry = failures.record_merge_reconciliation_notice(
+        state, issue_id=1304, repository="example/project", pr_url=None,
+        reason="review_lifecycle_required", detail="review label absent",
+        retriable=retriable,
+    )
+    key = entry["delivery_key"]
+    with failures.failure_state_transaction(state) as ledger:
+        current = ledger["merge_reconciliations"]["notices"][key]
+        current["resolved"] = resolved
+        current["observations"] = failures.MERGE_RETRY_PASSES if exhausted else 1
+    if has_receipt:
+        _write_delivery_receipt(state, key)
+    expected = has_receipt or (not resolved and (not retriable or exhausted))
+    pending = failures.pending_merge_reconciliation_notices(state)
+    assert [notice["delivery_key"] for notice in pending] == ([key] if expected else [])
+    failures.mark_merge_reconciliation_notified(state, key)
+    assert failures.pending_merge_reconciliation_notices(state) == []
 
 
 def test_merge_receipt_pruning_and_stale_snapshot(

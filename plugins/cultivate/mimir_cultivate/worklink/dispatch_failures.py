@@ -566,14 +566,18 @@ def record_merge_reconciliation_notice(
 
 
 def pending_merge_reconciliation_notices(state_dir: Path) -> list[dict[str, Any]]:
-    """Return unacknowledged notices, including resolved-but-undelivered ones."""
+    """Return undelivered refusals and resolved notices with receipts to acknowledge."""
     with merge_reconciliation_transaction(state_dir) as reconciliations:
         return [
             dict(entry)
             for _, entry in sorted(reconciliations["notices"].items())
             if not entry["notified"] and (
-                not entry.get("retriable") or
-                not entry["resolved"] and entry.get("observations", 0) >= MERGE_RETRY_PASSES
+                delivery_receipt_exists(state_dir, entry["delivery_key"]) or (
+                    not entry["resolved"] and (
+                        not entry.get("retriable") or
+                        entry.get("observations", 0) >= MERGE_RETRY_PASSES
+                    )
+                )
             )
         ]
 

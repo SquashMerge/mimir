@@ -420,6 +420,11 @@ def test_synchronize_coalesces_review_request_and_preserves_retry_state(
             return [_pr(42, "new-sha", requested_reviewers=["mimir-carreira"])]
         if endpoint == "repos/o/r/pulls/42/reviews":
             return []
+        if endpoint == "repos/o/r/issues/42/timeline?per_page=100":
+            return [{
+                "event": "review_requested", "created_at": CREATED,
+                "requested_reviewer": {"login": "mimir-carreira"},
+            }]
         raise AssertionError(endpoint)
 
     monkeypatch.setattr(poller, "_gh_api", second_poll_api)
@@ -437,6 +442,10 @@ def test_synchronize_coalesces_review_request_and_preserves_retry_state(
         "pr_review_requested"
     ]
     assert captured_emits[0]["attempt"] == 2
+    assert captured_emits[0]["review_request_at"] == CREATED
+    assert captured_emits[0]["recovery_key"] == poller._review_recovery_key(
+        captured_emits[0], "mimir-carreira",
+    )
     assert new_rr == {"42": 2}
 
 

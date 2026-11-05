@@ -39,6 +39,13 @@ from mimir.web_contracts import (
 )
 
 
+
+def _plugin_entry_points(fake):
+    """Fake only the mimir.plugins group; other groups (e.g. pydantic's) stay real."""
+    import importlib.metadata as _metadata
+    real = _metadata.entry_points
+    return lambda *, group: fake() if group == "mimir.plugins" else real(group=group)
+
 def _selected_web_manager(tmp_path: Path, monkeypatch, *, plugins: tuple[dict, ...], enable: str | None = None):
     """Discover and load distribution-owned manifests through the real selected path."""
     from mimir.plugins.manager import load_plugins
@@ -107,7 +114,7 @@ def _selected_web_manager(tmp_path: Path, monkeypatch, *, plugins: tuple[dict, .
         entries.append(SimpleNamespace(name=name, value=f"provider_{name}:register",
                                        dist=Distribution(), load=load))
 
-    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: entries)
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", _plugin_entry_points(lambda: entries))
     return load_plugins(enable=enable if enable is not None else ",".join(spec["name"] for spec in plugins)), loaded
 
 
