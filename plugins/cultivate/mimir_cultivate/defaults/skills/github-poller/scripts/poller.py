@@ -709,6 +709,26 @@ def _review_recovery_state(
     )
 
 
+def _review_recovery_key(extras: dict, reviewer: str) -> str:
+    """Identify this review activity across poll fires, without sharing PR budgets."""
+    identity = (
+        extras.get("repo"), extras.get("number"), extras.get("event_type"),
+        extras.get("head_sha") or extras.get("new_head"), reviewer,
+        extras.get("review_request_at") if extras.get("event_type") == "pr_review_requested"
+        else extras.get("delivery_key", ""),
+    )
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _review_refusal_settled(key: str) -> bool:
+    try:
+        state = json.loads((STATE_DIR / _RECOVERY_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    settled = state.get("settled_refusals") if isinstance(state, dict) else None
+    return isinstance(settled, dict) and "review:" + key in settled
+
+
 def _resolve_token() -> str:
     """Get a GitHub PAT from env or ``gh auth token``."""
     token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -2423,6 +2443,16 @@ def _emit_pr_review_needed(
         )
     if reviewed:
         return False
+    if extras.get("event_type") in {
+        "pr_review_requested", "pr_synchronize", "pr_checks_completed",
+    }:
+        if (extras.get("event_type") == "pr_review_requested"
+                and isinstance(repo, str) and number is not None and reviewer):
+            extras["review_request_at"] = _latest_review_request_at(repo, number, reviewer, token)
+        key = _review_recovery_key(extras, reviewer)
+        if _review_refusal_settled(key):
+            return False
+        extras["recovery_key"] = key
     _emit(prompt, **extras)
     return True
 
@@ -3321,6 +3351,13 @@ def _check_pr_ci_failures(
                                     )
                             else:
                                 prompt += "CI is green; approve without a full re-review. "
+                            review_extras = dict(
+                                repo=repo, number=number, event_type="pr_checks_completed",
+                                head_sha=head_sha, delivery_key=completion_key,
+                            )
+                            recovery_key = _review_recovery_key(review_extras, me)
+                            if _review_refusal_settled(recovery_key):
+                                continue
                             _emit(
                                 prompt + f"\n{pr.get('html_url', '')}" + evidence,
                                 event_type="pr_checks_completed", reason="checks_concluded",
@@ -3332,6 +3369,7 @@ def _check_pr_ci_failures(
                                                  else "review"),
                                 requested_reviewer=me, checks_concluded=True,
                                 delivery_key=completion_key, dedup_scope="head_sha,reviewer,failed_checks",
+                                recovery_key=recovery_key,
                             )
                             count += 1
                             completed_reviews.append(completion_key)
