@@ -577,6 +577,44 @@ def test_checkout_action_follow_on_is_bound_to_designated_tool_and_live_lease(
     )
 
 
+def test_checkout_observation_refuses_symlinked_configured_root(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        assert _live_scoped_pr_lease(scope, state) is lease
+        alias = tmp_path / "lease-root-alias"
+        alias.symlink_to(root, target_is_directory=True)
+        assert alias.resolve(strict=True) == root.resolve(strict=True)
+        monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(alias))
+        reasons = []
+        assert _live_scoped_pr_lease(scope, state, diagnostics=reasons) is None
+        assert reasons == ["configured lease root is relative or a symlink"]
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        ), diagnostics
+        assert diagnostics == ["checkout protocol absent or live lease returned None"]
+        assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
+        # Refusal must not consume the token or invalidate the real checkout.
+        monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+        diagnostics = []
+        assert observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        ), diagnostics
+        assert diagnostics == []
+    finally:
+        lease.revoke()
+
+
 def test_checkout_observation_refuses_symlink_escape_from_lease_root(policy, tmp_path, monkeypatch):
     _repo, scope = _repo_and_scope(tmp_path)
     state = RepoReviewState(scope)
