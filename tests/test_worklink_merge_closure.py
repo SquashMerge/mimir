@@ -133,6 +133,7 @@ def forge(issue_id: int, *, body: str | None = None, state: str = "closed", merg
         "html_url": PR_URL,
         "body": body if body is not None else f"Closes chainlink-{issue_id}.\n\nWorklink evidence.",
         "state": state,
+        "draft": False,
         "merged": merged,
         "merged_at": MERGED_AT if merged else None,
         "merge_commit_sha": MERGE_SHA if merged else merge_sha,
@@ -217,7 +218,7 @@ def test_merge_does_not_compare_target_or_evidence_base(
 
 
 @pytest.mark.parametrize("base", ["main", "feature/plugins", "release/next"])
-def test_open_pr_has_no_base_notice_or_tracker_mutation(
+def test_open_pr_has_only_held_pr_notice_and_no_tracker_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str,
 ) -> None:
     home, repo = configured_home(tmp_path, monkeypatch)
@@ -228,7 +229,10 @@ def test_open_pr_has_no_base_notice_or_tracker_mutation(
         gh_runner=forge(2449, state="open", merged=False, base=base),
         git_runner=git_runner(repo),
     ) == []
-    assert unresolved_reasons(home) == []
+    assert unresolved_reasons(home) == ["pr_open"]
+    assert dispatch_failures.pending_merge_reconciliation_notices(
+        dispatch_failure_state_dir(home)
+    ) == []
     assert tracker.status == "open"
     assert not [call for call in tracker.calls if call[1:3] in (
         ["issue", "comment"], ["issue", "close"], ["issue", "unlabel"],
@@ -687,7 +691,7 @@ def test_unrelated_open_issue_is_silently_excluded(
     assert state["merge_reconciliations"]["notices"] == {}
 
 
-def test_open_pr_is_pending_without_notice(
+def test_open_pr_records_facts_and_waits_for_repeated_reconciliation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home, repo = configured_home(tmp_path, monkeypatch)
@@ -701,7 +705,85 @@ def test_open_pr_is_pending_without_notice(
     assert tracker.status == "open"
     assert (home / "state" / "worklink" / "evidence" / "12-1.json").is_file()
     state = load_failure_state(dispatch_failure_state_dir(home))
-    assert not state.get("merge_reconciliations", {}).get("notices")
+    notice = next(iter(state["merge_reconciliations"]["notices"].values()))
+    assert notice["reason"] == "pr_open"
+    assert notice["retriable"] is True
+    assert notice["observations"] == 1
+    assert notice["facts"] == {
+        "pr_url": PR_URL, "pr_state": "open", "pr_draft": False,
+        "pr_head_sha": "a" * 40, "pr_base_ref": "main",
+        "pr_merge_commit_sha": None, "pr_merged_at": None,
+        "issue_lifecycle_labels": ["worklink:review"],
+    }
+    assert dispatch_failures.pending_merge_reconciliation_notices(
+        dispatch_failure_state_dir(home)
+    ) == []
+    for _ in range(dispatch_failures.MERGE_RETRY_PASSES - 1):
+        closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker,
+            gh_runner=forge(12, state="open", merged=False), git_runner=git_runner(repo),
+        )
+    assert [entry["delivery_key"] for entry in
+            dispatch_failures.pending_merge_reconciliation_notices(
+                dispatch_failure_state_dir(home))] == [notice["delivery_key"]]
+
+
+def test_persistent_identity_mismatch_is_terminal_and_deduplicated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 121)
+    tracker = Tracker(121)
+    for _ in range(2):
+        closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker,
+            gh_runner=forge(121, slug="other/project"), git_runner=git_runner(repo),
+        )
+    state_dir = dispatch_failure_state_dir(home)
+    [notice] = dispatch_failures.pending_merge_reconciliation_notices(state_dir)
+    assert notice["reason"] == "repository_identity_mismatch"
+    assert notice["retriable"] is False
+    assert notice["facts"]["pr_state"] == "merged"
+    assert notice["facts"]["pr_merge_commit_sha"] == MERGE_SHA
+    assert notice["facts"]["pr_merged_at"] == MERGED_AT
+    assert notice["facts"]["issue_lifecycle_labels"] == ["worklink:review"]
+    assert dispatch_failures.mark_merge_reconciliation_notified(state_dir, notice["delivery_key"])
+    closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(121, slug="other/project"),
+        git_runner=git_runner(repo),
+    )
+    assert dispatch_failures.pending_merge_reconciliation_notices(state_dir) == []
+
+
+def test_active_attempt_is_silent_and_forge_read_failures_are_held_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 122)
+    tracker = Tracker(122, labels={"worklink:in-progress"})
+    state_dir = dispatch_failure_state_dir(home)
+    closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(122), git_runner=git_runner(repo),
+    )
+    # Main's active-attempt publication ownership suppresses this notice
+    # entirely; only the later forge-read failure is held for retry.
+    assert not load_failure_state(state_dir)["merge_reconciliations"]["notices"]
+    assert dispatch_failures.pending_merge_reconciliation_notices(state_dir) == []
+
+    tracker.labels = {"worklink:review"}
+    def failing_forge(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return cp(1, stderr="temporary forge failure")
+
+    closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=failing_forge, git_runner=git_runner(repo),
+    )
+    notices = load_failure_state(state_dir)["merge_reconciliations"]["notices"].values()
+    [retry] = [item for item in notices if not item["resolved"]]
+    assert retry["reason"] == "reconciliation_read_failed"
+    assert retry["retriable"] is True
+    assert retry["facts"]["pr_url"] == PR_URL
+    assert retry["facts"]["pr_state"] is None
+    assert dispatch_failures.pending_merge_reconciliation_notices(state_dir) == []
 
 
 def test_closed_unmerged_archives_only_completed_unique_evidence(
@@ -737,6 +819,91 @@ def test_invalid_pr_reads_refuse(defect: str) -> None:
     payload[field] = value
     with pytest.raises(closure.ClosureReadError):
         closure.read_pr_snapshot(PR_URL, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)))
+
+
+@pytest.mark.parametrize(("ledger_slug", "forge_slug"), [
+    ("squashmerge/mimir", "SquashMerge/mimir"),
+    ("SquashMerge/mimir", "squashmerge/mimir"),
+])
+def test_pr_snapshot_accepts_only_repo_casing_difference(ledger_slug: str, forge_slug: str) -> None:
+    ledger = f"https://github.com/{ledger_slug}/pull/7"
+    payload = {
+        "number": 7, "html_url": f"https://github.com/{forge_slug}/pull/7",
+        "state": "closed", "merged": True, "merged_at": MERGED_AT,
+        "merge_commit_sha": MERGE_SHA,
+        "base": {"repo": {"full_name": forge_slug}, "ref": "main"},
+    }
+
+    def read() -> closure.PrSnapshot:
+        return closure.read_pr_snapshot(ledger, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)))
+
+    assert read().number == 7  # Replacing the URL comparison with exact equality fails here.
+    for url in (
+        f"https://github.com/{forge_slug}-old/pull/7",
+        f"https://github.com/{forge_slug}/pull/8",
+        f"https://other.example/{forge_slug}/pull/7",
+    ):
+        payload["html_url"] = url
+        with pytest.raises(closure.ClosureReadError, match="identity mismatch"):
+            read()
+    payload["html_url"] = f"https://github.com/{forge_slug}/pull/7"
+    for number in (True, 7.0, 8):
+        payload["number"] = number
+        with pytest.raises(closure.ClosureReadError, match="identity mismatch"):
+            read()
+
+
+@pytest.mark.parametrize(("issue_id", "pr_number"), [(2090, 8), (2091, 7)])
+def test_lowercase_notice_reconciles_canonical_case_merge_without_renotification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, issue_id: int, pr_number: int,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    (home / "worklink.yaml").write_text("repository: squashmerge/mimir\n")
+    (home / "repositories.yaml").write_text(
+        "repositories:\n  - slug: squashmerge/mimir\n"
+        f"    root: {repo}\n    mode: rw\n"
+        "    origin: https://github.com/SquashMerge/mimir.git\n"
+        "    base_branch: main\n"
+    )
+    ledger_url = f"https://github.com/squashmerge/mimir/pull/{pr_number}"
+    evidence(home, issue_id, url=ledger_url)
+    state_dir = dispatch_failure_state_dir(home)
+    notice = dispatch_failures.record_merge_reconciliation_notice(
+        state_dir, issue_id=issue_id, repository="squashmerge/mimir", pr_url=ledger_url,
+        reason="reconciliation_read_failed", detail="PR snapshot identity mismatch",
+    )
+    dispatch_failures.mark_merge_reconciliation_notified(state_dir, notice["delivery_key"])
+    tracker = Tracker(issue_id)
+
+    def gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        assert list(args) == ["gh", "api", f"repos/squashmerge/mimir/pulls/{pr_number}"]
+        payload = {
+            "number": pr_number,
+            "html_url": f"https://github.com/SquashMerge/mimir/pull/{pr_number}",
+            "state": "closed", "merged": True, "merged_at": MERGED_AT,
+            "merge_commit_sha": MERGE_SHA,
+            "base": {"repo": {"full_name": "SquashMerge/mimir"}, "ref": "main"},
+        }
+        return cp(stdout=json.dumps(payload))
+
+    def git(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[-2:] == ["rev-parse", "--show-toplevel"]:
+            return cp(stdout=f"{repo}\n")
+        if list(args)[-3:] == ["remote", "get-url", "origin"]:
+            return cp(stdout="https://github.com/SquashMerge/mimir.git\n")
+        return cp(1)
+
+    assert [outcome.issue_id for outcome in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git,
+    )] == [issue_id]
+    assert tracker.status == "closed"
+    assert unresolved_reasons(home) == []
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git,
+    ) == []
+    notices = load_failure_state(state_dir)["merge_reconciliations"]["notices"]
+    assert list(notices) == [notice["delivery_key"]]
+    assert notices[notice["delivery_key"]]["notified"] is True
 
 
 def test_unmerged_pr_with_merged_at_refuses() -> None:
@@ -1101,6 +1268,93 @@ def test_associated_non_review_candidate_is_visible_but_unrelated_is_not(
     assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
         "review_lifecycle_required"
     ]
+
+
+def test_in_progress_unpublished_association_has_no_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2092, url=None, status="failed")
+    tracker = Tracker(2092, labels={"worklink:in-progress"})
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=lambda args: pytest.fail("unpublished PR must not be read"),
+        git_runner=git_runner(repo),
+    ) == []
+    assert not load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    assert tracker.status == "open"
+
+
+def test_in_progress_published_pr_waits_for_review_then_reconciles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2096)
+    tracker = Tracker(2096, labels={"worklink:in-progress"})
+    state_dir = dispatch_failure_state_dir(home)
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=lambda args: pytest.fail("active attempt owns PR publication"),
+        git_runner=git_runner(repo),
+    ) == []
+    assert not load_failure_state(state_dir)["merge_reconciliations"]["notices"]
+    tracker.labels = {"worklink:review"}
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=forge(2096, state="open", merged=False), git_runner=git_runner(repo),
+    ) == []
+    [notice] = load_failure_state(state_dir)["merge_reconciliations"]["notices"].values()
+    assert notice["reason"] == "pr_open"
+    assert notice["retriable"] is True
+    assert notice["facts"]["pr_state"] == "open"
+    assert notice["facts"]["issue_lifecycle_labels"] == ["worklink:review"]
+    assert dispatch_failures.pending_merge_reconciliation_notices(state_dir) == []
+    assert [outcome.issue_id for outcome in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2096), git_runner=git_runner(repo),
+    )] == [2096]
+    assert load_failure_state(state_dir)["merge_reconciliations"]["notices"][notice["delivery_key"]]["resolved"] is True
+    assert dispatch_failures.pending_merge_reconciliation_notices(state_dir) == []
+
+
+def test_non_progress_merged_pr_without_review_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2097)
+    tracker = Tracker(2097, labels={"triage"})
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2097), git_runner=git_runner(repo),
+    ) == []
+    assert unresolved_reasons(home) == ["review_lifecycle_required"]
+    assert tracker.status == "open"
+
+
+@pytest.mark.parametrize("already_notified", [False, True])
+def test_prepublication_notice_resolves_at_review_without_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_notified: bool,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    tracker = Tracker(2092, labels={"worklink:in-progress"})
+    state_dir = dispatch_failure_state_dir(home)
+    old = dispatch_failures.record_merge_reconciliation_notice(
+        state_dir, issue_id=2092, repository="example/project", pr_url=None,
+        reason="review_lifecycle_required", detail="publication pending",
+    )
+    if already_notified:
+        assert dispatch_failures.mark_merge_reconciliation_notified(state_dir, old["delivery_key"])
+    evidence(home, 2092)
+    tracker.labels = {"worklink:review"}
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=forge(2092, state="open", merged=False), git_runner=git_runner(repo),
+    ) == []
+    notices = load_failure_state(state_dir)["merge_reconciliations"]["notices"]
+    assert notices[old["delivery_key"]]["resolved"] is True
+    assert notices[old["delivery_key"]]["notified"] is already_notified
+    assert dispatch_failures.pending_merge_reconciliation_notices(state_dir) == []
 
 
 @pytest.mark.parametrize("config", ["repositories", "worklink"])

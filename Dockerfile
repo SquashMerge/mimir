@@ -261,7 +261,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 #
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN set -eu; case ",${MIMIR_EXTRAS}," in *,local-embeddings,*) \
-        pip install --no-cache-dir 'torch==2.14.1+cpu' --extra-index-url https://download.pytorch.org/whl/cpu ;; \
+        pip install --no-cache-dir 'torch==2.15.0+cpu' --extra-index-url https://download.pytorch.org/whl/cpu ;; \
     esac
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"

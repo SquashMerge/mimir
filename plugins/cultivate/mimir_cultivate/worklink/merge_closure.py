@@ -17,6 +17,7 @@ from typing import Callable, Sequence
 import yaml
 
 from mimir.redaction import redact_text
+from mimir.github_identity import same_github_pr_url, same_github_repo
 from ..repository import RepositoryConfig, RepositoryInventory
 from ..tracker.lifecycle import request_merge_closure
 from .backends.registry import WorklinkConfig
@@ -76,6 +77,7 @@ class PrSnapshot:
     base_slug: str
     base_ref: str
     head_sha: str | None = None
+    draft: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -191,7 +193,7 @@ def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryCo
     )
     if origin.returncode != 0 or origin.stdout.strip() != repository.origin:
         raise ClosureReadError("repository trust unavailable: local origin differs from inventory")
-    if _origin_slug(repository.origin) != repository.slug:
+    if not same_github_repo(_origin_slug(repository.origin), repository.slug):
         raise ClosureReadError("repository trust unavailable: origin identity differs from inventory")
     from dataclasses import replace
     return replace(repository, root=selected_root)
@@ -282,7 +284,7 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
     if (
         type(payload_number) is not int
         or payload_number != number
-        or payload.get("html_url") != canonical_url
+        or not same_github_pr_url(payload.get("html_url"), canonical_url)
     ):
         raise ClosureReadError("PR snapshot identity mismatch")
     # The PR body is display-only; even a null/missing body must not veto a
@@ -317,6 +319,7 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
         merge_sha.lower() if isinstance(merge_sha, str) else None,
         base_slug.lower(), base_ref,
         (payload.get("head") or {}).get("sha") if isinstance(payload.get("head"), dict) else None,
+        payload.get("draft") if type(payload.get("draft")) is bool else None,
     )
 
 
@@ -491,7 +494,7 @@ def _request_epic_closure(
         if association.reason or association.pr_url is None:
             return
         pr = read_pr_snapshot(association.pr_url, gh_bin=gh_bin, runner=gh_runner)
-        if pr.merged and pr.slug == repository.slug and pr.base_slug == repository.slug:
+        if pr.merged and same_github_repo(pr.slug, repository.slug) and same_github_repo(pr.base_slug, repository.slug):
             _queue_tracker_closure(home, issue, pr.url)
     except Exception as exc:
         _LOGGER.warning("tracker_closure_request_failed %s", type(exc).__name__)
@@ -500,10 +503,31 @@ def _request_epic_closure(
 def _notice(
     state_dir: Path, *, issue_id: int | None, repository: str | None,
     pr_url: str | None, reason: str, detail: str,
+    issue: IssueSnapshot | None = None, pr: PrSnapshot | None = None,
 ) -> None:
+    retriable = (reason == "pr_open" or
+                 (reason == "review_lifecycle_required" or
+                  reason.startswith("competing_lifecycle_label:"))
+                 and issue is not None and "worklink:in-progress" in issue.labels or
+                 (reason in {"reconciliation_read_failed", "intent_revalidation_failed",
+                             "pre_close_revalidation_failed", "close_recovery_read_failed"}
+                  and detail.startswith("PR https://github.com/") and " failed:" in detail))
     record_merge_reconciliation_notice(
-        state_dir, issue_id=issue_id, repository=repository, pr_url=pr_url,
-        reason=reason, detail=detail,
+        state_dir, issue_id=issue_id, repository=repository,
+        pr_url=pr.url if pr is not None else pr_url,
+        reason=reason, detail=detail, retriable=retriable,
+        facts={
+            "pr_url": pr.url if pr is not None else pr_url,
+            "pr_state": ("merged" if pr.merged else pr.state) if pr is not None else None,
+            "pr_draft": pr.draft if pr is not None else None,
+            "pr_head_sha": pr.head_sha if pr is not None else None,
+            "pr_base_ref": pr.base_ref if pr is not None else None,
+            "pr_merge_commit_sha": pr.merge_commit_sha if pr is not None and pr.merged else None,
+            "pr_merged_at": pr.merged_at if pr is not None else None,
+            "issue_lifecycle_labels": (sorted(label for label in issue.labels
+                                               if label.startswith("worklink:"))
+                                       if issue is not None else None),
+        },
     )
 
 
@@ -520,9 +544,9 @@ def _validate_qualification(
         return reason
     if association.reason and not ci_merged:
         return association.reason
-    if (association.pr_url if not ci_merged else association.ci_handoff_url) != pr.url:
+    if not same_github_pr_url(association.pr_url if not ci_merged else association.ci_handoff_url, pr.url):
         return "association_changed"
-    if pr.slug != repository.slug or pr.base_slug != repository.slug:
+    if not same_github_repo(pr.slug, repository.slug) or not same_github_repo(pr.base_slug, repository.slug):
         return "repository_identity_mismatch"
     if not pr.merged:
         return "pr_open" if pr.state == "open" else "pr_closed_unmerged"
@@ -568,7 +592,12 @@ def _persist_intent(state_dir: Path, key: str, identity: dict[str, object]) -> d
         existing = intents.get(key)
         if existing is None:
             intents[key] = {**identity, "stage": "discovered", "result_finalized": False}
-        elif any(existing.get(field) != value for field, value in identity.items()):
+        elif any(
+            not (same_github_repo(existing.get(field), value) if field == "repository" else
+                 same_github_pr_url(existing.get(field), value) if field == "pr_url" else
+                 existing.get(field) == value)
+            for field, value in identity.items()
+        ):
             raise ClosureReadError("persisted merge identity changed")
         return dict(intents[key])
 
@@ -593,10 +622,15 @@ def _run_tracker(runner: Runner, *args: str) -> subprocess.CompletedProcess[str]
 def _revalidate(
     home: Path, issue_id: int, pr_url: str, *, repository: RepositoryConfig,
     gh_bin: str, chainlink_runner: Runner, gh_runner: Runner,
+    observed: dict[str, IssueSnapshot | PrSnapshot] | None = None,
 ) -> tuple[IssueSnapshot, PrSnapshot, AssociationDecision]:
     issue = _read_issue(issue_id, chainlink_runner)
+    if observed is not None:
+        observed["issue"] = issue
     association = discover_associations(home, issue)
     pr = read_pr_snapshot(pr_url, gh_bin=gh_bin, runner=gh_runner)
+    if observed is not None:
+        observed["pr"] = pr
     reason = _validate_qualification(
         issue=issue, pr=pr, repository=repository, association=association,
     )
@@ -615,6 +649,9 @@ def _process_intent(
     pr_url = str(entry["pr_url"])
     audit = str(entry["audit_text"])
     stage = str(entry["stage"])
+    issue: IssueSnapshot | None = None
+    pr: PrSnapshot | None = None
+    observed: dict[str, IssueSnapshot | PrSnapshot] = {}
     if entry.get("result_finalized"):
         return None
     try:
@@ -628,9 +665,11 @@ def _process_intent(
     try:
         issue, pr, association = _revalidate(
             home, issue_id, pr_url, repository=repository, gh_bin=gh_bin,
-            chainlink_runner=chainlink_runner, gh_runner=gh_runner,
+            chainlink_runner=chainlink_runner, gh_runner=gh_runner, observed=observed,
         )
     except ClosureReadError as exc:
+        issue = observed.get("issue") if isinstance(observed.get("issue"), IssueSnapshot) else None
+        pr = observed.get("pr") if isinstance(observed.get("pr"), PrSnapshot) else None
         # A verified close is allowed to proceed to cleanup despite the normal
         # open-review lifecycle no longer applying.
         recovering_verified_close = stage in {"close_started", "closed_verified", "cleanup_pending"} or (
@@ -639,7 +678,7 @@ def _process_intent(
         if not recovering_verified_close:
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
-                reason="intent_revalidation_failed", detail=str(exc),
+                reason="intent_revalidation_failed", detail=str(exc), issue=issue, pr=pr,
             )
             return None
         try:
@@ -652,7 +691,7 @@ def _process_intent(
             # whole sweep, leaving no durable record of why.
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
-                reason="close_recovery_read_failed", detail=str(recovery_exc),
+                reason="close_recovery_read_failed", detail=str(recovery_exc), issue=issue, pr=pr,
             )
             return None
     persisted_identity = {
@@ -663,10 +702,16 @@ def _process_intent(
         "merged_at": pr.merged_at,
         "source_digests": list(association.evidence_digests),
     }
-    if any(entry.get(field) != value for field, value in persisted_identity.items()):
+    if any(
+        not (same_github_repo(entry.get(field), value) if field == "repository" else
+             same_github_pr_url(entry.get(field), value) if field == "pr_url" else
+             entry.get(field) == value)
+        for field, value in persisted_identity.items()
+    ):
         _notice(
             state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
             reason="merge_identity_changed", detail="persisted merge or source identity changed",
+            issue=issue, pr=pr,
         )
         return None
     if stage == "audit_started":
@@ -675,6 +720,7 @@ def _process_intent(
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="audit_outcome_uncertain", detail="audit submission began but exact marker is absent",
+                issue=issue, pr=pr,
             )
             return None
         entry = _update_intent(state_dir, key, stage="audit_confirmed")
@@ -689,6 +735,7 @@ def _process_intent(
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="audit_outcome_uncertain", detail="audit submission outcome could not be read",
+                issue=issue, pr=pr,
             )
             return None
         if audit not in issue.comments:
@@ -696,6 +743,7 @@ def _process_intent(
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="audit_outcome_uncertain", detail="exact audit marker was not observed after submission",
+                issue=issue, pr=pr,
             )
             return None
         _update_intent(state_dir, key, stage="audit_confirmed")
@@ -715,18 +763,21 @@ def _process_intent(
         try:
             issue, pr, _ = _revalidate(
                 home, issue_id, pr_url, repository=repository, gh_bin=gh_bin,
-                chainlink_runner=chainlink_runner, gh_runner=gh_runner,
+                chainlink_runner=chainlink_runner, gh_runner=gh_runner, observed=observed,
             )
         except ClosureReadError as exc:
+            issue = observed.get("issue") if isinstance(observed.get("issue"), IssueSnapshot) else issue
+            pr = observed.get("pr") if isinstance(observed.get("pr"), PrSnapshot) else pr
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
-                reason="pre_close_revalidation_failed", detail=str(exc),
+                reason="pre_close_revalidation_failed", detail=str(exc), issue=issue, pr=pr,
             )
             return None
         if audit not in issue.comments:
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="audit_marker_missing", detail="confirmed audit marker is no longer present",
+                issue=issue, pr=pr,
             )
             return None
         _update_intent(state_dir, key, stage="close_started")
@@ -738,6 +789,7 @@ def _process_intent(
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="close_outcome_uncertain", detail="close submission outcome could not be read",
+                issue=issue, pr=pr,
             )
             return None
         if issue.is_open or audit not in issue.comments:
@@ -746,6 +798,7 @@ def _process_intent(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="close_outcome_uncertain",
                 detail="closed state with the exact audit marker was not observed; no replay",
+                issue=issue, pr=pr,
             )
             return None
         _update_intent(state_dir, key, stage="closed_verified")
@@ -756,6 +809,7 @@ def _process_intent(
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="close_outcome_uncertain", detail="close began without positive closed audit evidence",
+                issue=issue, pr=pr,
             )
             return None
         _update_intent(state_dir, key, stage="closed_verified")
@@ -766,13 +820,14 @@ def _process_intent(
         except ClosureReadError as cleanup_exc:
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
-                reason="cleanup_read_failed", detail=str(cleanup_exc),
+                reason="cleanup_read_failed", detail=str(cleanup_exc), issue=issue, pr=pr,
             )
             return None
         if issue.is_open:
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                 reason="cleanup_refused_reopened", detail="verified-closed issue was reopened; review label retained",
+                issue=issue, pr=pr,
             )
             return None
         cleanup_label = ("worklink:review" if "worklink:review" in issue.labels else
@@ -784,7 +839,7 @@ def _process_intent(
             if result.returncode != 0:
                 _notice(
                     state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
-                    reason="cleanup_failed", detail="review label removal failed",
+                    reason="cleanup_failed", detail="review label removal failed", issue=issue, pr=pr,
                 )
                 return None
             try:
@@ -792,13 +847,14 @@ def _process_intent(
             except ClosureReadError as verify_exc:
                 _notice(
                     state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
-                    reason="cleanup_read_failed", detail=str(verify_exc),
+                    reason="cleanup_read_failed", detail=str(verify_exc), issue=issue, pr=pr,
                 )
                 return None
             if issue.is_open or cleanup_label in issue.labels:
                 _notice(
                     state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                     reason="cleanup_verification_failed", detail="review label absence was not verified",
+                    issue=issue, pr=pr,
                 )
                 return None
         if captured_incident is not None:
@@ -878,6 +934,8 @@ def reconcile_merged_leaves(
         }
         for issue_id in sorted(issue_ids):
             association: AssociationDecision | None = None
+            issue: IssueSnapshot | None = None
+            pr: PrSnapshot | None = None
             if intent_key := pending_by_issue.get(issue_id):
                 outcome = _process_intent(
                     home, state_dir, intent_key, repository=repository, gh_bin=gh_bin,
@@ -892,6 +950,17 @@ def reconcile_merged_leaves(
                     association = discover_associations(home, issue)
                     ci_candidate = (association.ci_handoff_head is not None and
                                     bool(issue.labels & {"worklink:blocked", "worklink:in-progress"}))
+                    # The active attempt owns publication and the transition to
+                    # review. Only an attested merged CI handoff may bypass it.
+                    if issue.is_open and "worklink:in-progress" in issue.labels:
+                        if not ci_candidate:
+                            continue
+                        assert association.ci_handoff_url is not None
+                        ci_pr = read_pr_snapshot(
+                            association.ci_handoff_url, gh_bin=gh_bin, runner=gh_runner,
+                        )
+                        if not ci_pr.merged:
+                            continue
                     if association.pr_url is None and not ci_candidate and association.reason == "missing_pr_association":
                         if not dry_run:
                             resolve_merge_reconciliation_notices(
@@ -924,8 +993,10 @@ def reconcile_merged_leaves(
                 )
                 if reason == "pr_open":
                     if not dry_run:
-                        resolve_merge_reconciliation_notices(
-                            state_dir, issue_id=issue_id, pr_url=pr.url,
+                        _notice(
+                            state_dir, issue_id=issue_id, repository=repository.slug,
+                            pr_url=pr.url, reason=reason, detail="PR is still open",
+                            issue=issue, pr=pr,
                         )
                     continue
                 if reason == "pr_closed_unmerged":
@@ -977,7 +1048,7 @@ def reconcile_merged_leaves(
                     _notice(
                         state_dir, issue_id=issue_id, repository=repository.slug,
                         pr_url=association.pr_url if association is not None else None,
-                        reason=reason, detail=detail,
+                        reason=reason, detail=detail, issue=issue, pr=pr,
                     )
         return outcomes
 

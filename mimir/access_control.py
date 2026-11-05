@@ -21,6 +21,7 @@ New in chainlink #866:
 from __future__ import annotations
 
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -9322,11 +9323,20 @@ class ScopedPRGrants:
             self._pending[key] = token
             return token
 
-    def observe_checkout(self, owner: str, scope: Any, lease: Any, token: object) -> bool:
+    def observe_checkout(
+        self, owner: str, scope: Any, lease: Any, token: object,
+        *, diagnostics: list[str] | None = None,
+    ) -> bool:
         with self._lock:
             key = (owner, scope.scope_id)
             protocol = self._protocols.get(owner)
             if token is None or protocol is None or self._pending.get(key) is not token:
+                if diagnostics is not None:
+                    diagnostics.append(
+                        "checkout token absent" if token is None else
+                        "checkout protocol absent" if protocol is None else
+                        "pending checkout token differs from consumed token"
+                    )
                 return False
             del self._pending[key]
             self._follow[key] = {
@@ -9416,13 +9426,33 @@ def consume_scoped_pr_checkout(auth_context: AuthContext, scope: Any, owner: str
 
 def observe_scoped_pr_checkout(
     auth_context: AuthContext, scope: Any, state: Any, token: object,
-    owner: str, protocol: Any,
+    owner: str, protocol: Any, *, diagnostics: list[str] | None = None,
 ) -> bool:
     grants = getattr(auth_context, "scoped_pr_grants", None)
-    lease = protocol.live_lease(scope, state) if protocol is not None and protocol.live_lease is not None else None
-    if not isinstance(grants, ScopedPRGrants) or lease is None:
+    if not isinstance(grants, ScopedPRGrants):
+        if diagnostics is not None:
+            diagnostics.append("scoped PR grants absent")
         return False
-    return grants.observe_checkout(owner, scope, lease, token)
+    if protocol is None or protocol.live_lease is None:
+        if diagnostics is not None:
+            diagnostics.append("checkout protocol absent")
+        return False
+    live_lease = protocol.live_lease
+    # Diagnostics are optional on third-party protocols. Pass them into the
+    # *first* lease check when supported; a subsequent probe can see a different
+    # filesystem/Git state and conceal the original refusal.
+    try:
+        accepts_diagnostics = "diagnostics" in inspect.signature(live_lease).parameters
+    except (TypeError, ValueError):
+        accepts_diagnostics = False
+    lease = (live_lease(scope, state, diagnostics=diagnostics)
+             if diagnostics is not None and accepts_diagnostics
+             else live_lease(scope, state))
+    if lease is None:
+        if diagnostics is not None:
+            diagnostics.insert(0, "live lease returned None")
+        return False
+    return grants.observe_checkout(owner, scope, lease, token, diagnostics=diagnostics)
 
 
 def resolve_registered_review_state(
@@ -10105,6 +10135,7 @@ class ToolRegistry:
         repo_pr_action_scope = None
         repo_review_state = None
         repo_review_state_refusal = None
+        state = None
         issue_target = None
         if auth_context is not None:
             if (
@@ -10187,7 +10218,9 @@ class ToolRegistry:
                     sink_target = target_channel = requested_target = destination
                 repo_pr_action_scope = issue_target
             elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS or (
-                plugin_tool is not None and plugin_tool.resource_scope == "repo_pr"
+                plugin_tool is not None and (
+                    plugin_tool.resource_scope == "repo_pr" or tool_name == "unsupported_operation"
+                )
             ):
                 tool_arguments = arguments or {}
                 plugin_repo_target = (
@@ -10459,6 +10492,23 @@ class ToolRegistry:
             if plugin_tool is not None:
                 scope_kind = plugin_tool.resource_scope
                 if scope_kind == "channel":
+                    if (tool_name == "unsupported_operation" and state is not None
+                            and repo_pr_action_scope is not None
+                            and (protocol := policy.scoped_actions.get(plugin_tool.owner)) is not None
+                            and type(plugin_tool.typed_action) is protocol.action_type
+                            and _valid_scoped_pr_grant(
+                                auth_context, plugin_tool.owner, plugin_tool.typed_action,
+                                protocol, repo_pr_action_scope, state, tool_name=tool_name,
+                            )):
+                        return finish(authorize_repo_pr_tool(
+                            tool_name, repo_pr_action_scope,
+                            service_principal=service_principal, enforce=enforce,
+                            flow_direction=flow_direction,
+                            required_actions=(plugin_tool.typed_action.value,),
+                            registered_plugin=True, auth_context=auth_context,
+                            owner=plugin_tool.owner, action=plugin_tool.typed_action,
+                            protocol=protocol, review_state=state,
+                        ))
                     if plugin_channel_valid:
                         channel_auth = ChannelResourceAdapter.authorize_channel_operation(
                             tool_name, plugin_channel_target, auth_context, enforce=enforce,
@@ -11437,9 +11487,15 @@ def protected_result_source(
             active_pr_checkout_lease_for_path = lambda _path: None
 
         lease = active_pr_checkout_lease_for_path(resource_id)
+        # Repository tools prefer the turn-local server-discovered state over
+        # the original event registry (which may hold an older checkout).
+        # File reads must resolve the very same lease before attesting it.
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        review_state = discovered.resolve_checkout_path(resource_id) if discovered is not None else None
         registry = getattr(auth_context, "repo_pr_scope_registry", None)
-        if registry is not None:
+        if review_state is None and registry is not None:
             review_state = registry.resolve_checkout_path(resource_id)
+        if review_state is not None or registry is not None:
             scope = getattr(review_state, "action_scope", None)
         else:
             scope = getattr(auth_context, "repo_pr_action_scope", None)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
@@ -59,14 +60,33 @@ class PollerHookProfile:
 
 def _github_recovery(poller: "PollerConfig") -> "RelevanceFn":
     token = poller.env.get("GITHUB_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
-    return github_recovery_relevance_check(token)
+    login = poller.env.get("MIMIR_GITHUB_SELF_LOGIN", "") or os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "")
+    return github_recovery_relevance_check(token, login)
 
 
-def github_recovery_relevance_check(token: str) -> "RelevanceFn":
+def github_recovery_relevance_check(token: str, self_login: str = "") -> "RelevanceFn":
     """Compatibility entry point for the GitHub skill's recovery hook."""
     from . import pollers
 
     cache: dict[tuple[str, int], bool | None] = {}
+    reviews_cache: dict[tuple[str, int], list | None] = {}
+
+    def submitted_after(review: dict, head: str, reviewer: str, activity: str) -> bool:
+        if not isinstance(review.get("user"), dict):
+            return False
+        if review["user"].get("login", "").casefold() != reviewer.casefold():
+            return False
+        if review.get("commit_id") != head or review.get("state") not in {
+            "APPROVED", "CHANGES_REQUESTED", "COMMENTED",
+        }:
+            return False
+        try:
+            submitted = datetime.fromisoformat(review["submitted_at"].replace("Z", "+00:00"))
+            event_at = datetime.fromisoformat(activity.replace("Z", "+00:00"))
+            return (submitted.tzinfo is not None and event_at.tzinfo is not None
+                    and submitted.astimezone(timezone.utc) > event_at.astimezone(timezone.utc))
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return False
 
     async def check(event: AgentEvent) -> bool | None:
         items = event.extra.get("items") if isinstance(event.extra, dict) else None
@@ -114,6 +134,32 @@ def github_recovery_relevance_check(token: str) -> "RelevanceFn":
                     cache[key] = attestation[1]["state"] == "open"
             verdict = cache[key]
             if verdict is True:
+                review_event = event_type in {
+                    "pr_review_requested", "pr_synchronize", "pr_checks_completed",
+                } and item.get("followup_action") != "operator_comment"
+                head = item.get("head_sha") or item.get("new_head")
+                reviewer = item.get("requested_reviewer") or self_login
+                extra = event.extra if isinstance(event.extra, dict) else {}
+                activity = item.get("review_request_at") or extra.get("recovery_event_at")
+                if (review_event and isinstance(head, str) and head
+                        and isinstance(reviewer, str) and reviewer
+                        and isinstance(activity, str) and activity):
+                    if key not in reviews_cache:
+                        escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
+                        result = await run_in_pool(
+                            pollers._ATTESTATION_POOL, pollers._github_api_attestation,
+                            f"repos/{escaped_repo}/pulls/{number}/reviews?per_page=100", token,
+                        )
+                        reviews_cache[key] = result[1] if (
+                            result is not None and result[0] == 200
+                            and isinstance(result[1], list)
+                        ) else None
+                    reviews = reviews_cache[key]
+                    if isinstance(reviews, list) and any(
+                        isinstance(review, dict) and submitted_after(review, head, reviewer, activity)
+                        for review in reviews
+                    ):
+                        continue
                 return True
             if verdict is None:
                 saw_unknown = True

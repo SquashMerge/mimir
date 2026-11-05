@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -34,7 +35,7 @@ from mimir.tool_descriptors import ResultOriginKind
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir_cultivate.policy import (
     RepoPRAction, RepoPRScopeRegistry, RepoReviewState, ServerDiscoveredPRStates,
-    register_action_protocol, validate_scoped_pr_action,
+    _live_scoped_pr_lease, register_action_protocol, validate_scoped_pr_action,
 )
 from tests.test_pr_checkout_lease import _repo_and_scope
 from tests.test_access_control import _github_scope_test_setup
@@ -88,7 +89,7 @@ def _auth(policy, state, enforce, *, discovered=False):
     )
 
 
-def _remediation_turn(tmp_path, monkeypatch):
+def _remediation_turn(tmp_path, monkeypatch, *, discovered=False):
     from mimir import access_control
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import policy_scope
@@ -101,7 +102,7 @@ def _remediation_turn(tmp_path, monkeypatch):
     policy = load_plugins(enable="cultivate").policy
     labels = InformationFlowLabels()
     auth = replace(
-        _auth(policy, state, True),
+        _auth(policy, state, True, discovered=discovered),
         ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
         _plugin_slot_policy=policy,
     )
@@ -275,17 +276,73 @@ def test_unsupported_escalation_preserves_trusted_turn_for_pr_comment(tmp_path, 
     ).reason != "write_blocked_by_untrusted_ingest"
 
 
+@pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
+def test_unsupported_operation_allows_remediation_writes(tmp_path, monkeypatch, discovered):
+    from mimir import event_logger
+    from mimir.access_control import classify_protected_result
+    from mimir.plugins.core import policy_scope
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, discovered=discovered)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(event_logger, "log_durable_event_sync", lambda *_args, **_kw: None)
+    with policy_scope(auth._plugin_slot_policy):
+        escalation_auth = ToolRegistry().authorize_tool(
+            "unsupported_operation", auth,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            enforce=True, policy=auth._plugin_slot_policy,
+        )
+    assert escalation_auth.allowed and not escalation_auth.would_block
+    assert escalation_auth.repo_pr_action_scope is scope
+    # The former channel route shadows this PR destination in a poller turn.
+    # It can execute outside enforcement, but its would_block decision must not
+    # exempt a result from the protected-source classifier.
+    with policy_scope(auth._plugin_slot_policy):
+        shadow = ToolRegistry().authorize_tool(
+            "unsupported_operation", replace(auth, scoped_pr_grants=None),
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            enforce=False, policy=auth._plugin_slot_policy,
+        )
+    assert shadow.allowed and shadow.would_block and shadow.reason == "cross_channel_scope"
+    status = {"status": "unsupported_operation", "escalated": True,
+              "repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    with policy_scope(auth._plugin_slot_policy):
+        shadow_labels = classify_protected_result(
+            "unsupported_operation", {"repository": scope.canonical_repo,
+                                      "pull_request": scope.pr_number}, auth, shadow, result=status,
+        )
+    assert shadow_labels is not None and shadow_labels.has_untrusted_active_ingest
+    escalated = invoke(
+        "unsupported_operation", description="Need unsupported test flags",
+        attempted_operations=["repo_test lacks this flag"],
+    )
+    assert escalated.status == "success", escalated.content
+    assert json.loads(escalated.content)["status"] == "unsupported_operation"
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    _commit_remediation(state, invoke, "verified fix")
+    with policy_scope(auth._plugin_slot_policy):
+        comment = ToolRegistry().authorize_tool(
+            "pr_comment", auth,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                       "body": "Verified fix"}, enforce=True, policy=auth._plugin_slot_policy,
+        )
+    assert comment.allowed, comment.reason
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+
+
 @pytest.mark.parametrize("invalid", [
     "extra_content", "failed", "wrong_pr", "untrusted_provenance", "other_owner",
     "result_repository", "result_pr", "result_status", "disallowed", "would_block",
+    "missing_field", "wrong_decision", "error_message", "malformed_message",
+    "wrong_scope", "wrong_repository", "wrong_origin", "wrong_sink", "wrong_scope_kind",
 ])
-def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypatch, invalid):
+@pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
+def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypatch, invalid, discovered):
     from mimir.access_control import (
         ProtectedResultProvenance, ToolAuthorization, classify_protected_result,
     )
     from mimir.plugins.core import policy_scope
 
-    _, scope, _, auth, _ = _remediation_turn(tmp_path, monkeypatch)
+    _, scope, _, auth, _ = _remediation_turn(tmp_path, monkeypatch, discovered=discovered)
     arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
     result = {"status": "unsupported_operation", "escalated": True,
               "repository": scope.canonical_repo, "pull_request": scope.pr_number}
@@ -296,14 +353,25 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
         tool_name="unsupported_operation", decision="resource_scoped", allowed=True,
         repo_pr_action_scope=scope, policy=policy,
     )
-    if invalid == "other_owner":
+    if invalid in {"other_owner", "wrong_origin", "wrong_sink", "wrong_scope_kind"}:
         # Copy the selected registry: never mutate the shared plugin policy.
         from copy import copy
         policy = copy(policy)
         policy._tools = dict(policy.tools)
-        policy._tools["unsupported_operation"] = replace(
-            policy.tools["unsupported_operation"], owner="other_plugin",
-        )
+        registered = policy.tools["unsupported_operation"]
+        if invalid == "other_owner":
+            registered = replace(registered, owner="other_plugin")
+        elif invalid == "wrong_scope_kind":
+            registered = replace(registered, resource_scope="repo_pr")
+        elif invalid == "wrong_origin":
+            registered = replace(registered, descriptor=replace(
+                registered.descriptor, result_origin=ResultOriginKind.REPOSITORY,
+            ))
+        else:
+            registered = replace(registered, descriptor=replace(
+                registered.descriptor, sink_destination="another_destination",
+            ))
+        policy._tools["unsupported_operation"] = registered
         authorization = replace(authorization, policy=policy)
     elif invalid == "result_repository":
         result["repository"] = "other/repo"
@@ -315,8 +383,20 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
         authorization = replace(authorization, allowed=False)
     elif invalid == "would_block":
         authorization = replace(authorization, would_block=True)
+    elif invalid == "wrong_decision":
+        authorization = replace(authorization, decision="admin_required")
+    elif invalid == "wrong_scope":
+        authorization = replace(authorization, repo_pr_action_scope=replace(scope, observed_head_sha="f" * 40))
+    elif invalid == "wrong_repository":
+        arguments["repository"] = "another/repository"
     elif invalid == "extra_content":
         result["description"] = "externally sourced text"
+    elif invalid == "missing_field":
+        result.pop("escalated")
+    elif invalid == "error_message":
+        result = ToolMessage(content=json.dumps(result), tool_call_id="unsupported_operation", status="error")
+    elif invalid == "malformed_message":
+        result = ToolMessage(content="not a status", tool_call_id="unsupported_operation")
     elif invalid == "failed":
         failed = True
     elif invalid == "wrong_pr":
@@ -334,6 +414,20 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
         )
     assert labels is not None
     assert labels.has_untrusted_active_ingest
+    assert any(source.resource_id == "<unresolved-resource:protected_tool:unsupported_operation>"
+               for source in labels.sources)
+    auth.ifc_state.merge(labels)
+    with policy_scope(policy):
+        for name, extras in (
+            ("repo_commit", {"paths": ("tracked.txt",), "message": "verified fix"}),
+            ("pr_comment", {"body": "Verified fix"}),
+        ):
+            decision = ToolRegistry().authorize_tool(
+                name, auth,
+                arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                           **extras}, enforce=True, policy=policy,
+            )
+            assert not decision.allowed, (name, decision)
 
 
 @pytest.mark.parametrize("invalid", [
@@ -574,6 +668,304 @@ def test_checkout_action_follow_on_is_bound_to_designated_tool_and_live_lease(
         auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
         tool_name="scoped_fetch",
     )
+
+
+def test_checkout_observation_refuses_symlinked_configured_root(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        assert _live_scoped_pr_lease(scope, state) is lease
+        alias = tmp_path / "lease-root-alias"
+        alias.symlink_to(root, target_is_directory=True)
+        assert alias.resolve(strict=True) == root.resolve(strict=True)
+        monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(alias))
+        reasons = []
+        assert _live_scoped_pr_lease(scope, state, diagnostics=reasons) is None
+        assert reasons == ["configured lease root is relative or a symlink"]
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        ), diagnostics
+        assert diagnostics == ["live lease returned None", "configured lease root is relative or a symlink"]
+        assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
+        # Refusal must not consume the token or invalidate the real checkout.
+        monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+        diagnostics = []
+        assert observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        ), diagnostics
+        assert diagnostics == []
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_refuses_symlink_escape_from_lease_root(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        outside = tmp_path / "outside"
+        shutil.copytree(lease.path, outside / lease.path.name)
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+        escaped_path = root / "escape" / lease.path.name
+        metadata = escaped_path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text(encoding="utf-8"))
+        raw["path"] = str(escaped_path)
+        metadata.write_text(json.dumps(raw), encoding="utf-8")
+        state.attach_checkout_lease(replace(lease, path=escaped_path))
+        diagnostics = []
+        assert _live_scoped_pr_lease(scope, state, diagnostics=diagnostics) is None
+        assert diagnostics == ["checkout leaf is a symlink or resolves outside configured lease root"]
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+        )
+        assert ("cultivate", scope.scope_id) in auth.scoped_pr_grants._pending
+    finally:
+        lease.revoke()
+
+
+@pytest.mark.parametrize("invalid", ["attached_root", "metadata_path", "metadata_root", "metadata_relative"])
+def test_checkout_observation_refuses_different_root_or_metadata_path(
+    policy, tmp_path, monkeypatch, invalid,
+):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        if invalid == "attached_root":
+            state.attach_checkout_lease(replace(lease, lease_root=other))
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text(encoding="utf-8"))
+        if invalid == "metadata_relative":
+            monkeypatch.chdir(root)
+            raw["path"] = lease.path.name
+        else:
+            raw["path" if invalid == "metadata_path" else "lease_root"] = str(other)
+        metadata.write_text(json.dumps(raw), encoding="utf-8")
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        reasons = []
+        assert _live_scoped_pr_lease(scope, state, diagnostics=reasons) is None
+        assert reasons == [
+            "attached lease root differs from configured lease root" if invalid == "attached_root"
+            else "lease metadata path or root differs from attached lease"
+        ]
+        assert diagnostics == ["live lease returned None", *reasons]
+        assert ("cultivate", scope.scope_id) in auth.scoped_pr_grants._pending
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_reports_wrong_pending_token(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, object(), "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        assert diagnostics == ["pending checkout token differs from consumed token"]
+        assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"])
+    finally:
+        lease.revoke()
+
+
+def test_issue_comment_checkout_observation_does_not_wait_for_git_status(
+    policy, tmp_path, monkeypatch,
+):
+    """A busy worktree scan cannot make a published checkout disappear."""
+    from mimir_cultivate import policy as cultivate_policy
+
+    _repo, original = _repo_and_scope(tmp_path)
+    scope = replace(original, event_type="issue_comment")
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    real_popen = cultivate_policy.subprocess.Popen
+    commands = []
+
+    def busy_status(command, *args, **kwargs):
+        commands.append(command)
+        if "status" in command:
+            # Force a transient status failure at the first lease check;
+            # the already-published checkout and its refs remain valid.
+            raise OSError("worktree status scan unavailable")
+        return real_popen(command, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(cultivate_policy.subprocess, "Popen", busy_status)
+        diagnostics = []
+        assert observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        ), diagnostics
+        assert diagnostics == []
+        assert any("symbolic-ref" in command for command in commands)
+        assert any("rev-parse" in command for command in commands)
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_refuses_changed_git_branch(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        _git(lease.path, "checkout", "-q", "main")
+        main_head = _git(lease.path, "rev-parse", "HEAD")
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        assert diagnostics[0] == "live lease returned None"
+        assert diagnostics[1] == (
+            f"checkout Git state differs from scope: {('main', main_head)!r}"
+        )
+        assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
+        _git(lease.path, "checkout", "-q", scope.head_ref)
+        assert observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+        )
+    finally:
+        lease.revoke()
+
+
+@pytest.mark.parametrize("git_command", ["symbolic-ref", "rev-parse"])
+@pytest.mark.parametrize("failure", ["exit", "overflow", "timeout"])
+def test_checkout_observation_reports_failed_git_identity(
+    policy, tmp_path, monkeypatch, git_command, failure,
+):
+    from mimir_cultivate import policy as cultivate_policy
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    real_popen = subprocess.Popen
+
+    def failed_identity(command, *args, **kwargs):
+        if git_command in command:
+            if failure == "timeout":
+                # The fake clock expires the shared budget at the first read;
+                # the real child is reaped by the observer's finally block.
+                expired = cultivate_policy.time.monotonic() + 31
+                monkeypatch.setattr(cultivate_policy, "time", SimpleNamespace(
+                    monotonic=lambda: expired,
+                ))
+            script = (
+                f"print({scope.head_ref!r}); raise SystemExit(7)" if failure == "exit"
+                else "import sys; sys.stderr.write('x' * 1025)" if failure == "overflow"
+                else "import time; time.sleep(60)"
+            )
+            return real_popen(
+                [sys.executable, "-c", script],
+                *args, **kwargs,
+            )
+        return real_popen(command, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(cultivate_policy.subprocess, "Popen", failed_identity)
+        if failure == "timeout" and git_command == "symbolic-ref":
+            # The first monotonic read sets the deadline; subsequent reads expire it.
+            ticks = iter((0, 31))
+            monkeypatch.setattr(cultivate_policy, "time", SimpleNamespace(
+                monotonic=lambda: next(ticks),
+            ))
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        args = ("symbolic-ref --quiet --short HEAD" if git_command == "symbolic-ref"
+                else "rev-parse --verify HEAD")
+        reason = (
+            "exited with code 7" if failure == "exit" else
+            "exceeded 1024-byte output budget" if failure == "overflow" else "timed out"
+        )
+        assert diagnostics == [
+            "live lease returned None", f"checkout Git state differs from scope: git {args} {reason}",
+        ]
+        assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_reports_first_live_lease_refusal(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    calls = []
+
+    def live_lease(_scope, _state, *, diagnostics=None):
+        calls.append(1)
+        if diagnostics is not None:
+            diagnostics.append("first refusal: checkout Git state unavailable")
+        return None
+
+    diagnostics = []
+    protocol = replace(policy.scoped_actions["cultivate"], live_lease=live_lease)
+    assert not observe_scoped_pr_checkout(
+        auth, scope, state, token, "cultivate", protocol, diagnostics=diagnostics,
+    )
+    assert calls == [1]
+    assert diagnostics == ["live lease returned None", "first refusal: checkout Git state unavailable"]
+    assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
+    diagnostics = []
+    assert not observe_scoped_pr_checkout(
+        auth, scope, state, token, "cultivate", None, diagnostics=diagnostics,
+    )
+    assert diagnostics == ["checkout protocol absent"]
 
 
 def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(tmp_path, monkeypatch):
