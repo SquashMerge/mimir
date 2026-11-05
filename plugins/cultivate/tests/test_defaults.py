@@ -121,8 +121,8 @@ def test_current_chainlink_orchestrator_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "chainlink-orchestrator"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2082-planner-prompt-path"]["chainlink-orchestrator"]
-    assert list(releases)[-1] == "2082-planner-prompt-path"
+    assert skill_inventory(skill) == releases["2097-merge-reconciliation-notices"]["chainlink-orchestrator"]
+    assert list(releases)[-1] == "2097-merge-reconciliation-notices"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.

@@ -7085,7 +7085,77 @@ def test_merge_notices_deliver_without_tracker_or_ready_work(
     assert output[0]["kind"] == "worklink_merge_reconciliation"
     assert output[0]["delivery_key"] == entry["delivery_key"]
     assert "Do not auto-close" in output[0]["prompt"]
+    assert output[0]["recommended_action"] == "operator: inspect audit_outcome_uncertain"
+    assert output[0]["facts"]["pr_state"] is None
+    assert '"pr_state": null' in output[0]["prompt"]
     assert output[-1]["signal"] == "worklink_poller_misconfigured"
+
+
+def test_merge_open_pr_is_held_then_delivered_once_with_observed_facts(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, _, _ = worklink_receipts
+    consumer = worklink_receipt_consumer
+    emitted = []
+    monkeypatch.setattr(consumer, "_emit", emitted.append)
+    budget = SimpleNamespace(hard_exhausted=lambda: False)
+    fields = dict(issue_id=1304, repository="example/project",
+                  pr_url="https://github.com/example/project/pull/42",
+                  reason="pr_open", detail="PR is still open", retriable=True,
+                  facts={"pr_url": "https://github.com/example/project/pull/42",
+                         "pr_state": "open", "pr_draft": False,
+                         "pr_head_sha": "a" * 40, "pr_base_ref": "main",
+                         "pr_merge_commit_sha": None, "pr_merged_at": None,
+                         "issue_lifecycle_labels": ["worklink:review"]})
+    for _ in range(failures.MERGE_RETRY_PASSES - 1):
+        entry = failures.record_merge_reconciliation_notice(state, **fields)
+        consumer._deliver_merge_reconciliations(state, budget)
+        assert emitted == []
+    failures.record_merge_reconciliation_notice(state, **fields)
+    consumer._deliver_merge_reconciliations(state, budget)
+    assert len(emitted) == 1
+    assert emitted[0]["facts"] == fields["facts"]
+    assert emitted[0]["retriable"] is True
+    assert emitted[0]["recommended_action"] == "operator: inspect pr_open"
+    _write_delivery_receipt(state, entry["delivery_key"])
+    consumer._deliver_merge_reconciliations(state, budget)
+    consumer._deliver_merge_reconciliations(state, budget)
+    assert len(emitted) == 1
+    assert failures.load_failure_state(state)["merge_reconciliations"]["notices"][entry["delivery_key"]]["notified"]
+
+
+def test_merge_notice_observed_facts_use_shared_redaction(worklink_receipts):
+    failures, state, _, _ = worklink_receipts
+    secret = "ghp_" + "x" * 36
+    entry = failures.record_merge_reconciliation_notice(
+        state, issue_id=1304, repository="example/project",
+        pr_url="https://github.com/example/project/pull/42",
+        reason="repository_identity_mismatch", detail=f"token={secret}",
+        facts={"pr_url": "https://github.com/example/project/pull/42",
+               "pr_state": "merged", "pr_draft": False,
+               "pr_head_sha": None, "pr_base_ref": f"token={secret}",
+               "pr_merge_commit_sha": None, "pr_merged_at": None,
+               "issue_lifecycle_labels": ["worklink:review"]},
+    )
+    assert secret not in json.dumps(entry)
+    assert "[REDACTED]" in entry["facts"]["pr_base_ref"]
+
+
+def test_merge_notice_same_reason_becomes_terminal_without_waiting(worklink_receipts):
+    failures, state, _, _ = worklink_receipts
+    fields = dict(issue_id=1304, repository="example/project", pr_url=None,
+                  reason="review_lifecycle_required", detail="review label absent")
+    held = failures.record_merge_reconciliation_notice(
+        state, **fields, retriable=True,
+    )
+    assert failures.pending_merge_reconciliation_notices(state) == []
+    terminal = failures.record_merge_reconciliation_notice(
+        state, **fields, retriable=False,
+    )
+    assert terminal["delivery_key"] == held["delivery_key"]
+    assert terminal["retriable"] is False
+    assert [notice["delivery_key"] for notice in
+            failures.pending_merge_reconciliation_notices(state)] == [held["delivery_key"]]
 
 
 def test_merge_receipt_pruning_and_stale_snapshot(

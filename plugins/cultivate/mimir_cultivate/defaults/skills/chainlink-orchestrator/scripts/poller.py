@@ -52,6 +52,7 @@ from mimir_cultivate.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_wo
 from mimir_cultivate.worklink.continuation import consume_worklink_budget_continuations
 from mimir_cultivate.worklink.dispatch_failures import (
     POLLER_NAME,
+    MERGE_RETRY_PASSES,
     _validate_merge_reconciliations,
     delivery_receipt_exists,
     dispatch_failure_state_dir,
@@ -482,22 +483,33 @@ def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> 
             current = reconciliations["notices"].get(delivery_key)
             if not isinstance(current, dict) or current.get("notified") is not False:
                 continue
+            if current.get("retriable") and (
+                current["resolved"] or current.get("observations", 0) < MERGE_RETRY_PASSES
+            ):
+                continue
             delivered = delivery_receipt_exists(state_dir, delivery_key)
             if not delivered:
                 if tick_budget.hard_exhausted():
                     return
+                facts = current.get("facts") or {
+                    "pr_url": None, "pr_state": None, "pr_draft": None,
+                    "pr_head_sha": None, "pr_base_ref": None,
+                    "pr_merge_commit_sha": None, "pr_merged_at": None,
+                    "issue_lifecycle_labels": None,
+                }
+                action = f"operator: inspect {current['reason']}"
                 _emit({
                     "prompt": (
-                        "Worklink merge reconciliation requires human inspection. "
-                        "Do not auto-close the Chainlink, repost the audit marker, reset durable "
-                        "intent, or infer completion. Inspect the current issue, PR, repository "
-                        "configuration, and reconciliation ledger; preserve uncertainty for an "
-                        "operator when positive evidence is unavailable.\n\n"
+                        "Worklink merge reconciliation observation. Do not auto-close the Chainlink "
+                        "without positive merge evidence or repost the audit marker. "
+                        "Use the observed facts below; they do not require a GitHub read.\n\n"
                         f"Reason: {current['reason']}\n"
                         f"Detail: {current['detail']}\n"
                         f"Issue: {current.get('issue_id') or '(unknown)'}\n"
                         f"Repository: {current.get('repository') or '(unknown)'}\n"
-                        f"PR: {current.get('pr_url') or '(unknown)'}\n"
+                        f"Observed facts: {json.dumps(facts, sort_keys=True)}\n"
+                        f"Retriable: {json.dumps(current.get('retriable', False))}\n"
+                        f"Recommended action: {action}\n"
                         f"Ledger: {state_dir / 'dispatch_failures.json'}"
                     ),
                     "source_id": delivery_key,
@@ -507,6 +519,9 @@ def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> 
                     "issue_id": current.get("issue_id"),
                     "repository": current.get("repository"),
                     "pr_url": current.get("pr_url"),
+                    "facts": facts,
+                    "retriable": current.get("retriable", False),
+                    "recommended_action": action,
                     "resolved": current["resolved"],
                 })
         if delivered:
