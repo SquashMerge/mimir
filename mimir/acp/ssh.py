@@ -16,7 +16,9 @@ SSH_PATH = Path("/usr/bin/ssh")
 SPAWN_TIMEOUT = 30.0
 WAIT_TIMEOUT = 1.0
 TERMINATE_TIMEOUT = 2.0
-KILL_TIMEOUT = 1.0
+# SIGKILL is immediate, but subprocess transport callbacks and pipe closure can
+# lag badly on a loaded runner. Allow time to observe the reap, not just the signal.
+KILL_TIMEOUT = 30.0
 
 class SshError(RuntimeError):
     pass

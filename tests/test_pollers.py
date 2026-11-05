@@ -6460,15 +6460,94 @@ async def test_worklink_receipt_growth_reclaimed_without_replaying_acknowledged_
 
 
 @pytest.fixture
-def worklink_receipt_consumer(monkeypatch):
+def worklink_receipt_consumer(monkeypatch, selected_cultivate_policy):
     path = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py"
     spec = importlib.util.spec_from_file_location("_receipt_worklink_consumer_test", path)
     consumer = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, consumer)
-    # This script owns import-path repair. Keep that mutation local to the test.
+    # The shipped script repairs sys.path and may import the source-only plugin.
+    # Scope both mutations, including when exec_module fails during setup.
     monkeypatch.setattr(sys, "path", sys.path.copy())
-    spec.loader.exec_module(consumer)
-    return consumer
+    modules_before = set(sys.modules)
+    try:
+        spec.loader.exec_module(consumer)
+        yield consumer
+    finally:
+        for name in tuple(sys.modules):
+            if name not in modules_before and (
+                name == "mimir_cultivate" or name.startswith("mimir_cultivate.")
+            ):
+                sys.modules.pop(name, None)
+
+
+def test_worklink_receipt_consumer_skips_without_cultivate_distribution(
+    request, monkeypatch,
+):
+    from importlib import metadata
+
+    original_version = metadata.version
+
+    def missing_cultivate(name):
+        if name == "mimir-cultivate":
+            raise metadata.PackageNotFoundError(name)
+        return original_version(name)
+
+    # Own and restore the plugin-module namespace so installed/full-suite runs
+    # exercise the same absent-distribution prerequisite as a core-only worker.
+    with monkeypatch.context() as patch:
+        for name in tuple(sys.modules):
+            if name == "mimir_cultivate" or name.startswith("mimir_cultivate."):
+                patch.delitem(sys.modules, name)
+        patch.setattr(metadata, "version", missing_cultivate)
+        exec_probe = Mock(side_effect=AssertionError("poller loaded without Cultivate"))
+        patch.setattr(importlib.util, "spec_from_file_location", exec_probe)
+        with pytest.raises(pytest.skip.Exception, match="requires installed Cultivate"):
+            request.getfixturevalue("worklink_receipt_consumer")
+        exec_probe.assert_not_called()
+        assert not any(
+            name == "mimir_cultivate" or name.startswith("mimir_cultivate.")
+            for name in sys.modules
+        )
+
+
+@pytest.mark.parametrize("setup_fails", [False, True])
+def test_worklink_receipt_consumer_scopes_added_plugin_modules(monkeypatch, setup_fails):
+    # Exercise the fixture's actual loader/teardown independently of plugin
+    # discovery, with a controlled loader that owns these exact module entries.
+    from types import ModuleType
+
+    existing_name = "mimir_cultivate._receipt_existing"
+    added_name = "mimir_cultivate._receipt_added"
+    unrelated_name = "_receipt_unrelated"
+    existing = ModuleType(existing_name)
+    added = ModuleType(added_name)
+    unrelated = ModuleType(unrelated_name)
+    monkeypatch.setitem(sys.modules, existing_name, existing)
+    monkeypatch.delitem(sys.modules, added_name, raising=False)
+    monkeypatch.delitem(sys.modules, unrelated_name, raising=False)
+
+    def exec_consumer(_consumer):
+        monkeypatch.setitem(sys.modules, added_name, added)
+        monkeypatch.setitem(sys.modules, unrelated_name, unrelated)
+        if setup_fails:
+            raise RuntimeError("consumer setup failed")
+
+    spec = importlib.util.spec_from_loader("_receipt_isolation_test", loader=None)
+    spec.loader = SimpleNamespace(
+        create_module=lambda _spec: None, exec_module=exec_consumer,
+    )
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", lambda *_args: spec)
+    fixture = worklink_receipt_consumer.__wrapped__(monkeypatch, None)
+    if setup_fails:
+        with pytest.raises(RuntimeError, match="consumer setup failed"):
+            next(fixture)
+    else:
+        next(fixture)
+        assert sys.modules[added_name] is added
+        fixture.close()
+    assert added_name not in sys.modules
+    assert sys.modules[existing_name] is existing
+    assert sys.modules[unrelated_name] is unrelated
 
 
 @pytest.mark.parametrize("kind", ["factory_start", "factory_success", "factory_publication_degraded"])
@@ -7132,7 +7211,173 @@ def test_merge_notices_deliver_without_tracker_or_ready_work(
     assert output[0]["kind"] == "worklink_merge_reconciliation"
     assert output[0]["delivery_key"] == entry["delivery_key"]
     assert "Do not auto-close" in output[0]["prompt"]
+    assert output[0]["recommended_action"] == "operator: inspect audit_outcome_uncertain"
+    assert output[0]["facts"]["pr_state"] is None
+    assert '"pr_state": null' in output[0]["prompt"]
     assert output[-1]["signal"] == "worklink_poller_misconfigured"
+
+
+def test_merge_open_pr_is_held_then_delivered_once_with_observed_facts(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, _, _ = worklink_receipts
+    consumer = worklink_receipt_consumer
+    emitted = []
+    monkeypatch.setattr(consumer, "_emit", emitted.append)
+    budget = SimpleNamespace(hard_exhausted=lambda: False)
+    fields = dict(issue_id=1304, repository="example/project",
+                  pr_url="https://github.com/example/project/pull/42",
+                  reason="pr_open", detail="PR is still open", retriable=True,
+                  facts={"pr_url": "https://github.com/example/project/pull/42",
+                         "pr_state": "open", "pr_draft": False,
+                         "pr_head_sha": "a" * 40, "pr_base_ref": "main",
+                         "pr_merge_commit_sha": None, "pr_merged_at": None,
+                         "issue_lifecycle_labels": ["worklink:review"]})
+    for _ in range(failures.MERGE_RETRY_PASSES - 1):
+        entry = failures.record_merge_reconciliation_notice(state, **fields)
+        consumer._deliver_merge_reconciliations(state, budget)
+        assert emitted == []
+    failures.record_merge_reconciliation_notice(state, **fields)
+    consumer._deliver_merge_reconciliations(state, budget)
+    assert len(emitted) == 1
+    assert emitted[0]["facts"] == fields["facts"]
+    assert emitted[0]["retriable"] is True
+    assert emitted[0]["recommended_action"] == (
+        f"operator: inspect — still retrying pr_open after {failures.MERGE_RETRY_PASSES} passes"
+    )
+    assert f"Recommended action: {emitted[0]['recommended_action']}" in emitted[0]["prompt"]
+    _write_delivery_receipt(state, entry["delivery_key"])
+    consumer._deliver_merge_reconciliations(state, budget)
+    consumer._deliver_merge_reconciliations(state, budget)
+    assert len(emitted) == 1
+    assert failures.load_failure_state(state)["merge_reconciliations"]["notices"][entry["delivery_key"]]["notified"]
+
+
+@pytest.mark.parametrize("reason, retriable, observations, changes, expected", [
+    ("reconciliation_read_failed", False, 1, {},
+     "close issue #1304 after confirming merge " + "b" * 40 + " on release/next"),
+    ("pr_open", True, 1, {"pr_state": "open"},
+     "none — will retry automatically"),
+    ("pr_open", True, 5, {"pr_state": "open"},
+     "operator: inspect — still retrying pr_open after 5 passes"),
+    ("repository_identity_mismatch", False, 1, {},
+     "operator: inspect repository_identity_mismatch"),
+    ("merge_identity_changed", False, 1, {},
+     "operator: inspect merge_identity_changed"),
+    ("review_lifecycle_required", False, 1, {},
+     "operator: inspect review_lifecycle_required"),
+    ("competing_lifecycle_label:worklink:blocked", False, 1, {},
+     "operator: inspect competing_lifecycle_label:worklink:blocked"),
+    ("audit_outcome_uncertain", False, 1, {},
+     "operator: inspect audit_outcome_uncertain"),
+    ("reconciliation_read_failed", False, 1, {"pr_merge_commit_sha": None},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1, {"pr_base_ref": None},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1, {"pr_state": "open"},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1, {"issue_lifecycle_labels": None},
+     "operator: inspect reconciliation_read_failed"),
+    ("reconciliation_read_failed", False, 1,
+     {"issue_lifecycle_labels": ["worklink:in-progress"]},
+     "operator: inspect reconciliation_read_failed"),
+])
+def test_merge_reconciliation_action_uses_reason_and_facts(
+    worklink_receipt_consumer, reason, retriable, observations, changes, expected,
+):
+    facts = {"pr_state": "merged", "pr_merge_commit_sha": "b" * 40,
+             "pr_base_ref": "release/next", "issue_lifecycle_labels": ["worklink:review"]}
+    facts.update(changes)
+    assert worklink_receipt_consumer._merge_reconciliation_action(
+        {"reason": reason, "issue_id": 1304, "retriable": retriable,
+         "observations": observations}, facts,
+    ) == expected
+
+
+def test_merge_merged_pr_notice_delivers_close_action(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, _, _ = worklink_receipts
+    consumer = worklink_receipt_consumer
+    emitted = []
+    monkeypatch.setattr(consumer, "_emit", emitted.append)
+    failures.record_merge_reconciliation_notice(
+        state, issue_id=1304, repository="example/project",
+        pr_url="https://github.com/example/project/pull/42",
+        reason="reconciliation_read_failed", detail="reconciliation observation unavailable",
+        facts={"pr_url": "https://github.com/example/project/pull/42",
+               "pr_state": "merged", "pr_draft": False,
+               "pr_head_sha": "a" * 40, "pr_base_ref": "release/next",
+               "pr_merge_commit_sha": "b" * 40, "pr_merged_at": "2026-11-05T04:00:00Z",
+               "issue_lifecycle_labels": ["worklink:review"]},
+    )
+    consumer._deliver_merge_reconciliations(state, SimpleNamespace(hard_exhausted=lambda: False))
+    [event] = emitted
+    expected = "close issue #1304 after confirming merge " + "b" * 40 + " on release/next"
+    assert event["recommended_action"] == expected
+    assert f"Recommended action: {expected}" in event["prompt"]
+    assert "they do not require a GitHub read" in event["prompt"]
+
+
+def test_merge_notice_observed_facts_use_shared_redaction(worklink_receipts):
+    failures, state, _, _ = worklink_receipts
+    secret = "ghp_" + "x" * 36
+    entry = failures.record_merge_reconciliation_notice(
+        state, issue_id=1304, repository="example/project",
+        pr_url="https://github.com/example/project/pull/42",
+        reason="repository_identity_mismatch", detail=f"token={secret}",
+        facts={"pr_url": "https://github.com/example/project/pull/42",
+               "pr_state": "merged", "pr_draft": False,
+               "pr_head_sha": None, "pr_base_ref": f"token={secret}",
+               "pr_merge_commit_sha": None, "pr_merged_at": None,
+               "issue_lifecycle_labels": ["worklink:review"]},
+    )
+    assert secret not in json.dumps(entry)
+    assert "[REDACTED]" in entry["facts"]["pr_base_ref"]
+
+
+def test_merge_notice_same_reason_becomes_terminal_without_waiting(worklink_receipts):
+    failures, state, _, _ = worklink_receipts
+    fields = dict(issue_id=1304, repository="example/project", pr_url=None,
+                  reason="review_lifecycle_required", detail="review label absent")
+    held = failures.record_merge_reconciliation_notice(
+        state, **fields, retriable=True,
+    )
+    assert failures.pending_merge_reconciliation_notices(state) == []
+    terminal = failures.record_merge_reconciliation_notice(
+        state, **fields, retriable=False,
+    )
+    assert terminal["delivery_key"] == held["delivery_key"]
+    assert terminal["retriable"] is False
+    assert [notice["delivery_key"] for notice in
+            failures.pending_merge_reconciliation_notices(state)] == [held["delivery_key"]]
+
+
+@pytest.mark.parametrize("retriable", [False, True])
+@pytest.mark.parametrize("resolved", [False, True])
+@pytest.mark.parametrize("has_receipt", [False, True])
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_pending_merge_notices_preserve_retry_gate_and_receipt_recovery(
+    worklink_receipts, retriable, resolved, has_receipt, exhausted,
+):
+    failures, state, _, _ = worklink_receipts
+    entry = failures.record_merge_reconciliation_notice(
+        state, issue_id=1304, repository="example/project", pr_url=None,
+        reason="review_lifecycle_required", detail="review label absent",
+        retriable=retriable,
+    )
+    key = entry["delivery_key"]
+    with failures.failure_state_transaction(state) as ledger:
+        current = ledger["merge_reconciliations"]["notices"][key]
+        current["resolved"] = resolved
+        current["observations"] = failures.MERGE_RETRY_PASSES if exhausted else 1
+    if has_receipt:
+        _write_delivery_receipt(state, key)
+    expected = has_receipt or (not resolved and (not retriable or exhausted))
+    pending = failures.pending_merge_reconciliation_notices(state)
+    assert [notice["delivery_key"] for notice in pending] == ([key] if expected else [])
+    failures.mark_merge_reconciliation_notified(state, key)
+    assert failures.pending_merge_reconciliation_notices(state) == []
 
 
 def test_merge_receipt_pruning_and_stale_snapshot(

@@ -1876,22 +1876,22 @@ async def test_aclose_task_timeout_continues_reverse_closers_and_is_idempotent(
         events.append("indexer")
         raise RuntimeError("indexer close failed")
 
-    background_task = asyncio.create_task(resistant_task(), name="resistant-runtime-task")
-    bundle._runtime_background_tasks.add(background_task)
-    await task_started.wait()
-    bundle._owned_closers = [
-        ("saga client", lambda: resistant_closer("saga")),
-        ("indexer", failing_indexer),
-        ("sessions", lambda: resistant_closer("sessions")),
-    ]
-    monkeypatch.setattr(
-        mimir.background_tasks,
-        "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS",
-        0.01,
-    )
-    monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
-
     try:
+        background_task = asyncio.create_task(resistant_task(), name="resistant-runtime-task")
+        bundle._runtime_background_tasks.add(background_task)
+        await task_started.wait()
+        bundle._owned_closers = [
+            ("saga client", lambda: resistant_closer("saga")),
+            ("indexer", failing_indexer),
+            ("sessions", lambda: resistant_closer("sessions")),
+        ]
+        monkeypatch.setattr(
+            mimir.background_tasks,
+            "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS",
+            0.01,
+        )
+        monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
+
         results = await asyncio.gather(
             bundle.aclose(),
             bundle.aclose(),
@@ -1992,12 +1992,6 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
             events.append(("cancelled", "runtime task"))
             await release.wait()
 
-    runtime_task = asyncio.create_task(
-        resistant_runtime_task(),
-        name="factory-resistant-task",
-    )
-    await started.wait()
-
     async def resistant_close(name: str) -> None:
         events.append(("close", name))
         try:
@@ -2010,87 +2004,93 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
         async def close(self) -> None:
             await resistant_close("saga")
 
-    monkeypatch.setattr(
-        mimir.saga_client,
-        "make_saga_client",
-        lambda *, db_path: SagaClient(),
-    )
-    base_indexer = mimir.search.Indexer
-
-    class FailingIndexer(base_indexer):
-        async def stop(self) -> None:
-            events.append(("close", "indexer"))
-            raise RuntimeError("indexer rollback failed")
-
-    monkeypatch.setattr(mimir.search, "Indexer", FailingIndexer)
-    base_sessions = mimir.session_manager.SessionManager
-    sessions_instances: list[Any] = []
-
-    class ResistantSessions(base_sessions):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            sessions_instances.append(self)
-
-        async def shutdown(self) -> None:
-            await resistant_close("sessions")
-
-    monkeypatch.setattr(mimir.session_manager, "SessionManager", ResistantSessions)
-    set_callback = selected_forge.set_github_identity_degraded_callback
-
-    def invoke_current(callback: Any, *, notify_current: bool = False) -> None:
-        set_callback(callback)
-        if callback is not None and notify_current:
-            callback(RuntimeError("forge degraded"))
-
-    monkeypatch.setattr(
-        selected_forge,
-        "set_github_identity_degraded_callback",
-        invoke_current,
-    )
-    monkeypatch.setattr(selected_forge, "initialize_github_forge_identity", lambda: True)
-    monkeypatch.setattr(mimir.event_logger, "log_event_sync", lambda *args, **kwargs: None)
-
-    async def log_event(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
-    original = LookupError("global publication failed")
-    set_scheduler = mimir.tools.set_scheduler
-    failed = False
-
-    def fail_scheduler(value: Any) -> None:
-        nonlocal failed
-        set_scheduler(value)
-        if value is not None and not failed:
-            failed = True
-            raise original
-
-    monkeypatch.setattr(mimir.tools, "set_scheduler", fail_scheduler)
-    monkeypatch.setattr(
-        mimir.background_tasks,
-        "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS",
-        0.01,
-    )
-    monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
-    config = _config(tmp_path)
-    config.plugin_manager = load_plugins(enable="cultivate")
-    config.operator_alert_channel = "ops"
-    adapters = _adapters(events)
-
-    def spawn(coroutine: Any, name: str) -> asyncio.Task[Any]:
-        coroutine.close()
-        runtime_task.set_name(name)
-        return runtime_task
-
-    adapters = runtime.RuntimeAdapters(
-        dispatcher=adapters.dispatcher,
-        scheduler=adapters.scheduler,
-        channels=adapters.channels,
-        pairing_notifier=adapters.pairing_notifier,
-        spawn_background_task=spawn,
-    )
-
     try:
+        runtime_task = asyncio.create_task(
+            resistant_runtime_task(),
+            name="factory-resistant-task",
+        )
+        await started.wait()
+
+        monkeypatch.setattr(
+            mimir.saga_client,
+            "make_saga_client",
+            lambda *, db_path: SagaClient(),
+        )
+        base_indexer = mimir.search.Indexer
+
+        class FailingIndexer(base_indexer):
+            async def stop(self) -> None:
+                events.append(("close", "indexer"))
+                raise RuntimeError("indexer rollback failed")
+
+        monkeypatch.setattr(mimir.search, "Indexer", FailingIndexer)
+        base_sessions = mimir.session_manager.SessionManager
+        sessions_instances: list[Any] = []
+
+        class ResistantSessions(base_sessions):
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
+                sessions_instances.append(self)
+
+            async def shutdown(self) -> None:
+                await resistant_close("sessions")
+
+        monkeypatch.setattr(mimir.session_manager, "SessionManager", ResistantSessions)
+        set_callback = selected_forge.set_github_identity_degraded_callback
+
+        def invoke_current(callback: Any, *, notify_current: bool = False) -> None:
+            set_callback(callback)
+            if callback is not None and notify_current:
+                callback(RuntimeError("forge degraded"))
+
+        monkeypatch.setattr(
+            selected_forge,
+            "set_github_identity_degraded_callback",
+            invoke_current,
+        )
+        monkeypatch.setattr(selected_forge, "initialize_github_forge_identity", lambda: True)
+        monkeypatch.setattr(mimir.event_logger, "log_event_sync", lambda *args, **kwargs: None)
+
+        async def log_event(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
+        original = LookupError("global publication failed")
+        set_scheduler = mimir.tools.set_scheduler
+        failed = False
+
+        def fail_scheduler(value: Any) -> None:
+            nonlocal failed
+            set_scheduler(value)
+            if value is not None and not failed:
+                failed = True
+                raise original
+
+        monkeypatch.setattr(mimir.tools, "set_scheduler", fail_scheduler)
+        monkeypatch.setattr(
+            mimir.background_tasks,
+            "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS",
+            0.01,
+        )
+        monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
+        config = _config(tmp_path)
+        config.plugin_manager = load_plugins(enable="cultivate")
+        config.operator_alert_channel = "ops"
+        adapters = _adapters(events)
+
+        def spawn(coroutine: Any, name: str) -> asyncio.Task[Any]:
+            coroutine.close()
+            runtime_task.set_name(name)
+            return runtime_task
+
+        adapters = runtime.RuntimeAdapters(
+            dispatcher=adapters.dispatcher,
+            scheduler=adapters.scheduler,
+            channels=adapters.channels,
+            pairing_notifier=adapters.pairing_notifier,
+            spawn_background_task=spawn,
+        )
+
         with pytest.raises(LookupError) as caught:
             await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
         assert caught.value is original

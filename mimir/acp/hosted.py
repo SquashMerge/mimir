@@ -28,6 +28,8 @@ READ_LIMIT_BYTES = 1024 * 1024
 FRAME_LIMIT_BYTES = 1024 * 1024
 OUTPUT_LIMIT_BYTES = 256 * 1024
 SHELL_TIMEOUT_SECONDS = 60
+# Reaping a SIGKILLed process can lag behind delivery on loaded event loops.
+SHELL_REAP_TIMEOUT = 30.0
 
 
 class HostedMcpError(RuntimeError):
@@ -775,9 +777,14 @@ class HostedHandsProvider:
             # been reaped and asyncio still reports returncode=None.
             self._signalled_processes.add(process)
         try:
-            await process.wait()
+            # SIGKILL cannot be deferred by the child, but the event loop may
+            # observe its reap late on a loaded host. Bound the wait generously;
+            # keep ownership if it still cannot be reaped by that deadline.
+            await asyncio.wait_for(process.wait(), SHELL_REAP_TIMEOUT)
         except ProcessLookupError:
             pass
+        except TimeoutError as exc:
+            raise HostedMcpError(-32000, "hands_shell child did not stop") from exc
         self._processes.pop(process, None)
         self._signalled_processes.discard(process)
 

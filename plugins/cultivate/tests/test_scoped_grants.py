@@ -856,13 +856,16 @@ def test_checkout_observation_refuses_changed_git_branch(policy, tmp_path, monke
     lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
     try:
         _git(lease.path, "checkout", "-q", "main")
+        main_head = _git(lease.path, "rev-parse", "HEAD")
         diagnostics = []
         assert not observe_scoped_pr_checkout(
             auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
             diagnostics=diagnostics,
         )
         assert diagnostics[0] == "live lease returned None"
-        assert diagnostics[1].startswith("checkout Git state differs from scope:")
+        assert diagnostics[1] == (
+            f"checkout Git state differs from scope: {('main', main_head)!r}"
+        )
         assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
         _git(lease.path, "checkout", "-q", scope.head_ref)
         assert observe_scoped_pr_checkout(
@@ -872,8 +875,10 @@ def test_checkout_observation_refuses_changed_git_branch(policy, tmp_path, monke
         lease.revoke()
 
 
-def test_checkout_observation_refuses_failed_git_identity_with_plausible_output(
-    policy, tmp_path, monkeypatch,
+@pytest.mark.parametrize("git_command", ["symbolic-ref", "rev-parse"])
+@pytest.mark.parametrize("failure", ["exit", "overflow", "timeout"])
+def test_checkout_observation_reports_failed_git_identity(
+    policy, tmp_path, monkeypatch, git_command, failure,
 ):
     from mimir_cultivate import policy as cultivate_policy
 
@@ -888,21 +893,48 @@ def test_checkout_observation_refuses_failed_git_identity_with_plausible_output(
     real_popen = subprocess.Popen
 
     def failed_identity(command, *args, **kwargs):
-        if "symbolic-ref" in command:
+        if git_command in command:
+            if failure == "timeout":
+                # The fake clock expires the shared budget at the first read;
+                # the real child is reaped by the observer's finally block.
+                expired = cultivate_policy.time.monotonic() + 31
+                monkeypatch.setattr(cultivate_policy, "time", SimpleNamespace(
+                    monotonic=lambda: expired,
+                ))
+            script = (
+                f"print({scope.head_ref!r}); raise SystemExit(7)" if failure == "exit"
+                else "import sys; sys.stderr.write('x' * 1025)" if failure == "overflow"
+                else "import time; time.sleep(60)"
+            )
             return real_popen(
-                [sys.executable, "-c", f"print({scope.head_ref!r}); raise SystemExit(1)"],
+                [sys.executable, "-c", script],
                 *args, **kwargs,
             )
         return real_popen(command, *args, **kwargs)
 
     try:
         monkeypatch.setattr(cultivate_policy.subprocess, "Popen", failed_identity)
+        if failure == "timeout" and git_command == "symbolic-ref":
+            # The first monotonic read sets the deadline; subsequent reads expire it.
+            ticks = iter((0, 31))
+            monkeypatch.setattr(cultivate_policy, "time", SimpleNamespace(
+                monotonic=lambda: next(ticks),
+            ))
         diagnostics = []
         assert not observe_scoped_pr_checkout(
             auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
             diagnostics=diagnostics,
         )
-        assert diagnostics == ["live lease returned None", "checkout Git state differs from scope: None"]
+        args = ("symbolic-ref --quiet --short HEAD" if git_command == "symbolic-ref"
+                else "rev-parse --verify HEAD")
+        reason = (
+            "exited with code 7" if failure == "exit" else
+            "exceeded 1024-byte output budget" if failure == "overflow" else "timed out"
+        )
+        assert diagnostics == [
+            "live lease returned None", f"checkout Git state differs from scope: git {args} {reason}",
+        ]
+        assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
     finally:
         lease.revoke()
 
