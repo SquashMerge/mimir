@@ -856,6 +856,30 @@ def test_review_requested_event_carries_submission_marker(monkeypatch):
     assert marker["reviewer"] == "mimir-carreira"
 
 
+def test_settled_refusal_suppresses_only_original_review_request(monkeypatch, tmp_path):
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    requested_at = ["2026-11-04T22:00:00Z"]
+    monkeypatch.setattr(poller, "_latest_review_request_at", lambda *args: requested_at[0])
+    kwargs = dict(
+        token="t", reviewer="mimir-carreira", current_head_reviewed=False,
+        event_type="pr_review_requested", repo="o/r", number=42,
+        head_sha="a" * 40, requested_reviewer="mimir-carreira", author="alice",
+    )
+    assert poller._emit_pr_review_needed("review", **kwargs)
+    key = captured[-1]["recovery_key"]
+    (tmp_path / ".recovery.json").write_text(json.dumps({
+        "settled_refusals": {"review:" + key: "2026-11-04T22:10:00Z"},
+    }), encoding="utf-8")
+    assert not poller._emit_pr_review_needed("review", **kwargs)
+    assert len(captured) == 1
+    requested_at[0] = "2026-11-04T22:15:00Z"
+    assert poller._emit_pr_review_needed("new request", **kwargs)
+    assert captured[-1]["recovery_key"] != key
+    assert poller._emit_pr_review_needed("new head", **{**kwargs, "head_sha": "b" * 40})
+    assert len(captured) == 3
+
+
 # ─── re-emit / wedge-guard / give-up (chainlink #299) ───────────────
 
 
@@ -975,6 +999,27 @@ def test_queued_review_request_does_not_spend_attempts_or_duplicate(
     )
     assert count == 0
     assert rr == {}
+
+
+def test_charged_completion_without_review_reemits_within_budget(monkeypatch, tmp_path):
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [
+        _pr(42, "sha", requested_reviewers=["mimir-carreira"]),
+    ])
+    entry = _review_recovery_entry(attempts=1, failed=True)
+    entry["outcome_disposition"] = "charge"
+    (tmp_path / ".recovery.json").write_text(json.dumps({
+        "last_reconciled": "", "inflight": {"completed-no-review": entry},
+    }), encoding="utf-8")
+    count, _, requests = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira", pr_heads={"42": "sha"},
+        pr_review_requests={"42": 0},
+    )
+    assert count == 1
+    assert requests == {"42": 1}
+    assert captured[0]["event_type"] == "pr_review_requested"
+    assert captured[0]["attempt"] == 2
 
 
 def test_three_started_failed_review_turns_reach_give_up(monkeypatch, tmp_path):

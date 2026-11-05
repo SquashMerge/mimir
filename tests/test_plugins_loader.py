@@ -220,7 +220,8 @@ class Entry:
         )
     def load(self):
         return importlib.import_module(self.value.split(':')[0])
-metadata.entry_points = lambda *, group: [Entry('alpha', 'poison_provider'), Entry('beta', 'enabled_provider')]
+_real_entry_points = metadata.entry_points
+metadata.entry_points = lambda *, group: [Entry('alpha', 'poison_provider'), Entry('beta', 'enabled_provider')] if group == 'mimir.plugins' else _real_entry_points(group=group)
 from mimir.plugins.manager import load_plugins
 manager = load_plugins(enable='beta')
 assert [plugin.candidate.name for plugin in manager.plugins] == ['beta']
