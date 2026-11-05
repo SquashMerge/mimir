@@ -15,6 +15,35 @@ from mimir.read_policy import (
 )
 
 
+def _require_cultivate_plugin() -> None:
+    """Source-path imports do not prove the optional provider is installed."""
+    from mimir.plugins.discovery import discover_plugins
+
+    if not any(candidate.name == "cultivate" for candidate in discover_plugins(enable="")):
+        pytest.skip("Cultivate plugin entry point is not installed")
+    pytest.importorskip("mimir_cultivate")
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_source_only_cultivate_does_not_establish_plugin_availability(
+    selected, tmp_path, monkeypatch,
+):
+    import sys
+    from types import ModuleType
+
+    # A poller source loader can make mimir_cultivate importable in a core-only
+    # test process without registering its distribution's plugin entry point.
+    source_only = ModuleType("mimir_cultivate")
+    monkeypatch.setitem(sys.modules, "mimir_cultivate", source_only)
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: ())
+    assert pytest.importorskip("mimir_cultivate") is source_only
+    if selected:
+        with pytest.raises(pytest.skip.Exception, match="plugin entry point is not installed"):
+            test_derived_lease_read_root_is_coding_only(True, tmp_path, monkeypatch)
+    else:
+        test_derived_lease_read_root_is_coding_only(False, tmp_path, monkeypatch)
+
+
 def test_missing_channel_note_is_only_own_channel_and_cannot_escape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -164,7 +193,7 @@ def test_derived_lease_read_root_is_coding_only(selected, tmp_path, monkeypatch)
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
     if selected:
-        pytest.importorskip("mimir_cultivate")
+        _require_cultivate_plugin()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
     baseline = configured_non_admin_read_roots()
     write_roots = _configured_file_write_roots()
@@ -201,7 +230,7 @@ def test_invalid_lease_root_does_not_extend_read_policy(invalid, tmp_path, monke
     }
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
-    pytest.importorskip("mimir_cultivate")
+    _require_cultivate_plugin()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
     baseline = configured_non_admin_read_roots()
@@ -228,7 +257,7 @@ def test_derived_lease_known_root_preserves_absolute_paths(tmp_path, monkeypatch
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lexical))
-    pytest.importorskip("mimir_cultivate")
+    _require_cultivate_plugin()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     roots = configured_non_admin_read_roots()
     assert root in roots and lexical in roots
@@ -270,7 +299,7 @@ def test_derived_lease_read_containment(escape, tmp_path, monkeypatch):
     (root / "escape").symlink_to(outside)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
-    pytest.importorskip("mimir_cultivate")
+    _require_cultivate_plugin()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lexical))
     requested = lexical / ("escape" if escape == "symlink" else "../outside.txt")
@@ -289,7 +318,7 @@ def test_derived_lease_does_not_expand_write_configuration(tmp_path, monkeypatch
     root.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
-    pytest.importorskip("mimir_cultivate")
+    _require_cultivate_plugin()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
     before = _configured_file_write_roots()

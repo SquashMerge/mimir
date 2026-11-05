@@ -52,6 +52,7 @@ from mimir_cultivate.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_wo
 from mimir_cultivate.worklink.continuation import consume_worklink_budget_continuations
 from mimir_cultivate.worklink.dispatch_failures import (
     POLLER_NAME,
+    MERGE_RETRY_PASSES,
     _validate_merge_reconciliations,
     delivery_receipt_exists,
     dispatch_failure_state_dir,
@@ -471,6 +472,34 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
             })
 
 
+def _merge_reconciliation_action(notice: dict, facts: dict) -> str:
+    """Recommend from observed evidence without overriding identity/lifecycle refusals."""
+    reason = notice["reason"]
+    if notice.get("retriable"):
+        passes = notice.get("observations", 0)
+        if passes < MERGE_RETRY_PASSES:
+            return "none — will retry automatically"
+        return f"operator: inspect — still retrying {reason} after {passes} passes"
+
+    # A merged PR alone cannot discharge a terminal identity/lifecycle refusal
+    # or authorize replaying a mutation whose outcome is uncertain.
+    inspect = f"operator: inspect {reason}"
+    if reason != "reconciliation_read_failed":
+        return inspect
+    issue_id = notice.get("issue_id")
+    merge_sha = facts.get("pr_merge_commit_sha")
+    base = facts.get("pr_base_ref")
+    if (
+        facts.get("pr_state") == "merged"
+        and isinstance(merge_sha, str) and re.fullmatch(r"[0-9a-fA-F]{7,64}", merge_sha)
+        and isinstance(base, str) and base
+        and type(issue_id) is int and issue_id > 0
+        and facts.get("issue_lifecycle_labels") == ["worklink:review"]
+    ):
+        return f"close issue #{issue_id} after confirming merge {merge_sha} on {base}"
+    return inspect
+
+
 def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> None:
     """Offer durable merge refusals without changing dispatch eligibility."""
     for notice in pending_merge_reconciliation_notices(state_dir):
@@ -482,22 +511,33 @@ def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> 
             current = reconciliations["notices"].get(delivery_key)
             if not isinstance(current, dict) or current.get("notified") is not False:
                 continue
+            if current.get("retriable") and (
+                current["resolved"] or current.get("observations", 0) < MERGE_RETRY_PASSES
+            ):
+                continue
             delivered = delivery_receipt_exists(state_dir, delivery_key)
             if not delivered:
                 if tick_budget.hard_exhausted():
                     return
+                facts = current.get("facts") or {
+                    "pr_url": None, "pr_state": None, "pr_draft": None,
+                    "pr_head_sha": None, "pr_base_ref": None,
+                    "pr_merge_commit_sha": None, "pr_merged_at": None,
+                    "issue_lifecycle_labels": None,
+                }
+                action = _merge_reconciliation_action(current, facts)
                 _emit({
                     "prompt": (
-                        "Worklink merge reconciliation requires human inspection. "
-                        "Do not auto-close the Chainlink, repost the audit marker, reset durable "
-                        "intent, or infer completion. Inspect the current issue, PR, repository "
-                        "configuration, and reconciliation ledger; preserve uncertainty for an "
-                        "operator when positive evidence is unavailable.\n\n"
+                        "Worklink merge reconciliation observation. Do not auto-close the Chainlink "
+                        "without positive merge evidence or repost the audit marker. "
+                        "Use the observed facts below; they do not require a GitHub read.\n\n"
                         f"Reason: {current['reason']}\n"
                         f"Detail: {current['detail']}\n"
                         f"Issue: {current.get('issue_id') or '(unknown)'}\n"
                         f"Repository: {current.get('repository') or '(unknown)'}\n"
-                        f"PR: {current.get('pr_url') or '(unknown)'}\n"
+                        f"Observed facts: {json.dumps(facts, sort_keys=True)}\n"
+                        f"Retriable: {json.dumps(current.get('retriable', False))}\n"
+                        f"Recommended action: {action}\n"
                         f"Ledger: {state_dir / 'dispatch_failures.json'}"
                     ),
                     "source_id": delivery_key,
@@ -507,6 +547,9 @@ def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> 
                     "issue_id": current.get("issue_id"),
                     "repository": current.get("repository"),
                     "pr_url": current.get("pr_url"),
+                    "facts": facts,
+                    "retriable": current.get("retriable", False),
+                    "recommended_action": action,
                     "resolved": current["resolved"],
                 })
         if delivered:
