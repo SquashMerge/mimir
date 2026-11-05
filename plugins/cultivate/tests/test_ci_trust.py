@@ -95,6 +95,50 @@ def test_provider_ci_pytest_error_section_keeps_traceback_and_summary():
     assert failure + summary in excerpt
 
 
+@pytest.mark.parametrize("prefix", [
+    b"2026-11-05T02:09:44.2169640Z ",
+    b"2026-11-05T02:09:44Z ",
+])
+def test_provider_ci_timestamped_pytest_failure_keeps_detail_and_summary(monkeypatch, prefix):
+    # The section and assertion below are the real lines quoted from GitHub
+    # job 126998030272 in PR #12's review. Surrounding context is synthetic
+    # to force header/error prioritization rather than retaining the whole block.
+    section = b"2026-11-05T02:09:44.2169640Z =================================== FAILURES ===================================\n"
+    assertion = b"2026-11-05T02:09:44.4049980Z E               AssertionError: ['checkout protocol absent or live lease returned None']\n"
+    header = prefix + b"________________________ test_lease ________________________\n"
+    context = prefix + b"tests/test_checkout.py:84: in test_lease\n"
+    summary = (
+        prefix + b"=========================== short test summary info ============================\n"
+        + prefix + b"FAILED tests/test_checkout.py::test_lease - AssertionError: ['ch\n"
+        + prefix + b"============================== 1 failed in 1.00s ===============================\n"
+    )
+    payload = (
+        (prefix + b"setup\n") * 1000
+        + section + header
+        + (prefix + b"distant traceback context\n") * 1000
+        + context + assertion
+        + (prefix + b"following traceback context\n") * 1000
+        + summary + (prefix + b"cleanup\n") * 1000
+    )
+
+    def run(argv, **kwargs):
+        kwargs["stdout"].write(payload)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(ci.subprocess, "run", run)
+    excerpt, error = ci.capture_job_log("o/r", 101, token="", timeout=5, limit=2048)
+    assert error == ""
+    assert section in excerpt
+    assert header in excerpt
+    assert context in excerpt
+    assert assertion in excerpt
+    assert summary in excerpt
+    assert excerpt.index(assertion) < excerpt.index(summary)
+    assert b"cleanup" not in excerpt
+    assert ci.TRUNCATION_MARKER in excerpt
+    assert len(excerpt) <= 2048
+
+
 def test_provider_ci_non_pytest_excerpt_keeps_error_fallback_and_tail():
     fallback = b"start\ncontext\nfatal: deployment failed\nfollowing\n"
     assert ci._select_excerpt(BytesIO(fallback), 2048, "") == fallback

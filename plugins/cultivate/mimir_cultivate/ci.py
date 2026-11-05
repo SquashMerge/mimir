@@ -178,17 +178,22 @@ def _select_excerpt(output, limit: int, token: str) -> bytes:
                 recent.clear()
                 continue
             end = clean.tell()
-            if re.match(rb"^=+ (?:FAILURES|ERRORS) =+\s*$", line):
+            # Classify GitHub Actions payloads without their timestamp prefix;
+            # retain the original bytes/offsets so excerpts preserve timestamps.
+            payload = re.sub(
+                rb"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ", b"", line, count=1,
+            )
+            if re.match(rb"^=+ (?:FAILURES|ERRORS) =+\s*$", payload):
                 in_failures = True
                 group += 1
                 failures.append((start, end, "section", group))
-            elif in_failures and re.match(rb"^=+ .+ =+\s*$", line):
+            elif in_failures and re.match(rb"^=+ .+ =+\s*$", payload):
                 in_failures = False
             elif in_failures:
-                if re.match(rb"^_{3,} .+ _{3,}\s*$", line):
+                if re.match(rb"^_{3,} .+ _{3,}\s*$", payload):
                     group += 1
                     label = "header"
-                elif re.match(rb"^\s*E\s+", line):
+                elif re.match(rb"^\s*E\s+", payload):
                     label = "error"
                 else:
                     label = "context"
