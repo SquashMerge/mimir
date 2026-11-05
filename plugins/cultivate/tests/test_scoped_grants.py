@@ -601,7 +601,7 @@ def test_checkout_observation_refuses_symlinked_configured_root(policy, tmp_path
             auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
             diagnostics=diagnostics,
         ), diagnostics
-        assert diagnostics == ["checkout protocol absent or live lease returned None"]
+        assert diagnostics == ["live lease returned None", "configured lease root is relative or a symlink"]
         assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
         # Refusal must not consume the token or invalidate the real checkout.
         monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
@@ -683,7 +683,7 @@ def test_checkout_observation_refuses_different_root_or_metadata_path(
             "attached lease root differs from configured lease root" if invalid == "attached_root"
             else "lease metadata path or root differs from attached lease"
         ]
-        assert diagnostics == ["checkout protocol absent or live lease returned None"]
+        assert diagnostics == ["live lease returned None", *reasons]
         assert ("cultivate", scope.scope_id) in auth.scoped_pr_grants._pending
     finally:
         lease.revoke()
@@ -709,6 +709,138 @@ def test_checkout_observation_reports_wrong_pending_token(policy, tmp_path, monk
         assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"])
     finally:
         lease.revoke()
+
+
+def test_issue_comment_checkout_observation_does_not_wait_for_git_status(
+    policy, tmp_path, monkeypatch,
+):
+    """A busy worktree scan cannot make a published checkout disappear."""
+    from mimir_cultivate import policy as cultivate_policy
+
+    _repo, original = _repo_and_scope(tmp_path)
+    scope = replace(original, event_type="issue_comment")
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    real_popen = cultivate_policy.subprocess.Popen
+    commands = []
+
+    def busy_status(command, *args, **kwargs):
+        commands.append(command)
+        if "status" in command:
+            # Force a transient status failure at the first lease check;
+            # the already-published checkout and its refs remain valid.
+            raise OSError("worktree status scan unavailable")
+        return real_popen(command, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(cultivate_policy.subprocess, "Popen", busy_status)
+        diagnostics = []
+        assert observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        ), diagnostics
+        assert diagnostics == []
+        assert any("symbolic-ref" in command for command in commands)
+        assert any("rev-parse" in command for command in commands)
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_refuses_changed_git_branch(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    try:
+        _git(lease.path, "checkout", "-q", "main")
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        assert diagnostics[0] == "live lease returned None"
+        assert diagnostics[1].startswith("checkout Git state differs from scope:")
+        assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
+        _git(lease.path, "checkout", "-q", scope.head_ref)
+        assert observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+        )
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_refuses_failed_git_identity_with_plausible_output(
+    policy, tmp_path, monkeypatch,
+):
+    from mimir_cultivate import policy as cultivate_policy
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    real_popen = subprocess.Popen
+
+    def failed_identity(command, *args, **kwargs):
+        if "symbolic-ref" in command:
+            return real_popen(
+                [sys.executable, "-c", f"print({scope.head_ref!r}); raise SystemExit(1)"],
+                *args, **kwargs,
+            )
+        return real_popen(command, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(cultivate_policy.subprocess, "Popen", failed_identity)
+        diagnostics = []
+        assert not observe_scoped_pr_checkout(
+            auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            diagnostics=diagnostics,
+        )
+        assert diagnostics == ["live lease returned None", "checkout Git state differs from scope: None"]
+    finally:
+        lease.revoke()
+
+
+def test_checkout_observation_reports_first_live_lease_refusal(policy, tmp_path, monkeypatch):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    calls = []
+
+    def live_lease(_scope, _state, *, diagnostics=None):
+        calls.append(1)
+        if diagnostics is not None:
+            diagnostics.append("first refusal: checkout Git state unavailable")
+        return None
+
+    diagnostics = []
+    protocol = replace(policy.scoped_actions["cultivate"], live_lease=live_lease)
+    assert not observe_scoped_pr_checkout(
+        auth, scope, state, token, "cultivate", protocol, diagnostics=diagnostics,
+    )
+    assert calls == [1]
+    assert diagnostics == ["live lease returned None", "first refusal: checkout Git state unavailable"]
+    assert auth.scoped_pr_grants._pending[("cultivate", scope.scope_id)] is token
+    diagnostics = []
+    assert not observe_scoped_pr_checkout(
+        auth, scope, state, token, "cultivate", None, diagnostics=diagnostics,
+    )
+    assert diagnostics == ["checkout protocol absent"]
 
 
 def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(tmp_path, monkeypatch):

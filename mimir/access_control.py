@@ -21,6 +21,7 @@ New in chainlink #866:
 from __future__ import annotations
 
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -9428,14 +9429,28 @@ def observe_scoped_pr_checkout(
     owner: str, protocol: Any, *, diagnostics: list[str] | None = None,
 ) -> bool:
     grants = getattr(auth_context, "scoped_pr_grants", None)
-    lease = protocol.live_lease(scope, state) if protocol is not None and protocol.live_lease is not None else None
     if not isinstance(grants, ScopedPRGrants):
         if diagnostics is not None:
             diagnostics.append("scoped PR grants absent")
         return False
+    if protocol is None or protocol.live_lease is None:
+        if diagnostics is not None:
+            diagnostics.append("checkout protocol absent")
+        return False
+    live_lease = protocol.live_lease
+    # Diagnostics are optional on third-party protocols. Pass them into the
+    # *first* lease check when supported; a subsequent probe can see a different
+    # filesystem/Git state and conceal the original refusal.
+    try:
+        accepts_diagnostics = "diagnostics" in inspect.signature(live_lease).parameters
+    except (TypeError, ValueError):
+        accepts_diagnostics = False
+    lease = (live_lease(scope, state, diagnostics=diagnostics)
+             if diagnostics is not None and accepts_diagnostics
+             else live_lease(scope, state))
     if lease is None:
         if diagnostics is not None:
-            diagnostics.append("checkout protocol absent or live lease returned None")
+            diagnostics.insert(0, "live lease returned None")
         return False
     return grants.observe_checkout(owner, scope, lease, token, diagnostics=diagnostics)
 

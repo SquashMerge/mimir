@@ -84,7 +84,7 @@ def test_current_github_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "github-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2090-checkout-grant-observe"]["github-poller"]
+    assert skill_inventory(skill) == releases["2095-checkout-observation"]["github-poller"]
 
 
 def test_history_file_defaults_are_released_for_both_pollers():
@@ -96,7 +96,7 @@ def test_history_file_defaults_are_released_for_both_pollers():
         # Keep historical release evidence intact; each poller can advance
         # independently after the shared history-file release.
         release = {
-            "github-poller": "2090-checkout-grant-observe",
+            "github-poller": "2095-checkout-observation",
             "github-ci-watch": "2072-history-files",
         }[skill.name]
         assert skill_inventory(skill) == releases[release][skill.name]

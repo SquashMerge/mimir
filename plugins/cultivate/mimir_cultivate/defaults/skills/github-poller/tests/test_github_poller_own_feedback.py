@@ -17,7 +17,7 @@ from mimir import access_control
 from mimir.models import SourceLabel
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
-from mimir_cultivate.policy import RepoPRAction, RepoPRScopeProvenance, _live_scoped_pr_lease
+from mimir_cultivate.policy import RepoPRAction, RepoPRScopeProvenance
 
 REPO = "owner/repo"
 BOT = "mimir-bot"
@@ -406,8 +406,6 @@ async def test_emitted_json_through_framework_attestation_and_checkout_grant(
                 auth, scope, state, token, "cultivate", selected.scoped_actions["cultivate"],
                 diagnostics=diagnostics,
             )
-            if not observed and "checkout protocol absent or live lease returned None" in diagnostics:
-                _live_scoped_pr_lease(scope, state, diagnostics=diagnostics)
             assert observed, diagnostics
             admitted = registry.authorize_tool(
                 "pr_comments", auth, arguments=args, enforce=True, policy=selected,
