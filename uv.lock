@@ -1757,7 +1757,7 @@ wheels = [
 
 [[package]]
 name = "mimir-agent"
-version = "1.0.0rc1"
+version = "1.0.0rc2"
 source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },
@@ -1925,7 +1925,7 @@ dev = [
 
 [[package]]
 name = "mimir-cultivate"
-version = "1.0.0rc1"
+version = "1.0.0rc2"
 source = { editable = "plugins/cultivate" }
 dependencies = [
     { name = "mimir-agent" },

@@ -1,7 +1,7 @@
 {
   "id": "mimir",
   "name": "Mimir",
-  "version": "1.0.0rc1",
+  "version": "1.0.0rc2",
   "description": "Memory-centric AI agent accessible through the Agent Client Protocol.",
   "repository": "https://github.com/SquashMerge/mimir",
   "authors": [
@@ -10,7 +10,7 @@
   "license": "MIT",
   "distribution": {
     "uvx": {
-      "package": "mimir-agent==1.0.0rc1",
+      "package": "mimir-agent==1.0.0rc2",
       "args": [
         "acp"
       ]
