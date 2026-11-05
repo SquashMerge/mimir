@@ -892,6 +892,17 @@ def reconcile_merged_leaves(
                     association = discover_associations(home, issue)
                     ci_candidate = (association.ci_handoff_head is not None and
                                     bool(issue.labels & {"worklink:blocked", "worklink:in-progress"}))
+                    # The active attempt owns publication and the transition to
+                    # review. Only an attested merged CI handoff may bypass it.
+                    if issue.is_open and "worklink:in-progress" in issue.labels:
+                        if not ci_candidate:
+                            continue
+                        assert association.ci_handoff_url is not None
+                        ci_pr = read_pr_snapshot(
+                            association.ci_handoff_url, gh_bin=gh_bin, runner=gh_runner,
+                        )
+                        if not ci_pr.merged:
+                            continue
                     if association.pr_url is None and not ci_candidate and association.reason == "missing_pr_association":
                         if not dry_run:
                             resolve_merge_reconciliation_notices(
