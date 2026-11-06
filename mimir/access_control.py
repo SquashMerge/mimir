@@ -9405,12 +9405,14 @@ def _valid_scoped_pr_grant(
             and slot_policy.scoped_actions.get(owner) is protocol):
         registry = getattr(auth_context, "repo_pr_scope_registry", None)
         discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        # Same order as tool authorization and lease attestation: a reminted
+        # server-discovered state supersedes the immutable event registry.
         registered_state = (
-            registry.resolve(scope.canonical_repo, scope.pr_number)
-            if registry is not None else None
+            discovered.resolve(scope.canonical_repo, scope.pr_number)
+            if discovered is not None else None
         )
-        if registered_state is None and discovered is not None:
-            registered_state = discovered.resolve(scope.canonical_repo, scope.pr_number)
+        if registered_state is None and registry is not None:
+            registered_state = registry.resolve(scope.canonical_repo, scope.pr_number)
         if registered_state is not review_state or review_state.action_scope is not scope:
             return False
     designated_checkout = getattr(protocol, "checkout_tool", None)

@@ -753,7 +753,7 @@ async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
     auth = _auth(scope)
     auth = replace(
         auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state,
-        server_discovered_pr_states=cache,
+        server_discovered_pr_states=cache, _plugin_slot_policy=selected_repo_policy,
         trigger="poller", canonical_principal="poller:github-activity",
         service_authority=replace(auth.service_authority, canonical="poller:github-activity",
                                   trigger="poller", authority_profile="github",
