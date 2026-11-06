@@ -9419,6 +9419,24 @@ def _valid_scoped_pr_grant(
         return False
 
 
+def register_server_discovered_review_grant(auth_context: AuthContext, state: Any) -> None:
+    """Bind a live, turn-registered review scope to an operator's grants."""
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    scope = getattr(state, "action_scope", None)
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
+    if (
+        not can_resolve_forge_review_scope(auth_context, stage="fetch")
+        or getattr(auth_context, "is_service", False)
+        or not isinstance(grants, ScopedPRGrants)
+        or grants.principal != getattr(auth_context, "canonical_principal", None)
+        or scope is None or getattr(scope, "provenance", None) != "server_discovered"
+        or discovered is None
+        or discovered.resolve(scope.canonical_repo, scope.pr_number) is not state
+    ):
+        return
+    grants.issue(scope)
+
+
 def consume_scoped_pr_checkout(auth_context: AuthContext, scope: Any, owner: str) -> object | None:
     grants = getattr(auth_context, "scoped_pr_grants", None)
     return grants.consume_checkout(owner, scope) if isinstance(grants, ScopedPRGrants) else None
@@ -13655,17 +13673,22 @@ def create_auth_context(
     )
     action_scope = single_state.action_scope if single_state is not None else None
     scoped_pr_grants = None
-    if (
+    operator_user = (
+        event.trigger == "user_message" and not is_service
+        and bool(canonical) and "admin" in roles
+        and event_ingress is None and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+    )
+    service_grants = (
         is_service and registered_service is not None
         and (registered_service.github_activity or
              registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES)
         and event_ingress is None and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
-        and (policy if policy is not None else selected_policy_registry()).scoped_actions
-    ):
+    )
+    if (operator_user or service_grants) and selected.scoped_actions:
         scoped_pr_grants = ScopedPRGrants(
             canonical, (state.action_scope for state in repo_pr_scope_registry.review_states)
-            if repo_pr_scope_registry is not None else (),
-            protocols=(policy if policy is not None else selected_policy_registry()).scoped_actions,
+            if service_grants and repo_pr_scope_registry is not None else (),
+            protocols=selected.scoped_actions,
             _issuer=_SCOPED_PR_ISSUER,
         )
 
