@@ -5230,7 +5230,7 @@ def checkout_scoped_pr(
     runtime: ToolRuntime[AuthContext],
 ) -> dict[str, Any]:
     """Shared checkout implementation for the host and the callable tool."""
-    from .forge import _call, _client, _pr_content_authors, remediation_checkout_preflight
+    from .forge import _client, pr_trust_verdict, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
     state, stopped = remediation_checkout_preflight(context, repository, pull_request)
@@ -5278,26 +5278,17 @@ def checkout_scoped_pr(
     context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
     context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
     client = _client(scope)
-    from .forge import _BOT_LOGIN, _author_verdict
+    from mimir.pollers import _github_author_trust_cause, github_author_trust_cause
 
-    if callable(getattr(client, "author_is_trusted", None)) or (
-        isinstance(scope.pull_request_author, str) and _BOT_LOGIN.fullmatch(scope.pull_request_author)
-    ):
-        authors, _ = _call(lambda: _pr_content_authors(client, scope))
-        if authors == (scope.pull_request_author,) and scope.pull_request_author:
-            from mimir.pollers import _github_author_trust_cause
-
-            _github_author_trust_cause.set(None)
-            verdict = _author_verdict(context, scope, scope.pull_request_author, client)
-            context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
-            if verdict is None:
-                from mimir.pollers import github_author_trust_cause
-
-                context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
-                    github_author_trust_cause() or "author_unresolved"
-                )
-            else:
-                context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
+    _github_author_trust_cause.set(None)
+    verdict = pr_trust_verdict(context, scope, client)
+    context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+    if verdict is None:
+        context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
+            github_author_trust_cause() or "author_unresolved"
+        )
+    else:
+        context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
     _publish_attested_lease_result(runtime, state)
     return {
         "status": "resumed" if candidates else "checked_out",

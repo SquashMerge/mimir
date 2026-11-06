@@ -1928,7 +1928,10 @@ def test_checkout_records_native_author_trust_for_file_reads(
     from mimir_cultivate import forge, repository as repo
 
     author = "" if mismatch == "missing_author" else "collaborator"
-    scope = _scope(author=author)
+    # Fork head: unlike a base-repository push, this needs a verified
+    # GitHub-linked collaborator identity to attest the checkout.
+    scope = replace(_scope(author=author), head_repo="external/repo", head_remote="source",
+                    event_type="pr_opened")
     if mismatch == "verified_own_push":
         import uuid
 
@@ -1974,6 +1977,7 @@ def test_checkout_records_native_author_trust_for_file_reads(
 
     client = SimpleNamespace(
         get_pull_request=lambda scope: metadata,
+        get_head_commit_identity=lambda _: (True, "collaborator"),
         get_diff=lambda scope: "diff --git a/src/work.py b/src/work.py",
         author_is_trusted=attest,
     )
@@ -2009,7 +2013,9 @@ def test_checkout_records_native_author_trust_for_file_reads(
             "trusted" if verdict is True and mismatch is None else "untrusted"
         )
     trusted_checkout = verdict is True and mismatch is None
-    assert checkout_labels.sources[0].integrity == ("trusted" if trusted_checkout else "untrusted")
+    # Fork checkout results retain the existing own-origin-only provenance
+    # guard; the independently checked lease still governs file reads.
+    assert checkout_labels.sources[0].integrity == "untrusted"
     assert checkout_labels.sources[0].resource_id == (
         f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted_checkout
         else "<unresolved-resource:protected_tool:repo_checkout>"
@@ -2092,7 +2098,8 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
     from mimir_cultivate import forge, repository as repo
 
     monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", allowlist)
-    scope = _scope(author=author)
+    scope = replace(_scope(author=author), head_repo="external/repo", head_remote="source",
+                    event_type="pr_opened")
     auth = _auth(scope=scope, recorded_verdict=False)
     runtime = SimpleNamespace(context=auth)
     root = tmp_path / "leases"
@@ -2114,6 +2121,7 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
     # No collaborator adapter: the mixed-case bot path must still attest.
     monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(
         get_pull_request=lambda _: metadata,
+        get_head_commit_identity=lambda _: (True, author),
     ))
     token = begin_protected_result_capture()
     try:
@@ -2128,7 +2136,8 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
     if provenance is not None and provenance.sources:
         assert provenance.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
         assert (provenance.sources[0].integrity == "trusted") is trusted
-    assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is trusted
+    assert labels.sources[0].integrity == "untrusted"
     assert labels.sources[0].resource_id == (
         f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted
         else "<unresolved-resource:protected_tool:repo_checkout>"

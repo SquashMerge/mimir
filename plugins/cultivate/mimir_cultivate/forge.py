@@ -639,6 +639,12 @@ class GitHubForgeClient:
             base_sha=str(base.get("sha", "")),
         )
 
+    def get_pull_request_identity(
+        self, repository: str, number: int,
+    ) -> NormalizedPullRequestSnapshot:
+        """Read the PR's identity/ref snapshot without projecting PR text."""
+        return self.get_pull_request_snapshot(repository, number)
+
     def author_is_trusted(self, repository: str, author: str) -> bool | None:
         """Share poller collaborator/org attestation, not payload trust claims."""
         from mimir.pollers import _github_author_is_trusted
@@ -646,6 +652,22 @@ class GitHubForgeClient:
         return _github_author_is_trusted(
             repository, author, self._token, timeout=self._timeout,
         )
+
+    def get_head_commit_identity(self, scope: RepoPRActionScope) -> tuple[bool, str | None] | None:
+        """Return GitHub's verification and linked author for the pinned head."""
+        data = self._request(
+            "GET", f"/repos/{scope.head_repo}/commits/{scope.observed_head_sha}",
+        )
+        if not isinstance(data, Mapping) or data.get("sha") != scope.observed_head_sha:
+            return None
+        commit = data.get("commit")
+        verification = commit.get("verification") if isinstance(commit, Mapping) else None
+        verified = verification.get("verified") if isinstance(verification, Mapping) else None
+        if type(verified) is not bool:
+            return None
+        author = data.get("author")
+        login = author.get("login") if isinstance(author, Mapping) else None
+        return verified, login if isinstance(login, str) and login else None
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection:
         repository, number = self._target(scope)
@@ -2096,6 +2118,58 @@ def _author_verdict(context: AuthContext, repo: str | RepoPRActionScope, author:
         repository, author,
         lambda: attest(repository, author),
     )
+
+
+def pr_trust_verdict(
+    context: AuthContext, scope: RepoPRActionScope, client: Any,
+) -> bool | None:
+    """Attest the last contributor from pinned, identity-only GitHub facts.
+
+    The event actor and unsigned commit email are never evidence of authorship.
+    A base-repository head is writable only by principals with repository write
+    access. On a fork, GitHub verification binds the head author; without it,
+    only the repository owner can vouch for the head.
+    """
+    if context.ifc_state is None:
+        return None
+    # The native adapter's snapshot reads only identity/ref fields. Legacy
+    # adapters expose the same fields through their PR projection.
+    read_snapshot = getattr(client, "get_pull_request_identity", None)
+    read_pr = getattr(client, "get_pull_request", None)
+    if not callable(read_snapshot) and not callable(read_pr):
+        return None
+    try:
+        metadata = (read_snapshot(scope.canonical_repo, scope.pr_number)
+                    if callable(read_snapshot) else read_pr(scope))
+    except ForgeError:
+        return None
+    if (
+        metadata.number != scope.pr_number
+        or metadata.head_sha != scope.observed_head_sha
+        or not isinstance(metadata.author, str) or not metadata.author
+        or metadata.author != scope.pull_request_author
+        or (callable(read_snapshot) and (
+            metadata.repo.casefold() != scope.canonical_repo.casefold()
+            or metadata.head_repo.casefold() != scope.head_repo.casefold()
+        ))
+    ):
+        return None
+    if scope.head_repo.casefold() == scope.canonical_repo.casefold():
+        return True
+    lookup = getattr(client, "get_head_commit_identity", None)
+    if not callable(lookup):
+        return None
+    try:
+        head = lookup(scope)
+    except ForgeError:
+        return None
+    if head is None or not isinstance(head, tuple) or len(head) != 2 or type(head[0]) is not bool:
+        return None
+    verified, author = head
+    if verified:
+        return _author_verdict(context, scope.canonical_repo, author, client)
+    owner = scope.head_repo.split("/", 1)[0]
+    return _author_verdict(context, scope.canonical_repo, owner, client)
 
 
 def _withheld_event(tool: str, kind: str, reason: str, count: int = 1) -> None:

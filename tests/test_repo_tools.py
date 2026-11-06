@@ -944,18 +944,20 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         "pr_reviews": "trusted", "pr_comments": "trusted",
         "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
         "pr_spec": "trusted",
-        "repo_checkout": None if case != "collaborator" else "trusted",
+        # A base-repository head is trusted independently of its PR author's
+        # collaborator status; forge content keeps its author attestation.
+        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else None,
     }, f"lease_refusals={refusal_reasons}; observed={observed_provenance}; events={events}"
     assert observed == {
         "pr_reviews": "untrusted", "pr_comments": "untrusted",
         "pr_metadata": "untrusted", "pr_spec": "untrusted",
-        "repo_checkout": "trusted" if case == "collaborator" else "untrusted",
+        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else "untrusted",
     }
     assert auth.ifc_state.has_untrusted_active_ingest()
-    if case in {"collaborator", "git_timeout"}:
+    if case in {"collaborator", "outsider", "git_timeout"}:
         assert status_probes  # The positive/timeout controls reached the real proof boundary.
     assert refusal_reasons == (
-        [] if case == "collaborator" else
+        [] if case in {"collaborator", "outsider"} else
         ["git_timeout"] if case == "git_timeout" else ["no_author_trust"]
     )
     # Read actual lease content before exercising the real edit-file gate.
@@ -967,7 +969,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     )
     auth.ifc_state.merge(read)
     assert read.sources[0].integrity == (
-        "trusted" if case == "collaborator" else "untrusted"
+        "trusted" if case in {"collaborator", "outsider"} else "untrusted"
     )
     decision = access_control.ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=True, target_channel=str(target),
@@ -991,22 +993,18 @@ def test_checkout_records_fresh_turn_local_author_cause(tmp_path, monkeypatch, c
     try:
         monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
         monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *a, **k: (state.checkout_lease, []))
-        monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(author_is_trusted=lambda *_: None))
+        monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace())
         monkeypatch.setattr(repo, "_publish_attested_lease_result", lambda *_: None)
 
-        def authors(*_):
+        def verdict(*_):
             assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None
             assert causes[scope.scope_id] == "author_unresolved"
-            return (("other",) if case == "author_mismatch" else ("owner",)), None
-
-        def verdict(*_):
             assert pollers.github_author_trust_cause() is None
             if case == "unavailable":
                 pollers._github_author_trust_cause.set("collaborator_timeout")
             return {"false": False, "true": True}.get(case)
 
-        monkeypatch.setattr(forge, "_pr_content_authors", authors)
-        monkeypatch.setattr(forge, "_author_verdict", verdict)
+        monkeypatch.setattr(forge, "pr_trust_verdict", verdict)
         repo.repo_checkout.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
         assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is {
             "false": False, "true": True,
@@ -1152,10 +1150,11 @@ def test_resumed_local_commit_requires_clean_producing_turn(
     from mimir_cultivate import forge as forge_module, repository as repo_module
     monkeypatch.setattr(forge_module, "remediation_checkout_preflight", lambda *_: (second, None))
     monkeypatch.setattr(forge_module, "_client", lambda _: SimpleNamespace(
-        author_is_trusted=lambda *_: True,
+        get_pull_request=lambda _: SimpleNamespace(
+            number=scope.pr_number, head_sha=scope.observed_head_sha,
+            author=scope.pull_request_author,
+        ),
     ))
-    monkeypatch.setattr(forge_module, "_pr_content_authors", lambda *_: ((scope.principal,), None))
-    monkeypatch.setattr(forge_module, "_author_verdict", lambda *_: True)
     from mimir.access_control import (
         SinkGate, ToolAuthorization, begin_protected_result_capture,
         classify_protected_result, end_protected_result_capture, protected_result_source,
