@@ -15,6 +15,7 @@ from importlib import metadata, resources
 import json
 from urllib.parse import quote
 import os
+import platform
 from pathlib import Path
 import re
 import secrets
@@ -169,6 +170,8 @@ _ALERT_ENV_KEYS = frozenset({"MIMIR_OPERATOR_ALERT_CHANNEL", "DISCORD_TOKEN", "S
                             "SLACK_APP_TOKEN", "MIMIR_DISCORD_ALLOWED_CHANNELS",
                             "MIMIR_DISCORD_REQUIRE_MENTION", "MIMIR_SLACK_ALLOWED_CHANNELS",
                             "MIMIR_SLACK_REQUIRE_MENTION"})
+_DOCKER_ARCHITECTURES = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}
+_PYTHON_BASE_IMAGE = "public.ecr.aws/docker/library/python:3.11-slim-bookworm"
 
 
 class SetupError(Exception):
@@ -618,7 +621,7 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _image_identity(version: str, wheels: dict) -> str:
+def _image_identity(version: str, wheels: dict, architecture: str = "x86_64") -> str:
     from packaging.version import Version, InvalidVersion
 
     try:
@@ -634,7 +637,8 @@ def _image_identity(version: str, wheels: dict) -> str:
         raise SetupError("Invalid PyPI wheel identity in manifest.json; reconcile it before retrying.") from None
     label = re.sub(r"[^A-Za-z0-9_-]", "-", version)
     return (label[:70] + "-" + wheels["mimir-agent"]["sha256"][:16] + "-" +
-            wheels["mimir-cultivate"]["sha256"][:16])
+            wheels["mimir-cultivate"]["sha256"][:16] +
+            ("-aarch64" if architecture == "aarch64" else ""))
 
 
 def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
@@ -645,14 +649,18 @@ def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
     version = previous.get("mimir_version")
     wheels = previous.get("wheels")
     tag = previous.get("layer_tag")
+    docker_platform = previous.get("docker_platform")
+    if docker_platform not in _DOCKER_ARCHITECTURES:
+        return None
     if not isinstance(version, str) or not isinstance(wheels, dict) or not isinstance(tag, str):
         return None
     try:
-        identity = _image_identity(version, wheels)
+        identity = _image_identity(version, wheels, _DOCKER_ARCHITECTURES[docker_platform])
     except SetupError:
         return None
     if (tag != f"mimir-cultivate-agent:{identity}-{previous.get('toolchain', '')}{str(previous.get('toolchain_version', '')).replace('.', '-')}"
             or f"MIMIR_VERSION={version}" not in build.read_text()
+            or f"--platform {docker_platform}" not in build.read_text()
             or any(wheels[name]["sha256"] not in build.read_text() for name in ("mimir-agent", "mimir-cultivate"))):
         return None
     return identity, tag
@@ -1444,6 +1452,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     ):
         setup.add_argument("--" + name, help=help_text)
     setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate (default: latest common stable, then prerelease).")
+    setup.add_argument("--platform", choices=tuple(_DOCKER_ARCHITECTURES),
+                       help="Docker target platform (linux/amd64 or linux/arm64; default: host architecture, or saved platform on rerun).")
     for name in ("github-token", "model-key", "saga-model-key", "embedding-key"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
@@ -1494,6 +1504,9 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verify) -> None:
+    requested_platform = getattr(args, "platform", None)
+    if requested_platform is not None and requested_platform not in _DOCKER_ARCHITECTURES:
+        raise SetupError("Unsupported Docker platform; choose linux/amd64 or linux/arm64.")
     requested_packages = getattr(args, "system_packages", None)
     if requested_packages is not None:
         system_packages = ([] if requested_packages.strip() == "none"
@@ -1525,6 +1538,18 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Invalid manifest.json; reconcile it before retrying.")
     if previous and previous.get("mimir_install_mode") != "pypi":
         raise SetupError("Source-era Cultivate deployments cannot be upgraded, even with --force; create a new --deploy directory and migrate operator data explicitly.")
+    saved_platform = previous.get("docker_platform")
+    if previous and saved_platform not in _DOCKER_ARCHITECTURES:
+        raise SetupError("Missing or unsupported Docker platform in manifest.json; choose a new deployment directory.")
+    if saved_platform is not None and requested_platform is not None and saved_platform != requested_platform:
+        raise SetupError("Docker platform differs from the saved deployment; choose a new deployment directory.")
+    if requested_platform is None and saved_platform is None:
+        requested_platform = {"x86_64": "linux/amd64", "amd64": "linux/amd64",
+                              "aarch64": "linux/arm64", "arm64": "linux/arm64"}.get(platform.machine().lower())
+    docker_platform = requested_platform or saved_platform
+    if docker_platform not in _DOCKER_ARCHITECTURES:
+        raise SetupError("Unsupported host architecture; pass --platform linux/amd64 or linux/arm64.")
+    architecture = _DOCKER_ARCHITECTURES[docker_platform]
     trackers, tracker_settings = _tracker_settings(args, previous)
     if getattr(args, "auto_review", None) is None and "auto_review" in previous:
         if not isinstance(previous["auto_review"], str):
@@ -1600,11 +1625,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     elif embedding_key_env and embedding_key_env not in extra_keys:
         extra_keys[embedding_key_env] = _secret(args, "embedding_key", "Embedding API key (input hidden).",
                                                  previous=prior.get(embedding_key_env))
-    release = resolve_release(getattr(args, "mimir_version", None))
+    release = resolve_release(getattr(args, "mimir_version", None), architecture=architecture)
     mimir_version = release.version
     wheels = {wheel.name: {"filename": wheel.filename, "sha256": wheel.sha256}
               for wheel in (release.agent, release.cultivate)}
-    identity = _image_identity(mimir_version, wheels)
+    identity = _image_identity(mimir_version, wheels, architecture)
     files = {name: _content(repo, branch, name, token, request) for name in
              ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version",
               ".github/workflows/rust.yml", ".github/workflows/ci.yml")}
@@ -1634,7 +1659,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     extras = {provider, saga_provider, "mcp", "local-embeddings"}
     if alert_adapter in {"discord", "slack"}:
         extras.add(alert_adapter)
-    build_args = ["--build-arg MIMIR_INSTALL_MODE=pypi", "--build-arg MIMIR_VERSION=" + mimir_version,
+    build_args = ["--build-arg BASE_IMAGE=" + _PYTHON_BASE_IMAGE,
+                   "--build-arg MIMIR_INSTALL_MODE=pypi", "--build-arg MIMIR_VERSION=" + mimir_version,
                   "--build-arg MIMIR_AGENT_WHEEL=" + wheels["mimir-agent"]["filename"],
                   "--build-arg MIMIR_CULTIVATE_WHEEL=" + wheels["mimir-cultivate"]["filename"],
                   "--build-arg MIMIR_AGENT_SHA256=" + release.agent.sha256,
@@ -1656,8 +1682,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                      + '"$interpreter" -I -S build_context.py '
                     + '"$context" ' + '"wheels/' + release.agent.filename + '" "wheels/' + release.cultivate.filename
                     + '" "' + mimir_version + '" "' + release.agent.sha256 + '" "' + release.cultivate.sha256 + '"\n'
-                    + "docker build -t " + tag + " " + " ".join(build_args) + ' "$context"\n'
-                    + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n")
+                    + "docker build --platform " + docker_platform + " -t " + tag + " " + " ".join(build_args) + ' "$context"\n'
+                    + "docker build --platform " + docker_platform + " -t " + layer_tag + " -f Dockerfile.toolchain .\n")
     from mimir.scaffold_docker import render_compose_yml
 
     # Start from the existing loopback-only compose renderer; use root-image
@@ -1728,7 +1754,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                    "system_packages": system_packages,
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
                     "mimir_install_mode": "pypi", "mimir_version": mimir_version, "wheels": wheels,
-                    "toolchain_version": version, "layer_tag": layer_tag,
+                    "toolchain_version": version, "layer_tag": layer_tag, "docker_platform": docker_platform,
                    "generated_sha256": {name: _digest(text) for name, text in generated.items()}}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     # The provision script and manifest are mounted read-only for a one-shot
@@ -1755,8 +1781,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                                cultivate_sha256=release.cultivate.sha256)
         except (ValueError, OSError) as exc:
             raise SetupError("Cannot assemble verified wheel Docker context; check released wheel resources.") from None
-        docker_step("build", ["docker", "build", "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)])
-    docker_step("build", ["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."])
+        docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)])
+    docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", layer_tag, "-f", "Dockerfile.toolchain", "."])
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])
     if was_running:
         docker_step("stop", ["docker", "compose", "stop", "agent"])

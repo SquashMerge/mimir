@@ -12,9 +12,9 @@ from mimir_cultivate import release_resolver
 from mimir_cultivate.release_resolver import ReleaseError, fetch_bytes, resolve_release
 
 
-def wheel(project, version, *, dependency=None, requirements=None):
+def wheel(project, version, *, dependency=None, requirements=None, tag="py3-none-manylinux2014_x86_64"):
     name = project.replace("-", "_")
-    filename = f"{name}-{version}-py3-none-manylinux2014_x86_64.whl"
+    filename = f"{name}-{version}-{tag}.whl"
     content = f"Name: {project}\nVersion: {version}\n"
     if dependency:
         content += f"Requires-Dist: mimir-agent=={dependency}\n"
@@ -61,6 +61,35 @@ def test_stable_first_and_verified_download():
     assert selected.agent.data == stable[0]["data"]
     assert selected.cultivate.sha256 == stable[1]["digests"]["sha256"]
     assert resolve_release("2.0.0rc1", fetch=fetch).version == "2.0.0rc1"
+
+
+def test_newest_common_modern_manylinux_pair_on_bookworm():
+    old = pair("1.0.0")
+    recent = (wheel("mimir-agent", "2.0.0", tag="cp311-cp311-manylinux_2_28_x86_64"),
+              wheel("mimir-cultivate", "2.0.0", dependency="2.0.0",
+                    tag="cp311-cp311-manylinux_2_28_x86_64"))
+    too_new = (wheel("mimir-agent", "3.0.0", tag="cp311-cp311-manylinux_2_37_x86_64"),
+               wheel("mimir-cultivate", "3.0.0", dependency="3.0.0",
+                     tag="cp311-cp311-manylinux_2_37_x86_64"))
+    fetch, _ = index({"1.0.0": [old[0]], "2.0.0": [recent[0]], "3.0.0": [too_new[0]]},
+                     {"1.0.0": [old[1]], "2.0.0": [recent[1]], "3.0.0": [too_new[1]]})
+    selected = resolve_release(fetch=fetch, architecture="x86_64")
+    assert selected.version == "2.0.0"
+    assert selected.agent.sha256 == recent[0]["digests"]["sha256"]
+    assert selected.cultivate.sha256 == recent[1]["digests"]["sha256"]
+
+
+def test_arm_target_ignores_newer_x86_only_pair():
+    arm = (wheel("mimir-agent", "1.0.0", tag="cp311-cp311-manylinux_2_28_aarch64"),
+           wheel("mimir-cultivate", "1.0.0", dependency="1.0.0",
+                 tag="cp311-cp311-manylinux_2_28_aarch64"))
+    x86 = pair("2.0.0")
+    fetch, _ = index({"1.0.0": [arm[0]], "2.0.0": [x86[0]]},
+                     {"1.0.0": [arm[1]], "2.0.0": [x86[1]]})
+    selected = resolve_release(fetch=fetch, architecture="aarch64")
+    assert selected.version == "1.0.0"
+    assert selected.agent.sha256 == arm[0]["digests"]["sha256"]
+    assert selected.cultivate.sha256 == arm[1]["digests"]["sha256"]
 
 
 def test_prerelease_fallback_skips_unpaired_and_yanked():

@@ -36,7 +36,7 @@ def isolated_license_record(tmp_path, monkeypatch):
     from mimir_cultivate.release_resolver import ReleasePair, Wheel
     from mimir import plugin_dockerfile
 
-    def release(version=None):
+    def release(version=None, *, architecture="x86_64"):
         selected = version or VERSION
         wheels = [Wheel(name, name.replace('-', '_') + f'-{selected}-py3-none-any.whl',
                         'https://files.pythonhosted.org/' + name, hashlib.sha256((name + selected).encode()).hexdigest(),
@@ -704,12 +704,12 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert sum(argv[-2:] == ["restart", "agent"] for argv in calls) == 0
 
     before_calls = len(calls)
-    monkeypatch.setattr(installer, 'resolve_release', lambda version=None: (_ for _ in ()).throw(installer.ReleaseError('PyPI unavailable')))
+    monkeypatch.setattr(installer, 'resolve_release', lambda version=None, **kw: (_ for _ in ()).throw(installer.ReleaseError('PyPI unavailable')))
     with pytest.raises(installer.ReleaseError, match="PyPI unavailable"):
         installer.setup(args, request=request, run=run, verify=lambda *a: None)
     assert len(calls) == before_calls
     from mimir_cultivate.release_resolver import ReleasePair, Wheel
-    def restored_release(version=None):
+    def restored_release(version=None, *, architecture="x86_64"):
         def wheel(name):
             return Wheel(name, name.replace('-', '_') + f'-{VERSION}-py3-none-any.whl',
                          'https://files.pythonhosted.org/' + name, hashlib.sha256((name + VERSION).encode()).hexdigest(),
@@ -731,7 +731,9 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         assert json.loads((deploy / 'manifest.json').read_text())['system_packages'] == expected
         layer = (deploy / 'Dockerfile.toolchain').read_text()
         assert layer == installer.render_layer(
-            'node', '22.16.0', 'mimir-cultivate-root:' + installer._image_identity(VERSION, saga['wheels']), system_packages=expected)
+            'node', '22.16.0', 'mimir-cultivate-root:' + installer._image_identity(
+                VERSION, saga['wheels'], installer._DOCKER_ARCHITECTURES[saga['docker_platform']]),
+            system_packages=expected)
         if not expected:
             assert 'RUN set -eu; apt-get update' not in layer
         assert verified[-1][-2] == expected
@@ -779,7 +781,7 @@ def setup_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.subprocess, 'run', docker_exec)
     state = {'sha': SHA, 'running': False, 'status': 'No Worklink leaf runs or labeled issues.', 'leases': '[]'}
     from mimir_cultivate.release_resolver import ReleasePair, Wheel
-    def release(version=None):
+    def release(version=None, *, architecture="x86_64"):
         selected = version or (VERSION if state['sha'] == SHA else '1.0.1')
         def wheel(name):
             return Wheel(name, name.replace('-', '_') + f'-{selected}-py3-none-any.whl',
@@ -855,8 +857,8 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     for name in ('mimir-agent', 'mimir-cultivate'):
         assert manifest['wheels'][name]['sha256'] == hashlib.sha256((name + '1.0.1').encode()).hexdigest()
         assert manifest['wheels'][name]['sha256'] != old_wheels[name]['sha256']
-    expected_identity = ('1-0-1-' + manifest['wheels']['mimir-agent']['sha256'][:16]
-                         + '-' + manifest['wheels']['mimir-cultivate']['sha256'][:16])
+    expected_identity = installer._image_identity(
+        '1.0.1', manifest['wheels'], installer._DOCKER_ARCHITECTURES[manifest['docker_platform']])
     assert new_tag == ('mimir-cultivate-agent:' + expected_identity + '-'
                        + manifest['toolchain'] + manifest['toolchain_version'].replace('.', '-'))
     assert new_tag != old_tag
@@ -1004,7 +1006,7 @@ def test_missing_generated_hashes_refused_even_with_force(upgrade_setup):
 @pytest.mark.parametrize('reason', ['Cannot reach PyPI', 'No common compatible, non-yanked PyPI wheel release'])
 def test_release_resolution_refuses_without_deployment_or_docker_writes(setup_environment, monkeypatch, reason):
     deploy, args, state, calls, invoke = setup_environment
-    def unavailable(version=None):
+    def unavailable(version=None, *, architecture="x86_64"):
         raise installer.ReleaseError(reason)
     monkeypatch.setattr(installer, 'resolve_release', unavailable)
     with pytest.raises(installer.ReleaseError, match=reason):
@@ -1038,6 +1040,52 @@ def test_explicit_version_and_source_free_artifact_inventory(setup_environment):
     assert 'MIMIR_EXTRAS=local-embeddings,mcp,openai' in root_build
 
 
+def test_arm_deployment_selects_arm_wheels_and_pins_both_builds(setup_environment, monkeypatch):
+    from test_release_resolver import index, wheel
+
+    deploy, args, state, calls, invoke = setup_environment
+    args.platform = 'linux/arm64'
+    arm = (wheel('mimir-agent', '2.0.0', tag='cp311-cp311-manylinux_2_28_aarch64'),
+           wheel('mimir-cultivate', '2.0.0', dependency='2.0.0',
+                 tag='cp311-cp311-manylinux_2_28_aarch64'))
+    x86 = (wheel('mimir-agent', '2.0.0', tag='cp311-cp311-manylinux_2_28_x86_64'),
+           wheel('mimir-cultivate', '2.0.0', dependency='2.0.0',
+                 tag='cp311-cp311-manylinux_2_28_x86_64'))
+    fetch, _ = index({'2.0.0': [x86[0], arm[0]]}, {'2.0.0': [x86[1], arm[1]]})
+    from mimir_cultivate.release_resolver import resolve_release as real_resolver
+    monkeypatch.setattr(installer, 'resolve_release',
+                        lambda version=None, *, architecture: real_resolver(version, fetch=fetch, architecture=architecture))
+    invoke()
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['docker_platform'] == 'linux/arm64'
+    for name, selected in zip(('mimir-agent', 'mimir-cultivate'), arm):
+        assert manifest['wheels'][name]['sha256'] == selected['digests']['sha256']
+        assert hashlib.sha256((deploy / 'wheels' / selected['filename']).read_bytes()).hexdigest() == selected['digests']['sha256']
+    assert all('x86_64' not in entry['filename'] for entry in manifest['wheels'].values())
+    builds = [argv for argv in calls if argv[:2] == ['docker', 'build']]
+    assert len(builds) == 2
+    assert all(argv[2:4] == ['--platform', 'linux/arm64'] for argv in builds)
+    assert 'BASE_IMAGE=' + installer._PYTHON_BASE_IMAGE in builds[0]
+    script = (deploy / 'build.sh').read_text()
+    assert script.count('docker build --platform linux/arm64') == 2
+    assert 'BASE_IMAGE=' + installer._PYTHON_BASE_IMAGE in script
+    args.platform = None
+    monkeypatch.setattr(installer.platform, 'machine', lambda: 'x86_64')
+    calls.clear()
+    invoke()
+    assert json.loads((deploy / 'manifest.json').read_text())['docker_platform'] == 'linux/arm64'
+    assert all(argv[2:4] == ['--platform', 'linux/arm64'] for argv in calls if argv[:2] == ['docker', 'build'])
+
+
+def test_unsupported_platform_fails_before_effects(setup_environment, monkeypatch):
+    deploy, args, state, calls, invoke = setup_environment
+    args.platform = 'linux/ppc64le'
+    monkeypatch.setattr(installer, '_license_gate', lambda args: pytest.fail('license side effect'))
+    with pytest.raises(installer.SetupError, match='Unsupported Docker platform'):
+        invoke()
+    assert not deploy.exists() and not calls
+
+
 def test_saved_build_runs_without_host_mimir_or_python(setup_environment, monkeypatch, tmp_path):
     import io
     import zipfile
@@ -1058,7 +1106,7 @@ def test_saved_build_runs_without_host_mimir_or_python(setup_environment, monkey
     agent = wheel('mimir-agent', ['mimir/docker_context/Dockerfile',
                                   *(f'mimir/docker_context/deploy/s6-overlay/s6-rc.d/{name}' for name in _S6_FILES)])
     cultivate = wheel('mimir-cultivate', [f'mimir_cultivate/docker/{name}' for name in _CONTEXT_SCRIPTS])
-    monkeypatch.setattr(installer, 'resolve_release', lambda version=None: ReleasePair(version or '2.0.0rc1', agent, cultivate))
+    monkeypatch.setattr(installer, 'resolve_release', lambda version=None, **kw: ReleasePair(version or '2.0.0rc1', agent, cultivate))
     deploy, args, state, calls, invoke = setup_environment
     args.mimir_version = version
     invoke()
