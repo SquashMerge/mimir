@@ -12,6 +12,7 @@ MIMIR_COMMIT=$(git rev-parse HEAD)
 test -z "$(git status --porcelain=v1)"
 test "$(git ls-remote origin "$MIMIR_GIT_REF" | awk 'NR == 1 {print $1}')" = "$MIMIR_COMMIT"
 docker build \
+  --build-arg MIMIR_INSTALL_MODE=source \
   --build-arg MIMIR_GIT_REF="$MIMIR_GIT_REF" \
   --build-arg MIMIR_CONTROLLER_COMMIT="$MIMIR_COMMIT" \
   --build-arg MIMIR_EXECUTOR_COMMIT="$MIMIR_COMMIT" \
@@ -20,9 +21,12 @@ docker build \
 
 Add both `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
 `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` (and usually
-`--build-arg MIMIR_ENABLE_OPENCODE=1`) for a coding image. Cultivate is not
-published to an index; the build installs core and the in-repo
-`plugins/cultivate` member from the pinned commit into both venvs. Then run the
+`--build-arg MIMIR_ENABLE_OPENCODE=1`) for a source-mode coding image. The
+independent Cultivate operator installer instead uses explicit
+`MIMIR_INSTALL_MODE=pypi`, exact `MIMIR_VERSION`, and both wheel filenames and
+SHA-256 digests from PyPI; its bounded Docker context contains only verified
+released wheel resources. There is no source fallback in `mimir cultivate setup`.
+Then run the
 container with `MIMIR_PLUGINS=cultivate` in its environment. Without the build
 argument the image is core-only and has no Worklink executor. See
 [upgrading a coding deployment](../docs/plugins.md#upgrading-a-coding-deployment).
@@ -49,8 +53,8 @@ Core-only images do not download or install gh. `mimir cultivate setup` passes
 saved `build.sh`. The extra installs CPU-only torch wheels from the PyTorch CPU
 index in the controller environment; the provision container prefetches
 voyage-4-nano to the shared persistent Hugging Face cache. The separate
-Worklink executor venv strips `local-embeddings` from its extras: it runs
-`worker_exec`, not the embedding provider, and does not install torch.
+Worklink executor venv preserves all configured extras in PyPI mode; the
+source-mode worker retains its historical embedding filter.
 
 The Cultivate image also ships `/usr/local/bin/chainlink` for Worklink claims,
 continuation, and the ready-queue poller. It is built from
@@ -71,7 +75,7 @@ With Cultivate selected, and only then, the image also creates the `worklink`
 user and group (UID/GID 1002), the `/var/lib/mimir-worklink` checkout roots and
 the `worklink-execd` service. A core-only image has none of them. The root-owned
 Worklink executor is installed into the image under `/opt/mimir-worklink`; it is not updated by a bind-mounted controller checkout.
-Its source is cloned from `MIMIR_GIT_URL` (the upstream repository by default)
+In source mode only, its source is cloned from `MIMIR_GIT_URL` (the upstream repository by default)
 and fetched from the required, fully qualified `MIMIR_GIT_REF`. The build requires
 the fetched commit to equal the full `MIMIR_EXECUTOR_COMMIT` SHA, so the ref makes
 GitHub pull-request merge commits reachable without becoming the source identity.
@@ -80,6 +84,12 @@ working-directory contents. `MIMIR_CONTROLLER_COMMIT` must be the same full SHA;
 an argument-less build or any mismatch fails with a named diagnostic. The SHA is retained in the OCI revision label and in
 `/opt/mimir-worklink/executor-source-commit`; `/health` reports it as
 `worklink_executor_source_commit`.
+
+In PyPI mode, `/health` reports matched installed distribution names, versions
+and retained wheel hashes instead of source SHAs (the historical source-commit
+fields are null). Missing, altered or mismatched archives or installed contents
+fail health closed. A source-era Cultivate deployment cannot be upgraded by the
+PyPI-only setup; use a new deployment directory and migrate operator data.
 
 Deployment wrappers must derive the controller SHA from the immutable source
 they deploy, not accept an operator's unverified description of a mutable

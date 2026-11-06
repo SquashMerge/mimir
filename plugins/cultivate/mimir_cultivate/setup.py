@@ -7,7 +7,6 @@ The Docker and GitHub boundaries are deliberately injectable for offline tests.
 from __future__ import annotations
 
 import argparse
-import ast
 import base64
 from datetime import datetime, timezone
 import getpass
@@ -32,10 +31,10 @@ import yaml
 from mimir._reasoning_effort import validate_effort
 
 from .repository import valid_repository_slug
+from .release_resolver import ReleaseError, resolve_release
 
 
 # Tool defaults are explicit; repository declarations take precedence.
-DEFAULT_SOURCE_REPO = "SquashMerge/mimir"
 DEFAULT_NEXTEST_VERSION = "0.9.148"
 DEFAULT_UV_VERSION = "0.11.0"
 DEFAULT_SAGA_MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5",
@@ -109,7 +108,6 @@ _LINEAR_KEY_HELP = (
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]*")
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*")
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
-_SHA = re.compile(r"[0-9a-f]{40}")
 _DEBIAN_PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]+(?:=[0-9][A-Za-z0-9.+:~-]*)?")
 _ALERT_ENV_KEYS = frozenset({"MIMIR_OPERATOR_ALERT_CHANNEL", "DISCORD_TOKEN", "SLACK_BOT_TOKEN",
                             "SLACK_APP_TOKEN", "MIMIR_DISCORD_ALLOWED_CHANNELS",
@@ -165,7 +163,7 @@ def _license_gate(args: argparse.Namespace) -> None:
 def validate(name: str, value: str) -> str:
     """Validate fields before any side effect or command interpolation."""
     value = value.strip()
-    if name in {"repo", "source_repo"}:
+    if name == "repo":
         ok = valid_repository_slug(value) and all(p not in {".", ".."} for p in value.split("/"))
     elif name in {"bot_login", "owner", "display_name"}:
         ok = bool(_NAME.fullmatch(value)) if name != "display_name" else bool(value) and "\n" not in value
@@ -195,8 +193,6 @@ def validate(name: str, value: str) -> str:
         ok = bool(value) and "\n" not in value and "\r" not in value
     elif name == "port":
         ok = value.isdigit() and 1 <= int(value) <= 65535
-    elif name == "source_ref":
-        ok = bool(re.fullmatch(r"refs/(heads|tags)/[A-Za-z0-9_./-]+", value)) and ".." not in value
     else:
         ok = bool(value) and not any(c in value for c in "\r\n\0")
     if not ok:
@@ -566,132 +562,63 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
-    """Recover the original image from the saved build, including legacy installs."""
-    build = deploy / "build.sh"
-    if not build.is_file() or build.is_symlink():
-        return None
-    text = build.read_text()
-    root = re.search(r"(?m)^docker build -t mimir-cultivate-root:([0-9a-f]{40}) ", text)
-    layer = re.search(r"(?m)^docker build -t (mimir-cultivate-agent:([0-9a-f]{40})-[a-z0-9-]+) -f Dockerfile\.toolchain \.\s*$", text)
-    if not root or not layer or root.group(1) != layer.group(2):
-        return None
-    sha, tag = root.group(1), layer.group(1)
-    if (previous.get("source_sha", sha) != sha or previous.get("layer_tag", tag) != tag):
-        return None
-    return sha, tag
-
-
-def _previous_provision_compose(source: str, constants: dict[str, object]) -> str:
-    """Recover the pinned provision override without executing historical setup."""
-    if "_PROVISION_COMPOSE" in constants:
-        value = constants["_PROVISION_COMPOSE"]
-        if not isinstance(value, str):
-            raise ValueError("Invalid provision Compose constant")
-        return value
-
-    # Before the constant existed, setup wrote this literal inline. Match the
-    # exact writer and destination, not a coincidentally named string elsewhere.
-    values = []
-    for function in ast.parse(source).body:
-        if not isinstance(function, ast.FunctionDef) or function.name != "setup":
-            continue
-        for node in ast.walk(function):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == "_write" and len(node.args) >= 2):
-                continue
-            destination = node.args[0]
-            if not (isinstance(destination, ast.BinOp) and isinstance(destination.op, ast.Div)
-                    and isinstance(destination.left, ast.Name) and destination.left.id == "deploy"
-                    and isinstance(destination.right, ast.Constant)
-                    and destination.right.value == "compose.provision.yml"):
-                continue
-            value = ast.literal_eval(node.args[1])
-            if not isinstance(value, str):
-                raise ValueError("Invalid inline provision Compose template")
-            values.append(value)
-    if len(values) != 1:
-        raise ValueError("Missing or ambiguous inline provision Compose template")
-    return values[0]
-
-
-def _previous_generated(source_repo: str, token: str, old_image: tuple[str, str],
-                        previous: dict, port: int, request) -> dict[str, str]:
-    """Render legacy files with the pinned source that originally produced them."""
-    sha, layer_tag = old_image
-    error = (f"Cannot recover previous generated templates for {sha}; "
-             "restore that source commit or reconcile the deployment before retrying.")
-    try:
-        setup_source = _content(source_repo, sha, "plugins/cultivate/mimir_cultivate/setup.py", token, request)
-        scaffold_source = _content(source_repo, sha, "mimir/scaffold_docker.py", token, request)
-    except SetupError:
-        raise SetupError(error) from None
-    if setup_source is None or scaffold_source is None:
-        raise SetupError(error)
+def _image_identity(version: str, wheels: dict) -> str:
+    from packaging.version import Version, InvalidVersion
 
     try:
-        def extract(source: str, names: set[str]) -> tuple[dict[str, object], dict[str, ast.FunctionDef]]:
-            constants = {}
-            functions = {}
-            for node in ast.parse(source).body:
-                if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                    for target in targets:
-                        if isinstance(target, ast.Name) and target.id in names:
-                            constants[target.id] = ast.literal_eval(node.value)
-                elif isinstance(node, ast.FunctionDef) and node.name in names:
-                    functions[node.name] = node
-            return constants, functions
-
-        setup_constants, setup_functions = extract(setup_source, {"_PROVISION", "_PROVISION_COMPOSE", "render_compose"})
-        scaffold_constants, scaffold_functions = extract(scaffold_source, {
-            "_COMPOSE_YML_TEMPLATE_PYPI", "_DEFAULT_MODE", "_MODES", "render_compose_yml"})
-        provision = setup_constants["_PROVISION"]
-        provision_compose = _previous_provision_compose(setup_source, setup_constants)
-        template = scaffold_constants["_COMPOSE_YML_TEMPLATE_PYPI"]
-        if not all(isinstance(value, str) for value in (provision, provision_compose, template)):
+        if not version or str(Version(version)) != version:
             raise ValueError
-        # Compile only the two pinned renderers, never the modules' top-level code.
-        namespace = {"re": re, "yaml": yaml, "SetupError": SetupError, **scaffold_constants}
-        for function in (setup_functions["render_compose"], scaffold_functions["render_compose_yml"]):
-            module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-                                      function], type_ignores=[])
-            exec(compile(ast.fix_missing_locations(module), f"{sha}:renderer", "exec"), namespace)
-        compose = namespace["render_compose_yml"](service_name="agent", web_port=port, mode="pypi")
-        compose = namespace["render_compose"](compose, layer_tag, previous["toolchain"], previous["slug"].split("/")[1])
-        return {"compose.yml": compose, "provision.py": provision,
-                "compose.provision.yml": provision_compose, ".gitignore": "*\n"}
-    except (KeyError, IndexError, NameError, SyntaxError, TypeError, ValueError, SetupError):
-        raise SetupError(error) from None
+        for name in ("mimir-agent", "mimir-cultivate"):
+            wheel = wheels[name]
+            if (not isinstance(wheel, dict) or
+                    not re.fullmatch(r"[0-9a-f]{64}", wheel["sha256"]) or
+                    not re.fullmatch(r"[A-Za-z0-9_.!+\-]+\.whl", wheel["filename"])):
+                raise ValueError
+    except (InvalidVersion, ValueError, TypeError, KeyError):
+        raise SetupError("Invalid PyPI wheel identity in manifest.json; reconcile it before retrying.") from None
+    label = re.sub(r"[^A-Za-z0-9_-]", "-", version)
+    return (label[:70] + "-" + wheels["mimir-agent"]["sha256"][:16] + "-" +
+            wheels["mimir-cultivate"]["sha256"][:16])
+
+
+def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
+    """Accept only a previously recorded, immutable PyPI wheel pair."""
+    build = deploy / "build.sh"
+    if not build.is_file() or build.is_symlink() or previous.get("mimir_install_mode") != "pypi":
+        return None
+    version = previous.get("mimir_version")
+    wheels = previous.get("wheels")
+    tag = previous.get("layer_tag")
+    if not isinstance(version, str) or not isinstance(wheels, dict) or not isinstance(tag, str):
+        return None
+    try:
+        identity = _image_identity(version, wheels)
+    except SetupError:
+        return None
+    if (tag != f"mimir-cultivate-agent:{identity}-{previous.get('toolchain', '')}{str(previous.get('toolchain_version', '')).replace('.', '-')}"
+            or f"MIMIR_VERSION={version}" not in build.read_text()
+            or any(wheels[name]["sha256"] not in build.read_text() for name in ("mimir-agent", "mimir-cultivate"))):
+        return None
+    return identity, tag
 
 
 def _check_generated(deploy: Path, generated: dict[str, str], previous: dict,
-                     old_image: tuple[str, str] | None, *, force: bool,
-                     source_repo: str, token: str, request) -> None:
+                     *, force: bool) -> None:
     """Validate *all* owned files before replacing any of them."""
     hashes = previous.get("generated_sha256")
     if hashes is not None and (not isinstance(hashes, dict) or
                                any(not isinstance(hashes.get(name), str) or
                                    not re.fullmatch(r"[0-9a-f]{64}", hashes[name]) for name in generated)):
         raise SetupError("Invalid generated file hashes in manifest.json; reconcile it before retrying.")
-    legacy = {}
-    if hashes is None and (deploy / "compose.yml").exists() and not force:
-        if old_image is None:
-            raise SetupError("Cannot verify previous generated files; reconcile build.sh before retrying.")
-        compose_path = deploy / "compose.yml"
-        content = compose_path.read_text()
-        match = re.search(r"127\.0\.0\.1:(\d+):8080", content)
-        if not match:
-            raise SetupError(f"{compose_path} already differs; reconcile it manually before retrying.")
-        legacy = _previous_generated(source_repo, token, old_image, previous, int(match.group(1)), request)
+    if hashes is None and (deploy / "compose.yml").exists():
+        raise SetupError("Previous generated file hashes are missing; choose a new deployment directory.")
     for name, text in generated.items():
         path = deploy / name
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise SetupError(f"Refusing non-regular deployment file {path}; move it aside and retry.")
         if path.exists() and not force:
             content = path.read_text()
-            trusted = (_digest(content) == hashes[name] if hashes is not None else
-                       content == legacy.get(name) if legacy else True)
+            trusted = hashes is None or _digest(content) == hashes[name]
             if not trusted:
                 raise SetupError(f"{path} already differs; reconcile it manually before retrying.")
         elif hashes is not None and not force:
@@ -1458,10 +1385,9 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("worklink-gate", "Worklink gate mode: local (default) or ci; omit to preserve the saved mode."),
         ("quick-gate-command", "Optional quick verification command for ci mode; omit to preserve the saved command."),
         ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
-        ("source-ref", "Pushed Mimir source ref (default: refs/heads/feature/plugins)."),
-        ("source-repo", "Mimir source owner/name (default: " + DEFAULT_SOURCE_REPO + ")."),
     ):
         setup.add_argument("--" + name, help=help_text)
+    setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate (default: latest common stable, then prerelease).")
     for name in ("github-token", "model-key", "saga-model-key", "embedding-key"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
@@ -1503,9 +1429,9 @@ def dispatch(args: argparse.Namespace) -> int:
         return 2
     try:
         setup(args)
-    except (SetupError, OSError, subprocess.TimeoutExpired) as exc:
+    except (SetupError, ReleaseError, OSError, subprocess.TimeoutExpired) as exc:
         # Never interpolate arbitrary third-party exception text: it may contain secrets.
-        message = str(exc) if isinstance(exc, SetupError) else "I/O timed out or failed; check deployment permissions and retry."
+        message = str(exc) if isinstance(exc, (SetupError, ReleaseError)) else "I/O timed out or failed; check deployment permissions and retry."
         print(f"setup: {message}", file=sys.stderr)
         return 1
     return 0
@@ -1541,6 +1467,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Cannot read previous settings from manifest.json; reconcile it before retrying.") from None
     if not isinstance(previous, dict):
         raise SetupError("Invalid manifest.json; reconcile it before retrying.")
+    if previous and previous.get("mimir_install_mode") != "pypi":
+        raise SetupError("Source-era Cultivate deployments cannot be upgraded, even with --force; create a new --deploy directory and migrate operator data explicitly.")
     trackers, tracker_settings = _tracker_settings(args, previous)
     if getattr(args, "auto_review", None) is None and "auto_review" in previous:
         if not isinstance(previous["auto_review"], str):
@@ -1616,13 +1544,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     elif embedding_key_env and embedding_key_env not in extra_keys:
         extra_keys[embedding_key_env] = _secret(args, "embedding_key", "Embedding API key (input hidden).",
                                                  previous=prior.get(embedding_key_env))
-    source_ref = _field(args, "source_ref", "Mimir source ref: a pushed branch or tag on the canonical GitHub repository.", default="refs/heads/feature/plugins")
-    source_repo = _field(args, "source_repo", "Mimir source owner/name: canonical repo or a trusted fork.", default=DEFAULT_SOURCE_REPO)
-    source_url = "https://github.com/" + source_repo + ".git"
-    status, source = request("https://api.github.com/repos/" + source_repo + "/git/ref/" + source_ref[5:], token)
-    if status != 200 or not isinstance(source, dict) or not _SHA.fullmatch(str(source.get("object", {}).get("sha", ""))):
-        raise SetupError("Cannot verify a pushed full Mimir source SHA from --source-ref; push the ref and retry.")
-    sha = source["object"]["sha"]
+    release = resolve_release(getattr(args, "mimir_version", None))
+    mimir_version = release.version
+    wheels = {wheel.name: {"filename": wheel.filename, "sha256": wheel.sha256}
+              for wheel in (release.agent, release.cultivate)}
+    identity = _image_identity(mimir_version, wheels)
     files = {name: _content(repo, branch, name, token, request) for name in
              ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version",
               ".github/workflows/rust.yml", ".github/workflows/ci.yml")}
@@ -1647,20 +1573,29 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     old_image = _previous_image(deploy, previous) if compose_path.is_file() else None
     if compose_path.is_file() and old_image is None:
         raise SetupError("Cannot identify previous agent image from build.sh; reconcile it before retrying.")
-    tag = "mimir-cultivate-root:" + sha
-    layer_tag = "mimir-cultivate-agent:" + sha + "-" + kind + version.replace(".", "-")
+    tag = "mimir-cultivate-root:" + identity
+    layer_tag = "mimir-cultivate-agent:" + identity + "-" + kind + version.replace(".", "-")
     extras = {provider, saga_provider, "mcp", "local-embeddings"}
     if alert_adapter in {"discord", "slack"}:
         extras.add(alert_adapter)
-    build_args = ["--build-arg MIMIR_GIT_REF=" + source_ref,
-                  "--build-arg MIMIR_CONTROLLER_COMMIT=" + sha,
-                  "--build-arg MIMIR_EXECUTOR_COMMIT=" + sha,
+    build_args = ["--build-arg MIMIR_INSTALL_MODE=pypi", "--build-arg MIMIR_VERSION=" + mimir_version,
+                  "--build-arg MIMIR_AGENT_WHEEL=" + wheels["mimir-agent"]["filename"],
+                  "--build-arg MIMIR_CULTIVATE_WHEEL=" + wheels["mimir-cultivate"]["filename"],
+                  "--build-arg MIMIR_AGENT_SHA256=" + release.agent.sha256,
+                  "--build-arg MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256,
                   "--build-arg MIMIR_PLUGIN_SELECTION=cultivate",
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
-                   "--build-arg MIMIR_EXTRAS=" + ",".join(sorted(extras))]
-    build_script = ("#!/bin/sh\nset -eu\n"
-                    + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
+                  "--build-arg MIMIR_EXTRAS=" + ",".join(sorted(extras))]
+    build_script = ("#!/bin/sh\nset -eu\ncd \"$(dirname \"$0\")\n"
+                    + "context=$(mktemp -d)\ntrap 'rm -rf \"$context\"' EXIT HUP INT TERM\n"
+                    + "python -c 'from pathlib import Path; from mimir.plugin_dockerfile import build_pypi_context; "
+                    + "build_pypi_context(Path(__import__(\"sys\").argv[1]), agent_wheel=Path(__import__(\"sys\").argv[2]), "
+                    + "cultivate_wheel=Path(__import__(\"sys\").argv[3]), version=__import__(\"sys\").argv[4], "
+                    + "agent_sha256=__import__(\"sys\").argv[5], cultivate_sha256=__import__(\"sys\").argv[6])' "
+                    + '"$context" ' + '"wheels/' + release.agent.filename + '" "wheels/' + release.cultivate.filename
+                    + '" "' + mimir_version + '" "' + release.agent.sha256 + '" "' + release.cultivate.sha256 + '"\n'
+                    + "docker build -t " + tag + " " + " ".join(build_args) + ' "$context"\n'
                     + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n")
     from mimir.scaffold_docker import render_compose_yml
 
@@ -1668,22 +1603,34 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # service/volumes rather than its pypi installation build path.
     compose = render_compose_yml(service_name="agent", web_port=port, mode="pypi")
     codex = provider == "codex-plus" or saga_provider == "codex-plus"
-    compose = render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex)
+    provenance = ("# MIMIR_INSTALL_MODE=pypi MIMIR_VERSION=" + mimir_version + " MIMIR_AGENT_SHA256="
+                  + release.agent.sha256 + " MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256 + "\n")
+    compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex)
     generated = {"compose.yml": compose, ".gitignore": "*\n",
-                 "provision.py": _PROVISION, "compose.provision.yml": _PROVISION_COMPOSE}
-    _check_generated(deploy, generated, previous, old_image, force=bool(getattr(args, "force", False)),
-                     source_repo=source_repo, token=token, request=request)
+                 "provision.py": _PROVISION, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
+    _check_generated(deploy, generated, previous, force=bool(getattr(args, "force", False)))
     # Query the old running container before publishing the new Compose image.
     was_running = bool(run(["docker", "compose", "ps", "-q", "agent"], cwd=deploy)) if old_image else False
     if was_running and not getattr(args, "force", False):
         _check_in_flight(deploy, run)
-    if old_image and old_image[0] != sha:
-        print(f"Upgrading {old_image[0]} -> {sha}")
+    if old_image and old_image[0] != identity:
+        print(f"Upgrading {previous['mimir_version']} -> {mimir_version}")
     deploy.mkdir(parents=True, exist_ok=True)
     deploy.chmod(0o700)
     if codex:
         _codex_directory(deploy)
         print("Codex subscription login (use this deployment only): " + _codex_login_command(deploy))
+    wheel_dir = deploy / "wheels"
+    wheel_dir.mkdir(exist_ok=True)
+    for wheel in (release.agent, release.cultivate):
+        path = wheel_dir / wheel.filename
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SetupError("Deployment wheel path is not a regular file; move it aside and retry.")
+        if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() != wheel.sha256 and not getattr(args, "force", False):
+            raise SetupError("Deployment wheel differs from the verified PyPI release; reconcile it before retrying.")
+        if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != wheel.sha256:
+            path.write_bytes(wheel.data)
+        path.chmod(0o600)
     # The layer and build script are wholly generated from setup inputs.
     _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
            nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
@@ -1719,7 +1666,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                    "previous_saga_model_spec": previous.get("saga_model_spec"),
                    "system_packages": system_packages,
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
-                   "source_sha": sha, "layer_tag": layer_tag,
+                    "mimir_install_mode": "pypi", "mimir_version": mimir_version, "wheels": wheels,
+                    "toolchain_version": version, "layer_tag": layer_tag,
                    "generated_sha256": {name: _digest(text) for name, text in generated.items()}}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     # The provision script and manifest are mounted read-only for a one-shot
@@ -1734,12 +1682,19 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
             # Do not interpolate subprocess output (including compose.env values).
             raise SetupError(f"Docker {step} failed; inspect the deployment and docker compose logs.") from None
 
-    print(f"Building pushed Mimir commit {sha} ({source_ref})")
-    docker_step("build", ["docker", "build", "-t", tag, "--build-arg", "MIMIR_GIT_REF=" + source_ref,
-          "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
-          "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
-          "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
-           "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted(extras)), source_url + "#" + sha])
+    print(f"Building verified PyPI Mimir {mimir_version}")
+    from mimir.plugin_dockerfile import build_pypi_context
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="cultivate-build-") as temporary:
+        context = Path(temporary) / "context"
+        try:
+            build_pypi_context(context, agent_wheel=wheel_dir / release.agent.filename,
+                               cultivate_wheel=wheel_dir / release.cultivate.filename,
+                               version=mimir_version, agent_sha256=release.agent.sha256,
+                               cultivate_sha256=release.cultivate.sha256)
+        except (ValueError, OSError) as exc:
+            raise SetupError("Cannot assemble verified wheel Docker context; check released wheel resources.") from None
+        docker_step("build", ["docker", "build", "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)])
     docker_step("build", ["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."])
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])
     if was_running:

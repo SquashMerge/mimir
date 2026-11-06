@@ -147,3 +147,19 @@ def test_repository_scan_discovers_new_script_workflow_and_doc(tmp_path):
     found = {path.relative_to(tmp_path).as_posix() for path in _build_sources(tmp_path)
              if _missing_arg_units(path.read_text(), path.suffix)}
     assert found == set(paths)
+
+
+def test_operator_setup_build_invocations_are_closed_pypi_only():
+    source = (ROOT / 'plugins/cultivate/mimir_cultivate/setup.py').read_text()
+    tree = ast.parse(source)
+    setup = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'setup')
+    literal_values = {node.value for node in ast.walk(setup)
+                      if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+    assert '--build-arg MIMIR_INSTALL_MODE=pypi' in literal_values
+    assert 'CHAINLINK_ARTIFACT_STAGE=chainlink-build' in ' '.join(literal_values)
+    assert not any(value.startswith(('MIMIR_GIT_REF=', 'MIMIR_CONTROLLER_COMMIT=',
+                                     'MIMIR_EXECUTOR_COMMIT=', 'MIMIR_GIT_URL=')) for value in literal_values)
+    assert 'build_pypi_context' in {node.id for node in ast.walk(setup) if isinstance(node, ast.Name)}
+    parser = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'add_argparse')
+    assert '--mimir-version' in {node.value for node in ast.walk(parser)
+                                 if isinstance(node, ast.Constant) and isinstance(node.value, str)}
