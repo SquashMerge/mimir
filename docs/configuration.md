@@ -643,7 +643,7 @@ Each repository can declare `test_suites` (default `[]`) in
 |---|---|---|---|
 | `name` | str | required | Unique suite name matching `[A-Za-z0-9][A-Za-z0-9_.-]*`. The name `default` is reserved when the repository has a non-null `test_command`. |
 | `command` | str | one of `command` or `legs` required | Non-empty, operator-configured test command, POSIX-split into fixed arguments. |
-| `legs` | list[leg] | one of `command` or `legs` required | Non-empty ordered list of named legs; stops at the first failed leg. Each leg's `command` is shell-free. |
+| `legs` | list[leg] | one of `command` or `legs` required | Ordered list of 1–4 named legs; stops at the first failed leg. Each leg's `command` is shell-free. |
 | `default` | bool | `false` | Select this suite when neither a suite name nor selectors are supplied. At most one suite may set `default: true`. |
 | `selector_prefixes` | list[str] | `[]` | Non-empty literal prefixes used to route selector paths to this suite. |
 | `selector_suffixes` | list[str] | `[]` | Non-empty literal suffixes used to route selector paths to this suite. |
@@ -697,7 +697,12 @@ and ambient environment cannot add variables. Selectors are validated and
 appended to **every** leg; a leg's `default_paths` are used only when no
 selectors are given. All paths must exist in the authorized checkout. Results
 include bounded per-leg output and pytest summaries, plus `failed_leg` on
-failure. The single-`command` form retains its existing behavior.
+failure. All legs share one configured `repo_test` timeout, measured from the
+first leg's start; subsequent legs receive only the remaining budget. Exhaustion
+returns `test_timeout` with `failed_leg` naming the timed-out leg (or the next
+leg if the budget expired before it could start). More than four legs is a
+`test_config_invalid` refusal before execution. The single-`command` form
+retains its existing behavior.
 
 `repo_test` resolves the command and suite as follows:
 

@@ -236,8 +236,8 @@ def _parse_test_suites(
         legs: list[RepositoryTestLeg] = []
         if "legs" in item:
             entries = item["legs"]
-            if not isinstance(entries, list) or not entries:
-                raise ValueError(f"{suite_label}.legs must be a non-empty list")
+            if not isinstance(entries, list) or not 1 <= len(entries) <= 4:
+                raise ValueError(f"{suite_label}.legs must contain between 1 and 4 legs")
             leg_names: set[str] = set()
             for leg_index, entry in enumerate(entries):
                 leg_label = f"{suite_label}.legs[{leg_index}]"
@@ -4767,18 +4767,30 @@ class RepoProjectTests:
                              stdout_relative, stderr_relative))
         result: CollectedExecutionResult | None = None
         leg_summaries: list[dict[str, object]] = []
+        deadline: float | None = None
         try:
             for leg, paths, prepared_leg in zip(legs, paths_by_leg, prepared):
                 (command, environment, identifier, stdout_path, stderr_path,
                  stdout_relative, stderr_relative) = prepared_leg
                 try:
                     try:
-                        result = await self._runner(
-                            (*command, *paths), checkout.capability, environment, (),
-                            identifier=identifier, timeout_s=self._timeout,
-                            stdout_limit=self._output_limit, stderr_limit=self._output_limit,
-                            scrubber=scrubber, stdout_path=stdout_path, stderr_path=stderr_path,
-                        )
+                        # All legs share one budget, starting at the first run.
+                        # Keep the single-command timeout unchanged.
+                        if deadline is None:
+                            remaining = self._timeout
+                            deadline = time.monotonic() + remaining
+                        else:
+                            remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            # Never launch another worker with an expired budget.
+                            result = CollectedExecutionResult(None, b"", b"", True, False, 0, 0)
+                        else:
+                            result = await self._runner(
+                                (*command, *paths), checkout.capability, environment, (),
+                                identifier=identifier, timeout_s=remaining,
+                                stdout_limit=self._output_limit, stderr_limit=self._output_limit,
+                                scrubber=scrubber, stdout_path=stdout_path, stderr_path=stderr_path,
+                            )
                     except StaleWorkerExecutorError as exc:
                         await safe_log_event(
                             "repo_test_containment_refused", reason_code="stale_root_executor",

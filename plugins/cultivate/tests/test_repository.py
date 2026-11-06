@@ -510,6 +510,83 @@ async def test_repo_test_legs_stop_at_first_failure(tmp_path: Path, monkeypatch:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_elapsed", [6.0, 10.0, 11.0])
+async def test_repo_test_legs_share_timeout_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_elapsed: float,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, test_suites=_two_leg_suites("/usr/bin/true"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (state.checkout_lease.path / "tests").mkdir()
+    (state.checkout_lease.path / "plugins/cultivate/tests").mkdir(parents=True)
+    now = [100.0]
+    # Replace only this module's clock, not asyncio's process-global clock.
+    monkeypatch.setattr(repository, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    timeouts = []
+
+    async def runner(argv, *args, timeout_s, **kwargs):
+        timeouts.append(timeout_s)
+        elapsed = first_elapsed if len(timeouts) == 1 else 6.0
+        now[0] += min(elapsed, timeout_s)
+        timed_out = len(timeouts) > 1 and elapsed > timeout_s
+        return CollectedExecutionResult(
+            None if timed_out else 0, b"", b"", timed_out, False, 0, 0,
+        )
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory, timeout=10.0,
+    ).execute()
+    assert timeouts == ([10.0, 4.0] if first_elapsed == 6.0 else [10.0])
+    assert not result.ok and result.code == "test_timeout"
+    assert result.failed_leg == "cultivate"
+    assert [leg["name"] for leg in result.legs] == ["core", "cultivate"]
+    assert [leg["timed_out"] for leg in result.legs] == [False, True]
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leg_count", [4, 5])
+async def test_repo_test_legs_count_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leg_count: int,
+) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    suites = [{"name": "python", "default": True, "legs": [
+        {"name": f"leg-{index}", "command": "/usr/bin/true"}
+        for index in range(leg_count)
+    ]}]
+    _configure_test_suites(home, state, test_suites=suites)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    calls = []
+
+    async def runner(*args, **kwargs):
+        calls.append(args)
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    def checkout(*args, **kwargs):
+        assert leg_count == 4, "over-limit suites must refuse before creating a checkout"
+        return _test_checkout_factory(*args, **kwargs)
+
+    executor = repository.RepoProjectTests(state, runner=runner, checkout_factory=checkout)
+    if leg_count == 5:
+        with pytest.raises(repository.ProjectTestRefusal) as error:
+            await executor.execute()
+        assert error.value.code == "test_config_invalid" and not error.value.execution_started
+        assert calls == [] and state.full_tested_head is None
+    else:
+        result = await executor.execute()
+        assert result.ok and len(result.legs) == len(calls) == 4
+        assert result.failed_leg is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("env", [
     {"UNLISTED": "cultivate"}, {"PATH": "safe"},
     {"MIMIR_PLUGINS": "cultivate;id"}, {"MIMIR_PLUGINS": "a" * 65},
