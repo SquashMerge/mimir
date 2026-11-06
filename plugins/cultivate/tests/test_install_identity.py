@@ -5,6 +5,9 @@ import csv
 import hashlib
 import io
 import json
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 import zipfile
 
@@ -55,6 +58,107 @@ def installed_pair(tmp_path):
     declared = {"mode": "pypi", "distributions": pair}
     marker.write_text(json.dumps(declared))
     return marker, wheels, site, declared
+
+
+@pytest.fixture
+def installed_wheels(tmp_path):
+    """Install built wheels into an isolated venv using the production installer."""
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    for name in identity.PROJECTS:
+        project = tmp_path / name
+        project.mkdir()
+        module = name.replace("-", "_")
+        (project / module).mkdir()
+        (project / module / "__init__.py").write_text("def main():\n    return 0\n")
+        script = (f'\n[project.scripts]\nmimir = "{module}:main"\n'
+                  f'mimir-agent = "{module}:main"\n') if name == "mimir-agent" else ""
+        (project / "pyproject.toml").write_text(
+            f'[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n'
+            f'\n[project]\nname = "{name}"\nversion = "1.2"\n{script}'
+        )
+        subprocess.run(["uv", "build", "--wheel", "--out-dir", str(wheels), str(project)], check=True)
+    venv = tmp_path / "venv"
+    subprocess.run(["uv", "venv", "--python", sys.executable, str(venv)], check=True)
+    python = venv / "bin/python"
+    subprocess.run(["uv", "pip", "install", "--python", str(python), "--no-deps",
+                    *(str(wheel) for wheel in sorted(wheels.glob("*.whl")))], check=True)
+    site = Path(subprocess.check_output([str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
+    pair = {name: {"version": "1.2", "wheel": wheel.name,
+                   "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()}
+            for name in identity.PROJECTS
+            for wheel in wheels.glob(f"{name.replace('-', '_')}-*.whl")}
+    declared = {"mode": "pypi", "distributions": pair}
+    marker = tmp_path / "identity.json"
+    marker.write_text(json.dumps(declared))
+    return marker, wheels, site, declared
+
+
+def test_installed_wheel_scripts_are_verified(installed_wheels):
+    marker, wheels, site, declared = installed_wheels
+    record = site / "mimir_agent-1.2.dist-info/RECORD"
+    assert "../../../bin/mimir" in record.read_text()
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site) == declared
+    script = site.parents[2] / "bin/mimir"
+    script.write_text("tampered\n")
+    with pytest.raises(identity.InstallIdentityError, match="console script drift"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site)
+
+
+def test_installed_wheel_requires_each_generated_script(installed_wheels):
+    marker, wheels, site, _ = installed_wheels
+    record = site / "mimir_agent-1.2.dist-info/RECORD"
+    rows = list(csv.reader(io.StringIO(record.read_text())))
+    with record.open("w") as stream:
+        csv.writer(stream).writerows(row for row in rows if row[0] != "../../../bin/mimir-agent")
+    with pytest.raises(identity.InstallIdentityError, match="console script missing"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site)
+
+
+@pytest.mark.parametrize("entry", ["../../../bin/other", "../../../../bin/mimir", "../../../bin/../bin/mimir"])
+def test_installed_wheel_rejects_unrelated_parent_paths(installed_wheels, entry):
+    marker, wheels, site, _ = installed_wheels
+    with (site / "mimir_agent-1.2.dist-info/RECORD").open("a") as record:
+        record.write(f"{entry},,\n")
+    with pytest.raises(identity.InstallIdentityError, match="unsafe wheel RECORD path"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site)
+
+
+@pytest.mark.asyncio
+async def test_real_installed_pair_http_health(installed_wheels, tmp_path, monkeypatch):
+    marker, wheels, site, declared = installed_wheels
+    controller_marker = tmp_path / identity.CONTROLLER_MARKER
+    controller_marker.write_bytes(marker.read_bytes())
+    monkeypatch.setattr(cultivate_server.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(identity, "controller_identity",
+                        lambda: identity.verify_install_identity(controller_marker, wheels=wheels, site=site))
+    socket = tmp_path / "executor.sock"
+    socket.touch()
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
+
+    async def executor():
+        return identity.verify_install_identity(marker, wheels=wheels, site=site)
+
+    monkeypatch.setattr(worker_client, "verify_executor_identity", executor)
+    monkeypatch.setattr(core_server, "_server_hooks", lambda policy, kind: {
+        "capture_source": (cultivate_server.capture_controller_source_commit,),
+        "health": (cultivate_server.executor_health,),
+    }.get(kind, ()))
+    app = web.Application()
+    app["plugin_manager"] = SimpleNamespace(policy=None, plugins=())
+    app["check_worker_executor_health"] = True
+    app.on_startup.append(core_server._capture_controller_source_commit)
+    app.router.add_get("/health", core_server._handle_health)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/health")
+        assert response.status == 200
+        assert (await response.json())["worklink_controller_distributions"] == declared["distributions"]
+        (site.parents[2] / "bin/mimir").write_text("tampered\n")
+        response = await client.get("/health")
+        body = await response.json()
+        assert response.status == 503
+        assert body["ok"] is False
+        assert body["worklink_install_status"] == "mismatched"
 
 
 def test_verified_pair_requires_archives_and_installed_record(installed_pair):

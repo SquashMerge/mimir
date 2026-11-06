@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import configparser
 import csv
 import hashlib
 import importlib.metadata as metadata
@@ -21,6 +22,7 @@ PROJECTS = ("mimir-agent", "mimir-cultivate")
 CONTROLLER_MARKER = "controller-install-identity.json"
 EXECUTOR_MARKER = Path("/opt/mimir-worklink/executor-install-identity.json")
 WHEEL_DIR = Path("/opt/mimir-worklink/wheels")
+CONSOLE_SCRIPTS = {"mimir-agent": frozenset({"mimir", "mimir-agent"}), "mimir-cultivate": frozenset()}
 
 
 class InstallIdentityError(RuntimeError):
@@ -35,13 +37,13 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _record(contents: str) -> dict[str, tuple[str, str]]:
+def _record(contents: str, *, scripts: frozenset[str] = frozenset()) -> dict[str, tuple[str, str]]:
     entries: dict[str, tuple[str, str]] = {}
     for row in csv.reader(io.StringIO(contents)):
         if len(row) != 3 or row[0] in entries or not row[0]:
             raise InstallIdentityError("invalid wheel RECORD")
         path = PurePosixPath(row[0])
-        if path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        if path.is_absolute() or (".." in path.parts and row[0] not in scripts):
             raise InstallIdentityError("unsafe wheel RECORD path")
         entries[row[0]] = row[1], row[2]
     return entries
@@ -99,7 +101,6 @@ def _verify_distribution(name: str, identity: object, wheels: Path, site: Path) 
         installed_record = next((file for file in dist.files or () if str(file).endswith(".dist-info/RECORD")), None)
         if installed_record is None:
             raise InstallIdentityError(f"{name} installed RECORD missing")
-        installed = _record(dist.locate_file(installed_record).read_text(encoding="utf-8"))
         with zipfile.ZipFile(archive) as wheel:
             records = [entry for entry in wheel.namelist() if entry.endswith(".dist-info/RECORD")]
             if len(records) != 1 or len(wheel.namelist()) != len(set(wheel.namelist())):
@@ -108,14 +109,34 @@ def _verify_distribution(name: str, identity: object, wheels: Path, site: Path) 
             if set(recorded) != set(wheel.namelist()):
                 raise InstallIdentityError(f"{name} wheel RECORD inventory mismatch")
             prefix = records[0].removesuffix("RECORD")
-            allowed = {records[0], prefix + "INSTALLER", prefix + "REQUESTED", prefix + "direct_url.json"}
+            scripts: frozenset[str] = frozenset()
+            entry_points = prefix + "entry_points.txt"
+            if entry_points in recorded:
+                config = configparser.ConfigParser(interpolation=None)
+                config.optionxform = str
+                config.read_string(wheel.read(entry_points).decode("utf-8"))
+                declared = set(config["console_scripts"]) if config.has_section("console_scripts") else set()
+                scripts = frozenset(f"../../../bin/{script}" for script in declared & CONSOLE_SCRIPTS[name])
+            installed = _record(dist.locate_file(installed_record).read_text(encoding="utf-8"), scripts=scripts)
+            if not scripts <= installed.keys():
+                raise InstallIdentityError(f"{name} installed console script missing")
+            allowed = {records[0], prefix + "INSTALLER", prefix + "REQUESTED", prefix + "direct_url.json", prefix + "uv_cache.json"}
             for entry in recorded:
                 if entry.endswith(".py"):
                     path = PurePosixPath(entry)
                     tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
                     allowed.add(str(path.parent / "__pycache__" / f"{path.stem}.{tag}.pyc"))
-            if set(installed) - set(recorded) - allowed:
+            if set(installed) - set(recorded) - allowed - scripts:
                 raise InstallIdentityError(f"{name} unexpected installed RECORD entries")
+            for entry in scripts & installed.keys():
+                digest, size = installed[entry]
+                target = site.parents[2] / "bin" / entry.removeprefix("../../../bin/")
+                if not digest.startswith("sha256=") or not size.isdigit() or not stat.S_ISREG(target.lstat().st_mode):
+                    raise InstallIdentityError(f"{name} invalid installed console script")
+                data = target.read_bytes()
+                expected = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+                if digest != f"sha256={expected}" or int(size) != len(data):
+                    raise InstallIdentityError(f"{name} installed console script drift")
             for entry in wheel.namelist():
                 if entry == records[0]:
                     continue
@@ -131,7 +152,7 @@ def _verify_distribution(name: str, identity: object, wheels: Path, site: Path) 
                 target = site.joinpath(*PurePosixPath(entry).parts)
                 if not target.is_relative_to(site) or not stat.S_ISREG(target.lstat().st_mode) or _digest(target) != hashlib.sha256(data).hexdigest():
                     raise InstallIdentityError(f"{name} installed content drift")
-    except (OSError, ValueError, TypeError, KeyError, UnicodeError, csv.Error, zipfile.BadZipFile) as exc:
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, csv.Error, zipfile.BadZipFile, configparser.Error, IndexError) as exc:
         raise InstallIdentityError(f"{name} wheel or installed RECORD unreadable") from exc
 
 
