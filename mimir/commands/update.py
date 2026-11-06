@@ -87,11 +87,11 @@ def dispatch(args: argparse.Namespace) -> int:
         print("  (or restart the mimir process by hand for bare-metal)")
         return 0
 
-    from ..update_on_start import cultivate_source_install, cultivate_source_refusal
+    from ..update_on_start import cultivate_update_refusal
 
-    source = cultivate_source_install()
-    if source is not None:
-        print(f"Refusing to update: {cultivate_source_refusal(source)}.", file=sys.stderr)
+    refusal = cultivate_update_refusal()
+    if refusal is not None:
+        print(f"Refusing to update: {refusal[1]}.", file=sys.stderr)
         return 2
 
     # --apply path. Use python -m pip directly so this works regardless

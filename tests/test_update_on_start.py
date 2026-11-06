@@ -1347,6 +1347,46 @@ def test_apply_without_source_cultivate_still_installs(tmp_path, monkeypatch) ->
     assert len(exec_called) == 1
 
 
+@pytest.mark.parametrize("marker_contents", [
+    '{"mode":"pypi","distributions":{"mimir-agent":{},"mimir-cultivate":{}}}',
+    "{malformed",
+])
+def test_apply_refuses_cultivate_pair_before_pip(tmp_path, monkeypatch, marker_contents) -> None:
+    import mimir.update_on_start as uos
+
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    (tmp_path / "controller-install-identity.json").write_text(marker_contents)
+    monkeypatch.setattr(uos, "cultivate_source_install", lambda: None)
+    write_flag(tmp_path)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("pip must not run"))
+    events = []
+    exec_calls = []
+    assert apply_pending_update(tmp_path, lambda kind, **fields: events.append((kind, fields)),
+                                _exec=lambda *a: exec_calls.append(a)) is True
+    assert not flag_path(tmp_path).exists()
+    assert exec_calls == []
+    assert len(events) == 1
+    assert events[0][0] == "mimir_update_failed"
+    assert events[0][1]["reason"] == "cultivate_pypi_pair"
+    assert "rebuild the image" in events[0][1]["error"]
+
+
+@pytest.mark.parametrize("marker_contents", ["{\"mode\":\"pypi\"}", "invalid"])
+def test_cli_apply_refuses_cultivate_pair_before_pip(tmp_path, monkeypatch, capsys, marker_contents) -> None:
+    import argparse
+    from types import SimpleNamespace
+    from mimir.commands import update
+
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    (tmp_path / "controller-install-identity.json").write_text(marker_contents)
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: None)
+    monkeypatch.setattr("mimir.version_check.check_for_update", lambda **kw: SimpleNamespace(
+        error_msg=None, current="0.9.10", latest="9.0.0", is_newer=True))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("pip must not run"))
+    assert update.dispatch(argparse.Namespace(pre=False, apply=True, check=False)) == 2
+    assert "immutable Cultivate wheel pair" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("source", [None, "c" * 40])
 def test_cli_update_apply_refuses_only_source_cultivate(monkeypatch, capsys, source) -> None:
     import argparse
