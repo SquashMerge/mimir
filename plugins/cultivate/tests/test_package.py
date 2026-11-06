@@ -145,6 +145,52 @@ def test_released_wheels_supply_the_entire_local_docker_context(built_packages, 
         build_pypi_context(tmp_path / "rejected", **(arguments | {"agent_wheel": broken}))
 
 
+def test_resolved_released_pair_is_the_only_pair_accepted_by_image_context(built_packages, tmp_path) -> None:
+    """AC2/3/4: index bytes must survive resolution into the source-free build context."""
+    from mimir.plugin_dockerfile import build_pypi_context
+    from mimir_cultivate.release_resolver import resolve_release
+
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    archives = {project: next(path for name, path in built_packages.items()
+                              if name.startswith(project.replace("-", "_") + "-") and name.endswith(".whl"))
+                for project in ("mimir-agent", "mimir-cultivate")}
+    sources = {}
+    for project, archive in archives.items():
+        url = f"https://files.pythonhosted.org/packages/{archive.name}"
+        data = archive.read_bytes()
+        sources[url] = data
+        sources[f"https://pypi.org/pypi/{project}/json"] = json.dumps({"releases": {version: [{
+            "filename": archive.name, "url": url, "packagetype": "bdist_wheel",
+            "digests": {"sha256": hashlib.sha256(data).hexdigest()},
+        }]}}).encode()
+
+    selected = resolve_release(fetch=lambda url, limit: sources[url])
+    assert selected.version == version
+    wheel_paths = {}
+    for project, wheel in (("mimir-agent", selected.agent), ("mimir-cultivate", selected.cultivate)):
+        assert wheel.sha256 == hashlib.sha256(wheel.data).hexdigest()
+        wheel_paths[project] = tmp_path / wheel.filename
+        wheel_paths[project].write_bytes(wheel.data)
+    arguments = dict(agent_wheel=wheel_paths["mimir-agent"], cultivate_wheel=wheel_paths["mimir-cultivate"],
+                     version=selected.version, agent_sha256=selected.agent.sha256,
+                     cultivate_sha256=selected.cultivate.sha256)
+    context = tmp_path / "context"
+    build_pypi_context(context, **arguments)
+    retained = context / "plugins/cultivate/mimir_cultivate/docker/wheels"
+    assert (context / "Dockerfile").is_file()
+    assert {p.name for p in retained.iterdir()} == {selected.agent.filename, selected.cultivate.filename}
+    assert all((retained / wheel.filename).read_bytes() == wheel.data
+               for wheel in (selected.agent, selected.cultivate))
+
+    # Each distribution independently rejects bytes that disagree with the resolved index digest.
+    for project in wheel_paths:
+        original = wheel_paths[project].read_bytes()
+        wheel_paths[project].write_bytes(original + b"tampered")
+        with pytest.raises(ValueError, match="wheel identity mismatch"):
+            build_pypi_context(tmp_path / f"rejected-{project}", **arguments)
+        wheel_paths[project].write_bytes(original)
+
+
 def test_wheel_pair_verifies_both_installed_venvs_and_retained_archives(built_packages, tmp_path) -> None:
     import runpy
 
