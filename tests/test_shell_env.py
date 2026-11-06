@@ -708,12 +708,22 @@ def test_missing_declared_environment_surfaces_child_error(tmp_path, monkeypatch
     assert "refused" not in result
 
 
-def test_direct_exec_env_defaults_to_minimal_non_secret_environment(monkeypatch) -> None:
+@pytest.mark.parametrize("no_bytecode", [None, "1"], ids=["unset", "no-bytecode"])
+def test_direct_exec_env_defaults_to_minimal_non_secret_environment(
+    monkeypatch, no_bytecode: str | None,
+) -> None:
+    # Own both states: worker-UID CI and PyPI deployments set this policy,
+    # while source deployments may leave it unset.
+    if no_bytecode is None:
+        monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", no_bytecode)
     monkeypatch.setenv("PYTEST_ADDOPTS", "-q")
     monkeypatch.setenv("PYTEST_PLUGINS", "example")
     monkeypatch.setenv("GITHUB_TOKEN", "secret")
     monkeypatch.setenv("HOME", "/safe/home")
     monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("TZ", "UTC")
     monkeypatch.setenv("LC_TEST_SENTINEL", "terminal-setting")
 
     env = direct_exec_env(["/bin/echo", "status"])
@@ -721,10 +731,11 @@ def test_direct_exec_env_defaults_to_minimal_non_secret_environment(monkeypatch)
     assert env == {
         "HOME": "/safe/home",
         "LANG": "C.UTF-8",
+        "TZ": "UTC",
         "PATH": _shell_env._TRUSTED_PATH,
     } | {
         key: value for key, value in os.environ.items() if key.startswith("LC_")
-    }
+    } | ({"PYTHONDONTWRITEBYTECODE": no_bytecode} if no_bytecode is not None else {})
 
 
 def test_login_shell_command_keeps_venv_console_scripts_after_system_tools() -> None:
@@ -1110,9 +1121,14 @@ def test_git_probe_env_matches_executed_git_pins() -> None:
         assert probe[key] == executed[key] == value
 
 
+@pytest.mark.parametrize("no_bytecode", [None, "1"], ids=["unset", "no-bytecode"])
 def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, no_bytecode: str | None,
 ) -> None:
+    if no_bytecode is None:
+        monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", no_bytecode)
     monkeypatch.setenv("JQ_ENV_SENTINEL", "super-secret-value")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
     monkeypatch.setenv("HOME", "/safe/home")
@@ -1125,9 +1141,14 @@ def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
     overlay = direct_exec_env_overlay(argv)
 
     assert all(
-        key in {"PATH", "HOME", "LANG", "TZ"} or key.startswith("LC_")
+        key in {"PATH", "HOME", "LANG", "TZ", "PYTHONDONTWRITEBYTECODE"}
+        or key.startswith("LC_")
         for key in env
     )
+    if no_bytecode is None:
+        assert "PYTHONDONTWRITEBYTECODE" not in env
+    else:
+        assert env["PYTHONDONTWRITEBYTECODE"] == no_bytecode
     assert env["PATH"] == _shell_env._TRUSTED_PATH
     assert env["HOME"] == "/safe/home"
     assert env["LANG"] == "en_US.UTF-8"
