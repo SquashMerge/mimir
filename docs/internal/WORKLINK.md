@@ -438,11 +438,17 @@ unreleased branch commit: the build resolves and checks out that commit, refuses
 unless it exactly matches the controller commit, and records it in the image's
 OCI revision label and `/opt/mimir-worklink/executor-source-commit`. The executor
 identity operation exposes the recorded SHA and `/health` reports it as
-`worklink_executor_source_commit`. Dirty-tree executor builds are unsupported;
+`worklink_executor_source_commit` in source mode; PyPI-mode Cultivate images
+instead expose the exact installed `mimir-agent` and `mimir-cultivate` version
+and both retained wheel hashes. Missing, drifted or unpinned identities fail
+health with HTTP 503; PyPI source-commit fields are null and source status is
+`not_applicable`. Dirty-tree source-mode executor builds are unsupported;
 working-directory edits cannot enter this root-owned artifact. Deployment
-compose files must pass a fully qualified `MIMIR_GIT_REF` plus the same resolved
+source-mode compose files must explicitly select `MIMIR_INSTALL_MODE=source`
+and pass a fully qualified `MIMIR_GIT_REF` plus the same resolved
 full SHA for `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT`. The build
-fetches exactly that ref and refuses unless `FETCH_HEAD` equals the pinned SHA.
+fetches the immutable SHA first, falling back to the named ref if necessary,
+and refuses unless `FETCH_HEAD` equals the pinned SHA.
 This permits CI to name `refs/pull/<number>/merge` while keeping the SHA
 authoritative; “point it at whichever checkout you want” is not a valid
 deployment contract. All three provenance arguments are required, so plain

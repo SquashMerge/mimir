@@ -25,6 +25,7 @@ from mimir_cultivate import setup as installer
 
 
 SHA = "a" * 40
+VERSION = "1.0.0rc2"
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,18 @@ def isolated_license_record(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("GH_USER_NAME", "trellisbot-squashmerge")
     monkeypatch.setenv("GH_USER_EMAIL", "trellisbot@example.com")
+    from mimir_cultivate.release_resolver import ReleasePair, Wheel
+    from mimir import plugin_dockerfile
+
+    def release(version=None, *, architecture="x86_64"):
+        selected = version or VERSION
+        wheels = [Wheel(name, name.replace('-', '_') + f'-{selected}-py3-none-any.whl',
+                        'https://files.pythonhosted.org/' + name, hashlib.sha256((name + selected).encode()).hexdigest(),
+                        (name + selected).encode()) for name in ('mimir-agent', 'mimir-cultivate')]
+        return ReleasePair(selected, *wheels)
+
+    monkeypatch.setattr(installer, 'resolve_release', release)
+    monkeypatch.setattr(plugin_dockerfile, 'build_pypi_context', lambda destination, **kwargs: destination.mkdir(parents=True))
 
 
 @pytest.mark.parametrize("answer", ["no", "y", "", None])
@@ -547,7 +560,7 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
             alert_secrets[name.upper().replace("-", "_")] = value
     extra += ["--operator-alert-adapter", alert_adapter]
     args = parser.parse_args([
-        "cultivate", "setup", "--accept-license", "--source-repo", "neworg/mimir",
+        "cultivate", "setup", "--accept-license",
         "--repo", "org/repo", "--branch", "main", "--bot-login", "bot",
         "--bot-email", "bot@example.com", "--owner", "owner", "--display-name", "Owner Name",
         "--owner-email", "owner@example.com", "--model-spec", "openai:gpt-test",
@@ -561,9 +574,6 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
             return 200, {"login": "bot"}
         if url.endswith("/repos/org/repo"):
             return 200, {"permissions": {"push": True}}
-        if "/git/ref/heads/feature/plugins" in url:
-            assert "/repos/neworg/mimir/" in url
-            return 200, {"object": {"sha": SHA}}
         if "/git/trees/" in url:
             return 200, {"tree": [{"path": "tools/verify", "mode": "100755", "type": "blob"}]}
         if "/contents/" in url:
@@ -644,8 +654,10 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert 'lsof libfoo-dev=1:2.3-4~deb12 && rm -rf /var/lib/apt/lists/*' in (deploy / 'Dockerfile.toolchain').read_text()
     assert saga["saga_model_spec"] != "openai:gpt-test"
     assert (deploy / "build.sh").stat().st_mode & 0o777 == 0o755
-    assert "https://github.com/neworg/mimir.git#" + SHA in (deploy / "build.sh").read_text()
-    assert any("https://github.com/neworg/mimir.git#" + SHA in argv for argv in calls)
+    assert 'MIMIR_INSTALL_MODE=pypi' in (deploy / 'build.sh').read_text()
+    assert 'github.com/' not in (deploy / 'build.sh').read_text()
+    assert set(saga['wheels']) == {'mimir-agent', 'mimir-cultivate'}
+    assert saga['mimir_version'] == VERSION
     # Check both providers and mcp independently, in the live and saved builds.
     expected_extras = {"openai", "mcp", "local-embeddings"}
     if alert_adapter in {"discord", "slack"}:
@@ -684,22 +696,26 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert "cache:/home/mimir/.cache" in compose["services"]["agent"]["volumes"]
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
     assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink"}
-    assert any("MIMIR_CONTROLLER_COMMIT=" + SHA in part for argv in calls for part in argv)
+    assert any('MIMIR_VERSION=' + VERSION in part for argv in calls for part in argv)
     assert sum("docker" == argv[0] and "exec" in argv for argv in calls) == 2  # idle probes on the rerun
     assert sum("-f" in argv and "compose.provision.yml" in argv for argv in calls) == 2
     assert all(argv[argv.index('--user') + 1] == '1001:1001' for argv in calls
                if 'compose.provision.yml' in argv)
     assert sum(argv[-2:] == ["restart", "agent"] for argv in calls) == 0
 
-    def unpushed(url, token):
-        if "/git/ref/" in url:
-            return 200, {"object": {"sha": "short"}}
-        return request(url, token)
-
     before_calls = len(calls)
-    with pytest.raises(installer.SetupError, match="pushed full"):
-        installer.setup(args, request=unpushed, run=run, verify=lambda *a: None)
+    monkeypatch.setattr(installer, 'resolve_release', lambda version=None, **kw: (_ for _ in ()).throw(installer.ReleaseError('PyPI unavailable')))
+    with pytest.raises(installer.ReleaseError, match="PyPI unavailable"):
+        installer.setup(args, request=request, run=run, verify=lambda *a: None)
     assert len(calls) == before_calls
+    from mimir_cultivate.release_resolver import ReleasePair, Wheel
+    def restored_release(version=None, *, architecture="x86_64"):
+        def wheel(name):
+            return Wheel(name, name.replace('-', '_') + f'-{VERSION}-py3-none-any.whl',
+                         'https://files.pythonhosted.org/' + name, hashlib.sha256((name + VERSION).encode()).hexdigest(),
+                         (name + VERSION).encode())
+        return ReleasePair(VERSION, wheel('mimir-agent'), wheel('mimir-cultivate'))
+    monkeypatch.setattr(installer, 'resolve_release', restored_release)
 
     # Exercise real setup writes, not just the renderer: set, change, clear,
     # and omit the flag after clearing. Both generated artifacts must agree
@@ -715,7 +731,9 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         assert json.loads((deploy / 'manifest.json').read_text())['system_packages'] == expected
         layer = (deploy / 'Dockerfile.toolchain').read_text()
         assert layer == installer.render_layer(
-            'node', '22.16.0', 'mimir-cultivate-root:' + SHA, system_packages=expected)
+            'node', '22.16.0', 'mimir-cultivate-root:' + installer._image_identity(
+                VERSION, saga['wheels'], installer._DOCKER_ARCHITECTURES[saga['docker_platform']]),
+            system_packages=expected)
         if not expected:
             assert 'RUN set -eu; apt-get update' not in layer
         assert verified[-1][-2] == expected
@@ -749,8 +767,7 @@ def setup_environment(tmp_path, monkeypatch):
               'bot_email': 'bot@example.com', 'owner': 'owner', 'display_name': 'Owner',
               'owner_email': 'owner@example.com', 'deploy': str(deploy),
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
-              'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
-              'source_repo': 'org/mimir', 'test_command': 'npm test',
+               'embedding': 'openai:model', 'test_command': 'npm test',
               'review_tests': 'targeted', 'auto_review': 'all', 'port': '8123'}
     monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: getattr(args, name, None) or fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret')
@@ -763,6 +780,15 @@ def setup_environment(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(argv, 0)
     monkeypatch.setattr(installer.subprocess, 'run', docker_exec)
     state = {'sha': SHA, 'running': False, 'status': 'No Worklink leaf runs or labeled issues.', 'leases': '[]'}
+    from mimir_cultivate.release_resolver import ReleasePair, Wheel
+    def release(version=None, *, architecture="x86_64"):
+        selected = version or (VERSION if state['sha'] == SHA else '1.0.1')
+        def wheel(name):
+            return Wheel(name, name.replace('-', '_') + f'-{selected}-py3-none-any.whl',
+                         'https://files.pythonhosted.org/' + name,
+                         hashlib.sha256((name + selected).encode()).hexdigest(), (name + selected).encode())
+        return ReleasePair(selected, wheel('mimir-agent'), wheel('mimir-cultivate'))
+    monkeypatch.setattr(installer, 'resolve_release', release)
     calls = []
 
     def request(url, token):
@@ -812,45 +838,36 @@ def upgrade_setup(setup_environment):
     return deploy, args, state, calls, invoke
 
 
-@pytest.fixture
-def legacy_source(monkeypatch):
-    """Serve a pinned historical source with a provision template changed since then."""
-    source = Path(installer.__file__).read_text()
-    old_source = source.replace("_PROVISION = '''from pathlib import Path",
-                                "_PROVISION = '''# previous commit\nfrom pathlib import Path")
-    old_source = old_source.replace('environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name',
-                                    'environment["MIMIR_ACP_ENABLED"] = "0"\n'
-                                    '        environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name')
-    assert old_source != source
-    scaffold = Path(installer.__file__).resolve().parents[3] / 'mimir/scaffold_docker.py'
-    original_content = installer._content
-
-    def content(slug, branch, path, token, request):
-        if branch == SHA and path == 'plugins/cultivate/mimir_cultivate/setup.py':
-            return old_source
-        if branch == SHA and path == 'mimir/scaffold_docker.py':
-            return scaffold.read_text()
-        return original_content(slug, branch, path, token, request)
-
-    monkeypatch.setattr(installer, '_content', content)
-    return '# previous commit\n' + installer._PROVISION
-
-
 def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrade_setup, capsys):
     deploy, args, state, calls, invoke = upgrade_setup
     old = SHA
+    previous = json.loads((deploy / 'manifest.json').read_text())
+    old_tag = previous['layer_tag']
+    old_wheels = previous['wheels']
+    assert previous['mimir_version'] == VERSION
     state['sha'] = 'c' * 40
+    args.mimir_version = '1.0.1'
     env = (deploy / 'compose.env').read_bytes()
     key = (deploy / 'owner-web-key').read_bytes()
     (deploy / 'persisted-volume-marker').write_text('untouched')
     invoke()
     output = capsys.readouterr().out
-    assert f'Upgrading {old} -> {state["sha"]}' in output
-    assert f'Previous agent image retained: mimir-cultivate-agent:{old}-node22-16-0' in output
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    new_tag = manifest['layer_tag']
+    assert manifest['mimir_version'] == '1.0.1'
+    for name in ('mimir-agent', 'mimir-cultivate'):
+        assert manifest['wheels'][name]['sha256'] == hashlib.sha256((name + '1.0.1').encode()).hexdigest()
+        assert manifest['wheels'][name]['sha256'] != old_wheels[name]['sha256']
+    expected_identity = installer._image_identity(
+        '1.0.1', manifest['wheels'], installer._DOCKER_ARCHITECTURES[manifest['docker_platform']])
+    assert new_tag == ('mimir-cultivate-agent:' + expected_identity + '-'
+                       + manifest['toolchain'] + manifest['toolchain_version'].replace('.', '-'))
+    assert new_tag != old_tag
+    assert 'Upgrading 1.0.0rc2 -> 1.0.1' in output
+    assert 'Previous agent image retained: ' + old_tag in output
     assert 'docker compose -f compose.yml -f <(printf' in output
-    assert f'image: mimir-cultivate-agent:{old}-node22-16-0' in output
-    assert yaml.safe_load((deploy / 'compose.yml').read_text())['services']['agent']['image'] == (
-        f'mimir-cultivate-agent:{state["sha"]}-node22-16-0')
+    assert "image: " + old_tag + "\\n') up -d --force-recreate --no-deps agent" in output
+    assert yaml.safe_load((deploy / 'compose.yml').read_text())['services']['agent']['image'] == new_tag
     assert (deploy / 'compose.env').read_bytes() == env
     assert (deploy / 'owner-web-key').read_bytes() == key
     assert (deploy / 'persisted-volume-marker').read_text() == 'untouched'
@@ -859,11 +876,9 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     assert any(argv[-2:] == ['--rm', 'init'] for argv in calls)
     assert any('compose.provision.yml' in argv for argv in calls)
     assert any(argv[-3:] == ['up', '-d', 'agent'] for argv in calls)
-    import hashlib
-    manifest = json.loads((deploy / 'manifest.json').read_text())
     assert manifest['review_tests'] == 'targeted'
     hashes = manifest['generated_sha256']
-    assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore'}
+    assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore', 'build_context.py'}
     assert all(hashes[name] == hashlib.sha256((deploy / name).read_bytes()).hexdigest() for name in hashes)
 
 
@@ -963,198 +978,236 @@ def test_upgrade_refuses_operator_edits_until_forced(upgrade_setup, name):
     assert '# operator edit' not in path.read_text()
 
 
-def test_previous_provision_compose_constant_precedes_inline():
-    source = 'def setup():\n    _write(deploy / "compose.provision.yml", "inline")\n'
-    assert installer._previous_provision_compose(source, {"_PROVISION_COMPOSE": "constant"}) == "constant"
-    with pytest.raises(ValueError, match="Invalid provision Compose constant"):
-        installer._previous_provision_compose(source, {"_PROVISION_COMPOSE": None})
-
-
-def test_previous_provision_compose_extracts_literal_without_execution():
-    source = '''
-raise RuntimeError("must not execute")
-def setup():
-    _write(deploy / "unrelated.yml", "wrong")
-    _write(deploy / "compose.provision.yml", "services:\\n" "  agent: {}\\n", replace=True)
-'''
-    assert installer._previous_provision_compose(source, {}) == "services:\n  agent: {}\n"
-
-
-@pytest.mark.parametrize("source", [
-    'def setup():\n    _write(deploy / "other.yml", "wrong")\n',
-    'def setup():\n    _write(other / "compose.provision.yml", "wrong")\n',
-    'def setup():\n    other_write(deploy / "compose.provision.yml", "wrong")\n',
-    'def unrelated():\n    _write(deploy / "compose.provision.yml", "wrong")\n',
-    'def setup():\n    _write(deploy / "compose.provision.yml", current_template)\n',
-    'def setup():\n    _write(deploy / "compose.provision.yml", 42)\n',
-    'def setup():\n    _write(deploy / "compose.provision.yml", "one")\n'
-    '    _write(deploy / "compose.provision.yml", "two")\n',
-])
-def test_previous_provision_compose_refuses_missing_nonliteral_or_ambiguous(source):
-    with pytest.raises(ValueError):
-        installer._previous_provision_compose(source, {})
-
-
-@pytest.fixture
-def historical_8af14772_deployment(upgrade_setup, monkeypatch):
-    """Seed real historical output independently of the recovery code under test."""
-    import ast
-
+@pytest.mark.parametrize('force', [False, True])
+def test_source_era_upgrade_refused_before_deployment_writes(upgrade_setup, force):
     deploy, args, state, calls, invoke = upgrade_setup
-    previous_sha = '8af1477265c0c7066c99f1d588956a6894122d43'
-    data = Path(__file__).parent / 'data' / 'legacy-8af14772'
-    sources = {
-        'plugins/cultivate/mimir_cultivate/setup.py': (data / 'setup.py.txt').read_text(),
-        'mimir/scaffold_docker.py': (data / 'scaffold_docker.py.txt').read_text(),
-    }
-    setup_tree, scaffold_tree = (ast.parse(source) for source in sources.values())
-    # Compile only the snapshot's renderers and literal constants, never import
-    # either historical module or call _previous_generated to create its oracle.
-    namespace = {'re': re, 'yaml': yaml, 'SetupError': installer.SetupError}
-    for tree, names in [
-        (setup_tree, {'_PROVISION'}),
-        (scaffold_tree, {'_COMPOSE_YML_TEMPLATE_PYPI', '_DEFAULT_MODE', '_MODES'}),
-    ]:
-        for node in tree.body:
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    if isinstance(target, ast.Name) and target.id in names:
-                        namespace[target.id] = ast.literal_eval(node.value)
-    for tree, name in [(scaffold_tree, 'render_compose_yml'), (setup_tree, 'render_compose')]:
-        function, = [node for node in tree.body
-                     if isinstance(node, ast.FunctionDef) and node.name == name]
-        module = ast.Module(body=[ast.ImportFrom(
-            module='__future__', names=[ast.alias(name='annotations')], level=0), function],
-            type_ignores=[])
-        exec(compile(ast.fix_missing_locations(module), str(data / name), 'exec'), namespace)
-    # This exact literal is the snapshot's inline writer, not today's constant.
-    historical_provision_compose = (
-        'services:\n  agent:\n    volumes:\n'
-        '      - ./provision.py:/opt/cultivate-provision.py:ro\n'
-        '      - ./manifest.json:/opt/cultivate-manifest.json:ro\n')
-    historical_setup, = [node for node in setup_tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == 'setup']
-    writer, = [node for node in ast.walk(historical_setup)
-               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-               and node.func.id == '_write'
-               and ast.unparse(node.args[0]) == "deploy / 'compose.provision.yml'"]
-    assert ast.literal_eval(writer.args[1]) == historical_provision_compose
-    assert not any(isinstance(node, ast.Assign)
-                   and any(isinstance(target, ast.Name) and target.id == '_PROVISION_COMPOSE'
-                           for target in node.targets) for node in setup_tree.body)
-    manifest_path = deploy / 'manifest.json'
-    manifest = json.loads(manifest_path.read_text())
-    layer_tag = f'mimir-cultivate-agent:{previous_sha}-node22-16-0'
-    scaffold = namespace['render_compose_yml'](service_name='agent', web_port=8123, mode='pypi')
-    historical = {
-        'compose.yml': namespace['render_compose'](
-            scaffold, layer_tag, manifest['toolchain'], manifest['slug'].split('/')[1]),
-        'provision.py': namespace['_PROVISION'],
-        'compose.provision.yml': historical_provision_compose,
-        '.gitignore': '*\n',
-    }
-    for name, text in historical.items():
-        (deploy / name).write_text(text)
-    build = deploy / 'build.sh'
-    build.write_text(build.read_text().replace(SHA, previous_sha))
-    # Real pre-upgrade manifests had none of these later bookkeeping fields.
-    for key in ('generated_sha256', 'source_sha', 'layer_tag'):
-        manifest.pop(key, None)
-    manifest_path.write_text(json.dumps(manifest))
-    original_content = installer._content
-    fetched = []
-
-    def content(slug, branch, path, token, request):
-        if branch == previous_sha:
-            fetched.append(path)
-            return sources[path]
-        return original_content(slug, branch, path, token, request)
-
-    monkeypatch.setattr(installer, '_content', content)
-    state['sha'] = 'c' * 40
-    return deploy, args, state, calls, invoke, historical, fetched
-
-
-def test_upgrade_legacy_inline_provision_compose(historical_8af14772_deployment):
-    deploy, args, state, calls, invoke, historical, fetched = historical_8af14772_deployment
-    before = {name: (deploy / name).read_text() for name in historical}
-    assert before == historical
-    assert historical['provision.py'] != installer._PROVISION
-    assert '8af1477265c0c7066c99f1d588956a6894122d43' in before['compose.yml']
-    assert not args.force
-    invoke()
-    assert set(fetched) == {'plugins/cultivate/mimir_cultivate/setup.py', 'mimir/scaffold_docker.py'}
-    assert state['sha'] in (deploy / 'compose.yml').read_text()
-    assert (deploy / 'provision.py').read_text() == installer._PROVISION
     manifest = json.loads((deploy / 'manifest.json').read_text())
-    assert manifest['source_sha'] == state['sha']
-    assert manifest['generated_sha256'] == {
-        name: installer._digest((deploy / name).read_text()) for name in historical}
-    assert any(argv[:2] == ['docker', 'build'] for argv in calls)
-
-
-def test_upgrade_legacy_8af14772_one_byte_provision_compose_edit_is_refused(
-        historical_8af14772_deployment):
-    deploy, args, state, calls, invoke, historical, fetched = historical_8af14772_deployment
-    path = deploy / 'compose.provision.yml'
-    path.write_bytes(path.read_bytes() + b'x')
-    before = {p.name: p.read_bytes() for p in deploy.iterdir() if p.is_file()}
-    assert len(path.read_bytes()) == len(historical['compose.provision.yml'].encode()) + 1
-    assert not args.force
-    with pytest.raises(installer.SetupError, match=r'compose\.provision\.yml already differs'):
+    manifest.pop('mimir_install_mode')
+    manifest['source_sha'] = SHA
+    (deploy / 'manifest.json').write_text(json.dumps(manifest))
+    before = {p.relative_to(deploy): p.read_bytes() for p in deploy.rglob('*') if p.is_file()}
+    args.force = force
+    with pytest.raises(installer.SetupError, match='Source-era Cultivate deployments cannot be upgraded'):
         invoke()
-    assert set(fetched) == {'plugins/cultivate/mimir_cultivate/setup.py', 'mimir/scaffold_docker.py'}
     assert not calls
-    assert {p.name: p.read_bytes() for p in deploy.iterdir() if p.is_file()} == before
+    assert {p.relative_to(deploy): p.read_bytes() for p in deploy.rglob('*') if p.is_file()} == before
 
 
-def test_upgrade_legacy_unedited_generated_files(upgrade_setup, legacy_source):
+def test_missing_generated_hashes_refused_even_with_force(upgrade_setup):
     deploy, args, state, calls, invoke = upgrade_setup
-    assert legacy_source != installer._PROVISION
-    (deploy / 'provision.py').write_text(legacy_source)
-    compose_path = deploy / 'compose.yml'
-    original_compose = compose_path.read_text()
-    historical_compose = original_compose.replace('MIMIR_ACP_ENABLED: \'1\'', 'MIMIR_ACP_ENABLED: \'0\'')
-    assert historical_compose != original_compose
-    compose_path.write_text(historical_compose)
     manifest = json.loads((deploy / 'manifest.json').read_text())
-    for key in ('generated_sha256', 'source_sha', 'layer_tag'):
-        del manifest[key]
+    manifest.pop('generated_sha256')
     (deploy / 'manifest.json').write_text(json.dumps(manifest))
-    state['sha'] = 'c' * 40
+    args.force = True
+    with pytest.raises(installer.SetupError, match='Previous generated file hashes are missing'):
+        invoke()
+    assert not calls
+
+
+@pytest.mark.parametrize('reason', ['Cannot reach PyPI', 'No common compatible, non-yanked PyPI wheel release'])
+def test_release_resolution_refuses_without_deployment_or_docker_writes(setup_environment, monkeypatch, reason):
+    deploy, args, state, calls, invoke = setup_environment
+    def unavailable(version=None, *, architecture="x86_64"):
+        raise installer.ReleaseError(reason)
+    monkeypatch.setattr(installer, 'resolve_release', unavailable)
+    with pytest.raises(installer.ReleaseError, match=reason):
+        invoke()
+    assert not deploy.exists() and not calls
+
+
+def test_rerun_preserves_saved_release_unless_explicitly_changed(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    before = json.loads((deploy / 'manifest.json').read_text())
+    state['sha'] = 'c' * 40  # fake index now offers a newer release
     invoke()
-    assert state['sha'] in (deploy / 'compose.yml').read_text()
-    assert yaml.safe_load(compose_path.read_text())['services']['agent']['environment']['MIMIR_ACP_ENABLED'] == '1'
-    assert (deploy / 'provision.py').read_text() == installer._PROVISION
-    hashes = json.loads((deploy / 'manifest.json').read_text())['generated_sha256']
-    assert hashes['provision.py'] == installer._digest(installer._PROVISION)
+    after = json.loads((deploy / 'manifest.json').read_text())
+    assert after['mimir_version'] == before['mimir_version']
+    assert after['wheels'] == before['wheels']
+    args.mimir_version = '1.0.1'
+    invoke()
+    assert json.loads((deploy / 'manifest.json').read_text())['mimir_version'] == '1.0.1'
 
 
-def test_upgrade_legacy_operator_edit_is_refused(upgrade_setup, legacy_source):
+@pytest.mark.parametrize("changed", ["hash", "filename", "missing_wheels"])
+def test_rerun_refuses_changed_saved_wheels_before_mutation(upgrade_setup, monkeypatch, changed):
+    from dataclasses import replace
     deploy, args, state, calls, invoke = upgrade_setup
-    compose = deploy / 'compose.yml'
-    compose.write_text(compose.read_text().replace('MIMIR_ACP_ENABLED: \'1\'', 'MIMIR_ACP_ENABLED: \'0\''))
-    provision = deploy / 'provision.py'
-    provision.write_text(legacy_source + 'x')
-    manifest = json.loads((deploy / 'manifest.json').read_text())
-    del manifest['generated_sha256']
-    (deploy / 'manifest.json').write_text(json.dumps(manifest))
-    state['sha'] = 'c' * 40
-    with pytest.raises(installer.SetupError, match='provision.py already differs'):
+    before = {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()}
+    resolver = installer.resolve_release
+    if changed == "missing_wheels":
+        manifest = json.loads((deploy / "manifest.json").read_text())
+        del manifest["wheels"]
+        (deploy / "manifest.json").write_text(json.dumps(manifest))
+        before["manifest.json"] = (deploy / "manifest.json").read_bytes()
+    else:
+        def altered(*args, **kwargs):
+            pair = resolver(*args, **kwargs)
+            wheel = replace(pair.agent, **({"sha256": "0" * 64} if changed == "hash" else
+                                          {"filename": pair.agent.filename.replace("-py3", "-1-py3")}))
+            return replace(pair, agent=wheel)
+        monkeypatch.setattr(installer, "resolve_release", altered)
+    with pytest.raises(installer.SetupError, match="Resolved wheels differ"):
         invoke()
-    assert not calls and provision.read_text() == legacy_source + 'x'
+    assert not calls
+    assert {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()} == before
 
 
-def test_upgrade_legacy_unrecoverable_source_is_refused(upgrade_setup):
+def test_rerun_refuses_missing_saved_version(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    del manifest["mimir_version"]
+    (deploy / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(installer.SetupError, match="Missing exact Mimir version"):
+        invoke()
+    assert not calls
+
+
+def test_explicit_version_and_source_free_artifact_inventory(setup_environment):
+    deploy, args, state, calls, invoke = setup_environment
+    args.mimir_version = '2.0.0rc1'
+    invoke()
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['mimir_install_mode'] == 'pypi'
+    assert manifest['mimir_version'] == '2.0.0rc1'
+    assert set(manifest['wheels']) == {'mimir-agent', 'mimir-cultivate'}
+    for package, wheel in manifest['wheels'].items():
+        archive = deploy / 'wheels' / wheel['filename']
+        assert hashlib.sha256(archive.read_bytes()).hexdigest() == wheel['sha256']
+    for name in ('build.sh', 'compose.yml', 'compose.provision.yml'):
+        text = (deploy / name).read_text()
+        assert '2.0.0rc1' in text
+        assert all(wheel['sha256'] in text for wheel in manifest['wheels'].values())
+        assert not any(item in text for item in ('MIMIR_GIT_REF', 'MIMIR_CONTROLLER_COMMIT',
+                                                  'MIMIR_EXECUTOR_COMMIT', 'github.com/SquashMerge/mimir'))
+    root_build, = (argv for argv in calls if argv[:2] == ['docker', 'build'] and
+                   'MIMIR_INSTALL_MODE=pypi' in argv)
+    assert root_build[-1] != '.' and not root_build[-1].startswith('https://')
+    assert 'MIMIR_VERSION=2.0.0rc1' in root_build
+    assert 'MIMIR_PLUGIN_SELECTION=cultivate' in root_build
+    assert 'CHAINLINK_ARTIFACT_STAGE=chainlink-build' in root_build
+    assert 'MIMIR_EXTRAS=local-embeddings,mcp,openai' in root_build
+
+
+def test_arm_deployment_selects_arm_wheels_and_pins_both_builds(setup_environment, monkeypatch):
+    from test_release_resolver import index, wheel
+
+    deploy, args, state, calls, invoke = setup_environment
+    args.platform = 'linux/arm64'
+    arm = (wheel('mimir-agent', '2.0.0', tag='cp311-cp311-manylinux_2_28_aarch64'),
+           wheel('mimir-cultivate', '2.0.0', dependency='2.0.0',
+                 tag='cp311-cp311-manylinux_2_28_aarch64'))
+    x86 = (wheel('mimir-agent', '2.0.0', tag='cp311-cp311-manylinux_2_28_x86_64'),
+           wheel('mimir-cultivate', '2.0.0', dependency='2.0.0',
+                 tag='cp311-cp311-manylinux_2_28_x86_64'))
+    fetch, _ = index({'2.0.0': [x86[0], arm[0]]}, {'2.0.0': [x86[1], arm[1]]})
+    from mimir_cultivate.release_resolver import resolve_release as real_resolver
+    monkeypatch.setattr(installer, 'resolve_release',
+                        lambda version=None, *, architecture: real_resolver(version, fetch=fetch, architecture=architecture))
+    invoke()
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['docker_platform'] == 'linux/arm64'
+    for name, selected in zip(('mimir-agent', 'mimir-cultivate'), arm):
+        assert manifest['wheels'][name]['sha256'] == selected['digests']['sha256']
+        assert hashlib.sha256((deploy / 'wheels' / selected['filename']).read_bytes()).hexdigest() == selected['digests']['sha256']
+    assert all('x86_64' not in entry['filename'] for entry in manifest['wheels'].values())
+    builds = [argv for argv in calls if argv[:2] == ['docker', 'build']]
+    assert len(builds) == 2
+    assert all(argv[2:4] == ['--platform', 'linux/arm64'] for argv in builds)
+    assert 'BASE_IMAGE=' + installer._PYTHON_BASE_IMAGE in builds[0]
+    script = (deploy / 'build.sh').read_text()
+    assert script.count('docker build --platform linux/arm64') == 2
+    assert 'BASE_IMAGE=' + installer._PYTHON_BASE_IMAGE in script
+    args.platform = None
+    monkeypatch.setattr(installer.platform, 'machine', lambda: 'x86_64')
+    calls.clear()
+    invoke()
+    assert json.loads((deploy / 'manifest.json').read_text())['docker_platform'] == 'linux/arm64'
+    assert all(argv[2:4] == ['--platform', 'linux/arm64'] for argv in calls if argv[:2] == ['docker', 'build'])
+
+
+def test_unsupported_platform_fails_before_effects(setup_environment, monkeypatch):
+    deploy, args, state, calls, invoke = setup_environment
+    args.platform = 'linux/ppc64le'
+    monkeypatch.setattr(installer, '_license_gate', lambda args: pytest.fail('license side effect'))
+    with pytest.raises(installer.SetupError, match='Unsupported Docker platform'):
+        invoke()
+    assert not deploy.exists() and not calls
+
+
+def test_saved_build_runs_without_host_mimir_or_python(setup_environment, monkeypatch, tmp_path):
+    import io
+    import zipfile
+    from mimir.plugin_dockerfile import _S6_FILES, _CONTEXT_SCRIPTS
+    from mimir_cultivate.release_resolver import ReleasePair, Wheel
+
+    version = '2.0.0rc1'
+    def wheel(name, entries):
+        filename = name.replace('-', '_') + f'-{version}-py3-none-any.whl'
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as archive:
+            for member in entries:
+                archive.writestr(member, f'{name}:{member}')
+        content = data.getvalue()
+        return Wheel(name, filename, 'https://files.pythonhosted.org/' + filename,
+                     hashlib.sha256(content).hexdigest(), content)
+
+    agent = wheel('mimir-agent', ['mimir/docker_context/Dockerfile',
+                                  *(f'mimir/docker_context/deploy/s6-overlay/s6-rc.d/{name}' for name in _S6_FILES)])
+    cultivate = wheel('mimir-cultivate', [f'mimir_cultivate/docker/{name}' for name in _CONTEXT_SCRIPTS])
+    monkeypatch.setattr(installer, 'resolve_release', lambda version=None, **kw: ReleasePair(version or '2.0.0rc1', agent, cultivate))
+    deploy, args, state, calls, invoke = setup_environment
+    args.mimir_version = version
+    invoke()
+    binary = tmp_path / 'bin'
+    binary.mkdir()
+    docker = binary / 'docker'
+    docker.write_text('#!/bin/sh\nset -eu\nfor arg do [ "$arg" != "-f" ] || exit 0; done\n'
+                      'if [ "$1" = build ]; then\n'
+                      '  for last do :; done\n  cp -R "$last" "$CAPTURE"\nfi\n')
+    docker.chmod(0o755)
+    for command in ('dirname', 'mktemp', 'rm', 'cp'):
+        (binary / command).symlink_to('/usr/bin/' + command)
+    capture = tmp_path / 'captured'
+    environment = {'PATH': str(binary), 'CAPTURE': str(capture),
+                   'PYTHONPATH': str(tmp_path / 'nonexistent'), 'HOME': str(tmp_path)}
+    def rebuild():
+        with subprocess.Popen([str(deploy / 'build.sh')], env=environment,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            stdout, stderr = process.communicate(timeout=30)
+        return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+    result = rebuild()
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['mimir_version'] == version
+    for selected in (agent, cultivate):
+        assert (capture / 'plugins/cultivate/mimir_cultivate/docker/wheels' / selected.filename).read_bytes() == selected.data
+        assert manifest['wheels'][selected.name]['sha256'] == hashlib.sha256(selected.data).hexdigest()
+    assert (capture / 'Dockerfile').read_text() == 'mimir-agent:mimir/docker_context/Dockerfile'
+    assert (capture / 'plugins/cultivate/mimir_cultivate/docker/base.sh').read_text() == (
+        'mimir-cultivate:mimir_cultivate/docker/base.sh')
+    assert not (capture / 'compose.env').exists()
+
+    (deploy / 'build_context.py').write_text('raise SystemExit("tampered")\n')
+    capture.rename(tmp_path / 'previous-capture')
+    result = rebuild()
+    assert result.returncode != 0 and 'build context helper differs' in result.stderr
+    assert not capture.exists()
+    (deploy / 'build_context.py').unlink()
+    result = rebuild()
+    assert result.returncode != 0 and not capture.exists()
+
+
+def test_changed_verified_wheel_refused_before_build(upgrade_setup):
     deploy, args, state, calls, invoke = upgrade_setup
     manifest = json.loads((deploy / 'manifest.json').read_text())
-    del manifest['generated_sha256']
-    (deploy / 'manifest.json').write_text(json.dumps(manifest))
-    state['sha'] = 'c' * 40
-    with pytest.raises(installer.SetupError, match='Cannot recover previous generated templates'):
+    archive = deploy / 'wheels' / manifest['wheels']['mimir-agent']['filename']
+    archive.write_bytes(b'tampered')
+    before = (deploy / 'manifest.json').read_bytes()
+    with pytest.raises(installer.SetupError, match='Deployment wheel differs'):
         invoke()
-    assert not calls and SHA in (deploy / 'compose.yml').read_text()
+    assert not any(argv[:2] == ['docker', 'build'] or 'compose.provision.yml' in argv for argv in calls)
+    assert (deploy / 'manifest.json').read_bytes() == before
 
 
 @pytest.mark.parametrize('activity,detail', [('worklink', 'Worklink #42 (running)'),
@@ -1173,7 +1226,7 @@ def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail, 
         invoke()
     assert not any(argv[-2:] == ['stop', 'agent'] for argv in calls)
     assert not any(argv[:2] == ['docker', 'build'] for argv in calls)
-    assert SHA in (deploy / 'compose.yml').read_text()
+    assert VERSION in (deploy / 'compose.yml').read_text()
     args.force = True
     invoke()
     assert any(argv[-2:] == ['stop', 'agent'] for argv in calls)
@@ -1190,6 +1243,7 @@ def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail, 
 def test_upgrade_refuses_unreadable_activity_before_mutation_until_forced(upgrade_setup, probe, output):
     deploy, args, state, calls, invoke = upgrade_setup
     state['sha'] = 'c' * 40
+    args.mimir_version = '1.0.1'
     state[probe] = output
     args.reembed = True  # A successful upgrade would stop the running agent.
     before = {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()}
@@ -1219,8 +1273,8 @@ def test_upgrade_refuses_unreadable_activity_before_mutation_until_forced(upgrad
     assert any(argv == ['docker', 'compose', 'up', '-d', 'agent'] for argv in calls)
     assert not any(argv[-3:] == ['mimir', 'worklink', 'status'] for argv in calls)
     assert not any(argv[-1] == installer._PR_LEASE_PROBE for argv in calls)
-    assert state['sha'] in (deploy / 'compose.yml').read_text()
-    assert json.loads((deploy / 'manifest.json').read_text())['source_sha'] == state['sha']
+    assert '1.0.1' in (deploy / 'compose.yml').read_text()
+    assert json.loads((deploy / 'manifest.json').read_text())['mimir_version'] == '1.0.1'
 
 
 def test_same_commit_rerun_with_system_packages(upgrade_setup):
@@ -1334,12 +1388,13 @@ def test_api_setup_preserves_operator_key(setup_environment, provider, other_pro
     before = path.read_bytes()
     if upgrade:
         state['sha'] = 'c' * 40
+        args.mimir_version = '1.0.1'
     invoke()
     assert path.read_bytes() == before
     assert f'{other_key}=operator-added-key' in path.read_text()
     assert f'MIMIR_MODEL_SPEC={provider}:model' in path.read_text()
     assert state['verified'] and state['running']
-    assert json.loads((deploy / 'manifest.json').read_text())['source_sha'] == state['sha']
+    assert json.loads((deploy / 'manifest.json').read_text())['mimir_version'] == ('1.0.1' if upgrade else VERSION)
 
 
 @pytest.mark.parametrize('provider,target', [('openai', 'anthropic'), ('anthropic', 'openai')])
@@ -1431,10 +1486,17 @@ def test_subscription_fresh_setup_requires_login_before_start(setup_environment,
     with pytest.raises(installer.SetupError, match=re.escape(command)):
         invoke()
     _fixture_codex_login(deploy)
-    with subprocess.Popen([sys.executable, '-c', installer._CODEX_LOGIN_PROBE],
+    diagnostic_probe = ('import faulthandler\nfaulthandler.dump_traceback_later(8)\n'
+                        + installer._CODEX_LOGIN_PROBE)
+    with subprocess.Popen([sys.executable, '-c', diagnostic_probe],
                           env={**os.environ, 'CODEX_HOME': str(deploy / 'codex')},
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as probe:
-        output, errors = probe.communicate(timeout=10)
+        try:
+            output, errors = probe.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            output, errors = probe.communicate()
+            pytest.fail('login probe timed out: ' + errors)
     assert probe.returncode == 0 and output.strip() == 'ok', errors
     invoke()
     assert state['running'] and state['verified']
@@ -1672,11 +1734,13 @@ def test_plain_git_credential_helper_reads_environment_without_persisting_secret
     assert "fixture-private-token" not in helper and not result.stderr
 
 
-def test_source_repo_validation():
-    assert installer.validate("source_repo", "neworg/mimir") == "neworg/mimir"
-    for slug in ("../escape", "o/.", "https://github.com/o/r", "o/r;evil"):
-        with pytest.raises(installer.SetupError):
-            installer.validate("source_repo", slug)
+def test_setup_cli_has_no_mimir_source_options():
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest='command'))
+    for option in ('--source-repo', '--source-ref', '--source-url', '--source-commit'):
+        with pytest.raises(SystemExit):
+            parser.parse_args(['cultivate', 'setup', option, 'org/mimir'])
+    assert parser.parse_args(['cultivate', 'setup', '--mimir-version', VERSION]).mimir_version == VERSION
 
 
 def test_secret_file_requires_private_mode(tmp_path):
@@ -2698,7 +2762,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     people = yaml.safe_load((state / "identities.yaml").read_text())["people"]
     assert {p["canonical"] for p in people} == {"another", "owner"}
     assert {"user", "admin"}.issubset(people[1]["access"]["roles"])
-    assert installer._SHA.fullmatch("a" * 40)
+    assert 'https://github.com/org/repo.git' == inventory['repositories'][0]['origin']
     assert sum("clone" in argv for argv in calls) == 2
     assert [argv for argv in calls if argv[0] == 'chainlink'] == [
         ['chainlink', 'init', '-q'], ['chainlink', 'agent', 'init', 'cultivate-worklink']]

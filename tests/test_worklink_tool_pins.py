@@ -125,10 +125,14 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
             assert f"{package}@${{FACTORY_VERSION}}" in fragment
     for mode in ("workspace", "pypi"):
         if selected:
-            scaffold = render_dockerfile([], mode=mode, plugins=selected)
-            assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in scaffold
-            assert "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/" in scaffold
-            assert 'FACTORY_VERSION="$FACTORY_VERSION" sh /opt/cultivate-docker/base.sh' in scaffold
+            if mode == "pypi":
+                with pytest.raises(ValueError, match="mimir cultivate setup"):
+                    render_dockerfile([], mode=mode, plugins=selected)
+            else:
+                scaffold = render_dockerfile([], mode=mode, plugins=selected)
+                assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in scaffold
+                assert "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/" in scaffold
+                assert 'FACTORY_VERSION="$FACTORY_VERSION" sh /opt/cultivate-docker/base.sh' in scaffold
         unselected = render_dockerfile([], mode=mode)
         assert "cultivate-docker" not in unselected
         assert "opencode-ai@" not in unselected

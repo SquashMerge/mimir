@@ -34,6 +34,7 @@ from mimir_cultivate.worklink.worker_client import (
 )
 import mimir_cultivate.worklink.worker_exec as worker_exec
 from mimir_cultivate.worklink import identities
+from mimir_cultivate import install_identity
 from tests.stat_helpers import stat_with
 
 
@@ -253,6 +254,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
             return json.dumps({
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "mode": "source",
                 "source_commit": "a" * 40,
                 "checkout_root": "/workspace/.worklink",
             }).encode()
@@ -263,7 +265,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
     monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
     monkeypatch.setattr(socket, "socket", lambda *args: Peer())
 
-    assert await verify_executor_identity(Path("/executor.sock")) == "a" * 40
+    assert await verify_executor_identity(Path("/executor.sock")) == {"mode": "source", "source_commit": "a" * 40}
 
     assert sent == [{
         "version": 1,
@@ -288,6 +290,7 @@ async def test_identity_probe_refuses_missing_or_malformed_source_commit(monkeyp
             return json.dumps({
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "mode": "source",
                 "source_commit": "dirty-or-unpinned",
             }).encode()
 
@@ -313,6 +316,50 @@ def test_executor_identity_reports_image_recorded_source_commit(
     source_commit.write_text("dirty\n", encoding="ascii")
     with pytest.raises(RuntimeError, match="invalid recorded source commit"):
         worker_exec._executor_source_commit()
+
+
+@pytest.mark.asyncio
+async def test_identity_probe_requires_complete_pypi_pair(monkeypatch) -> None:
+    pair = {name: {"version": "1.2", "wheel": f"{name.replace('-', '_')}-1.2-py3-none-any.whl", "sha256": "a" * 64}
+            for name in install_identity.PROJECTS}
+    response = {"status": "identity", "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "checkout_root": str(worker_exec.worklink_checkout_root()), "mode": "pypi", "distributions": pair}
+
+    class Peer:
+        def send(self, _data):
+            pass
+
+        def recv(self, _size):
+            return json.dumps(response).encode()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(WorkerClient, "_connect", lambda self: Peer())
+    assert await verify_executor_identity() == {"mode": "pypi", "distributions": pair}
+    for altered in ({"distributions": {"mimir-agent": pair["mimir-agent"]}},
+                    {"distributions": {**pair, "mimir-cultivate": {**pair["mimir-cultivate"], "version": "2.0"}}},
+                    {"mode": "source"}):
+        response.update(altered)
+        with pytest.raises(StaleWorkerExecutorError):
+            await verify_executor_identity()
+
+
+def test_executor_identity_reads_verified_pypi_pair(tmp_path, monkeypatch) -> None:
+    marker = tmp_path / "executor-install-identity.json"
+    marker.touch()
+    monkeypatch.setattr(install_identity, "EXECUTOR_MARKER", marker)
+    expected = {"mode": "pypi", "distributions": {"mimir-agent": {}, "mimir-cultivate": {}}}
+    monkeypatch.setattr(install_identity, "executor_identity", lambda: expected)
+    observed = []
+
+    class Connection:
+        def send(self, data):
+            observed.append(json.loads(data))
+
+    worker_exec._handle_identity(Connection(), {"version": 1, "op": "identity", "executor_identity": EXECUTOR_PROTOCOL_IDENTITY}, [])
+    assert observed[0]["mode"] == "pypi"
+    assert observed[0]["distributions"] == expected["distributions"]
 
 
 @pytest.mark.asyncio

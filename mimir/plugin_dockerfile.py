@@ -3,18 +3,76 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from packaging.utils import canonicalize_name
+from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from .plugins.discovery import PluginCandidate, PluginDiscoveryError, discover_plugins
 
 
 _CULTIVATE_PACKAGE = "mimir-cultivate"
 _CULTIVATE_SCRIPTS = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh")
+_CONTEXT_SCRIPTS = (*_CULTIVATE_SCRIPTS, "verify_wheels.py")
+_S6_FILES = (
+    "mimir/type", "mimir/run", "watchdog/type", "watchdog/run",
+    "worklink-execd/type", "worklink-execd/run", "worklink-execd/dependencies.d/base",
+    "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd",
+)
+
+
+def build_pypi_context(destination: Path, *, agent_wheel: Path, cultivate_wheel: Path,
+                       version: str, agent_sha256: str, cultivate_sha256: str) -> None:
+    """Materialize the closed image context from two verified release wheels.
+
+    The destination must be empty. No checkout path is read; wheel members are
+    copied by exact name rather than extracted from an untrusted archive.
+    """
+    if destination.exists() and any(destination.iterdir()):
+        raise ValueError("Docker build context must be empty")
+    inputs = (("mimir-agent", agent_wheel, agent_sha256),
+              ("mimir-cultivate", cultivate_wheel, cultivate_sha256))
+    if not version or agent_wheel.name == cultivate_wheel.name:
+        raise ValueError("a matching, distinct wheel pair is required")
+    resources = (
+        (agent_wheel, "mimir/docker_context/Dockerfile", "Dockerfile"),
+        *((agent_wheel, f"mimir/docker_context/deploy/s6-overlay/s6-rc.d/{name}",
+           f"deploy/s6-overlay/s6-rc.d/{name}") for name in _S6_FILES),
+        *((cultivate_wheel, f"mimir_cultivate/docker/{name}",
+           f"plugins/cultivate/mimir_cultivate/docker/{name}") for name in _CONTEXT_SCRIPTS),
+    )
+    opened = {}
+    try:
+        for name, path, expected in inputs:
+            parsed_name, parsed_version, _, _ = parse_wheel_filename(path.name)
+            if (parsed_name != name or str(parsed_version) != version or
+                    not re.fullmatch(r"[0-9a-f]{64}", expected) or
+                    not path.is_file() or path.is_symlink() or
+                    hashlib.sha256(path.read_bytes()).hexdigest() != expected):
+                raise ValueError(f"{name} wheel identity mismatch")
+            opened[path] = zipfile.ZipFile(path)
+        for archive, member, _ in resources:
+            info = opened[archive].getinfo(member)
+            if info.is_dir() or (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError(f"unsafe Docker context resource: {member}")
+        destination.mkdir(parents=True, exist_ok=True)
+        for archive, member, target in resources:
+            output = destination / target
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(opened[archive].read(member))
+        wheel_dir = destination / "plugins/cultivate/mimir_cultivate/docker/wheels"
+        wheel_dir.mkdir()
+        for _, path, _ in inputs:
+            shutil.copyfile(path, wheel_dir / path.name)
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise ValueError("released wheel lacks required Docker context resources") from exc
+    finally:
+        for archive in opened.values():
+            archive.close()
 
 
 def has_trusted_cultivate(candidates: tuple[PluginCandidate, ...]) -> bool:

@@ -142,7 +142,10 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
 
     for name, original in zip(names, baseline, strict=True):
         expected_steps = steps(original)
-        actual_steps = steps((source / name).read_text())
+        script = (source / name).read_text()
+        if name == "executor.sh":
+            script = "git check-ref-format" + script.split("git check-ref-format", 1)[1]
+        actual_steps = steps(script)
         if name == "base.sh":
             # Common developer tools were added after the historical extraction.
             old = "xz-utils poppler-utils"
@@ -189,7 +192,8 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
 ])
 def test_executor_install_excludes_local_embeddings(extras, expected):
     script = (ROOT / "plugins/cultivate/mimir_cultivate/docker/executor.sh").read_text()
-    assert "torch" not in script
+    assert "'torch==2.15.0+cpu'" in script
+    assert "https://download.pytorch.org/whl/cpu" in script
     # Execute the real filter and install command, replacing only pip with an
     # argv recorder. No Git, venv creation, package install or cleanup runs.
     program = script.split('MIMIR_EXTRAS="$(', 1)[1]
@@ -218,6 +222,36 @@ def _run_instructions(text: str) -> list[str]:
                 programs.append(current[0])
                 current = None
     return programs
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_wheel_preinstall_run_fails_closed_on_hash_mismatch(tmp_path, valid) -> None:
+    import hashlib
+    import zipfile
+
+    scripts = tmp_path / "cultivate-docker"
+    wheels = scripts / "wheels"
+    wheels.mkdir(parents=True)
+    staged = tmp_path / "worklink/wheels"
+    names = ("mimir_agent-1.0-py3-none-any.whl", "mimir_cultivate-1.0-py3-none-any.whl")
+    digests = []
+    for name in names:
+        with zipfile.ZipFile(wheels / name, "w") as archive:
+            archive.writestr("metadata", name)
+        digests.append(hashlib.sha256((wheels / name).read_bytes()).hexdigest())
+    program, = (p for p in _run_instructions(DOCKERFILE.read_text())
+                if "verify_wheels.py" in p and "cp /opt/cultivate-docker/wheels" in p)
+    program = program.replace("/opt/cultivate-docker", str(scripts)).replace(
+        "/opt/mimir-worklink/wheels", str(staged))
+    (scripts / "verify_wheels.py").write_bytes(
+        (ROOT / "plugins/cultivate/mimir_cultivate/docker/verify_wheels.py").read_bytes())
+    result = subprocess.run(["/bin/sh", "-c", program], capture_output=True, text=True,
+                            env={**os.environ, "MIMIR_INSTALL_MODE": "pypi", "MIMIR_VERSION": "1.0",
+                                 "MIMIR_AGENT_WHEEL": names[0], "MIMIR_CULTIVATE_WHEEL": names[1],
+                                 "MIMIR_AGENT_SHA256": digests[0] if valid else "0" * 64,
+                                 "MIMIR_CULTIVATE_SHA256": digests[1]})
+    assert (result.returncode == 0) is valid, result.stderr
+    assert staged.exists() is valid, "a rejected wheel must never reach the install location"
 
 
 @pytest.mark.parametrize("selection,packages,selected,success", [
@@ -251,7 +285,7 @@ def test_root_cultivate_selection_executes_verified_build_branches(
     for command in ("sh", "groupadd", "useradd", "chmod"):
         (bin_dir / command).write_text(f'#!/bin/sh\nprintf "{command} %s\\n" "$*" >> "$COMMAND_LOG"\n')
         (bin_dir / command).chmod(0o755)
-    env = {**os.environ, "MIMIR_PLUGIN_SELECTION": selection, "MIMIR_PLUGIN_PACKAGES": packages,
+    env = {**os.environ, "MIMIR_INSTALL_MODE": "source", "MIMIR_PLUGIN_SELECTION": selection, "MIMIR_PLUGIN_PACKAGES": packages,
            "COMMAND_LOG": str(log)}
 
     def run(program: str, *, stubbed: bool) -> subprocess.CompletedProcess[str]:
@@ -358,7 +392,7 @@ def _runtime_stage_dependencies(text: str, **build_args: str) -> set[str]:
 
 
 def _assert_core_skips_chainlink_builder(text: str) -> None:
-    reachable = _runtime_stage_dependencies(text)
+    reachable = _runtime_stage_dependencies(text, MIMIR_INSTALL_MODE="source")
     assert "chainlink-none" in reachable
     assert "chainlink-build" not in reachable, "core build schedules the Rust builder"
 
@@ -366,13 +400,15 @@ def _assert_core_skips_chainlink_builder(text: str) -> None:
 def test_chainlink_builder_is_only_reachable_when_explicitly_selected() -> None:
     text = DOCKERFILE.read_text()
     _assert_core_skips_chainlink_builder(text)
-    reachable = _runtime_stage_dependencies(text, CHAINLINK_ARTIFACT_STAGE="chainlink-build")
-    assert "chainlink-build" in reachable
-    assert "chainlink-none" not in reachable
-    # Pin the live Docker proof's selection as well as the documented invocation.
+    for mode in ("source", "pypi"):
+        reachable = _runtime_stage_dependencies(text, MIMIR_INSTALL_MODE=mode,
+                                                CHAINLINK_ARTIFACT_STAGE="chainlink-build")
+        assert "chainlink-build" in reachable
+        assert "chainlink-none" not in reachable
+        assert ("source-assembly" in reachable) is (mode == "source")
     proof = (ROOT / "scripts/worklink_image_identity.py").read_text()
-    assert '"--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate"' in proof
-    assert '"--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build"' in proof
+    assert '"CHAINLINK_ARTIFACT_STAGE=chainlink-build"' in proof
+    assert '"MIMIR_PLUGIN_SELECTION=cultivate"' in proof
 
 
 @pytest.mark.parametrize("old,new", [
@@ -607,7 +643,7 @@ def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -
             "/home/mimir/venv/bin/python", str(python)).replace("&& rm -rf /opt/mimir-image-assembly", "")
         subprocess.run(["/bin/sh", "-c", local], check=True, env={
             **os.environ, "MIMIR_PLUGIN_PACKAGES": packages, "MIMIR_PLUGIN_SELECTION": "",
-            "MIMIR_PLUGIN_ALL_INSTALLED": "0", "ARGS_LOG": str(log)})
+            "MIMIR_INSTALL_MODE": "source", "MIMIR_PLUGIN_ALL_INSTALLED": "0", "ARGS_LOG": str(log)})
         args = log.read_text().splitlines()
         assert args[args.index("--packages") + 1] == expected
 
@@ -721,7 +757,29 @@ def _assert_provenance_stage_ancestry(text: str, **build_args: str) -> None:
 
 def test_every_image_stage_inherits_provenance_validation() -> None:
     for artifact in ("chainlink-none", "chainlink-build"):
-        _assert_provenance_stage_ancestry(_text(), CHAINLINK_ARTIFACT_STAGE=artifact)
+        for mode in ("source", "pypi"):
+            _assert_provenance_stage_ancestry(_text(), CHAINLINK_ARTIFACT_STAGE=artifact, MIMIR_INSTALL_MODE=mode)
+
+
+@pytest.mark.parametrize("mode", ["invalid", "wheel", "typo"])
+def test_unrecognized_install_modes_still_require_validation(mode):
+    text = DOCKERFILE.read_text()
+    runtime = text.split("FROM ${MIMIR_INSTALL_MODE}-assembly AS runtime\n", 1)[1]
+    assert "COPY --from=provenance-validation /etc/os-release /mimir-provenance-base-os-release" in runtime
+    # Unlike FROM ancestry for recognized modes, this dependency must survive
+    # even when Docker interprets the assembly name as an external image.
+    assert "provenance-validation" in _runtime_stage_dependencies(text, MIMIR_INSTALL_MODE=mode)
+    result = _run_provenance_validation(MIMIR_INSTALL_MODE=mode)
+    assert result.returncode == 2
+    assert "MIMIR_INSTALL_MODE must be source or pypi" in result.stdout
+
+
+def test_unrecognized_mode_guard_detects_removed_validation_edge(monkeypatch):
+    text = DOCKERFILE.read_text().replace(
+        "COPY --from=provenance-validation /etc/os-release /mimir-provenance-base-os-release\n", "")
+    monkeypatch.setattr(type(DOCKERFILE), "read_text", lambda *args, **kwargs: text)
+    with pytest.raises(AssertionError):
+        test_unrecognized_install_modes_still_require_validation("wheel")
 
 
 def test_provenance_stage_ancestry_rejects_external_artifact_default() -> None:
@@ -774,12 +832,18 @@ def _run_provenance_validation(**build_args: str) -> subprocess.CompletedProcess
     """
     stage = _text().split("FROM ${BASE_IMAGE} AS provenance-validation\n", 1)[1]
     stage = re.split(r"(?m)^FROM ", stage, maxsplit=1)[0]
-    names = ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT")
+    names = ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT", "MIMIR_GIT_URL", "MIMIR_INSTALL_MODE", "MIMIR_VERSION", "MIMIR_AGENT_WHEEL", "MIMIR_AGENT_SHA256", "MIMIR_CULTIVATE_WHEEL", "MIMIR_CULTIVATE_SHA256")
+    defaults = {}
     for name in names:
-        assert f"ARG {name}\n" in stage
+        declaration = re.search(rf'(?m)^ARG {name}(?:=(.*))?$', stage)
+        assert declaration is not None
+        if declaration[1] is not None:
+            defaults[name] = shlex.split(declaration[1])[0] if declaration[1] != '""' else ""
     program = stage.split("RUN ", 1)[1].strip().replace("\\\n", "\n")
-    # Docker's unset ARGs are empty, regardless of the test process environment.
-    env = {**os.environ, **dict.fromkeys(names, ""), **build_args}
+    # Only explicit ARG defaults are exported. Undeclared values remain unset,
+    # as Docker actually presents them to a set -u shell.
+    env = {key: value for key, value in os.environ.items() if key not in names}
+    env.update({**defaults, "MIMIR_INSTALL_MODE": "source", **build_args})
     return subprocess.run(
         ["/bin/sh", "-c", program], cwd=ROOT, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=30,
@@ -815,6 +879,25 @@ def test_provenance_validation_accepts_pinned_args() -> None:
     assert result.returncode == 0, result.stdout
 
 
+@pytest.mark.parametrize("change,message", [
+    ({"MIMIR_INSTALL_MODE": ""}, "MIMIR_INSTALL_MODE must be source or pypi"),
+    ({"MIMIR_GIT_REF": "refs/heads/main"}, "pypi mode refuses Mimir source arguments"),
+    ({"MIMIR_GIT_URL": "https://example.test/source"}, "pypi mode refuses Mimir source arguments"),
+    ({"MIMIR_VERSION": ""}, "MIMIR_VERSION must be exact"),
+    ({"MIMIR_AGENT_WHEEL": ""}, "MIMIR_AGENT wheel required"),
+    ({"MIMIR_CULTIVATE_SHA256": "f" * 63}, "MIMIR_CULTIVATE SHA256 required"),
+])
+def test_pypi_provenance_rejects_missing_or_source_inputs(change, message) -> None:
+    pins = {"MIMIR_INSTALL_MODE": "pypi", "MIMIR_VERSION": "1.0.0rc2",
+            "MIMIR_AGENT_WHEEL": "mimir_agent-1.0.0rc2-py3-none-any.whl",
+            "MIMIR_CULTIVATE_WHEEL": "mimir_cultivate-1.0.0rc2-py3-none-any.whl",
+            "MIMIR_AGENT_SHA256": "a" * 64, "MIMIR_CULTIVATE_SHA256": "b" * 64}
+    assert _run_provenance_validation(**pins).returncode == 0
+    result = _run_provenance_validation(**(pins | change))
+    assert result.returncode == 2
+    assert message in result.stdout
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
 # Hang guard above the subprocess bounds this test already owns (60s ls-remote,
 # 1200s build, 60s run). The suite-wide 300s default killed a cold-cache image
@@ -848,6 +931,7 @@ def test_built_image_provides_process_tools() -> None:
             [
                 "docker", "build",
                 "--build-arg", f"MIMIR_GIT_REF={source_ref}",
+                "--build-arg", "MIMIR_INSTALL_MODE=source",
                 "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
                 "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
                 "--tag", image, ".",
@@ -945,13 +1029,94 @@ def test_provider_services_are_build_time_opt_in_and_preserve_core_bundle() -> N
     assert 'pip install --no-cache-dir "$package"' in text
     assert '--enable "$MIMIR_PLUGIN_SELECTION"' in text
     assert '--all-installed "$MIMIR_PLUGIN_ALL_INSTALLED"' in text
-    assert 'sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' in text
+    assert "from mimir.plugin_dockerfile import main; main()" in text
     assert '--destination /etc/s6-overlay/s6-rc.d' in text
     assert '--scripts /usr/local/libexec/mimir-plugin-services' in text
     assert text.index('pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"') < text.index('pip install --no-cache-dir "$package"') < text.index('COPY deploy/s6-overlay/s6-rc.d/')
     assert 'COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/' in text
     for service in ("mimir", "watchdog", "worklink-execd"):
         assert f"/etc/s6-overlay/s6-rc.d/{service}/run" in text or service == "mimir" and "deploy/s6-overlay/s6-rc.d/" in text
+
+
+def test_mode_selection_and_source_assembler_have_real_stage_dependencies():
+    text = DOCKERFILE.read_text()
+    assert "ARG MIMIR_INSTALL_MODE=invalid\n" in text
+    assert "FROM provenance-validation AS invalid-assembly\n" in text
+    assert "FROM ${MIMIR_INSTALL_MODE}-assembly AS runtime\n" in text
+    assert "FROM base AS source-assembly\nCOPY mimir/ /opt/mimir-image-assembly/mimir/\n" in text
+    assert "ENV MIMIR_INSTALL_MODE=${MIMIR_INSTALL_MODE}" in text
+    reachable = _runtime_stage_dependencies(text)
+    assert "provenance-validation" in reachable
+    assert "source-assembly" not in reachable
+
+
+def test_pypi_install_scripts_keep_dependency_cache_and_no_bytecode_policy():
+    text = DOCKERFILE.read_text()
+    scripts = ROOT / "plugins/cultivate/mimir_cultivate/docker"
+    controller = (scripts / "controller.sh").read_text().split("git check-ref-format", 1)[0]
+    executor = (scripts / "executor.sh").read_text().split("git check-ref-format", 1)[0]
+    assert "pip install --no-cache-dir --no-compile" in controller
+    assert "ENV PYTHONDONTWRITEBYTECODE=1" in text
+    assert "UV_CACHE_DIR=/opt/mimir-worklink/uv-cache /opt/mimir-worklink/venv/bin/uv pip install" in executor
+    plugin_install = next(program for program in _run_instructions(text)
+                          if "for package in $MIMIR_PLUGIN_PACKAGES" in program and "pip install" in program)
+    assert "--no-deps" not in plugin_install
+    assert "--no-compile" in plugin_install
+    # Both allowlists are created during the image build, not from the mutable
+    # venv at health time. Controller snapshot runs as root after optional extras.
+    snapshot = text.index("write_startup_hooks(CONTROLLER_HOOKS)")
+    assert text.rfind("USER root", 0, snapshot) > text.rfind("USER mimir", 0, snapshot)
+    assert text.index('ARG MIMIR_ENABLE_CLAUDE_CODE=0') < snapshot
+    assert "chown root:root /opt/mimir-worklink/controller-startup-hooks.json" in text
+    assert "write_startup_hooks(EXECUTOR_HOOKS); executor_identity()" in executor
+
+
+@pytest.mark.parametrize("mode", ["source", "pypi"])
+def test_controller_package_lockdown_is_pypi_only(tmp_path, mode):
+    import shlex
+    import stat
+
+    text = DOCKERFILE.read_text()
+    program = next(p for p in _run_instructions(text) if "write_startup_hooks(CONTROLLER_HOOKS)" in p)
+    assert 'if [ "$MIMIR_INSTALL_MODE" = pypi ]' in program
+    ownership_commands = [
+        shlex.split(command.strip())
+        for command in program.replace('\\\n', '').split(';')
+        if command.strip().startswith('chown -R ')
+    ]
+    assert ownership_commands == [[
+        'chown', '-R', 'root:root',
+        '/home/mimir/venv/lib/python*/site-packages/mimir',
+        '/home/mimir/venv/lib/python*/site-packages/mimir_cultivate',
+    ]]
+    assert text.index('ARG MIMIR_ENABLE_CLAUDE_CODE=0') < text.index('chown -R root:root /home/mimir/venv/lib/')
+    assert text.rfind('USER root', 0, text.index('chown -R root:root /home/mimir/venv/lib/')) > text.rfind('USER mimir', 0, text.index('chown -R root:root /home/mimir/venv/lib/'))
+    venv = tmp_path / 'venv'
+    site = venv / 'lib/python3.11/site-packages'
+    for package in ('mimir', 'mimir_cultivate'):
+        (site / package / 'nested').mkdir(parents=True)
+        (site / package / 'nested/module.py').write_text('value = 42\n')
+    (venv / 'controller-install-identity.json').write_text('{}')
+    # Execute the actual Docker RUN against a fixture venv. Only privileged
+    # ownership and the earlier snapshot writer are substituted; chmod and its
+    # mode guard remain real. Live image proof independently attests uid 0.
+    program = program.replace('/home/mimir/venv', str(venv))
+    program = program.replace('/opt/mimir-worklink/controller-startup-hooks.json', str(tmp_path / 'hooks.json'))
+    program = program.replace(str(venv) + '/bin/python -c', 'true -c')
+    program = program.replace('chown ', 'true ')
+    (tmp_path / 'hooks.json').write_text('{}')
+    result = subprocess.run(['/bin/sh', '-c', program], capture_output=True, text=True,
+                            env={**os.environ, 'MIMIR_INSTALL_MODE': mode})
+    try:
+        assert result.returncode == 0, result.stderr
+        for package in ('mimir', 'mimir_cultivate'):
+            for path in (site / package, *(site / package).rglob('*')):
+                assert bool(path.stat().st_mode & 0o222) == (mode == 'source'), path
+                if path.is_dir():
+                    assert path.stat().st_mode & stat.S_IXUSR
+    finally:
+        for path in venv.rglob('*'):
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
 
 
 def test_image_assembly_rejects_missing_selected_package() -> None:

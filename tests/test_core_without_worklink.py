@@ -45,6 +45,11 @@ def test_core_only_scaffold_sets_up_no_worklink_identity_or_paths(tmp_path, monk
 def test_cultivate_scaffold_does_set_up_the_worklink_identity(tmp_path, monkeypatch, mode):
     pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    if mode == "pypi":
+        with pytest.raises(ValueError, match="mimir cultivate setup"):
+            scaffold(tmp_path, mode=mode)
+        assert not list(tmp_path.iterdir())
+        return
     scaffold(tmp_path, mode=mode)
     users = (tmp_path / ".mimir-scaffold/cultivate-docker/users.sh").read_text()
     assert "useradd --no-create-home --uid 1002 --gid worklink" in users

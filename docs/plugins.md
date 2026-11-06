@@ -31,8 +31,8 @@ operator-only CLI invocation is described below.
 
 #### Set up a Cultivate agent
 
-Run `mimir cultivate setup` from a source checkout with Cultivate installed
-(`uv run --all-packages mimir cultivate setup`). The operator workstation does
+Run `mimir cultivate setup` with both released packages installed (or
+`uv run --all-packages mimir cultivate setup` in a development checkout). The operator workstation does
 not need `MIMIR_PLUGINS`: the installer selects Cultivate in the generated agent
 deployment, not in the operator's shell.
 Before any other prompt or provisioning, setup displays the full shipped
@@ -48,13 +48,22 @@ commit email, an owner name and email, a model spec (and an API key only for
 API-backed models), and a local
 deployment directory and loopback port. It shows the required fine-grained PAT
 permissions and verifies the bot's identity, Write invitation, PR read and
-Actions read before building. The source is fetched from a pushed ref and its
-full SHA is pinned into both the controller and executor image build.
-Re-run setup against the same deployment directory to upgrade to a newer
-`--source-ref` commit in place. It retains `compose.env`, the owner web key and
-all named volumes; generated files are replaced only if they still match the
-hashes saved in `manifest.json` (older deployments are checked against their
-previously generated contents). An edited generated file or an active Worklink
+Actions read before building. Setup resolves a matching pair of non-yanked,
+Python 3.11 Linux-compatible `mimir-agent` and `mimir-cultivate` PyPI wheels.
+By default it selects the latest common stable version, falling back to the
+latest common prerelease. `--mimir-version` requires an exact common version.
+The installer verifies both wheel downloads against their PyPI SHA-256 hashes,
+then builds from a bounded local context derived from those wheel archives.
+`manifest.json`, Compose and `build.sh` retain the exact version and both
+hashes; rebuilding pins the two first-party wheels, not the entire dependency
+closure. Transitive dependencies still resolve from the index independently in
+each venv, so builds are not byte-for-byte reproducible.
+Re-running setup preserves the saved version. To upgrade, pass an explicit
+`--mimir-version` against the same PyPI-mode deployment directory. It
+retains `compose.env`, the owner web key and all named volumes; generated files
+are replaced only if they still match the hashes saved in `manifest.json`.
+Source-era deployments cannot be upgraded, even with `--force`: create a new
+deployment directory and migrate operator data explicitly. An edited generated file or an active Worklink
 run or PR checkout lease prevents the upgrade unless `--force` is supplied.
 On an image change, setup prints the previous image tag and a Compose rollback
 command. Wait for running work to finish before upgrading.
@@ -125,8 +134,6 @@ enable Socket Mode and create an app-level `xapp-…` token with
 token, invite the bot to the alert channel and copy its C/G channel ID.
 Both bot choices build the matching image extra and limit inbound messages to
 that channel with mentions required.
-Use `--source-repo owner/name` (`MIMIR_CULTIVATE_SOURCE_REPO`) to build from
-a trusted fork or relocated source repo; the default is `SquashMerge/mimir`.
 Setup prefers executable `tools/verify` or `scripts/verify` (including `.sh`
 variants) over language-default test commands. Rust nextest uses a versioned
 prebuilt binary, taking a `cargo-nextest@X.Y.Z` workflow pin when present
@@ -183,7 +190,8 @@ web key as separate mode-600 files and does not print either key.
 
 The generated Compose binds only to `127.0.0.1`, has an init service to own
 the named volumes, and selects Cultivate in the **process environment**. Setup
-also writes a provenance-pinned `build.sh` for reproducible rebuilds. Setup
+also writes a `build.sh` pinned to the first-party wheel pair. Transitive
+dependencies are independently resolved, not locked by this script. Setup
 provisions the checkout, repository inventory, Chainlink agent identity
 (`cultivate-worklink`), Worklink config, dedicated base, optional GitHub pollers,
 and owner key before starting the agent. Issues are tracked in Chainlink in
@@ -202,12 +210,11 @@ the same command to repair missing provisioning without replacing operator
 secrets. Use `--rotate-web-key` only when intentionally revoking the old key.
 
 Coding is supplied by the separately packaged `mimir-cultivate` distribution
-(`BUSL-1.1`), not by an extra on the MIT `mimir-agent` distribution. It is
-**not published to a package index**: it is installed from the in-repo
-`plugins/cultivate` workspace member at the same commit as core. From a source
+(`BUSL-1.1`), not by an extra on the MIT `mimir-agent` distribution. From a source
 checkout, `uv sync --all-packages` (plus your usual `--extra` flags) installs
-both; a plain `uv sync` or `uv sync --extra …` removes it again. Images build it
-from the pinned source commit with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate`
+both; a plain `uv sync` or `uv sync --extra …` removes it again. Independent
+source-mode images build it from the pinned source commit with explicit
+`--build-arg MIMIR_INSTALL_MODE=source`, `--build-arg MIMIR_PLUGIN_SELECTION=cultivate`
 and `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` (see
 [Docker image assembly](#docker-image-assembly-and-services)). Then set
 `MIMIR_PLUGINS=cultivate` in the operator-owned process environment and restart.
@@ -231,15 +238,15 @@ selected plugin owns. Startup does not fail.
      every later `uv sync`, including any wrapper script. The workspace-mode
      `start.sh` that `mimir scaffold-docker` generates does this when Cultivate is
      selected at scaffold time.
-   - Root `Dockerfile`: rebuild with
+    - Root `Dockerfile` in source mode: rebuild with `--build-arg MIMIR_INSTALL_MODE=source`,
      `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
      `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` (and
      `--build-arg MIMIR_ENABLE_OPENCODE=1` for the OpenCode CLI the coding tools
      require). Do not list `mimir-cultivate` in `MIMIR_PLUGIN_PACKAGES`; the
      build refuses it.
-   - PyPI-mode scaffold: re-run `mimir scaffold-docker` with
-     `MIMIR_PLUGINS=cultivate` exported, then rebuild. The image installs core
-     and Cultivate from `MIMIR_CONTROLLER_COMMIT`.
+    - PyPI-mode Cultivate: use dedicated `mimir cultivate setup` in a new
+      deployment directory. The generic PyPI scaffold refuses Cultivate rather
+      than silently installing a source overlay.
 2. **Select it in the process environment.** Set `MIMIR_PLUGINS=cultivate`
    where the supervisor starts Mimir: shell export, systemd `Environment=`, or
    compose `environment:`/`env_file`. The agent home's `.env` cannot select
@@ -498,12 +505,32 @@ The repository-root production `Dockerfile` has s6 and the core `mimir` and
 `CHAINLINK_ARTIFACT_STAGE=chainlink-build` at build time it also assembles the
 trusted first-party fragment: pinned OpenCode and factory adapters, UID 1002 Worklink user, data directories,
 `opencode-bootstrap` and the exact `worklink-execd` s6 service (not a generic
-prefixed plugin service). Both venvs run Cultivate built from the verified
-source commit, never from an index: the root executor venv overlays core and
+prefixed plugin service). In explicit source mode both venvs run Cultivate built
+from the verified source commit: the root executor venv overlays core and
 `plugins/cultivate` from `MIMIR_EXECUTOR_COMMIT` with `--no-deps` (so the
 plugin's exact `mimir-agent==` pin cannot replace the overlaid core), and the
 user-owned controller venv installs core and `plugins/cultivate` together from
 `MIMIR_CONTROLLER_COMMIT`, which the build requires to equal the executor commit.
+In explicit PyPI mode, dedicated setup supplies two verified, exact-version
+wheel archives and their SHA-256 hashes in a bounded local context; both venvs
+install the same pair and configured extras. It cannot fall back to Git.
+First-party package bytes are checked against retained root-owned wheels; any
+bytecode under their package roots is drift, even with a self-consistent hash
+in a mutable installed RECORD. Builds use explicit `pip --no-compile` and
+`PYTHONDONTWRITEBYTECODE=1`. PyPI controller first-party package trees are also
+root-owned and read-only: Python silently skips bytecode writes even when a
+poller, skill smoke check or other subprocess drops that environment setting.
+Source-mode controller packages retain their existing writable update flow.
+Interpreter startup hooks (`*.pth`,
+`sitecustomize.py`, `usercustomize.py`) must exactly match root-owned build-time
+allowlists outside the controller venv. This includes uv's `_virtualenv.pth`
+when present at build time; a new or modified hook is never authorized by a
+new dist-info RECORD. Allowlist regeneration is a build operation, not runtime
+repair. Dependency code in the user-owned controller venv is outside AC3's
+first-party integrity guarantee; this is not a sandbox against arbitrary code
+already executing as the controller. Transitive dependencies remain unpinned.
+Setup reruns compare resolved wheel names/hashes to the saved manifest and
+refuse changed files for the same version.
 Without the selection the image is core-only: no executor venv, no `worklink`
 user and no `worklink-execd` service. Third-party plugins are installed at
 **build time** too: set `MIMIR_PLUGIN_PACKAGES` to comma-separated exact
@@ -514,12 +541,11 @@ verifies installed versions/selection and assembles services; a non-installable
 selected provider fails the build. Runtime `MIMIR_PLUGINS` alone neither installs
 packages nor changes s6 definitions. Rebuild the image when adding services.
 The PyPI self-update paths (the approved pending-update flag,
-`request_mimir_update` and `mimir update --apply`) refuse wherever Cultivate is
-installed from source, which is detected from `<venv>/controller-source-commit` or
-a `file://` install of `mimir-cultivate`. A refused startup update consumes the
-flag and boots the current version, the same as a failed install. To update,
-rebuild the image or re-sync the checkout at the new commit, so core and the
-plugin stay paired.
+`request_mimir_update` and `mimir update --apply`) refuse core-only upgrades
+of an installed Cultivate image pair, including malformed identity; source
+images are also immutable. A refused startup update consumes the flag and boots
+the current version, the same as a failed install. Rebuild the image from a new
+verified release pair, or re-sync a source-mode checkout at the new commit.
 
 ### Defaults and configuration
 

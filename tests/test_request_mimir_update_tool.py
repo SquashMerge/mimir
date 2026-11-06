@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +23,9 @@ def setup_update(tmp_path, monkeypatch):
     # The selected-mode suite's own venv is a file:// Cultivate install; these
     # tests own the request path, so pin the source-install probe to PyPI.
     monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: None)
+    def no_cultivate(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+    monkeypatch.setattr(importlib.metadata, "distribution", no_cultivate)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setitem(registry._STATE, "dispatcher", SimpleNamespace(
         _config=SimpleNamespace(operator_alert_channel="discord-1")))
@@ -113,4 +118,28 @@ async def test_source_installed_cultivate_refuses_before_registering(setup_updat
     assert result.startswith("request_mimir_update refused: this deployment installs Cultivate "
                              f"from source at {'d' * 40}; rebuild the image or re-sync the checkout")
     assert registered == []
+    assert not flag_path(home).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contents", ['{"mode":"pypi"}', "not json"])
+async def test_pair_install_refuses_before_authorization(setup_update, monkeypatch, contents):
+    home, _ = setup_update
+    monkeypatch.setattr(sys, "prefix", str(home))
+    (home / "controller-install-identity.json").write_text(contents)
+    monkeypatch.setattr(approval_requests, "register", lambda **kw: pytest.fail("must not register"))
+    result = await registry.request_mimir_update.ainvoke({})
+    assert "refused: this deployment has an immutable Cultivate wheel pair" in result
+    assert "rebuild the image" in result
+    assert not flag_path(home).exists()
+
+
+@pytest.mark.asyncio
+async def test_installed_cultivate_without_marker_refuses_before_authorization(setup_update, monkeypatch):
+    home, _ = setup_update
+    monkeypatch.setattr(sys, "prefix", str(home))
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: SimpleNamespace())
+    monkeypatch.setattr(approval_requests, "register", lambda **kw: pytest.fail("must not register"))
+    result = await registry.request_mimir_update.ainvoke({})
+    assert "refused: this deployment has Cultivate installed without a controller install identity" in result
     assert not flag_path(home).exists()

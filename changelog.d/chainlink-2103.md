@@ -1,0 +1,5 @@
+- Build Cultivate deployments exclusively from matched, SHA-256-verified PyPI wheel releases, with explicit version selection and source-era upgrade refusal.
+- Preserve the selected release on setup reruns, preflight released build resources before writing deployment artifacts, and exercise the generated platform/base/extras build in image-identity CI; keep the provider-dependent generated-build regression in the Cultivate-enabled suite rather than requiring Cultivate in core-only jobs.
+- Reject first-party bytecode and compare package inventories with immutable wheels off the health event loop; pin startup hooks to root-owned build-time allowlists, retain legacy source-mode health and assembler compatibility, and use CPU embeddings and a pinned, preseeded uv toolchain in PyPI workers.
+- Refuse changed wheel filenames or hashes for a saved release, keep pip installs bytecode-free explicitly, and route omitted Docker install modes to the actionable provenance diagnostic.
+- Initialize the required controller-owned PR lease directory before starting either direct-run image proof, matching setup's Compose initialization without weakening startup checks.

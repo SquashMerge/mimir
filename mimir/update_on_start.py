@@ -631,6 +631,7 @@ def _read_flag(path: Path) -> PendingUpdate:
 
 #: Written into the controller venv by Cultivate's ``controller.sh`` image step.
 _CONTROLLER_SOURCE_COMMIT_BASENAME = "controller-source-commit"
+_CONTROLLER_INSTALL_IDENTITY_BASENAME = "controller-install-identity.json"
 
 
 def cultivate_source_install() -> str | None:
@@ -676,6 +677,37 @@ def cultivate_source_refusal(source: str) -> str:
         f"this deployment installs Cultivate from source at {source}; rebuild the "
         "image or re-sync the checkout to update (a PyPI upgrade of mimir-agent "
         "would move core away from the plugin's commit)"
+    )
+
+
+def cultivate_update_refusal() -> tuple[str, str, str | None] | None:
+    """Refuse a core-only upgrade when the controller has an immutable pair.
+
+    Marker presence is enough: an unreadable or malformed identity must never
+    turn a paired image into an eligible core-only PyPI install.
+    """
+    marker = Path(sys.prefix) / _CONTROLLER_INSTALL_IDENTITY_BASENAME
+    if marker.exists() or marker.is_symlink():
+        return (
+            "cultivate_pypi_pair",
+            "this deployment has an immutable Cultivate wheel pair; rebuild the "
+            "image with a matching mimir-agent and mimir-cultivate release to update "
+            "(a core-only PyPI upgrade would break the pair)",
+            None,
+        )
+    source = cultivate_source_install()
+    if source is not None:
+        return "cultivate_source_install", cultivate_source_refusal(source), source
+    try:
+        importlib.metadata.distribution("mimir-cultivate")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    return (
+        "cultivate_unverified_install",
+        "this deployment has Cultivate installed without a controller install identity; "
+        "rebuild the image or re-sync the checkout to update both packages together "
+        "(a core-only PyPI upgrade could break the installation)",
+        None,
     )
 
 
@@ -932,14 +964,14 @@ def apply_pending_update(
         return True
     pkg = _pypi_package_name()
     spec = _install_spec(pkg, parsed)
-    source = cultivate_source_install()
-    if source is not None:
+    refusal = cultivate_update_refusal()
+    if refusal is not None:
         # Same outcome as a failed install: flag consumed, keep booting the
         # current version, event surfaced on the first turn after restart.
-        message = cultivate_source_refusal(source)
+        reason, message, source = refusal
         log.error("pending mimir update REFUSED: %s", message)
-        emit("mimir_update_failed", spec=spec, reason="cultivate_source_install",
-             source=source, error=message)
+        emit("mimir_update_failed", spec=spec, reason=reason,
+              source=source, error=message)
         try:
             path.unlink()
         except OSError as exc:
