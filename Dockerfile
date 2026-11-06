@@ -470,6 +470,9 @@ FROM base AS pypi-assembly
 # rather than fail Docker's stage-name parser on "-assembly".
 FROM provenance-validation AS invalid-assembly
 FROM ${MIMIR_INSTALL_MODE}-assembly AS runtime
+# Even an external assembly selected by a misspelled mode must depend on the
+# validation RUN. Its refusal prevents the runtime from completing.
+COPY --from=provenance-validation /etc/os-release /mimir-provenance-base-os-release
 # MIMIR_PLUGIN_SELECTION chooses enabled providers at build time; disabled pinned
 # distributions add no services unless MIMIR_PLUGIN_ALL_INSTALLED=1 is explicit.
 # A selected Cultivate is pinned to the version controller.sh installed.

@@ -761,6 +761,27 @@ def test_every_image_stage_inherits_provenance_validation() -> None:
             _assert_provenance_stage_ancestry(_text(), CHAINLINK_ARTIFACT_STAGE=artifact, MIMIR_INSTALL_MODE=mode)
 
 
+@pytest.mark.parametrize("mode", ["invalid", "wheel", "typo"])
+def test_unrecognized_install_modes_still_require_validation(mode):
+    text = DOCKERFILE.read_text()
+    runtime = text.split("FROM ${MIMIR_INSTALL_MODE}-assembly AS runtime\n", 1)[1]
+    assert "COPY --from=provenance-validation /etc/os-release /mimir-provenance-base-os-release" in runtime
+    # Unlike FROM ancestry for recognized modes, this dependency must survive
+    # even when Docker interprets the assembly name as an external image.
+    assert "provenance-validation" in _runtime_stage_dependencies(text, MIMIR_INSTALL_MODE=mode)
+    result = _run_provenance_validation(MIMIR_INSTALL_MODE=mode)
+    assert result.returncode == 2
+    assert "MIMIR_INSTALL_MODE must be source or pypi" in result.stdout
+
+
+def test_unrecognized_mode_guard_detects_removed_validation_edge(monkeypatch):
+    text = DOCKERFILE.read_text().replace(
+        "COPY --from=provenance-validation /etc/os-release /mimir-provenance-base-os-release\n", "")
+    monkeypatch.setattr(type(DOCKERFILE), "read_text", lambda *args, **kwargs: text)
+    with pytest.raises(AssertionError):
+        test_unrecognized_install_modes_still_require_validation("wheel")
+
+
 def test_provenance_stage_ancestry_rejects_external_artifact_default() -> None:
     text = _text().replace("ARG CHAINLINK_ARTIFACT_STAGE=chainlink-none",
                            "ARG CHAINLINK_ARTIFACT_STAGE=python:3.11-slim")

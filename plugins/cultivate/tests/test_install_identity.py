@@ -112,6 +112,42 @@ def test_installed_wheel_scripts_are_verified(installed_wheels):
         identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
+@pytest.mark.parametrize("shell_kind", ["interactive", "direct"])
+def test_shell_cli_preserves_installed_identity(installed_wheels, monkeypatch, shell_kind):
+    from mimir.tools import _shell_env
+    import shlex
+
+    marker, wheels, site, declared = installed_wheels
+    venv = site.parents[2]
+    python = venv / "bin/python"
+    cli = venv / "bin/mimir"
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    monkeypatch.setattr(_shell_env.sys, "executable", str(python))
+    if shell_kind == "interactive":
+        env = _shell_env.interactive_shell_env()
+        command = ["/bin/bash", "-lc", _shell_env.login_shell_command(shlex.quote(str(cli)))]
+    else:
+        command = [str(cli)]
+        env = _shell_env.direct_exec_env(command)
+    assert env.get("PYTHONDONTWRITEBYTECODE") == "1"
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site,
+                                          hooks_manifest=marker.parent / "hooks.json") == declared
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert not list((site / "mimir_agent").rglob("*.pyc"))
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site,
+                                          hooks_manifest=marker.parent / "hooks.json") == declared
+    # Discriminating control: the same real installed CLI without the policy
+    # does write bytecode in this writable venv and makes identity fail closed.
+    control = subprocess.run([str(cli)], env={"PATH": env["PATH"]},
+                             capture_output=True, text=True, timeout=30)
+    assert control.returncode == 0, control.stderr
+    assert list((site / "mimir_agent").rglob("*.pyc"))
+    with pytest.raises(identity.InstallIdentityError, match="bytecode drift"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site,
+                                         hooks_manifest=marker.parent / "hooks.json")
+
+
 def test_installed_wheel_requires_each_generated_script(installed_wheels):
     marker, wheels, site, _ = installed_wheels
     record = site / "mimir_agent-1.2.dist-info/RECORD"

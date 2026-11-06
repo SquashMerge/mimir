@@ -1,0 +1,1 @@
+- Preserve the image's no-bytecode policy in interactive and direct shell subprocesses so ordinary CLI imports do not invalidate PyPI Cultivate identity; require provenance validation even when an unknown install mode selects an external assembly name.
