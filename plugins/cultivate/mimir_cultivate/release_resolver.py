@@ -99,8 +99,9 @@ def fetch_bytes(url: str, limit: int) -> bytes:
 def _target_tags(architecture: str) -> set[Tag]:
     if architecture not in {"x86_64", "aarch64"}:
         raise ReleaseError("Unsupported Linux image architecture; choose x86_64 or aarch64.")
-    # The floating python:3.11-slim base does not promise a newer glibc.
-    platforms = [f"manylinux_2_17_{architecture}", f"manylinux2014_{architecture}"]
+    # setup pins python:3.11-slim-bookworm (Debian 12, glibc 2.36).
+    platforms = [f"manylinux_2_{minor}_{architecture}" for minor in range(36, 16, -1)]
+    platforms.append(f"manylinux2014_{architecture}")
     if architecture == "x86_64":
         platforms.extend(("manylinux2010_x86_64", "manylinux1_x86_64"))
     return set(cpython_tags((3, 11), platforms=platforms)) | set(compatible_tags((3, 11), platforms=platforms))
