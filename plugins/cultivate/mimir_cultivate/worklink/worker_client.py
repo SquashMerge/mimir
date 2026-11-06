@@ -17,6 +17,7 @@ import uuid
 
 from mimir.output_capture import OutputSink, open_output_pair
 from mimir.otel_credentials import filter_otlp_env
+from mimir_cultivate import install_identity
 from . import identities
 from .compute import LaunchHandle
 
@@ -29,10 +30,10 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v12-factory-cancel"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v13-paired-identity"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
-    "or source identities do not match; rebuild the image and restart the container"
+    "or install identities do not match; rebuild the image and restart the container"
 )
 _PROJECTION_PATHS = frozenset({
     ".config/opencode/opencode.json",
@@ -520,7 +521,7 @@ class WorkerClient:
 
 async def verify_executor_identity(
     socket_path: Path | None = None,
-) -> str:
+) -> dict[str, object]:
     """Verify the image-owned executor before a launch contract is needed."""
     socket_path = socket_path or DEFAULT_EXECUTOR_SOCKET
     client = object.__new__(WorkerClient)
@@ -537,14 +538,26 @@ async def verify_executor_identity(
         ).encode()
         sock.send(payload)
         response = json.loads(await asyncio.to_thread(sock.recv, 4096))
-        if (
+        if not isinstance(response, dict) or (
             response.get("status") != "identity"
             or response.get("executor_identity") != EXECUTOR_PROTOCOL_IDENTITY
             or not isinstance(response.get("checkout_root"), str)
-            or not isinstance(response.get("source_commit"), str)
-            or len(response["source_commit"]) != 40
-            or any(character not in "0123456789abcdef" for character in response["source_commit"])
         ):
+            raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+        mode = response.get("mode")
+        if mode == "source":
+            if (set(response) != {"status", "executor_identity", "checkout_root", "mode", "source_commit"}
+                or not isinstance(response.get("source_commit"), str)
+                or re.fullmatch(r"[0-9a-f]{40}", response["source_commit"]) is None):
+                raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+            identity = {"mode": "source", "source_commit": response["source_commit"]}
+        elif mode == "pypi":
+            if set(response) != {"status", "executor_identity", "checkout_root", "mode", "distributions"}:
+                raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+            identity = {"mode": "pypi", "distributions": response["distributions"]}
+            if not install_identity.valid_pair(identity):
+                raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+        else:
             raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
         controller_root = str(worklink_checkout_root())
         if response["checkout_root"] != controller_root:
@@ -553,7 +566,7 @@ async def verify_executor_identity(
                 f"executor={response['checkout_root']!r}; align WORKLINK_CHECKOUT_ROOT "
                 "in the controller and executor service environments"
             )
-        return response["source_commit"]
+        return identity
     finally:
         sock.close()
 

@@ -13,37 +13,31 @@ from pathlib import Path
 from typing import Any
 
 from mimir.event_logger import log_event_sync
+from . import install_identity
 
 log = logging.getLogger(__name__)
 
 
 async def capture_controller_source_commit(app: Any) -> None:
-    if "worklink_controller_source_commit" in app:
+    if "worklink_controller_identity" in app:
         return
-    controller_source_commit = None
+    identity = None
     if app.get("check_worker_executor_health"):
         marker = Path(sys.prefix) / "controller-source-commit"
-        if marker.exists():
+        if (Path(sys.prefix) / install_identity.CONTROLLER_MARKER).exists():
             try:
-                commit = marker.read_text(encoding="utf-8").strip()
+                identity = install_identity.controller_identity()
+            except install_identity.InstallIdentityError:
+                pass
+        elif marker.exists():
+            try:
+                commit = marker.read_text(encoding="ascii").strip()
                 if re.fullmatch(r"[0-9a-f]{40}", commit):
-                    controller_source_commit = commit
+                    identity = {"mode": "source", "source_commit": commit}
             except (OSError, UnicodeError):
                 pass
-        else:
-            repo = os.environ.get("WORKLINK_REPO")
-            if repo:
-                try:
-                    result = await asyncio.to_thread(
-                        subprocess.run, ["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
-                        capture_output=True, text=True, check=True, timeout=5,
-                    )
-                    commit = result.stdout.strip()
-                    if re.fullmatch(r"[0-9a-f]{40}", commit):
-                        controller_source_commit = commit
-                except (OSError, subprocess.SubprocessError):
-                    pass
-    app["worklink_controller_source_commit"] = controller_source_commit
+    app["worklink_controller_identity"] = identity
+    app["worklink_controller_source_commit"] = identity.get("source_commit") if identity else None
 
 
 async def executor_health(app: Any) -> dict[str, object]:
@@ -51,26 +45,41 @@ async def executor_health(app: Any) -> dict[str, object]:
 
     if not app.get("check_worker_executor_health"):
         return {}
-    executor_source_commit = None
+    executor_identity = None
     result: dict[str, object] = {}
     if DEFAULT_EXECUTOR_SOCKET.exists():
         try:
-            executor_source_commit = await verify_executor_identity()
+            executor_identity = await verify_executor_identity()
         except (OSError, RuntimeError, ValueError) as exc:
             result.update(ok=False, error=str(exc))
-    controller_source_commit = app.get("worklink_controller_source_commit")
-    source_status = "unknown"
-    if executor_source_commit is not None and controller_source_commit is not None:
-        source_status = "matched" if executor_source_commit == controller_source_commit else "mismatched"
+    controller_identity = app.get("worklink_controller_identity")
+    if isinstance(controller_identity, dict) and controller_identity.get("mode") == "pypi":
+        try:
+            if install_identity.controller_identity() != controller_identity:
+                raise install_identity.InstallIdentityError("controller install identity changed since boot")
+        except install_identity.InstallIdentityError as exc:
+            result.update(ok=False, error=str(exc))
+    if not isinstance(controller_identity, dict) or not isinstance(executor_identity, dict):
+        result.update(ok=False, error=result.get("error", "Worklink install identity unavailable"))
+    elif controller_identity != executor_identity:
+        result.update(ok=False, error="Worklink controller and executor install identities differ")
+    mode = controller_identity.get("mode") if isinstance(controller_identity, dict) else None
+    source_status = "not_applicable" if mode == "pypi" else "unknown"
+    if mode == "source" and isinstance(executor_identity, dict) and executor_identity.get("mode") == "source":
+        source_status = "matched" if executor_identity == controller_identity else "mismatched"
     if source_status == "mismatched":
         log.warning(
             "Worklink executor source drift: executor=%s controller=%s; rebuild the root executor image",
-            executor_source_commit, controller_source_commit,
+            executor_identity, controller_identity,
         )
     result.update(
-        worklink_executor_source_commit=executor_source_commit,
-        worklink_controller_source_commit=controller_source_commit,
+        worklink_executor_source_commit=executor_identity.get("source_commit") if isinstance(executor_identity, dict) else None,
+        worklink_controller_source_commit=controller_identity.get("source_commit") if isinstance(controller_identity, dict) else None,
         worklink_executor_source_status=source_status,
+        worklink_install_mode=mode,
+        worklink_controller_distributions=controller_identity.get("distributions") if mode == "pypi" else None,
+        worklink_executor_distributions=executor_identity.get("distributions") if isinstance(executor_identity, dict) and executor_identity.get("mode") == "pypi" else None,
+        worklink_install_status="matched" if result.get("ok", True) else "mismatched",
     )
     return result
 

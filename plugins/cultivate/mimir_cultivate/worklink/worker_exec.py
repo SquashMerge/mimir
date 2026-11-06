@@ -22,6 +22,7 @@ import time
 from typing import Any, Callable
 
 from mimir._rmtree import rmtree_missing_ok
+from mimir_cultivate import install_identity
 from .checkout import _normalize_checkout_fd
 from .identities import get_identities
 from .worker_client import (
@@ -42,11 +43,11 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v12-factory-cancel"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v13-paired-identity"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
-    "or source identities do not match; rebuild the image and restart the container"
+    "or install identities do not match; rebuild the image and restart the container"
 )
 _CONTROLLER_CANCELLATION_GRACE_S = 10.0
 _PROCESS_GROUP_KILL_TIMEOUT_S = 5.0
@@ -983,11 +984,16 @@ def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: li
     if fds or set(request) != _IDENTITY_FIELDS:
         raise RuntimeError("invalid executor identity request")
     _validate_executor_identity(request)
+    identity = (
+        {"mode": "pypi", "distributions": install_identity.executor_identity()["distributions"]}
+        if install_identity.EXECUTOR_MARKER.exists() else
+        {"mode": "source", "source_commit": _executor_source_commit()}
+    )
     _send(connection, {
         "status": "identity",
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
-        "source_commit": _executor_source_commit(),
         "checkout_root": str(worklink_checkout_root()),
+        **identity,
     })
 
 
