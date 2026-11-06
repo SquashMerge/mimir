@@ -839,18 +839,32 @@ def upgrade_setup(setup_environment):
 def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrade_setup, capsys):
     deploy, args, state, calls, invoke = upgrade_setup
     old = SHA
+    previous = json.loads((deploy / 'manifest.json').read_text())
+    old_tag = previous['layer_tag']
+    old_wheels = previous['wheels']
+    assert previous['mimir_version'] == VERSION
     state['sha'] = 'c' * 40
     env = (deploy / 'compose.env').read_bytes()
     key = (deploy / 'owner-web-key').read_bytes()
     (deploy / 'persisted-volume-marker').write_text('untouched')
     invoke()
     output = capsys.readouterr().out
-    old_tag = json.loads((deploy / 'manifest.json').read_text())['layer_tag']
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    new_tag = manifest['layer_tag']
+    assert manifest['mimir_version'] == '1.0.1'
+    for name in ('mimir-agent', 'mimir-cultivate'):
+        assert manifest['wheels'][name]['sha256'] == hashlib.sha256((name + '1.0.1').encode()).hexdigest()
+        assert manifest['wheels'][name]['sha256'] != old_wheels[name]['sha256']
+    expected_identity = ('1-0-1-' + manifest['wheels']['mimir-agent']['sha256'][:16]
+                         + '-' + manifest['wheels']['mimir-cultivate']['sha256'][:16])
+    assert new_tag == ('mimir-cultivate-agent:' + expected_identity + '-'
+                       + manifest['toolchain'] + manifest['toolchain_version'].replace('.', '-'))
+    assert new_tag != old_tag
     assert 'Upgrading 1.0.0rc2 -> 1.0.1' in output
-    assert 'Previous agent image retained: mimir-cultivate-agent:1-0-0rc2-' in output
+    assert 'Previous agent image retained: ' + old_tag in output
     assert 'docker compose -f compose.yml -f <(printf' in output
-    assert 'image: mimir-cultivate-agent:1-0-0rc2-' in output
-    assert yaml.safe_load((deploy / 'compose.yml').read_text())['services']['agent']['image'] == old_tag
+    assert "image: " + old_tag + "\\n') up -d --force-recreate --no-deps agent" in output
+    assert yaml.safe_load((deploy / 'compose.yml').read_text())['services']['agent']['image'] == new_tag
     assert (deploy / 'compose.env').read_bytes() == env
     assert (deploy / 'owner-web-key').read_bytes() == key
     assert (deploy / 'persisted-volume-marker').read_text() == 'untouched'
@@ -859,8 +873,6 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     assert any(argv[-2:] == ['--rm', 'init'] for argv in calls)
     assert any('compose.provision.yml' in argv for argv in calls)
     assert any(argv[-3:] == ['up', '-d', 'agent'] for argv in calls)
-    import hashlib
-    manifest = json.loads((deploy / 'manifest.json').read_text())
     assert manifest['review_tests'] == 'targeted'
     hashes = manifest['generated_sha256']
     assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore', 'build_context.py'}
