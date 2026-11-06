@@ -36,6 +36,23 @@ def docker_exec(*args: str, user: str = "root", input_text: str | None = None) -
     return run(command, input_text=input_text).stdout
 
 
+def start_runtime(*environment: str) -> None:
+    """Initialize the direct-run fixture before the shipped s6 services start.
+
+    Setup's Compose init service provisions this controller-owned lease root.
+    The proofs launch without Compose, so perform that same prerequisite in
+    the container, then exec the real entrypoint as PID 1. Do not relax the
+    selected plugin's production startup validation.
+    """
+    run([
+        "docker", "run", "--detach", "--env", "MIMIR_PLUGINS=cultivate",
+        "--env", "MIMIR_PR_CHECKOUT_LEASE_ROOT=/workspace/pr-leases",
+        *(argument for value in environment for argument in ("--env", value)),
+        "--name", CONTAINER, "--entrypoint", "/bin/sh", IMAGE, "-ceu",
+        "install -d -o mimir -g mimir -m 0755 /workspace/pr-leases; exec /init",
+    ])
+
+
 def wait_for_runtime() -> None:
     deadline = time.monotonic() + 45
     last = ""
@@ -592,8 +609,7 @@ def prove_pypi(agent_wheel: Path, cultivate_wheel: Path) -> None:
         IMAGE = manifest["layer_tag"]
         try:
             run(["sh", str(deploy / "build.sh")], timeout=2400)
-            run(["docker", "run", "--detach", "--env", "MIMIR_PLUGINS=cultivate",
-                 "--name", CONTAINER, IMAGE])
+            start_runtime()
             wait_for_runtime()
             wait_for_health()
             docker_exec("/bin/sh", "-ceu", """
@@ -664,11 +680,7 @@ def prove_source() -> None:
         require_rust_native_toolchain(layer)
         run(['docker', 'build', '--file', '-', '--tag', IMAGE, '.'],
             input_text=layer, timeout=1200)
-        run([
-            "docker", "run", "--detach", "--env", "HOME=/home/mimir",
-            "--env", "MIMIR_PLUGINS=cultivate",
-            "--env", f"WORKLINK_REPO={repo}", "--name", CONTAINER, IMAGE,
-        ])
+        start_runtime("HOME=/home/mimir", f"WORKLINK_REPO={repo}")
         wait_for_runtime()
         docker_exec("/bin/sh", "-ceu", """
             test "$(id -u mimir)" = 1001

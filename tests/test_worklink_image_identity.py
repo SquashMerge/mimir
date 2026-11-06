@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import runpy
+import subprocess
 import zipfile
 
 import pytest
@@ -26,6 +27,58 @@ def test_image_job_builds_and_proves_both_modes() -> None:
     assert "uv build --wheel --out-dir dist/cultivate plugins/cultivate" in commands[wheels]
     assert "--agent-wheel dist/agent/*.whl --cultivate-wheel dist/cultivate/*.whl" in commands[pypi]
     assert workflow["jobs"]["worklink-image-identity"]["env"]["WORKLINK_REPO"] == "/workspace/worklink-base"
+
+
+@pytest.mark.parametrize("mode", ["source", "pypi"])
+def test_live_proofs_initialize_lease_root_before_services(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(PROOF))
+    proof = namespace["prove_" + mode]
+    globals_ = proof.__globals__
+    calls = []
+
+    class Started(Exception):
+        pass
+
+    def record(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["git", "status", "--porcelain=v1"]:
+            output = ""
+        elif args[:3] == ["git", "rev-parse", "HEAD"]:
+            output = "a" * 40
+        else:
+            output = ""
+        return subprocess.CompletedProcess(args, 0, stdout=output)
+
+    def stop_after_launch():
+        raise Started
+
+    deploy = tmp_path / "deployment"
+    deploy.mkdir()
+    (deploy / "manifest.json").write_text('{"layer_tag":"proof-layer"}')
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/worklink-base")
+    monkeypatch.setitem(globals_, "run", record)
+    monkeypatch.setitem(globals_, "source_ref", lambda: "refs/pull/30/merge")
+    monkeypatch.setitem(globals_, "source_url", lambda: None)
+    monkeypatch.setitem(globals_, "require_rust_native_toolchain", lambda _: None)
+    monkeypatch.setitem(globals_, "prepare_pypi_deployment", lambda *args: deploy)
+    monkeypatch.setitem(globals_, "wheel_identity", lambda *args: ("1.0", "0" * 64))
+    monkeypatch.setitem(globals_, "wait_for_runtime", stop_after_launch)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: None)  # Docker cleanup only.
+    args = () if mode == "source" else (tmp_path / "agent.whl", tmp_path / "cultivate.whl")
+    with pytest.raises(Started):
+        proof(*args)
+    launch, = [call for call in calls if call[:3] == ["docker", "run", "--detach"]]
+    environments = [launch[i + 1] for i, arg in enumerate(launch) if arg == "--env"]
+    assert "MIMIR_PLUGINS=cultivate" in environments
+    assert "MIMIR_PR_CHECKOUT_LEASE_ROOT=/workspace/pr-leases" in environments
+    if mode == "source":
+        assert "WORKLINK_REPO=/workspace/worklink-base" in environments
+    assert launch[launch.index("--entrypoint") + 1:] == [
+        "/bin/sh", globals_["IMAGE"], "-ceu",
+        "install -d -o mimir -g mimir -m 0755 /workspace/pr-leases; exec /init",
+    ]
 
 
 def test_source_mode_keeps_explicit_build_arg_and_live_proof() -> None:
