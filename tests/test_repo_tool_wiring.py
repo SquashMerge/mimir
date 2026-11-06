@@ -591,7 +591,7 @@ def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationFo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("checkout", [True, False, "connect_error", "invalid_grant"])
+@pytest.mark.parametrize("checkout", [True, False, "connect_error", "git_transport", "invalid_grant"])
 async def test_poller_prechecks_own_remediation_before_first_pr_read(
     tmp_path, monkeypatch, selected_repo_policy, checkout,
 ):
@@ -638,6 +638,10 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
         if checkout == "connect_error":
             import httpx
             raise httpx.ConnectError("temporary connection failure")
+        if checkout == "git_transport":
+            raise repository.GitTransportError(
+                "fatal: unable to access 'https://github.com/o/r/': Could not resolve host: github.com"
+            )
         state.attach_checkout_lease(lease)
         return lease, ("candidate",)
 
@@ -675,9 +679,10 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
     ))
     event = AgentEvent(trigger="poller", channel_id="poller:github-activity", content="review")
     with policy_scope(selected_repo_policy):
-        if checkout in {"connect_error", "invalid_grant"}:
-            message = ("temporary connection failure" if checkout == "connect_error"
-                       else "scoped PR grant refused")
+        if checkout in {"connect_error", "git_transport", "invalid_grant"}:
+            message = {"connect_error": "temporary connection failure",
+                       "git_transport": "Could not resolve host",
+                       "invalid_grant": "scoped PR grant refused"}[checkout]
             with pytest.raises(Exception, match=message):
                 await agent.run_turn(event)
         else:
@@ -686,7 +691,7 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
     if checkout == "invalid_grant":
         assert not seen and state.checkout_lease is None
         return
-    if checkout == "connect_error":
+    if checkout in {"connect_error", "git_transport"}:
         import json
         events = [json.loads(line) for line in (
             tmp_path / "home" / "logs" / "events.jsonl"

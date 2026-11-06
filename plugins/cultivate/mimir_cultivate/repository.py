@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from mimir._paths import live_loader_path_allowed
+from mimir._provider_errors import TransientTransportError
 
 
 @dataclass(frozen=True)
@@ -931,10 +932,26 @@ def active_pr_checkout_lease_for_path(path: str | Path) -> PRCheckoutLease | Non
         return None
 
 
+# git's own network-failure diagnostics for fetches this module runs itself.
+_GIT_TRANSPORT_FAILURE = re.compile(
+    r"Could not resolve host|Failed to connect to|Connection timed out|Connection refused"
+    r"|Connection reset|Operation timed out|The requested URL returned error: (?:429|5[0-9][0-9])"
+    r"|RPC failed|early EOF|unexpected disconnect",
+    re.IGNORECASE,
+)
+
+
+class GitTransportError(TransientTransportError):
+    """A git fetch run by this module failed at the network transport."""
+
+
 def _run(runner: Runner, args: list[str], failure: str) -> str:
     result = runner(args)
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or failure)
+        detail = (result.stderr or result.stdout).strip() or failure
+        if "fetch" in args[:5] and _GIT_TRANSPORT_FAILURE.search(detail):
+            raise GitTransportError(detail)
+        raise RuntimeError(detail)
     return result.stdout.strip()
 
 
@@ -5230,7 +5247,12 @@ def checkout_scoped_pr(
         raise ToolPolicyRefusal("repository checkout rejected: no authorized pull request state")
     scope = state.action_scope
     existing = state.checkout_lease
-    if existing is not None and getattr(state, "checkout_prepared_by_framework", False):
+    framework = (
+        context.ifc_state.framework_pr_checkouts.get(scope.scope_id)
+        if context is not None and context.ifc_state is not None else None
+    )
+    if (existing is not None and framework is not None
+            and framework[0] == (str(existing.path), existing.recovery_id)):
         from mimir.access_control import pr_checkout_lease_attestation
 
         if not pr_checkout_lease_attestation(context, scope, existing).ok:
@@ -5239,7 +5261,7 @@ def checkout_scoped_pr(
         return {
             "status": "resumed", "path": str(existing.path), "scope_id": existing.scope_id,
             "head_sha": existing.head_sha,
-            "candidate_commits": getattr(state, "checkout_candidates", ()),
+            "candidate_commits": framework[1],
         }
     try:
         lease, candidates = acquire_pr_checkout_lease(
@@ -5251,7 +5273,6 @@ def checkout_scoped_pr(
         detail = _redact_git_output(str(exc))
         _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
-    object.__setattr__(state, "checkout_candidates", candidates)
     # Record only turn-local authority, never trust in checkout-controlled metadata.
     # Clear an earlier verdict before fetching metadata, so failures stay closed.
     context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None

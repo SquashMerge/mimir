@@ -4378,28 +4378,58 @@ def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCap
     )
 
 
+# Consumption token for ``repo_checkout`` returning the framework's own lease.
+_FRAMEWORK_CHECKOUT_RESUME = object()
+
+
+def _scoped_pr_call_state(call: _PreparedToolCall) -> Any:
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    repository = call.arguments.get("repository")
+    pull_request = call.arguments.get("pull_request")
+    state = discovered.resolve(repository, pull_request) if discovered is not None else None
+    if state is None and registry is not None:
+        state = registry.resolve(repository, pull_request)
+    return state
+
+
+def _framework_checkout_resume(call: _PreparedToolCall) -> bool:
+    from ..access_control import framework_checkout_resumable
+
+    scope = call.authorization.repo_pr_action_scope
+    registered = _plugin_tool(call.tool_name, call.policy)
+    if scope is None or registered is None:
+        return False
+    state = _scoped_pr_call_state(call)
+    return (
+        state is not None and state.action_scope is scope
+        and framework_checkout_resumable(
+            call.auth_context, registered.owner,
+            call.policy.scoped_actions.get(registered.owner), scope, state,
+        )
+    )
+
+
 def _consume_scoped_pr_checkout(call: _PreparedToolCall) -> object | None:
     from ..access_control import consume_scoped_pr_checkout
 
     scope = call.authorization.repo_pr_action_scope
     registered = _plugin_tool(call.tool_name, call.policy)
-    # A checkout already observed by the framework has a follow-on grant.
-    # Dispatch revalidated its live lease; do not consume the one-shot grant again.
-    if (registered is not None and scope is not None
-            and call.auth_context.scoped_pr_grants.get(
-                registered.owner, scope, registered.typed_action.value, checkout=True,
-            ) is None):
-        return True
-    return scope is not None and registered is not None and consume_scoped_pr_checkout(
-        call.auth_context, scope, registered.owner,
-    )
+    if scope is None or registered is None:
+        return False
+    token = consume_scoped_pr_checkout(call.auth_context, scope, registered.owner)
+    if token is None and _framework_checkout_resume(call):
+        # No grant is consumed: the call may only return the attested lease.
+        return _FRAMEWORK_CHECKOUT_RESUME
+    return token
 
 
 def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: object) -> bool:
-    if token is True:  # already-attested framework checkout
-        return True
     if _result_is_error(call.tool_name, result, policy=call.policy):
         return True
+    if token is _FRAMEWORK_CHECKOUT_RESUME:
+        # The resumed result must still be the framework's live lease.
+        return _framework_checkout_resume(call)
     from ..access_control import observe_scoped_pr_checkout
 
     scope = call.authorization.repo_pr_action_scope

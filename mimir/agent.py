@@ -91,6 +91,7 @@ from ._langchain_codex_plus_patches import (
 from ._deepagents_summarization import install_offload_traceback_logging_patch
 from ._jsonl_tail import tail_jsonl_records
 from ._llm_retry import _is_retryable_error
+from ._provider_errors import TransientTransportError
 from ._reasoning_effort import EFFORT_LEVELS as _EFFORT_LEVELS
 from ._reasoning_effort import validate_effort as _validate_effort
 from .jsonl_snapshot import JsonlSnapshot
@@ -2252,14 +2253,8 @@ class Agent:
                                 and type(cause).__name__ == "_GitHubRequestError"
                                 and getattr(cause, "retryable", False) is True):
                             transient_reason = "provider_error_transient:_GitHubRequestError"
-                        if (transient_reason is None
-                                and getattr(ctx, "pr_checkout_in_progress", False)
-                                and type(cause) is RuntimeError
-                                and any(marker in str(cause).casefold() for marker in (
-                                    "could not resolve host", "failed to connect",
-                                    "connection timed out", "connection refused",
-                                ))):
-                            transient_reason = "provider_error_transient:PRCheckoutTransport"
+                        if transient_reason is None and isinstance(cause, TransientTransportError):
+                            transient_reason = f"provider_error_transient:{type(cause).__name__}"
                         cause = cause.__cause__
                     await log_event(
                         "turn_failed", channel_id=event.channel_id,
@@ -2708,7 +2703,6 @@ class Agent:
                     hook = checkout_hooks.get((scope.owner, "pr_checkout"))
                     if hook is None:
                         raise RuntimeError("repository checkout rejected: checkout provider unavailable")
-                    ctx.pr_checkout_in_progress = True
                     result = await asyncio.to_thread(
                         hook, scope.canonical_repo, scope.pr_number,
                         SimpleNamespace(context=auth_ctx),
@@ -2719,8 +2713,13 @@ class Agent:
                         auth_ctx, scope, state, token, scope.owner, protocol,
                     ):
                         raise RuntimeError("repository checkout rejected: lease attestation refused")
-                    object.__setattr__(state, "checkout_prepared_by_framework", True)
-                    ctx.pr_checkout_in_progress = False
+                    live = protocol.live_lease(scope, state) if protocol.live_lease is not None else None
+                    if live is None or auth_ctx.ifc_state is None:
+                        raise RuntimeError("repository checkout rejected: lease attestation refused")
+                    auth_ctx.ifc_state.framework_pr_checkouts[scope.scope_id] = (
+                        (str(live.path), live.recovery_id),
+                        tuple(result.get("candidate_commits") or ()),
+                    )
                     ctx.prechecked_pr_leases.append(result)
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
             # state/wiki/ content page BEFORE the model loop runs so the

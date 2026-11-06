@@ -21,6 +21,14 @@ class ProviderErrorClassification:
     quota_exhausted: bool
 
 
+class TransientTransportError(RuntimeError):
+    """A host-owned transport (git, forge HTTP) failed before any turn work.
+
+    Raised only by server code that ran the transport itself, never built from
+    model or tool output. Poller recovery treats it as infrastructure.
+    """
+
+
 class ProviderErrorKind(Enum):
     """Behaviorally distinct classes of provider failure."""
 

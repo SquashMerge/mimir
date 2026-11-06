@@ -9366,6 +9366,26 @@ class ScopedPRGrants:
             return True
 
 
+def framework_checkout_resumable(
+    auth_context: AuthContext | None, owner: str | None, protocol: Any,
+    scope: Any, review_state: Any,
+) -> bool:
+    """True only for the exact live lease turn setup checked out and observed."""
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    record = getattr(ifc_state, "framework_pr_checkouts", {}).get(getattr(scope, "scope_id", None))
+    if (record is None or not isinstance(grants, ScopedPRGrants) or protocol is None
+            or getattr(protocol, "live_lease", None) is None or owner is None):
+        return False
+    follow = grants.get(owner, scope, protocol.checkout_action.value, checkout=False)
+    live = protocol.live_lease(scope, review_state)
+    return (
+        follow is not None and live is not None
+        and follow.lease_identity == record[0]
+        and (str(live.path), live.recovery_id) == record[0]
+    )
+
+
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
     protocol: Any, scope: Any, review_state: Any, *, tool_name: str | None = None,
@@ -9398,8 +9418,15 @@ def _valid_scoped_pr_grant(
         return False
     is_checkout = action is protocol.checkout_action and (
         designated_checkout is None or tool_name == designated_checkout
-    ) and grants.get(owner, scope, action.value, checkout=True) is not None
+    )
     grant = grants.get(owner, scope, action.value, checkout=is_checkout)
+    if is_checkout and grant is None and framework_checkout_resumable(
+        auth_context, owner, protocol, scope, review_state,
+    ):
+        # The designated checkout tool may only return the lease the framework
+        # itself attested this turn. It is validated as that lease's follow-on.
+        is_checkout = False
+        grant = grants.get(owner, scope, action.value, checkout=False)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
             or grant.owner != owner or grant.principal != grants.principal
             or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at

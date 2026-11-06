@@ -670,6 +670,72 @@ def test_checkout_action_follow_on_is_bound_to_designated_tool_and_live_lease(
     )
 
 
+def test_designated_checkout_resumes_only_the_framework_attested_lease(
+    policy, tmp_path, monkeypatch,
+):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    protocol = policy.scoped_actions["cultivate"]
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+
+    def designated() -> bool:
+        return _valid_scoped_pr_grant(
+            auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
+            tool_name="scoped_checkout",
+        )
+
+    # A consumed grant stays one-shot without a framework record for this lease.
+    assert not designated()
+    auth.ifc_state.framework_pr_checkouts[scope.scope_id] = ((str(lease.path), "other-recovery"), ())
+    assert not designated()
+    auth.ifc_state.framework_pr_checkouts[scope.scope_id] = ((str(lease.path), lease.recovery_id), ())
+    assert designated()
+    # Resume never re-opens the one-shot checkout grant itself.
+    assert consume_scoped_pr_checkout(auth, scope, "cultivate") is None
+    lease.revoke()
+    assert not designated()
+
+
+def test_budget_gate_resume_token_requires_the_framework_lease(policy, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from mimir.tools import budget_gate
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    protocol = policy.scoped_actions["cultivate"]
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    call = SimpleNamespace(
+        tool_name="scoped_checkout", policy=policy, auth_context=auth,
+        authorization=SimpleNamespace(repo_pr_action_scope=scope),
+        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+    )
+    ok = SimpleNamespace(status="success", content="{}")
+    monkeypatch.setattr(budget_gate, "_result_is_error", lambda *_a, **_k: False)
+
+    # Consumed grant and no framework record: no token, so dispatch refuses.
+    assert budget_gate._consume_scoped_pr_checkout(call) is None
+    auth.ifc_state.framework_pr_checkouts[scope.scope_id] = ((str(lease.path), lease.recovery_id), ())
+    resume = budget_gate._consume_scoped_pr_checkout(call)
+    assert resume is budget_gate._FRAMEWORK_CHECKOUT_RESUME
+    assert budget_gate._observe_scoped_pr_checkout(call, ok, resume)
+    # The lease changed underneath the resumed call: observation refuses it.
+    lease.revoke()
+    assert not budget_gate._observe_scoped_pr_checkout(call, ok, resume)
+
+
 def test_checkout_observation_refuses_symlinked_configured_root(policy, tmp_path, monkeypatch):
     _repo, scope = _repo_and_scope(tmp_path)
     state = RepoReviewState(scope)
