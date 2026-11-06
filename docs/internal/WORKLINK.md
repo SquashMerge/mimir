@@ -438,7 +438,11 @@ unreleased branch commit: the build resolves and checks out that commit, refuses
 unless it exactly matches the controller commit, and records it in the image's
 OCI revision label and `/opt/mimir-worklink/executor-source-commit`. The executor
 identity operation exposes the recorded SHA and `/health` reports it as
-`worklink_executor_source_commit`. Dirty-tree executor builds are unsupported;
+`worklink_executor_source_commit` in source mode; PyPI-mode Cultivate images
+instead expose the exact installed `mimir-agent` and `mimir-cultivate` version
+and both retained wheel hashes. Missing, drifted or unpinned identities fail
+health with HTTP 503; PyPI source-commit fields are null and source status is
+`not_applicable`. Dirty-tree source-mode executor builds are unsupported;
 working-directory edits cannot enter this root-owned artifact. Deployment
 compose files must pass a fully qualified `MIMIR_GIT_REF` plus the same resolved
 full SHA for `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT`. The build

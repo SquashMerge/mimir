@@ -1,0 +1,1 @@
+- Build Cultivate deployments exclusively from matched, SHA-256-verified PyPI wheel releases, with explicit version selection and source-era upgrade refusal.
