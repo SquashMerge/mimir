@@ -601,6 +601,96 @@ def test_published_head_lookup_refuses_noncanonical_url() -> None:
     ) is None
 
 
+def _large_status(sandbox: Path) -> dict[str, object]:
+    return {
+        "run_id": "chainlink-2109", "valid": True, "sandbox_path": str(sandbox),
+        "next": "step current-agent",
+        "slices": [
+            {"id": f"slice-{index}",
+             "status": "merged" if index < 23 else "in_review" if index < 28 else "pending",
+             "attempts": 2, "extra_attempts": 1, "retry_limit": 5,
+             "history": "x" * 40_000}
+            for index in range(40)
+        ],
+        "steps": [
+            {"agent": f"agent-{index}", "status": "running" if index == 29 else "completed",
+             "attempts": 1, "history": "x" * 40_000}
+            for index in range(30)
+        ],
+        "gates": {
+            f"gate-{index}": {"status": "failed" if index == 19 else "passed",
+                                "at": "2026-11-06T00:00:00Z", "artifact": "gate.log",
+                                "reviewed_head": "a" * 40, "history": "x" * 40_000}
+            for index in range(20)
+        },
+    }
+
+
+def _assert_large_projection(projected: dict[str, object]) -> None:
+    assert len(projected["slices"]) == 40
+    assert len(projected["steps"]) == 30
+    assert len(projected["gates"]) == 20
+    assert all("history" not in row for row in projected["slices"] + projected["steps"])
+    assert all("history" not in row for row in projected["gates"].values())
+    assert projected["slices_total"] == 40
+    assert projected["slices_counts"] == {"merged": 23, "in-review": 5, "pending": 12}
+    parsed = parse_factory_status(projected)
+    assert parsed.steps[-1] == {"agent": "agent-29", "status": "running", "attempts": 1}
+    assert parsed.slices[-1]["retry_limit"] == 5
+    assert parsed.gates["gate-19"]["artifact"] == "gate.log"
+    assert parse_factory_status(parsed.to_json()) == parsed
+    record = SimpleNamespace(session="session", run_id=parsed.run_id, sandbox=parsed.sandbox_path)
+    reason = orchestrator._factory_budget_park_reason(parsed, record)
+    assert "23 of 40 slices merged, 5 in review, 12 pending" in reason
+    assert "gate-19=failed" in reason
+    # Prove the alert uses worker counts rather than recounting a display list.
+    display_only = replace(parsed, slices=parsed.slices[:16])
+    assert "23 of 40 slices merged, 5 in review, 12 pending" in orchestrator._factory_budget_park_reason(
+        display_only, record,
+    )
+
+
+def test_large_factory_status_projection_preserves_progress(tmp_path: Path) -> None:
+    from mimir_cultivate.worklink.factory_control_output import _status_projection
+
+    projected = _status_projection(_large_status(tmp_path))
+    assert len(json.dumps(projected).encode()) < 256 * 1024
+    _assert_large_projection(projected)
+
+
+@pytest.mark.parametrize("original,mutant", [
+    ("for row in rows]", "for row in rows[:16]]"),
+    ("for name, row in gates.items()}", "for name, row in list(gates.items())[:16]}"),
+])
+def test_large_factory_status_regression_kills_row_cap(
+    tmp_path: Path, original: str, mutant: str,
+) -> None:
+    import inspect
+    from mimir_cultivate.worklink import factory_control_output
+
+    source = inspect.getsource(factory_control_output._status_projection)
+    assert source.count(original) == 1
+    namespace = vars(factory_control_output).copy()
+    exec(compile(source.replace(original, mutant), "<row-cap-mutation>", "exec"), namespace)
+    with pytest.raises(AssertionError):
+        _assert_large_projection(namespace["_status_projection"](_large_status(tmp_path)))
+
+
+@pytest.mark.parametrize("summary", [
+    {"slices_total": True, "slices_counts": {}},
+    {"slices_total": 40, "slices_counts": {"merged": True, "pending": 39}},
+    {"slices_total": 16, "slices_counts": {"merged": 16}},
+])
+def test_factory_status_refuses_invalid_worker_counts(tmp_path: Path, summary: dict[str, object]) -> None:
+    from mimir_cultivate.worklink.factory_control_output import _status_projection
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryContractError
+
+    projected = _status_projection(_large_status(tmp_path))
+    projected.update(summary)
+    with pytest.raises(FactoryContractError, match="slice summary"):
+        parse_factory_status(projected)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="factory executor requires Linux")
 def test_large_factory_control_projection_measured_through_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path,
@@ -626,6 +716,7 @@ def test_large_factory_control_projection_measured_through_executor(
                       "reviewed_head": "a" * 40, "loops": 1},
         "terminal_result": {"result": "published", "remediation_log": "x" * 1_100_000},
     }
+    status.update(_large_status(sandbox))
     artifact = tmp_path / "factory-status.json"
     artifact.write_text(json.dumps(status))
     cli = tmp_path / "control-stub.py"
@@ -639,7 +730,7 @@ def test_large_factory_control_projection_measured_through_executor(
         for operation in ("status", "heartbeat", "resume", "lock", "terminal", "snapshot"):
             raw_command = [sys.executable, "-I", str(cli), str(artifact), operation]
             raw = worker_client.run_factory_control(
-                sandbox, raw_command, env={}, output_limit=2 * 1024 * 1024,
+                sandbox, raw_command, env={}, output_limit=8 * 1024 * 1024,
             )
             projected = worker_client.run_factory_control(
                 sandbox, [sys.executable, "-I", str(wrapper),
@@ -652,7 +743,8 @@ def test_large_factory_control_projection_measured_through_executor(
             if operation == "status":
                 parsed = parse_factory_status(projected.stdout)
                 assert parsed.pr_url == status["pr_url"]
-                assert len(parsed.slices) == 8 and parsed.validator["loops"] == 1
+                assert parsed.validator["loops"] == 1
+                _assert_large_projection(json.loads(projected.stdout))
     assert all(raw > 1024 * 1024 for raw, _ in measurements.values())
     # The other run-facing control sites use independent bounds. Exercise their
     # command shapes against the same eight-slice checkout, not only the CLI.

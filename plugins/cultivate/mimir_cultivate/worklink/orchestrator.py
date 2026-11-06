@@ -232,18 +232,16 @@ def _factory_budget_park_reason(status: FactoryStatus, record: FactoryRunRecord)
         next_step = value if isinstance(value, str) and value.strip() else None
     next_step = next_step or "unknown next action"
 
+    from .factory_control_output import slice_counts
+
     slices = status.slices or ()
-    merged = 0
-    in_review = 0
-    for item in slices:
-        value = str(item.get("status", "")).strip().lower().replace("_", "-")
-        if value in {"merged", "completed"}:
-            merged += 1
-        elif value in {"review", "in-review", "reviewing"}:
-            in_review += 1
-    pending = len(slices) - merged - in_review
+    counts = status.slices_counts if status.slices_counts is not None else slice_counts(slices)
+    total = status.slices_total if status.slices_total is not None else len(slices)
+    merged = sum(counts.get(value, 0) for value in ("merged", "completed"))
+    in_review = sum(counts.get(value, 0) for value in ("review", "in-review", "reviewing"))
+    pending = total - merged - in_review
     slice_tally = (
-        f"{merged} of {len(slices)} slices merged, {in_review} in review, {pending} pending"
+        f"{merged} of {total} slices merged, {in_review} in review, {pending} pending"
     )
 
     gates = status.gates or {}

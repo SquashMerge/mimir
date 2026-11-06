@@ -151,6 +151,8 @@ class FactoryStatus:
     park_snapshot: str | None = None
     next: str | None = None
     next_present: bool = False
+    slices_total: int | None = None
+    slices_counts: dict[str, int] | None = None
 
     TERMINAL_STATUSES: ClassVar[frozenset[str]] = frozenset(
         {"completed", "blocked", "partial"}
@@ -192,6 +194,9 @@ class FactoryStatus:
             "terminal_result": self.terminal_result,
             "park_snapshot": self.park_snapshot,
         }
+        if self.slices_total is not None:
+            payload["slices_total"] = self.slices_total
+            payload["slices_counts"] = self.slices_counts
         if self.next_present:
             payload["next"] = self.next
         return payload
@@ -406,6 +411,13 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         raise FactoryContractError("factory status lock must be fresh, stale, or absent")
     next_present = "next" in decoded
     next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
+    slices = _structured_status(decoded.get("slices"), "slices")
+    from ..factory_control_output import parse_slice_summary
+
+    try:
+        slices_total, slices_counts = parse_slice_summary(decoded, slices)
+    except ValueError as exc:
+        raise FactoryContractError(str(exc)) from exc
     return FactoryStatus(
         run_id=_bounded_text(decoded["run_id"], "run_id") or "",
         valid=_bool(decoded["valid"], "valid"),
@@ -421,7 +433,9 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         lock_session=_bounded_text(decoded.get("lock_session"), "lock_session", nullable=True),
         gates=_structured_status(decoded.get("gates"), "gates"),
         steps=_structured_status(decoded.get("steps"), "steps"),
-        slices=_structured_status(decoded.get("slices"), "slices"),
+        slices=slices,
+        slices_total=slices_total,
+        slices_counts=slices_counts,
         validator=_structured_status(decoded.get("validator"), "validator"),
         next_action=_structured_status(decoded.get("next_action"), "next_action"),
         pr_url=_bounded_text(decoded.get("pr_url"), "pr_url", nullable=True),

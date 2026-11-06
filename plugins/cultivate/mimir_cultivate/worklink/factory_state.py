@@ -43,6 +43,8 @@ class FactoryStatus:
     park_snapshot: str | None = None
     next: str | None = None
     next_present: bool = False
+    slices_total: int | None = None
+    slices_counts: dict[str, int] | None = None
 
     TERMINAL_STATUSES: ClassVar[frozenset[str]] = frozenset({"completed", "blocked", "partial"})
 
@@ -62,6 +64,9 @@ class FactoryStatus:
     def to_json(self) -> dict[str, Any]:
         payload = {name: list(value) if name in {"steps", "slices"} and value is not None else value
                    for name, value in vars(self).items() if name not in {"next", "next_present"}}
+        if self.slices_total is None:
+            payload.pop("slices_total")
+            payload.pop("slices_counts")
         if self.next_present:
             payload["next"] = self.next
         return payload
@@ -174,6 +179,12 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
                 raise FactoryContractError(f"factory status {name} must be a bounded object list")
             rows = tuple(_status_row(item, name) for item in rows)
         values[name] = rows
+    from .factory_control_output import parse_slice_summary
+
+    try:
+        values["slices_total"], values["slices_counts"] = parse_slice_summary(payload, values["slices"])
+    except ValueError as exc:
+        raise FactoryContractError(str(exc)) from exc
     gates = payload.get("gates")
     if gates is not None:
         if not isinstance(gates, dict) or len(gates) > 1000:
