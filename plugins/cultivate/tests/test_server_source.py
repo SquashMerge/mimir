@@ -1,68 +1,64 @@
-"""Controller source identity in image and editable Cultivate deployments."""
+"""Mode-specific controller and executor health identity."""
 
 from __future__ import annotations
 
-import logging
-import subprocess
-
 import pytest
 
-from mimir_cultivate import server
+from mimir_cultivate import server, install_identity
 from mimir_cultivate.worklink import worker_client
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("recorded,expected_status", [
-    ("a" * 40, "matched"),
-    ("b" * 40, "mismatched"),
-    ("invalid-commit", "unknown"),
+@pytest.mark.parametrize("commit,worker,status", [
+    ("a" * 40, "a" * 40, "matched"),
+    ("a" * 40, "b" * 40, "mismatched"),
+    (None, "a" * 40, "unknown"),
 ])
-async def test_recorded_controller_commit_overrides_project_head(
-    tmp_path, monkeypatch, caplog, recorded, expected_status,
+async def test_source_identity_fails_closed_without_target_head(
+    tmp_path, monkeypatch, commit, worker, status,
 ) -> None:
     monkeypatch.setattr(server.sys, "prefix", str(tmp_path))
-    monkeypatch.setenv("WORKLINK_REPO", "/workspace/worklink/base/trellis")
-    (tmp_path / "controller-source-commit").write_text(recorded + "\n")
-
-    def unexpected_git(*args, **kwargs):
-        pytest.fail("WORKLINK_REPO must not be read when the controller marker exists")
-
-    monkeypatch.setattr(server.subprocess, "run", unexpected_git)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "target"))
+    if commit is not None:
+        (tmp_path / "controller-source-commit").write_text(commit)
     socket = tmp_path / "executor.sock"
     socket.touch()
     monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
 
-    async def identity() -> str:
-        return "a" * 40
+    async def identity():
+        return {"mode": "source", "source_commit": worker}
 
     monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
     app = {"check_worker_executor_health": True}
     await server.capture_controller_source_commit(app)
-    with caplog.at_level(logging.WARNING, logger=server.log.name):
-        health = await server.executor_health(app)
-
-    assert app["worklink_controller_source_commit"] == (
-        None if expected_status == "unknown" else recorded
-    )
-    assert health["worklink_controller_source_commit"] == app["worklink_controller_source_commit"]
-    assert health["worklink_executor_source_status"] == expected_status
-    assert ("Worklink executor source drift" in caplog.text) is (expected_status == "mismatched")
+    health = await server.executor_health(app)
+    assert health["worklink_executor_source_status"] == status
+    assert health["ok"] is False if status != "matched" else "ok" not in health
+    assert health["worklink_controller_source_commit"] == commit
 
 
 @pytest.mark.asyncio
-async def test_absent_controller_marker_uses_repo_head(tmp_path, monkeypatch) -> None:
+async def test_pypi_health_compares_verified_pairs(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(server.sys, "prefix", str(tmp_path))
-    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "project"))
-    head = "c" * 40
-    calls = []
+    (tmp_path / install_identity.CONTROLLER_MARKER).write_text("{}")
+    pair = {name: {"version": "1.2", "wheel": f"{name.replace('-', '_')}-1.2-py3-none-any.whl", "sha256": "a" * 64}
+            for name in install_identity.PROJECTS}
+    controller = {"mode": "pypi", "distributions": pair}
+    monkeypatch.setattr(install_identity, "controller_identity", lambda: controller)
+    socket = tmp_path / "executor.sock"
+    socket.touch()
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
+    executor = {"mode": "pypi", "distributions": pair}
 
-    def read_head(argv, **kwargs):
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout=head + "\n")
+    async def identity():
+        return executor
 
-    monkeypatch.setattr(server.subprocess, "run", read_head)
+    monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
     app = {"check_worker_executor_health": True}
     await server.capture_controller_source_commit(app)
-
-    assert calls == [["git", "-C", str(tmp_path / "project"), "rev-parse", "--verify", "HEAD"]]
-    assert app["worklink_controller_source_commit"] == head
+    assert (await server.executor_health(app))["worklink_install_status"] == "matched"
+    executor = {"mode": "pypi", "distributions": {**pair, "mimir-agent": {**pair["mimir-agent"], "sha256": "b" * 64}}}
+    health = await server.executor_health(app)
+    assert health["ok"] is False
+    assert health["worklink_install_status"] == "mismatched"
+    assert health["worklink_executor_source_status"] == "not_applicable"
