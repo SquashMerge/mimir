@@ -1018,10 +1018,13 @@ async def reconcile_failed_turns(
                 if not recover_failed_turns:
                     # Pollers with live-state reconciliation (notably GitHub
                     # review requests) consume this durable count themselves.
-                    # The turn did start and fail even though generic recovery
-                    # will not re-enqueue it.
+                    # Keep the framework's failure classification and work
+                    # marker: a transport/startup failure before any work has
+                    # a different retry budget from a failed model turn.
                     entry["attempts"] = int(entry.get("attempts", 0)) + 1
-                    entry["outcome_disposition"] = "charge"
+                    entry["outcome_disposition"] = disposition or "charge"
+                    entry["outcome_phase"] = rec.get("phase")
+                    entry["outcome_tool_call_count"] = rec.get("tool_call_count")
                     charged_reason = (
                         reason if isinstance(reason, str) and reason
                         else rec.get("result_subtype") or rec.get("error") or "turn_failed"
