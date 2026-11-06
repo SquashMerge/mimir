@@ -5205,6 +5205,14 @@ def repo_checkout(
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
     if _retained_scope(runtime, repository, pull_request) is not None:
         raise _retained_refusal("repo_checkout")
+    return checkout_scoped_pr(repository, pull_request, runtime)
+
+
+def checkout_scoped_pr(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext],
+) -> dict[str, Any]:
+    """Shared checkout implementation for the host and the callable tool."""
     from .forge import _call, _client, _pr_content_authors, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
@@ -5220,6 +5228,19 @@ def repo_checkout(
         }
     if state is None:
         raise ToolPolicyRefusal("repository checkout rejected: no authorized pull request state")
+    scope = state.action_scope
+    existing = state.checkout_lease
+    if existing is not None and getattr(state, "checkout_prepared_by_framework", False):
+        from mimir.access_control import pr_checkout_lease_attestation
+
+        if not pr_checkout_lease_attestation(context, scope, existing).ok:
+            raise ToolPolicyRefusal("repository checkout rejected: existing lease attestation refused")
+        _publish_attested_lease_result(runtime, state)
+        return {
+            "status": "resumed", "path": str(existing.path), "scope_id": existing.scope_id,
+            "head_sha": existing.head_sha,
+            "candidate_commits": getattr(state, "checkout_candidates", ()),
+        }
     try:
         lease, candidates = acquire_pr_checkout_lease(
             state.action_scope,
@@ -5230,7 +5251,7 @@ def repo_checkout(
         detail = _redact_git_output(str(exc))
         _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
-    scope = state.action_scope
+    object.__setattr__(state, "checkout_candidates", candidates)
     # Record only turn-local authority, never trust in checkout-controlled metadata.
     # Clear an earlier verdict before fetching metadata, so failures stay closed.
     context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None

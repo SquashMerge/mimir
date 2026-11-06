@@ -590,6 +590,140 @@ def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationFo
     return old_scope, context, SimpleNamespace(context=context)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("checkout", [True, False, "connect_error", "invalid_grant"])
+async def test_poller_prechecks_own_remediation_before_first_pr_read(
+    tmp_path, monkeypatch, selected_repo_policy, checkout,
+):
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.models import AgentEvent
+    from mimir.plugins.core import policy_scope
+    from tests.test_agent import _build_agent, _FakeAgent, _FakeSessionManager
+    from tests.test_budget_gate_and_alias import _make_request
+    from tests.test_repo_tools import _repo_scope_and_state
+    from mimir_cultivate import forge, repository
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from langchain_core.messages import ToolMessage
+    import json
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    state.revoke_checkout_lease(lease)
+    if checkout is False:
+        scope = replace(scope, event_type="pr_review",
+                        allowed_operations=frozenset({RepoPRAction.PR_COMMENT.value}))
+        state = RepoReviewState(scope)
+    auth = _auth(scope)
+    auth = replace(
+        auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state,
+        trigger="poller", canonical_principal="poller:github-activity",
+        service_authority=replace(auth.service_authority, canonical="poller:github-activity",
+                                  trigger="poller", authority_profile="github",
+                                  capabilities=("pr_metadata", "repo_checkout")),
+        scoped_pr_grants=ScopedPRGrants(
+            "poller:github-activity", (scope,), protocols=selected_repo_policy.scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        ),
+    )
+    if checkout == "invalid_grant":
+        auth = replace(auth, canonical_principal="different-service")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr("mimir.agent._create_turn_auth_context", lambda *a, **k: auth)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
+    fetches = []
+
+    def checkout_once(*args, **kwargs):
+        fetches.append(True)
+        if checkout == "connect_error":
+            import httpx
+            raise httpx.ConnectError("temporary connection failure")
+        state.attach_checkout_lease(lease)
+        return lease, ("candidate",)
+
+    monkeypatch.setattr(repository, "acquire_pr_checkout_lease", checkout_once)
+    seen = []
+
+    class FirstRead(_FakeAgent):
+        async def astream(self, inputs, *, config, context=None, stream_mode="values"):
+            decision = ToolRegistry().authorize_tool(
+                "pr_metadata", context, enforce=True,
+                arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+                policy=selected_repo_policy,
+            )
+            seen.append((decision, state.checkout_lease, str(inputs)))
+            if checkout is True:
+                monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                                    lambda *_args: SimpleNamespace(ok=True))
+                args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+
+                async def execute(request):
+                    value = repo_checkout.func(**args, runtime=request.runtime)
+                    return ToolMessage(content=json.dumps(value), tool_call_id=request.tool_call["id"])
+
+                result = await BudgetGateMiddleware(selected_repo_policy).awrap_tool_call(
+                    _make_request("repo_checkout", "reuse-checkout", context, args), execute,
+                )
+                assert result.status != "error", result.content
+                assert json.loads(result.content)["path"] == str(lease.path)
+            yield {"messages": []}
+
+    agent = _build_agent(tmp_path, fake_agent=FirstRead([]), fake_saga=None,
+                         session_manager=_FakeSessionManager())
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+        policy=selected_repo_policy, plugins=(), turn_preflight=None,
+    ))
+    event = AgentEvent(trigger="poller", channel_id="poller:github-activity", content="review")
+    with policy_scope(selected_repo_policy):
+        if checkout in {"connect_error", "invalid_grant"}:
+            message = ("temporary connection failure" if checkout == "connect_error"
+                       else "scoped PR grant refused")
+            with pytest.raises(Exception, match=message):
+                await agent.run_turn(event)
+        else:
+            await agent.run_turn(event)
+    assert len(fetches) == int(checkout not in {False, "invalid_grant"})
+    if checkout == "invalid_grant":
+        assert not seen and state.checkout_lease is None
+        return
+    if checkout == "connect_error":
+        import json
+        events = [json.loads(line) for line in (
+            tmp_path / "home" / "logs" / "events.jsonl"
+        ).read_text().splitlines()]
+        failed = [entry for entry in events if entry.get("type") == "turn_failed"]
+        assert len(failed) == 1
+        assert failed[0]["phase"] == "pre_model_loop"
+        assert failed[0]["tool_call_count"] == 0
+        assert failed[0]["attempt_disposition"] == "transient_provider"
+        assert not seen
+        return
+    assert len(seen) == 1
+    if checkout:
+        assert seen[0][0].allowed, seen[0][0]
+        assert seen[0][1] is lease
+        assert str(lease.path) in seen[0][2]
+        monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                            lambda *_args: SimpleNamespace(ok=True))
+        first = repo_checkout.func(scope.canonical_repo, scope.pr_number,
+                                   runtime=SimpleNamespace(context=auth))
+        second = repo_checkout.func(scope.canonical_repo, scope.pr_number,
+                                    runtime=SimpleNamespace(context=auth))
+        assert first == second == {
+            "status": "resumed", "path": str(lease.path), "scope_id": lease.scope_id,
+            "head_sha": lease.head_sha, "candidate_commits": ("candidate",),
+        }
+        assert len(fetches) == 1
+        with pytest.raises(ToolException, match="existing lease attestation refused"):
+            monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                                lambda *_args: SimpleNamespace(ok=False))
+            repo_checkout.func(scope.canonical_repo, scope.pr_number,
+                               runtime=SimpleNamespace(context=auth))
+        assert len(fetches) == 1
+    else:
+        assert state.checkout_lease is None
+
+
 def test_core_only_head_advance_cannot_dispatch_without_owner(monkeypatch):
     from mimir.plugins.core import core_policy_registry
 

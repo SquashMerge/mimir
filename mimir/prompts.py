@@ -276,6 +276,7 @@ def build_turn_prompt(
     trigger_authority_present: bool = False,
     trigger_shell_commands: Iterable[str] | None = None,
     turn_scratch_path: str | None = None,
+    prechecked_pr_leases: Iterable[Mapping[str, object]] = (),
     stable_prefix_out: list[str] | None = None,
 ) -> str:
     """Assemble stable channel/session context before live context and event.
@@ -319,6 +320,13 @@ def build_turn_prompt(
             f"Use `{turn_scratch_path}/` for ordinary ephemeral files. This workspace "
             "is private to this turn; the shared `scratch/` root and other turns' "
             "workspaces are unreadable.",
+        )
+    for checkout in prechecked_pr_leases:
+        _add_labeled(
+            "Current PR checkout",
+            f"The framework already checked out this PR at `{checkout['path']}` "
+            f"(head `{checkout['head_sha']}`). You may use PR tools directly; "
+            "repo_checkout will return this same lease.",
         )
 
     # Materialize once if we need to scan it twice (identity + render).

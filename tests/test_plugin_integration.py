@@ -1041,7 +1041,9 @@ async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
             assert result.status == "error"
             assert called == []
             assert (
-                "scoped PR grant refused" if hard_grant_refusal and not enforce
+                decision.refusal_detail
+                if hard_grant_refusal and decision.refusal_detail
+                else "scoped PR grant refused" if hard_grant_refusal and not enforce
                 else expected_reason
             ) in str(result.content)
         if refusal_reason is not None:

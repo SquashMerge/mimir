@@ -9398,7 +9398,7 @@ def _valid_scoped_pr_grant(
         return False
     is_checkout = action is protocol.checkout_action and (
         designated_checkout is None or tool_name == designated_checkout
-    )
+    ) and grants.get(owner, scope, action.value, checkout=True) is not None
     grant = grants.get(owner, scope, action.value, checkout=is_checkout)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
             or grant.owner != owner or grant.principal != grants.principal

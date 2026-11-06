@@ -3604,6 +3604,19 @@ def _tool_call_refusal(
     )
 
 
+def _scoped_pr_refusal_text(authorization: Any) -> str:
+    """Use only policy-generated guidance, never an adapter exception body."""
+    detail = getattr(authorization, "refusal_detail", None)
+    if (getattr(authorization, "reason", None) == "repo_pr_grant_denied"
+            and detail == "Call repo_checkout(repository, pull_request) for this repository and PR first."):
+        return detail
+    if (getattr(authorization, "reason", None) in {"repo_pr_grant_denied", "repo_pr_scope_denied"}
+            and isinstance(detail, str) and detail.startswith("scope does not grant ")
+            and len(detail) <= 160 and "\n" not in detail):
+        return detail
+    return "scoped PR grant refused before execution"
+
+
 def _prepare_tool_call_execution(
     call: _ToolCallReview,
     review_denial: str | None,
@@ -3731,7 +3744,7 @@ def _prepare_tool_call_execution(
             auth_context=auth_context,
         )
         return _tool_call_refusal(
-            call, "scoped PR grant refused before execution", arguments=None,
+            call, _scoped_pr_refusal_text(authorization), arguments=None,
             record_outcome=True,
         )
     if arguments is None:
@@ -4285,7 +4298,7 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
             reason="repo_pr_grant_denied", auth_context=call.auth_context,
         )
         return _tool_call_refusal(
-            call, "scoped PR grant refused before execution", arguments=None,
+            call, _scoped_pr_refusal_text(call.authorization), arguments=None,
             record_outcome=True,
         )
     return None
@@ -4370,12 +4383,21 @@ def _consume_scoped_pr_checkout(call: _PreparedToolCall) -> object | None:
 
     scope = call.authorization.repo_pr_action_scope
     registered = _plugin_tool(call.tool_name, call.policy)
+    # A checkout already observed by the framework has a follow-on grant.
+    # Dispatch revalidated its live lease; do not consume the one-shot grant again.
+    if (registered is not None and scope is not None
+            and call.auth_context.scoped_pr_grants.get(
+                registered.owner, scope, registered.typed_action.value, checkout=True,
+            ) is None):
+        return True
     return scope is not None and registered is not None and consume_scoped_pr_checkout(
         call.auth_context, scope, registered.owner,
     )
 
 
 def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: object) -> bool:
+    if token is True:  # already-attested framework checkout
+        return True
     if _result_is_error(call.tool_name, result, policy=call.policy):
         return True
     from ..access_control import observe_scoped_pr_checkout
