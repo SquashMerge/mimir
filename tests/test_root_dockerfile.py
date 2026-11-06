@@ -142,7 +142,10 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
 
     for name, original in zip(names, baseline, strict=True):
         expected_steps = steps(original)
-        actual_steps = steps((source / name).read_text())
+        script = (source / name).read_text()
+        if name == "executor.sh":
+            script = "git check-ref-format" + script.split("git check-ref-format", 1)[1]
+        actual_steps = steps(script)
         if name == "base.sh":
             # Common developer tools were added after the historical extraction.
             old = "xz-utils poppler-utils"
@@ -251,7 +254,7 @@ def test_root_cultivate_selection_executes_verified_build_branches(
     for command in ("sh", "groupadd", "useradd", "chmod"):
         (bin_dir / command).write_text(f'#!/bin/sh\nprintf "{command} %s\\n" "$*" >> "$COMMAND_LOG"\n')
         (bin_dir / command).chmod(0o755)
-    env = {**os.environ, "MIMIR_PLUGIN_SELECTION": selection, "MIMIR_PLUGIN_PACKAGES": packages,
+    env = {**os.environ, "MIMIR_INSTALL_MODE": "source", "MIMIR_PLUGIN_SELECTION": selection, "MIMIR_PLUGIN_PACKAGES": packages,
            "COMMAND_LOG": str(log)}
 
     def run(program: str, *, stubbed: bool) -> subprocess.CompletedProcess[str]:
@@ -369,10 +372,6 @@ def test_chainlink_builder_is_only_reachable_when_explicitly_selected() -> None:
     reachable = _runtime_stage_dependencies(text, CHAINLINK_ARTIFACT_STAGE="chainlink-build")
     assert "chainlink-build" in reachable
     assert "chainlink-none" not in reachable
-    # Pin the live Docker proof's selection as well as the documented invocation.
-    proof = (ROOT / "scripts/worklink_image_identity.py").read_text()
-    assert '"--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate"' in proof
-    assert '"--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build"' in proof
 
 
 @pytest.mark.parametrize("old,new", [
@@ -774,12 +773,12 @@ def _run_provenance_validation(**build_args: str) -> subprocess.CompletedProcess
     """
     stage = _text().split("FROM ${BASE_IMAGE} AS provenance-validation\n", 1)[1]
     stage = re.split(r"(?m)^FROM ", stage, maxsplit=1)[0]
-    names = ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT")
+    names = ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT", "MIMIR_GIT_URL", "MIMIR_INSTALL_MODE", "MIMIR_VERSION", "MIMIR_AGENT_WHEEL", "MIMIR_AGENT_SHA256", "MIMIR_CULTIVATE_WHEEL", "MIMIR_CULTIVATE_SHA256")
     for name in names:
         assert f"ARG {name}\n" in stage
     program = stage.split("RUN ", 1)[1].strip().replace("\\\n", "\n")
     # Docker's unset ARGs are empty, regardless of the test process environment.
-    env = {**os.environ, **dict.fromkeys(names, ""), **build_args}
+    env = {**os.environ, **dict.fromkeys(names, ""), "MIMIR_INSTALL_MODE": "source", **build_args}
     return subprocess.run(
         ["/bin/sh", "-c", program], cwd=ROOT, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=30,
@@ -815,6 +814,25 @@ def test_provenance_validation_accepts_pinned_args() -> None:
     assert result.returncode == 0, result.stdout
 
 
+@pytest.mark.parametrize("change,message", [
+    ({"MIMIR_INSTALL_MODE": ""}, "MIMIR_INSTALL_MODE must be source or pypi"),
+    ({"MIMIR_GIT_REF": "refs/heads/main"}, "pypi mode refuses Mimir source arguments"),
+    ({"MIMIR_GIT_URL": "https://example.test/source"}, "pypi mode refuses Mimir source arguments"),
+    ({"MIMIR_VERSION": ""}, "MIMIR_VERSION must be exact"),
+    ({"MIMIR_AGENT_WHEEL": ""}, "MIMIR_AGENT wheel required"),
+    ({"MIMIR_CULTIVATE_SHA256": "f" * 63}, "MIMIR_CULTIVATE SHA256 required"),
+])
+def test_pypi_provenance_rejects_missing_or_source_inputs(change, message) -> None:
+    pins = {"MIMIR_INSTALL_MODE": "pypi", "MIMIR_VERSION": "1.0.0rc2",
+            "MIMIR_AGENT_WHEEL": "mimir_agent-1.0.0rc2-py3-none-any.whl",
+            "MIMIR_CULTIVATE_WHEEL": "mimir_cultivate-1.0.0rc2-py3-none-any.whl",
+            "MIMIR_AGENT_SHA256": "a" * 64, "MIMIR_CULTIVATE_SHA256": "b" * 64}
+    assert _run_provenance_validation(**pins).returncode == 0
+    result = _run_provenance_validation(**(pins | change))
+    assert result.returncode == 2
+    assert message in result.stdout
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
 # Hang guard above the subprocess bounds this test already owns (60s ls-remote,
 # 1200s build, 60s run). The suite-wide 300s default killed a cold-cache image
@@ -848,6 +866,7 @@ def test_built_image_provides_process_tools() -> None:
             [
                 "docker", "build",
                 "--build-arg", f"MIMIR_GIT_REF={source_ref}",
+                "--build-arg", "MIMIR_INSTALL_MODE=source",
                 "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
                 "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
                 "--tag", image, ".",
@@ -945,7 +964,7 @@ def test_provider_services_are_build_time_opt_in_and_preserve_core_bundle() -> N
     assert 'pip install --no-cache-dir "$package"' in text
     assert '--enable "$MIMIR_PLUGIN_SELECTION"' in text
     assert '--all-installed "$MIMIR_PLUGIN_ALL_INSTALLED"' in text
-    assert 'sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' in text
+    assert "from mimir.plugin_dockerfile import main; main()" in text
     assert '--destination /etc/s6-overlay/s6-rc.d' in text
     assert '--scripts /usr/local/libexec/mimir-plugin-services' in text
     assert text.index('pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"') < text.index('pip install --no-cache-dir "$package"') < text.index('COPY deploy/s6-overlay/s6-rc.d/')

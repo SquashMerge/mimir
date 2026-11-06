@@ -184,6 +184,8 @@ packages = ["mimir"]
 "docs" = "mimir/bundled_docs/docs"
 "README.md" = "mimir/bundled_docs/README.md"
 ".env.example" = "mimir/bundled_docs/.env.example"
+"Dockerfile" = "mimir/docker_context/Dockerfile"
+"deploy/s6-overlay/s6-rc.d" = "mimir/docker_context/deploy/s6-overlay/s6-rc.d"
 
 # ...and the sdist must CARRY those root paths, because `uv build` builds the
 # wheel FROM the freshly built sdist. With no sdist config, hatchling's default
@@ -196,6 +198,8 @@ packages = ["mimir"]
 "docs" = "docs"
 "README.md" = "README.md"
 ".env.example" = ".env.example"
+"Dockerfile" = "Dockerfile"
+"deploy/s6-overlay/s6-rc.d" = "deploy/s6-overlay/s6-rc.d"
 
 [tool.hatch.build]
 # The built React app (mimir/react_app/dist/) is a VCS-IGNORED build artifact:

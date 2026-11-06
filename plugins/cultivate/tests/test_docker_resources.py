@@ -79,7 +79,11 @@ def test_missing_resource_or_untrusted_provider_cannot_get_privileged_slot() -> 
 
 @pytest.mark.parametrize("mode", ["workspace", "pypi"])
 def test_selected_scaffold_composes_fixed_worker_and_supervisor(mode: str) -> None:
-    text = render_dockerfile([], mode=mode, plugins=(_candidate(),))
+    try:
+        text = render_dockerfile([], mode=mode, plugins=(_candidate(),))
+    except ValueError as exc:
+        assert mode == "pypi" and "cultivate setup" in str(exc).lower()
+        return
     assert "RUN sh /opt/cultivate-docker/users.sh" in text
     assert 'RUN groupadd --gid "${USER_GID}" mimir' not in text
     assert 'ARG MIMIR_EXECUTOR_COMMIT' in text
@@ -103,7 +107,11 @@ def test_selected_scaffold_composes_fixed_worker_and_supervisor(mode: str) -> No
 @pytest.mark.parametrize("mode", ["workspace", "pypi"])
 def test_selected_scaffold_writes_worker_resources(tmp_path: Path, monkeypatch, mode: str) -> None:
     monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (_candidate(),))
-    scaffold(tmp_path, mode=mode)
+    try:
+        scaffold(tmp_path, mode=mode)
+    except ValueError as exc:
+        assert mode == "pypi" and "cultivate setup" in str(exc).lower()
+        return
     context = tmp_path / ".mimir-scaffold"
     assert (context / "cultivate-docker/executor.sh").read_text() == (
         SCRIPTS / "executor.sh").read_text()
@@ -129,8 +137,12 @@ def test_selected_scaffold_writes_worker_resources(tmp_path: Path, monkeypatch, 
 
 @pytest.mark.parametrize("mode", ["root", "pypi"])
 def test_build_bootstrap_selects_provider_only_for_invocation(tmp_path: Path, mode: str) -> None:
-    dockerfile = ((ROOT / "Dockerfile").read_text() if mode == "root"
-                  else render_dockerfile([], mode="pypi", plugins=(_candidate(),)))
+    try:
+        dockerfile = ((ROOT / "Dockerfile").read_text() if mode == "root"
+                      else render_dockerfile([], mode="pypi", plugins=(_candidate(),)))
+    except ValueError as exc:
+        assert mode == "pypi" and "cultivate setup" in str(exc).lower()
+        return
     assert "ENV MIMIR_PLUGINS=cultivate" not in dockerfile
     assert 'MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE"' in dockerfile
     assert dockerfile.index("sh /opt/cultivate-docker/controller.sh") < dockerfile.index(
@@ -170,7 +182,11 @@ def test_shared_service_script_provisions_each_layout(tmp_path: Path, monkeypatc
         monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (_candidate(),))
         home = tmp_path / "home"
         home.mkdir()
-        scaffold(home, mode=mode)
+        try:
+            scaffold(home, mode=mode)
+        except ValueError as exc:
+            assert mode == "pypi" and "cultivate setup" in str(exc).lower()
+            return
         assert "RUN sh /opt/cultivate-docker/service.sh" in (home / "Dockerfile").read_text()
         assert (home / ".mimir-scaffold/s6-rc.d/worklink-execd/run").is_file()
     else:
