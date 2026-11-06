@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 import time
@@ -11,6 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+import yaml
+
+from .repository import RepositoryInventory, valid_repository_slug
 
 
 _cache: dict[Path, tuple[float, dict[str, Any]]] = {}
@@ -54,7 +59,7 @@ def worklink_evidence(home: Path) -> dict[int, dict[str, Any]]:
 
 def _empty(error: str | None = None) -> dict[str, Any]:
     return {"available": False, "error": error, "generated_at": datetime.now(timezone.utc).isoformat(),
-            "repo": None, "pull_requests": [], "truncated": False, "total_count": 0}
+            "repo": [], "errors": {}, "pull_requests": [], "truncated": False, "total_count": 0}
 
 
 def _github_repo(remote: str) -> str | None:
@@ -69,39 +74,52 @@ def _github_repo(remote: str) -> str | None:
     return "/".join(parts) if len(parts) == 2 and all(parts) else None
 
 
-def _load_prs(home: Path) -> dict[str, Any]:
+def _configured_repos(home: Path) -> list[str]:
+    inventory = RepositoryInventory.load(home / "repositories.yaml")
+    if inventory.declared:
+        return [repo.slug for repo in inventory.repositories]
+    return [repo for part in os.environ.get("GITHUB_REPOS", "").split(",")
+            if (repo := part.strip()) and valid_repository_slug(repo)
+            and all(segment not in {".", ".."} for segment in repo.split("/"))]
+
+
+def _origin_repo(home: Path) -> tuple[str | None, str | None]:
     try:
         remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=home,
                                  capture_output=True, text=True, timeout=8)
     except FileNotFoundError:
-        return _empty("git CLI not on PATH")
+        return None, "git CLI not on PATH"
     except subprocess.TimeoutExpired:
-        return _empty("git remote timed out after 8.0s")
+        return None, "git remote timed out after 8.0s"
     except (OSError, ValueError) as exc:
-        return _empty(str(exc)[:500])
+        return None, str(exc)[:500]
     if remote.returncode:
-        return _empty(remote.stderr.strip()[:500] or f"git remote exit code {remote.returncode}")
+        return None, remote.stderr.strip()[:500] or f"git remote exit code {remote.returncode}"
     repo = _github_repo(remote.stdout)
     if repo is None:
-        return _empty("origin remote is not a parseable GitHub repo")
+        return None, "origin remote is not a parseable GitHub repo"
+    return repo, None
+
+
+def _list_prs(home: Path, repo: str) -> tuple[list[dict[str, Any]] | None, str | None]:
     try:
         prs = subprocess.run(["gh", "pr", "list", "-R", repo, "--state", "open",
-                               "--json", "number,title,url,author,createdAt,reviewDecision,isDraft"],
-                              cwd=home, capture_output=True, text=True, timeout=8)
+                               "--limit", "1000", "--json", "number,title,url,author,createdAt,reviewDecision,isDraft"],
+                               cwd=home, capture_output=True, text=True, timeout=8)
     except FileNotFoundError:
-        return _empty("gh CLI not on PATH") | {"repo": repo}
+        return None, "gh CLI not on PATH"
     except subprocess.TimeoutExpired:
-        return _empty("gh pr list timed out after 8.0s") | {"repo": repo}
+        return None, "gh pr list timed out after 8.0s"
     except (OSError, ValueError) as exc:
-        return _empty(str(exc)[:500]) | {"repo": repo}
+        return None, str(exc)[:500]
     if prs.returncode:
-        return _empty(prs.stderr.strip()[:500] or f"gh pr list exit code {prs.returncode}") | {"repo": repo}
+        return None, prs.stderr.strip()[:500] or f"gh pr list exit code {prs.returncode}"
     try:
         raw = json.loads(prs.stdout)
     except json.JSONDecodeError as exc:
-        return _empty(f"gh output: {exc}") | {"repo": repo}
+        return None, f"gh output: {exc}"
     if not isinstance(raw, list):
-        return _empty("gh returned non-list payload") | {"repo": repo}
+        return None, "gh returned non-list payload"
     rows = []
     for item in raw:
         if not isinstance(item, dict) or type(item.get("number")) is not int:
@@ -109,6 +127,7 @@ def _load_prs(home: Path) -> dict[str, Any]:
         number = item["number"]
         author = item.get("author")
         rows.append({
+            "repo": repo,
             "number": number, "title": item.get("title") if isinstance(item.get("title"), str) else f"PR #{number}",
             "url": item.get("url") if isinstance(item.get("url"), str) else "",
             "author": author.get("login", "") if isinstance(author, dict) and isinstance(author.get("login"), str) else "",
@@ -116,8 +135,34 @@ def _load_prs(home: Path) -> dict[str, Any]:
             "review_decision": item.get("reviewDecision") if isinstance(item.get("reviewDecision"), str) else "",
             "is_draft": item.get("isDraft") if isinstance(item.get("isDraft"), bool) else False,
         })
-    return {"available": True, "error": None, "generated_at": datetime.now(timezone.utc).isoformat(),
-            "repo": repo, "pull_requests": rows[:100], "truncated": len(rows) > 100, "total_count": len(rows)}
+    return rows, None
+
+
+def _load_prs(home: Path) -> dict[str, Any]:
+    errors: dict[str, str] = {}
+    try:
+        configured = _configured_repos(home)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        configured = []
+        errors["repositories.yaml"] = str(exc)[:500]
+    origin, origin_error = _origin_repo(home)
+    if origin_error:
+        errors["origin"] = origin_error
+    repos = list(dict.fromkeys(repo.lower() for repo in configured))
+    if origin and origin.lower() not in repos:
+        repos.append(origin)
+    rows: list[dict[str, Any]] = []
+    available = False
+    for repo in repos:
+        listed, error = _list_prs(home, repo)
+        if error is not None:
+            errors[repo] = error
+        else:
+            available = True
+            rows.extend(listed or [])
+    return {"available": available, "error": None if available else next(iter(errors.values()), "No repositories configured"),
+            "generated_at": datetime.now(timezone.utc).isoformat(), "repo": repos, "errors": errors,
+            "pull_requests": rows[:100], "truncated": len(rows) > 100, "total_count": len(rows)}
 
 
 async def build_pr_board_payload(home: Path | None) -> dict[str, Any]:

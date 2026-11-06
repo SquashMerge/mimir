@@ -20,6 +20,7 @@ def _own_board_cache(monkeypatch: pytest.MonkeyPatch) -> dict:
     """Give each test its own copy of the board's module cache."""
     cache: dict = {}
     monkeypatch.setattr(board, "_cache", cache)
+    monkeypatch.delenv("GITHUB_REPOS", raising=False)
     return cache
 
 
@@ -65,7 +66,7 @@ async def test_non_github_or_unparseable_origin_is_unavailable_without_calling_g
     payload = await board.build_pr_board_payload(tmp_path)
 
     assert payload["available"] is False
-    assert payload["repo"] is None
+    assert payload["repo"] == []
     assert payload["error"] == "origin remote is not a parseable GitHub repo"
     assert payload["pull_requests"] == []
     assert [call[0] for call in calls] == ["git"]
@@ -92,7 +93,7 @@ async def test_payload_is_cached_per_home_for_ninety_seconds(
     monkeypatch.setattr(board.time, "monotonic", lambda: now[0])
 
     first = await board.build_pr_board_payload(tmp_path)
-    assert first["available"] is True and first["repo"] == "owner/home"
+    assert first["available"] is True and first["repo"] == ["owner/home"]
     assert len(calls) == 2  # git remote + gh pr list
 
     now[0] += 89.9

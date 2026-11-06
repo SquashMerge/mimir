@@ -91,6 +91,7 @@ from ._langchain_codex_plus_patches import (
 from ._deepagents_summarization import install_offload_traceback_logging_patch
 from ._jsonl_tail import tail_jsonl_records
 from ._llm_retry import _is_retryable_error
+from ._provider_errors import TransientTransportError
 from ._reasoning_effort import EFFORT_LEVELS as _EFFORT_LEVELS
 from ._reasoning_effort import validate_effort as _validate_effort
 from .jsonl_snapshot import JsonlSnapshot
@@ -2244,6 +2245,17 @@ class Agent:
             if event.trigger == "poller" and not getattr(ctx, "outcome_emitted", False):
                 try:
                     transient_reason, retry_after_s = _transient_provider_failure(exc)
+                    # Checkout wrappers preserve provider failures as causes.
+                    cause = exc.__cause__
+                    while transient_reason is None and cause is not None:
+                        transient_reason, retry_after_s = _transient_provider_failure(cause)
+                        if (transient_reason is None
+                                and type(cause).__name__ == "_GitHubRequestError"
+                                and getattr(cause, "retryable", False) is True):
+                            transient_reason = "provider_error_transient:_GitHubRequestError"
+                        if transient_reason is None and isinstance(cause, TransientTransportError):
+                            transient_reason = f"provider_error_transient:{type(cause).__name__}"
+                        cause = cause.__cause__
                     await log_event(
                         "turn_failed", channel_id=event.channel_id,
                         turn_id=failed_turn_id, trigger=event.trigger,
@@ -2252,6 +2264,7 @@ class Agent:
                             type(exc), exc, exc.__traceback__, limit=12,
                         ))[-4000:],
                         phase="pre_model_loop",
+                        tool_call_count=0,
                         attempt_disposition=("transient_provider" if transient_reason else "charge"),
                         attempt_reason=transient_reason or f"{type(exc).__name__}: {exc}"[:240],
                         **({"retry_after_s": retry_after_s} if retry_after_s else {}),
@@ -2660,6 +2673,76 @@ class Agent:
             )
             ctx.turn_event_emitter = emitter
             emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
+            # Only host-issued checkout grants qualify; never infer a checkout
+            # target from the prompt or model arguments.
+            from .access_control import (
+                ScopedPRGrants, _valid_scoped_pr_grant,
+                consume_scoped_pr_checkout, observe_scoped_pr_checkout,
+            )
+            grants = getattr(auth_ctx, "scoped_pr_grants", None)
+            registry = getattr(auth_ctx, "repo_pr_scope_registry", None)
+            states = getattr(registry, "review_states", ()) if registry is not None else ()
+            checkout_hooks = self._config.plugin_manager.policy.turn_hooks
+            ctx.prechecked_pr_leases = []
+            ctx.prechecked_pr_stops = []
+            if event.trigger == "poller" and isinstance(grants, ScopedPRGrants):
+                for state in states:
+                    scope = state.action_scope
+                    protocol = grants._protocols.get(scope.owner)
+                    if protocol is None or grants.get(
+                        scope.owner, scope, protocol.checkout_action.value, checkout=True,
+                    ) is None:
+                        continue
+                    if not _valid_scoped_pr_grant(
+                        auth_ctx, scope.owner, protocol.checkout_action, protocol,
+                        scope, state, tool_name=protocol.checkout_tool,
+                    ):
+                        raise RuntimeError("repository checkout rejected: scoped PR grant refused")
+                    token = consume_scoped_pr_checkout(auth_ctx, scope, scope.owner)
+                    if token is None:
+                        raise RuntimeError("repository checkout rejected: scoped PR grant expired")
+                    hook = checkout_hooks.get((scope.owner, "pr_checkout"))
+                    if hook is None:
+                        raise RuntimeError("repository checkout rejected: checkout provider unavailable")
+                    result = await asyncio.to_thread(
+                        hook, scope.canonical_repo, scope.pr_number,
+                        SimpleNamespace(context=auth_ctx),
+                    )
+                    if result.get("status") == "stopped":
+                        # A closed PR or resolved checks is a no-work outcome:
+                        # the grant stays consumed and the turn ends quietly.
+                        ctx.prechecked_pr_stops.append({
+                            "repository": scope.canonical_repo,
+                            "pull_request": scope.pr_number,
+                            "message": str(result.get("message") or "nothing to remediate")[:500],
+                        })
+                        continue
+                    # Preflight may re-mint a fresh server scope for a moved head
+                    # and attach the lease there. Move scope, grant and token
+                    # together, as the next tool authorization would.
+                    discovered = getattr(auth_ctx, "server_discovered_pr_states", None)
+                    current = (
+                        discovered.resolve(scope.canonical_repo, scope.pr_number)
+                        if discovered is not None else None
+                    )
+                    if current is not None and current is not state:
+                        grants.issue(current.action_scope)
+                        state, scope = current, current.action_scope
+                        token = consume_scoped_pr_checkout(auth_ctx, scope, scope.owner)
+                        if token is None:
+                            raise RuntimeError("repository checkout rejected: refreshed PR scope has no checkout grant")
+                    if not observe_scoped_pr_checkout(
+                        auth_ctx, scope, state, token, scope.owner, protocol,
+                    ):
+                        raise RuntimeError("repository checkout rejected: lease attestation refused")
+                    live = protocol.live_lease(scope, state) if protocol.live_lease is not None else None
+                    if live is None or auth_ctx.ifc_state is None:
+                        raise RuntimeError("repository checkout rejected: lease attestation refused")
+                    auth_ctx.ifc_state.framework_pr_checkouts[scope.scope_id] = (
+                        (str(live.path), live.recovery_id),
+                        tuple(result.get("candidate_commits") or ()),
+                    )
+                    ctx.prechecked_pr_leases.append(result)
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
             # state/wiki/ content page BEFORE the model loop runs so the
             # finalize step can tell if any wiki page was edited this turn.
@@ -5658,6 +5741,8 @@ class Agent:
                 str(ctx.turn_scratch_path)
                 if getattr(ctx, "turn_scratch_path", None) is not None else None
             ),
+            prechecked_pr_leases=getattr(ctx, "prechecked_pr_leases", ()),
+            prechecked_pr_stops=getattr(ctx, "prechecked_pr_stops", ()),
             stable_prefix_out=stable_prefix_out,
         )
         ctx.ifc_labels = _merge_ifc_labels(

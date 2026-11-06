@@ -9366,6 +9366,26 @@ class ScopedPRGrants:
             return True
 
 
+def framework_checkout_resumable(
+    auth_context: AuthContext | None, owner: str | None, protocol: Any,
+    scope: Any, review_state: Any,
+) -> bool:
+    """True only for the exact live lease turn setup checked out and observed."""
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    record = getattr(ifc_state, "framework_pr_checkouts", {}).get(getattr(scope, "scope_id", None))
+    if (record is None or not isinstance(grants, ScopedPRGrants) or protocol is None
+            or getattr(protocol, "live_lease", None) is None or owner is None):
+        return False
+    follow = grants.get(owner, scope, protocol.checkout_action.value, checkout=False)
+    live = protocol.live_lease(scope, review_state)
+    return (
+        follow is not None and live is not None
+        and follow.lease_identity == record[0]
+        and (str(live.path), live.recovery_id) == record[0]
+    )
+
+
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
     protocol: Any, scope: Any, review_state: Any, *, tool_name: str | None = None,
@@ -9385,12 +9405,14 @@ def _valid_scoped_pr_grant(
             and slot_policy.scoped_actions.get(owner) is protocol):
         registry = getattr(auth_context, "repo_pr_scope_registry", None)
         discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        # Same order as tool authorization and lease attestation: a reminted
+        # server-discovered state supersedes the immutable event registry.
         registered_state = (
-            registry.resolve(scope.canonical_repo, scope.pr_number)
-            if registry is not None else None
+            discovered.resolve(scope.canonical_repo, scope.pr_number)
+            if discovered is not None else None
         )
-        if registered_state is None and discovered is not None:
-            registered_state = discovered.resolve(scope.canonical_repo, scope.pr_number)
+        if registered_state is None and registry is not None:
+            registered_state = registry.resolve(scope.canonical_repo, scope.pr_number)
         if registered_state is not review_state or review_state.action_scope is not scope:
             return False
     designated_checkout = getattr(protocol, "checkout_tool", None)
@@ -9400,6 +9422,13 @@ def _valid_scoped_pr_grant(
         designated_checkout is None or tool_name == designated_checkout
     )
     grant = grants.get(owner, scope, action.value, checkout=is_checkout)
+    if is_checkout and grant is None and framework_checkout_resumable(
+        auth_context, owner, protocol, scope, review_state,
+    ):
+        # The designated checkout tool may only return the lease the framework
+        # itself attested this turn. It is validated as that lease's follow-on.
+        is_checkout = False
+        grant = grants.get(owner, scope, action.value, checkout=False)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
             or grant.owner != owner or grant.principal != grants.principal
             or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at
@@ -9417,6 +9446,24 @@ def _valid_scoped_pr_grant(
         return protocol.validate_scope(action, scope, grant) is True
     except (TypeError, ValueError, AttributeError):
         return False
+
+
+def register_server_discovered_review_grant(auth_context: AuthContext, state: Any) -> None:
+    """Bind a live, turn-registered review scope to an operator's grants."""
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    scope = getattr(state, "action_scope", None)
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
+    if (
+        not can_resolve_forge_review_scope(auth_context, stage="fetch")
+        or getattr(auth_context, "is_service", False)
+        or not isinstance(grants, ScopedPRGrants)
+        or grants.principal != getattr(auth_context, "canonical_principal", None)
+        or scope is None or getattr(scope, "provenance", None) != "server_discovered"
+        or discovered is None
+        or discovered.resolve(scope.canonical_repo, scope.pr_number) is not state
+    ):
+        return
+    grants.issue(scope)
 
 
 def consume_scoped_pr_checkout(auth_context: AuthContext, scope: Any, owner: str) -> object | None:
@@ -13655,17 +13702,22 @@ def create_auth_context(
     )
     action_scope = single_state.action_scope if single_state is not None else None
     scoped_pr_grants = None
-    if (
+    operator_user = (
+        event.trigger == "user_message" and not is_service
+        and bool(canonical) and "admin" in roles
+        and event_ingress is None and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+    )
+    service_grants = (
         is_service and registered_service is not None
         and (registered_service.github_activity or
              registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES)
         and event_ingress is None and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
-        and (policy if policy is not None else selected_policy_registry()).scoped_actions
-    ):
+    )
+    if (operator_user or service_grants) and selected.scoped_actions:
         scoped_pr_grants = ScopedPRGrants(
             canonical, (state.action_scope for state in repo_pr_scope_registry.review_states)
-            if repo_pr_scope_registry is not None else (),
-            protocols=(policy if policy is not None else selected_policy_registry()).scoped_actions,
+            if service_grants and repo_pr_scope_registry is not None else (),
+            protocols=selected.scoped_actions,
             _issuer=_SCOPED_PR_ISSUER,
         )
 
