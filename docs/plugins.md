@@ -517,7 +517,11 @@ install the same pair and configured extras. It cannot fall back to Git.
 First-party package bytes are checked against retained root-owned wheels; any
 bytecode under their package roots is drift, even with a self-consistent hash
 in a mutable installed RECORD. Builds use explicit `pip --no-compile` and
-`PYTHONDONTWRITEBYTECODE=1`. Interpreter startup hooks (`*.pth`,
+`PYTHONDONTWRITEBYTECODE=1`. PyPI controller first-party package trees are also
+root-owned and read-only: Python silently skips bytecode writes even when a
+poller, skill smoke check or other subprocess drops that environment setting.
+Source-mode controller packages retain their existing writable update flow.
+Interpreter startup hooks (`*.pth`,
 `sitecustomize.py`, `usercustomize.py`) must exactly match root-owned build-time
 allowlists outside the controller venv. This includes uv's `_virtualenv.pth`
 when present at build time; a new or modified hook is never authorized by a

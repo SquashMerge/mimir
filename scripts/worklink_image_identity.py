@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -460,15 +461,13 @@ import sys
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
+import os
+assert os.geteuid() == 1001, 'protocol and health proof must run as mimir'
+
 from mimir_cultivate.install_identity import controller_identity, executor_identity
 from mimir_cultivate.worklink.worker_client import verify_executor_identity
-
 expected = json.loads(sys.argv[1])
-controller = Path('/home/mimir/venv/controller-install-identity.json')
-executor = Path('/opt/mimir-worklink/executor-install-identity.json')
-wheels = Path('/opt/mimir-worklink/wheels')
-controller_file = next(Path('/home/mimir/venv/lib').glob('python*/site-packages/mimir_cultivate/install_identity.py'))
-worker_file = next(Path('/opt/mimir-worklink/venv/lib').glob('python*/site-packages/mimir_cultivate/install_identity.py'))
+affected = sys.argv[2] if len(sys.argv) > 2 else ''
 
 def health():
     try:
@@ -476,6 +475,18 @@ def health():
             return response.status, json.load(response)
     except HTTPError as exc:
         return exc.code, json.load(exc)
+
+if affected:
+    verify = (lambda: asyncio.run(verify_executor_identity())) if affected == 'worker' else controller_identity
+    try:
+        verify()
+    except (RuntimeError, ValueError, OSError):
+        pass
+    else:
+        raise AssertionError('identity accepted mutated ' + affected)
+    status, payload = health()
+    assert status == 503 and payload['ok'] is False, (affected, status, payload)
+    sys.exit(0)
 
 assert controller_identity() == expected
 assert executor_identity() == expected
@@ -490,41 +501,77 @@ assert payload['worklink_executor_source_commit'] is None, payload
 assert payload['worklink_controller_source_commit'] is None, payload
 assert payload['worklink_executor_source_status'] == 'not_applicable', payload
 
-mutations = [(controller, b'{}', 'controller'), (executor, b'{}', 'worker'),
-             (controller_file, b'# altered installed content\n', 'controller'),
-             (worker_file, b'# altered installed content\n', 'worker')]
-mutations += [(wheels / item['wheel'], b'not a wheel', 'both')
-              for item in expected['distributions'].values()]
-for path, replacement, affected in mutations:
-    original = path.read_bytes()
-    try:
-        path.write_bytes(replacement)
-        if affected == 'worker':
-            try:
-                asyncio.run(verify_executor_identity())
-            except (RuntimeError, ValueError, OSError):
-                pass
-            else:
-                raise AssertionError('worker accepted a mutated executor marker')
-        else:
-            verify = executor_identity if affected == 'both' else controller_identity
-            try:
-                verify()
-            except (RuntimeError, ValueError, OSError):
-                pass
-            else:
-                raise AssertionError(f'identity accepted mutated {path}')
-        status, payload = health()
-        assert status == 503 and payload['ok'] is False, (path, status, payload)
-    finally:
-        path.write_bytes(original)
-    assert controller_identity() == expected
-    assert executor_identity() == expected
-    assert asyncio.run(verify_executor_identity()) == expected
-    status, payload = health()
-    assert status == 200 and payload['ok'] is True, (path, status, payload)
-print('live PyPI pair, protocol, health and mutation proof passed')
+print('live PyPI pair, protocol and health proof passed')
 '''
+
+
+PYPI_READONLY_IMPORT_PROOF = r'''
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+assert os.geteuid() == 1001
+site = next(Path('/home/mimir/venv/lib').glob('python*/site-packages'))
+for package in ('mimir', 'mimir_cultivate'):
+    root = site / package
+    for path in (root, *root.rglob('*')):
+        assert path.stat().st_uid == 0, path
+        assert path.stat().st_mode & 0o222 == 0, path
+        assert not os.access(path, os.W_OK), path
+# No image ENV can rescue this deliberately scrubbed launcher. Both packages
+# really import, yet neither can create bytecode, even outside known launchers.
+result = subprocess.run([sys.executable, '-c',
+                         'import mimir.pollers, mimir_cultivate.install_identity'],
+                        env={'PATH': '/home/mimir/venv/bin:/usr/bin:/bin', 'HOME': '/home/mimir'},
+                        capture_output=True, text=True, timeout=30)
+assert result.returncode == 0, result.stderr
+for package in ('mimir', 'mimir_cultivate'):
+    assert not list((site / package).rglob('*.pyc'))
+'''
+
+
+def prove_pypi_runtime(pair: dict) -> None:
+    """Keep protocol/health as the controller; root only reads/mutates fixtures."""
+    python = '/home/mimir/venv/bin/python'
+    expected = json.dumps(pair, sort_keys=True)
+
+    def check(affected: str = '') -> None:
+        docker_exec(python, '-c', PYPI_RUNTIME_PROOF, expected, affected, user='mimir')
+
+    docker_exec(python, '-c', PYPI_READONLY_IMPORT_PROOF, user='mimir')
+    check()
+    mutations = [('/home/mimir/venv/controller-install-identity.json', b'{}', 'controller'),
+                 ('/opt/mimir-worklink/executor-install-identity.json', b'{}', 'worker')]
+    for venv, affected in (('/home/mimir/venv', 'controller'), ('/opt/mimir-worklink/venv', 'worker')):
+        path = docker_exec(python, '-c',
+                           "from pathlib import Path; import sys; print(next(Path(sys.argv[1]).glob('lib/python*/site-packages/mimir_cultivate/install_identity.py')))",
+                           venv, user='root').strip()
+        mutations.append((path, b'# altered installed content\n', affected))
+    mutations += [('/opt/mimir-worklink/wheels/' + item['wheel'], b'not a wheel', 'both')
+                  for item in pair['distributions'].values()]
+    for path, replacement, affected in mutations:
+        # Keep full wheels inside the container: putting their bytes in argv
+        # can exceed ARG_MAX. mkstemp creates a private root-owned backup.
+        backup = docker_exec(python, '-c',
+                             'import os, shutil, sys, tempfile; fd, backup = tempfile.mkstemp(); '
+                             'os.close(fd); shutil.copyfile(sys.argv[1], backup); print(backup)',
+                             path, user='root').strip()
+        try:
+            # Append to Python sources so fresh controller subprocesses can
+            # still import the verifier and detect the changed wheel bytes.
+            docker_exec(python, '-c',
+                        'import base64, pathlib, sys; path = pathlib.Path(sys.argv[1]); '
+                        'data = base64.b64decode(sys.argv[2]); '
+                        'path.write_bytes(path.read_bytes() + data if path.suffix == ".py" else data)',
+                        path, base64.b64encode(replacement).decode(), user='root')
+            check(affected)
+        finally:
+            docker_exec(python, '-c',
+                        'import pathlib, shutil, sys; shutil.copyfile(sys.argv[2], sys.argv[1]); '
+                        'pathlib.Path(sys.argv[2]).unlink()', path, backup, user='root')
+        check()
+    print('live PyPI pair, protocol, health and mutation proof passed')
 
 
 def prepare_pypi_deployment(directory: Path, agent_wheel: Path, cultivate_wheel: Path,
@@ -627,8 +674,7 @@ def prove_pypi(agent_wheel: Path, cultivate_wheel: Path) -> None:
                             f"assert {'controller_identity' if interpreter.startswith('/home') else 'executor_identity'}(); "
                             "[m.version(name) for name in ('langchain-openai', 'sentence-transformers', 'mcp')]; assert m.version('torch').endswith('+cpu')",
                             user="root")
-            docker_exec("/home/mimir/venv/bin/python", "-c", PYPI_RUNTIME_PROOF,
-                        json.dumps(pair, sort_keys=True))
+            prove_pypi_runtime(pair)
             print("worklink shipped-image PyPI identity proof passed")
         finally:
             subprocess.run(["docker", "rm", "--force", CONTAINER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

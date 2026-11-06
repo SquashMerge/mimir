@@ -1071,6 +1071,44 @@ def test_pypi_install_scripts_keep_dependency_cache_and_no_bytecode_policy():
     assert "write_startup_hooks(EXECUTOR_HOOKS); executor_identity()" in executor
 
 
+@pytest.mark.parametrize("mode", ["source", "pypi"])
+def test_controller_package_lockdown_is_pypi_only(tmp_path, mode):
+    import stat
+
+    text = DOCKERFILE.read_text()
+    program = next(p for p in _run_instructions(text) if "write_startup_hooks(CONTROLLER_HOOKS)" in p)
+    assert 'if [ "$MIMIR_INSTALL_MODE" = pypi ]' in program
+    assert 'chown -R root:root /home/mimir/venv/lib/python*/site-packages/mimir' in program
+    assert text.index('ARG MIMIR_ENABLE_CLAUDE_CODE=0') < text.index('chown -R root:root /home/mimir/venv/lib/')
+    assert text.rfind('USER root', 0, text.index('chown -R root:root /home/mimir/venv/lib/')) > text.rfind('USER mimir', 0, text.index('chown -R root:root /home/mimir/venv/lib/'))
+    venv = tmp_path / 'venv'
+    site = venv / 'lib/python3.11/site-packages'
+    for package in ('mimir', 'mimir_cultivate'):
+        (site / package / 'nested').mkdir(parents=True)
+        (site / package / 'nested/module.py').write_text('value = 42\n')
+    (venv / 'controller-install-identity.json').write_text('{}')
+    # Execute the actual Docker RUN against a fixture venv. Only privileged
+    # ownership and the earlier snapshot writer are substituted; chmod and its
+    # mode guard remain real. Live image proof independently attests uid 0.
+    program = program.replace('/home/mimir/venv', str(venv))
+    program = program.replace('/opt/mimir-worklink/controller-startup-hooks.json', str(tmp_path / 'hooks.json'))
+    program = program.replace(str(venv) + '/bin/python -c', 'true -c')
+    program = program.replace('chown ', 'true ')
+    (tmp_path / 'hooks.json').write_text('{}')
+    result = subprocess.run(['/bin/sh', '-c', program], capture_output=True, text=True,
+                            env={**os.environ, 'MIMIR_INSTALL_MODE': mode})
+    try:
+        assert result.returncode == 0, result.stderr
+        for package in ('mimir', 'mimir_cultivate'):
+            for path in (site / package, *(site / package).rglob('*')):
+                assert bool(path.stat().st_mode & 0o222) == (mode == 'source'), path
+                if path.is_dir():
+                    assert path.stat().st_mode & stat.S_IXUSR
+    finally:
+        for path in venv.rglob('*'):
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+
+
 def test_image_assembly_rejects_missing_selected_package() -> None:
     with pytest.raises(ValueError, match="selected provider packages differ"):
         verify_pins(("missing-provider==1.0",), ())

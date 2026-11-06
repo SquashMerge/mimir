@@ -359,7 +359,15 @@ RUN set -eu; if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
         chmod 0444 /opt/mimir-worklink/controller-startup-hooks.json; \
         chown root:root /home/mimir/venv/controller-install-identity.json; \
         chmod 0444 /home/mimir/venv/controller-install-identity.json; \
+        chown -R root:root /home/mimir/venv/lib/python*/site-packages/mimir \
+                          /home/mimir/venv/lib/python*/site-packages/mimir_cultivate; \
+        chmod -R a-w /home/mimir/venv/lib/python*/site-packages/mimir \
+                     /home/mimir/venv/lib/python*/site-packages/mimir_cultivate; \
     fi
+# First-party package trees in PyPI mode are read-only even when a subprocess
+# scrubs PYTHONDONTWRITEBYTECODE. Python silently skips unwritable bytecode;
+# normal poller, skill-smoke and future launcher imports cannot poison health.
+# Source mode retains its existing writable update flow.
 USER mimir
 
 # Pre-warm the fastembed cache so the first request doesn't pay the

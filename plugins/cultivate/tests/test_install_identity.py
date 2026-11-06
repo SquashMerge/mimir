@@ -148,6 +148,38 @@ def test_shell_cli_preserves_installed_identity(installed_wheels, monkeypatch, s
                                          hooks_manifest=marker.parent / "hooks.json")
 
 
+def test_readonly_pair_import_preserves_identity_with_scrubbed_launcher(installed_wheels):
+    import os
+    import stat
+
+    if os.geteuid() == 0:
+        pytest.skip('root bypasses read-only mode bits; live image proof uses mimir uid')
+    marker, wheels, site, declared = installed_wheels
+    cli = site.parents[2] / 'bin/mimir'
+    roots = [site / name.replace('-', '_') for name in identity.PROJECTS]
+    saved = {path: path.stat().st_mode for root in roots for path in (root, *root.rglob('*'))}
+    assert all(path.stat().st_mode & stat.S_IWUSR for path in roots)
+    try:
+        for path in saved:
+            path.chmod(saved[path] & ~0o222)
+        result = subprocess.run([str(cli)], env={'PATH': '/usr/bin:/bin'},
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        assert all(not list(root.rglob('*.pyc')) for root in roots)
+        assert identity.verify_install_identity(marker, wheels=wheels, site=site,
+                                              hooks_manifest=marker.parent / 'hooks.json') == declared
+    finally:
+        for path, mode in saved.items():
+            path.chmod(mode)
+    # Same CLI and scrubbed env, with writable package trees: prove the
+    # filesystem policy, not inherited no-bytecode settings, prevents drift.
+    subprocess.run([str(cli)], env={'PATH': '/usr/bin:/bin'}, check=True, timeout=30)
+    assert list(roots[0].rglob('*.pyc'))
+    with pytest.raises(identity.InstallIdentityError, match='bytecode drift'):
+        identity.verify_install_identity(marker, wheels=wheels, site=site,
+                                         hooks_manifest=marker.parent / 'hooks.json')
+
+
 def test_installed_wheel_requires_each_generated_script(installed_wheels):
     marker, wheels, site, _ = installed_wheels
     record = site / "mimir_agent-1.2.dist-info/RECORD"

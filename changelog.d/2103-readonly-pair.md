@@ -1,0 +1,1 @@
+- Make PyPI Cultivate controller package trees root-owned and read-only so scrubbed subprocess imports cannot create bytecode drift; run live image protocol and health proofs as the controller, reserving root for drift fixture mutations and restoration.

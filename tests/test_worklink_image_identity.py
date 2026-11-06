@@ -103,8 +103,56 @@ def test_pypi_proof_builds_local_context_and_checks_runtime() -> None:
     compile(namespace["PYPI_RUNTIME_PROOF"], "PYPI_RUNTIME_PROOF", "exec")
     for invariant in ("controller_identity() == expected", "executor_identity() == expected",
                       "verify_executor_identity()", "status == 503", "status == 200",
-                      "installed content", "executor-install-identity.json", "worklink_install_status"):
+                      "worklink_install_status"):
         assert invariant in namespace["PYPI_RUNTIME_PROOF"]
+    assert "# altered installed content" in script
+    assert "executor-install-identity.json" in script
+
+
+def test_pypi_protocol_proof_uses_controller_uid_and_root_only_for_mutations(monkeypatch):
+    import base64
+
+    namespace = runpy.run_path(str(PROOF))
+    prove = namespace['prove_pypi_runtime']
+    calls = []
+    def execute(*args, user='root', **kwargs):
+        calls.append((args, user))
+        if 'print(next(Path' in args[2]:
+            return args[3] + '/lib/python3.11/site-packages/mimir_cultivate/install_identity.py\n'
+        if 'tempfile.mkstemp()' in args[2]:
+            return '/tmp/private-root-backup\n'
+        return ''
+
+    monkeypatch.setitem(prove.__globals__, 'docker_exec', execute)
+    prove({'distributions': {'agent': {'wheel': 'agent.whl'}, 'cultivate': {'wheel': 'cultivate.whl'}}})
+    checks = [(args, user) for args, user in calls if args[2] == namespace['PYPI_RUNTIME_PROOF']]
+    assert len(checks) == 13  # initial plus failure/recovery for all six mutations
+    assert all(user == 'mimir' for _, user in checks)
+    assert [args[4] for args, _ in checks] == ['', 'controller', '', 'worker', '', 'controller', '', 'worker', '', 'both', '', 'both', '']
+    imports = [(args, user) for args, user in calls if args[2] == namespace['PYPI_READONLY_IMPORT_PROOF']]
+    assert len(imports) == 1 and imports[0][1] == 'mimir'
+    writes = [(args, user) for args, user in calls if 'write_bytes(' in args[2]]
+    assert len(writes) == 6
+    assert all(user == 'root' for _, user in writes)
+    restores = [(args, user) for args, user in calls if 'shutil.copyfile(sys.argv[2]' in args[2]]
+    assert len(restores) == 6
+    assert all(user == 'root' and args[4] == '/tmp/private-root-backup' for args, user in restores)
+    assert [args[3] for args, _ in writes] == [args[3] for args, _ in restores]
+    for args, _ in writes:
+        if args[3].endswith('.py'):
+            assert base64.b64decode(args[4]) == b'# altered installed content\n'
+            assert 'path.read_bytes() + data' in args[2]
+
+
+def test_pypi_runtime_proof_refuses_root_before_protocol(monkeypatch):
+    import os
+    import sys
+
+    namespace = runpy.run_path(str(PROOF))
+    monkeypatch.setattr(os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(sys, 'argv', ['proof', '{}'])
+    with pytest.raises(AssertionError, match='must run as mimir'):
+        exec(namespace['PYPI_RUNTIME_PROOF'], {})
 
 
 def test_wheel_identity_checks_metadata_and_cultivate_pair(tmp_path: Path) -> None:
