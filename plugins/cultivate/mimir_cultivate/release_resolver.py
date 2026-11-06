@@ -8,7 +8,10 @@ from email.policy import default
 import hashlib
 from io import BytesIO
 import json
+from queue import Empty, SimpleQueue
 import re
+from threading import Event, Thread
+import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
@@ -23,6 +26,7 @@ from packaging.version import InvalidVersion, Version
 INDEX_LIMIT = 8 * 1024 * 1024
 WHEEL_LIMIT = 128 * 1024 * 1024
 METADATA_LIMIT = 1024 * 1024
+FETCH_DEADLINE = 30
 _PROJECTS = ("mimir-agent", "mimir-cultivate")
 
 
@@ -47,21 +51,49 @@ class ReleasePair:
 
 
 def fetch_bytes(url: str, limit: int) -> bytes:
-    """Read at most limit bytes over HTTPS, with a finite connection timeout."""
+    """Read at most limit bytes over HTTPS within a total wall-clock deadline."""
     if urlsplit(url).scheme != "https":
         raise ReleaseError("PyPI download requires HTTPS.")
+
+    deadline = time.monotonic() + FETCH_DEADLINE
+    cancelled = Event()
+    result: SimpleQueue[bytes | Exception] = SimpleQueue()
+
+    def download() -> None:
+        try:
+            with urlopen(Request(url, headers={"User-Agent": "mimir-cultivate-setup/1"}),
+                         timeout=min(15, max(0.001, deadline - time.monotonic()))) as response:
+                if urlsplit(response.geturl()).scheme != "https":
+                    raise ReleaseError("PyPI redirected to an insecure download.")
+                data = bytearray()
+                while not cancelled.is_set():
+                    if time.monotonic() >= deadline:
+                        raise ReleaseError("PyPI download exceeded the time limit.")
+                    chunk = response.read(min(64 * 1024, limit + 1 - len(data)))
+                    if time.monotonic() >= deadline:
+                        raise ReleaseError("PyPI download exceeded the time limit.")
+                    if not chunk:
+                        result.put(bytes(data))
+                        return
+                    data.extend(chunk)
+                    if len(data) > limit:
+                        raise ReleaseError("PyPI response exceeds the permitted size.")
+        except Exception as exc:
+            if not cancelled.is_set():
+                result.put(exc)
+
+    Thread(target=download, daemon=True).start()
     try:
-        with urlopen(Request(url, headers={"User-Agent": "mimir-cultivate-setup/1"}), timeout=15) as response:
-            if urlsplit(response.geturl()).scheme != "https":
-                raise ReleaseError("PyPI redirected to an insecure download.")
-            data = response.read(limit + 1)
-    except (OSError, ValueError) as exc:
-        if isinstance(exc, ReleaseError):
-            raise
+        outcome = result.get(timeout=max(0, deadline - time.monotonic()))
+    except Empty:
+        raise ReleaseError("PyPI download exceeded the time limit.") from None
+    finally:
+        cancelled.set()
+    if isinstance(outcome, ReleaseError):
+        raise outcome
+    if isinstance(outcome, Exception):
         raise ReleaseError("Cannot reach PyPI; check network access and retry setup.") from None
-    if len(data) > limit:
-        raise ReleaseError("PyPI response exceeds the permitted size.")
-    return data
+    return outcome
 
 
 def _target_tags(architecture: str) -> set[Tag]:
@@ -134,7 +166,7 @@ def _candidates(project: str, releases: dict, tags: set[Tag]) -> dict[Version, d
     return result
 
 
-def _download(project: str, version: Version, entry: dict, fetch) -> Wheel:
+def _download(project: str, version: Version, entry: dict, fetch, architecture: str) -> Wheel:
     filename = entry["filename"]
     try:
         data = fetch(entry["url"], WHEEL_LIMIT)
@@ -159,9 +191,17 @@ def _download(project: str, version: Version, entry: dict, fetch) -> Wheel:
         if requires_python and Version("3.11.0") not in SpecifierSet(requires_python):
             raise ReleaseError(f"Wheel metadata excludes Python 3.11 for {project} {version}.")
         if project == "mimir-cultivate":
+            target = {
+                "implementation_name": "cpython", "implementation_version": "3.11.0",
+                "os_name": "posix", "platform_machine": architecture,
+                "platform_python_implementation": "CPython", "platform_release": "",
+                "platform_system": "Linux", "platform_version": "",
+                "python_full_version": "3.11.0", "python_version": "3.11",
+                "sys_platform": "linux", "extra": "",
+            }
             dependencies = [Requirement(value) for value in metadata.get_all("Requires-Dist", [])]
             core = [dep for dep in dependencies if canonicalize_name(dep.name) == "mimir-agent"
-                    and (dep.marker is None or dep.marker.evaluate())]
+                    and (dep.marker is None or dep.marker.evaluate(environment=target))]
             if not core or any(version not in dep.specifier for dep in core):
                 raise ReleaseError(f"Cultivate wheel does not require mimir-agent {version}.")
     except (BadZipFile, KeyError, ValueError, InvalidRequirement, RuntimeError) as exc:
@@ -197,5 +237,5 @@ def resolve_release(version: str | None = None, *, fetch=fetch_bytes,
         if not common:
             raise ReleaseError("No common compatible, non-yanked PyPI wheel release for Mimir and Cultivate.")
         selected = max(stable or common)
-    return ReleasePair(str(selected), _download(_PROJECTS[0], selected, agent[selected], fetch),
-                       _download(_PROJECTS[1], selected, cultivate[selected], fetch))
+    return ReleasePair(str(selected), _download(_PROJECTS[0], selected, agent[selected], fetch, architecture),
+                       _download(_PROJECTS[1], selected, cultivate[selected], fetch, architecture))

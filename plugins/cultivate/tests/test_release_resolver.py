@@ -3,19 +3,23 @@ from __future__ import annotations
 import hashlib
 from io import BytesIO
 import json
+import time
 from zipfile import ZipFile
 
 import pytest
 
-from mimir_cultivate.release_resolver import ReleaseError, resolve_release
+from mimir_cultivate import release_resolver
+from mimir_cultivate.release_resolver import ReleaseError, fetch_bytes, resolve_release
 
 
-def wheel(project, version, *, dependency=None):
+def wheel(project, version, *, dependency=None, requirements=None):
     name = project.replace("-", "_")
     filename = f"{name}-{version}-py3-none-manylinux2014_x86_64.whl"
     content = f"Name: {project}\nVersion: {version}\n"
     if dependency:
         content += f"Requires-Dist: mimir-agent=={dependency}\n"
+    for requirement in requirements or ():
+        content += f"Requires-Dist: {requirement}\n"
     output = BytesIO()
     with ZipFile(output, "w") as archive:
         archive.writestr(f"{name}-{version}.dist-info/METADATA", content)
@@ -149,3 +153,51 @@ def test_rejects_bad_index_digest_and_wheel_url():
     fetch, _ = index({"1.0.0": [agent]}, {"1.0.0": [cultivate]})
     with pytest.raises(ReleaseError, match="URL or SHA-256"):
         resolve_release(fetch=fetch)
+
+
+@pytest.mark.parametrize("requirements,accepted", [
+    (["mimir-agent==2.0; python_version >= '3.12'",
+      "mimir-agent==1.0; python_version < '3.12' and sys_platform == 'linux'"], True),
+    (["mimir-agent==1.0; sys_platform == 'darwin'",
+      "mimir-agent==2.0; sys_platform == 'linux' and platform_machine == 'x86_64'"], False),
+])
+def test_dependency_markers_use_target_not_host(monkeypatch, requirements, accepted):
+    import packaging.markers
+
+    monkeypatch.setattr(packaging.markers, "default_environment", lambda: {
+        "python_version": "3.12", "python_full_version": "3.12.0",
+        "sys_platform": "darwin", "platform_machine": "arm64", "extra": "",
+    })
+    agent = wheel("mimir-agent", "1.0")
+    cultivate = wheel("mimir-cultivate", "1.0", requirements=requirements)
+    fetch, _ = index({"1.0": [agent]}, {"1.0": [cultivate]})
+    if accepted:
+        assert resolve_release(fetch=fetch).version == "1.0"
+    else:
+        with pytest.raises(ReleaseError, match="does not require mimir-agent"):
+            resolve_release(fetch=fetch)
+
+
+@pytest.mark.parametrize("resource", ["index", "wheel"])
+def test_fetch_has_total_deadline_under_trickling_response(monkeypatch, resource):
+    class Trickle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def geturl(self):
+            return "https://files.pythonhosted.org/packages/test.whl"
+
+        def read(self, size):
+            time.sleep(0.02)
+            return b"x"
+
+    monkeypatch.setattr(release_resolver, "urlopen", lambda *args, **kwargs: Trickle())
+    monkeypatch.setattr(release_resolver, "FETCH_DEADLINE", 0.08)
+    limit = release_resolver.INDEX_LIMIT if resource == "index" else release_resolver.WHEEL_LIMIT
+    start = time.monotonic()
+    with pytest.raises(ReleaseError, match="time limit"):
+        fetch_bytes("https://files.pythonhosted.org/packages/test.whl", limit)
+    assert time.monotonic() - start < 0.5
