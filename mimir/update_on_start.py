@@ -698,7 +698,17 @@ def cultivate_update_refusal() -> tuple[str, str, str | None] | None:
     source = cultivate_source_install()
     if source is not None:
         return "cultivate_source_install", cultivate_source_refusal(source), source
-    return None
+    try:
+        importlib.metadata.distribution("mimir-cultivate")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    return (
+        "cultivate_unverified_install",
+        "this deployment has Cultivate installed without a controller install identity; "
+        "rebuild the image or re-sync the checkout to update both packages together "
+        "(a core-only PyPI upgrade could break the installation)",
+        None,
+    )
 
 
 def _install_spec(pkg: str, parsed: PendingUpdate) -> str:
