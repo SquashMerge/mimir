@@ -514,6 +514,19 @@ user-owned controller venv installs core and `plugins/cultivate` together from
 In explicit PyPI mode, dedicated setup supplies two verified, exact-version
 wheel archives and their SHA-256 hashes in a bounded local context; both venvs
 install the same pair and configured extras. It cannot fall back to Git.
+First-party package bytes are checked against retained root-owned wheels; any
+bytecode under their package roots is drift, even with a self-consistent hash
+in a mutable installed RECORD. Builds use explicit `pip --no-compile` and
+`PYTHONDONTWRITEBYTECODE=1`. Interpreter startup hooks (`*.pth`,
+`sitecustomize.py`, `usercustomize.py`) must exactly match root-owned build-time
+allowlists outside the controller venv. This includes uv's `_virtualenv.pth`
+when present at build time; a new or modified hook is never authorized by a
+new dist-info RECORD. Allowlist regeneration is a build operation, not runtime
+repair. Dependency code in the user-owned controller venv is outside AC3's
+first-party integrity guarantee; this is not a sandbox against arbitrary code
+already executing as the controller. Transitive dependencies remain unpinned.
+Setup reruns compare resolved wheel names/hashes to the saved manifest and
+refuse changed files for the same version.
 Without the selection the image is core-only: no executor venv, no `worklink`
 user and no `worklink-execd` service. Third-party plugins are installed at
 **build time** too: set `MIMIR_PLUGIN_PACKAGES` to comma-separated exact

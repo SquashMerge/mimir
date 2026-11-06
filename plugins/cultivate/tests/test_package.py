@@ -215,12 +215,20 @@ def test_wheel_pair_verifies_both_installed_venvs_and_retained_archives(built_pa
                        check=True, capture_output=True, text=True)
         marker = venv / "controller-install-identity.json"
         marker.write_text(json.dumps(identity))
-        code = ("from pathlib import Path; import runpy, sys; "
-                "module = runpy.run_path(str(Path(sys.prefix) / 'lib' / "
-                "f'python{sys.version_info.major}.{sys.version_info.minor}' / "
-                "'site-packages/mimir_cultivate/install_identity.py')); "
-                "module['verify_install_identity'](Path(sys.argv[1]), wheels=Path(sys.argv[2]))")
-        cmd = [str(venv / "bin/python"), "-c", code, str(marker), str(wheels)]
+        loader = ("from pathlib import Path; import runpy, sys; "
+                  "module = runpy.run_path(str(Path(sys.prefix) / 'lib' / "
+                  "f'python{sys.version_info.major}.{sys.version_info.minor}' / "
+                  "'site-packages/mimir_cultivate/install_identity.py')); ")
+        hooks = tmp_path / f"{label}-startup-hooks.json"
+        # Simulate the distinct image-build step once. Rechecks after corruption
+        # must reuse this pinned evidence, never regenerate it from the venv.
+        built = subprocess.run([str(venv / "bin/python"), "-B", "-c",
+                                loader + "module['write_startup_hooks'](Path(sys.argv[1]))",
+                                str(hooks)], capture_output=True, text=True)
+        assert built.returncode == 0, built.stderr
+        code = loader + ("module['verify_install_identity'](Path(sys.argv[1]), "
+                         "wheels=Path(sys.argv[2]), hooks_manifest=Path(sys.argv[3]))")
+        cmd = [str(venv / "bin/python"), "-B", "-c", code, str(marker), str(wheels), str(hooks)]
         result = subprocess.run(cmd, capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
         with pytest.raises(ValueError, match="hash mismatch"):

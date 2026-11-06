@@ -57,11 +57,12 @@ def installed_pair(tmp_path):
     marker = tmp_path / "identity.json"
     declared = {"mode": "pypi", "distributions": pair}
     marker.write_text(json.dumps(declared))
+    identity.write_startup_hooks(tmp_path / "hooks.json", site=site)
     return marker, wheels, site, declared
 
 
-@pytest.fixture
-def installed_wheels(tmp_path):
+@pytest.fixture(params=["uv", "pip"])
+def installed_wheels(tmp_path, request):
     """Install built wheels into an isolated venv using the production installer."""
     wheels = tmp_path / "wheels"
     wheels.mkdir()
@@ -79,9 +80,14 @@ def installed_wheels(tmp_path):
         )
         subprocess.run(["uv", "build", "--wheel", "--out-dir", str(wheels), str(project)], check=True)
     venv = tmp_path / "venv"
-    subprocess.run(["uv", "venv", "--python", sys.executable, str(venv)], check=True)
+    if request.param == "uv":
+        subprocess.run(["uv", "venv", "--python", sys.executable, str(venv)], check=True)
+    else:
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
     python = venv / "bin/python"
-    subprocess.run(["uv", "pip", "install", "--python", str(python), "--no-deps",
+    installer = (["uv", "pip", "install", "--python", str(python)] if request.param == "uv"
+                 else [str(python), "-m", "pip", "install", "--no-compile"])
+    subprocess.run([*installer, "--no-deps",
                     *(str(wheel) for wheel in sorted(wheels.glob("*.whl")))], check=True)
     site = Path(subprocess.check_output([str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
     pair = {name: {"version": "1.2", "wheel": wheel.name,
@@ -91,6 +97,7 @@ def installed_wheels(tmp_path):
     declared = {"mode": "pypi", "distributions": pair}
     marker = tmp_path / "identity.json"
     marker.write_text(json.dumps(declared))
+    identity.write_startup_hooks(tmp_path / "hooks.json", site=site)
     return marker, wheels, site, declared
 
 
@@ -98,11 +105,11 @@ def test_installed_wheel_scripts_are_verified(installed_wheels):
     marker, wheels, site, declared = installed_wheels
     record = site / "mimir_agent-1.2.dist-info/RECORD"
     assert "../../../bin/mimir" in record.read_text()
-    assert identity.verify_install_identity(marker, wheels=wheels, site=site) == declared
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json") == declared
     script = site.parents[2] / "bin/mimir"
     script.write_text("tampered\n")
     with pytest.raises(identity.InstallIdentityError, match="console script drift"):
-        identity.verify_install_identity(marker, wheels=wheels, site=site)
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
 def test_installed_wheel_requires_each_generated_script(installed_wheels):
@@ -112,7 +119,7 @@ def test_installed_wheel_requires_each_generated_script(installed_wheels):
     with record.open("w") as stream:
         csv.writer(stream).writerows(row for row in rows if row[0] != "../../../bin/mimir-agent")
     with pytest.raises(identity.InstallIdentityError, match="console script missing"):
-        identity.verify_install_identity(marker, wheels=wheels, site=site)
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
 @pytest.mark.parametrize("entry", ["../../../bin/other", "../../../../bin/mimir", "../../../bin/../bin/mimir"])
@@ -121,7 +128,7 @@ def test_installed_wheel_rejects_unrelated_parent_paths(installed_wheels, entry)
     with (site / "mimir_agent-1.2.dist-info/RECORD").open("a") as record:
         record.write(f"{entry},,\n")
     with pytest.raises(identity.InstallIdentityError, match="unsafe wheel RECORD path"):
-        identity.verify_install_identity(marker, wheels=wheels, site=site)
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
 @pytest.mark.asyncio
@@ -131,13 +138,13 @@ async def test_real_installed_pair_http_health(installed_wheels, tmp_path, monke
     controller_marker.write_bytes(marker.read_bytes())
     monkeypatch.setattr(cultivate_server.sys, "prefix", str(tmp_path))
     monkeypatch.setattr(identity, "controller_identity",
-                        lambda: identity.verify_install_identity(controller_marker, wheels=wheels, site=site))
+                        lambda: identity.verify_install_identity(controller_marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json"))
     socket = tmp_path / "executor.sock"
     socket.touch()
     monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
 
     async def executor():
-        return identity.verify_install_identity(marker, wheels=wheels, site=site)
+        return identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
     monkeypatch.setattr(worker_client, "verify_executor_identity", executor)
     monkeypatch.setattr(core_server, "_server_hooks", lambda policy, kind: {
@@ -165,15 +172,16 @@ async def test_real_installed_pair_http_health(installed_wheels, tmp_path, monke
                                      "evil.pth", "sitecustomize.py", "usercustomize.py"])
 def test_unrecorded_executable_files_fail_closed(installed_pair, relative):
     marker, wheels, site, _ = installed_pair
-    assert identity.verify_install_identity(marker, wheels=wheels, site=site)
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
     target = site / relative
     target.parent.mkdir(exist_ok=True)
     target.write_text("# injected without touching RECORD\n")
     with pytest.raises(identity.InstallIdentityError, match="unrecorded"):
-        identity.verify_install_identity(marker, wheels=wheels, site=site)
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
-def test_recorded_bytecode_is_hashed(installed_pair):
+@pytest.mark.parametrize("record_kind", ["hashed", "unhashed", "unrecorded"])
+def test_first_party_bytecode_is_always_drift(installed_pair, record_kind):
     marker, wheels, site, _ = installed_pair
     import importlib.util
     import marshal
@@ -185,17 +193,64 @@ def test_recorded_bytecode_is_hashed(installed_pair):
     header = importlib.util.MAGIC_NUMBER + b'\x00' * 12
     cache.write_bytes(header + marshal.dumps(compile('value = 1', str(source), 'exec')))
     digest = base64.urlsafe_b64encode(hashlib.sha256(cache.read_bytes()).digest()).rstrip(b"=").decode()
-    with (site / "mimir_agent-1.2.dist-info/RECORD").open("a") as stream:
-        csv.writer(stream).writerow((cache.relative_to(site).as_posix(), "sha256=" + digest, cache.stat().st_size))
-    assert identity.verify_install_identity(marker, wheels=wheels, site=site)
-    cache.write_bytes(header + marshal.dumps(compile('value = 2', str(source), 'exec')))
-    with pytest.raises(identity.InstallIdentityError, match="drift"):
-        identity.verify_install_identity(marker, wheels=wheels, site=site)
+    if record_kind != "unrecorded":
+        with (site / "mimir_agent-1.2.dist-info/RECORD").open("a") as stream:
+            csv.writer(stream).writerow((cache.relative_to(site).as_posix(),
+                                        "sha256=" + digest if record_kind == "hashed" else "",
+                                        cache.stat().st_size if record_kind == "hashed" else ""))
+    with pytest.raises(identity.InstallIdentityError, match="bytecode drift"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
+
+
+@pytest.mark.parametrize("hook", ["evil.pth", "sitecustomize.py", "usercustomize.py"])
+def test_forged_dependency_record_cannot_authorize_hooks(installed_pair, hook):
+    marker, wheels, site, _ = installed_pair
+    target = site / hook
+    target.write_text("# forged hook\n")
+    fake = site / "evil-1.0.dist-info"
+    fake.mkdir()
+    (fake / "METADATA").write_text("Name: evil\nVersion: 1.0\n")
+    digest = base64.urlsafe_b64encode(hashlib.sha256(target.read_bytes()).digest()).rstrip(b"=").decode()
+    with (fake / "RECORD").open("w") as stream:
+        csv.writer(stream).writerow((hook, "sha256=" + digest, target.stat().st_size))
+    with pytest.raises(identity.InstallIdentityError, match="unrecorded or altered"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
+
+
+@pytest.mark.parametrize("mutation", ["changed", "deleted", "missing_allowlist"])
+def test_build_time_hook_allowlist_pins_exact_bytes(installed_pair, mutation):
+    marker, wheels, site, _ = installed_pair
+    hook = site / "_virtualenv.pth"
+    hook.write_text("import _virtualenv\n")
+    manifest = marker.parent / "hooks.json"
+    # The fixture captured an empty build inventory and locked it read-only.
+    # This test owns the simulated build step, before runtime tampering.
+    manifest.chmod(0o644)
+    identity.write_startup_hooks(manifest, site=site)
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=manifest)
+    if mutation == "changed":
+        hook.write_text("import evil\n")
+    elif mutation == "deleted":
+        hook.unlink()
+    else:
+        manifest.unlink()
+    with pytest.raises(identity.InstallIdentityError, match="startup hook"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=manifest)
+
+
+def test_package_symlink_is_rejected_even_with_matching_bytes(installed_pair):
+    marker, wheels, site, _ = installed_pair
+    package = site / "mimir_agent"
+    saved = site / "saved"
+    package.rename(saved)
+    package.symlink_to(saved, target_is_directory=True)
+    with pytest.raises(identity.InstallIdentityError, match="package symlink"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
 def test_verified_pair_requires_archives_and_installed_record(installed_pair):
     marker, wheels, site, declared = installed_pair
-    assert identity.verify_install_identity(marker, wheels=wheels, site=site) == declared
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json") == declared
 
 
 @pytest.mark.parametrize("mutation", ["marker", "mode", "hash", "version", "wheel", "record", "record_drift", "content", "missing_archive", "archive_drift"])
@@ -226,7 +281,7 @@ def test_identity_fails_closed(installed_pair, mutation):
     if mutation in {"mode", "hash", "version", "wheel"}:
         marker.write_text(json.dumps(declared))
     with pytest.raises(identity.InstallIdentityError):
-        identity.verify_install_identity(marker, wheels=wheels, site=site)
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
 def test_installed_record_rejects_extra_module_but_allows_installer_metadata(installed_pair):
@@ -234,11 +289,11 @@ def test_installed_record_rejects_extra_module_but_allows_installer_metadata(ins
     record = site / "mimir_agent-1.2.dist-info/RECORD"
     with record.open("a") as stream:
         stream.write("mimir_agent-1.2.dist-info/INSTALLER,,\n")
-    assert identity.verify_install_identity(marker, wheels=wheels, site=site)
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
     with record.open("a") as stream:
         stream.write("mimir_agent/backdoor.py,,\n")
     with pytest.raises(identity.InstallIdentityError, match="unexpected installed RECORD"):
-        identity.verify_install_identity(marker, wheels=wheels, site=site)
+        identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
 
 @pytest.mark.asyncio
@@ -252,14 +307,14 @@ async def test_health_rejects_corrupt_installed_evidence(installed_pair, tmp_pat
     monkeypatch.setattr(cultivate_server.sys, "prefix", str(tmp_path))
     monkeypatch.setattr(
         identity, "controller_identity",
-        lambda: identity.verify_install_identity(controller_marker, wheels=wheels, site=site),
+        lambda: identity.verify_install_identity(controller_marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json"),
     )
     socket = tmp_path / "executor.sock"
     socket.touch()
     monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
 
     async def executor():
-        return identity.verify_install_identity(marker, wheels=wheels, site=site)
+        return identity.verify_install_identity(marker, wheels=wheels, site=site, hooks_manifest=marker.parent / "hooks.json")
 
     monkeypatch.setattr(worker_client, "verify_executor_identity", executor)
     monkeypatch.setattr(core_server, "_server_hooks", lambda policy, kind: {

@@ -19,7 +19,7 @@ if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
         --python /opt/mimir-worklink/venv/bin/python \
         "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
         "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
-    /opt/mimir-worklink/venv/bin/python -c 'from mimir_cultivate.install_identity import executor_identity; executor_identity()'
+    /opt/mimir-worklink/venv/bin/python -c 'from mimir_cultivate.install_identity import write_startup_hooks, EXECUTOR_HOOKS, executor_identity; write_startup_hooks(EXECUTOR_HOOKS); executor_identity()'
     chown -R root:root /opt/mimir-worklink
     chmod -R go-w /opt/mimir-worklink
     exit 0

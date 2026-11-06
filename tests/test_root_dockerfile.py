@@ -1017,6 +1017,39 @@ def test_provider_services_are_build_time_opt_in_and_preserve_core_bundle() -> N
         assert f"/etc/s6-overlay/s6-rc.d/{service}/run" in text or service == "mimir" and "deploy/s6-overlay/s6-rc.d/" in text
 
 
+def test_mode_selection_and_source_assembler_have_real_stage_dependencies():
+    text = DOCKERFILE.read_text()
+    assert "ARG MIMIR_INSTALL_MODE=invalid\n" in text
+    assert "FROM provenance-validation AS invalid-assembly\n" in text
+    assert "FROM ${MIMIR_INSTALL_MODE}-assembly AS runtime\n" in text
+    assert "FROM base AS source-assembly\nCOPY mimir/ /opt/mimir-image-assembly/mimir/\n" in text
+    assert "ENV MIMIR_INSTALL_MODE=${MIMIR_INSTALL_MODE}" in text
+    reachable = _runtime_stage_dependencies(text)
+    assert "provenance-validation" in reachable
+    assert "source-assembly" not in reachable
+
+
+def test_pypi_install_scripts_keep_dependency_cache_and_no_bytecode_policy():
+    text = DOCKERFILE.read_text()
+    scripts = ROOT / "plugins/cultivate/mimir_cultivate/docker"
+    controller = (scripts / "controller.sh").read_text().split("git check-ref-format", 1)[0]
+    executor = (scripts / "executor.sh").read_text().split("git check-ref-format", 1)[0]
+    assert "pip install --no-cache-dir --no-compile" in controller
+    assert "ENV PYTHONDONTWRITEBYTECODE=1" in text
+    assert "UV_CACHE_DIR=/opt/mimir-worklink/uv-cache /opt/mimir-worklink/venv/bin/uv pip install" in executor
+    plugin_install = next(program for program in _run_instructions(text)
+                          if "for package in $MIMIR_PLUGIN_PACKAGES" in program and "pip install" in program)
+    assert "--no-deps" not in plugin_install
+    assert "--no-compile" in plugin_install
+    # Both allowlists are created during the image build, not from the mutable
+    # venv at health time. Controller snapshot runs as root after optional extras.
+    snapshot = text.index("write_startup_hooks(CONTROLLER_HOOKS)")
+    assert text.rfind("USER root", 0, snapshot) > text.rfind("USER mimir", 0, snapshot)
+    assert text.index('ARG MIMIR_ENABLE_CLAUDE_CODE=0') < snapshot
+    assert "chown root:root /opt/mimir-worklink/controller-startup-hooks.json" in text
+    assert "write_startup_hooks(EXECUTOR_HOOKS); executor_identity()" in executor
+
+
 def test_image_assembly_rejects_missing_selected_package() -> None:
     with pytest.raises(ValueError, match="selected provider packages differ"):
         verify_pins(("missing-provider==1.0",), ())

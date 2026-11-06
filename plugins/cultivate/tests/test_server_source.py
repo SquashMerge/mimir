@@ -38,7 +38,7 @@ async def test_source_identity_fails_closed_without_target_head(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["source", "pypi"])
+@pytest.mark.parametrize("mode", [None, "source", "pypi"])
 async def test_legacy_workspace_fallback_never_applies_to_pypi(tmp_path, monkeypatch, mode):
     import subprocess
     repo = tmp_path / "repo"
@@ -49,10 +49,24 @@ async def test_legacy_workspace_fallback_never_applies_to_pypi(tmp_path, monkeyp
     commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     monkeypatch.setattr(server.sys, "prefix", str(tmp_path))
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
-    monkeypatch.setenv("MIMIR_INSTALL_MODE", mode)
+    if mode is None:
+        monkeypatch.delenv("MIMIR_INSTALL_MODE", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_INSTALL_MODE", mode)
     app = {"check_worker_executor_health": True}
     await server.capture_controller_source_commit(app)
-    assert app["worklink_controller_source_commit"] == (commit if mode == "source" else None)
+    assert app["worklink_controller_source_commit"] == (commit if mode != "pypi" else None)
+
+
+@pytest.mark.asyncio
+async def test_pypi_never_honours_source_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(server.sys, "prefix", str(tmp_path))
+    monkeypatch.setenv("MIMIR_INSTALL_MODE", "pypi")
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    (tmp_path / "controller-source-commit").write_text("a" * 40)
+    app = {"check_worker_executor_health": True}
+    await server.capture_controller_source_commit(app)
+    assert app["worklink_controller_identity"] is None
 
 
 @pytest.mark.asyncio

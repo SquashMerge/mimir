@@ -1028,6 +1028,40 @@ def test_rerun_preserves_saved_release_unless_explicitly_changed(upgrade_setup):
     assert json.loads((deploy / 'manifest.json').read_text())['mimir_version'] == '1.0.1'
 
 
+@pytest.mark.parametrize("changed", ["hash", "filename", "missing_wheels"])
+def test_rerun_refuses_changed_saved_wheels_before_mutation(upgrade_setup, monkeypatch, changed):
+    from dataclasses import replace
+    deploy, args, state, calls, invoke = upgrade_setup
+    before = {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()}
+    resolver = installer.resolve_release
+    if changed == "missing_wheels":
+        manifest = json.loads((deploy / "manifest.json").read_text())
+        del manifest["wheels"]
+        (deploy / "manifest.json").write_text(json.dumps(manifest))
+        before["manifest.json"] = (deploy / "manifest.json").read_bytes()
+    else:
+        def altered(*args, **kwargs):
+            pair = resolver(*args, **kwargs)
+            wheel = replace(pair.agent, **({"sha256": "0" * 64} if changed == "hash" else
+                                          {"filename": pair.agent.filename.replace("-py3", "-1-py3")}))
+            return replace(pair, agent=wheel)
+        monkeypatch.setattr(installer, "resolve_release", altered)
+    with pytest.raises(installer.SetupError, match="Resolved wheels differ"):
+        invoke()
+    assert not calls
+    assert {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()} == before
+
+
+def test_rerun_refuses_missing_saved_version(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    del manifest["mimir_version"]
+    (deploy / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(installer.SetupError, match="Missing exact Mimir version"):
+        invoke()
+    assert not calls
+
+
 def test_explicit_version_and_source_free_artifact_inventory(setup_environment):
     deploy, args, state, calls, invoke = setup_environment
     args.mimir_version = '2.0.0rc1'

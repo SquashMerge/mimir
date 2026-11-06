@@ -32,7 +32,7 @@ ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
 # BuildKit resolves stage dependencies before RUN shell conditions. Keep the
 # Rust builder unreachable unless the caller explicitly selects its artifact.
 ARG CHAINLINK_ARTIFACT_STAGE=chainlink-none
-ARG MIMIR_INSTALL_MODE
+ARG MIMIR_INSTALL_MODE=invalid
 FROM ${BASE_IMAGE} AS provenance-validation
 
 # Every canonical image must identify one remote ref and the exact commit it is
@@ -107,9 +107,9 @@ FROM ${CHAINLINK_ARTIFACT_STAGE} AS chainlink-artifact
 
 FROM provenance-validation AS base
 ENV MIMIR_INSTALL_MODE=${MIMIR_INSTALL_MODE}
-# Keep executable bytecode out of the mutable venv; if present, identity
-# verification requires a recorded content hash (pip may leave it empty).
-ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_COMPILE=1
+# First-party bytecode has no immutable wheel reference: forbid it at runtime
+# and pass --no-compile explicitly to every PyPI-mode pip install.
+ENV PYTHONDONTWRITEBYTECODE=1
 COPY plugins/cultivate/mimir_cultivate/docker/ /opt/cultivate-docker/
 ARG MIMIR_INSTALL_MODE
 ARG MIMIR_VERSION
@@ -298,7 +298,7 @@ RUN set -eu; old_ifs="$IFS"; IFS=,; \
     for package in $MIMIR_PLUGIN_PACKAGES; do \
         case "$package" in *==*) ;; *) echo >&2 "plugin package must be pinned: $package"; exit 2 ;; esac; \
         if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
-            pip install --no-cache-dir "$package" \
+            pip install --no-cache-dir --no-compile "$package" \
                 "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
                 "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"; \
         else pip install --no-cache-dir "$package"; fi; \
@@ -348,13 +348,15 @@ RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
 ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
         if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
-            pip install --no-cache-dir "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[claude-code]" \
+            pip install --no-cache-dir --no-compile "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[claude-code]" \
                 "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"; \
-            python -c 'from mimir_cultivate.install_identity import controller_identity; controller_identity()'; \
         else pip install --no-cache-dir "mimir-agent[claude-code]"; fi; \
     fi
 USER root
-RUN if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
+RUN set -eu; if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
+        /home/mimir/venv/bin/python -c 'from mimir_cultivate.install_identity import write_startup_hooks, CONTROLLER_HOOKS, controller_identity; write_startup_hooks(CONTROLLER_HOOKS); controller_identity()'; \
+        chown root:root /opt/mimir-worklink/controller-startup-hooks.json; \
+        chmod 0444 /opt/mimir-worklink/controller-startup-hooks.json; \
         chown root:root /home/mimir/venv/controller-install-identity.json; \
         chmod 0444 /home/mimir/venv/controller-install-identity.json; \
     fi
@@ -464,6 +466,9 @@ RUN set -eu; \
 FROM base AS source-assembly
 COPY mimir/ /opt/mimir-image-assembly/mimir/
 FROM base AS pypi-assembly
+# An omitted mode must reach provenance-validation's actionable diagnostic,
+# rather than fail Docker's stage-name parser on "-assembly".
+FROM provenance-validation AS invalid-assembly
 FROM ${MIMIR_INSTALL_MODE}-assembly AS runtime
 # MIMIR_PLUGIN_SELECTION chooses enabled providers at build time; disabled pinned
 # distributions add no services unless MIMIR_PLUGIN_ALL_INSTALLED=1 is explicit.

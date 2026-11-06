@@ -1634,6 +1634,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     mimir_version = release.version
     wheels = {wheel.name: {"filename": wheel.filename, "sha256": wheel.sha256}
               for wheel in (release.agent, release.cultivate)}
+    if previous and requested_version == previous.get("mimir_version") and wheels != previous.get("wheels"):
+        raise SetupError("Resolved wheels differ from manifest.json for the saved Mimir version; refusing changed release files.")
     identity = _image_identity(mimir_version, wheels, architecture)
     files = {name: _content(repo, branch, name, token, request) for name in
              ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version",
