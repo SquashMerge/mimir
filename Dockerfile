@@ -113,7 +113,7 @@ ARG MIMIR_AGENT_WHEEL
 ARG MIMIR_AGENT_SHA256
 ARG MIMIR_CULTIVATE_WHEEL
 ARG MIMIR_CULTIVATE_SHA256
-RUN if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
+RUN set -eu; if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
         python3 /opt/cultivate-docker/verify_wheels.py /opt/cultivate-docker/wheels \
           "$MIMIR_VERSION" "$MIMIR_AGENT_WHEEL" "$MIMIR_AGENT_SHA256" \
           "$MIMIR_CULTIVATE_WHEEL" "$MIMIR_CULTIVATE_SHA256"; \

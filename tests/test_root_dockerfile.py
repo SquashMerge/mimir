@@ -223,6 +223,36 @@ def _run_instructions(text: str) -> list[str]:
     return programs
 
 
+@pytest.mark.parametrize("valid", [True, False])
+def test_wheel_preinstall_run_fails_closed_on_hash_mismatch(tmp_path, valid) -> None:
+    import hashlib
+    import zipfile
+
+    scripts = tmp_path / "cultivate-docker"
+    wheels = scripts / "wheels"
+    wheels.mkdir(parents=True)
+    staged = tmp_path / "worklink/wheels"
+    names = ("mimir_agent-1.0-py3-none-any.whl", "mimir_cultivate-1.0-py3-none-any.whl")
+    digests = []
+    for name in names:
+        with zipfile.ZipFile(wheels / name, "w") as archive:
+            archive.writestr("metadata", name)
+        digests.append(hashlib.sha256((wheels / name).read_bytes()).hexdigest())
+    program, = (p for p in _run_instructions(DOCKERFILE.read_text())
+                if "verify_wheels.py" in p and "cp /opt/cultivate-docker/wheels" in p)
+    program = program.replace("/opt/cultivate-docker", str(scripts)).replace(
+        "/opt/mimir-worklink/wheels", str(staged))
+    (scripts / "verify_wheels.py").write_bytes(
+        (ROOT / "plugins/cultivate/mimir_cultivate/docker/verify_wheels.py").read_bytes())
+    result = subprocess.run(["/bin/sh", "-c", program], capture_output=True, text=True,
+                            env={**os.environ, "MIMIR_INSTALL_MODE": "pypi", "MIMIR_VERSION": "1.0",
+                                 "MIMIR_AGENT_WHEEL": names[0], "MIMIR_CULTIVATE_WHEEL": names[1],
+                                 "MIMIR_AGENT_SHA256": digests[0] if valid else "0" * 64,
+                                 "MIMIR_CULTIVATE_SHA256": digests[1]})
+    assert (result.returncode == 0) is valid, result.stderr
+    assert staged.exists() is valid, "a rejected wheel must never reach the install location"
+
+
 @pytest.mark.parametrize("selection,packages,selected,success", [
     ("", "", "0", True),
     ("other", "example-provider==1.0", "0", True),

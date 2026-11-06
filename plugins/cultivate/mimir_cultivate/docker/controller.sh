@@ -6,13 +6,13 @@
 # venv owner, so the pending-update flow keeps a user-owned venv.
 set -eu
 if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
-    pip install --no-cache-dir \
-        "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
-        "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
     python3 /opt/cultivate-docker/verify_wheels.py /opt/mimir-worklink/wheels \
         "$MIMIR_VERSION" "$MIMIR_AGENT_WHEEL" "$MIMIR_AGENT_SHA256" \
         "$MIMIR_CULTIVATE_WHEEL" "$MIMIR_CULTIVATE_SHA256" \
         > "$VIRTUAL_ENV/controller-install-identity.json"
+    pip install --no-cache-dir \
+        "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
+        "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
     python -c 'from mimir_cultivate.install_identity import controller_identity; controller_identity()'
     exit 0
 fi
