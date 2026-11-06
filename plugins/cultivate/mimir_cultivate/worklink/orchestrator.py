@@ -2839,6 +2839,8 @@ class WorklinkRunner:
                 return
             candidate = candidates[0]
             try:
+                if candidate.controller_phase == "published-with-controller-error":
+                    raise WorklinkError("published factory PR requires operator review, not a new factory attempt")
                 sandbox = _verify_factory_recovery_target(
                     runner=self,
                     issue=issue,
@@ -3083,12 +3085,27 @@ class WorklinkRunner:
                 current = records[0] if records else None
             except Exception:
                 current = None
+            published_url = (
+                current.status.pr_url if current is not None and current.status is not None
+                else None
+            )
+            published = published_url is not None
             preserved_ref, preservation_error = _preserve_failed_factory_run(
                 home=self.home,
                 trusted_repo=self.repo,
                 record=current,
             )
             reason = original_reason
+            if published:
+                # The child may already have opened its PR before a later status,
+                # evidence or controller call fails. Record its identity on the
+                # issue before releasing the claim; never spend another build.
+                head = _published_factory_head(published_url, runner=runner)
+                reason = (
+                    f"published-with-controller-error: {original_reason}; "
+                    f"PR: {published_url}; head: {head or 'unavailable'}; "
+                    f"retained sandbox: {current.sandbox}"
+                )
             if preserved_ref is not None:
                 reason += f"; completed work preserved at {preserved_ref}"
             elif preservation_error is not None:
@@ -3098,7 +3115,7 @@ class WorklinkRunner:
                     self.home,
                     replace(
                         current,
-                        controller_phase="failed",
+                        controller_phase="published-with-controller-error" if published else "failed",
                         controller_error=_factory_controller_error(reason),
                     ),
                 )
@@ -3126,7 +3143,7 @@ class WorklinkRunner:
             try:
                 claims.transition_issue(
                     issue_id,
-                    status="blocked" if isinstance(exc, FactoryPRHeadMismatch) else "failed",
+                    status="blocked" if published or isinstance(exc, FactoryPRHeadMismatch) else "failed",
                     review_ready=False,
                     attempt=claim_record.budget_attempt or claim_record.attempt,
                     reason=reason,
@@ -3139,9 +3156,11 @@ class WorklinkRunner:
                 "worklink_transition",
                 issue_id=issue_id,
                 attempt=claim_record.attempt,
-                status="blocked" if isinstance(exc, FactoryPRHeadMismatch) else "failed",
+                status="published-with-controller-error" if published else (
+                    "blocked" if isinstance(exc, FactoryPRHeadMismatch) else "failed"
+                ),
                 review_ready=False,
-                pr_url=None,
+                pr_url=published_url,
                 reason=reason,
                 **(
                     {
@@ -3155,7 +3174,10 @@ class WorklinkRunner:
             result = WorklinkRunResult(
                 issue_id,
                 claim_record.attempt,
-                "blocked" if isinstance(exc, FactoryPRHeadMismatch) else "failed",
+                "published-with-controller-error" if published else (
+                    "blocked" if isinstance(exc, FactoryPRHeadMismatch) else "failed"
+                ),
+                pr_url=published_url,
                 checkout=Path(current.sandbox) if current is not None else None,
                 branch=current.branch if current is not None else None,
                 reason=reason,
@@ -4478,6 +4500,21 @@ def _factory_controller_error(error: BaseException | str) -> str:
         "utf-8", errors="ignore"
     )
     return prefix.rstrip() + marker.decode("ascii")
+
+
+def _published_factory_head(pr_url: str, *, runner: Runner) -> str | None:
+    """Read the published head without trusting the sandbox's local HEAD as PR evidence."""
+    if _CANONICAL_PR_URL.fullmatch(pr_url) is None:
+        return None
+    try:
+        result = runner(["gh", "pr", "view", pr_url, "--json", "headRefOid"])
+        if result.returncode == 0:
+            head = json.loads(result.stdout).get("headRefOid")
+            if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+                return head
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
 
 
 def _preserve_failed_factory_run(

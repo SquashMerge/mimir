@@ -245,6 +245,10 @@ def _attempt_is_active(
         if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
             continue
         phase = getattr(candidate, "controller_phase", None)
+        if phase == "published-with-controller-error" and (
+            getattr(getattr(candidate, "status", None), "pr_url", None) is not None
+        ):
+            return True  # Operator evidence is never TTL-prunable.
         if phase in LIVE_CONTROLLER_PHASES and not factory_process_is_verified_dead(candidate):
             return True
         if phase not in LIVE_CONTROLLER_PHASES | RETAINED_CONTROLLER_PHASES:

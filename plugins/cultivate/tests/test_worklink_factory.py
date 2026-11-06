@@ -175,7 +175,7 @@ def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys:
 @pytest.mark.parametrize("pr_head", [
     "equal", "advanced", "unrelated", "compare_error", "ancestry_timeout",
     "invalid_json", "invalid_data", "behind", "diverged", "wrong_merge_base",
-    "missing_behind", "bool_behind", "invalid_sha",
+    "missing_behind", "bool_behind", "invalid_sha", "control_overflow",
 ])
 async def test_provider_completion_uses_emitted_record_and_worker_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path, reaped: bool, pr_head: str,
@@ -233,7 +233,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     auth.parent.mkdir(parents=True)
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}))
     seed_codex_subscription(operator_home)
-    (tmp_path / "worklink.yaml").write_text(f"defaults:\n  test_command: \"{gate_command}\"\n")
+    (tmp_path / "worklink.yaml").write_text(f"defaults:\n  test_command: {json.dumps(gate_command)}\n")
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(
         mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid(),
@@ -305,6 +305,45 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "cancel", cancel)
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "cleanup", cleanup)
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "job_alive", lambda self, handle: not cancelled.is_set())
+    overflow_events: list[dict[str, object]] = []
+    if pr_head == "control_overflow":
+        from mimir import event_logger
+
+        original_log = event_logger.log_event_sync
+
+        def capture_event(name: str, **fields: object) -> None:
+            if name == "worklink_factory_control_overflow":
+                overflow_events.append(fields)
+            else:
+                try:
+                    original_log(name, **fields)
+                except RuntimeError:
+                    pass
+
+        monkeypatch.setattr(event_logger, "log_event_sync", capture_event)
+        real_launch = worker_client.WorkerClient.launch
+
+        async def oversized_launch(self: worker_client.WorkerClient, **kwargs: object):
+            if kwargs["argv"][0] == "/bin/sh" and "1048576" in kwargs["argv"][-1]:
+                sink = kwargs["stdout_sink"]
+                os.write(sink.fd, b"X" * (1048576 + 8))
+                return SimpleNamespace(
+                    wait=lambda: asyncio.sleep(0, result=0), timed_out=False,
+                    output_overflow=True, stdout_bytes=1048584, stderr_bytes=0,
+                )
+            return await real_launch(self, **kwargs)
+
+        monkeypatch.setattr(worker_client.WorkerClient, "launch", oversized_launch)
+
+        async def overflow_gate(*args: object, **kwargs: object) -> ComputeResult:
+            await asyncio.to_thread(
+                worker_client.run_factory_control, checkout,
+                ("/bin/sh", "-c", "python3 -c 'print(\"X\" * 1048576)'"),
+                env={}, output_limit=1024 * 1024,
+            )
+            pytest.fail("oversized factory control unexpectedly returned")
+
+        monkeypatch.setattr(evidence, "_run_compute_gate", overflow_gate)
 
     issue = json.dumps({
         "id": 1949, "title": "Factory", "description": "Build factory", "labels": ["worklink:epic"],
@@ -374,6 +413,9 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
                 "head": {"repo": {"full_name": "owner/repository"}, "ref": branches[0],
                          "sha": "invalid" if pr_head == "invalid_sha" else observed_heads[0]},
             }), "")
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "view"]:
+            assert args[3:] == ["https://github.com/owner/repository/pull/42", "--json", "headRefOid"]
+            return subprocess.CompletedProcess(args, 0, json.dumps({"headRefOid": heads[0]}), "")
         if isinstance(args, list) and args[:3] == ["git", "-C", str(repo)]:
             return subprocess.CompletedProcess(args, 0, "git@github.com:owner/repository.git\n", "")
         if isinstance(args, list) and args[:3] == ["git", "-C", str(checkout)]:
@@ -434,20 +476,41 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
                 )
             assert len(requests) == before
     assert len(waits) == len(cancels) == len(cleanups) == 1
-    assert result.status == ("review_ready" if pr_head in {"equal", "advanced"} else "blocked"), result.reason
+    assert result.status == (
+        "review_ready" if pr_head in {"equal", "advanced"} else "published-with-controller-error"
+    ), result.reason
     assert transitions[-1]["status"] == ("review" if result.review_ready else "blocked")
     assert transitions[-1]["review_ready"] is result.review_ready
     applied = [args for args in labels if args[:2] == ("issue", "label")]
     assert applied == [("issue", "label", "1949", "worklink:review" if result.review_ready else "worklink:blocked")]
     assert all("worklink:ready" not in args for args in applied)
     if not result.review_ready:
-        assert "GitHub PR head SHA mismatch" in result.reason
-        assert any(args[:3] == ("issue", "comment", "1949") and
-                   args[3].startswith("WORKLINK_BLOCKED GitHub PR head SHA mismatch") for args in labels)
-    assert bool(comparisons) is (pr_head not in {"equal", "invalid_sha"})
+        if pr_head == "control_overflow":
+            assert result.pr_url == "https://github.com/owner/repository/pull/42"
+            assert result.checkout.is_dir() and (result.checkout / "changed.py").exists()
+            assert "factory control gate stdout exceeded 1048576 bytes" in result.reason
+            assert "observed " in result.reason and "bytes" in result.reason
+            assert overflow_events and overflow_events[0]["command"] == "gate"
+            assert overflow_events[0]["observed_bytes"] > 1048576
+            assert str(overflow_events[0]["observed_bytes"]) in result.reason
+            assert f"head: {heads[0]}" in result.reason
+            assert any(args[:3] == ("issue", "comment", "1949") and
+                       args[3].startswith("WORKLINK_BLOCKED published-with-controller-error:") and
+                       result.pr_url in args[3] for args in labels)
+            assert not any(args[:2] == ("issue", "label") and "worklink:ready" in args for args in labels)
+            assert record.controller_phase == "published-with-controller-error"
+            assert autonomy._attempt_is_active(checkout.parent, [record],
+                                               now=datetime(2100, 1, 1, tzinfo=UTC))
+        else:
+            assert "GitHub PR head SHA mismatch" in result.reason
+            assert any(args[:3] == ("issue", "comment", "1949") and
+                       args[3].startswith("WORKLINK_BLOCKED published-with-controller-error: GitHub PR head SHA mismatch")
+                       and result.pr_url in args[3] for args in labels)
+    assert bool(comparisons) is (pr_head not in {"equal", "invalid_sha", "control_overflow"})
     assert git("config", "--get", "remote.origin.url") == str(checkout)
     assert git_at(checkout, "config", "--get", "remote.origin.url") == str(forge)
-    assert git_at(forge, "rev-parse", "refs/pull/42/head") == observed_heads[0]
+    if pr_head != "control_overflow":
+        assert git_at(forge, "rev-parse", "refs/pull/42/head") == observed_heads[0]
     assert not git_at(checkout, "for-each-ref", "refs/pull/")
     assert not git("for-each-ref", "refs/pull/")
     if pr_head == "advanced":
@@ -464,16 +527,23 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     assert result.checkout == sandbox
     assert requests and all(request["op"] == "launch_factory_control" for request in requests)
     assert all(request["path"] == str(checkout) for request in requests)
-    assert any(request["argv"] == [
-        "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
-    ] for request in requests)
+    if pr_head == "control_overflow":
+        assert not any(request["argv"] == [
+            "/bin/sh", "-c", "python3 -c 'print(\"X\" * 1048576)'",
+        ] for request in requests)
+    else:
+        assert any(request["argv"] == [
+            "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
+        ] for request in requests)
     evidence_path = result.evidence_path or next((tmp_path / "state" / "worklink" / "evidence").rglob("*.json"))
     payload = json.loads(evidence_path.read_text())
     assert payload["checkout"] == str(result.checkout)
-    assert payload["head_sha"] == heads[0]
-    assert payload["observed_pr_head_sha"] == ("invalid" if pr_head == "invalid_sha" else observed_heads[0])
-    assert payload["tests"]["exit_code"] == 0
-    assert "1949" in payload["tests"]["summary"]
+    if pr_head != "control_overflow":
+        assert payload["head_sha"] == heads[0]
+        assert payload["observed_pr_head_sha"] == ("invalid" if pr_head == "invalid_sha" else observed_heads[0])
+    if pr_head != "control_overflow":
+        assert payload["tests"]["exit_code"] == 0
+        assert "1949" in payload["tests"]["summary"]
     assert supervision_order == ["cancel", "drained", "prune"]
     with sqlite3.connect(db_path) as db:
         assert db.execute("SELECT count(*) FROM event").fetchone() == (0 if reaped else 1,)
@@ -520,6 +590,116 @@ def test_provider_registry_refuses_unknown_backend_and_selects_factory() -> None
     assert registry.select(labels={"worklink:epic"}, repo="owner/repository").name == "feature_factory"
     with pytest.raises((KeyError, ValueError)):
         registry.get("unregistered")
+
+
+def test_published_head_lookup_refuses_noncanonical_url() -> None:
+    def forbidden(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        pytest.fail("unverified PR URL reached the GitHub CLI")
+
+    assert orchestrator._published_factory_head(
+        "https://github.com/owner/repository/pull/42/extra", runner=forbidden,
+    ) is None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="factory executor requires Linux")
+def test_large_factory_control_projection_measured_through_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path,
+) -> None:
+    root = tmp_path / "worklink"
+    checkout = root / "repository" / "2109-1" / "checkout"
+    checkout.mkdir(parents=True)
+    root.chmod(0o755)
+    checkout.parent.parent.chmod(0o755)
+    checkout.parent.chmod(0o2750)
+    checkout.chmod(0o2770)
+    sandbox = checkout / ".factory-sandboxes" / "chainlink-2109"
+    sandbox.mkdir(parents=True)
+    status = {
+        "run_id": "chainlink-2109", "valid": True, "sandbox_path": str(sandbox),
+        "issue_key": "2109", "status": "completed", "mode": "autonomous",
+        "branch": "feature/chainlink-2109", "pr_base": "main", "pr_draft": False,
+        "pr_url": "https://github.com/owner/repository/pull/42",
+        "lock": "absent", "dead_lock": False, "lock_session": None,
+        "slices": [{"id": f"slice-{index}", "status": "merged", "attempts": 2,
+                    "extra_attempts": 1, "retry_limit": 5} for index in range(8)],
+        "validator": {"verdict": "GO", "report": "remediation verified",
+                      "reviewed_head": "a" * 40, "loops": 1},
+        "terminal_result": {"result": "published", "remediation_log": "x" * 1_100_000},
+    }
+    artifact = tmp_path / "factory-status.json"
+    artifact.write_text(json.dumps(status))
+    cli = tmp_path / "control-stub.py"
+    cli.write_text(
+        "import pathlib,sys\n"
+        "sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n"
+    )
+    wrapper = Path(__file__).resolve().parents[1] / "mimir_cultivate" / "worklink" / "factory_control_output.py"
+    measurements: dict[str, tuple[int, int]] = {}
+    with _executor_in_process(tmp_path, monkeypatch, root, short_socket_dir):
+        for operation in ("status", "heartbeat", "resume", "lock", "terminal", "snapshot"):
+            raw_command = [sys.executable, "-I", str(cli), str(artifact), operation]
+            raw = worker_client.run_factory_control(
+                sandbox, raw_command, env={}, output_limit=2 * 1024 * 1024,
+            )
+            projected = worker_client.run_factory_control(
+                sandbox, [sys.executable, "-I", str(wrapper),
+                          "status" if operation == "status" else "other", *raw_command],
+                env={}, output_limit=1024 * 1024,
+            )
+            assert raw.returncode == projected.returncode == 0
+            measurements[operation] = (len(raw.stdout), len(projected.stdout))
+            assert len(projected.stdout) < 256 * 1024
+            if operation == "status":
+                parsed = parse_factory_status(projected.stdout)
+                assert parsed.pr_url == status["pr_url"]
+                assert len(parsed.slices) == 8 and parsed.validator["loops"] == 1
+    assert all(raw > 1024 * 1024 for raw, _ in measurements.values())
+    # The other run-facing control sites use independent bounds. Exercise their
+    # command shapes against the same eight-slice checkout, not only the CLI.
+    def git(*arguments: str) -> None:
+        subprocess.run(["git", "-C", str(sandbox), *arguments], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "worker@example.org")
+    git("config", "user.name", "Worker")
+    for index in range(8):
+        (sandbox / f"slice-{index}.py").write_text("base\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    for index in range(8):
+        (sandbox / f"slice-{index}.py").write_text("base\nremediation\n")
+    other_measurements: dict[str, int] = {}
+    second = tmp_path / "second"
+    second.mkdir()
+    second_socket = short_socket_dir / "second"
+    second_socket.mkdir()
+    with _executor_in_process(second, monkeypatch, root, second_socket):
+        for name, args, limit in (
+            ("git diff --name-only", ["git", "-C", str(sandbox), "diff", "--name-only", "HEAD"], 1024 * 1024),
+            ("git diff --stat", ["git", "-C", str(sandbox), "diff", "--stat", "HEAD"], 1024 * 1024),
+            ("git status --porcelain", ["git", "-C", str(sandbox), "status", "--porcelain=v1"], 1024 * 1024),
+            ("git rev-parse HEAD", ["git", "-C", str(sandbox), "rev-parse", "HEAD"], 1024 * 1024),
+            ("gate", ["/bin/sh", "-c", "python3 -c 'print(\"8 slices, remediation GO\")'"], 20_000_000),
+        ):
+            observed = worker_client.run_factory_control(sandbox, args, env={}, output_limit=limit)
+            assert observed.returncode == 0
+            other_measurements[name] = len(observed.stdout)
+        runtime = checkout.parent / ".factory-runtime"
+        runtime.mkdir()
+        cleared = worker_client.run_factory_control(
+            sandbox, [sys.executable, "-I", str(Path(factory_store.__file__).resolve()),
+                      "--clear-runtime", str(runtime)], env={}, output_limit=4096,
+        )
+        assert cleared.returncode == 0
+        other_measurements["store clear-runtime"] = len(cleared.stdout)
+        auth = worker_client.run_factory_control(
+            sandbox, [sys.executable, "-I", str(Path(worker_client.__file__).with_name("factory_auth.py"))],
+            env={}, output_limit=64 * 1024 + 1,
+        )
+        other_measurements["auth read (missing)"] = len(auth.stdout)
+        assert auth.returncode != 0
+    print(f"synthetic factory control stdout bytes (raw, projected): {measurements}")
+    print(f"synthetic other control stdout bytes: {other_measurements}")
 
 
 @pytest.mark.parametrize("active,allowed", [(1, True), (2, False)])

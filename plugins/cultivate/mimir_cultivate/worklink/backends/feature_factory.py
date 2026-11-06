@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from typing import Any, Callable, ClassVar, Mapping, Sequence
@@ -831,8 +832,13 @@ class FeatureFactoryBackend:
 
             command = ["node", str(entrypoint), *args]
             if factory_checkout_for_path(sandbox) is not None:
+                # The CLI's full status and snapshot output grows with the run.
+                # Project inside the owner process before crossing the 1 MiB pipe.
+                projection = Path(__file__).resolve().parent.parent / "factory_control_output.py"
                 result = run_factory_control(
-                    sandbox, command, env=_control_environment(), timeout=30,
+                    sandbox, [sys.executable, "-I", str(projection),
+                              "status" if args[0] == "status" else "other", *command],
+                    env=_control_environment(), timeout=30,
                     output_limit=_MAX_STATUS_BYTES,
                 )
             else:

@@ -222,7 +222,7 @@ FACTORY_STOP_GRACE_S = 900
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 # Emitted by the factory controller and the operator stop path.
 LIVE_CONTROLLER_PHASES = frozenset({"running"})
-RETAINED_CONTROLLER_PHASES = frozenset({"failed", "parked", "stopped", "terminal"})
+RETAINED_CONTROLLER_PHASES = frozenset({"failed", "parked", "stopped", "terminal", "published-with-controller-error"})
 
 
 def _valid_record_run_id(run_id: str) -> bool:
