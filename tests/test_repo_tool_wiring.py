@@ -729,6 +729,96 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
         assert state.checkout_lease is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["stopped", "reminted"])
+async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
+    tmp_path, monkeypatch, selected_repo_policy, outcome,
+):
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.models import AgentEvent
+    from mimir.plugins.core import policy_scope
+    from tests.test_agent import _build_agent, _FakeAgent, _FakeSessionManager
+    from tests.test_repo_tools import _repo_scope_and_state
+    from mimir_cultivate import forge, repository
+    from mimir_cultivate.policy import ServerDiscoveredPRStates
+    from mimir_cultivate.repository import create_pr_checkout_lease
+    import json
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    state.revoke_checkout_lease(lease)
+    cache = ServerDiscoveredPRStates()
+    fresh = RepoReviewState(replace(scope, provenance="server_discovered"))
+    assert fresh.action_scope.scope_id != scope.scope_id
+    auth = _auth(scope)
+    auth = replace(
+        auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state,
+        server_discovered_pr_states=cache,
+        trigger="poller", canonical_principal="poller:github-activity",
+        service_authority=replace(auth.service_authority, canonical="poller:github-activity",
+                                  trigger="poller", authority_profile="github",
+                                  capabilities=("pr_metadata", "repo_checkout")),
+        scoped_pr_grants=ScopedPRGrants(
+            "poller:github-activity", (scope,), protocols=selected_repo_policy.scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        ),
+    )
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr("mimir.agent._create_turn_auth_context", lambda *a, **k: auth)
+
+    def preflight(*_args):
+        if outcome == "stopped":
+            return None, "pull request is closed or merged"
+        # A moved head re-mints a fresh server scope; the lease attaches there.
+        return cache.remember(fresh), None
+
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", preflight)
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(
+        repository, "acquire_pr_checkout_lease",
+        lambda target, **kwargs: (create_pr_checkout_lease(
+            target, owner=target.principal, lease_root=lease.lease_root,
+            review_state=kwargs["review_state"],
+        ), ("candidate",)),
+    )
+    seen = []
+
+    class FirstRead(_FakeAgent):
+        async def astream(self, inputs, *, config, context=None, stream_mode="values"):
+            decision = ToolRegistry().authorize_tool(
+                "pr_metadata", context, enforce=True,
+                arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+                policy=selected_repo_policy,
+            )
+            seen.append((decision, str(inputs)))
+            yield {"messages": []}
+
+    agent = _build_agent(tmp_path, fake_agent=FirstRead([]), fake_saga=None,
+                         session_manager=_FakeSessionManager())
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+        policy=selected_repo_policy, plugins=(), turn_preflight=None,
+    ))
+    with policy_scope(selected_repo_policy):
+        await agent.run_turn(AgentEvent(
+            trigger="poller", channel_id="poller:github-activity", content="review",
+        ))
+    events = [json.loads(line) for line in (
+        tmp_path / "home" / "logs" / "events.jsonl"
+    ).read_text().splitlines()]
+    assert not [entry for entry in events if entry.get("type") == "turn_failed"]
+    assert len(seen) == 1
+    if outcome == "stopped":
+        assert "found nothing to remediate" in seen[0][1]
+        assert "pull request is closed or merged" in seen[0][1]
+        assert state.checkout_lease is None and fresh.checkout_lease is None
+        return
+    assert fresh.checkout_lease is not None and state.checkout_lease is None
+    assert seen[0][0].allowed, seen[0][0]
+    record = auth.ifc_state.framework_pr_checkouts[fresh.action_scope.scope_id]
+    assert record[0] == (str(fresh.checkout_lease.path), fresh.checkout_lease.recovery_id)
+    assert str(fresh.checkout_lease.path) in seen[0][1]
+
+
 def test_core_only_head_advance_cannot_dispatch_without_owner(monkeypatch):
     from mimir.plugins.core import core_policy_registry
 

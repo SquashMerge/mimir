@@ -2684,6 +2684,7 @@ class Agent:
             states = getattr(registry, "review_states", ()) if registry is not None else ()
             checkout_hooks = self._config.plugin_manager.policy.turn_hooks
             ctx.prechecked_pr_leases = []
+            ctx.prechecked_pr_stops = []
             if event.trigger == "poller" and isinstance(grants, ScopedPRGrants):
                 for state in states:
                     scope = state.action_scope
@@ -2708,7 +2709,28 @@ class Agent:
                         SimpleNamespace(context=auth_ctx),
                     )
                     if result.get("status") == "stopped":
-                        raise RuntimeError(f"repository checkout stopped: {result['message']}")
+                        # A closed PR or resolved checks is a no-work outcome:
+                        # the grant stays consumed and the turn ends quietly.
+                        ctx.prechecked_pr_stops.append({
+                            "repository": scope.canonical_repo,
+                            "pull_request": scope.pr_number,
+                            "message": str(result.get("message") or "nothing to remediate")[:500],
+                        })
+                        continue
+                    # Preflight may re-mint a fresh server scope for a moved head
+                    # and attach the lease there. Move scope, grant and token
+                    # together, as the next tool authorization would.
+                    discovered = getattr(auth_ctx, "server_discovered_pr_states", None)
+                    current = (
+                        discovered.resolve(scope.canonical_repo, scope.pr_number)
+                        if discovered is not None else None
+                    )
+                    if current is not None and current is not state:
+                        grants.issue(current.action_scope)
+                        state, scope = current, current.action_scope
+                        token = consume_scoped_pr_checkout(auth_ctx, scope, scope.owner)
+                        if token is None:
+                            raise RuntimeError("repository checkout rejected: refreshed PR scope has no checkout grant")
                     if not observe_scoped_pr_checkout(
                         auth_ctx, scope, state, token, scope.owner, protocol,
                     ):
@@ -5720,6 +5742,7 @@ class Agent:
                 if getattr(ctx, "turn_scratch_path", None) is not None else None
             ),
             prechecked_pr_leases=getattr(ctx, "prechecked_pr_leases", ()),
+            prechecked_pr_stops=getattr(ctx, "prechecked_pr_stops", ()),
             stable_prefix_out=stable_prefix_out,
         )
         ctx.ifc_labels = _merge_ifc_labels(
