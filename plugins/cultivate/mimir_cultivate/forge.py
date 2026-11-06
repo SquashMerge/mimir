@@ -131,6 +131,8 @@ class ForgeClient(Protocol):
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection: ...
 
+    def get_pull_request_commit_authors(self, scope: RepoPRActionScope) -> tuple[str, ...]: ...
+
     def list_pull_requests(
         self, repository: str, *, state: str, base: str | None,
         head: str | None, limit: int,
@@ -672,6 +674,33 @@ class GitHubForgeClient:
                 _MAX_BODY_BYTES,
             ).encode("utf-8")[:_MAX_BODY_BYTES].decode("utf-8", errors="ignore"),
         )
+
+    def get_pull_request_commit_authors(self, scope: RepoPRActionScope) -> tuple[str, ...]:
+        """Resolve every commit's GitHub login at the immutable PR head.
+
+        A missing linked account remains unresolved; incomplete pagination or a
+        changed head cannot certify the checkout's authorship.
+        """
+        repository, number = self._target(scope)
+        authors: list[str] = []
+        last_sha = None
+        page_size = 50
+        for page in range(1, _MAX_PAGES + 1):
+            commits = self._request(
+                "GET", f"/repos/{repository}/pulls/{number}/commits?per_page={page_size}&page={page}",
+            )
+            if not isinstance(commits, list) or any(not isinstance(commit, Mapping) for commit in commits):
+                raise ForgeError("forge returned invalid pull-request commits")
+            for commit in commits:
+                actor = commit.get("author")
+                login = actor.get("login") if isinstance(actor, Mapping) else None
+                authors.append(login if isinstance(login, str) else "")
+                last_sha = commit.get("sha")
+            if len(commits) < page_size:
+                if not authors or last_sha != scope.observed_head_sha:
+                    raise ForgeError("forge returned commits for a different pull-request head")
+                return tuple(authors)
+        raise ForgeResponseTooLarge("forge pull-request commits exceeded page limit")
 
     def list_pull_requests(
         self, repository: str, *, state: str, base: str | None = None,
@@ -2321,7 +2350,14 @@ def _pr_content_authors(
     runtime: ToolRuntime[AuthContext] | None = None,
 ) -> tuple[tuple[str, ...], str]:
     """Bind PR-owned diff/file text to API authorship at its verified head."""
-    return _pr_attestation(client.get_pull_request(scope), scope, runtime)
+    authors, head_sha = _pr_attestation(client.get_pull_request(scope), scope, runtime)
+    # Synthetic adapters without a commit projection retain the historical
+    # metadata-only path. GitHub itself must attest the entire commit set.
+    commits = getattr(client, "get_pull_request_commit_authors", None)
+    if (callable(commits) and head_sha == scope.observed_head_sha
+            and authors != ("<head-mismatch>",) and authors != ("",)):
+        authors = tuple(dict.fromkeys((*authors, *commits(scope))))
+    return authors, head_sha
 
 
 def _attest_scoped_read(
@@ -2468,7 +2504,9 @@ def pr_metadata(
         _verify_scoped_read_head(runtime, scope, client, "pr_metadata", before)
         raise
     authors, head_sha = _pr_attestation(metadata, scope, runtime)
-    if before is None or (authors, head_sha) != before:
+    # The pre-read attestation already includes commit authors. Comparing it
+    # with metadata alone would overwrite that label with a weaker one.
+    if before is None or (authors, head_sha) != (before[0][:1], before[1]):
         _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
     return asdict(metadata)
 

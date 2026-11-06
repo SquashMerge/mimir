@@ -5242,17 +5242,25 @@ def repo_checkout(
         isinstance(scope.pull_request_author, str) and _BOT_LOGIN.fullmatch(scope.pull_request_author)
     ):
         authors, _ = _call(lambda: _pr_content_authors(client, scope))
-        if authors == (scope.pull_request_author,) and scope.pull_request_author:
+        if authors and scope.pull_request_author and scope.pull_request_author in authors:
             from mimir.pollers import _github_author_trust_cause
 
             _github_author_trust_cause.set(None)
-            verdict = _author_verdict(context, scope, scope.pull_request_author, client)
+            verdicts = []
+            unavailable_cause = None
+            for author in dict.fromkeys(authors):
+                verdict = _author_verdict(context, scope, author, client)
+                verdicts.append(verdict)
+                if verdict is None and unavailable_cause is None:
+                    from mimir.pollers import github_author_trust_cause
+
+                    unavailable_cause = github_author_trust_cause() or "author_unresolved"
+            verdict = (False if False in verdicts else
+                       None if None in verdicts else True)
             context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
             if verdict is None:
-                from mimir.pollers import github_author_trust_cause
-
                 context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
-                    github_author_trust_cause() or "author_unresolved"
+                    unavailable_cause or "author_unresolved"
                 )
             else:
                 context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)

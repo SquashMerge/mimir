@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import ToolMessage
 
-from mimir_cultivate import repository
+from mimir_cultivate import forge, repository
 from mimir._context import reset_current_turn, set_current_turn
 from mimir_cultivate.policy import RepoPRScopeRegistry
 from mimir.plugins.manager import load_plugins
@@ -149,6 +149,81 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
     assert repository.RepoGitTools(state).validated_checkout_root() == state.checkout_lease.path
     assert repository.cleanup_pr_checkout_lease(lease, runner=run) is True
     assert not os.path.lexists(lease.path)
+
+
+@pytest.mark.parametrize("scope_author, commit_authors, collaborator_verdict, expected", [
+    ("dependabot[bot]", ("dependabot[bot]", "collaborator"), True, True),
+    ("collaborator", ("dependabot[bot]", "collaborator"), True, True),
+    ("dependabot[bot]", ("dependabot[bot]", "collaborator"), False, False),
+    ("dependabot[bot]", ("dependabot[bot]", "collaborator"), None, None),
+    ("dependabot[bot]", ("dependabot[bot]", ""), True, None),
+    ("dependabot[bot]", ("dependabot[bot]",), True, True),
+])
+def test_checkout_attests_every_pr_author_and_labels_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    scope_author: str,
+    commit_authors: tuple[str, ...],
+    collaborator_verdict: bool | None, expected: bool | None,
+) -> None:
+    from mimir import access_control
+    from mimir.plugins.core import policy_scope
+
+    _origin, _source, scope, state = _repo_scope_and_state(
+        tmp_path, pull_request_author=scope_author,
+    )
+    selected = load_plugins(enable="cultivate").policy
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    runtime = SimpleNamespace(context=auth)
+    examined = []
+    client = SimpleNamespace(
+        get_pull_request=lambda _: forge.PullRequestProjection(
+            scope.pr_number, "Title", "open", "dependabot[bot]", False,
+            "main", "worklink/7", scope.observed_head_sha, True, "created", "updated",
+        ),
+        get_pull_request_commit_authors=lambda _: commit_authors,
+        author_is_trusted=lambda repo, author: examined.append(author) or collaborator_verdict,
+    )
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    monkeypatch.setattr(forge, "_client", lambda _: client)
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(repository, "acquire_pr_checkout_lease", lambda *_a, **_k: (state.checkout_lease, ()))
+    monkeypatch.setattr(repository, "_publish_attested_lease_result", lambda *_: None)
+    labels = []
+    monkeypatch.setattr(access_control, "publish_protected_result", lambda sources, **_: labels.extend(sources))
+
+    with policy_scope(selected):
+        result = repository.repo_checkout.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+        assert result["head_sha"] == scope.observed_head_sha
+        assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is expected
+        assert access_control.pr_checkout_lease_attestation(auth, scope, state.checkout_lease).ok is (expected is True)
+        forge.pr_metadata.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+    # Unavailable lookups are retried; bots never use the collaborator API.
+    assert examined == (["collaborator"] * (2 if collaborator_verdict is None else 1)
+                        if "collaborator" in commit_authors else [])
+    assert labels
+    assert labels[0].resource_id == f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"
+    assert labels[0].integrity == ("trusted" if expected is True else "untrusted")
+    assert all(label.integrity == labels[0].integrity for label in labels)
+
+
+def test_checkout_scope_author_missing_from_commit_authors_stays_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, state = _repo_scope_and_state(
+        tmp_path, pull_request_author="dependabot[bot]",
+    )
+    auth = replace(_untainted_ifc_auth(), repo_review_state=state, repo_pr_action_scope=scope)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(author_is_trusted=lambda *_: True))
+    monkeypatch.setattr(forge, "_pr_content_authors", lambda *_: (("other",), scope.observed_head_sha))
+    monkeypatch.setattr(repository, "acquire_pr_checkout_lease", lambda *_a, **_k: (state.checkout_lease, ()))
+    monkeypatch.setattr(repository, "_publish_attested_lease_result", lambda *_: None)
+    repository.repo_checkout.func(scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth))
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

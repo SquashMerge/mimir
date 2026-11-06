@@ -149,6 +149,57 @@ class _Forge:
         self.calls.append(("rerequest", (scope, reviewer)))
 
 
+def test_github_commit_authors_require_complete_head_bound_pages(monkeypatch) -> None:
+    scope = _runtime().context.repo_pr_action_scope
+    client = forge.GitHubForgeClient(token="test")
+    pages = []
+
+    def request(_method, endpoint):
+        pages.append(endpoint)
+        if "page=1" in endpoint:
+            return [{"author": {"login": "dependabot[bot]"}, "sha": "c" * 40}] * 50
+        return [{"author": {"login": "collaborator"}, "sha": scope.observed_head_sha}]
+
+    monkeypatch.setattr(client, "_request", request)
+    assert client.get_pull_request_commit_authors(scope)[-1] == "collaborator"
+    assert len(pages) == 2
+    monkeypatch.setattr(client, "_request", lambda *_: [
+        {"author": {"login": "collaborator"}, "sha": "c" * 40},
+    ])
+    with pytest.raises(forge.ForgeError, match="different pull-request head"):
+        client.get_pull_request_commit_authors(scope)
+    monkeypatch.setattr(client, "_request", lambda *_: [
+        {"author": None, "sha": scope.observed_head_sha},
+    ])
+    assert client.get_pull_request_commit_authors(scope) == ("",)
+
+
+def test_commit_author_projection_never_overrides_mismatched_head() -> None:
+    scope = _runtime().context.repo_pr_action_scope
+    calls = []
+    client = SimpleNamespace(
+        get_pull_request=lambda _: PullRequestProjection(
+            scope.pr_number, "Title", "open", "dependabot[bot]", False,
+            "main", "change", "c" * 40, True, "created", "updated",
+        ),
+        get_pull_request_commit_authors=lambda _: calls.append("commits") or ("dependabot[bot]",),
+    )
+    assert forge._pr_content_authors(client, scope) == (("<head-mismatch>",), scope.observed_head_sha)
+    assert calls == []
+
+
+def test_verified_own_push_retains_existing_single_author_projection(monkeypatch) -> None:
+    scope = _runtime().context.repo_pr_action_scope
+    calls = []
+    client = SimpleNamespace(
+        get_pull_request=lambda _: object(),
+        get_pull_request_commit_authors=lambda _: calls.append("commits") or ("author",),
+    )
+    monkeypatch.setattr(forge, "_pr_attestation", lambda *_: (("author",), "c" * 40))
+    assert forge._pr_content_authors(client, scope) == (("author",), "c" * 40)
+    assert calls == []
+
+
 def test_forge_surface_has_all_scoped_tools() -> None:
     assert [item.name for item in forge.FORGE_TOOLS] == [
         "pr_list", "pr_metadata", "pr_spec", "pr_files", "pr_diff",
