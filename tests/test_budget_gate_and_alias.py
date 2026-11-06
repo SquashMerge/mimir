@@ -133,6 +133,77 @@ def _selected_repo_middleware():
     return BudgetGateMiddleware(policy=selected_policy_registry())
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_scoped_pr_checkout_order_refusal_surfaces_server_hint(async_mode):
+    from tests.test_repo_tool_wiring import _auth, _scope
+
+    scope = _scope(*RepoPRAction)
+    auth = replace(
+        _auth(scope), trigger="poller", canonical_principal="mimir-bot",
+        service_authority=replace(_auth(scope).service_authority,
+            canonical="mimir-bot", trigger="poller", authority_profile="github",
+            capabilities=("pr_metadata", "repo_checkout")),
+    )
+    state = auth.repo_pr_scope_registry.resolve(scope.canonical_repo, scope.pr_number)
+    auth = _repo_granted_auth(auth, scope, state, follow_on=False)
+    auth = replace(auth, enforcement_enabled=False)
+    gate = _selected_repo_middleware()
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    request = _make_request("pr_metadata", "checkout-order", auth, args)
+
+    def never_called(_request):
+        pytest.fail("unauthorized PR read executed")
+
+    async def never_called_async(_request):
+        never_called(_request)
+
+    result = (asyncio.run(gate.awrap_tool_call(request, never_called_async))
+              if async_mode else gate.wrap_tool_call(request, never_called))
+    assert result.status == "error"
+    assert "Call repo_checkout(repository, pull_request)" in result.content
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_scoped_pr_dispatch_refusal_preserves_server_hint():
+    import time
+    from mimir.access_control import ToolRegistry
+    from mimir.plugins.core import selected_policy_registry
+    from mimir.tools.budget_gate import _PreparedToolCall, _scoped_pr_dispatch_refusal
+    from tests.test_repo_tool_wiring import _auth, _scope
+
+    scope = _scope(*RepoPRAction)
+    original = _auth(scope)
+    auth = replace(
+        original, trigger="poller", canonical_principal="mimir-bot",
+        service_authority=replace(original.service_authority,
+            canonical="mimir-bot", trigger="poller", authority_profile="github",
+            capabilities=("pr_metadata", "repo_checkout")),
+    )
+    state = auth.repo_pr_scope_registry.resolve(scope.canonical_repo, scope.pr_number)
+    auth = _repo_granted_auth(auth, scope, state, follow_on=False)
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    policy = selected_policy_registry()
+    decision = ToolRegistry().authorize_tool(
+        "pr_metadata", auth, enforce=True, arguments=args, policy=policy,
+    )
+    assert decision.refusal_detail and "repo_checkout" in decision.refusal_detail
+    request = _make_request("pr_metadata", "dispatch-hint", auth, args)
+    call = _PreparedToolCall(
+        request=request, execution_request=request, tool_name="pr_metadata",
+        auth_context=auth, arguments=args, authorization=decision,
+        operator_shell_preparation=None, operator_shell_audit=None,
+        host_execution=None, started=time.monotonic(), policy=policy,
+    )
+    refused = _scoped_pr_dispatch_refusal(call)
+    assert refused is not None and refused.status == "error"
+    assert refused.content == decision.refusal_detail
+    untrusted = replace(decision, refusal_detail="GitHub response: token=synthetic-secret")
+    assert _scoped_pr_dispatch_refusal(replace(call, authorization=untrusted)).content == (
+        "scoped PR grant refused before execution"
+    )
+
+
 @pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("snapshot_state,head,check_status,conclusion,message", [
     ("closed", "a" * 40, "completed", "failure", "pull request is closed or merged"),
