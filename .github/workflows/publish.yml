@@ -56,12 +56,37 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
       - name: Build distributions
-        run: uv build
+        # mimir-agent (the root project) and the Cultivate plugin publish
+        # together at one version. benchmarks/saga is a workspace member too,
+        # but it is a local benchmark harness and is never published.
+        run: |
+          uv build --out-dir dist
+          uv build --package mimir-cultivate --out-dir dist
+      - name: Assert exactly mimir-agent and mimir-cultivate at one version
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+          files = sorted(os.path.basename(p) for p in glob.glob("dist/*"))
+          found = {}
+          for name in files:
+              m = re.match(r"(mimir_agent|mimir_cultivate)-([^-]+?)(?:-py3-none-any\.whl|\.tar\.gz)$", name)
+              if not m:
+                  print("FAIL: unexpected distribution", name, file=sys.stderr); sys.exit(1)
+              found.setdefault(m.group(1), set()).add((m.group(2), name.endswith(".whl")))
+          want = {"mimir_agent", "mimir_cultivate"}
+          if set(found) != want or any({w for _, w in v} != {True, False} for v in found.values()):
+              print("FAIL: need a wheel and an sdist for each of", sorted(want), "got", files, file=sys.stderr); sys.exit(1)
+          versions = {ver for v in found.values() for ver, _ in v}
+          ref = os.environ.get("GITHUB_REF_NAME", "")
+          if len(versions) != 1 or (ref.startswith("v") and versions != {ref[1:]}):
+              print("FAIL: versions", sorted(versions), "tag", ref, file=sys.stderr); sys.exit(1)
+          print("OK:", files)
+          PY
       - name: Assert the wheel ships the built React app
         run: |
           python3 - <<'PY'
           import glob, zipfile, sys
-          whl = sorted(glob.glob("dist/*.whl"))[-1]
+          whl = sorted(glob.glob("dist/mimir_agent-*.whl"))[-1]
           names = zipfile.ZipFile(whl).namelist()
           if not any(n.endswith("mimir/react_app/dist/index.html") for n in names):
               print("FAIL:", whl, "missing mimir/react_app/dist/index.html", file=sys.stderr)

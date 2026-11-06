@@ -8,6 +8,38 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc2] — 2026-11-05
+
+- **Second release candidate for 1.0.0.** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly (`mimir-agent==1.0.0rc2` or `--prerelease allow`).
+  - **`mimir-cultivate` is now published to PyPI** alongside `mimir-agent`, at the same version and under the Business Source License 1.1. Install it with `pip install mimir-agent==1.0.0rc2 mimir-cultivate==1.0.0rc2`.
+  - Mostly reliability fixes for Cultivate's GitHub review, Worklink and CI handling found running rc1 on the SquashMerge repositories, plus flaky-test fixes surfaced by the new merge queue.
+
+- Harden scoped PR checkout observation with branch-specific diagnostics, consistent path comparisons across aliased ancestors, and refusal of symlinked configured roots (#2090). Later entries for #2095 and #2100 address the intermittent macOS checkout-grant failure.
+
+- Resume CI-only change requests when rerun checks turn green on the reviewed head (#2091).
+
+- Keep attested PR checkout reads trusted when a review turn discovers a newer lease than its original scope registry.
+
+- Bound live-state review hard-refusal deliveries, expire settled-refusal records after 48 hours, and settle completed reviews after GitHub confirms a submitted review on the requested head (#2093).
+
+- Fix Worklink merge closure and GitHub PR attestation for mixed-case repository owners.
+
+- Make scoped PR checkout observation insensitive to transient Git worktree status scans and report the first lease refusal.
+
+- Include pytest failure details alongside the short summary in Cultivate CI job log excerpts, recognizing single-underscore long test headers and GitHub Actions timestamp prefixes while preserving timestamps in the output (#2096).
+
+- Hold transient Worklink merge-reconciliation notices until repeated observations and include observed PR and issue facts in delivered notices.
+- Require an installed Cultivate plugin entry point before running provider-dependent lease-read tests, even when poller source loading makes the provider importable.
+- Gate the shared Worklink receipt-consumer fixture on installed Cultivate and remove plugin modules added by its source loader, preventing core-only workers from retaining an uninstalled provider.
+
+- Avoid premature merge-reconciliation notices while a Worklink leaf is publishing its PR (#2098).
+
+- Keep bound unsupported-operation escalations from tainting scoped PR remediation turns.
+
+- Report checkout Git observation failures precisely and allow slow CI hosts time to resolve refs (#2100).
+
+- Give ACP SSH and hosted shell child reaping a loaded-host deadline after SIGKILL, while reporting children that still cannot be reaped (#2102).
+
 ## [1.0.0rc1] — 2026-11-04
 
 - **Release candidate for 1.0.0, and the first release from [SquashMerge/mimir](https://github.com/SquashMerge/mimir).** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly (`mimir-agent==1.0.0rc1` or `--prerelease allow`).
