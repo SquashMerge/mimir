@@ -21,13 +21,14 @@ from mimir.access_control import (
     ScopedPRGrants, _SCOPED_PR_ISSUER, _valid_scoped_pr_grant,
     ToolFlowDirection, authorize_repo_pr_tool,
     create_auth_context, consume_scoped_pr_checkout, observe_scoped_pr_checkout,
-    ToolRegistry, CapabilityTier, build_trigger_service_principal,
+    register_server_discovered_review_grant, ToolRegistry, CapabilityTier,
+    build_trigger_service_principal,
     publish_protected_result,
 )
 from mimir.config import DEFAULT_TURN_TIMEOUT_SECONDS
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
-    SourceLabel, TurnInteractivity,
+    NormalizedPullRequestSnapshot, SourceLabel, TurnInteractivity,
 )
 from mimir.plugins.registry import PolicyRegistry
 from mimir_cultivate.repository import active_pr_checkout_lease_for_path, create_pr_checkout_lease
@@ -40,6 +41,232 @@ from mimir_cultivate.policy import (
 from tests.test_pr_checkout_lease import _repo_and_scope
 from tests.test_access_control import _github_scope_test_setup
 from tests.test_repo_tools import _git, _repo_scope_and_state
+
+
+def _operator_discovery(tmp_path, monkeypatch, *, roles=("admin",), ingress=None, is_service=False):
+    from mimir import access_control
+    from mimir.identities import AccessMetadata
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
+    from mimir_cultivate.forge import PullRequestProjection
+
+    root, fixture_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    # This local bare origin stands in for the configured GitHub remote.
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
+    monkeypatch.setattr(access_control, "_canonical_repo_binding_resolution", lambda _repo:
+                        access_control.RepoBindingResolution(
+                            (str(root.resolve()), fixture_scope.canonical_origin),
+                            (str(root.resolve()),), 1,
+                        ))
+    snapshot = NormalizedPullRequestSnapshot(
+        repo="owner/repo", state="open", number=7, author="mimir-bot",
+        head_repo="owner/repo", head_remote="origin", head_ref="worklink/7",
+        head_sha=fixture_scope.observed_head_sha, base_ref="main",
+        base_sha=fixture_scope.observed_base_sha,
+    )
+    client = SimpleNamespace(
+        get_pull_request_snapshot=lambda *_: snapshot,
+        list_reviews=lambda _: (SimpleNamespace(author="reviewer", state="CHANGES_REQUESTED"),),
+        get_pull_request=lambda _: PullRequestProjection(
+            7, "Fix review", "open", "mimir-bot", False, "main", "worklink/7",
+            snapshot.head_sha, True, "created", "updated",
+        ),
+        get_diff=lambda _: "diff --git a/file.txt b/file.txt\n",
+        author_is_trusted=lambda *_: True,
+    )
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
+    resolver = SimpleNamespace(
+        resolve=lambda _: "operator", access_metadata=lambda _: AccessMetadata(
+            roles=roles, is_service=is_service,
+        ),
+        resolve_channel=lambda channel: channel,
+    )
+    policy = load_plugins(enable="cultivate").policy
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="chat", author="chat-operator"),
+        resolver, policy=policy, event_ingress=ingress, enforce=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    return root, fixture_scope, auth, policy
+
+
+def test_operator_discovered_checkout_reads_commit_and_push(tmp_path, monkeypatch):
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import forge, repository
+
+    _, fixture_scope, auth, policy = _operator_discovery(tmp_path, monkeypatch)
+    assert isinstance(auth.scoped_pr_grants, ScopedPRGrants)
+    assert auth.scoped_pr_grants.principal == "operator"
+    assert auth.scoped_pr_grants.get("cultivate", fixture_scope, RepoPRAction.CHECKOUT.value) is None
+    with policy_scope(policy):
+        state = forge.resolve_review_state_for_context(auth, "owner/repo", 7)
+    scope = state.action_scope
+    assert scope.provenance == "server_discovered"
+    assert scope.allowed_operations == frozenset({
+        "repo.inspect", "repo.checkout", "repo.test", "repo.write", "repo.commit",
+        "repo.push", "pr.comment", "pr.edit", "pr.rerequest",
+    })
+    assert auth.server_discovered_pr_states.resolve("owner/repo", 7) is state
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    args = {"repository": "owner/repo", "pull_request": 7}
+    gate = BudgetGateMiddleware(policy)
+
+    def invoke(name, **extra):
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": {**args, **extra}, "id": name, "type": "tool_call"},
+            tool=policy.tools[name].factory(), state={}, runtime=Runtime(context=auth),
+        )
+
+        def handler(call):
+            from langchain.tools import ToolRuntime
+
+            runtime = ToolRuntime(
+                state={}, context=auth, config={}, stream_writer=lambda _: None,
+                tool_call_id=name, store=None,
+            )
+            tool = getattr(forge if name.startswith("pr_") else repository, name)
+            result = tool.func(**call.tool_call["args"], runtime=runtime)
+            return ToolMessage(content=json.dumps(result), tool_call_id=name)
+
+        with policy_scope(policy):
+            return gate.wrap_tool_call(request, handler)
+
+    for name in ("repo_checkout", "pr_metadata", "pr_diff"):
+        outcome = invoke(name)
+        assert outcome.status != "error", (name, outcome.content)
+        if name == "pr_metadata":
+            assert json.loads(outcome.content)["head_sha"] == scope.observed_head_sha
+        if name == "pr_diff":
+            assert "diff --git" in outcome.content
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    assert auth.scoped_pr_grants.get("cultivate", scope, RepoPRAction.CHECKOUT.value) is None
+    assert invoke("repo_checkout").status == "error"  # One shot, even after a live lease.
+    for name in ("pr_metadata", "pr_diff", "repo_commit", "repo_push"):
+        decision = ToolRegistry().authorize_tool(name, auth, enforce=True, arguments=args, policy=policy)
+        assert decision.allowed, (name, decision.reason)
+    assert auth.scoped_pr_grants.nonce
+    checkout_grant = auth.scoped_pr_grants.get("cultivate", scope, RepoPRAction.COMMIT.value)
+    assert checkout_grant.turn_nonce == auth.scoped_pr_grants.nonce
+    assert checkout_grant.head == fixture_scope.observed_head_sha
+    assert checkout_grant.lease_identity == (str(state.checkout_lease.path), state.checkout_lease.recovery_id)
+    (state.checkout_lease.path / "file.txt").write_text("operator fix\n", encoding="utf-8")
+    for name, extra in (
+        ("repo_stage", {"paths": ("file.txt",)}),
+        ("repo_commit", {"paths": ("file.txt",), "message": "operator fix"}),
+        ("repo_push", {}),
+    ):
+        outcome = invoke(name, **extra)
+        assert outcome.status != "error", (name, outcome.content)
+        assert json.loads(outcome.content)["ok"] is True
+    assert _git(fixture_scope.canonical_origin, "rev-parse", scope.destination_ref) == _git(
+        state.checkout_lease.path, "rev-parse", "HEAD",
+    )
+    auth.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="channel", resource_id="chat", bridge_instance="chat",
+        sensitivity="public", authorized_principals=frozenset({"operator"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),)))
+    denied = ToolRegistry().authorize_tool(
+        "repo_commit", auth, enforce=True, arguments=args, policy=policy,
+    )
+    assert not denied.allowed and denied.reason == "write_blocked_by_untrusted_ingest"
+    state.checkout_lease.revoke()
+    assert not ToolRegistry().authorize_tool(
+        "pr_diff", auth, enforce=True, arguments=args, policy=policy,
+    ).allowed
+
+
+@pytest.mark.parametrize("roles, ingress, is_service", [
+    (("user",), None, False), (("admin",), "http_event", False),
+    (("admin",), None, True),
+])
+def test_non_operator_chat_never_gets_scoped_grants(tmp_path, monkeypatch, roles, ingress, is_service):
+    from mimir_cultivate import forge
+
+    _, _, auth, policy = _operator_discovery(
+        tmp_path, monkeypatch, roles=roles, ingress=ingress, is_service=is_service,
+    )
+    assert auth.scoped_pr_grants is None
+    assert not ToolRegistry().authorize_tool(
+        "repo_checkout", auth, enforce=True,
+        arguments={"repository": "owner/repo", "pull_request": 7}, policy=policy,
+    ).allowed
+    with pytest.raises(ToolException, match="live scope discovery requires"):
+        forge.resolve_review_state_for_context(auth, "owner/repo", 7)
+
+
+def test_operator_grants_require_the_server_resolved_state(tmp_path, monkeypatch):
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import forge
+
+    _, _, auth, policy = _operator_discovery(tmp_path, monkeypatch)
+    with policy_scope(policy):
+        state = forge.resolve_review_state_for_context(auth, "owner/repo", 7)
+    supplied = RepoReviewState(replace(state.action_scope, pr_number=8))
+    register_server_discovered_review_grant(auth, supplied)
+    assert auth.scoped_pr_grants.get("cultivate", supplied.action_scope, RepoPRAction.CHECKOUT.value) is None
+    assert not ToolRegistry().authorize_tool(
+        "repo_checkout", auth, enforce=True,
+        arguments={"repository": "owner/repo", "pull_request": 8}, policy=policy,
+    ).allowed
+    assert auth.scoped_pr_grants.get("cultivate", state.action_scope, RepoPRAction.CHECKOUT.value)
+
+
+@pytest.mark.parametrize("invalid", ["non_admin", "other_principal", "poller_scope"])
+def test_discovered_grant_registration_rejects_untrusted_carriers(
+    tmp_path, monkeypatch, invalid,
+):
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import forge
+
+    _, _, auth, policy = _operator_discovery(tmp_path, monkeypatch)
+    with policy_scope(policy):
+        state = forge.resolve_review_state_for_context(auth, "owner/repo", 7)
+    scope = state.action_scope
+    fresh = ScopedPRGrants("operator", (), protocols=policy.scoped_actions,
+                           _issuer=_SCOPED_PR_ISSUER)
+    if invalid == "non_admin":
+        carrier = replace(auth, roles=("user",), scoped_pr_grants=fresh)
+    elif invalid == "other_principal":
+        carrier = replace(auth, canonical_principal="other", scoped_pr_grants=fresh)
+    else:
+        scope = replace(scope, provenance="poller_payload")
+        state = RepoReviewState(scope)
+        discovered = ServerDiscoveredPRStates()
+        discovered.remember(state)
+        carrier = replace(auth, server_discovered_pr_states=discovered,
+                          scoped_pr_grants=fresh)
+    register_server_discovered_review_grant(carrier, state)
+    assert fresh.get("cultivate", scope, RepoPRAction.CHECKOUT.value) is None
+
+
+def test_operator_stored_scope_requires_live_head_before_grant(tmp_path, monkeypatch):
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import forge
+    from mimir_cultivate.policy import ServerDiscoveredPRScopeStore
+
+    _, _, first, policy = _operator_discovery(tmp_path, monkeypatch)
+    with policy_scope(policy):
+        state = forge.resolve_review_state_for_context(first, "owner/repo", 7)
+    store = ServerDiscoveredPRScopeStore()
+    store.remember_server_discovery(state.action_scope)
+    other = replace(first, server_discovered_pr_states=ServerDiscoveredPRStates(),
+                    server_discovered_pr_scope_store=store,
+                    scoped_pr_grants=ScopedPRGrants(
+                        "operator", (), protocols=policy.scoped_actions,
+                        _issuer=_SCOPED_PR_ISSUER,
+                    ))
+    assert other.scoped_pr_grants.get("cultivate", state.action_scope, "repo.checkout") is None
+    with policy_scope(policy):
+        reused = forge.resolve_review_state_for_context(other, "owner/repo", 7)
+    assert reused.action_scope is state.action_scope
+    assert other.scoped_pr_grants.get("cultivate", reused.action_scope, "repo.checkout") is not None
 
 
 def _tool(repository: str, pull_request: int) -> str:
