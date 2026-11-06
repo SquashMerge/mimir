@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -105,6 +108,84 @@ def test_built_distribution_boundaries(built_packages: dict[str, Path]) -> None:
                 assert any(member.endswith("/mimir-plugin.toml") for member in members)
                 assert any(member.endswith("/defaults/skills/github-poller/scripts/poller.py")
                            for member in members)
+
+
+def test_released_wheels_supply_the_entire_local_docker_context(built_packages, tmp_path) -> None:
+    from mimir.plugin_dockerfile import _CONTEXT_SCRIPTS, _S6_FILES, build_pypi_context
+
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    agent = next(path for name, path in built_packages.items() if name.startswith("mimir_agent-") and name.endswith(".whl"))
+    cultivate = next(path for name, path in built_packages.items() if name.startswith("mimir_cultivate-") and name.endswith(".whl"))
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    with ZipFile(agent) as wheel:
+        assert wheel.read("mimir/docker_context/Dockerfile") == (ROOT / "Dockerfile").read_bytes()
+        for name in _S6_FILES:
+            assert wheel.read(f"mimir/docker_context/deploy/s6-overlay/s6-rc.d/{name}") == (
+                ROOT / "deploy/s6-overlay/s6-rc.d" / name).read_bytes()
+    with ZipFile(cultivate) as wheel:
+        for name in _CONTEXT_SCRIPTS:
+            assert wheel.read(f"mimir_cultivate/docker/{name}") == (
+                PLUGIN / "mimir_cultivate/docker" / name).read_bytes()
+    context = tmp_path / "context"
+    arguments = dict(agent_wheel=agent, cultivate_wheel=cultivate, version=version,
+                     agent_sha256=digest(agent), cultivate_sha256=digest(cultivate))
+    build_pypi_context(context, **arguments)
+    expected = {"Dockerfile", *(f"deploy/s6-overlay/s6-rc.d/{name}" for name in _S6_FILES),
+                *(f"plugins/cultivate/mimir_cultivate/docker/{name}" for name in _CONTEXT_SCRIPTS),
+                f"plugins/cultivate/mimir_cultivate/docker/wheels/{agent.name}",
+                f"plugins/cultivate/mimir_cultivate/docker/wheels/{cultivate.name}"}
+    assert {str(path.relative_to(context)) for path in context.rglob("*") if path.is_file()} == expected
+    for changed in (dict(agent_sha256="0" * 64), dict(version="0.0.0")):
+        with pytest.raises(ValueError, match="identity mismatch"):
+            build_pypi_context(tmp_path / "rejected", **(arguments | changed))
+    broken = tmp_path / agent.name
+    shutil.copyfile(agent, broken)
+    broken.write_bytes(broken.read_bytes() + b"altered")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        build_pypi_context(tmp_path / "rejected", **(arguments | {"agent_wheel": broken}))
+
+
+def test_wheel_pair_verifies_both_installed_venvs_and_retained_archives(built_packages, tmp_path) -> None:
+    import runpy
+
+    check = runpy.run_path(str(PLUGIN / "mimir_cultivate/docker/verify_wheels.py"))["check"]
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    archives = [next(path for name, path in built_packages.items()
+                     if name.startswith(prefix) and name.endswith(".whl"))
+                for prefix in ("mimir_agent-", "mimir_cultivate-")]
+    for archive in archives:
+        shutil.copyfile(archive, wheels / archive.name)
+    agent, cultivate = archives
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    identity = check(wheels, version, agent.name, sha(agent), cultivate.name, sha(cultivate))
+    assert identity["mode"] == "pypi"
+    for label in ("controller", "worker"):
+        venv = tmp_path / label
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        subprocess.run(["uv", "pip", "install", "--python", str(venv / "bin/python"), "--no-deps",
+                        "packaging", str(wheels / agent.name), str(wheels / cultivate.name)],
+                       check=True, capture_output=True, text=True)
+        marker = venv / "controller-install-identity.json"
+        marker.write_text(json.dumps(identity))
+        code = ("from pathlib import Path; import runpy, sys; "
+                "module = runpy.run_path(str(Path(sys.prefix) / 'lib' / "
+                "f'python{sys.version_info.major}.{sys.version_info.minor}' / "
+                "'site-packages/mimir_cultivate/install_identity.py')); "
+                "module['verify_install_identity'](Path(sys.argv[1]), wheels=Path(sys.argv[2]))")
+        cmd = [str(venv / "bin/python"), "-c", code, str(marker), str(wheels)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        with pytest.raises(ValueError, match="hash mismatch"):
+            check(wheels, version, agent.name, "0" * 64, cultivate.name, sha(cultivate))
+        with pytest.raises(ValueError, match="name, version"):
+            check(wheels, "0.0.0", agent.name, sha(agent), cultivate.name, sha(cultivate))
+        (wheels / cultivate.name).write_bytes(b"corrupted")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        assert result.returncode != 0 and "archive hash mismatch" in result.stderr
+        shutil.copyfile(cultivate, wheels / cultivate.name)
+        assert subprocess.run(cmd, capture_output=True).returncode == 0
 
 
 def test_disabled_provider_is_not_imported() -> None:

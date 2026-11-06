@@ -1,5 +1,22 @@
 #!/bin/sh
 set -eu
+if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
+    python3 /opt/cultivate-docker/verify_wheels.py /opt/mimir-worklink/wheels \
+        "$MIMIR_VERSION" "$MIMIR_AGENT_WHEEL" "$MIMIR_AGENT_SHA256" \
+        "$MIMIR_CULTIVATE_WHEEL" "$MIMIR_CULTIVATE_SHA256" \
+        > /opt/mimir-worklink/executor-install-identity.json
+    python3 -m venv /opt/mimir-worklink/venv
+    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip
+    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir \
+        "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
+        "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
+    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps uv
+    ln -sf /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv
+    /opt/mimir-worklink/venv/bin/python -c 'from mimir_cultivate.install_identity import executor_identity; executor_identity()'
+    chown -R root:root /opt/mimir-worklink
+    chmod -R go-w /opt/mimir-worklink
+    exit 0
+fi
 git check-ref-format "$MIMIR_GIT_REF"
 git init /opt/mimir-worklink/source
 git -C /opt/mimir-worklink/source remote add origin "$MIMIR_GIT_URL"

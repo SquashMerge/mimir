@@ -5,6 +5,17 @@
 # so the plugin never runs against a core it was not tested with. Runs as the
 # venv owner, so the pending-update flow keeps a user-owned venv.
 set -eu
+if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
+    python3 /opt/cultivate-docker/verify_wheels.py /opt/mimir-worklink/wheels \
+        "$MIMIR_VERSION" "$MIMIR_AGENT_WHEEL" "$MIMIR_AGENT_SHA256" \
+        "$MIMIR_CULTIVATE_WHEEL" "$MIMIR_CULTIVATE_SHA256" \
+        > "$VIRTUAL_ENV/controller-install-identity.json"
+    pip install --no-cache-dir \
+        "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
+        "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
+    python -c 'from mimir_cultivate.install_identity import controller_identity; controller_identity()'
+    exit 0
+fi
 git check-ref-format "$MIMIR_GIT_REF"
 work="$(mktemp -d)"
 source="$work/mimir"

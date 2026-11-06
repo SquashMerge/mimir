@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import runpy
+import hashlib
+import os
 from pathlib import Path
+import subprocess
+import zipfile
 
 import pytest
 import yaml
@@ -667,3 +671,55 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert "ControllerGitPublication.capture" in proof
     assert "Worklink unexpectedly selected the contained checkout path" in proof
     assert "issue_id=1411" in proof
+
+
+@pytest.mark.parametrize("extras", ["anthropic,discord,slack,mcp", "openai,local-embeddings,mcp"])
+def test_pypi_scripts_install_configured_extras_in_both_venvs(tmp_path, extras) -> None:
+    scripts = ROOT / "plugins/cultivate/mimir_cultivate/docker"
+    copied = tmp_path / "cultivate-docker"
+    wheels = tmp_path / "worklink/wheels"
+    wheels.mkdir(parents=True)
+    copied.mkdir()
+    (copied / "verify_wheels.py").write_bytes((scripts / "verify_wheels.py").read_bytes())
+    agent = "mimir_agent-1.0-py3-none-any.whl"
+    cultivate = "mimir_cultivate-1.0-py3-none-any.whl"
+    for name in (agent, cultivate):
+        with zipfile.ZipFile(wheels / name, "w") as archive:
+            archive.writestr("metadata", name)
+    controller = tmp_path / "controller/venv"
+    worker = tmp_path / "worklink/venv"
+    log = tmp_path / "installs"
+    for venv in (controller, worker):
+        bin_dir = venv / "bin"
+        bin_dir.mkdir(parents=True)
+        for executable in ("pip", "python", "uv"):
+            stub = bin_dir / executable
+            stub.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$0" "$*" >> "$INSTALL_LOG"\n')
+            stub.chmod(0o755)
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    chown = commands / "chown"
+    chown.write_text("#!/bin/sh\nexit 0\n")
+    chown.chmod(0o755)
+    env = {**os.environ, "MIMIR_INSTALL_MODE": "pypi", "MIMIR_VERSION": "1.0",
+           "MIMIR_AGENT_WHEEL": agent, "MIMIR_CULTIVATE_WHEEL": cultivate,
+           "MIMIR_AGENT_SHA256": hashlib.sha256((wheels / agent).read_bytes()).hexdigest(),
+           "MIMIR_CULTIVATE_SHA256": hashlib.sha256((wheels / cultivate).read_bytes()).hexdigest(),
+           "MIMIR_EXTRAS": extras, "VIRTUAL_ENV": str(controller), "INSTALL_LOG": str(log),
+           "PATH": f"{controller / 'bin'}:{commands}:/usr/local/bin:/usr/bin:/bin"}
+    for name in ("controller", "executor"):
+        program = (scripts / f"{name}.sh").read_text()
+        program = program.replace("/opt/cultivate-docker", str(copied))
+        program = program.replace("/opt/mimir-worklink", str(tmp_path / "worklink"))
+        program = program.replace("/usr/local/bin/uv", str(tmp_path / "uv"))
+        # The venvs and pip recorders are fixture-owned; run the real installer branch.
+        program = program.replace(f"python3 -m venv {worker}", ":")
+        result = subprocess.run(["/bin/sh", "-c", program], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    for venv in (controller, worker):
+        installs = [line for line in lines if line.startswith(str(venv / "bin/pip") + "|")]
+        assert any(f"{wheels / agent}[{extras}]" in line and str(wheels / cultivate) in line
+                   for line in installs)
+    assert (controller / "controller-install-identity.json").is_file()
+    assert (tmp_path / "worklink/executor-install-identity.json").is_file()
