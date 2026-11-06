@@ -26,7 +26,8 @@ from tests.test_budget_gate_and_alias import (
     _ifc_turn, _make_request, _repo_granted_auth, _untainted_ifc_auth,
 )
 from tests.test_repo_tools import (
-    _configure_worklink_test, _fixture_git_env, _repo_scope_and_state,
+    _configure_test_suites, _configure_worklink_test, _fixture_git_env,
+    _repo_scope_and_state, _test_checkout_factory,
 )
 
 
@@ -428,3 +429,128 @@ async def test_repo_test_relative_runner_refuses_unresolvable_or_escaping_path(
     assert error.value.code == "test_command_unresolvable"
     assert not error.value.execution_started
     assert not calls and not marker.exists()
+
+
+def _two_leg_suites(command: str) -> list[dict]:
+    return [{
+        "name": "python", "default": True, "selector_prefixes": ["tests/"],
+        "legs": [
+            {"name": "core", "command": command},
+            {"name": "cultivate", "command": command,
+             "env": {"MIMIR_PLUGINS": "cultivate"},
+             "default_paths": ["tests", "plugins/cultivate/tests"]},
+        ],
+    }]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selectors", [(), ("tests/test_changed.py",)])
+async def test_repo_test_legs_process_env_and_selectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selectors: tuple[str, ...],
+) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.path
+    (root / "tools").mkdir()
+    script = root / "tools" / "verify"
+    script.write_text('#!/bin/sh\nprintf "%s|%s\\n" "${MIMIR_PLUGINS-unset}" "$*"\n')
+    script.chmod(0o755)
+    (root / "tests").mkdir()
+    (root / "tests/test_changed.py").write_text("def test_changed(): pass\n")
+    (root / "plugins/cultivate/tests").mkdir(parents=True)
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, test_suites=_two_leg_suites("./tools/verify"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_PLUGINS", "ambient")
+    calls = []
+
+    async def runner(argv, capability, environment, projections, **kwargs):
+        calls.append(argv)
+        process = subprocess.run(argv, cwd=capability.path, env=environment, capture_output=True, check=False)
+        return CollectedExecutionResult(process.returncode, process.stdout, process.stderr,
+                                        False, False, 0, 0)
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(selectors)
+    assert result.ok and result.failed_leg is None
+    expected = selectors or ()
+    assert calls[0] == ("./tools/verify", *expected)
+    assert calls[1] == ("./tools/verify", *(selectors or ("tests", "plugins/cultivate/tests")))
+    assert result.legs[0]["stdout"] == f"unset|{' '.join(expected)}\n"
+    assert result.legs[1]["stdout"] == (
+        f"cultivate|{' '.join(selectors or ('tests', 'plugins/cultivate/tests'))}\n"
+    )
+    assert state.full_tested_head == (state.git_expected_head if not selectors else None)
+
+
+@pytest.mark.asyncio
+async def test_repo_test_legs_stop_at_first_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, test_suites=_two_leg_suites("/usr/bin/false"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (state.checkout_lease.path / "tests").mkdir()
+    (state.checkout_lease.path / "plugins/cultivate/tests").mkdir(parents=True)
+    calls = []
+
+    async def runner(argv, *args, **kwargs):
+        calls.append(argv)
+        return CollectedExecutionResult(1, b"failed", b"", False, False, 0, 0)
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute()
+    assert result.code == "tests_failed" and result.failed_leg == "core"
+    assert [leg["name"] for leg in result.legs] == ["core"]
+    assert len(calls) == 1 and state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env", [
+    {"UNLISTED": "cultivate"}, {"PATH": "safe"},
+    {"MIMIR_PLUGINS": "cultivate;id"}, {"MIMIR_PLUGINS": "a" * 65},
+    {"MIMIR_ACCESS_CONTROL_ENFORCED": 1},
+])
+async def test_repo_test_legs_reject_env_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: dict,
+) -> None:
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    suites = _two_leg_suites("/usr/bin/true")
+    suites[0]["legs"][1]["env"] = env
+    _configure_test_suites(home, state, test_suites=suites)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (state.checkout_lease.path / "tests").mkdir()
+    (state.checkout_lease.path / "plugins/cultivate/tests").mkdir(parents=True)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid leg configuration must not create a checkout")
+
+    with pytest.raises(repository.ProjectTestRefusal) as error:
+        await repository.RepoProjectTests(state, checkout_factory=forbidden).execute()
+    assert error.value.code == "test_config_invalid" and not error.value.execution_started
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paths", [["../outside"], ["missing"]])
+async def test_repo_test_legs_reject_bad_default_paths_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, paths: list[str],
+) -> None:
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    suites = _two_leg_suites("/usr/bin/true")
+    suites[0]["legs"][1]["default_paths"] = paths
+    _configure_test_suites(home, state, test_suites=suites)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid fallback must not create a checkout")
+
+    with pytest.raises(repository.ProjectTestRefusal) as error:
+        await repository.RepoProjectTests(state, checkout_factory=forbidden).execute()
+    assert error.value.code in {"test_selector_outside_checkout", "test_selector_not_found"}
+    assert not error.value.execution_started

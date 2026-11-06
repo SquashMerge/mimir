@@ -642,7 +642,8 @@ Each repository can declare `test_suites` (default `[]`) in
 | Field | Type | Default | Effect |
 |---|---|---|---|
 | `name` | str | required | Unique suite name matching `[A-Za-z0-9][A-Za-z0-9_.-]*`. The name `default` is reserved when the repository has a non-null `test_command`. |
-| `command` | str | required | Non-empty, operator-configured test command, POSIX-split into fixed arguments. |
+| `command` | str | one of `command` or `legs` required | Non-empty, operator-configured test command, POSIX-split into fixed arguments. |
+| `legs` | list[leg] | one of `command` or `legs` required | Non-empty ordered list of named legs; stops at the first failed leg. Each leg's `command` is shell-free. |
 | `default` | bool | `false` | Select this suite when neither a suite name nor selectors are supplied. At most one suite may set `default: true`. |
 | `selector_prefixes` | list[str] | `[]` | Non-empty literal prefixes used to route selector paths to this suite. |
 | `selector_suffixes` | list[str] | `[]` | Non-empty literal suffixes used to route selector paths to this suite. |
@@ -668,6 +669,35 @@ repositories:
         selector_prefixes: [frontend/]
         selector_suffixes: [.test.ts, .test.tsx]
 ```
+
+To run core tests followed by the Cultivate leg in the same selected suite:
+
+```yaml
+test_suites:
+  - name: python
+    default: true
+    selector_prefixes: [tests/, plugins/cultivate/tests/]
+    selector_suffixes: [.py]
+    legs:
+      - name: core
+        command: env -u MIMIR_PLUGINS uv run --extra dev --extra bench pytest -q
+      - name: cultivate
+        command: uv run --extra dev --extra bench pytest -q
+        env: {MIMIR_PLUGINS: cultivate}
+        default_paths: [tests, plugins/cultivate/tests]
+```
+
+Each leg requires a unique safe `name` and a non-empty `command`; `env` and
+`default_paths` are optional. `env` accepts only `MIMIR_PLUGINS` and
+`MIMIR_ACCESS_CONTROL_ENFORCED`, with string values matching
+`^[A-Za-z0-9_,.-]{0,64}$`. Invalid configuration refuses `repo_test` with
+`test_config_invalid` before any leg runs. Each leg starts from the runner's
+fresh environment, plus only its own declared `env`; PR content, tool arguments
+and ambient environment cannot add variables. Selectors are validated and
+appended to **every** leg; a leg's `default_paths` are used only when no
+selectors are given. All paths must exist in the authorized checkout. Results
+include bounded per-leg output and pytest summaries, plus `failed_leg` on
+failure. The single-`command` form retains its existing behavior.
 
 `repo_test` resolves the command and suite as follows:
 

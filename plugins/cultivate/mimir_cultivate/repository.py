@@ -17,12 +17,25 @@ from mimir._paths import live_loader_path_allowed
 
 
 @dataclass(frozen=True)
+class RepositoryTestLeg:
+    name: str
+    command: str
+    env: tuple[tuple[str, str], ...] = ()
+    default_paths: tuple[str, ...] = ()
+
+
+_TEST_LEG_ENV_NAMES = frozenset({"MIMIR_PLUGINS", "MIMIR_ACCESS_CONTROL_ENFORCED"})
+_TEST_LEG_ENV_VALUE = re.compile(r"[A-Za-z0-9_,.-]{0,64}", re.ASCII)
+
+
+@dataclass(frozen=True)
 class RepositoryTestSuite:
     name: str
     command: str
     default: bool = False
     selector_prefixes: tuple[str, ...] = ()
     selector_suffixes: tuple[str, ...] = ()
+    legs: tuple[RepositoryTestLeg, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -202,11 +215,14 @@ def _parse_test_suites(
         suite_label = f"{label}[{index}]"
         if not isinstance(item, dict):
             raise ValueError(f"{suite_label} must be a mapping")
-        missing = [key for key in ("name", "command") if key not in item]
-        if missing:
-            raise ValueError(f"{suite_label} missing required field(s): {', '.join(missing)}")
-        if set(item) - {"name", "command", "default", "selector_prefixes", "selector_suffixes"}:
+        if "name" not in item:
+            raise ValueError(f"{suite_label} missing required field(s): name")
+        if set(item) - {"name", "command", "legs", "default", "selector_prefixes", "selector_suffixes"}:
             raise ValueError(f"{suite_label} contains unknown fields")
+        if "command" not in item and "legs" not in item:
+            raise ValueError(f"{suite_label} missing required field(s): command or legs")
+        if "command" in item and "legs" in item:
+            raise ValueError(f"{suite_label} requires exactly one of command or legs")
         name = item["name"]
         if not isinstance(name, str) or _TEST_SUITE_NAME.fullmatch(name) is None:
             raise ValueError(f"{suite_label}.name must be a safe name matching {_TEST_SUITE_NAME.pattern}")
@@ -214,9 +230,38 @@ def _parse_test_suites(
             raise ValueError(f"{suite_label} duplicate test suite name: {name}")
         if name == "default" and test_command is not None:
             raise ValueError(f"{suite_label}.name 'default' is reserved when test_command is nonnull")
-        command = item["command"]
-        if not isinstance(command, str) or not command.strip():
+        command = item.get("command", "")
+        if "command" in item and (not isinstance(command, str) or not command.strip()):
             raise ValueError(f"{suite_label}.command must be a non-empty string")
+        legs: list[RepositoryTestLeg] = []
+        if "legs" in item:
+            entries = item["legs"]
+            if not isinstance(entries, list) or not entries:
+                raise ValueError(f"{suite_label}.legs must be a non-empty list")
+            leg_names: set[str] = set()
+            for leg_index, entry in enumerate(entries):
+                leg_label = f"{suite_label}.legs[{leg_index}]"
+                if not isinstance(entry, dict) or set(entry) - {"name", "command", "env", "default_paths"}:
+                    raise ValueError(f"{leg_label} must be a mapping with known fields")
+                leg_name = entry.get("name")
+                if (not isinstance(leg_name, str) or _TEST_SUITE_NAME.fullmatch(leg_name) is None
+                        or leg_name in leg_names):
+                    raise ValueError(f"{leg_label}.name must be a unique safe name")
+                leg_command = entry.get("command")
+                if not isinstance(leg_command, str) or not leg_command.strip():
+                    raise ValueError(f"{leg_label}.command must be a non-empty string")
+                leg_env = entry.get("env", {})
+                if not isinstance(leg_env, dict) or any(
+                    not isinstance(key, str) or key not in _TEST_LEG_ENV_NAMES
+                    or not isinstance(value, str) or _TEST_LEG_ENV_VALUE.fullmatch(value) is None
+                    for key, value in leg_env.items()
+                ):
+                    raise ValueError(f"{leg_label}.env contains a disallowed name or value")
+                paths = entry.get("default_paths", [])
+                if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+                    raise ValueError(f"{leg_label}.default_paths must be a list of paths")
+                leg_names.add(leg_name)
+                legs.append(RepositoryTestLeg(leg_name, leg_command, tuple(leg_env.items()), tuple(paths)))
         default = item.get("default", False)
         if not isinstance(default, bool):
             raise ValueError(f"{suite_label}.default must be a boolean")
@@ -232,7 +277,7 @@ def _parse_test_suites(
             selectors[field] = tuple(entries)
         names.add(name)
         has_default = has_default or default
-        suites.append(RepositoryTestSuite(name, command, default, **selectors))
+        suites.append(RepositoryTestSuite(name, command, default, **selectors, legs=tuple(legs)))
     return tuple(suites)
 
 
@@ -4074,6 +4119,16 @@ class ProjectTestResult:
     stderr_path: str = ""
     suite: str = "default"
     failure_summary: dict[str, object] | None = None
+    failed_leg: str | None = None
+    legs: tuple[dict[str, object], ...] = ()
+
+
+@dataclass(frozen=True)
+class _ResolvedTestLeg:
+    name: str
+    command: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()
+    default_paths: tuple[str, ...] = ()
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
@@ -4092,8 +4147,8 @@ def _selector_matches(path: str, suite: RepositoryTestSuite) -> bool:
 def _configured_command(
     repo_slug: str, selectors: tuple[str, ...] = (), suite: str | None = None,
     root: Path | None = None,
-) -> tuple[tuple[str, ...], dict[str, str], str, str, bool]:
-    """Resolve Worklink's deployment command into one shell-free fixed argv."""
+) -> tuple[tuple[str, ...] | tuple[_ResolvedTestLeg, ...], dict[str, str], str, str, bool]:
+    """Resolve a selected suite into prevalidated shell-free commands."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         raise ProjectTestRefusal(
@@ -4144,10 +4199,8 @@ def _configured_command(
                 execution_started=False,
             )
         chosen = matches[0]
-        command = chosen.command
         if not legacy and chosen in record.test_suites:
             source = "repository"
-        words = shlex.split(command, posix=True)
     except ProjectTestRefusal:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -4156,13 +4209,6 @@ def _configured_command(
             "project test command is invalid",
             execution_started=False,
         ) from exc
-    if not words:
-        raise ProjectTestRefusal(
-            "test_command_unresolvable",
-            f"project test command from {source} configuration is empty",
-            execution_started=False,
-        )
-
     env = {
         "PATH": _PATH,
         # HOME is deliberately absent here. A writable HOME is required -- every
@@ -4182,6 +4228,35 @@ def _configured_command(
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
+    configured_legs = chosen.legs or (RepositoryTestLeg(chosen.name, chosen.command),)
+    resolved_legs = tuple(
+        _resolve_test_leg(leg, root, env, selectors, legacy, source)
+        for leg in configured_legs
+    )
+    if chosen.legs:
+        return resolved_legs, env, source, chosen.name, chosen == default
+    return resolved_legs[0].command, dict(resolved_legs[0].env), source, chosen.name, chosen == default
+
+
+def _resolve_test_leg(
+    leg: RepositoryTestLeg, root: Path | None, base_env: dict[str, str],
+    selectors: tuple[str, ...], legacy: bool, source: str,
+) -> _ResolvedTestLeg:
+    try:
+        words = shlex.split(leg.command, posix=True)
+    except ValueError as exc:
+        raise ProjectTestRefusal(
+            "test_config_invalid", "project test command is invalid", execution_started=False,
+        ) from exc
+    if not words:
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            f"project test command from {source} configuration is empty",
+            execution_started=False,
+        )
+    # Preserve the existing shell-free `env -u NAME` compatibility form. Its
+    # unset operation applies only to this leg's fresh environment.
+    leg_env = dict(base_env)
     if Path(words[0]).name == "env":
         index = 1
         while index < len(words) and words[index] in {"-u", "--unset"}:
@@ -4191,7 +4266,7 @@ def _configured_command(
                     "invalid env unset directive",
                     execution_started=False,
                 )
-            env.pop(words[index + 1], None)
+            leg_env.pop(words[index + 1], None)
             index += 2
         words = words[index:]
         if not words:
@@ -4244,7 +4319,10 @@ def _configured_command(
             "configured test runner is unavailable",
             execution_started=False,
         )
-    return (str(resolved), *words[1:]), env, source, chosen.name, chosen == default
+    leg_env.update(leg.env)
+    return _ResolvedTestLeg(
+        leg.name, (str(resolved), *words[1:]), tuple(leg_env.items()), leg.default_paths,
+    )
 
 
 def _validated_selectors(
@@ -4565,10 +4643,19 @@ class RepoProjectTests:
         try:
             repository = scope.repository if retained else scope.canonical_repo
             issue = scope.issue_id if retained else scope.pr_number
-            command, configured_env, command_source, suite_name, is_default = _configured_command(
+            commands, configured_env, command_source, suite_name, is_default = _configured_command(
                 repository, selectors, suite, root
             )
             selected = _validated_selectors(root, selectors, suite=suite_name)
+            legs = (
+                commands if commands and isinstance(commands[0], _ResolvedTestLeg)
+                else (_ResolvedTestLeg(suite_name, commands, tuple(configured_env.items())),)
+            )
+            # Validate every fallback before the first leg can start.
+            paths_by_leg = tuple(
+                selected if selectors else _validated_selectors(root, leg.default_paths, suite=suite_name)
+                for leg in legs
+            )
         except ProjectTestRefusal as exc:
             raise ProjectTestRefusal(
                 exc.code,
@@ -4640,121 +4727,106 @@ class RepoProjectTests:
                 fixed_message=True,
             ) from exc
 
-        identifier = str(uuid.uuid4())
-        stdout_path, stderr_path, stdout_relative, stderr_relative = _live_output_paths(
-            os.environ["MIMIR_HOME"], identifier
-        )
         scrubber.add_path(checkout.path)
-        command = _remap_command(root, command)
-        environment = base_worker_environment(identifier)
-        environment.update(configured_env)
-        environment.pop("HOME", None)
-        environment.update({
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "safe.directory",
-            "GIT_CONFIG_VALUE_0": "*",
-        })
-        if Path(command[0]).name == "uv":
-            # uv otherwise searches above the fd-entered checkout for uv.toml.
-            # The snapshot's 0700 isolation boundary deliberately cannot be
-            # traversed by the worker, so ambient config discovery must be off.
-            environment["UV_NO_CONFIG"] = "1"
-            # The executor may seed this disposable cache from its image-owned
-            # read-only cache. Misses remain writable here and can download
-            # normally without giving executions write access to shared state.
-            environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
-        if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
-            try:
-                checkout.close()
-            except (OSError, RuntimeError, ValueError) as exc:
-                await safe_log_event(
-                    "repo_test_containment_refused",
-                    reason_code="cleanup_failed",
-                    repository=repository,
-                    pull_request=issue,
-                )
-                raise ProjectTestRefusal(
-                    "test_snapshot_cleanup_failed",
-                    "project test snapshot cleanup failed",
-                    execution_started=True,
-                    fixed_message=True,
-                ) from exc
-            raise ProjectTestRefusal(
-                "test_config_invalid",
-                "project test command or environment contains a controller path",
-                execution_started=True,
-                fixed_message=True,
+        prepared = []
+        for leg in legs:
+            identifier = str(uuid.uuid4())
+            stdout_path, stderr_path, stdout_relative, stderr_relative = _live_output_paths(
+                os.environ["MIMIR_HOME"], identifier
             )
-        result: CollectedExecutionResult | None = None
-        try:
-            try:
-                result = await self._runner(
-                    (*command, *selected),
-                    checkout.capability,
-                    environment,
-                    (),
-                    identifier=identifier,
-                    timeout_s=self._timeout,
-                    stdout_limit=self._output_limit,
-                    stderr_limit=self._output_limit,
-                    scrubber=scrubber,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                )
-            except StaleWorkerExecutorError as exc:
-                await safe_log_event(
-                    "repo_test_containment_refused",
-                    reason_code="stale_root_executor",
-                    repository=repository,
-                    pull_request=issue,
-                )
-                raise ProjectTestRefusal(
-                    "test_stale_root_executor",
-                    str(exc),
-                    execution_started=True,
-                ) from exc
-            except (OSError, RuntimeError, ValueError) as exc:
-                diagnostic = _permission_diagnostic_from_error(exc)
-                if diagnostic is not None:
+            command = _remap_command(root, leg.command)
+            environment = base_worker_environment(identifier)
+            environment.update(leg.env)
+            environment.pop("HOME", None)
+            environment.update({
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": "*",
+            })
+            if Path(command[0]).name == "uv":
+                # Disable ambient uv config above the fd-entered checkout.
+                environment["UV_NO_CONFIG"] = "1"
+                environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
+            if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
+                try:
+                    checkout.close()
+                except (OSError, RuntimeError, ValueError) as exc:
                     await safe_log_event(
-                        "repo_test_containment_refused",
-                        reason_code="path_permission_denied",
-                        repository=repository,
-                        pull_request=issue,
-                        **diagnostic,
+                        "repo_test_containment_refused", reason_code="cleanup_failed",
+                        repository=repository, pull_request=issue,
                     )
                     raise ProjectTestRefusal(
-                        "test_path_permission_denied",
-                        _permission_refusal_message(diagnostic),
-                        execution_started=True,
+                        "test_snapshot_cleanup_failed", "project test snapshot cleanup failed",
+                        execution_started=True, fixed_message=True,
                     ) from exc
-                await safe_log_event(
-                    "repo_test_containment_refused",
-                    reason_code="containment_unavailable",
-                    repository=repository,
-                    pull_request=issue,
-                )
                 raise ProjectTestRefusal(
-                    "test_containment_unavailable",
-                    "contained project test execution is unavailable",
-                    execution_started=True,
-                    fixed_message=True,
-                ) from exc
-            if result.exit_code not in {None, 0}:
-                diagnostic = _permission_diagnostic_from_error(result.stderr)
-                if diagnostic is not None:
-                    await safe_log_event(
-                        "repo_test_containment_refused",
-                        reason_code="path_permission_denied",
-                        repository=repository,
-                        pull_request=issue,
-                        **diagnostic,
-                    )
-                    raise ProjectTestRefusal(
-                        "test_path_permission_denied",
-                        _permission_refusal_message(diagnostic),
-                        execution_started=True,
-                    )
+                    "test_config_invalid", "project test command or environment contains a controller path",
+                    execution_started=True, fixed_message=True,
+                )
+            prepared.append((command, environment, identifier, stdout_path, stderr_path,
+                             stdout_relative, stderr_relative))
+        result: CollectedExecutionResult | None = None
+        leg_summaries: list[dict[str, object]] = []
+        try:
+            for leg, paths, prepared_leg in zip(legs, paths_by_leg, prepared):
+                (command, environment, identifier, stdout_path, stderr_path,
+                 stdout_relative, stderr_relative) = prepared_leg
+                try:
+                    try:
+                        result = await self._runner(
+                            (*command, *paths), checkout.capability, environment, (),
+                            identifier=identifier, timeout_s=self._timeout,
+                            stdout_limit=self._output_limit, stderr_limit=self._output_limit,
+                            scrubber=scrubber, stdout_path=stdout_path, stderr_path=stderr_path,
+                        )
+                    except StaleWorkerExecutorError as exc:
+                        await safe_log_event(
+                            "repo_test_containment_refused", reason_code="stale_root_executor",
+                            repository=repository, pull_request=issue,
+                        )
+                        raise ProjectTestRefusal("test_stale_root_executor", str(exc), execution_started=True) from exc
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        diagnostic = _permission_diagnostic_from_error(exc)
+                        if diagnostic is not None:
+                            await safe_log_event(
+                                "repo_test_containment_refused", reason_code="path_permission_denied",
+                                repository=repository, pull_request=issue, **diagnostic,
+                            )
+                            raise ProjectTestRefusal(
+                                "test_path_permission_denied", _permission_refusal_message(diagnostic),
+                                execution_started=True,
+                            ) from exc
+                        await safe_log_event(
+                            "repo_test_containment_refused", reason_code="containment_unavailable",
+                            repository=repository, pull_request=issue,
+                        )
+                        raise ProjectTestRefusal(
+                            "test_containment_unavailable", "contained project test execution is unavailable",
+                            execution_started=True, fixed_message=True,
+                        ) from exc
+                    if result.exit_code not in {None, 0}:
+                        diagnostic = _permission_diagnostic_from_error(result.stderr)
+                        if diagnostic is not None:
+                            await safe_log_event(
+                                "repo_test_containment_refused", reason_code="path_permission_denied",
+                                repository=repository, pull_request=issue, **diagnostic,
+                            )
+                            raise ProjectTestRefusal(
+                                "test_path_permission_denied", _permission_refusal_message(diagnostic),
+                                execution_started=True,
+                            )
+                    leg_summaries.append({
+                        "name": leg.name, "returncode": result.exit_code,
+                        "timed_out": result.timed_out, "output_limited": result.output_overflow,
+                        "pytest_summary": _pytest_terminal_summary(result.stdout),
+                        "stdout": _safe_output(result.stdout, scrubber, _RETURN_STDOUT_CHARS)[0],
+                        "stderr": _safe_stderr_output(result.stderr, scrubber, _RETURN_STDERR_CHARS)[0],
+                    })
+                    if result.exit_code != 0 or result.timed_out or result.output_overflow:
+                        break
+                finally:
+                    if result is None or not result.timed_out:
+                        _remove_live_output(stdout_path, stderr_path)
         finally:
             try:
                 checkout.close()
@@ -4771,9 +4843,6 @@ class RepoProjectTests:
                     execution_started=True,
                     fixed_message=True,
                 ) from exc
-            finally:
-                if result is None or not result.timed_out:
-                    _remove_live_output(stdout_path, stderr_path)
 
         assert result is not None
 
@@ -4796,12 +4865,16 @@ class RepoProjectTests:
         parsed = {
             "pytest_summary": summary,
             "failing_node_ids": (failure_summary["failing"][:_RETURN_FAILING_NODES]
-                                 if failure_summary is not None else []),
+                                  if failure_summary is not None else []),
         }
+        leg_report = {"legs": tuple(leg_summaries), "failed_leg": (
+            legs[len(leg_summaries) - 1].name
+            if result.exit_code != 0 or result.timed_out or result.output_overflow else None
+        )}
         if result.timed_out:
             return ProjectTestResult(
                 False, "test_timeout", None, stdout, stderr,
-                command, command_source, **truncation, **parsed,
+                command, command_source, **truncation, **parsed, **leg_report,
                 git_context=_git_execution_context(),
                 stdout_path=stdout_relative,
                 stderr_path=stderr_relative,
@@ -4814,7 +4887,7 @@ class RepoProjectTests:
                 code = "test_output_overflow" if result.exit_code == 0 else "tests_failed_output_overflow"
             return ProjectTestResult(
                 False, code, result.exit_code, stdout, stderr,
-                command, command_source, **truncation, **parsed,
+                command, command_source, **truncation, **parsed, **leg_report,
                 git_context=_git_execution_context(),
                 failure_summary=(failure_summary if code == "tests_failed" else None),
             )
@@ -4832,7 +4905,7 @@ class RepoProjectTests:
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,
-            **truncation, **parsed, git_context=_git_execution_context(),
+            **truncation, **parsed, **leg_report, git_context=_git_execution_context(),
         )
 
 # Model-facing repository tools
