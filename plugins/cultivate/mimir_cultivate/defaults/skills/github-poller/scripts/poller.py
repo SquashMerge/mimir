@@ -31,13 +31,14 @@ detect the failure without persisting an untrusted response or endpoint.
 Exception — review-requests (chainlink #299): that "advance regardless"
 tradeoff covers POLL-side (gh-api) failures, NOT the downstream review
 TURN failing. A ``pr_review_requested`` whose triggered turn dies (e.g.
-a transient model 503) would otherwise vanish — the cursor recorded the
+a model failure) would otherwise vanish — the cursor recorded the
 request as "already seen," so it never re-fired and the review was
 silently dropped (observed on PR #511). The review-request cursor now
 stores a per-PR ATTEMPT COUNT and RE-EMITS while ``me`` remains a
 requested reviewer — a submitted review removes ``me`` from
 ``requested_reviewers``, so "still requested" means "review still
-pending" — bounded by ``REVIEW_REQUEST_MAX_ATTEMPTS``. On exhaustion it
+pending" — bounded by ``REVIEW_REQUEST_MAX_ATTEMPTS`` for model failures
+and a separate backoff/cap for pre-work infrastructure failures. On exhaustion it
 emits a one-shot ``pr_review_request_gave_up`` signal (negative
 algedonic; ``feedback.classify`` maps the ``*_gave_up`` suffix) and goes
 dormant for that PR. The bound is the wedge guard the original tradeoff
@@ -186,6 +187,12 @@ BODY_PREVIEW_CHARS = 300
 # At ~15-min polls this is ~3 retries over ~45 min before the give-up
 # signal fires.
 REVIEW_REQUEST_MAX_ATTEMPTS = 3
+# Infrastructure failures before work have a separate, larger wedge guard.
+# Backoff starts at one poll interval and doubles up to two hours; six failed
+# turns exhaust in well under the recovery ledger's 48-hour stash TTL.
+REVIEW_REQUEST_MAX_INFRA_FAILURES = 6
+REVIEW_REQUEST_INFRA_BACKOFF = timedelta(minutes=15)
+REVIEW_REQUEST_INFRA_BACKOFF_CAP = timedelta(hours=2)
 
 _RECOVERY_STATE_FILE = ".recovery.json"
 _REVIEW_TURN_EVENT_TYPES = frozenset({
@@ -617,7 +624,7 @@ def _review_recovery_state(
     after: str = "",
     head_sha: str = "",
     pending_before: str = "",
-) -> tuple[int, bool, bool, bool, list[str], str, list[str], int] | None:
+) -> tuple[int, bool, bool, bool, list[str], str, list[str], int, int, str, str] | None:
     """Return charged/pending/refusal details from framework recovery state.
 
     ``None`` means recovery state is unavailable, for example when this script is
@@ -644,6 +651,9 @@ def _review_recovery_state(
     latest_refusal_at = ""
     refusal_reasons: list[str] = []
     self_clearing_refusals = 0
+    infrastructure_failures = 0
+    latest_infrastructure_at = ""
+    infrastructure_cause = ""
     for entry in inflight.values():
         if not isinstance(entry, dict):
             continue
@@ -688,6 +698,28 @@ def _review_recovery_state(
                     latest_refusal_at = outcome_at
                     refusal_reasons = [reason]
                 continue
+            # Only framework-authored classification/phase can exempt an
+            # attempt. An unknown or legacy outcome is charged, never inferred
+            # from error text (which can include model/tool output).
+            tool_calls = entry.get("outcome_tool_call_count")
+            no_work = (type(tool_calls) is int and tool_calls == 0) or (
+                entry.get("outcome_phase") == "pre_model_loop" and tool_calls is None
+            )
+            if (
+                event_types == _REVIEW_TURN_EVENT_TYPES
+                and no_work
+                and (entry.get("outcome_disposition") == "transient_provider"
+                     or entry.get("outcome_phase") == "pre_model_loop")
+            ):
+                infrastructure_failures += max(attempts, 1)
+                if isinstance(outcome_at, str) and outcome_at >= latest_infrastructure_at:
+                    latest_infrastructure_at = outcome_at
+                    reason = entry.get("outcome_reason")
+                    if not isinstance(reason, str) or not reason:
+                        reasons = entry.get("attempt_reasons")
+                        reason = reasons[-1] if isinstance(reasons, list) and reasons else "infrastructure_failure"
+                    infrastructure_cause = str(reason)[:240]
+                continue
             # Pre-fix persisted failures may still say attempts=0. The durable
             # outcome proves that turn started even when the old counter did not.
             started += max(attempts, 1)
@@ -706,6 +738,7 @@ def _review_recovery_state(
     return (
         started, pending, found, canonical, attempt_reasons,
         latest_refusal_at, refusal_reasons, self_clearing_refusals,
+        infrastructure_failures, latest_infrastructure_at, infrastructure_cause,
     )
 
 
@@ -2169,8 +2202,9 @@ def _check_pr_pushes(
                     if recovery is not None:
                         (
                             started, pending, found, canonical, _, _, _, _,
+                            infra_failures, latest_infra_at, infra_cause,
                         ) = recovery
-                        if found:
+                        if found and prior_attempts <= REVIEW_REQUEST_MAX_ATTEMPTS:
                             prior_attempts = max(
                                 started,
                                 prior_attempts if canonical else 0,
@@ -2178,6 +2212,38 @@ def _check_pr_pushes(
                         if pending:
                             new_review_requests[key] = prior_attempts
                             continue
+
+                        if prior_attempts > REVIEW_REQUEST_MAX_ATTEMPTS:
+                            new_review_requests[key] = prior_attempts
+                            continue
+
+                        if infra_failures >= REVIEW_REQUEST_MAX_INFRA_FAILURES:
+                            _emit_signal(
+                                "pr_review_request_gave_up",
+                                repo=repo, number=number, url=url,
+                                requested_reviewer=me, attempts=prior_attempts,
+                                infrastructure_failures=infra_failures,
+                                infrastructure_cause=infra_cause,
+                            )
+                            count += 1
+                            new_review_requests[key] = REVIEW_REQUEST_MAX_ATTEMPTS + 1
+                            continue
+                        if latest_infra_at:
+                            try:
+                                failed_at = datetime.fromisoformat(
+                                    latest_infra_at.replace("Z", "+00:00")
+                                )
+                                delay = min(
+                                    REVIEW_REQUEST_INFRA_BACKOFF * (2 ** (infra_failures - 1)),
+                                    REVIEW_REQUEST_INFRA_BACKOFF_CAP,
+                                )
+                                if datetime.now(timezone.utc) < failed_at + delay:
+                                    new_review_requests[key] = prior_attempts
+                                    continue
+                            except (ValueError, TypeError, OverflowError):
+                                # A malformed timestamp cannot indefinitely pin
+                                # a request; the separate failure cap still holds.
+                                pass
 
                     if prior_attempts < REVIEW_REQUEST_MAX_ATTEMPTS:
                         attempt = prior_attempts + 1
@@ -2919,7 +2985,7 @@ def _check_own_changes_requested(
         if recovery is not None:
             (
                 charged, pending, found, _, attempt_reasons,
-                latest_refusal_at, refusal_reasons, self_clearing_refusals,
+                latest_refusal_at, refusal_reasons, self_clearing_refusals, *_infra,
             ) = recovery
             if found and prior_attempts <= REVIEW_REQUEST_MAX_ATTEMPTS:
                 # Recovery is authoritative over legacy emission-count cursors.

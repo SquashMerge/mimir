@@ -881,7 +881,10 @@ def test_direct_exec_env_scrubs_git_repository_and_helper_injection(
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
 
 
-def test_git_uses_minimal_env_and_repository_credentials(monkeypatch, selected_shell_policy) -> None:
+@pytest.mark.parametrize("no_bytecode", [None, "1"])
+def test_git_uses_minimal_env_and_repository_credentials(
+    monkeypatch, selected_shell_policy, no_bytecode,
+) -> None:
     """Only review pull/push need auth, supplied by the configured helper.
 
     Inspection Git has ``credential.helper=`` injected into argv. Authorized
@@ -890,14 +893,19 @@ def test_git_uses_minimal_env_and_repository_credentials(monkeypatch, selected_s
     """
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
     monkeypatch.setenv("GIT_ASKPASS", "/tmp/credential-helper")
+    if no_bytecode is None:
+        monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", no_bytecode)
 
     env = direct_exec_env(["/usr/bin/git", "push", "origin", "topic"])
 
     assert "GITHUB_TOKEN" not in env
     assert "GIT_ASKPASS" not in env
+    assert env.get("PYTHONDONTWRITEBYTECODE") == no_bytecode
     assert set(env) <= {
         "PATH", "HOME", "LANG", "TZ", "GIT_CONFIG_NOSYSTEM", "GIT_PAGER",
-        "GIT_OPTIONAL_LOCKS",
+        "GIT_OPTIONAL_LOCKS", "PYTHONDONTWRITEBYTECODE",
     } | {key for key in env if key.startswith("LC_")}
 
 

@@ -10,6 +10,7 @@ PRs drop out because the new dict is rebuilt from the current
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -1067,6 +1068,140 @@ def test_three_started_failed_review_turns_reach_give_up(monkeypatch, tmp_path):
     assert captured[0]["signal"] == "pr_review_request_gave_up"
     assert captured[0]["attempts"] == poller.REVIEW_REQUEST_MAX_ATTEMPTS
     assert rr == {"42": poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1}
+
+
+def _infra_review_entry(reason: str, *, phase: str | None = None,
+                        tool_calls: int | None = 0) -> dict:
+    entry = _review_recovery_entry(attempts=1, failed=True)
+    entry.update(
+        outcome_disposition="transient_provider" if phase is None else "charge",
+        outcome_phase=phase,
+        outcome_tool_call_count=tool_calls,
+        attempt_reasons=[reason],
+    )
+    return entry
+
+
+def test_three_connect_errors_then_success_still_review(monkeypatch, tmp_path):
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    requested = [True]
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [
+        _pr(42, "sha", requested_reviewers=["mimir-carreira"] if requested[0] else []),
+    ])
+    recovery_path = tmp_path / ".recovery.json"
+    failures = {}
+    rr = {"42": 0}
+    for i in range(4):
+        recovery_path.write_text(json.dumps({"inflight": failures}), encoding="utf-8")
+        captured.clear()
+        count, _, rr = poller._check_pr_pushes(
+            "o/r", token="t", me="mimir-carreira",
+            pr_heads={"42": "sha"}, pr_review_requests=rr,
+        )
+        assert count == 1
+        assert [e["attempt"] for e in captured if e.get("event_type") == "pr_review_requested"] == [1]
+        assert not any(e.get("signal") == "pr_review_request_gave_up" for e in captured)
+        assert rr == {"42": 0}
+        failures[f"dns-{i}"] = _infra_review_entry(
+            "provider_error_transient:ConnectError: [Errno -2] Name or service not known",
+        )
+    requested[0] = False
+    _, _, rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests=rr,
+    )
+    assert rr == {}
+
+
+def test_infrastructure_backoff_and_bound_record_cause(monkeypatch, tmp_path):
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [
+        _pr(42, "sha", requested_reviewers=["mimir-carreira"]),
+    ])
+    path = tmp_path / ".recovery.json"
+    reason = "provider_error_transient:ConnectError: [Errno -2] Name or service not known"
+    failed = _infra_review_entry(reason)
+    failed["last_outcome_at"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps({"inflight": {"dns-0": failed}}), encoding="utf-8")
+    count, _, rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests={"42": 0},
+    )
+    assert count == 0
+    assert captured == []
+    assert rr == {"42": 0}
+
+    failures = {}
+    for i in range(poller.REVIEW_REQUEST_MAX_INFRA_FAILURES):
+        entry = _infra_review_entry(reason)
+        entry["last_outcome_at"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        failures[f"dns-{i}"] = entry
+        path.write_text(json.dumps({"inflight": failures}), encoding="utf-8")
+        captured.clear()
+        count, _, rr = poller._check_pr_pushes(
+            "o/r", token="t", me="mimir-carreira",
+            pr_heads={"42": "sha"}, pr_review_requests=rr,
+        )
+        if i + 1 < poller.REVIEW_REQUEST_MAX_INFRA_FAILURES:
+            assert count == 1
+            assert captured[0]["event_type"] == "pr_review_requested"
+            assert captured[0]["attempt"] == 1
+        else:
+            assert count == 1
+            assert captured[0]["signal"] == "pr_review_request_gave_up"
+            assert captured[0]["attempts"] == 0
+            assert captured[0]["infrastructure_failures"] == poller.REVIEW_REQUEST_MAX_INFRA_FAILURES
+            assert captured[0]["infrastructure_cause"] == reason
+            assert rr == {"42": poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1}
+    captured.clear()
+    count, _, rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests=rr,
+    )
+    assert count == 0
+    assert captured == []
+
+
+@pytest.mark.parametrize("entry", [
+    _infra_review_entry("runner startup failed", phase="pre_model_loop", tool_calls=None),
+    _infra_review_entry("provider_error_transient:HTTPStatusError:429"),
+    _infra_review_entry("provider_error_transient:APIStatusError:503"),
+])
+def test_prework_infrastructure_does_not_charge(monkeypatch, tmp_path, entry):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    (tmp_path / ".recovery.json").write_text(json.dumps({
+        "inflight": {"failed": entry},
+    }), encoding="utf-8")
+    recovery = poller._review_recovery_state("o/r", "42")
+    assert recovery is not None
+    assert recovery[0] == 0
+    assert recovery[8] == 1
+
+
+def test_transient_failure_after_work_charges_review_attempt(monkeypatch, tmp_path):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    entry = _infra_review_entry("provider_error_transient:ConnectError", tool_calls=1)
+    (tmp_path / ".recovery.json").write_text(json.dumps({
+        "inflight": {"failed": entry},
+    }), encoding="utf-8")
+    recovery = poller._review_recovery_state("o/r", "42")
+    assert recovery is not None
+    assert recovery[0] == 1
+    assert recovery[8] == 0
+
+
+def test_startup_marker_cannot_override_recorded_work(monkeypatch, tmp_path):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    entry = _infra_review_entry("runner failed", phase="pre_model_loop", tool_calls=1)
+    (tmp_path / ".recovery.json").write_text(json.dumps({
+        "inflight": {"failed": entry},
+    }), encoding="utf-8")
+    recovery = poller._review_recovery_state("o/r", "42")
+    assert recovery is not None
+    assert recovery[0] == 1
+    assert recovery[8] == 0
 
 
 def test_queued_canonical_review_turn_keeps_deliberate_attempt(monkeypatch, tmp_path):

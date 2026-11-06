@@ -43,7 +43,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v13-paired-identity"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v13-control-output-size"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -1049,7 +1049,7 @@ def _wait_with_output_limits(
     stdout_limit: int,
     stderr_fd: int,
     stderr_limit: int,
-) -> tuple[int, bool, bool]:
+) -> tuple[int, bool, bool, int, int]:
     """Reap *proc* while enforcing output caps inside the durable executor.
 
     This monitor is deliberately executor-owned: controller loss must not turn
@@ -1060,34 +1060,40 @@ def _wait_with_output_limits(
     if isinstance(proc, _FactoryProcess):
         return _wait_factory(proc, timeout_s, stdout_fd, stdout_limit, stderr_fd, stderr_limit)
     deadline = time.monotonic() + timeout_s + _CONTROLLER_CANCELLATION_GRACE_S
+    observed = [0, 0]
     while True:
-        for fd, limit in ((stdout_fd, stdout_limit), (stderr_fd, stderr_limit)):
-            if os.fstat(fd).st_size > limit:
+        for index, (fd, limit) in enumerate(((stdout_fd, stdout_limit), (stderr_fd, stderr_limit))):
+            size = os.fstat(fd).st_size
+            observed[index] = max(observed[index], size)
+            if size > limit:
                 os.ftruncate(fd, limit)
                 _terminate_process_group(proc)
-                return proc.returncode if proc.returncode is not None else -signal.SIGKILL, False, True
+                return proc.returncode if proc.returncode is not None else -signal.SIGKILL, False, True, *observed
         exit_code = proc.poll()
         if exit_code is not None:
             _terminate_process_group(proc, 0)
-            return exit_code, False, False
+            return exit_code, False, False, *observed
         if time.monotonic() >= deadline:
             _terminate_process_group(proc)
-            return proc.returncode if proc.returncode is not None else -signal.SIGKILL, True, False
+            return proc.returncode if proc.returncode is not None else -signal.SIGKILL, True, False, *observed
         time.sleep(_OUTPUT_LIMIT_POLL_S)
 
 
 def _wait_factory(
     proc: _FactoryProcess, timeout_s: float,
     stdout_fd: int, stdout_limit: int, stderr_fd: int, stderr_limit: int,
-) -> tuple[int, bool, bool]:
+) -> tuple[int, bool, bool, int, int]:
     deadline = time.monotonic() + timeout_s + _CONTROLLER_CANCELLATION_GRACE_S
     ready = False
     timed_out = overflow = False
+    observed = [0, 0]
     proc.channel.setblocking(False)
     try:
         while True:
-            for fd, limit in ((stdout_fd, stdout_limit), (stderr_fd, stderr_limit)):
-                if os.fstat(fd).st_size > limit:
+            for index, (fd, limit) in enumerate(((stdout_fd, stdout_limit), (stderr_fd, stderr_limit))):
+                size = os.fstat(fd).st_size
+                observed[index] = max(observed[index], size)
+                if size > limit:
                     os.ftruncate(fd, limit)
                     overflow = True
             timed_out = timed_out or time.monotonic() >= deadline
@@ -1116,7 +1122,7 @@ def _wait_factory(
                     if proc.process.wait(timeout=_PROCESS_REAP_TIMEOUT_S) != 0:
                         raise RuntimeError("worklink_factory_supervisor_lost: abnormal supervisor exit")
                     proc.returncode = packet["exit_code"]
-                    return proc.returncode, timed_out, overflow
+                    return proc.returncode, timed_out, overflow, *observed
                 else:
                     raise RuntimeError("worklink_factory_supervisor_lost: invalid supervisor packet")
             if proc.stop_deadline is not None and time.monotonic() >= proc.stop_deadline:
@@ -1253,7 +1259,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             _jobs[identifier] = proc
             _launching.remove(identifier)
         _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
-        exit_code, timed_out, output_overflow = _wait_with_output_limits(
+        exit_code, timed_out, output_overflow, stdout_bytes, stderr_bytes = _wait_with_output_limits(
             proc,
             timeout_s,
             fds[1],
@@ -1271,6 +1277,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             "exit_code": exit_code,
             "timed_out": timed_out,
             "output_overflow": output_overflow,
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes,
         }, nonblocking=factory)
     finally:
         with _jobs_lock:

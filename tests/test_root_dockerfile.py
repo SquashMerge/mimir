@@ -1073,12 +1073,22 @@ def test_pypi_install_scripts_keep_dependency_cache_and_no_bytecode_policy():
 
 @pytest.mark.parametrize("mode", ["source", "pypi"])
 def test_controller_package_lockdown_is_pypi_only(tmp_path, mode):
+    import shlex
     import stat
 
     text = DOCKERFILE.read_text()
     program = next(p for p in _run_instructions(text) if "write_startup_hooks(CONTROLLER_HOOKS)" in p)
     assert 'if [ "$MIMIR_INSTALL_MODE" = pypi ]' in program
-    assert 'chown -R root:root /home/mimir/venv/lib/python*/site-packages/mimir' in program
+    ownership_commands = [
+        shlex.split(command.strip())
+        for command in program.replace('\\\n', '').split(';')
+        if command.strip().startswith('chown -R ')
+    ]
+    assert ownership_commands == [[
+        'chown', '-R', 'root:root',
+        '/home/mimir/venv/lib/python*/site-packages/mimir',
+        '/home/mimir/venv/lib/python*/site-packages/mimir_cultivate',
+    ]]
     assert text.index('ARG MIMIR_ENABLE_CLAUDE_CODE=0') < text.index('chown -R root:root /home/mimir/venv/lib/')
     assert text.rfind('USER root', 0, text.index('chown -R root:root /home/mimir/venv/lib/')) > text.rfind('USER mimir', 0, text.index('chown -R root:root /home/mimir/venv/lib/'))
     venv = tmp_path / 'venv'

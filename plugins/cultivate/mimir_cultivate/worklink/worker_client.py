@@ -30,7 +30,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v13-paired-identity"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v13-control-output-size"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -107,7 +107,18 @@ def run_factory_control(
             if process.timed_out:
                 raise subprocess.TimeoutExpired(argv, timeout)
             if process.output_overflow:
-                raise RuntimeError("factory control output exceeds bounds")
+                command = _factory_control_name(argv)
+                observed = max(process.stdout_bytes, process.stderr_bytes)
+                stream = "stdout" if process.stdout_bytes > output_limit else "stderr"
+                reason = f"factory control {command} {stream} exceeded {output_limit} bytes (observed {observed} bytes)"
+                from mimir.event_logger import log_event_sync
+
+                try:
+                    log_event_sync("worklink_factory_control_overflow", command=command,
+                                   stream=stream, observed_bytes=observed, limit_bytes=output_limit)
+                except RuntimeError:
+                    pass  # An unavailable event sink must not replace the diagnosis.
+                raise RuntimeError(reason)
             return subprocess.CompletedProcess(
                 argv, code, stdout.read_bounded()[0], stderr.read_bounded()[0],
             )
@@ -119,6 +130,22 @@ def run_factory_control(
     # Own the loop in a thread rather than nesting it in the controller's loop.
     with ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(lambda: asyncio.run(run())).result()
+
+
+def _factory_control_name(argv: Sequence[str]) -> str:
+    if "factory_control_output.py" in (Path(arg).name for arg in argv):
+        return next((arg for arg in argv if arg in {
+            "status", "snapshot", "resume", "heartbeat", "terminal", "lock",
+        }), "factory")
+    if "factory.js" in (Path(arg).name for arg in argv):
+        return next((arg for arg in argv if arg in {
+            "status", "snapshot", "resume", "heartbeat", "terminal", "lock",
+        }), "factory")
+    if argv and Path(argv[0]).name == "git":
+        return "git " + next((arg for arg in argv[3:] if not arg.startswith("-")), "control")
+    if argv and Path(argv[0]).name == "sh":
+        return "gate"
+    return Path(argv[0]).name if argv else "unknown"
 
 
 @dataclass(frozen=True)
@@ -145,6 +172,8 @@ class WorkerProcess:
     returncode: int | None = None
     timed_out: bool = False
     output_overflow: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -177,6 +206,11 @@ class WorkerProcess:
             self.returncode = int(response["exit_code"])
             self.timed_out = response.get("timed_out") is True
             self.output_overflow = response.get("output_overflow") is True
+            for name in ("stdout_bytes", "stderr_bytes"):
+                value = response.get(name)
+                if type(value) is not int or value < 0:
+                    raise RuntimeError("worker executor returned an invalid output byte count")
+                setattr(self, name, value)
             self._socket.close()
         return self.returncode
 

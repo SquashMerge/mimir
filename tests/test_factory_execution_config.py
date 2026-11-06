@@ -455,11 +455,12 @@ def test_factory_control_rejects_incomplete_results(
         assert client.run_uid == factory_control_identity.worklink_uid
         async def wait():
             return 0
-        return SimpleNamespace(wait=wait, timed_out=failure == "timed_out", output_overflow=failure == "output_overflow")
+        return SimpleNamespace(wait=wait, timed_out=failure == "timed_out", output_overflow=failure == "output_overflow",
+                               stdout_bytes=1024 * 1024 + 1, stderr_bytes=0)
 
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
     expected = subprocess.TimeoutExpired if failure == "timed_out" else RuntimeError
-    message = "timed out" if failure == "timed_out" else "factory control output exceeds bounds"
+    message = "timed out" if failure == "timed_out" else "factory control node stdout exceeded 1048576 bytes \\(observed 1048577 bytes\\)"
     with pytest.raises(expected, match=message):
         worker_client.run_factory_control(tmp_path / "repo/41-2/checkout", ["node", "status"], env={})
 
@@ -636,7 +637,12 @@ def test_factory_backend_controls_use_retained_owner(tmp_path, monkeypatch, comm
     monkeypatch.setattr(worker_client, "run_factory_control", control)
     backend = feature_factory.FeatureFactoryBackend(runner=forbidden)
     backend._control(entrypoint, [command, "run", "--repo", str(sandbox)], sandbox=sandbox)
-    assert calls == [(sandbox, ["node", str(entrypoint), command, "run", "--repo", str(sandbox)])]
+    assert calls == [(
+        sandbox,
+        [sys.executable, "-I", str(Path(feature_factory.__file__).resolve().parent.parent / "factory_control_output.py"),
+         "status" if command == "status" else "other",
+         "node", str(entrypoint), command, "run", "--repo", str(sandbox)],
+    )]
 
 
 def test_executor_auth_path_and_exported_xdg_data_home_agree() -> None:
