@@ -863,7 +863,7 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     manifest = json.loads((deploy / 'manifest.json').read_text())
     assert manifest['review_tests'] == 'targeted'
     hashes = manifest['generated_sha256']
-    assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore'}
+    assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore', 'build_context.py'}
     assert all(hashes[name] == hashlib.sha256((deploy / name).read_bytes()).hexdigest() for name in hashes)
 
 
@@ -1024,6 +1024,70 @@ def test_explicit_version_and_source_free_artifact_inventory(setup_environment):
     assert 'MIMIR_PLUGIN_SELECTION=cultivate' in root_build
     assert 'CHAINLINK_ARTIFACT_STAGE=chainlink-build' in root_build
     assert 'MIMIR_EXTRAS=local-embeddings,mcp,openai' in root_build
+
+
+def test_saved_build_runs_without_host_mimir_or_python(setup_environment, monkeypatch, tmp_path):
+    import io
+    import zipfile
+    from mimir.plugin_dockerfile import _S6_FILES, _CONTEXT_SCRIPTS
+    from mimir_cultivate.release_resolver import ReleasePair, Wheel
+
+    version = '2.0.0rc1'
+    def wheel(name, entries):
+        filename = name.replace('-', '_') + f'-{version}-py3-none-any.whl'
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as archive:
+            for member in entries:
+                archive.writestr(member, f'{name}:{member}')
+        content = data.getvalue()
+        return Wheel(name, filename, 'https://files.pythonhosted.org/' + filename,
+                     hashlib.sha256(content).hexdigest(), content)
+
+    agent = wheel('mimir-agent', ['mimir/docker_context/Dockerfile',
+                                  *(f'mimir/docker_context/deploy/s6-overlay/s6-rc.d/{name}' for name in _S6_FILES)])
+    cultivate = wheel('mimir-cultivate', [f'mimir_cultivate/docker/{name}' for name in _CONTEXT_SCRIPTS])
+    monkeypatch.setattr(installer, 'resolve_release', lambda version=None: ReleasePair(version or '2.0.0rc1', agent, cultivate))
+    deploy, args, state, calls, invoke = setup_environment
+    args.mimir_version = version
+    invoke()
+    binary = tmp_path / 'bin'
+    binary.mkdir()
+    docker = binary / 'docker'
+    docker.write_text('#!/bin/sh\nset -eu\nfor arg do [ "$arg" != "-f" ] || exit 0; done\n'
+                      'if [ "$1" = build ]; then\n'
+                      '  for last do :; done\n  cp -R "$last" "$CAPTURE"\nfi\n')
+    docker.chmod(0o755)
+    for command in ('dirname', 'mktemp', 'rm', 'cp'):
+        (binary / command).symlink_to('/usr/bin/' + command)
+    capture = tmp_path / 'captured'
+    environment = {'PATH': str(binary), 'CAPTURE': str(capture),
+                   'PYTHONPATH': str(tmp_path / 'nonexistent'), 'HOME': str(tmp_path)}
+    def rebuild():
+        with subprocess.Popen([str(deploy / 'build.sh')], env=environment,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            stdout, stderr = process.communicate(timeout=30)
+        return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+    result = rebuild()
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['mimir_version'] == version
+    for selected in (agent, cultivate):
+        assert (capture / 'plugins/cultivate/mimir_cultivate/docker/wheels' / selected.filename).read_bytes() == selected.data
+        assert manifest['wheels'][selected.name]['sha256'] == hashlib.sha256(selected.data).hexdigest()
+    assert (capture / 'Dockerfile').read_text() == 'mimir-agent:mimir/docker_context/Dockerfile'
+    assert (capture / 'plugins/cultivate/mimir_cultivate/docker/base.sh').read_text() == (
+        'mimir-cultivate:mimir_cultivate/docker/base.sh')
+    assert not (capture / 'compose.env').exists()
+
+    (deploy / 'build_context.py').write_text('raise SystemExit("tampered")\n')
+    capture.rename(tmp_path / 'previous-capture')
+    result = rebuild()
+    assert result.returncode != 0 and 'build context helper differs' in result.stderr
+    assert not capture.exists()
+    (deploy / 'build_context.py').unlink()
+    result = rebuild()
+    assert result.returncode != 0 and not capture.exists()
 
 
 def test_changed_verified_wheel_refused_before_build(upgrade_setup):

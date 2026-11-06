@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import socket
 import subprocess
 import sys
@@ -32,6 +33,61 @@ from mimir._reasoning_effort import validate_effort
 
 from .repository import valid_repository_slug
 from .release_resolver import ReleaseError, resolve_release
+
+
+# Saved deployments use this stdlib-only program, never the operator's current
+# Mimir installation. The script is checked against its setup-time digest before
+# execution; its input inventory is restricted to the two pinned wheel archives.
+_BUILD_CONTEXT_HELPER = '''\
+from pathlib import Path
+import hashlib
+import re
+import shutil
+import sys
+import zipfile
+
+destination = Path(sys.argv[1])
+version, agent_hash, cultivate_hash = sys.argv[4:7]
+inputs = (("mimir_agent", Path(sys.argv[2]), agent_hash),
+          ("mimir_cultivate", Path(sys.argv[3]), cultivate_hash))
+s6 = ("mimir/type", "mimir/run", "watchdog/type", "watchdog/run",
+      "worklink-execd/type", "worklink-execd/run", "worklink-execd/dependencies.d/base",
+      "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd")
+scripts = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh",
+           "service.sh", "verify_wheels.py")
+if not version or destination.exists() and any(destination.iterdir()):
+    raise SystemExit("invalid Docker context destination or version")
+opened = {}
+try:
+    for name, path, digest in inputs:
+        if (not path.is_file() or path.is_symlink() or
+                not re.fullmatch(r"[0-9a-f]{64}", digest) or
+                not re.fullmatch(re.escape(name) + "-" + re.escape(version) + r"-[A-Za-z0-9_.-]+\\.whl", path.name) or
+                hashlib.sha256(path.read_bytes()).hexdigest() != digest):
+            raise ValueError("wheel identity mismatch: " + name)
+        opened[name] = zipfile.ZipFile(path)
+    resources = [("mimir_agent", "mimir/docker_context/Dockerfile", "Dockerfile")]
+    resources += [("mimir_agent", "mimir/docker_context/deploy/s6-overlay/s6-rc.d/" + name,
+                   "deploy/s6-overlay/s6-rc.d/" + name) for name in s6]
+    resources += [("mimir_cultivate", "mimir_cultivate/docker/" + name,
+                   "plugins/cultivate/mimir_cultivate/docker/" + name) for name in scripts]
+    for package, member, _ in resources:
+        info = opened[package].getinfo(member)
+        if info.is_dir() or (info.external_attr >> 16) & 0o170000 == 0o120000:
+            raise ValueError("unsafe Docker context resource: " + member)
+    destination.mkdir(parents=True, exist_ok=True)
+    for package, member, target in resources:
+        output = destination / target
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(opened[package].read(member))
+    wheels = destination / "plugins/cultivate/mimir_cultivate/docker/wheels"
+    wheels.mkdir()
+    for _, path, _ in inputs:
+        shutil.copyfile(path, wheels / path.name)
+finally:
+    for archive in opened.values():
+        archive.close()
+'''
 
 
 # Tool defaults are explicit; repository declarations take precedence.
@@ -1587,12 +1643,17 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
                   "--build-arg MIMIR_EXTRAS=" + ",".join(sorted(extras))]
-    build_script = ("#!/bin/sh\nset -eu\ncd \"$(dirname \"$0\")\n"
-                    + "context=$(mktemp -d)\ntrap 'rm -rf \"$context\"' EXIT HUP INT TERM\n"
-                    + "python -c 'from pathlib import Path; from mimir.plugin_dockerfile import build_pypi_context; "
-                    + "build_pypi_context(Path(__import__(\"sys\").argv[1]), agent_wheel=Path(__import__(\"sys\").argv[2]), "
-                    + "cultivate_wheel=Path(__import__(\"sys\").argv[3]), version=__import__(\"sys\").argv[4], "
-                    + "agent_sha256=__import__(\"sys\").argv[5], cultivate_sha256=__import__(\"sys\").argv[6])' "
+    interpreter = str(Path(sys.executable).absolute())
+    if not Path(interpreter).is_file():
+        raise SetupError("Cannot record the setup Python interpreter for later builds.")
+    build_script = ("#!/bin/sh\nset -eu\ncd \"$(dirname \"$0\")\"\n"
+                     + "context=$(mktemp -d)\ntrap 'rm -rf \"$context\"' EXIT HUP INT TERM\n"
+                     + "interpreter=" + shlex.quote(interpreter) + "\n"
+                     + "\"$interpreter\" -I -S -c 'import hashlib, pathlib, sys; "
+                     + "sys.exit(0 if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() == sys.argv[2] "
+                     + "else \"build context helper differs from setup; refusing rebuild\")' "
+                     + "build_context.py " + _digest(_BUILD_CONTEXT_HELPER) + "\n"
+                     + '"$interpreter" -I -S build_context.py '
                     + '"$context" ' + '"wheels/' + release.agent.filename + '" "wheels/' + release.cultivate.filename
                     + '" "' + mimir_version + '" "' + release.agent.sha256 + '" "' + release.cultivate.sha256 + '"\n'
                     + "docker build -t " + tag + " " + " ".join(build_args) + ' "$context"\n'
@@ -1606,7 +1667,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     provenance = ("# MIMIR_INSTALL_MODE=pypi MIMIR_VERSION=" + mimir_version + " MIMIR_AGENT_SHA256="
                   + release.agent.sha256 + " MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256 + "\n")
     compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex)
-    generated = {"compose.yml": compose, ".gitignore": "*\n",
+    generated = {"compose.yml": compose, ".gitignore": "*\n", "build_context.py": _BUILD_CONTEXT_HELPER,
                  "provision.py": _PROVISION, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
     _check_generated(deploy, generated, previous, force=bool(getattr(args, "force", False)))
     # Query the old running container before publishing the new Compose image.
