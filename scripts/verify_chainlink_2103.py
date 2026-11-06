@@ -1,4 +1,8 @@
-"""Run both lock-consistent Chainlink 2103 acceptance suites without deselection."""
+"""Run both lock-consistent core and Cultivate acceptance suites without deselection.
+
+The historical filename is retained for existing automation; the checks contain
+no epic-specific paths, environment overrides, or test deselection.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +24,6 @@ SUITES = (
 
 def main() -> int:
     environment = os.environ.copy()
-    environment["PATH"] = "/usr/local/bin:/usr/bin:/bin"
     failed = False
     for name, command in SUITES:
         print(f"Running {name}: {' '.join(command)}", flush=True)

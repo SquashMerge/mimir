@@ -38,16 +38,16 @@ FROM ${BASE_IMAGE} AS provenance-validation
 # Every canonical image must identify one remote ref and the exact commit it is
 # expected to resolve. Keep this validation in its own early stage so an
 # argument-less build fails quickly and with an actionable diagnostic.
-ARG MIMIR_GIT_REF
-ARG MIMIR_CONTROLLER_COMMIT
-ARG MIMIR_EXECUTOR_COMMIT
-ARG MIMIR_GIT_URL
+ARG MIMIR_GIT_REF=""
+ARG MIMIR_CONTROLLER_COMMIT=""
+ARG MIMIR_EXECUTOR_COMMIT=""
+ARG MIMIR_GIT_URL=""
 ARG MIMIR_INSTALL_MODE
-ARG MIMIR_VERSION
-ARG MIMIR_AGENT_WHEEL
-ARG MIMIR_AGENT_SHA256
-ARG MIMIR_CULTIVATE_WHEEL
-ARG MIMIR_CULTIVATE_SHA256
+ARG MIMIR_VERSION=""
+ARG MIMIR_AGENT_WHEEL=""
+ARG MIMIR_AGENT_SHA256=""
+ARG MIMIR_CULTIVATE_WHEEL=""
+ARG MIMIR_CULTIVATE_SHA256=""
 RUN set -eu; \
     case "$MIMIR_INSTALL_MODE" in \
       source) if [ -n "$MIMIR_VERSION$MIMIR_AGENT_WHEEL$MIMIR_AGENT_SHA256$MIMIR_CULTIVATE_WHEEL$MIMIR_CULTIVATE_SHA256" ]; then echo >&2 "source mode refuses wheel arguments"; exit 2; fi ;; \
@@ -106,6 +106,10 @@ RUN touch /usr/local/bin/chainlink
 FROM ${CHAINLINK_ARTIFACT_STAGE} AS chainlink-artifact
 
 FROM provenance-validation AS base
+ENV MIMIR_INSTALL_MODE=${MIMIR_INSTALL_MODE}
+# Keep executable bytecode out of the mutable venv; if present, identity
+# verification requires a recorded content hash (pip may leave it empty).
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_COMPILE=1
 COPY plugins/cultivate/mimir_cultivate/docker/ /opt/cultivate-docker/
 ARG MIMIR_INSTALL_MODE
 ARG MIMIR_VERSION
@@ -181,11 +185,10 @@ RUN set -eu; \
     tar -C / -Jxpf /tmp/s6-arch.tar.xz; \
     rm -f /tmp/s6-noarch.tar.xz /tmp/s6-arch.tar.xz
 
-# Non-root user. The mimir process needs to own its venv so the
-# pending-update flag flow (``mimir/update_on_start.py``) can
-# ``pip install --upgrade mimir-agent`` from inside the container
-# without escalating to root. ``/home/mimir/`` is also where the
-# Claude Code CLI keeps its OAuth credential under ``.claude/``.
+# Non-root controller user. Source/core images retain the user-owned venv
+# update flow. Verified PyPI Cultivate pairs must instead be upgraded together
+# through setup and rebuilt; in-place core-only updates are refused.
+# /home/mimir also holds the Claude Code CLI OAuth credential under .claude/.
 #
 # MIMIR_PLUGIN_SELECTION is the build-time MIMIR_PLUGINS selection. ``cultivate``
 # (or ``all``) selects the first-party provider. MIMIR_PLUGIN_PACKAGES names only pinned third-party
@@ -257,13 +260,10 @@ USER mimir
 # mimir-carreira review note on PR #331.
 WORKDIR /home/mimir
 
-# Install mimir-agent into a user-owned venv at ``/home/mimir/venv``.
-# This venv is what the pending-update flow targets — the
-# ``request_mimir_update`` tool writes a flag; on next restart the
-# pre-flight in ``server.main`` runs ``pip install --upgrade
-# mimir-agent`` against THIS venv, replaces the old wheel, then
-# ``os.execv``'s onto the new code. The user-owned venv is what makes
-# that work without root.
+# Install the controller into /home/mimir/venv. Source/core deployments retain
+# their user-owned pending-update behavior. PyPI Cultivate installs a verified
+# pair here and refuses in-place core updates; use setup --mimir-version to
+# rebuild both controller and executor together.
 ENV VIRTUAL_ENV=/home/mimir/venv
 RUN python3 -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
@@ -273,6 +273,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # Override at build time:
 #
 #   docker build \
+#     --build-arg MIMIR_INSTALL_MODE=source \
 #     --build-arg MIMIR_GIT_REF="$MIMIR_GIT_REF" \
 #     --build-arg MIMIR_CONTROLLER_COMMIT="$MIMIR_COMMIT" \
 #     --build-arg MIMIR_EXECUTOR_COMMIT="$MIMIR_COMMIT" \
@@ -297,7 +298,9 @@ RUN set -eu; old_ifs="$IFS"; IFS=,; \
     for package in $MIMIR_PLUGIN_PACKAGES; do \
         case "$package" in *==*) ;; *) echo >&2 "plugin package must be pinned: $package"; exit 2 ;; esac; \
         if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
-            pip install --no-cache-dir --no-deps "$package"; \
+            pip install --no-cache-dir "$package" \
+                "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
+                "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"; \
         else pip install --no-cache-dir "$package"; fi; \
     done; IFS="$old_ifs"
 
@@ -329,9 +332,9 @@ RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         MIMIR_GIT_URL="${MIMIR_GIT_URL:-https://github.com/SquashMerge/mimir.git}" MIMIR_EXTRAS="$MIMIR_EXTRAS" sh /opt/cultivate-docker/executor.sh; \
     fi
 USER mimir
-# In source mode the controller venv gets core and Cultivate from the same pinned commit.
-# In PyPI mode it gets the verified pair. Runs as mimir, so
-# the venv stays user-owned for the pending-update flow.
+# The source controller gets core and Cultivate from the same pinned commit.
+# PyPI installs the verified wheel pair; upgrade it only by rebuilding both
+# runtimes together, never through the core-only pending-update flow.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         MIMIR_INSTALL_MODE="$MIMIR_INSTALL_MODE" MIMIR_VERSION="$MIMIR_VERSION" \
         MIMIR_AGENT_WHEEL="$MIMIR_AGENT_WHEEL" MIMIR_AGENT_SHA256="$MIMIR_AGENT_SHA256" \
@@ -385,7 +388,9 @@ RUN set -eu; \
         gh api --help | grep -q -- --allow-escape-sequences; \
     fi
 
-# Auto-update behavior on this image:
+# Update behavior: verified PyPI Cultivate deployments refuse core-only
+# in-place updates. Rerun setup with --mimir-version and recreate the pair.
+# Source/core-only images retain the following pending-update behavior:
 #
 #   - Daily PyPI poll runs automatically at 08:00 UTC inside the
 #     container — emits ``mimir_update_available`` algedonic when
@@ -453,7 +458,13 @@ RUN set -eu; \
         rm -rf /etc/s6-overlay/s6-rc.d/worklink-execd \
                /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-execd; \
     fi
-# Use the assembler installed alongside the selected controller distribution.
+# Source builds must use the checkout's assembler: the published core-only
+# wheel can predate plugin support. BuildKit leaves this COPY unreachable for
+# source-free PyPI contexts, which use the selected wheel's assembler instead.
+FROM base AS source-assembly
+COPY mimir/ /opt/mimir-image-assembly/mimir/
+FROM base AS pypi-assembly
+FROM ${MIMIR_INSTALL_MODE}-assembly AS runtime
 # MIMIR_PLUGIN_SELECTION chooses enabled providers at build time; disabled pinned
 # distributions add no services unless MIMIR_PLUGIN_ALL_INSTALLED=1 is explicit.
 # A selected Cultivate is pinned to the version controller.sh installed.
@@ -463,6 +474,7 @@ RUN set -eu; \
         version="$(/home/mimir/venv/bin/python -c 'import importlib.metadata as m; print(m.version("mimir-cultivate"))')"; \
         packages="${packages:+$packages,}mimir-cultivate==$version"; \
     fi; \
+    if [ "$MIMIR_INSTALL_MODE" = source ]; then export PYTHONPATH=/opt/mimir-image-assembly; fi; \
     /home/mimir/venv/bin/python -c 'from mimir.plugin_dockerfile import main; main()' \
         --packages "$packages" \
         --enable "$MIMIR_PLUGIN_SELECTION" \

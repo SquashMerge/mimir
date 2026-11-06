@@ -26,16 +26,31 @@ async def capture_controller_source_commit(app: Any) -> None:
         marker = Path(sys.prefix) / "controller-source-commit"
         if (Path(sys.prefix) / install_identity.CONTROLLER_MARKER).exists():
             try:
-                identity = install_identity.controller_identity()
+                identity = await asyncio.to_thread(install_identity.controller_identity)
             except install_identity.InstallIdentityError:
                 pass
-        elif marker.exists():
+        elif os.environ.get("MIMIR_INSTALL_MODE") != "pypi" and marker.exists():
             try:
                 commit = marker.read_text(encoding="ascii").strip()
                 if re.fullmatch(r"[0-9a-f]{40}", commit):
                     identity = {"mode": "source", "source_commit": commit}
             except (OSError, UnicodeError):
                 pass
+        elif os.environ.get("MIMIR_INSTALL_MODE") != "pypi":
+            # Legacy source/workspace deployments predate the venv marker.
+            # Never use this fallback when the image declares wheel-pair mode.
+            repo = os.environ.get("WORKLINK_REPO", "").strip()
+            if repo:
+                try:
+                    result = await asyncio.to_thread(
+                        subprocess.run, ["git", "-C", repo, "rev-parse", "HEAD"],
+                        capture_output=True, text=True, check=True, timeout=5,
+                    )
+                    commit = result.stdout.strip()
+                    if re.fullmatch(r"[0-9a-f]{40}", commit):
+                        identity = {"mode": "source", "source_commit": commit}
+                except (OSError, subprocess.SubprocessError):
+                    pass
     app["worklink_controller_identity"] = identity
     app["worklink_controller_source_commit"] = identity.get("source_commit") if identity else None
 
@@ -55,7 +70,7 @@ async def executor_health(app: Any) -> dict[str, object]:
     controller_identity = app.get("worklink_controller_identity")
     if isinstance(controller_identity, dict) and controller_identity.get("mode") == "pypi":
         try:
-            if install_identity.controller_identity() != controller_identity:
+            if await asyncio.to_thread(install_identity.controller_identity) != controller_identity:
                 raise install_identity.InstallIdentityError("controller install identity changed since boot")
         except install_identity.InstallIdentityError as exc:
             result.update(ok=False, error=str(exc))

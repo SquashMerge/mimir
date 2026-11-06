@@ -510,8 +510,70 @@ print('live PyPI pair, protocol, health and mutation proof passed')
 '''
 
 
+def prepare_pypi_deployment(directory: Path, agent_wheel: Path, cultivate_wheel: Path,
+                            version: str, agent_hash: str, cultivate_hash: str) -> Path:
+    """Drive the real setup writer; substitute only index/GitHub facts and stop
+    at its first Docker invocation, then execute its saved build.sh verbatim.
+    """
+    from unittest.mock import patch
+    from mimir_cultivate import setup as installer
+    from mimir_cultivate.release_resolver import ReleasePair, Wheel
+
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers())
+    token = directory / "proof-credential"
+    token.write_text("offline-image-proof")
+    token.chmod(0o600)
+    deploy = directory / "deployment"
+    args = parser.parse_args([
+        "cultivate", "setup", "--accept-license", "--repo", "fixture/proof",
+        "--bot-login", "proof-bot", "--bot-email", "proof@example.com",
+        "--owner", "proof", "--display-name", "Proof", "--owner-email", "proof@example.com",
+        "--branch", "main", "--model-spec", "openai:proof", "--saga-model-spec", "openai:proof:low",
+        "--embedding", "local", "--github-token-file", str(token), "--model-key-file", str(token),
+        "--operator-alert-adapter", "none", "--deploy", str(deploy), "--port", "8123",
+        "--test-command", "uv run pytest -q", "--review-tests", "targeted",
+        "--auto-review", "all", "--mimir-version", version, "--platform", "linux/amd64", "--no-start",
+    ])
+    pair = ReleasePair(version, *(
+        Wheel(name, path.name, "https://files.pythonhosted.org/" + path.name, digest, path.read_bytes())
+        for name, path, digest in (("mimir-agent", agent_wheel, agent_hash),
+                                  ("mimir-cultivate", cultivate_wheel, cultivate_hash))))
+
+    def request(url, token):
+        import base64
+        if url.endswith("/user"):
+            return 200, {"login": "proof-bot"}
+        if url.endswith("/repos/fixture/proof"):
+            return 200, {"permissions": {"push": True}}
+        if "/git/trees/" in url:
+            return 200, {"tree": []}
+        if "/contents/" in url:
+            content = ("[project]\nname = 'proof'\nversion = '1.0'\n" if "/pyproject.toml?" in url
+                       else "3.11.15" if "/.python-version?" in url else None)
+            return ((200, {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()})
+                    if content else (404, {}))
+        return 200, {}
+
+    class Prepared(Exception):
+        pass
+
+    def stop_before_docker(argv, *, cwd):
+        assert argv[:2] == ["docker", "build"], argv
+        raise Prepared
+
+    with patch.object(installer, "resolve_release", return_value=pair):
+        try:
+            installer.setup(args, request=request, run=stop_before_docker)
+        except Prepared:
+            pass
+        else:
+            raise RuntimeError("setup did not reach its Docker build")
+    return deploy
+
+
 def prove_pypi(agent_wheel: Path, cultivate_wheel: Path) -> None:
-    from mimir.plugin_dockerfile import build_pypi_context
+    global IMAGE
 
     run(["docker", "info"], timeout=30)
     agent_wheel, cultivate_wheel = agent_wheel.resolve(), cultivate_wheel.resolve()
@@ -524,20 +586,12 @@ def prove_pypi(agent_wheel: Path, cultivate_wheel: Path) -> None:
         "mimir-cultivate": {"version": version, "wheel": cultivate_wheel.name, "sha256": cultivate_hash},
     }}
     with tempfile.TemporaryDirectory(prefix="mimir-wheel-image-") as directory:
-        context = Path(directory) / "context"
-        build_pypi_context(context, agent_wheel=agent_wheel, cultivate_wheel=cultivate_wheel,
-                           version=version, agent_sha256=agent_hash, cultivate_sha256=cultivate_hash)
+        deploy = prepare_pypi_deployment(Path(directory), agent_wheel, cultivate_wheel,
+                                         version, agent_hash, cultivate_hash)
+        manifest = json.loads((deploy / "manifest.json").read_text())
+        IMAGE = manifest["layer_tag"]
         try:
-            run(["docker", "build", "--build-arg", "MIMIR_INSTALL_MODE=pypi",
-                 "--build-arg", f"MIMIR_VERSION={version}",
-                 "--build-arg", f"MIMIR_AGENT_WHEEL={agent_wheel.name}",
-                 "--build-arg", f"MIMIR_AGENT_SHA256={agent_hash}",
-                 "--build-arg", f"MIMIR_CULTIVATE_WHEEL={cultivate_wheel.name}",
-                 "--build-arg", f"MIMIR_CULTIVATE_SHA256={cultivate_hash}",
-                 "--build-arg", "MIMIR_EXTRAS=anthropic,discord,slack,mcp",
-                 "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
-                 "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build",
-                 "--tag", IMAGE, str(context)], timeout=1200)
+            run(["sh", str(deploy / "build.sh")], timeout=2400)
             run(["docker", "run", "--detach", "--env", "MIMIR_PLUGINS=cultivate",
                  "--name", CONTAINER, IMAGE])
             wait_for_runtime()
@@ -555,7 +609,7 @@ def prove_pypi(agent_wheel: Path, cultivate_wheel: Path) -> None:
                 docker_exec(interpreter, "-c", "import importlib.metadata as m; "
                             "from mimir_cultivate.install_identity import controller_identity, executor_identity; "
                             f"assert {'controller_identity' if interpreter.startswith('/home') else 'executor_identity'}(); "
-                            "[m.version(name) for name in ('langchain-anthropic', 'discord-py', 'slack-bolt', 'mcp')]",
+                            "[m.version(name) for name in ('langchain-openai', 'sentence-transformers', 'mcp')]; assert m.version('torch').endswith('+cpu')",
                             user="root")
             docker_exec("/home/mimir/venv/bin/python", "-c", PYPI_RUNTIME_PROOF,
                         json.dumps(pair, sort_keys=True))

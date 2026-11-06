@@ -23,6 +23,12 @@ def wheel(project, version, *, dependency=None, requirements=None, tag="py3-none
     output = BytesIO()
     with ZipFile(output, "w") as archive:
         archive.writestr(f"{name}-{version}.dist-info/METADATA", content)
+        from mimir.plugin_dockerfile import _CONTEXT_SCRIPTS, _S6_FILES
+        resources = (["mimir/docker_context/Dockerfile", *(
+            "mimir/docker_context/deploy/s6-overlay/s6-rc.d/" + item for item in _S6_FILES)]
+            if project == "mimir-agent" else ["mimir_cultivate/docker/" + item for item in _CONTEXT_SCRIPTS])
+        for resource in resources:
+            archive.writestr(resource, "fixture resource\n")
     data = output.getvalue()
     url = f"https://files.pythonhosted.org/packages/{filename}"
     return {"filename": filename, "url": url, "packagetype": "bdist_wheel",
@@ -116,8 +122,10 @@ def test_rejects_bad_wheels(change, expected):
         agent["digests"]["sha256"] = "0" * 64
     elif change == "metadata":
         output = BytesIO()
-        with ZipFile(output, "w") as archive:
-            archive.writestr("mimir_agent-1.0.0.dist-info/METADATA", "Name: mimir-agent\nVersion: 2.0.0\n")
+        with ZipFile(BytesIO(agent["data"])) as original, ZipFile(output, "w") as archive:
+            for member in original.namelist():
+                archive.writestr(member, "Name: mimir-agent\nVersion: 2.0.0\n"
+                                 if member.endswith("/METADATA") else original.read(member))
         agent["data"] = output.getvalue()
         agent["digests"]["sha256"] = hashlib.sha256(agent["data"]).hexdigest()
     elif change == "dependency":
@@ -132,6 +140,25 @@ def test_rejects_bad_wheels(change, expected):
     fetch, _ = index({"1.0.0": [agent]}, {"1.0.0": [cultivate]})
     with pytest.raises(ReleaseError, match=expected):
         resolve_release(fetch=fetch)
+
+
+@pytest.mark.parametrize('project,missing', [
+    ('mimir-agent', 'mimir/docker_context/Dockerfile'),
+    ('mimir-cultivate', 'mimir_cultivate/docker/verify_wheels.py'),
+])
+def test_rejects_release_missing_build_resources(project, missing):
+    agent, cultivate = pair('1.0.0')
+    target = agent if project == 'mimir-agent' else cultivate
+    output = BytesIO()
+    with ZipFile(BytesIO(target['data'])) as original, ZipFile(output, 'w') as archive:
+        for member in original.namelist():
+            if member != missing:
+                archive.writestr(member, original.read(member))
+    target['data'] = output.getvalue()
+    target['digests']['sha256'] = hashlib.sha256(target['data']).hexdigest()
+    fetch, _ = index({'1.0.0': [agent]}, {'1.0.0': [cultivate]})
+    with pytest.raises(ReleaseError, match='Docker context'):
+        resolve_release('1.0.0', fetch=fetch)
 
 
 def test_no_pair_and_invalid_version():

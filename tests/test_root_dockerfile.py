@@ -192,7 +192,8 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
 ])
 def test_executor_install_excludes_local_embeddings(extras, expected):
     script = (ROOT / "plugins/cultivate/mimir_cultivate/docker/executor.sh").read_text()
-    assert "torch" not in script
+    assert "'torch==2.15.0+cpu'" in script
+    assert "https://download.pytorch.org/whl/cpu" in script
     # Execute the real filter and install command, replacing only pip with an
     # argv recorder. No Git, venv creation, package install or cleanup runs.
     program = script.split('MIMIR_EXTRAS="$(', 1)[1]
@@ -391,7 +392,7 @@ def _runtime_stage_dependencies(text: str, **build_args: str) -> set[str]:
 
 
 def _assert_core_skips_chainlink_builder(text: str) -> None:
-    reachable = _runtime_stage_dependencies(text)
+    reachable = _runtime_stage_dependencies(text, MIMIR_INSTALL_MODE="source")
     assert "chainlink-none" in reachable
     assert "chainlink-build" not in reachable, "core build schedules the Rust builder"
 
@@ -399,9 +400,15 @@ def _assert_core_skips_chainlink_builder(text: str) -> None:
 def test_chainlink_builder_is_only_reachable_when_explicitly_selected() -> None:
     text = DOCKERFILE.read_text()
     _assert_core_skips_chainlink_builder(text)
-    reachable = _runtime_stage_dependencies(text, CHAINLINK_ARTIFACT_STAGE="chainlink-build")
-    assert "chainlink-build" in reachable
-    assert "chainlink-none" not in reachable
+    for mode in ("source", "pypi"):
+        reachable = _runtime_stage_dependencies(text, MIMIR_INSTALL_MODE=mode,
+                                                CHAINLINK_ARTIFACT_STAGE="chainlink-build")
+        assert "chainlink-build" in reachable
+        assert "chainlink-none" not in reachable
+        assert ("source-assembly" in reachable) is (mode == "source")
+    proof = (ROOT / "scripts/worklink_image_identity.py").read_text()
+    assert '"CHAINLINK_ARTIFACT_STAGE=chainlink-build"' in proof
+    assert '"MIMIR_PLUGIN_SELECTION=cultivate"' in proof
 
 
 @pytest.mark.parametrize("old,new", [
@@ -636,7 +643,7 @@ def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -
             "/home/mimir/venv/bin/python", str(python)).replace("&& rm -rf /opt/mimir-image-assembly", "")
         subprocess.run(["/bin/sh", "-c", local], check=True, env={
             **os.environ, "MIMIR_PLUGIN_PACKAGES": packages, "MIMIR_PLUGIN_SELECTION": "",
-            "MIMIR_PLUGIN_ALL_INSTALLED": "0", "ARGS_LOG": str(log)})
+            "MIMIR_INSTALL_MODE": "source", "MIMIR_PLUGIN_ALL_INSTALLED": "0", "ARGS_LOG": str(log)})
         args = log.read_text().splitlines()
         assert args[args.index("--packages") + 1] == expected
 
@@ -750,7 +757,8 @@ def _assert_provenance_stage_ancestry(text: str, **build_args: str) -> None:
 
 def test_every_image_stage_inherits_provenance_validation() -> None:
     for artifact in ("chainlink-none", "chainlink-build"):
-        _assert_provenance_stage_ancestry(_text(), CHAINLINK_ARTIFACT_STAGE=artifact)
+        for mode in ("source", "pypi"):
+            _assert_provenance_stage_ancestry(_text(), CHAINLINK_ARTIFACT_STAGE=artifact, MIMIR_INSTALL_MODE=mode)
 
 
 def test_provenance_stage_ancestry_rejects_external_artifact_default() -> None:
@@ -804,11 +812,17 @@ def _run_provenance_validation(**build_args: str) -> subprocess.CompletedProcess
     stage = _text().split("FROM ${BASE_IMAGE} AS provenance-validation\n", 1)[1]
     stage = re.split(r"(?m)^FROM ", stage, maxsplit=1)[0]
     names = ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT", "MIMIR_GIT_URL", "MIMIR_INSTALL_MODE", "MIMIR_VERSION", "MIMIR_AGENT_WHEEL", "MIMIR_AGENT_SHA256", "MIMIR_CULTIVATE_WHEEL", "MIMIR_CULTIVATE_SHA256")
+    defaults = {}
     for name in names:
-        assert f"ARG {name}\n" in stage
+        declaration = re.search(rf'(?m)^ARG {name}(?:=(.*))?$', stage)
+        assert declaration is not None
+        if declaration[1] is not None:
+            defaults[name] = shlex.split(declaration[1])[0] if declaration[1] != '""' else ""
     program = stage.split("RUN ", 1)[1].strip().replace("\\\n", "\n")
-    # Docker's unset ARGs are empty, regardless of the test process environment.
-    env = {**os.environ, **dict.fromkeys(names, ""), "MIMIR_INSTALL_MODE": "source", **build_args}
+    # Only explicit ARG defaults are exported. Undeclared values remain unset,
+    # as Docker actually presents them to a set -u shell.
+    env = {key: value for key, value in os.environ.items() if key not in names}
+    env.update({**defaults, "MIMIR_INSTALL_MODE": "source", **build_args})
     return subprocess.run(
         ["/bin/sh", "-c", program], cwd=ROOT, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=30,

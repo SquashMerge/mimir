@@ -1,1 +1,3 @@
 - Build Cultivate deployments exclusively from matched, SHA-256-verified PyPI wheel releases, with explicit version selection and source-era upgrade refusal.
+- Preserve the selected release on setup reruns, preflight released build resources before writing deployment artifacts, and exercise the generated platform/base/extras build in image-identity CI.
+- Verify installed bytecode and package inventories off the health event loop, retain legacy source-mode health and assembler compatibility, and use CPU embeddings and a pinned, preseeded uv toolchain in PyPI workers.

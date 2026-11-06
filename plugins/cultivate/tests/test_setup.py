@@ -846,6 +846,7 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     old_wheels = previous['wheels']
     assert previous['mimir_version'] == VERSION
     state['sha'] = 'c' * 40
+    args.mimir_version = '1.0.1'
     env = (deploy / 'compose.env').read_bytes()
     key = (deploy / 'owner-web-key').read_bytes()
     (deploy / 'persisted-volume-marker').write_text('untouched')
@@ -1012,6 +1013,19 @@ def test_release_resolution_refuses_without_deployment_or_docker_writes(setup_en
     with pytest.raises(installer.ReleaseError, match=reason):
         invoke()
     assert not deploy.exists() and not calls
+
+
+def test_rerun_preserves_saved_release_unless_explicitly_changed(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    before = json.loads((deploy / 'manifest.json').read_text())
+    state['sha'] = 'c' * 40  # fake index now offers a newer release
+    invoke()
+    after = json.loads((deploy / 'manifest.json').read_text())
+    assert after['mimir_version'] == before['mimir_version']
+    assert after['wheels'] == before['wheels']
+    args.mimir_version = '1.0.1'
+    invoke()
+    assert json.loads((deploy / 'manifest.json').read_text())['mimir_version'] == '1.0.1'
 
 
 def test_explicit_version_and_source_free_artifact_inventory(setup_environment):
@@ -1195,6 +1209,7 @@ def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail, 
 def test_upgrade_refuses_unreadable_activity_before_mutation_until_forced(upgrade_setup, probe, output):
     deploy, args, state, calls, invoke = upgrade_setup
     state['sha'] = 'c' * 40
+    args.mimir_version = '1.0.1'
     state[probe] = output
     args.reembed = True  # A successful upgrade would stop the running agent.
     before = {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()}
@@ -1339,6 +1354,7 @@ def test_api_setup_preserves_operator_key(setup_environment, provider, other_pro
     before = path.read_bytes()
     if upgrade:
         state['sha'] = 'c' * 40
+        args.mimir_version = '1.0.1'
     invoke()
     assert path.read_bytes() == before
     assert f'{other_key}=operator-added-key' in path.read_text()
@@ -1436,10 +1452,17 @@ def test_subscription_fresh_setup_requires_login_before_start(setup_environment,
     with pytest.raises(installer.SetupError, match=re.escape(command)):
         invoke()
     _fixture_codex_login(deploy)
-    with subprocess.Popen([sys.executable, '-c', installer._CODEX_LOGIN_PROBE],
+    diagnostic_probe = ('import faulthandler\nfaulthandler.dump_traceback_later(8)\n'
+                        + installer._CODEX_LOGIN_PROBE)
+    with subprocess.Popen([sys.executable, '-c', diagnostic_probe],
                           env={**os.environ, 'CODEX_HOME': str(deploy / 'codex')},
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as probe:
-        output, errors = probe.communicate(timeout=10)
+        try:
+            output, errors = probe.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            output, errors = probe.communicate()
+            pytest.fail('login probe timed out: ' + errors)
     assert probe.returncode == 0 and output.strip() == 'ok', errors
     invoke()
     assert state['running'] and state['verified']

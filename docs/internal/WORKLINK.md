@@ -444,9 +444,11 @@ and both retained wheel hashes. Missing, drifted or unpinned identities fail
 health with HTTP 503; PyPI source-commit fields are null and source status is
 `not_applicable`. Dirty-tree source-mode executor builds are unsupported;
 working-directory edits cannot enter this root-owned artifact. Deployment
-compose files must pass a fully qualified `MIMIR_GIT_REF` plus the same resolved
+source-mode compose files must explicitly select `MIMIR_INSTALL_MODE=source`
+and pass a fully qualified `MIMIR_GIT_REF` plus the same resolved
 full SHA for `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT`. The build
-fetches exactly that ref and refuses unless `FETCH_HEAD` equals the pinned SHA.
+fetches the immutable SHA first, falling back to the named ref if necessary,
+and refuses unless `FETCH_HEAD` equals the pinned SHA.
 This permits CI to name `refs/pull/<number>/merge` while keeping the SHA
 authoritative; “point it at whichever checkout you want” is not a valid
 deployment contract. All three provenance arguments are required, so plain

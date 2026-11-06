@@ -55,8 +55,11 @@ latest common prerelease. `--mimir-version` requires an exact common version.
 The installer verifies both wheel downloads against their PyPI SHA-256 hashes,
 then builds from a bounded local context derived from those wheel archives.
 `manifest.json`, Compose and `build.sh` retain the exact version and both
-hashes; rebuilding never follows a moving index version or Git ref.
-Re-run setup against the same PyPI-mode deployment directory to upgrade. It
+hashes; rebuilding pins the two first-party wheels, not the entire dependency
+closure. Transitive dependencies still resolve from the index independently in
+each venv, so builds are not byte-for-byte reproducible.
+Re-running setup preserves the saved version. To upgrade, pass an explicit
+`--mimir-version` against the same PyPI-mode deployment directory. It
 retains `compose.env`, the owner web key and all named volumes; generated files
 are replaced only if they still match the hashes saved in `manifest.json`.
 Source-era deployments cannot be upgraded, even with `--force`: create a new
@@ -187,7 +190,8 @@ web key as separate mode-600 files and does not print either key.
 
 The generated Compose binds only to `127.0.0.1`, has an init service to own
 the named volumes, and selects Cultivate in the **process environment**. Setup
-also writes a provenance-pinned `build.sh` for reproducible rebuilds. Setup
+also writes a `build.sh` pinned to the first-party wheel pair. Transitive
+dependencies are independently resolved, not locked by this script. Setup
 provisions the checkout, repository inventory, Chainlink agent identity
 (`cultivate-worklink`), Worklink config, dedicated base, optional GitHub pollers,
 and owner key before starting the agent. Issues are tracked in Chainlink in

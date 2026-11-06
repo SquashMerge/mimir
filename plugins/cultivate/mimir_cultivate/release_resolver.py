@@ -185,6 +185,18 @@ def _download(project: str, version: Version, entry: dict, fetch, architecture: 
             if len(matching) != 1 or matching[0].file_size > METADATA_LIMIT:
                 raise ReleaseError(f"Missing or oversized wheel metadata for {project} {version}.")
             metadata = BytesParser(policy=default).parsebytes(archive.read(matching[0]))
+            # Validate build inputs while everything is still in memory, before
+            # setup publishes any deployment files or changes an existing one.
+            from mimir.plugin_dockerfile import _CONTEXT_SCRIPTS, _S6_FILES
+
+            resources = (["mimir/docker_context/Dockerfile", *(
+                "mimir/docker_context/deploy/s6-overlay/s6-rc.d/" + item for item in _S6_FILES)]
+                if project == "mimir-agent" else ["mimir_cultivate/docker/" + item for item in _CONTEXT_SCRIPTS])
+            for resource in resources:
+                members = [item for item in archive.infolist() if item.filename == resource]
+                if (len(members) != 1 or members[0].is_dir()
+                        or (members[0].external_attr >> 16) & 0o170000 == 0o120000):
+                    raise ReleaseError(f"{project} {version} lacks required Docker context resource: {resource}")
         if (canonicalize_name(metadata.get("Name", "")) != project
                 or Version(metadata.get("Version", "")) != version):
             raise ReleaseError(f"Wheel metadata name or version mismatch for {project} {version}.")

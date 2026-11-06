@@ -161,6 +161,38 @@ async def test_real_installed_pair_http_health(installed_wheels, tmp_path, monke
         assert body["worklink_install_status"] == "mismatched"
 
 
+@pytest.mark.parametrize("relative", ["mimir_agent/backdoor.py", "mimir_cultivate/extra.py",
+                                     "evil.pth", "sitecustomize.py", "usercustomize.py"])
+def test_unrecorded_executable_files_fail_closed(installed_pair, relative):
+    marker, wheels, site, _ = installed_pair
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site)
+    target = site / relative
+    target.parent.mkdir(exist_ok=True)
+    target.write_text("# injected without touching RECORD\n")
+    with pytest.raises(identity.InstallIdentityError, match="unrecorded"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site)
+
+
+def test_recorded_bytecode_is_hashed(installed_pair):
+    marker, wheels, site, _ = installed_pair
+    import importlib.util
+    import marshal
+    source = site / "mimir_agent/__init__.py"
+    cache = source.parent / "__pycache__" / f"__init__.cpython-{sys.version_info.major}{sys.version_info.minor}.pyc"
+    cache.parent.mkdir()
+    # A realistic timestamp header plus executable payload; identity must check
+    # all bytes, not rely on import invalidation or the source digest.
+    header = importlib.util.MAGIC_NUMBER + b'\x00' * 12
+    cache.write_bytes(header + marshal.dumps(compile('value = 1', str(source), 'exec')))
+    digest = base64.urlsafe_b64encode(hashlib.sha256(cache.read_bytes()).digest()).rstrip(b"=").decode()
+    with (site / "mimir_agent-1.2.dist-info/RECORD").open("a") as stream:
+        csv.writer(stream).writerow((cache.relative_to(site).as_posix(), "sha256=" + digest, cache.stat().st_size))
+    assert identity.verify_install_identity(marker, wheels=wheels, site=site)
+    cache.write_bytes(header + marshal.dumps(compile('value = 2', str(source), 'exec')))
+    with pytest.raises(identity.InstallIdentityError, match="drift"):
+        identity.verify_install_identity(marker, wheels=wheels, site=site)
+
+
 def test_verified_pair_requires_archives_and_installed_record(installed_pair):
     marker, wheels, site, declared = installed_pair
     assert identity.verify_install_identity(marker, wheels=wheels, site=site) == declared

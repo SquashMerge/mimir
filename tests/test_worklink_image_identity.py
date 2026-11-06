@@ -43,10 +43,9 @@ def test_source_mode_keeps_explicit_build_arg_and_live_proof() -> None:
 
 def test_pypi_proof_builds_local_context_and_checks_runtime() -> None:
     script = PROOF.read_text()
-    for invariant in ("build_pypi_context(context", "MIMIR_INSTALL_MODE=pypi",
-                      "MIMIR_AGENT_SHA256=", "MIMIR_CULTIVATE_SHA256=",
-                      "MIMIR_PLUGIN_SELECTION=cultivate", "CHAINLINK_ARTIFACT_STAGE=chainlink-build",
-                      "MIMIR_EXTRAS=anthropic,discord,slack,mcp"):
+    for invariant in ("prepare_pypi_deployment", 'installer.setup(args,',
+                      'run(["sh", str(deploy / "build.sh")]',
+                      '"--platform", "linux/amd64"', '"--embedding", "local"'):
         assert invariant in script
     namespace = runpy.run_path(str(PROOF))
     compile(namespace["PYPI_RUNTIME_PROOF"], "PYPI_RUNTIME_PROOF", "exec")
@@ -84,34 +83,58 @@ def test_pypi_refuses_mismatched_versions_before_docker_build(tmp_path: Path, mo
     assert calls == [["docker", "info"]]
 
 
-def test_pypi_passes_exact_pair_to_context_and_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pypi_generated_setup_rebuild_executes_closed_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    import os
+    import sys
+    from mimir.plugin_dockerfile import _CONTEXT_SCRIPTS, _S6_FILES
+    from mimir_cultivate.setup import _PYTHON_BASE_IMAGE
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("GH_USER_NAME", "proof-bot")
+    monkeypatch.setenv("GH_USER_EMAIL", "proof@example.com")
+    version = "1.0.0rc2"
+    agent = tmp_path / f"mimir_agent-{version}-py3-none-any.whl"
+    cultivate = tmp_path / f"mimir_cultivate-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(agent, "w") as archive:
+        archive.writestr("mimir/docker_context/Dockerfile", (ROOT / "Dockerfile").read_bytes())
+        for name in _S6_FILES:
+            archive.writestr("mimir/docker_context/deploy/s6-overlay/s6-rc.d/" + name,
+                             (ROOT / "deploy/s6-overlay/s6-rc.d" / name).read_bytes())
+    with zipfile.ZipFile(cultivate, "w") as archive:
+        for name in _CONTEXT_SCRIPTS:
+            archive.writestr("mimir_cultivate/docker/" + name,
+                             (ROOT / "plugins/cultivate/mimir_cultivate/docker" / name).read_bytes())
+    agent_hash, cultivate_hash = (hashlib.sha256(path.read_bytes()).hexdigest() for path in (agent, cultivate))
     namespace = runpy.run_path(str(PROOF))
-    build_context = []
-    from mimir import plugin_dockerfile
-
-    monkeypatch.setattr(plugin_dockerfile, "build_pypi_context", lambda *args, **kwargs: build_context.append((args, kwargs)))
-    globals_ = namespace["prove_pypi"].__globals__
-    monkeypatch.setitem(globals_, "wheel_identity", lambda path, name: ("1.0.0rc2", name[0] * 64))
-
-    class BuildReached(Exception):
-        pass
-
-    def run(args: list[str], **kwargs: object) -> None:
-        if args[:2] == ["docker", "build"]:
-            assert args[-1] == str(build_context[0][0][0])
-            for value in ("MIMIR_INSTALL_MODE=pypi", "MIMIR_VERSION=1.0.0rc2",
-                          "MIMIR_AGENT_WHEEL=agent.whl", "MIMIR_CULTIVATE_WHEEL=cultivate.whl",
-                          f"MIMIR_AGENT_SHA256={'m' * 64}", f"MIMIR_CULTIVATE_SHA256={'m' * 64}",
-                          "MIMIR_PLUGIN_SELECTION=cultivate", "CHAINLINK_ARTIFACT_STAGE=chainlink-build"):
-                assert value in args
-            raise BuildReached
-        assert args == ["docker", "info"]
-
-    monkeypatch.setitem(globals_, "run", run)
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: None)
-    with pytest.raises(BuildReached):
-        namespace["prove_pypi"](tmp_path / "agent.whl", tmp_path / "cultivate.whl")
-    assert build_context[0][1] == {
-        "agent_wheel": tmp_path / "agent.whl", "cultivate_wheel": tmp_path / "cultivate.whl",
-        "version": "1.0.0rc2", "agent_sha256": "m" * 64, "cultivate_sha256": "m" * 64,
-    }
+    deploy = namespace["prepare_pypi_deployment"](tmp_path, agent, cultivate, version, agent_hash, cultivate_hash)
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["docker_platform"] == "linux/amd64"
+    # Execute the saved script AND its isolated stdlib context helper. Only the
+    # external daemon boundary is replaced; inspect the context while it exists.
+    docker = tmp_path / "docker"
+    log = tmp_path / "build-log.jsonl"
+    docker.write_text(f"#!{sys.executable}\n" + '''import json, pathlib, sys
+args = sys.argv[1:]
+context = pathlib.Path(args[-1])
+files = {str(p.relative_to(context)): p.read_bytes().hex() for p in context.rglob('*') if p.is_file()}
+with open('BUILD_LOG', 'a') as stream:
+    stream.write(json.dumps({'args': args, 'files': files}) + '\\n')
+'''.replace("BUILD_LOG", str(log)))
+    docker.chmod(0o755)
+    result = subprocess.run(["sh", str(deploy / "build.sh")], capture_output=True, text=True,
+                            env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]})
+    assert result.returncode == 0, result.stderr
+    root, layer = [json.loads(line) for line in log.read_text().splitlines()]
+    for build in (root, layer):
+        assert build["args"][:3] == ["build", "--platform", "linux/amd64"]
+    for value in ("BASE_IMAGE=" + _PYTHON_BASE_IMAGE, "MIMIR_INSTALL_MODE=pypi", "MIMIR_VERSION=" + version,
+                  "MIMIR_AGENT_SHA256=" + agent_hash, "MIMIR_CULTIVATE_SHA256=" + cultivate_hash,
+                  "MIMIR_EXTRAS=local-embeddings,mcp,openai", "MIMIR_PLUGIN_SELECTION=cultivate",
+                  "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "MIMIR_ENABLE_OPENCODE=1"):
+        assert value in root["args"]
+    assert bytes.fromhex(root["files"]["Dockerfile"]) == (ROOT / "Dockerfile").read_bytes()
+    assert bytes.fromhex(root["files"]["plugins/cultivate/mimir_cultivate/docker/wheels/" + agent.name]) == agent.read_bytes()
+    assert not any(name.startswith("mimir/") for name in root["files"])
+    assert layer["args"][-3:] == ["-f", "Dockerfile.toolchain", "."]
+    assert manifest["layer_tag"] in layer["args"]

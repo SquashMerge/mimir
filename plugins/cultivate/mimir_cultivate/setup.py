@@ -1451,7 +1451,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
     ):
         setup.add_argument("--" + name, help=help_text)
-    setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate (default: latest common stable, then prerelease).")
+    setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate; omit to preserve the saved version (fresh setup: latest common stable, then prerelease).")
     setup.add_argument("--platform", choices=tuple(_DOCKER_ARCHITECTURES),
                        help="Docker target platform (linux/amd64 or linux/arm64; default: host architecture, or saved platform on rerun).")
     for name in ("github-token", "model-key", "saga-model-key", "embedding-key"):
@@ -1625,7 +1625,12 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     elif embedding_key_env and embedding_key_env not in extra_keys:
         extra_keys[embedding_key_env] = _secret(args, "embedding_key", "Embedding API key (input hidden).",
                                                  previous=prior.get(embedding_key_env))
-    release = resolve_release(getattr(args, "mimir_version", None), architecture=architecture)
+    requested_version = getattr(args, "mimir_version", None)
+    if requested_version is None and previous:
+        requested_version = previous.get("mimir_version")
+        if not isinstance(requested_version, str) or not requested_version:
+            raise SetupError("Missing exact Mimir version in manifest.json; reconcile it before retrying.")
+    release = resolve_release(requested_version, architecture=architecture)
     mimir_version = release.version
     wheels = {wheel.name: {"filename": wheel.filename, "sha256": wheel.sha256}
               for wheel in (release.agent, release.cultivate)}

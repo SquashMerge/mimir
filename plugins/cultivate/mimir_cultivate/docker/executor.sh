@@ -7,11 +7,18 @@ if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
         > /opt/mimir-worklink/executor-install-identity.json
     python3 -m venv /opt/mimir-worklink/venv
     /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip
-    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir \
+    # Match the controller's CPU-only local embeddings dependency.
+    case ",${MIMIR_EXTRAS}," in *,local-embeddings,*)
+        /opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'torch==2.15.0+cpu' \
+            --extra-index-url https://download.pytorch.org/whl/cpu ;;
+    esac
+    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps 'uv==0.11.12'
+    ln -sf /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv
+    # Populate the root-owned seed cache without needing a source checkout.
+    UV_CACHE_DIR=/opt/mimir-worklink/uv-cache /opt/mimir-worklink/venv/bin/uv pip install \
+        --python /opt/mimir-worklink/venv/bin/python \
         "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
         "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
-    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps uv
-    ln -sf /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv
     /opt/mimir-worklink/venv/bin/python -c 'from mimir_cultivate.install_identity import executor_identity; executor_identity()'
     chown -R root:root /opt/mimir-worklink
     chmod -R go-w /opt/mimir-worklink

@@ -102,7 +102,11 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     assert "rm -rf /opt/mimir-worklink/source/.venv" in text
     assert "rm -rf /opt/mimir-worklink/source" in text
     assert "chmod 0755 /usr/local/libexec/worklink-execd" in text
-    assert "PYTHONPATH=" not in text
+    # Checkout code is exposed only to the source-mode build-time assembler,
+    # never to the runtime controller or the root worker interpreter.
+    assert 'ENV PYTHONPATH' not in text
+    assert text.count('PYTHONPATH=') == 1
+    assert 'if [ "$MIMIR_INSTALL_MODE" = source ]; then export PYTHONPATH=/opt/mimir-image-assembly; fi' in text
     assert "/opt/mimir-worklink/venv/bin/python -m mimir_cultivate.worklink.worker_exec" in text
     assert "chown -R root:root /opt/mimir-worklink" in text
     assert "chmod -R go-w /opt/mimir-worklink" in text
@@ -717,9 +721,11 @@ def test_pypi_scripts_install_configured_extras_in_both_venvs(tmp_path, extras) 
         result = subprocess.run(["/bin/sh", "-c", program], env=env, capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
     lines = log.read_text().splitlines()
-    for venv in (controller, worker):
-        installs = [line for line in lines if line.startswith(str(venv / "bin/pip") + "|")]
+    for venv, installer in ((controller, "pip"), (worker, "uv")):
+        installs = [line for line in lines if line.startswith(str(venv / "bin" / installer) + "|")]
         assert any(f"{wheels / agent}[{extras}]" in line and str(wheels / cultivate) in line
                    for line in installs)
+    assert any('uv==0.11.12' in line for line in lines)
+    assert any('torch==2.15.0+cpu' in line for line in lines) == ('local-embeddings' in extras)
     assert (controller / "controller-install-identity.json").is_file()
     assert (tmp_path / "worklink/executor-install-identity.json").is_file()
