@@ -87,18 +87,18 @@ def _verify_distribution(name: str, identity: object, wheels: Path, site: Path) 
         raise InstallIdentityError(f"invalid {name} wheel filename") from exc
     if wheel_name != canonicalize_name(name) or str(wheel_version) != version:
         raise InstallIdentityError(f"{name} wheel name/version mismatch")
-    archive = wheels / filename
-    if archive.is_symlink() or not archive.is_file() or _digest(archive) != sha:
-        raise InstallIdentityError(f"{name} wheel archive hash mismatch")
-    distributions = [dist for dist in metadata.distributions(path=[str(site)])
-                     if canonicalize_name(dist.metadata["Name"]) == name]
-    if len(distributions) != 1 or distributions[0].version != version:
-        raise InstallIdentityError(f"{name} installed version mismatch")
-    dist = distributions[0]
-    installed_record = next((file for file in dist.files or () if str(file).endswith(".dist-info/RECORD")), None)
-    if installed_record is None:
-        raise InstallIdentityError(f"{name} installed RECORD missing")
     try:
+        archive = wheels / filename
+        if archive.is_symlink() or not archive.is_file() or _digest(archive) != sha:
+            raise InstallIdentityError(f"{name} wheel archive hash mismatch")
+        distributions = [dist for dist in metadata.distributions(path=[str(site)])
+                         if dist.metadata.get("Name") and canonicalize_name(dist.metadata["Name"]) == name]
+        if len(distributions) != 1 or distributions[0].version != version:
+            raise InstallIdentityError(f"{name} installed version mismatch")
+        dist = distributions[0]
+        installed_record = next((file for file in dist.files or () if str(file).endswith(".dist-info/RECORD")), None)
+        if installed_record is None:
+            raise InstallIdentityError(f"{name} installed RECORD missing")
         installed = _record(dist.locate_file(installed_record).read_text(encoding="utf-8"))
         with zipfile.ZipFile(archive) as wheel:
             records = [entry for entry in wheel.namelist() if entry.endswith(".dist-info/RECORD")]
@@ -107,6 +107,15 @@ def _verify_distribution(name: str, identity: object, wheels: Path, site: Path) 
             recorded = _record(wheel.read(records[0]).decode("utf-8"))
             if set(recorded) != set(wheel.namelist()):
                 raise InstallIdentityError(f"{name} wheel RECORD inventory mismatch")
+            prefix = records[0].removesuffix("RECORD")
+            allowed = {records[0], prefix + "INSTALLER", prefix + "REQUESTED", prefix + "direct_url.json"}
+            for entry in recorded:
+                if entry.endswith(".py"):
+                    path = PurePosixPath(entry)
+                    tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
+                    allowed.add(str(path.parent / "__pycache__" / f"{path.stem}.{tag}.pyc"))
+            if set(installed) - set(recorded) - allowed:
+                raise InstallIdentityError(f"{name} unexpected installed RECORD entries")
             for entry in wheel.namelist():
                 if entry == records[0]:
                     continue
@@ -122,7 +131,7 @@ def _verify_distribution(name: str, identity: object, wheels: Path, site: Path) 
                 target = site.joinpath(*PurePosixPath(entry).parts)
                 if not target.is_relative_to(site) or not stat.S_ISREG(target.lstat().st_mode) or _digest(target) != hashlib.sha256(data).hexdigest():
                     raise InstallIdentityError(f"{name} installed content drift")
-    except (OSError, ValueError, KeyError, UnicodeError, zipfile.BadZipFile) as exc:
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, csv.Error, zipfile.BadZipFile) as exc:
         raise InstallIdentityError(f"{name} wheel or installed RECORD unreadable") from exc
 
 

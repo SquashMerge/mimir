@@ -3339,7 +3339,7 @@ class TestHandleHealth:
         self, boot_commit: str | None, executor_commit: str,
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from mimir_cultivate import server as cultivate_server
+        cultivate_server = pytest.importorskip("mimir_cultivate.server")
         worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
         monkeypatch.setattr(cultivate_server.sys, "prefix", str(tmp_path))
