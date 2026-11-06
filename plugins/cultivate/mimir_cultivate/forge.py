@@ -1535,9 +1535,13 @@ def resolve_review_state_for_context(
             and snapshot.head_sha.lower() == stored_scope.observed_head_sha
         ):
             reused = RepoReviewState(stored_scope)
-            return cache.remember(reused) if isinstance(
+            reused = cache.remember(reused) if isinstance(
                 cache, ServerDiscoveredPRStates,
             ) else reused
+            from mimir.access_control import register_server_discovered_review_grant
+
+            register_server_discovered_review_grant(context, reused)
+            return reused
         store.discard(
             repository, pull_request, expected_scope=stored_scope,
         )
@@ -1666,7 +1670,11 @@ def resolve_review_state_for_context(
     store = getattr(context, "server_discovered_pr_scope_store", None)
     if isinstance(store, ServerDiscoveredPRScopeStore):
         store.remember_server_discovery(scope)
-    return cache.remember(state) if cache is not None else state
+    state = cache.remember(state) if cache is not None else state
+    from mimir.access_control import register_server_discovered_review_grant
+
+    register_server_discovered_review_grant(context, state)
+    return state
 
 
 def _resolve_heartbeat_git_state(

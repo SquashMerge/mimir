@@ -30,6 +30,28 @@ from tests.test_repo_tools import (
 )
 
 
+@pytest.mark.parametrize("args, stderr, transport", [
+    (["git", "-C", "/x", "fetch", "--no-tags", "origin", "main"],
+     "fatal: unable to access 'https://github.com/o/r/': Could not resolve host: github.com", True),
+    (["git", "-C", "/x", "fetch", "--no-tags", "origin", "main"],
+     "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503", True),
+    (["git", "-C", "/x", "fetch", "--no-tags", "origin", "main"],
+     "fatal: couldn't find remote ref refs/pull/9/head", False),
+    (["git", "-C", "/x", "rev-parse", "--verify", "HEAD"],
+     "fatal: Could not resolve host: github.com", False),
+])
+def test_git_fetch_transport_failures_are_typed(args, stderr, transport) -> None:
+    from mimir._provider_errors import TransientTransportError
+
+    def runner(_args):
+        return subprocess.CompletedProcess(_args, 128, stdout="", stderr=stderr)
+
+    with pytest.raises(RuntimeError) as raised:
+        repository._run(runner, args, "fetch failed")
+    assert isinstance(raised.value, TransientTransportError) is transport
+    assert isinstance(raised.value, repository.GitTransportError) is transport
+
+
 def test_repository_implementation_is_owned_by_provider() -> None:
     root = Path(__file__).resolve().parents[3] / "mimir"
     for retired in (

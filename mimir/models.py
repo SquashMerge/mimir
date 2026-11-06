@@ -612,6 +612,12 @@ class InformationFlowState:
     pr_checkout_author_trust_cause: dict[str, str] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )
+    # Leases the framework checked out before the model loop, keyed by scope ID:
+    # ``(lease path, recovery id)`` and the candidate commits it reported.
+    # Written only by turn setup; ``repo_checkout`` may resume exactly these.
+    framework_pr_checkouts: dict[str, tuple[tuple[str, str], tuple[Any, ...]]] = field(
+        default_factory=dict, repr=False, compare=False, init=False,
+    )
     _own_push_lineage: dict[tuple[str, int], frozenset[str]] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )

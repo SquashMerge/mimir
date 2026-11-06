@@ -59,11 +59,15 @@ describe("Cultivate bundle", () => {
     await waitFor(() => expect(screen.getByText("No slices reported.")).toBeTruthy());
   });
 
-  it("uses the owner-scoped PR endpoint and does not create unsafe links", async () => {
-    fetcher.mockImplementation(() => reply({ available: true, repo: "owner/repo", truncated: false,
-      pull_requests: [{ number: 4, title: "Review", url: "javascript:alert(1)", created_at: "", review_decision: "", is_draft: true }] }));
-    render(React.createElement(window.mimirCultivate!.PullRequests));
+  it("shows repositories and partial failures without creating unsafe links", async () => {
+    fetcher.mockImplementation(() => reply({ available: true, repo: ["owner/repo", "owner/other"],
+      errors: { "owner/other": "repository unavailable" }, truncated: false,
+      pull_requests: [{ repo: "owner/repo", number: 4, title: "Review", url: "javascript:alert(1)", created_at: "", review_decision: "", is_draft: true }] }));
+    const { container } = render(React.createElement(window.mimirCultivate!.PullRequests));
     expect(await screen.findByText("Review")).toBeTruthy();
+    expect(screen.getByRole("columnheader", { name: "Repository" })).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "owner/repo" })).toBeTruthy();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not load PRs for owner/other: repository unavailable");
     expect(screen.queryByRole("link", { name: "Open PR 4" })).toBeNull();
     expect(fetcher.mock.calls[0][0]).toBe("/api/v1/plugins/cultivate/pr-board");
   });

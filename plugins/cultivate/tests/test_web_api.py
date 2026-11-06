@@ -190,6 +190,7 @@ async def test_selected_factory_api_projects_real_record_fields(tmp_path: Path, 
 async def test_selected_pr_board_reports_command_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, expected: tuple[str | None, str],
 ) -> None:
+    monkeypatch.delenv("GITHUB_REPOS", raising=False)
     def run(args, **kwargs):
         command = args[0]
         if failure == f"missing_{command}":
@@ -211,13 +212,15 @@ async def test_selected_pr_board_reports_command_failures(
         assert response.status == 200
         board = (await response.json())["data"]
         assert board["available"] is False
-        assert board["repo"] == expected[0]
+        assert board["repo"] == ([expected[0]] if expected[0] else [])
         assert expected[1] in board["error"]
+        assert expected[1] in board["errors"][expected[0] or "origin"]
         assert board["pull_requests"] == []
 
 
 @pytest.mark.asyncio
 async def test_selected_pr_board_normalizes_open_prs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_REPOS", raising=False)
     calls = []
 
     def run(args, **kwargs):
@@ -240,16 +243,136 @@ async def test_selected_pr_board_normalizes_open_prs(tmp_path: Path, monkeypatch
         assert response.status == 200
         board = (await response.json())["data"]
         assert board["available"] is True
-        assert board["repo"] == "owner/home"
+        assert board["repo"] == ["owner/home"]
         assert board["total_count"] == 1
         assert board["truncated"] is False
         assert board["pull_requests"] == [{
+            "repo": "owner/home",
             "number": 12, "title": "Review", "url": "https://github.com/owner/home/pull/12",
             "author": "alice", "created_at": "2026-06-27T12:00:00Z",
             "review_decision": "REVIEW_REQUIRED", "is_draft": False,
         }]
-    assert calls[1] == ["gh", "pr", "list", "-R", "owner/home", "--state", "open",
-                        "--json", "number,title,url,author,createdAt,reviewDecision,isDraft"]
+    assert calls[1] == ["gh", "pr", "list", "-R", "owner/home", "--state", "open", "--limit", "1000",
+                         "--json", "number,title,url,author,createdAt,reviewDecision,isDraft"]
+
+
+def _inventory(home: Path, *repos: str) -> None:
+    (home / "repositories.yaml").write_text(json.dumps({"repositories": [
+        {"slug": repo, "root": str(home / repo.split("/")[1]), "mode": "rw",
+         "origin": f"https://github.com/{repo}.git", "base_branch": "main"}
+        for repo in repos
+    ]}), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_pr_board_lists_configured_repo_when_home_has_no_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _inventory(tmp_path, "o/code")
+    calls: list[str] = []
+
+    def run(args, **kwargs):
+        if args[0] == "git":
+            return subprocess.CompletedProcess(args, 0, stdout="git@github.com:o/home.git", stderr="")
+        repo = args[args.index("-R") + 1]
+        calls.append(repo)
+        prs = [{"number": 27, "title": "Code change", "url": "https://github.com/o/code/pull/27"}] if repo == "o/code" else []
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(prs), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        board = (await (await client.get("/api/v1/plugins/cultivate/pr-board")).json())["data"]
+    assert board["available"] is True
+    assert board["repo"] == ["o/code", "o/home"]
+    assert calls == ["o/code", "o/home"]
+    assert board["total_count"] == 1
+    assert board["pull_requests"][0]["repo"] == "o/code"
+    assert board["pull_requests"][0]["number"] == 27
+
+
+@pytest.mark.asyncio
+async def test_pr_board_reports_one_repo_failure_and_caps_combined_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "o/bad,o/code,o/another")
+
+    def run(args, **kwargs):
+        if args[0] == "git":
+            return subprocess.CompletedProcess(args, 0, stdout="https://github.com/o/bad", stderr="")
+        repo = args[args.index("-R") + 1]
+        if repo == "o/bad":
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="repository unavailable")
+        prs = [{"number": n, "title": f"PR {n}"} for n in range(60)]
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(prs), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        board = (await (await client.get("/api/v1/plugins/cultivate/pr-board")).json())["data"]
+    assert board["available"] is True
+    assert board["error"] is None
+    assert board["errors"] == {"o/bad": "repository unavailable"}
+    assert board["repo"] == ["o/bad", "o/code", "o/another"]
+    assert board["total_count"] == 120
+    assert board["truncated"] is True
+    assert len(board["pull_requests"]) == 100
+    assert {row["repo"] for row in board["pull_requests"]} == {"o/code", "o/another"}
+
+
+@pytest.mark.asyncio
+async def test_pr_board_deduplicates_configured_home_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _inventory(tmp_path, "o/home")
+    monkeypatch.setenv("GITHUB_REPOS", "o/other")  # declared inventory takes precedence
+    calls: list[str] = []
+
+    def run(args, **kwargs):
+        if args[0] == "git":
+            return subprocess.CompletedProcess(args, 0, stdout="https://github.com/O/Home.git", stderr="")
+        calls.append(args[args.index("-R") + 1])
+        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        board = (await (await client.get("/api/v1/plugins/cultivate/pr-board")).json())["data"]
+    assert board["repo"] == ["o/home"]
+    assert board["available"] is True
+    assert calls == ["o/home"]
+
+
+@pytest.mark.asyncio
+async def test_pr_board_ignores_invalid_legacy_repositories_and_survives_origin_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "o/code,o/..,o/invalid/name")
+    calls: list[str] = []
+
+    def run(args, **kwargs):
+        if args[0] == "git":
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="origin unavailable")
+        calls.append(args[args.index("-R") + 1])
+        return subprocess.CompletedProcess(args, 0, stdout='[{"number": 3}]', stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        board = (await (await client.get("/api/v1/plugins/cultivate/pr-board")).json())["data"]
+    assert calls == ["o/code"]
+    assert board["repo"] == ["o/code"]
+    assert board["available"] is True
+    assert board["errors"] == {"origin": "origin unavailable"}
+    assert board["pull_requests"][0]["repo"] == "o/code"
 
 
 @pytest.mark.asyncio
