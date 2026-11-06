@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import hashlib
+from io import BytesIO
+import json
+from zipfile import ZipFile
+
+import pytest
+
+from mimir_cultivate.release_resolver import ReleaseError, resolve_release
+
+
+def wheel(project, version, *, dependency=None):
+    name = project.replace("-", "_")
+    filename = f"{name}-{version}-py3-none-manylinux2014_x86_64.whl"
+    content = f"Name: {project}\nVersion: {version}\n"
+    if dependency:
+        content += f"Requires-Dist: mimir-agent=={dependency}\n"
+    output = BytesIO()
+    with ZipFile(output, "w") as archive:
+        archive.writestr(f"{name}-{version}.dist-info/METADATA", content)
+    data = output.getvalue()
+    url = f"https://files.pythonhosted.org/packages/{filename}"
+    return {"filename": filename, "url": url, "packagetype": "bdist_wheel",
+            "digests": {"sha256": hashlib.sha256(data).hexdigest()}, "data": data}
+
+
+def index(agents, cultivates):
+    sources = {}
+    for project, releases in (("mimir-agent", agents), ("mimir-cultivate", cultivates)):
+        listing = {}
+        for version, options in releases.items():
+            listing[version] = []
+            for option in options:
+                entry = option.copy()
+                sources[entry["url"]] = entry.pop("data")
+                listing[version].append(entry)
+        sources[f"https://pypi.org/pypi/{project}/json"] = json.dumps({"releases": listing}).encode()
+
+    def fetch(url, limit):
+        return sources[url]
+
+    return fetch, sources
+
+
+def pair(version):
+    return wheel("mimir-agent", version), wheel("mimir-cultivate", version, dependency=version)
+
+
+def test_stable_first_and_verified_download():
+    stable = pair("1.0.0")
+    rc = pair("2.0.0rc1")
+    fetch, _ = index({"1.0.0": [stable[0]], "2.0.0rc1": [rc[0]]},
+                     {"1.0.0": [stable[1]], "2.0.0rc1": [rc[1]]})
+    selected = resolve_release(fetch=fetch)
+    assert selected.version == "1.0.0"
+    assert selected.agent.data == stable[0]["data"]
+    assert selected.cultivate.sha256 == stable[1]["digests"]["sha256"]
+    assert resolve_release("2.0.0rc1", fetch=fetch).version == "2.0.0rc1"
+
+
+def test_prerelease_fallback_skips_unpaired_and_yanked():
+    old = pair("1.0.0rc1")
+    newest = pair("1.0.0rc2")
+    yanked = pair("2.0.0")
+    yanked[1]["yanked"] = True
+    fetch, _ = index({"1.0.0rc1": [old[0]], "1.0.0rc2": [newest[0]],
+                      "2.0.0": [yanked[0]], "3.0.0": [wheel("mimir-agent", "3.0.0")]},
+                     {"1.0.0rc1": [old[1]], "1.0.0rc2": [newest[1]], "2.0.0": [yanked[1]]})
+    assert resolve_release(fetch=fetch).version == "1.0.0rc2"
+    with pytest.raises(ReleaseError, match="non-yanked"):
+        resolve_release("2.0.0", fetch=fetch)
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("hash", "SHA-256 mismatch"), ("metadata", "metadata name or version mismatch"),
+    ("dependency", "does not require"), ("filename", "name or version disagrees"),
+    ("python", "non-yanked"), ("tags", "non-yanked"),
+])
+def test_rejects_bad_wheels(change, expected):
+    agent, cultivate = pair("1.0.0")
+    if change == "hash":
+        agent["digests"]["sha256"] = "0" * 64
+    elif change == "metadata":
+        output = BytesIO()
+        with ZipFile(output, "w") as archive:
+            archive.writestr("mimir_agent-1.0.0.dist-info/METADATA", "Name: mimir-agent\nVersion: 2.0.0\n")
+        agent["data"] = output.getvalue()
+        agent["digests"]["sha256"] = hashlib.sha256(agent["data"]).hexdigest()
+    elif change == "dependency":
+        cultivate["data"] = wheel("mimir-cultivate", "1.0.0", dependency="2.0.0")["data"]
+        cultivate["digests"]["sha256"] = hashlib.sha256(cultivate["data"]).hexdigest()
+    elif change == "filename":
+        agent["filename"] = agent["filename"].replace("1.0.0", "2.0.0")
+    elif change == "python":
+        agent["requires_python"] = ">=3.12"
+    else:
+        agent["filename"] = agent["filename"].replace("manylinux2014_x86_64", "win_amd64")
+    fetch, _ = index({"1.0.0": [agent]}, {"1.0.0": [cultivate]})
+    with pytest.raises(ReleaseError, match=expected):
+        resolve_release(fetch=fetch)
+
+
+def test_no_pair_and_invalid_version():
+    agent, cultivate = pair("1.0.0")
+    fetch, _ = index({"1.0.0": [agent]}, {"2.0.0": [wheel("mimir-cultivate", "2.0.0", dependency="2.0.0")]})
+    with pytest.raises(ReleaseError, match="No common"):
+        resolve_release(fetch=fetch)
+    with pytest.raises(ReleaseError, match="Invalid exact"):
+        resolve_release("latest", fetch=fetch)
+
+
+def test_invalid_index_and_unreachable():
+    def unavailable(url, limit):
+        raise ReleaseError("Cannot reach PyPI")
+
+    with pytest.raises(ReleaseError, match="Cannot reach PyPI"):
+        resolve_release(fetch=unavailable)
+    with pytest.raises(ReleaseError, match="Invalid PyPI JSON"):
+        resolve_release(fetch=lambda url, limit: b"not json")
+    with pytest.raises(ReleaseError, match="Cannot reach PyPI"):
+        resolve_release(fetch=lambda url, limit: (_ for _ in ()).throw(OSError("unavailable")))
+
+
+def test_rejects_unreachable_wheel_and_oversized_index():
+    agent, cultivate = pair("1.0.0")
+    fetch, sources = index({"1.0.0": [agent]}, {"1.0.0": [cultivate]})
+    del sources[agent["url"]]
+
+    def unavailable(url, limit):
+        if url == agent["url"]:
+            raise OSError("unavailable")
+        return fetch(url, limit)
+
+    with pytest.raises(ReleaseError, match="Cannot download"):
+        resolve_release(fetch=unavailable)
+    with pytest.raises(ReleaseError, match="exceeds"):
+        resolve_release(fetch=lambda url, limit: b" " * (limit + 1))
+
+
+def test_rejects_bad_index_digest_and_wheel_url():
+    agent, cultivate = pair("1.0.0")
+    agent["digests"]["sha256"] = "unknown"
+    fetch, _ = index({"1.0.0": [agent]}, {"1.0.0": [cultivate]})
+    with pytest.raises(ReleaseError, match="URL or SHA-256"):
+        resolve_release(fetch=fetch)
+    agent["digests"]["sha256"] = "a" * 64
+    agent["url"] = "http://files.pythonhosted.org/packages/" + agent["filename"]
+    fetch, _ = index({"1.0.0": [agent]}, {"1.0.0": [cultivate]})
+    with pytest.raises(ReleaseError, match="URL or SHA-256"):
+        resolve_release(fetch=fetch)
