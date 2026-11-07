@@ -1059,6 +1059,7 @@ def _repo_pr_scope_resolution(
     provenance: str,
     repo: object,
     principal: object,
+    pull_request_author: object = None,
     event_type: object,
     number: object,
     head_repo: object,
@@ -1196,7 +1197,7 @@ def _repo_pr_scope_resolution(
         base_ref=base_ref,
         observed_base_sha=base_sha.lower(),
         checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
-        pull_request_author=principal,
+        pull_request_author=pull_request_author if pull_request_author is not None else principal,
     )
     return RepoPRScopeResolution(scope=scope_type(
         is_remediation=is_remediation, **scope_fields,
@@ -1364,8 +1365,11 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             policy=policy,
             provenance="poller_payload",
             repo=item.get("repo"),
+            # Synchronize's author is an optional push identity, not the PR
+            # principal. Keep the established PR-author mapping for admission.
             principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"
                        else item.get("author")),
+            pull_request_author=item.get("pr_author") or item.get("author"),
             event_type=item.get("event_type"),
             review_state=item.get("state"),
             actor=item.get("actor"),

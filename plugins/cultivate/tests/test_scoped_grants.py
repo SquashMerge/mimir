@@ -71,6 +71,7 @@ def _operator_discovery(tmp_path, monkeypatch, *, roles=("admin",), ingress=None
     )
     client = SimpleNamespace(
         get_pull_request_snapshot=lambda *_: snapshot,
+        get_pull_request_identity=lambda *_: snapshot,
         list_reviews=lambda _: (SimpleNamespace(author="reviewer", state="CHANGES_REQUESTED"),),
         get_pull_request=lambda _: PullRequestProjection(
             7, "Fix review", "open", "mimir-bot", False, "main", "worklink/7",
