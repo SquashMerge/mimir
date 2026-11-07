@@ -6758,7 +6758,11 @@ _REPOSITORY_RESULT_RESOURCE = re.compile(
 
 
 def _trusted_forge_repository_source(source: Any) -> bool:
-    """Author-attested repository content needs no destination scope binding."""
+    """Any complete, trusted repository source needs no destination binding.
+
+    This includes author-attested content and server-attested issue-write echoes;
+    untrusted repository content still goes through the exact scope checks below.
+    """
     return (
         source.domain == "repository"
         and source.domain_qualifier is None

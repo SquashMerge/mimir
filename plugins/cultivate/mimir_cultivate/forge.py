@@ -2157,7 +2157,12 @@ def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: R
 
 
 def _publish_issue_write_projection(runtime: ToolRuntime[AuthContext] | None, target: IssueTarget) -> None:
-    """Attest only the server-resolved target of a completed issue write."""
+    """Attest only the server-resolved target of a completed issue write.
+
+    Unlike PR-write provenance, which inherits PR content-author attestation,
+    this trusts only our own CommentProjection echo regardless of issue author.
+    No issue content or adapter error text may enter this successful projection.
+    """
     from mimir.access_control import publish_protected_result
     from mimir.models import SourceLabel
 

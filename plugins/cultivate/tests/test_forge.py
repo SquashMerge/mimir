@@ -166,14 +166,19 @@ def test_registered_forge_writes_all_publish_provenance() -> None:
     tree = ast.parse(Path(forge.__file__).read_text(encoding="utf-8"))
     adapter = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                    and node.name == "GitHubForgeClient")
-    mutations = {
-        node.name for node in adapter.body if isinstance(node, ast.FunctionDef)
-        and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "_request" and call.args
-                and isinstance(call.args[0], ast.Constant)
-                and call.args[0].value in {"POST", "PATCH", "PUT", "DELETE"}
-                for call in ast.walk(node))
-    }
+    mutations = set()
+    for node in adapter.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_request"):
+                continue
+            # A variable verb must not silently disappear from this inventory.
+            assert call.args and isinstance(call.args[0], ast.Constant), node.name
+            assert call.args[0].value in {"GET", "POST", "PATCH", "PUT", "DELETE"}, node.name
+            if call.args[0].value != "GET":
+                mutations.add(node.name)
     assert mutations
     registered = {item.name for item in forge.FORGE_TOOLS}
     handlers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
@@ -187,6 +192,23 @@ def test_registered_forge_writes_all_publish_provenance() -> None:
             covered.update(writes)
             expected = "_publish_issue_write_projection" if name == "issue_comment" else "_publish_write_projection"
             assert expected in calls, f"{name} writes via {writes} without attestation"
+            # Require a top-level attestation after every write-containing statement
+            # and before the return, not merely an unreachable/conditional call.
+            statements = handlers[name].body
+            attestations = [index for index, statement in enumerate(statements)
+                            if isinstance(statement, ast.Expr)
+                            and isinstance(statement.value, ast.Call)
+                            and isinstance(statement.value.func, ast.Name)
+                            and statement.value.func.id == expected]
+            write_statements = [index for index, statement in enumerate(statements)
+                                if any(isinstance(call, ast.Call)
+                                       and isinstance(call.func, ast.Attribute)
+                                       and call.func.attr in writes
+                                       for call in ast.walk(statement))]
+            returns = [index for index, statement in enumerate(statements)
+                       if any(isinstance(node, ast.Return) for node in ast.walk(statement))]
+            assert len(attestations) == 1, name
+            assert max(write_statements) < attestations[0] < min(returns), name
     assert covered == mutations, f"unregistered forge writes: {mutations - covered}"
 
 
