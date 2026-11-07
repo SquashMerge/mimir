@@ -37,6 +37,34 @@ def cultivate_policy(monkeypatch):
         yield
 
 
+@pytest.mark.parametrize("push_author", ["different-pusher", None])
+def test_synchronize_scope_records_pr_author_not_push_author(tmp_path, monkeypatch, push_author):
+    from mimir import access_control
+
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    repo, template = _repo_and_scope(tmp_path)
+    monkeypatch.setattr(access_control, "_canonical_repo_binding_resolution", lambda _:
+        RepoBindingResolution((str(repo.resolve()), template.canonical_origin),
+                              (str(repo.resolve()),), 1))
+    item = {
+        "event_type": "pr_synchronize", "repo": template.canonical_repo,
+        "number": template.pr_number, "author": push_author,
+        "pr_author": "collaborator", "pr_author_is_trusted": True,
+        "head_repo": template.head_repo, "head_remote": "origin",
+        "head_ref": template.head_ref, "head_sha": template.observed_head_sha,
+        "base_ref": template.base_ref, "base_sha": template.observed_base_sha,
+    }
+    registry = access_control._repo_review_state_from_event(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity",
+                   extra={"items": [item]}),
+        SimpleNamespace(authority_profile="github"),
+    )
+    assert registry is not None
+    state = registry.resolve(template.canonical_repo, template.pr_number)
+    assert state is not None
+    assert state.action_scope.pull_request_author == "collaborator"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_type", ["pr_checks_completed", "issue_comment"])
 @pytest.mark.usefixtures("stub_opencode")

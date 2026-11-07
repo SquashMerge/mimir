@@ -435,6 +435,19 @@ def test_lease_missing_and_false_verdicts_are_not_author_resolution_failures(
 @pytest.mark.parametrize("cause,expected", [
     ("collaborator_timeout", "collaborator_timeout"),
     ("membership_budget", "membership_budget"),
+    *[(cause, cause) for cause in (
+        "ifc_state_missing", "pr_identity_reader_missing", "head_identity_reader_missing",
+        "pr_number_mismatch", "pr_head_sha_mismatch", "pr_author_mismatch",
+        "pr_repository_mismatch", "pr_head_repository_mismatch",
+        "head_committer_unavailable", "github_identity_verification_failed",
+    )],
+    *[(f"{stage}_{failure}", f"{stage}_{failure}")
+      for stage in ("pr_identity", "head_identity", "contributor_trust")
+      for failure in ("rate_limited", "server_error", "request_refused",
+                      "transport_failed", "unavailable")],
+    ("pr_identity_untrusted response body", "author_unresolved"),
+    ("head_identity_server_error: private response", "author_unresolved"),
+    ("contributor_trust_unknown", "author_unresolved"),
     ("untrusted response body", "author_unresolved"),
 ])
 def test_no_author_trust_lease_diagnostic_carries_bounded_cause(

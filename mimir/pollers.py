@@ -592,9 +592,19 @@ GITHUB_AUTHOR_FAILURE_CLASSES = frozenset({
 GITHUB_AUTHOR_UNAVAILABLE_CAUSES = frozenset({
     "budget_exhausted", "deadline_exceeded", "author_unresolved",
     "verdict_missing", "no_turn_verdict", "non_collaborator",
+    # Identity-only checkout verdicts use fixed codes, never API error text.
+    "ifc_state_missing", "pr_identity_reader_missing", "head_identity_reader_missing",
+    "pr_number_mismatch", "pr_head_sha_mismatch", "pr_author_mismatch",
+    "pr_repository_mismatch", "pr_head_repository_mismatch",
+    "head_committer_unavailable", "github_identity_verification_failed",
 }) | frozenset(
     f"{request}_{failure}" for request in ("collaborator", "membership")
     for failure in GITHUB_AUTHOR_FAILURE_CLASSES
+) | frozenset(
+    f"{stage}_{failure}"
+    for stage in ("pr_identity", "head_identity", "contributor_trust")
+    for failure in ("rate_limited", "server_error", "request_refused",
+                    "transport_failed", "unavailable")
 )
 
 
