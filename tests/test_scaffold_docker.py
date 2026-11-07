@@ -625,8 +625,9 @@ def test_render_dockerfile_does_not_install_codex_cli():
         assert "npm install -g @openai/codex" not in out, mode
 
 
-def test_scaffold_codex_plus_extra_does_not_install_codex_cli(tmp_path: Path):
+def test_scaffold_codex_plus_extra_does_not_install_codex_cli(tmp_path: Path, monkeypatch):
     """The model adapter needs auth.json, not the separate Codex executable."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     home = tmp_path / "codex-home"
     home.mkdir()
     scaffold(home, mode="pypi", mimir_extras=["codex-plus", "discord"])
@@ -646,6 +647,10 @@ def test_render_dockerfile_installs_opencode_when_selected():
     assert FACTORY_VERSION == "0.12.1"
     plugins = _cultivate_or_refusal()
     for mode in ("workspace", "pypi"):
+        if plugins and mode == "pypi":
+            with pytest.raises(ValueError, match="mimir cultivate setup"):
+                render_dockerfile([], mode=mode, install_opencode=True, plugins=plugins)
+            continue
         out = render_dockerfile([], mode=mode, install_opencode=True, plugins=plugins)
         if not plugins:
             assert "cultivate-docker" not in out
@@ -682,12 +687,38 @@ def test_render_dockerfile_does_not_install_opencode_without_provider():
 def test_scaffold_selected_missing_provider_refuses(tmp_path, monkeypatch):
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     if _cultivate_installed():
-        scaffold(tmp_path, mode="pypi")
-        assert (tmp_path / ".mimir-scaffold/cultivate-docker/base.sh").is_file()
+        with pytest.raises(ValueError, match="mimir cultivate setup"):
+            scaffold(tmp_path, mode="pypi")
+        assert not list(tmp_path.iterdir())
     else:
         with pytest.raises(PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
             scaffold(tmp_path, mode="pypi")
         assert not (tmp_path / "Dockerfile").exists()
+
+
+def test_pypi_cultivate_renderer_refuses_without_source_overlay():
+    plugins = _cultivate_or_refusal()
+    if not plugins:
+        return
+    with pytest.raises(ValueError, match="mimir cultivate setup"):
+        render_start_sh(mode="pypi", cultivate=True)
+    with pytest.raises(ValueError, match="mimir cultivate setup"):
+        render_dockerfile([], mode="pypi", plugins=plugins)
+
+
+def test_workspace_cultivate_retains_source_pins(tmp_path, monkeypatch):
+    plugins = _cultivate_or_refusal()
+    if not plugins:
+        return
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    scaffold(tmp_path, mode="workspace")
+    dockerfile = (tmp_path / "Dockerfile").read_text()
+    compose = (tmp_path / "compose.yml").read_text()
+    start = (tmp_path / "start.sh").read_text()
+    assert "sh /opt/cultivate-docker/executor.sh" in dockerfile
+    for key in ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT", "MIMIR_GIT_URL"):
+        assert f"        {key}:" in compose
+    assert "--all-packages" in start
 
 
 @pytest.mark.parametrize("mode", ["workspace", "pypi"])
@@ -699,6 +730,10 @@ def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
     monkeypatch.setenv("MIMIR_ENABLE_OPENCODE", "0")
     plugins = _cultivate_or_refusal() if selected else ()
+    if plugins and mode == "pypi":
+        with pytest.raises(ValueError, match="mimir cultivate setup"):
+            render_dockerfile([], mode=mode, plugins=plugins)
+        return
     dockerfile = render_dockerfile([], mode=mode, plugins=plugins)
     assert ("COPY .mimir-scaffold/cultivate-docker/" in dockerfile) is bool(plugins)
     assert ("ARG MIMIR_ENABLE_OPENCODE=0" in dockerfile) is bool(plugins)
@@ -718,6 +753,11 @@ def test_selected_cultivate_scaffold_executes_gated_pinned_install(tmp_path, mon
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    if plugins and mode == "pypi":
+        with pytest.raises(ValueError, match="mimir cultivate setup"):
+            scaffold(home, mode=mode)
+        assert not list(home.iterdir())
+        return
     scaffold(home, mode=mode)
     dockerfile = (home / "Dockerfile").read_text()
     fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"
@@ -770,8 +810,13 @@ def test_scaffold_installs_opencode_when_selected(tmp_path: Path, monkeypatch):
     home.mkdir()
     plugins = _cultivate_or_refusal()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
-    scaffold(home, mode="pypi", install_opencode=True)
-    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
+    if plugins:
+        with pytest.raises(ValueError, match="mimir cultivate setup"):
+            scaffold(home, mode="pypi", install_opencode=True)
+        assert not list(home.iterdir())
+    else:
+        scaffold(home, mode="pypi", install_opencode=True)
+        assert f"opencode-ai@{OPENCODE_VERSION}" not in _scaffold_install_text(home)
 
     plain = tmp_path / "plain-home"
     plain.mkdir()
@@ -791,8 +836,9 @@ def test_scaffold_installs_opencode_for_workspace_mode(tmp_path: Path, monkeypat
     assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
 
 
-def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path):
+def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path, monkeypatch):
     """The global XDG config applies from outer repos and nested worktrees."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     home = tmp_path / "oc-home"
     home.mkdir()
     scaffold(home, mode="pypi", install_opencode=True)
@@ -810,8 +856,9 @@ def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path):
     assert '"gitExclude": false' in content
 
 
-def test_scaffold_skips_opencode_config_when_disabled(tmp_path: Path):
+def test_scaffold_skips_opencode_config_when_disabled(tmp_path: Path, monkeypatch):
     """When install_opencode=False, no global opencode.json is created."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     home = tmp_path / "no-oc-home"
     home.mkdir()
     scaffold(home, mode="pypi", install_opencode=False)
@@ -869,7 +916,8 @@ def test_ensure_opencode_config_preserves_existing_options_and_deduplicates(tmp_
     assert config_path.read_text() == before
 
 
-def test_scaffold_opencode_config_is_idempotent(tmp_path: Path):
+def test_scaffold_opencode_config_is_idempotent(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     home = tmp_path / "idempotent-home"
     home.mkdir()
     scaffold(home, mode="pypi", install_opencode=True)
@@ -1150,8 +1198,13 @@ def test_cli_exposes_opencode_opt_in(tmp_path: Path, capsys, monkeypatch):
     args = parser.parse_args(
         ["--home", str(tmp_path), "--mode", "pypi", "--opencode"]
     )
-    assert cmd(args) == 0
-    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(tmp_path)) is bool(plugins)
+    if plugins:
+        assert cmd(args) == 2
+        assert "mimir cultivate setup" in capsys.readouterr().out
+        assert not list(tmp_path.iterdir())
+    else:
+        assert cmd(args) == 0
+        assert f"opencode-ai@{OPENCODE_VERSION}" not in _scaffold_install_text(tmp_path)
 
 
 @pytest.mark.parametrize("installed_version", ["0.0.1", OPENCODE_VERSION])
@@ -1163,7 +1216,7 @@ def test_cmd_flagless_rerun_preserves_deployment_shape(
     home = tmp_path / "renamed-home"
     home.mkdir()
     plugins = _cultivate_or_refusal()
-    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     scaffold(
         home,
         mode="pypi",
@@ -1174,10 +1227,17 @@ def test_cmd_flagless_rerun_preserves_deployment_shape(
     fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"
     install_path = fragment if fragment.is_file() else home / "Dockerfile"
     install_path.write_text(install_path.read_text().replace(OPENCODE_VERSION, installed_version))
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
     parser = ArgumentParser()
     add_argparse(parser)
     args = parser.parse_args(["--home", str(home)])
 
+    if plugins:
+        before = {path.relative_to(home): path.read_bytes() for path in home.rglob("*") if path.is_file()}
+        assert cmd(args) == 2
+        assert "mimir cultivate setup" in capsys.readouterr().out
+        assert {path.relative_to(home): path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
+        return
     assert cmd(args) == 0
     dockerfile = (home / "Dockerfile").read_text()
     compose = (home / "compose.yml").read_text()
@@ -1187,7 +1247,8 @@ def test_cmd_flagless_rerun_preserves_deployment_shape(
     assert '"127.0.0.1:9000:8080"' in compose
 
 
-def test_explicit_rerun_flags_override_recovered_shape(tmp_path: Path):
+def test_explicit_rerun_flags_override_recovered_shape(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     home = tmp_path / "home"
     home.mkdir()
     scaffold(
@@ -1656,10 +1717,11 @@ def test_render_start_sh_workspace_mode_unchanged():
 # ─── scaffold() end-to-end in PyPI mode ─────────────────────────────
 
 
-def test_scaffold_pypi_mode_writes_pypi_flavored_files(tmp_path):
+def test_scaffold_pypi_mode_writes_pypi_flavored_files(tmp_path, monkeypatch):
     """End-to-end: ``mode='pypi'`` produces Dockerfile + compose.yml +
     start.sh that all match the PyPI shape."""
     from mimir.scaffold_docker import scaffold
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     result = scaffold(
         tmp_path, service_name="test-agent", web_port=8092,
         mode="pypi", mimir_extras=["anthropic"],

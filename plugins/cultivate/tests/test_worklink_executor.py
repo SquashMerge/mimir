@@ -223,7 +223,7 @@ def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(name: 
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
-    expected_protocol = "worklink-executor-v12-factory-cancel"
+    expected_protocol = "worklink-executor-v13-control-output-size"
     assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_exec.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_client.MAX_REQUEST_BYTES == worker_exec.MAX_REQUEST_BYTES == 256 * 1024
@@ -330,7 +330,7 @@ async def test_executor_identity_requires_matching_independent_root(
 ) -> None:
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / "checkouts"))
     response = {"status": "identity", "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
-                "source_commit": "a" * 40, "checkout_root": str(worker_exec.worklink_checkout_root())}
+                "mode": "source", "source_commit": "a" * 40, "checkout_root": str(worker_exec.worklink_checkout_root())}
 
     class Socket:
         def send(self, payload):
@@ -343,7 +343,7 @@ async def test_executor_identity_requires_matching_independent_root(
             pass
 
     monkeypatch.setattr(worker_client.WorkerClient, "_connect", lambda self: Socket())
-    assert await worker_client.verify_executor_identity() == "a" * 40
+    assert await worker_client.verify_executor_identity() == {"mode": "source", "source_commit": "a" * 40}
     response["checkout_root"] = str(tmp_path / "wrong-root")
     with pytest.raises(worker_client.CheckoutRootMismatchError) as mismatch:
         await worker_client.verify_executor_identity()
@@ -739,7 +739,7 @@ async def test_provider_worker_wire_fd_identity_launch_wait_cancel(
     client = worker_client.WorkerClient(Capability())
     identifier = "00000000-0000-4000-8000-000000000002"
     try:
-        assert await worker_client.verify_executor_identity() == "a" * 40
+        assert await worker_client.verify_executor_identity() == {"mode": "source", "source_commit": "a" * 40}
         with pytest.raises(RuntimeError, match="identity does not match"):
             wrong = worker_client.WorkerClient(Capability())
             wrong.checkout = SimpleNamespace(

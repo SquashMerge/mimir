@@ -1,5 +1,29 @@
 #!/bin/sh
 set -eu
+if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
+    python3 /opt/cultivate-docker/verify_wheels.py /opt/mimir-worklink/wheels \
+        "$MIMIR_VERSION" "$MIMIR_AGENT_WHEEL" "$MIMIR_AGENT_SHA256" \
+        "$MIMIR_CULTIVATE_WHEEL" "$MIMIR_CULTIVATE_SHA256" \
+        > /opt/mimir-worklink/executor-install-identity.json
+    python3 -m venv /opt/mimir-worklink/venv
+    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip
+    # Match the controller's CPU-only local embeddings dependency.
+    case ",${MIMIR_EXTRAS}," in *,local-embeddings,*)
+        /opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'torch==2.15.0+cpu' \
+            --extra-index-url https://download.pytorch.org/whl/cpu ;;
+    esac
+    /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps 'uv==0.11.12'
+    ln -sf /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv
+    # Populate the root-owned seed cache without needing a source checkout.
+    UV_CACHE_DIR=/opt/mimir-worklink/uv-cache /opt/mimir-worklink/venv/bin/uv pip install \
+        --python /opt/mimir-worklink/venv/bin/python \
+        "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
+        "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
+    /opt/mimir-worklink/venv/bin/python -c 'from mimir_cultivate.install_identity import write_startup_hooks, EXECUTOR_HOOKS, executor_identity; write_startup_hooks(EXECUTOR_HOOKS); executor_identity()'
+    chown -R root:root /opt/mimir-worklink
+    chmod -R go-w /opt/mimir-worklink
+    exit 0
+fi
 git check-ref-format "$MIMIR_GIT_REF"
 git init /opt/mimir-worklink/source
 git -C /opt/mimir-worklink/source remote add origin "$MIMIR_GIT_URL"

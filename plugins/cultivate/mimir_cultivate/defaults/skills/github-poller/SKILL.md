@@ -119,10 +119,12 @@ For each repo in `GITHUB_REPOS`:
 - **Review requests** (`pr_review_requested`) — fired when `MIMIR_GITHUB_SELF_LOGIN`
   appears in a PR's `requested_reviewers`. **State-reconciling retry** (chainlink
   #299): a submitted review removes you from `requested_reviewers`, so while you
-  remain requested the poller RE-EMITS once per poll (up to
-  `REVIEW_REQUEST_MAX_ATTEMPTS`, default 3). This recovers a review whose
-  triggered turn died (e.g. a transient model 503) instead of silently dropping
-  it — the old emit-once model advanced the cursor past a dead turn and never
+  remain requested the poller RE-EMITS on later polls. Model-side failures
+  consume up to `REVIEW_REQUEST_MAX_ATTEMPTS` (default 3); pre-work transport,
+  provider, and startup failures use a separate six-failure bound with backoff.
+  This recovers a review whose triggered turn died (e.g. a transient model
+  503) instead of silently dropping it — the old emit-once model advanced
+  the cursor past a dead turn and never
   re-fired (observed on PR #511). On exhaustion it emits a one-shot
   `pr_review_request_gave_up` **signal** (no turn; surfaces as a *negative
   algedonic signal* via `feedback.classify`'s `*_gave_up` rule) and goes dormant

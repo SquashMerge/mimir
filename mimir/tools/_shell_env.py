@@ -32,7 +32,10 @@ _TRUSTED_PATH_DIRS = (
 )
 _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
 _MODEL_SELECTION_ENV = "MIMIR_MODEL_SPEC"
-_MINIMAL_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
+# Preserve the image's no-bytecode policy in both direct and login shells.
+# PyPI first-party bytecode is unverifiable and therefore identity drift; even
+# ordinary CLI imports must not create it in the controller's writable venv.
+_MINIMAL_ENV_NAMES = frozenset({"HOME", "LANG", "TZ", "PYTHONDONTWRITEBYTECODE"})
 _INTERACTIVE_ENV_NAMES = _MINIMAL_ENV_NAMES | frozenset({
     "TERM", "TMPDIR", "USER", "LOGNAME", "MIMIR_HOME",
 })

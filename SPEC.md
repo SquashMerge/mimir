@@ -1293,6 +1293,7 @@ name the remote ref and its exact controller/executor commit:
 MIMIR_GIT_REF=refs/heads/main
 MIMIR_COMMIT=$(git rev-parse HEAD)
 docker build \
+  --build-arg MIMIR_INSTALL_MODE=source \
   --build-arg MIMIR_GIT_REF="$MIMIR_GIT_REF" \
   --build-arg MIMIR_CONTROLLER_COMMIT="$MIMIR_COMMIT" \
   --build-arg MIMIR_EXECUTOR_COMMIT="$MIMIR_COMMIT" \

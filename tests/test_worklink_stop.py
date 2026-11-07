@@ -888,7 +888,9 @@ def _exercise_stop(home: Path, *, stale_leaf: bool = True) -> None:
                 ['chainlink', 'issue', 'unlabel', '700', 'worklink:in-progress'],
             ]
             assert remaining == [], evidence  # Zombies count as unreaped too.
-            assert monitor.result() == (-signal.SIGTERM, False, False)
+            code, timed_out, overflow, stdout_bytes, stderr_bytes = monitor.result()
+            assert (code, timed_out, overflow) == (-signal.SIGTERM, False, False)
+            assert stdout_bytes >= 0 and stderr_bytes >= 0
             rpc.result()
             assert proc.done.is_set() and proc.error is None
             assert process.returncode == 0

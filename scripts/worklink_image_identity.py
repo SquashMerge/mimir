@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import argparse
+import base64
+import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 import time
+import zipfile
+
+from packaging.utils import canonicalize_name, parse_wheel_filename
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = f"mimir-worklink-identity:{os.getpid()}"
@@ -29,6 +37,23 @@ def docker_exec(*args: str, user: str = "root", input_text: str | None = None) -
     return run(command, input_text=input_text).stdout
 
 
+def start_runtime(*environment: str) -> None:
+    """Initialize the direct-run fixture before the shipped s6 services start.
+
+    Setup's Compose init service provisions this controller-owned lease root.
+    The proofs launch without Compose, so perform that same prerequisite in
+    the container, then exec the real entrypoint as PID 1. Do not relax the
+    selected plugin's production startup validation.
+    """
+    run([
+        "docker", "run", "--detach", "--env", "MIMIR_PLUGINS=cultivate",
+        "--env", "MIMIR_PR_CHECKOUT_LEASE_ROOT=/workspace/pr-leases",
+        *(argument for value in environment for argument in ("--env", value)),
+        "--name", CONTAINER, "--entrypoint", "/bin/sh", IMAGE, "-ceu",
+        "install -d -o mimir -g mimir -m 0755 /workspace/pr-leases; exec /init",
+    ])
+
+
 def wait_for_runtime() -> None:
     deadline = time.monotonic() + 45
     last = ""
@@ -44,6 +69,20 @@ def wait_for_runtime() -> None:
         time.sleep(1)
     logs = run(["docker", "logs", CONTAINER]).stdout
     raise RuntimeError(f"shipped services did not become ready\n{last}\n{logs}")
+
+
+def wait_for_health() -> None:
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        probe = subprocess.run(
+            ["docker", "exec", CONTAINER, "curl", "-fsS", "http://127.0.0.1:8080/health"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+        )
+        if probe.returncode == 0:
+            return
+        time.sleep(1)
+    raise RuntimeError(f"PyPI image health did not become ready: {probe.stdout}\n"
+                       + run(["docker", "logs", CONTAINER]).stdout)
 
 
 CONTROLLER_PROOF = r"""
@@ -393,7 +432,256 @@ def require_rust_native_toolchain(layer: str) -> None:
         raise RuntimeError('generated Rust layer omitted its native toolchain')
 
 
-def main() -> None:
+def wheel_identity(path: Path, name: str) -> tuple[str, str]:
+    parsed_name, version, _, _ = parse_wheel_filename(path.name)
+    if parsed_name != canonicalize_name(name):
+        raise ValueError(f"expected {name} wheel: {path.name}")
+    with zipfile.ZipFile(path) as archive:
+        members = [member for member in archive.namelist() if member.endswith(".dist-info/METADATA")]
+        if len(members) != 1:
+            raise ValueError(f"missing or ambiguous {name} METADATA")
+        from email.parser import Parser
+
+        metadata = Parser().parsestr(archive.read(members[0]).decode("utf-8"))
+        if (canonicalize_name(metadata.get("Name", "")) != parsed_name
+                or metadata.get("Version") != str(version)):
+            raise ValueError(f"{name} wheel filename and METADATA disagree")
+        if name == "mimir-cultivate" and f"mimir-agent=={version}" not in [
+            dependency.replace(" ", "") for dependency in metadata.get_all("Requires-Dist", [])
+        ]:
+            raise ValueError("Cultivate wheel does not pin the paired core version")
+    return str(version), hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+PYPI_RUNTIME_PROOF = r'''
+import asyncio
+import json
+from pathlib import Path
+import sys
+from urllib.error import HTTPError
+from urllib.request import urlopen
+
+import os
+assert os.geteuid() == 1001, 'protocol and health proof must run as mimir'
+
+from mimir_cultivate.install_identity import controller_identity, executor_identity
+from mimir_cultivate.worklink.worker_client import verify_executor_identity
+expected = json.loads(sys.argv[1])
+affected = sys.argv[2] if len(sys.argv) > 2 else ''
+
+def health():
+    try:
+        with urlopen('http://127.0.0.1:8080/health', timeout=10) as response:
+            return response.status, json.load(response)
+    except HTTPError as exc:
+        return exc.code, json.load(exc)
+
+if affected:
+    verify = (lambda: asyncio.run(verify_executor_identity())) if affected == 'worker' else controller_identity
+    try:
+        verify()
+    except (RuntimeError, ValueError, OSError):
+        pass
+    else:
+        raise AssertionError('identity accepted mutated ' + affected)
+    status, payload = health()
+    assert status == 503 and payload['ok'] is False, (affected, status, payload)
+    sys.exit(0)
+
+assert controller_identity() == expected
+assert executor_identity() == expected
+assert asyncio.run(verify_executor_identity()) == expected
+status, payload = health()
+assert status == 200 and payload['ok'] is True, (status, payload)
+assert payload['worklink_install_mode'] == 'pypi', payload
+assert payload['worklink_install_status'] == 'matched', payload
+assert payload['worklink_controller_distributions'] == expected['distributions'], payload
+assert payload['worklink_executor_distributions'] == expected['distributions'], payload
+assert payload['worklink_executor_source_commit'] is None, payload
+assert payload['worklink_controller_source_commit'] is None, payload
+assert payload['worklink_executor_source_status'] == 'not_applicable', payload
+
+print('live PyPI pair, protocol and health proof passed')
+'''
+
+
+PYPI_READONLY_IMPORT_PROOF = r'''
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+assert os.geteuid() == 1001
+site = next(Path('/home/mimir/venv/lib').glob('python*/site-packages'))
+for package in ('mimir', 'mimir_cultivate'):
+    root = site / package
+    for path in (root, *root.rglob('*')):
+        assert path.stat().st_uid == 0, path
+        assert path.stat().st_mode & 0o222 == 0, path
+        assert not os.access(path, os.W_OK), path
+# No image ENV can rescue this deliberately scrubbed launcher. Both packages
+# really import, yet neither can create bytecode, even outside known launchers.
+result = subprocess.run([sys.executable, '-c',
+                         'import mimir.pollers, mimir_cultivate.install_identity'],
+                        env={'PATH': '/home/mimir/venv/bin:/usr/bin:/bin', 'HOME': '/home/mimir'},
+                        capture_output=True, text=True, timeout=30)
+assert result.returncode == 0, result.stderr
+for package in ('mimir', 'mimir_cultivate'):
+    assert not list((site / package).rglob('*.pyc'))
+'''
+
+
+def prove_pypi_runtime(pair: dict) -> None:
+    """Keep protocol/health as the controller; root only reads/mutates fixtures."""
+    python = '/home/mimir/venv/bin/python'
+    expected = json.dumps(pair, sort_keys=True)
+
+    def check(affected: str = '') -> None:
+        docker_exec(python, '-c', PYPI_RUNTIME_PROOF, expected, affected, user='mimir')
+
+    docker_exec(python, '-c', PYPI_READONLY_IMPORT_PROOF, user='mimir')
+    check()
+    mutations = [('/home/mimir/venv/controller-install-identity.json', b'{}', 'controller'),
+                 ('/opt/mimir-worklink/executor-install-identity.json', b'{}', 'worker')]
+    for venv, affected in (('/home/mimir/venv', 'controller'), ('/opt/mimir-worklink/venv', 'worker')):
+        path = docker_exec(python, '-c',
+                           "from pathlib import Path; import sys; print(next(Path(sys.argv[1]).glob('lib/python*/site-packages/mimir_cultivate/install_identity.py')))",
+                           venv, user='root').strip()
+        mutations.append((path, b'# altered installed content\n', affected))
+    mutations += [('/opt/mimir-worklink/wheels/' + item['wheel'], b'not a wheel', 'both')
+                  for item in pair['distributions'].values()]
+    for path, replacement, affected in mutations:
+        # Keep full wheels inside the container: putting their bytes in argv
+        # can exceed ARG_MAX. mkstemp creates a private root-owned backup.
+        backup = docker_exec(python, '-c',
+                             'import os, shutil, sys, tempfile; fd, backup = tempfile.mkstemp(); '
+                             'os.close(fd); shutil.copyfile(sys.argv[1], backup); print(backup)',
+                             path, user='root').strip()
+        try:
+            # Append to Python sources so fresh controller subprocesses can
+            # still import the verifier and detect the changed wheel bytes.
+            docker_exec(python, '-c',
+                        'import base64, pathlib, sys; path = pathlib.Path(sys.argv[1]); '
+                        'data = base64.b64decode(sys.argv[2]); '
+                        'path.write_bytes(path.read_bytes() + data if path.suffix == ".py" else data)',
+                        path, base64.b64encode(replacement).decode(), user='root')
+            check(affected)
+        finally:
+            docker_exec(python, '-c',
+                        'import pathlib, shutil, sys; shutil.copyfile(sys.argv[2], sys.argv[1]); '
+                        'pathlib.Path(sys.argv[2]).unlink()', path, backup, user='root')
+        check()
+    print('live PyPI pair, protocol, health and mutation proof passed')
+
+
+def prepare_pypi_deployment(directory: Path, agent_wheel: Path, cultivate_wheel: Path,
+                            version: str, agent_hash: str, cultivate_hash: str) -> Path:
+    """Drive the real setup writer; substitute only index/GitHub facts and stop
+    at its first Docker invocation, then execute its saved build.sh verbatim.
+    """
+    from unittest.mock import patch
+    from mimir_cultivate import setup as installer
+    from mimir_cultivate.release_resolver import ReleasePair, Wheel
+
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers())
+    token = directory / "proof-credential"
+    token.write_text("offline-image-proof")
+    token.chmod(0o600)
+    deploy = directory / "deployment"
+    args = parser.parse_args([
+        "cultivate", "setup", "--accept-license", "--repo", "fixture/proof",
+        "--bot-login", "proof-bot", "--bot-email", "proof@example.com",
+        "--owner", "proof", "--display-name", "Proof", "--owner-email", "proof@example.com",
+        "--branch", "main", "--model-spec", "openai:proof", "--saga-model-spec", "openai:proof:low",
+        "--embedding", "local", "--github-token-file", str(token), "--model-key-file", str(token),
+        "--operator-alert-adapter", "none", "--deploy", str(deploy), "--port", "8123",
+        "--test-command", "uv run pytest -q", "--review-tests", "targeted",
+        "--auto-review", "all", "--mimir-version", version, "--platform", "linux/amd64", "--no-start",
+    ])
+    pair = ReleasePair(version, *(
+        Wheel(name, path.name, "https://files.pythonhosted.org/" + path.name, digest, path.read_bytes())
+        for name, path, digest in (("mimir-agent", agent_wheel, agent_hash),
+                                  ("mimir-cultivate", cultivate_wheel, cultivate_hash))))
+
+    def request(url, token):
+        import base64
+        if url.endswith("/user"):
+            return 200, {"login": "proof-bot"}
+        if url.endswith("/repos/fixture/proof"):
+            return 200, {"permissions": {"push": True}}
+        if "/git/trees/" in url:
+            return 200, {"tree": []}
+        if "/contents/" in url:
+            content = ("[project]\nname = 'proof'\nversion = '1.0'\n" if "/pyproject.toml?" in url
+                       else "3.11.15" if "/.python-version?" in url else None)
+            return ((200, {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()})
+                    if content else (404, {}))
+        return 200, {}
+
+    class Prepared(Exception):
+        pass
+
+    def stop_before_docker(argv, *, cwd):
+        assert argv[:2] == ["docker", "build"], argv
+        raise Prepared
+
+    with patch.object(installer, "resolve_release", return_value=pair):
+        try:
+            installer.setup(args, request=request, run=stop_before_docker)
+        except Prepared:
+            pass
+        else:
+            raise RuntimeError("setup did not reach its Docker build")
+    return deploy
+
+
+def prove_pypi(agent_wheel: Path, cultivate_wheel: Path) -> None:
+    global IMAGE
+
+    run(["docker", "info"], timeout=30)
+    agent_wheel, cultivate_wheel = agent_wheel.resolve(), cultivate_wheel.resolve()
+    version, agent_hash = wheel_identity(agent_wheel, "mimir-agent")
+    cultivate_version, cultivate_hash = wheel_identity(cultivate_wheel, "mimir-cultivate")
+    if version != cultivate_version:
+        raise ValueError("wheel pair must have the same exact version")
+    pair = {"mode": "pypi", "distributions": {
+        "mimir-agent": {"version": version, "wheel": agent_wheel.name, "sha256": agent_hash},
+        "mimir-cultivate": {"version": version, "wheel": cultivate_wheel.name, "sha256": cultivate_hash},
+    }}
+    with tempfile.TemporaryDirectory(prefix="mimir-wheel-image-") as directory:
+        deploy = prepare_pypi_deployment(Path(directory), agent_wheel, cultivate_wheel,
+                                         version, agent_hash, cultivate_hash)
+        manifest = json.loads((deploy / "manifest.json").read_text())
+        IMAGE = manifest["layer_tag"]
+        try:
+            run(["sh", str(deploy / "build.sh")], timeout=2400)
+            start_runtime()
+            wait_for_runtime()
+            wait_for_health()
+            docker_exec("/bin/sh", "-ceu", """
+                test -x /home/mimir/venv/bin/python
+                test -x /opt/mimir-worklink/venv/bin/python
+                test "$(stat -c %U:%G /opt/mimir-worklink/wheels)" = root:root
+                test "$(stat -c %U:%G /home/mimir/venv/controller-install-identity.json)" = root:root
+                test "$(stat -c %U:%G /opt/mimir-worklink/executor-install-identity.json)" = root:root
+                test ! -e /opt/mimir-worklink/executor-source-commit
+                test ! -e /home/mimir/venv/controller-source-commit
+            """)
+            for interpreter in ("/home/mimir/venv/bin/python", "/opt/mimir-worklink/venv/bin/python"):
+                docker_exec(interpreter, "-c", "import importlib.metadata as m; "
+                            "from mimir_cultivate.install_identity import controller_identity, executor_identity; "
+                            f"assert {'controller_identity' if interpreter.startswith('/home') else 'executor_identity'}(); "
+                            "[m.version(name) for name in ('langchain-openai', 'sentence-transformers', 'mcp')]; assert m.version('torch').endswith('+cpu')",
+                            user="root")
+            prove_pypi_runtime(pair)
+            print("worklink shipped-image PyPI identity proof passed")
+        finally:
+            subprocess.run(["docker", "rm", "--force", CONTAINER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["docker", "image", "rm", "--force", IMAGE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def prove_source() -> None:
     repo = os.environ.get("WORKLINK_REPO", "").strip()
     if not repo or not Path(repo).is_absolute():
         raise RuntimeError("WORKLINK_REPO must name the absolute in-container proof repository")
@@ -415,6 +703,7 @@ def main() -> None:
     try:
         run([
             "docker", "build",
+            "--build-arg", "MIMIR_INSTALL_MODE=source",
             "--build-arg", f"MIMIR_GIT_REF={git_ref}",
             *(["--build-arg", f"MIMIR_GIT_URL={git_url}"] if git_url else []),
             "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
@@ -437,11 +726,7 @@ def main() -> None:
         require_rust_native_toolchain(layer)
         run(['docker', 'build', '--file', '-', '--tag', IMAGE, '.'],
             input_text=layer, timeout=1200)
-        run([
-            "docker", "run", "--detach", "--env", "HOME=/home/mimir",
-            "--env", "MIMIR_PLUGINS=cultivate",
-            "--env", f"WORKLINK_REPO={repo}", "--name", CONTAINER, IMAGE,
-        ])
+        start_runtime("HOME=/home/mimir", f"WORKLINK_REPO={repo}")
         wait_for_runtime()
         docker_exec("/bin/sh", "-ceu", """
             test "$(id -u mimir)" = 1001
@@ -739,5 +1024,26 @@ PY
         subprocess.run(["docker", "image", "rm", "--force", IMAGE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def main() -> None:
+    """Retain the source-mode proof entry point for existing callers."""
+    prove_source()
+
+
+def cli() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("source", "pypi"), required=True)
+    parser.add_argument("--agent-wheel", type=Path)
+    parser.add_argument("--cultivate-wheel", type=Path)
+    args = parser.parse_args()
+    if args.mode == "source":
+        if args.agent_wheel or args.cultivate_wheel:
+            parser.error("source mode does not accept wheels")
+        prove_source()
+    else:
+        if not args.agent_wheel or not args.cultivate_wheel:
+            parser.error("pypi mode requires both wheels")
+        prove_pypi(args.agent_wheel, args.cultivate_wheel)
+
+
 if __name__ == "__main__":
-    main()
+    cli()

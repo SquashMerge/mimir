@@ -226,6 +226,10 @@ _FRAGMENTS_SENTINEL = "<!-- mimir-scaffold-docker:FRAGMENTS -->"
 ScaffoldMode = Literal["workspace", "pypi"]
 _MODES: tuple[ScaffoldMode, ...] = ("workspace", "pypi")
 _DEFAULT_MODE: ScaffoldMode = "workspace"
+_CULTIVATE_PYPI_ERROR = (
+    "generic scaffold --mode pypi does not support Cultivate; "
+    "use `mimir cultivate setup` for a pinned PyPI deployment"
+)
 
 
 # Shared Dockerfile RUN block — defensive userdel/groupdel before the
@@ -510,6 +514,8 @@ def render_dockerfile(
     ``install_opencode`` retains the existing config-baking option. The
     runtime installation belongs to the selected Cultivate Docker fragment.
     """
+    if mode == "pypi" and has_trusted_cultivate(plugins):
+        raise ValueError(_CULTIVATE_PYPI_ERROR)
     if mode == "pypi":
         base = _DOCKERFILE_BASE_PYPI
         extras_csv = ",".join(mimir_extras) if mimir_extras else "anthropic,discord,slack,mcp"
@@ -566,35 +572,22 @@ def render_dockerfile(
                             _S6_SCAFFOLD_BLOCK.replace('__PLUGIN_SERVICES__', '') + '\n'
                             'COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/\n'
                             'RUN sh /opt/cultivate-docker/service.sh\nENTRYPOINT ["/init"]')
-        # Cultivate is never installed from an index. executor.sh overlays core
-        # and plugins/cultivate from the verified MIMIR_EXECUTOR_COMMIT into the
-        # root worker venv. In pypi mode controller.sh installs core and the
-        # plugin from the same commit into the user-owned venv; in workspace mode
-        # start.sh syncs the boot clone with ``--all-packages`` instead.
+        # Cultivate is never installed from an index in workspace mode.
+        # executor.sh overlays core and plugins/cultivate from the verified
+        # MIMIR_EXECUTOR_COMMIT; start.sh syncs with ``--all-packages``.
         executor = (
             "USER root\nARG MIMIR_GIT_REF\nARG MIMIR_CONTROLLER_COMMIT\n"
             "ARG MIMIR_EXECUTOR_COMMIT\nARG MIMIR_GIT_URL=https://github.com/SquashMerge/mimir.git\n"
-            # pypi mode already declared MIMIR_EXTRAS with the scaffold's extras;
-            # a second default here would silently replace them.
-            + ("" if mode == "pypi" else "ARG MIMIR_EXTRAS=anthropic,discord,slack,mcp\n")
+            + "ARG MIMIR_EXTRAS=anthropic,discord,slack,mcp\n"
             + "RUN test \"$MIMIR_EXECUTOR_COMMIT\" = \"$MIMIR_CONTROLLER_COMMIT\" "
             "&& git check-ref-format \"$MIMIR_GIT_REF\"\n"
             "RUN MIMIR_GIT_REF=\"$MIMIR_GIT_REF\" MIMIR_EXECUTOR_COMMIT=\"$MIMIR_EXECUTOR_COMMIT\" "
             "MIMIR_GIT_URL=\"$MIMIR_GIT_URL\" MIMIR_EXTRAS=\"$MIMIR_EXTRAS\" "
             "sh /opt/cultivate-docker/executor.sh\n"
         )
-        if mode == "pypi":
-            executor += (
-                "USER mimir\n"
-                "RUN MIMIR_GIT_REF=\"$MIMIR_GIT_REF\" MIMIR_CONTROLLER_COMMIT=\"$MIMIR_CONTROLLER_COMMIT\" "
-                "MIMIR_GIT_URL=\"$MIMIR_GIT_URL\" MIMIR_EXTRAS=\"$MIMIR_EXTRAS\" "
-                "sh /opt/cultivate-docker/controller.sh\n"
-            )
-            base = base.replace("# Pre-warm the fastembed", executor + "\n# Pre-warm the fastembed")
-        else:
-            # The workspace template is still root here; the following
-            # ``COPY start.sh`` + ``chmod`` must keep running as root.
-            base = base.replace("EXPOSE 8080", executor + "\nEXPOSE 8080")
+        # The workspace template is still root here; the following
+        # ``COPY start.sh`` + ``chmod`` must keep running as root.
+        base = base.replace("EXPOSE 8080", executor + "\nEXPOSE 8080")
     if plugins:
         base = base.replace("# ===== BEGIN mimir-scaffold-docker: skill fragments =====",
                             render_stage(plugins, "base") + "\n\n# ===== BEGIN mimir-scaffold-docker: skill fragments =====")
@@ -612,10 +605,6 @@ def render_dockerfile(
             base = base.replace('ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]',
                                 _S6_SCAFFOLD_BLOCK.replace("__PLUGIN_SERVICES__", render_stage(plugins, "services"))
                                 + '\nENTRYPOINT ["/init"]')
-    if trusted_cultivate and mode == "pypi":
-        base = base.replace("# Pre-warm the fastembed",
-                            'RUN MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" '
-                            'sh /opt/cultivate-docker/bootstrap.sh\n\n# Pre-warm the fastembed')
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
     else:
@@ -1008,9 +997,10 @@ def render_start_sh(
     syncs it from the boot clone with ``uv sync --all-packages`` (a plain
     ``uv sync`` would remove it), so it is always the clone's own commit.
     """
+    if mode == "pypi" and cultivate:
+        raise ValueError(_CULTIVATE_PYPI_ERROR)
     if mode == "pypi":
-        selected = (("mimir-cultivate (built from plugins/cultivate at MIMIR_CONTROLLER_COMMIT)",)
-                    if cultivate else ()) + tuple(plugin_pins)
+        selected = tuple(plugin_pins)
         return _START_SH_TEMPLATE_PYPI + ("\n# Selected services are supervised separately by s6: " + ", ".join(selected) + "\n" if selected else "")
     if mode != "workspace":
         raise ValueError(f"unknown scaffold mode {mode!r}; expected one of {_MODES}")
@@ -1425,6 +1415,8 @@ def scaffold(
     result = ScaffoldResult()
     plugins = select_plugins(all_installed=all_installed)
     trusted_cultivate = has_trusted_cultivate(plugins)
+    if mode == "pypi" and trusted_cultivate:
+        raise ValueError(_CULTIVATE_PYPI_ERROR)
     selected_services = services(plugins)
     result.plugins_with_services = [f"{service.plugin}-{service.name}" for service in selected_services]
     context = home / ".mimir-scaffold"

@@ -385,7 +385,7 @@ def test_exact_recovery_metadata_boundary(tmp_path: Path, entry: str) -> None:
 @pytest.mark.parametrize(
     "control", [None, "equivalent", "edited_patch", "forge_stale", "remote_stale", "origin", "branch", "destination"],
 )
-def test_later_turn_reuses_rebased_candidate_with_added_fix(
+def test_later_turn_retires_rebased_candidate_and_preserves_added_fix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     control: str | None,
@@ -460,15 +460,21 @@ def test_later_turn_reuses_rebased_candidate_with_added_fix(
         review_state=state,
     )
 
-    assert resumed.path == earlier.path
+    assert resumed.path != earlier.path
     assert resumed.scope_id == current_scope.scope_id
-    assert candidates == (rebased_head,)
+    assert candidates == ()
     assert resumed.head_sha == current_scope.observed_head_sha
     assert state.checkout_lease is resumed
-    assert state.git_expected_head == rebased_head
-    assert _git(resumed.path, "rev-parse", "HEAD") == rebased_head
+    assert state.git_expected_head == current_scope.observed_head_sha
+    assert _git(resumed.path, "rev-parse", "HEAD") == current_scope.observed_head_sha
+    assert not earlier.path.exists()
     if control != "equivalent":
-        assert (resumed.path / "fix.txt").read_text() == "additional fix\n"
+        ref = f"refs/worklink-lease/{scope.pr_number}/{earlier.recovery_id}"
+        assert _git(repo, "rev-parse", ref) == rebased_head
+        patch = lease_root / ".recovery" / f"{earlier.path.name}-{earlier.recovery_id}.patch"
+        assert "fix.txt" in patch.read_text()
+    else:
+        assert not (lease_root / ".recovery").exists()
     assert _git(resumed.path, "rev-parse", "refs/mimir/pr-checkout-lease/published") == scope.observed_head_sha
 
 
@@ -518,12 +524,14 @@ def test_turn_recovers_genuinely_divergent_same_pr_candidate(
         resumed, candidates = acquire_pr_checkout_lease(
             scope, owner=scope.principal, lease_root=lease_root, review_state=state,
         )
-        assert resumed.path == earlier.path
-        assert resumed.recovered
-        assert candidates == (head,)
-        assert state.git_expected_head == head
+        assert resumed.path != earlier.path
+        assert not resumed.recovered
+        assert candidates == ()
+        assert state.git_expected_head == scope.observed_head_sha
         assert state.checkout_lease is resumed
-    assert _git(earlier.path, "rev-parse", "HEAD") == head
+        assert not earlier.path.exists()
+    if control:
+        assert _git(earlier.path, "rev-parse", "HEAD") == head
 
 
 def test_fresh_acquisition_records_actual_checkout_head(
@@ -1398,7 +1406,7 @@ def test_acquire_bundles_unpublished_superseded_work_and_releases_lease(
     assert candidates == ()
 
 
-def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
+def test_acquire_replaces_equivalent_rebase_even_with_unrelated_local_tracking_ref(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1417,12 +1425,12 @@ def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
-    with pytest.raises(RuntimeError, match="no verifiable tracked base"):
-        acquire_pr_checkout_lease(
-            fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
-        )
-
-    assert old_lease.path.is_dir()
+    fresh, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+    assert fresh.path != old_lease.path and candidates == ()
+    assert not old_lease.path.exists()
+    assert _git(fresh.path, "rev-parse", "HEAD") == fresh_scope.observed_head_sha
 
 
 def test_acquire_refuses_second_live_scope_for_same_target(

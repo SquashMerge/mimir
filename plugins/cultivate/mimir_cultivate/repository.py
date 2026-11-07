@@ -6,6 +6,7 @@ from __future__ import annotations
 # Repository inventory
 import re
 import os
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,12 +19,25 @@ from mimir._provider_errors import TransientTransportError
 
 
 @dataclass(frozen=True)
+class RepositoryTestLeg:
+    name: str
+    command: str
+    env: tuple[tuple[str, str], ...] = ()
+    default_paths: tuple[str, ...] = ()
+
+
+_TEST_LEG_ENV_NAMES = frozenset({"MIMIR_PLUGINS", "MIMIR_ACCESS_CONTROL_ENFORCED"})
+_TEST_LEG_ENV_VALUE = re.compile(r"[A-Za-z0-9_,.-]{0,64}", re.ASCII)
+
+
+@dataclass(frozen=True)
 class RepositoryTestSuite:
     name: str
     command: str
     default: bool = False
     selector_prefixes: tuple[str, ...] = ()
     selector_suffixes: tuple[str, ...] = ()
+    legs: tuple[RepositoryTestLeg, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -203,11 +217,14 @@ def _parse_test_suites(
         suite_label = f"{label}[{index}]"
         if not isinstance(item, dict):
             raise ValueError(f"{suite_label} must be a mapping")
-        missing = [key for key in ("name", "command") if key not in item]
-        if missing:
-            raise ValueError(f"{suite_label} missing required field(s): {', '.join(missing)}")
-        if set(item) - {"name", "command", "default", "selector_prefixes", "selector_suffixes"}:
+        if "name" not in item:
+            raise ValueError(f"{suite_label} missing required field(s): name")
+        if set(item) - {"name", "command", "legs", "default", "selector_prefixes", "selector_suffixes"}:
             raise ValueError(f"{suite_label} contains unknown fields")
+        if "command" not in item and "legs" not in item:
+            raise ValueError(f"{suite_label} missing required field(s): command or legs")
+        if "command" in item and "legs" in item:
+            raise ValueError(f"{suite_label} requires exactly one of command or legs")
         name = item["name"]
         if not isinstance(name, str) or _TEST_SUITE_NAME.fullmatch(name) is None:
             raise ValueError(f"{suite_label}.name must be a safe name matching {_TEST_SUITE_NAME.pattern}")
@@ -215,9 +232,38 @@ def _parse_test_suites(
             raise ValueError(f"{suite_label} duplicate test suite name: {name}")
         if name == "default" and test_command is not None:
             raise ValueError(f"{suite_label}.name 'default' is reserved when test_command is nonnull")
-        command = item["command"]
-        if not isinstance(command, str) or not command.strip():
+        command = item.get("command", "")
+        if "command" in item and (not isinstance(command, str) or not command.strip()):
             raise ValueError(f"{suite_label}.command must be a non-empty string")
+        legs: list[RepositoryTestLeg] = []
+        if "legs" in item:
+            entries = item["legs"]
+            if not isinstance(entries, list) or not 1 <= len(entries) <= 4:
+                raise ValueError(f"{suite_label}.legs must contain between 1 and 4 legs")
+            leg_names: set[str] = set()
+            for leg_index, entry in enumerate(entries):
+                leg_label = f"{suite_label}.legs[{leg_index}]"
+                if not isinstance(entry, dict) or set(entry) - {"name", "command", "env", "default_paths"}:
+                    raise ValueError(f"{leg_label} must be a mapping with known fields")
+                leg_name = entry.get("name")
+                if (not isinstance(leg_name, str) or _TEST_SUITE_NAME.fullmatch(leg_name) is None
+                        or leg_name in leg_names):
+                    raise ValueError(f"{leg_label}.name must be a unique safe name")
+                leg_command = entry.get("command")
+                if not isinstance(leg_command, str) or not leg_command.strip():
+                    raise ValueError(f"{leg_label}.command must be a non-empty string")
+                leg_env = entry.get("env", {})
+                if not isinstance(leg_env, dict) or any(
+                    not isinstance(key, str) or key not in _TEST_LEG_ENV_NAMES
+                    or not isinstance(value, str) or _TEST_LEG_ENV_VALUE.fullmatch(value) is None
+                    for key, value in leg_env.items()
+                ):
+                    raise ValueError(f"{leg_label}.env contains a disallowed name or value")
+                paths = entry.get("default_paths", [])
+                if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+                    raise ValueError(f"{leg_label}.default_paths must be a list of paths")
+                leg_names.add(leg_name)
+                legs.append(RepositoryTestLeg(leg_name, leg_command, tuple(leg_env.items()), tuple(paths)))
         default = item.get("default", False)
         if not isinstance(default, bool):
             raise ValueError(f"{suite_label}.default must be a boolean")
@@ -233,7 +279,7 @@ def _parse_test_suites(
             selectors[field] = tuple(entries)
         names.add(name)
         has_default = has_default or default
-        suites.append(RepositoryTestSuite(name, command, default, **selectors))
+        suites.append(RepositoryTestSuite(name, command, default, **selectors, legs=tuple(legs)))
     return tuple(suites)
 
 
@@ -712,6 +758,7 @@ def _report_retained_candidates(
     event_type: str,
     scope: RepoPRActionScope,
     candidates: Sequence[tuple[Path, str]],
+    **details: object,
 ) -> None:
     """Best-effort structured evidence for retained work and reconciliation refusals."""
     try:
@@ -725,6 +772,7 @@ def _report_retained_candidates(
             candidates=[
                 {"commit": head, "path": str(path)} for path, head in candidates
             ],
+            **details,
         )
     except Exception:  # noqa: BLE001 - evidence failure must not change lease safety
         pass
@@ -1325,6 +1373,11 @@ def _recover_pr_checkout_lease_unlocked(
             f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
             f"fetched head is {remote_head}"
         )
+    ancestry = runner([
+        "git", "-C", str(path), "merge-base", "--is-ancestor", remote_head, head,
+    ])
+    if ancestry.returncode != 0:
+        raise RuntimeError("divergent PR checkout lease cannot be renewed")
     lease = replace(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
@@ -1488,8 +1541,10 @@ def _unexplained_publication_paths(
     return tuple(unexplained)
 
 
-def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -> Path:
-    """Atomically preserve the complete history reachable from a lease HEAD."""
+def _preserve_checkout_head(
+    lease: PRCheckoutLease, head: str, runner: Runner, *, incremental: bool = False,
+) -> Path:
+    """Preserve local history; divergent recovery can reuse origin prerequisites."""
     recovery_root = lease.lease_root / _RECOVERY_DIRECTORY
     if recovery_root.is_symlink():
         raise RuntimeError("PR checkout lease recovery directory may not be a symlink")
@@ -1498,7 +1553,7 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
     if recovery_root.parent != lease.lease_root.resolve(strict=True):
         raise RuntimeError("PR checkout lease recovery directory escapes its lease root")
     bundle = recovery_root / f"{lease.path.name}-{lease.recovery_id}.bundle"
-    if bundle.exists():
+    if bundle.exists() and not incremental:
         verified = runner([
             "git", "-C", str(lease.path), "bundle", "verify", str(bundle),
         ])
@@ -1509,14 +1564,34 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
             ["git", "-C", str(lease.path), "bundle", "list-heads", str(bundle)],
             "existing PR checkout lease recovery bundle has no heads",
         )
-        if head not in {line.split()[0].lower() for line in heads.splitlines() if line}:
+        retained_heads = {tuple(line.split()) for line in heads.splitlines() if line}
+        if (head, "HEAD") not in retained_heads:
             raise RuntimeError("existing PR checkout lease recovery bundle has another HEAD")
+        refs = _run(runner, [
+            "git", "-C", str(lease.path), "for-each-ref", "--format=%(objectname) %(refname)",
+        ], "PR checkout lease recovery refs inspection failed")
+        if not {tuple(line.split()) for line in refs.splitlines() if line} <= retained_heads:
+            raise RuntimeError("existing PR checkout lease recovery bundle lacks current refs")
         return bundle
+    # Git needs a non-excluded ref tip to advertise an incremental bundle.
+    # Reflog-only commits contribute pack objects, but cannot provide that tip.
+    # Probe refs plus HEAD without reflogs; if all tips are origin-reachable,
+    # use a full bundle while still retaining reflog-only objects in its pack.
+    bundle_revisions = ["--all", "HEAD"]
+    if incremental:
+        bundle_revisions.append("--reflog")
+        unpublished = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", "--all", "HEAD", "--not", "--remotes=origin", "--",
+        ], "PR checkout lease recovery revision inspection failed")
+        if unpublished:
+            bundle_revisions.extend(["--not", "--remotes=origin"])
     staging = recovery_root / f".{bundle.name}.{uuid.uuid4().hex}.tmp"
     try:
         _run(
             runner,
-            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "HEAD"],
+            ["git", "-C", str(lease.path), "bundle", "create", str(staging),
+             *bundle_revisions],
             "PR checkout lease recovery bundle creation failed",
         )
         _run(
@@ -1532,10 +1607,14 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
     return bundle
 
 
-def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
-    """Atomically archive dirty tracked and untracked files without changing them."""
-    archive = bundle.with_suffix(".worktree.tar.gz")
-    if archive.exists():
+def _preserve_dirty_worktree(
+    lease: PRCheckoutLease, bundle: Path, *, include_git: bool = False,
+) -> Path:
+    """Archive worktree state, optionally including local refs and stash reflogs."""
+    archive = bundle.with_suffix(".checkout.tar.gz" if include_git else ".worktree.tar.gz")
+    # A prior failed retirement may have left a snapshot behind. Refresh the
+    # complete checkout atomically rather than deleting later work with it stale.
+    if archive.exists() and not include_git:
         if not archive.is_file() or archive.stat().st_size == 0:
             raise RuntimeError("existing dirty-worktree recovery archive is invalid")
         with tarfile.open(archive, "r:gz") as retained:
@@ -1546,9 +1625,15 @@ def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
     staging = archive.with_name(f".{archive.name}.{uuid.uuid4().hex}.tmp")
     try:
         with tarfile.open(staging, "w:gz") as retained:
+            def metadata_without_objects(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+                if info.name == "worktree/.git/objects" or info.name.startswith("worktree/.git/objects/"):
+                    return None
+                return info
+
             for entry in lease.path.iterdir():
-                if entry.name != ".git":
-                    retained.add(entry, arcname=str(Path("worktree") / entry.name))
+                if include_git or entry.name != ".git":
+                    retained.add(entry, arcname=str(Path("worktree") / entry.name),
+                                 filter=metadata_without_objects)
         with tarfile.open(staging, "r:gz") as retained:
             if not retained.getmembers():
                 raise RuntimeError("dirty-worktree recovery archive is empty")
@@ -1905,6 +1990,11 @@ def _foreign_candidate_head(
             (ancestor.stderr or ancestor.stdout).strip()
             or "PR checkout lease candidate ancestry inspection failed"
         )
+    # A matching published anchor is enough to inspect a divergent candidate;
+    # it is NOT sufficient to renew or attest it. Acquisition classifies its
+    # patches and retires it before any rebind.
+    if published.returncode == 0 and published.stdout.strip().lower() == observed_head:
+        return head, True
     return head, False
 
 
@@ -1961,6 +2051,11 @@ def _rebind_foreign_candidate(
         "retained PR checkout has no HEAD",
     ).lower() != head:
         raise RuntimeError("retained PR checkout HEAD changed during lease recovery")
+    ancestry = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", remote_head, head,
+    ])
+    if ancestry.returncode != 0:
+        raise RuntimeError("divergent PR checkout lease cannot be rebound")
 
     rebound = replace(
         lease,
@@ -1990,6 +2085,200 @@ def _rebind_foreign_candidate(
     return rebound
 
 
+def _discard_divergent_candidate(
+    lease: PRCheckoutLease, scope: RepoPRActionScope, *, runner: Runner,
+    notices: list[dict[str, str]] | None = None,
+) -> bool:
+    """Retire a divergent checkout, retaining anything not proven redundant."""
+    from .scheduler import active_pr_checkout_lease_paths
+
+    def active() -> set[Path]:
+        return {path.resolve(strict=False) for path in active_pr_checkout_lease_paths()}
+
+    head = _run(
+        runner, ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+        "retained PR checkout has no HEAD",
+    ).lower()
+    scoped = scope.observed_head_sha.lower()
+    ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", scoped, head,
+    ])
+    if ancestor.returncode == 0:
+        return False
+    if ancestor.returncode != 1:
+        raise RuntimeError("PR checkout lease ancestry inspection failed")
+    if lease.path.resolve(strict=False) in active():
+        raise RuntimeError("live PR checkout lease cannot be retired")
+    origin = _run(runner, [
+        "git", "-C", str(lease.path), "config", "--get", "remote.origin.url",
+    ], "retained PR checkout has no origin")
+    branch = _run(runner, [
+        "git", "-C", str(lease.path), "symbolic-ref", "--quiet", "--short", "HEAD",
+    ], "retained PR checkout has no branch")
+    if (origin != scope.canonical_origin or lease.canonical_origin != origin
+            or branch != scope.head_ref or lease.destination_ref != scope.destination_ref):
+        raise RuntimeError("divergent PR checkout lease identity mismatch")
+    _assert_self_contained_checkout(lease.path, runner=runner)
+    _run(runner, [
+        "git", "-C", str(lease.path), "fetch", "--no-tags", "origin",
+        scope.checkout_ref or scope.destination_ref,
+    ], "PR head fetch failed during divergent lease inspection")
+    remote_head = _run(runner, [
+        "git", "-C", str(lease.path), "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+    ], "PR head missing during divergent lease inspection").lower()
+    if remote_head != scoped:
+        raise RuntimeError("PR head advanced during divergent lease inspection")
+    status = _run(runner, [
+        "git", "-C", str(lease.path), "status", "--porcelain=v1",
+        "--untracked-files=all", "--ignored",
+    ], "retained PR checkout status inspection failed")
+    refs = _run(runner, [
+        "git", "-C", str(lease.path), "for-each-ref", "--format=%(objectname) %(refname)",
+    ], "retained PR checkout refs inspection failed").splitlines()
+    # A local clone inherits source heads/tags. Exact pairs are redundant;
+    # after the source advances, an inherited tip is also redundant if it is
+    # reachable from current source refs or published origin history. New ref
+    # names and lease-only objects remain protected.
+    source_refs = set(_run(runner, [
+        "git", "-C", str(lease.source_root), "for-each-ref",
+        "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/",
+    ], "source checkout refs inspection failed").splitlines())
+    source_names = {entry.split()[1] for entry in source_refs}
+
+    def redundant_ref(entry: str) -> bool:
+        object_id, ref = entry.split()
+        if (ref == scope.destination_ref or ref == PUBLISHED_HEAD_REF
+                or ref.startswith("refs/remotes/origin/") or entry in source_refs):
+            return True
+        if ref not in source_names:
+            return False
+        origin_only = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", object_id, "--not", "--remotes=origin", "--",
+        ], "inherited checkout ref origin inspection failed")
+        if not origin_only:
+            return True
+        exists = runner([
+            "git", "-C", str(lease.source_root), "cat-file", "-e", f"{object_id}^{{commit}}",
+        ])
+        if exists.returncode != 0:
+            return False  # Missing/uncertain source objects cannot justify discard.
+        source_only = _run(runner, [
+            "git", "-C", str(lease.source_root), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", object_id, "--not", "--branches", "--tags", "--remotes=origin", "--",
+        ], "inherited checkout ref source inspection failed")
+        return not source_only
+
+    extra_refs = [entry for entry in refs if not redundant_ref(entry)]
+    base = lease.base_sha.lower()
+    # A lease created before the scoped base advanced may have been rebased
+    # without updating its metadata. Exclude only a scoped, verified base that
+    # is itself an ancestor of the checkout; never infer one from the checkout.
+    scoped_base = scope.observed_base_sha.lower()
+    for older, newer in ((base, scoped_base), (scoped_base, head)):
+        precondition = runner([
+            "git", "-C", str(lease.path), "merge-base", "--is-ancestor", older, newer,
+        ])
+        if precondition.returncode not in {0, 1}:
+            raise RuntimeError("PR checkout lease base substitution inspection failed")
+        if precondition.returncode == 1:
+            break
+    else:
+        base = scoped_base
+    base_ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", base, head,
+    ])
+    equivalent = False
+    if base_ancestor.returncode == 0 and not status and not extra_refs:
+        # Compare verbatim diffs, not git cherry/patch-id (which erase whitespace).
+        # Context changes may conservatively preserve an otherwise redundant replay.
+        commits = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--max-count=501",
+            head, "--not", scoped, base, "--",
+        ], "retained PR checkout commit inspection failed").splitlines()
+        published = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--max-count=501",
+            scoped, "--not", base, "--",
+        ], "published PR commit inspection failed").splitlines()
+
+        def verbatim(commit: str) -> str | None:
+            parents = _run(runner, [
+                "git", "-C", str(lease.path), "rev-list", "--parents", "-n", "1", commit,
+            ], "retained PR commit parent inspection failed").split()
+            if len(parents) != 2:
+                return None  # Never discard merge resolutions or root commits.
+            result = runner([
+                "git", "-C", str(lease.path), "diff-tree", "--no-commit-id", "-r",
+                "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff",
+                "--no-textconv", "--no-color", parents[1], commit, "--",
+            ])
+            if result.returncode != 0:
+                raise RuntimeError("retained PR checkout verbatim diff inspection failed")
+            return result.stdout  # Do not strip any patch bytes.
+
+        if len(commits) <= 500 and len(published) <= 500:
+            patches = {patch for commit in published if (patch := verbatim(commit))}
+            equivalent = all(
+                (patch := verbatim(commit)) is not None and patch in patches
+                for commit in commits
+            )
+    elif base_ancestor.returncode not in {0, 1}:
+        raise RuntimeError("PR checkout lease base ancestry inspection failed")
+
+    if equivalent:
+        _report_retained_candidates(
+            "pr_checkout_lease_discarded_equivalent", scope, [(lease.path, head)],
+        )
+    else:
+        # Refresh incremental recovery on retries rather than reusing a stale
+        # snapshot. Published origin objects are prerequisites, not duplicated
+        # in both a full bundle and a checkout archive.
+        bundle = _preserve_checkout_head(lease, head, runner, incremental=True)
+        # Include Git metadata, index and ignored files, but not .git/objects.
+        # Restore published prerequisites from origin before importing the bundle.
+        archive = _preserve_dirty_worktree(lease, bundle, include_git=True)
+        patch = bundle.with_suffix(".patch")
+        # A binary tree diff retains merge resolutions too; the bundle is the
+        # authoritative history and the patch is for operator inspection.
+        diff = _run(runner, [
+            "git", "-C", str(lease.path), "diff", "--binary", base, head, "--",
+        ], "retained PR checkout patch creation failed")
+        staging = patch.with_name(f".{patch.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            staging.write_text(diff + "\n", encoding="utf-8")
+            os.replace(staging, patch)
+        finally:
+            staging.unlink(missing_ok=True)
+        ref = f"refs/worklink-lease/{scope.pr_number}/{lease.recovery_id}"
+        _run(runner, [
+            "git", "-C", str(lease.source_root), "fetch", "--no-tags",
+            str(lease.path), f"{head}:{ref}",
+        ], "retained PR checkout recovery ref creation failed")
+        if _run(runner, [
+            "git", "-C", str(lease.source_root), "rev-parse", "--verify", ref,
+        ], "retained PR checkout recovery ref verification failed").lower() != head:
+            raise RuntimeError("retained PR checkout recovery ref differs from HEAD")
+        notice = {
+            "head": head, "ref": ref, "source_root": str(lease.source_root),
+            "patch": str(patch), "bundle": str(bundle), "archive": str(archive),
+        }
+        _report_retained_candidates(
+            "pr_checkout_lease_preserved_divergent", scope, [(patch, head)], **notice,
+        )
+        logging.getLogger(__name__).warning(
+            "Divergent PR checkout preserved: %s at %s; patch %s; bundle %s; archive %s",
+            ref, lease.source_root, patch, bundle, archive,
+        )
+        if notices is not None:
+            notices.append(notice)
+    try:
+        _reclaim_tombstone(lease, active, lambda _step: None)
+    except _LeaseBecameActive as exc:
+        raise RuntimeError("live PR checkout lease cannot be retired") from exc
+    lease.revoke()
+    return True
+
+
 def acquire_pr_checkout_lease(
     scope: RepoPRActionScope,
     *,
@@ -1999,7 +2288,7 @@ def acquire_pr_checkout_lease(
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
 ) -> tuple[PRCheckoutLease, tuple[str, ...]]:
-    """Resume the sole exact-scope lease, refusing divergent retained fixes."""
+    """Resume an ancestral lease or replace divergent work after recovery."""
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
         raise RuntimeError("scope does not grant PR checkout")
     if owner != scope.principal:
@@ -2180,6 +2469,16 @@ def acquire_pr_checkout_lease(
                 else:
                     foreign_candidates.append((lease.path, head))
 
+        # Classify before _recover or _rebind writes a new expiry. A checkout
+        # on a different base cannot attest even if its recorded lineage is clean.
+        for path, _head in tuple(candidates):
+            existing = _lease_from_recorded_metadata(path, root)
+            if _discard_divergent_candidate(
+                existing, scope, runner=runner,
+                notices=review_state.checkout_recovery_notices if review_state else None,
+            ):
+                candidates = [(p, h) for p, h in candidates if p != path]
+                rebound_candidates.pop(path, None)
         unpublished = [
             (path, head) for path, head in candidates
             if head != scope.observed_head_sha.lower()
@@ -3672,7 +3971,8 @@ class RepoGitTools:
                     "force_push_refused",
                     "push would not be a fast-forward; use repo_merge to merge the base "
                     "and scoped published PR head, resolve any conflicts, then repo_push; "
-                    "retained work can also be resumed by a later turn for this PR",
+                    "a later checkout replaces divergent history: proven byte-equivalent work "
+                    "is discarded; other work is preserved for operator recovery, not resumed",
                 )
             try:
                 push_remote, auth_env, sensitive_values = self._push_remote()
@@ -4091,6 +4391,16 @@ class ProjectTestResult:
     stderr_path: str = ""
     suite: str = "default"
     failure_summary: dict[str, object] | None = None
+    failed_leg: str | None = None
+    legs: tuple[dict[str, object], ...] = ()
+
+
+@dataclass(frozen=True)
+class _ResolvedTestLeg:
+    name: str
+    command: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()
+    default_paths: tuple[str, ...] = ()
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
@@ -4109,8 +4419,8 @@ def _selector_matches(path: str, suite: RepositoryTestSuite) -> bool:
 def _configured_command(
     repo_slug: str, selectors: tuple[str, ...] = (), suite: str | None = None,
     root: Path | None = None,
-) -> tuple[tuple[str, ...], dict[str, str], str, str, bool]:
-    """Resolve Worklink's deployment command into one shell-free fixed argv."""
+) -> tuple[tuple[str, ...] | tuple[_ResolvedTestLeg, ...], dict[str, str], str, str, bool]:
+    """Resolve a selected suite into prevalidated shell-free commands."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         raise ProjectTestRefusal(
@@ -4161,10 +4471,8 @@ def _configured_command(
                 execution_started=False,
             )
         chosen = matches[0]
-        command = chosen.command
         if not legacy and chosen in record.test_suites:
             source = "repository"
-        words = shlex.split(command, posix=True)
     except ProjectTestRefusal:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -4173,13 +4481,6 @@ def _configured_command(
             "project test command is invalid",
             execution_started=False,
         ) from exc
-    if not words:
-        raise ProjectTestRefusal(
-            "test_command_unresolvable",
-            f"project test command from {source} configuration is empty",
-            execution_started=False,
-        )
-
     env = {
         "PATH": _PATH,
         # HOME is deliberately absent here. A writable HOME is required -- every
@@ -4199,6 +4500,35 @@ def _configured_command(
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
+    configured_legs = chosen.legs or (RepositoryTestLeg(chosen.name, chosen.command),)
+    resolved_legs = tuple(
+        _resolve_test_leg(leg, root, env, selectors, legacy, source)
+        for leg in configured_legs
+    )
+    if chosen.legs:
+        return resolved_legs, env, source, chosen.name, chosen == default
+    return resolved_legs[0].command, dict(resolved_legs[0].env), source, chosen.name, chosen == default
+
+
+def _resolve_test_leg(
+    leg: RepositoryTestLeg, root: Path | None, base_env: dict[str, str],
+    selectors: tuple[str, ...], legacy: bool, source: str,
+) -> _ResolvedTestLeg:
+    try:
+        words = shlex.split(leg.command, posix=True)
+    except ValueError as exc:
+        raise ProjectTestRefusal(
+            "test_config_invalid", "project test command is invalid", execution_started=False,
+        ) from exc
+    if not words:
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            f"project test command from {source} configuration is empty",
+            execution_started=False,
+        )
+    # Preserve the existing shell-free `env -u NAME` compatibility form. Its
+    # unset operation applies only to this leg's fresh environment.
+    leg_env = dict(base_env)
     if Path(words[0]).name == "env":
         index = 1
         while index < len(words) and words[index] in {"-u", "--unset"}:
@@ -4208,7 +4538,7 @@ def _configured_command(
                     "invalid env unset directive",
                     execution_started=False,
                 )
-            env.pop(words[index + 1], None)
+            leg_env.pop(words[index + 1], None)
             index += 2
         words = words[index:]
         if not words:
@@ -4261,7 +4591,10 @@ def _configured_command(
             "configured test runner is unavailable",
             execution_started=False,
         )
-    return (str(resolved), *words[1:]), env, source, chosen.name, chosen == default
+    leg_env.update(leg.env)
+    return _ResolvedTestLeg(
+        leg.name, (str(resolved), *words[1:]), tuple(leg_env.items()), leg.default_paths,
+    )
 
 
 def _validated_selectors(
@@ -4582,10 +4915,19 @@ class RepoProjectTests:
         try:
             repository = scope.repository if retained else scope.canonical_repo
             issue = scope.issue_id if retained else scope.pr_number
-            command, configured_env, command_source, suite_name, is_default = _configured_command(
+            commands, configured_env, command_source, suite_name, is_default = _configured_command(
                 repository, selectors, suite, root
             )
             selected = _validated_selectors(root, selectors, suite=suite_name)
+            legs = (
+                commands if commands and isinstance(commands[0], _ResolvedTestLeg)
+                else (_ResolvedTestLeg(suite_name, commands, tuple(configured_env.items())),)
+            )
+            # Validate every fallback before the first leg can start.
+            paths_by_leg = tuple(
+                selected if selectors else _validated_selectors(root, leg.default_paths, suite=suite_name)
+                for leg in legs
+            )
         except ProjectTestRefusal as exc:
             raise ProjectTestRefusal(
                 exc.code,
@@ -4657,121 +4999,118 @@ class RepoProjectTests:
                 fixed_message=True,
             ) from exc
 
-        identifier = str(uuid.uuid4())
-        stdout_path, stderr_path, stdout_relative, stderr_relative = _live_output_paths(
-            os.environ["MIMIR_HOME"], identifier
-        )
         scrubber.add_path(checkout.path)
-        command = _remap_command(root, command)
-        environment = base_worker_environment(identifier)
-        environment.update(configured_env)
-        environment.pop("HOME", None)
-        environment.update({
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "safe.directory",
-            "GIT_CONFIG_VALUE_0": "*",
-        })
-        if Path(command[0]).name == "uv":
-            # uv otherwise searches above the fd-entered checkout for uv.toml.
-            # The snapshot's 0700 isolation boundary deliberately cannot be
-            # traversed by the worker, so ambient config discovery must be off.
-            environment["UV_NO_CONFIG"] = "1"
-            # The executor may seed this disposable cache from its image-owned
-            # read-only cache. Misses remain writable here and can download
-            # normally without giving executions write access to shared state.
-            environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
-        if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
-            try:
-                checkout.close()
-            except (OSError, RuntimeError, ValueError) as exc:
-                await safe_log_event(
-                    "repo_test_containment_refused",
-                    reason_code="cleanup_failed",
-                    repository=repository,
-                    pull_request=issue,
-                )
-                raise ProjectTestRefusal(
-                    "test_snapshot_cleanup_failed",
-                    "project test snapshot cleanup failed",
-                    execution_started=True,
-                    fixed_message=True,
-                ) from exc
-            raise ProjectTestRefusal(
-                "test_config_invalid",
-                "project test command or environment contains a controller path",
-                execution_started=True,
-                fixed_message=True,
+        prepared = []
+        for leg in legs:
+            identifier = str(uuid.uuid4())
+            stdout_path, stderr_path, stdout_relative, stderr_relative = _live_output_paths(
+                os.environ["MIMIR_HOME"], identifier
             )
-        result: CollectedExecutionResult | None = None
-        try:
-            try:
-                result = await self._runner(
-                    (*command, *selected),
-                    checkout.capability,
-                    environment,
-                    (),
-                    identifier=identifier,
-                    timeout_s=self._timeout,
-                    stdout_limit=self._output_limit,
-                    stderr_limit=self._output_limit,
-                    scrubber=scrubber,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                )
-            except StaleWorkerExecutorError as exc:
-                await safe_log_event(
-                    "repo_test_containment_refused",
-                    reason_code="stale_root_executor",
-                    repository=repository,
-                    pull_request=issue,
-                )
-                raise ProjectTestRefusal(
-                    "test_stale_root_executor",
-                    str(exc),
-                    execution_started=True,
-                ) from exc
-            except (OSError, RuntimeError, ValueError) as exc:
-                diagnostic = _permission_diagnostic_from_error(exc)
-                if diagnostic is not None:
+            command = _remap_command(root, leg.command)
+            environment = base_worker_environment(identifier)
+            environment.update(leg.env)
+            environment.pop("HOME", None)
+            environment.update({
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": "*",
+            })
+            if Path(command[0]).name == "uv":
+                # Disable ambient uv config above the fd-entered checkout.
+                environment["UV_NO_CONFIG"] = "1"
+                environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
+            if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
+                try:
+                    checkout.close()
+                except (OSError, RuntimeError, ValueError) as exc:
                     await safe_log_event(
-                        "repo_test_containment_refused",
-                        reason_code="path_permission_denied",
-                        repository=repository,
-                        pull_request=issue,
-                        **diagnostic,
+                        "repo_test_containment_refused", reason_code="cleanup_failed",
+                        repository=repository, pull_request=issue,
                     )
                     raise ProjectTestRefusal(
-                        "test_path_permission_denied",
-                        _permission_refusal_message(diagnostic),
-                        execution_started=True,
+                        "test_snapshot_cleanup_failed", "project test snapshot cleanup failed",
+                        execution_started=True, fixed_message=True,
                     ) from exc
-                await safe_log_event(
-                    "repo_test_containment_refused",
-                    reason_code="containment_unavailable",
-                    repository=repository,
-                    pull_request=issue,
-                )
                 raise ProjectTestRefusal(
-                    "test_containment_unavailable",
-                    "contained project test execution is unavailable",
-                    execution_started=True,
-                    fixed_message=True,
-                ) from exc
-            if result.exit_code not in {None, 0}:
-                diagnostic = _permission_diagnostic_from_error(result.stderr)
-                if diagnostic is not None:
-                    await safe_log_event(
-                        "repo_test_containment_refused",
-                        reason_code="path_permission_denied",
-                        repository=repository,
-                        pull_request=issue,
-                        **diagnostic,
-                    )
-                    raise ProjectTestRefusal(
-                        "test_path_permission_denied",
-                        _permission_refusal_message(diagnostic),
-                        execution_started=True,
-                    )
+                    "test_config_invalid", "project test command or environment contains a controller path",
+                    execution_started=True, fixed_message=True,
+                )
+            prepared.append((command, environment, identifier, stdout_path, stderr_path,
+                             stdout_relative, stderr_relative))
+        result: CollectedExecutionResult | None = None
+        leg_summaries: list[dict[str, object]] = []
+        deadline: float | None = None
+        try:
+            for leg, paths, prepared_leg in zip(legs, paths_by_leg, prepared):
+                (command, environment, identifier, stdout_path, stderr_path,
+                 stdout_relative, stderr_relative) = prepared_leg
+                try:
+                    try:
+                        # All legs share one budget, starting at the first run.
+                        # Keep the single-command timeout unchanged.
+                        if deadline is None:
+                            remaining = self._timeout
+                            deadline = time.monotonic() + remaining
+                        else:
+                            remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            # Never launch another worker with an expired budget.
+                            result = CollectedExecutionResult(None, b"", b"", True, False, 0, 0)
+                        else:
+                            result = await self._runner(
+                                (*command, *paths), checkout.capability, environment, (),
+                                identifier=identifier, timeout_s=remaining,
+                                stdout_limit=self._output_limit, stderr_limit=self._output_limit,
+                                scrubber=scrubber, stdout_path=stdout_path, stderr_path=stderr_path,
+                            )
+                    except StaleWorkerExecutorError as exc:
+                        await safe_log_event(
+                            "repo_test_containment_refused", reason_code="stale_root_executor",
+                            repository=repository, pull_request=issue,
+                        )
+                        raise ProjectTestRefusal("test_stale_root_executor", str(exc), execution_started=True) from exc
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        diagnostic = _permission_diagnostic_from_error(exc)
+                        if diagnostic is not None:
+                            await safe_log_event(
+                                "repo_test_containment_refused", reason_code="path_permission_denied",
+                                repository=repository, pull_request=issue, **diagnostic,
+                            )
+                            raise ProjectTestRefusal(
+                                "test_path_permission_denied", _permission_refusal_message(diagnostic),
+                                execution_started=True,
+                            ) from exc
+                        await safe_log_event(
+                            "repo_test_containment_refused", reason_code="containment_unavailable",
+                            repository=repository, pull_request=issue,
+                        )
+                        raise ProjectTestRefusal(
+                            "test_containment_unavailable", "contained project test execution is unavailable",
+                            execution_started=True, fixed_message=True,
+                        ) from exc
+                    if result.exit_code not in {None, 0}:
+                        diagnostic = _permission_diagnostic_from_error(result.stderr)
+                        if diagnostic is not None:
+                            await safe_log_event(
+                                "repo_test_containment_refused", reason_code="path_permission_denied",
+                                repository=repository, pull_request=issue, **diagnostic,
+                            )
+                            raise ProjectTestRefusal(
+                                "test_path_permission_denied", _permission_refusal_message(diagnostic),
+                                execution_started=True,
+                            )
+                    leg_summaries.append({
+                        "name": leg.name, "returncode": result.exit_code,
+                        "timed_out": result.timed_out, "output_limited": result.output_overflow,
+                        "pytest_summary": _pytest_terminal_summary(result.stdout),
+                        "stdout": _safe_output(result.stdout, scrubber, _RETURN_STDOUT_CHARS)[0],
+                        "stderr": _safe_stderr_output(result.stderr, scrubber, _RETURN_STDERR_CHARS)[0],
+                    })
+                    if result.exit_code != 0 or result.timed_out or result.output_overflow:
+                        break
+                finally:
+                    if result is None or not result.timed_out:
+                        _remove_live_output(stdout_path, stderr_path)
         finally:
             try:
                 checkout.close()
@@ -4788,9 +5127,6 @@ class RepoProjectTests:
                     execution_started=True,
                     fixed_message=True,
                 ) from exc
-            finally:
-                if result is None or not result.timed_out:
-                    _remove_live_output(stdout_path, stderr_path)
 
         assert result is not None
 
@@ -4813,12 +5149,16 @@ class RepoProjectTests:
         parsed = {
             "pytest_summary": summary,
             "failing_node_ids": (failure_summary["failing"][:_RETURN_FAILING_NODES]
-                                 if failure_summary is not None else []),
+                                  if failure_summary is not None else []),
         }
+        leg_report = {"legs": tuple(leg_summaries), "failed_leg": (
+            legs[len(leg_summaries) - 1].name
+            if result.exit_code != 0 or result.timed_out or result.output_overflow else None
+        )}
         if result.timed_out:
             return ProjectTestResult(
                 False, "test_timeout", None, stdout, stderr,
-                command, command_source, **truncation, **parsed,
+                command, command_source, **truncation, **parsed, **leg_report,
                 git_context=_git_execution_context(),
                 stdout_path=stdout_relative,
                 stderr_path=stderr_relative,
@@ -4831,7 +5171,7 @@ class RepoProjectTests:
                 code = "test_output_overflow" if result.exit_code == 0 else "tests_failed_output_overflow"
             return ProjectTestResult(
                 False, code, result.exit_code, stdout, stderr,
-                command, command_source, **truncation, **parsed,
+                command, command_source, **truncation, **parsed, **leg_report,
                 git_context=_git_execution_context(),
                 failure_summary=(failure_summary if code == "tests_failed" else None),
             )
@@ -4849,7 +5189,7 @@ class RepoProjectTests:
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,
-            **truncation, **parsed, git_context=_git_execution_context(),
+            **truncation, **parsed, **leg_report, git_context=_git_execution_context(),
         )
 
 # Model-facing repository tools
@@ -5262,6 +5602,8 @@ def checkout_scoped_pr(
             "status": "resumed", "path": str(existing.path), "scope_id": existing.scope_id,
             "head_sha": existing.head_sha,
             "candidate_commits": framework[1],
+            **({"preserved_prior_work": state.checkout_recovery_notices}
+               if state.checkout_recovery_notices else {}),
         }
     try:
         lease, candidates = acquire_pr_checkout_lease(
@@ -5296,6 +5638,7 @@ def checkout_scoped_pr(
         "scope_id": lease.scope_id,
         "head_sha": lease.head_sha,
         "candidate_commits": candidates,
+        "preserved_prior_work": state.checkout_recovery_notices,
     }
 
 

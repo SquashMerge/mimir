@@ -14,6 +14,7 @@ import pytest
 pytest.importorskip("mimir_cultivate")
 
 from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends import feature_factory
 from mimir_cultivate.worklink.backends.feature_factory import (
     FACTORY_COMMANDS,
     FACTORY_PUBLISHING_IDENTITY_ENV,
@@ -117,7 +118,8 @@ def test_snapshot_uses_attempt_bound_control_and_operator_root(
     backend.snapshot("chainlink-700", sandbox=sandbox, launcher=launcher)
     assert calls == [(
         sandbox,
-        ["node", str(launcher), "snapshot", "chainlink-700", "--repo", str(tmp_path / "operator")],
+        [sys.executable, "-I", str(Path(feature_factory.__file__).resolve().parent.parent / "factory_control_output.py"),
+         "other", "node", str(launcher), "snapshot", "chainlink-700", "--repo", str(tmp_path / "operator")],
     )]
     assert str(sandbox) not in calls[0][1]
 

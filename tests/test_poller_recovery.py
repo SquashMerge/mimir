@@ -693,6 +693,7 @@ async def test_transient_live_state_retry_does_not_charge_until_exhaustion(
         events, type_="turn_failed", channel_id=event.channel_id,
         source_id=event.source_id, ts=clock[0].isoformat(),
         attempt_disposition="transient_provider", attempt_reason="provider_error_transient:CodexResponseError",
+        phase="pre_model_loop", tool_call_count=0,
     )
     await reconcile()
     assert poller_recovery._load_state(tmp_path)["inflight"][event.source_id]["attempts"] == 0
@@ -704,11 +705,14 @@ async def test_transient_live_state_retry_does_not_charge_until_exhaustion(
         events, type_="turn_failed", channel_id=event.channel_id,
         source_id=event.source_id, ts=clock[0].isoformat(),
         attempt_disposition="transient_provider", attempt_reason="provider_error_transient:CodexResponseError",
+        phase="pre_model_loop", tool_call_count=0,
     )
     await reconcile()
     entry = poller_recovery._load_state(tmp_path)["inflight"][event.source_id]
     assert entry["attempts"] == 1
-    assert entry["outcome_disposition"] == "charge"
+    assert entry["outcome_disposition"] == "transient_provider"
+    assert entry["outcome_phase"] == "pre_model_loop"
+    assert entry["outcome_tool_call_count"] == 0
     assert len(enqueue.calls) == 1
 
 

@@ -34,6 +34,7 @@ from mimir_cultivate.worklink.worker_client import (
 )
 import mimir_cultivate.worklink.worker_exec as worker_exec
 from mimir_cultivate.worklink import identities
+from mimir_cultivate import install_identity
 from tests.stat_helpers import stat_with
 
 
@@ -253,6 +254,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
             return json.dumps({
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "mode": "source",
                 "source_commit": "a" * 40,
                 "checkout_root": "/workspace/.worklink",
             }).encode()
@@ -263,7 +265,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
     monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
     monkeypatch.setattr(socket, "socket", lambda *args: Peer())
 
-    assert await verify_executor_identity(Path("/executor.sock")) == "a" * 40
+    assert await verify_executor_identity(Path("/executor.sock")) == {"mode": "source", "source_commit": "a" * 40}
 
     assert sent == [{
         "version": 1,
@@ -288,6 +290,7 @@ async def test_identity_probe_refuses_missing_or_malformed_source_commit(monkeyp
             return json.dumps({
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "mode": "source",
                 "source_commit": "dirty-or-unpinned",
             }).encode()
 
@@ -313,6 +316,50 @@ def test_executor_identity_reports_image_recorded_source_commit(
     source_commit.write_text("dirty\n", encoding="ascii")
     with pytest.raises(RuntimeError, match="invalid recorded source commit"):
         worker_exec._executor_source_commit()
+
+
+@pytest.mark.asyncio
+async def test_identity_probe_requires_complete_pypi_pair(monkeypatch) -> None:
+    pair = {name: {"version": "1.2", "wheel": f"{name.replace('-', '_')}-1.2-py3-none-any.whl", "sha256": "a" * 64}
+            for name in install_identity.PROJECTS}
+    response = {"status": "identity", "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "checkout_root": str(worker_exec.worklink_checkout_root()), "mode": "pypi", "distributions": pair}
+
+    class Peer:
+        def send(self, _data):
+            pass
+
+        def recv(self, _size):
+            return json.dumps(response).encode()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(WorkerClient, "_connect", lambda self: Peer())
+    assert await verify_executor_identity() == {"mode": "pypi", "distributions": pair}
+    for altered in ({"distributions": {"mimir-agent": pair["mimir-agent"]}},
+                    {"distributions": {**pair, "mimir-cultivate": {**pair["mimir-cultivate"], "version": "2.0"}}},
+                    {"mode": "source"}):
+        response.update(altered)
+        with pytest.raises(StaleWorkerExecutorError):
+            await verify_executor_identity()
+
+
+def test_executor_identity_reads_verified_pypi_pair(tmp_path, monkeypatch) -> None:
+    marker = tmp_path / "executor-install-identity.json"
+    marker.touch()
+    monkeypatch.setattr(install_identity, "EXECUTOR_MARKER", marker)
+    expected = {"mode": "pypi", "distributions": {"mimir-agent": {}, "mimir-cultivate": {}}}
+    monkeypatch.setattr(install_identity, "executor_identity", lambda: expected)
+    observed = []
+
+    class Connection:
+        def send(self, data):
+            observed.append(json.loads(data))
+
+    worker_exec._handle_identity(Connection(), {"version": 1, "op": "identity", "executor_identity": EXECUTOR_PROTOCOL_IDENTITY}, [])
+    assert observed[0]["mode"] == "pypi"
+    assert observed[0]["distributions"] == expected["distributions"]
 
 
 @pytest.mark.asyncio
@@ -936,7 +983,7 @@ def test_path_launch_git_environment_at_spawn(
     def wait(proc, *args):
         if isinstance(proc, worker_exec._FactoryProcess):
             proc.done.set()
-        return 0, False, False
+        return 0, False, False, 0, 0
 
     monkeypatch.setattr(worker_exec.subprocess, "Popen", spawn)
     monkeypatch.setattr(worker_exec, "_wait_with_output_limits", wait)
@@ -1359,6 +1406,8 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
             "exit_code": -signal.SIGKILL,
             "timed_out": True,
             "output_overflow": False,
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
         }
     finally:
         for fd in fds:
@@ -1395,7 +1444,7 @@ def test_executor_truncates_and_terminates_on_output_overflow(
     try:
         assert worker_exec._wait_with_output_limits(
             process, 30, stdout_fd, 4, stderr_fd, 4
-        ) == (-signal.SIGKILL, False, True)
+        ) == (-signal.SIGKILL, False, True, 8, 0)
         assert stdout_path.read_bytes() == b"over"
     finally:
         os.close(stdout_fd)
@@ -1834,7 +1883,7 @@ def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory
 
     def wait(proc, *args):
         proc.done.set()
-        return 0, False, False
+        return 0, False, False, 0, 0
 
     monkeypatch.setattr(worker_exec.subprocess, "Popen", spawn)
     monkeypatch.setattr(worker_exec, "_wait_with_output_limits", wait)
@@ -2289,7 +2338,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
         assert worker_exec._jobs[factory_request["id"]] is proc
         proc.emit({"kind": "event", "event": "worklink_factory_orphan_adopted", "pid": 456})
         proc.done.set()
-        return 0, False, False
+        return 0, False, False, 0, 0
 
     monkeypatch.setattr(worker_exec, "_wait_with_output_limits", wait)
     with (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
@@ -2377,10 +2426,14 @@ def test_wait_factory_real_supervisor(tmp_path: Path, monkeypatch, mode: str) ->
                     with pytest.raises(RuntimeError, match="supervisor_lost"):
                         proc.stop()
                 else:
-                    code, timed_out, overflow = future.result()
+                    code, timed_out, overflow, stdout_bytes, stderr_bytes = future.result()
                     assert code == (37 if mode == "complete" else -signal.SIGTERM)
                     assert timed_out is (mode == "timeout")
                     assert overflow is (mode in {"stdout", "stderr"})
+                    if mode == "stdout":
+                        assert stdout_bytes > 64
+                    if mode == "stderr":
+                        assert stderr_bytes > 64
                     assert proc.returncode == code
                     assert proc.error is None
                     assert process.returncode == 0
@@ -2455,7 +2508,8 @@ async def test_worker_process_forwards_factory_events_to_owned_logger(tmp_path, 
                 "adopted_count": 96000, "final": True,
             }).encode())
         packet = {"id": identifier, "status": "terminal", "exit_code": 37,
-                  "timed_out": True, "output_overflow": True}
+                  "timed_out": True, "output_overflow": True,
+                  "stdout_bytes": 128, "stderr_bytes": 0}
         expected = None
         if ending == "error":
             packet = {"id": identifier, "error": "cleanup refused"}
@@ -2575,7 +2629,7 @@ def test_wait_factory_forwards_supervisor_event_before_terminal(tmp_path, event)
         for response in ({"kind": "ready"}, packet, {"kind": "terminal", "exit_code": 37}):
             child.send(json.dumps(response).encode())
         child.close()
-        assert worker_exec._wait_factory(proc, 10, output.fileno(), 64, output.fileno(), 64) == (37, False, False)
+        assert worker_exec._wait_factory(proc, 10, output.fileno(), 64, output.fileno(), 64) == (37, False, False, 0, 0)
     assert events == [packet]
     assert proc.done.is_set()
     assert proc.error is None
