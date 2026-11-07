@@ -33,7 +33,9 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
         assert after.flow == tables["flow"][name]
         assert after.tier == tables["tier"][name]
         assert after.operation_class == tables["catalog"][name]
-        assert after.result_domain == tables["protected_domains"].get(name)
+        expected_domain = ("repository" if name == "pr_rerequest_review"
+                           else tables["protected_domains"].get(name))
+        assert after.result_domain == expected_domain
         assert after.readable_domain == tables["readable_domains"].get(name)
         assert after.read_backend == (name in tables["read_backend"])
         assert after.writes_code_or_state == (name in CODING_WRITES_CODE_OR_STATE)
@@ -70,6 +72,11 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
             value = getattr(after.descriptor, field.name)
             if field.name == "result_origin":
                 value = int(value)
+                if name == "pr_rerequest_review":
+                    from mimir.tool_descriptors import ResultOriginKind
+
+                    assert value == int(ResultOriginKind.REPOSITORY)
+                    continue
             elif field.name in {"sink_target_extractor", "sink_payload_extractor"}:
                 undeclared = (_TARGET_EXTRACTOR_UNDECLARED if field.name == "sink_target_extractor"
                               else _PAYLOAD_EXTRACTOR_UNDECLARED)

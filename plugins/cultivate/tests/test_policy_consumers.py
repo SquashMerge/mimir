@@ -296,6 +296,131 @@ def test_selected_issue_comment_requires_repository_source_and_owner_resolution(
         assert not unavailable.allowed and unavailable.would_block
 
 
+def test_issue_write_result_allows_next_write_and_attestation_failure_stays_untrusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control
+    from langchain.tools import ToolRuntime
+    from mimir.access_control import (
+        CapabilityTier, ProtectedResultProvenance, ToolRegistry,
+        build_trigger_service_principal, classify_protected_result,
+    )
+    from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel
+    from mimir_cultivate import forge
+    from mimir_cultivate.forge import CommentProjection, IssueTarget
+
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    policy = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(policy, "_policy_consumer_hooks", replace(
+        policy.policy_consumer_hooks,
+        resolve_issue=lambda repo, number: IssueTarget(repo, number),
+    ))
+    principal = "service:poller:github-activity"
+    source = SourceLabel(
+        principal=principal, domain="repository", resource_id="owner/repo#pull/7@head",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}), source_kind="protected_tool",
+        integrity="trusted", integrity_effect="informational",
+    )
+    labels = InformationFlowLabels().with_channel("poller:github").with_source(source)
+    with policy_scope(policy):
+        service = build_trigger_service_principal(
+            canonical="poller:github-activity", trigger="poller", profile="github",
+            tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+            capabilities=("issue_comment",), creation_path="test",
+        )
+
+    def run(*, fail_attestation=False):
+        context = AuthContext(
+            principal="poller:github-activity", canonical_principal="poller:github-activity",
+            roles=("service",), event_ingress=None, trigger="poller",
+            channel_id="poller:github", interactivity=None, is_service=True,
+            service_authority=service, enforcement_enabled=True, ifc_labels=labels,
+            ifc_state=InformationFlowState(labels),
+        )
+        calls = []
+        client = SimpleNamespace(
+            get_open_issue_target=lambda repo, number: IssueTarget(repo, number),
+            add_issue_comment=lambda repo, number, body: (
+                calls.append(body) or CommentProjection("1", "bot", body, "now", "now")
+            ),
+        )
+        monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+        if fail_attestation:
+            def unavailable(*_args):
+                raise RuntimeError("private adapter detail")
+            monkeypatch.setattr(access_control, "publish_protected_result", unavailable)
+        gate = budget_gate.BudgetGateMiddleware(policy)
+
+        def invoke(body):
+            args = {"repository": "owner/repo", "issue": 220, "body": body}
+            request = ToolCallRequest(
+                tool_call={"name": "issue_comment", "args": args, "id": body,
+                           "type": "tool_call"},
+                tool=policy.tools["issue_comment"].factory(), state={},
+                runtime=Runtime(context=context),
+            )
+
+            def handler(call):
+                runtime = ToolRuntime(
+                    state={}, context=context, config={}, stream_writer=lambda _: None,
+                    tool_call_id=body, store=None,
+                )
+                result = forge.issue_comment.func(**call.tool_call["args"], runtime=runtime)
+                return ToolMessage(content=json.dumps(result), tool_call_id=body)
+
+            with policy_scope(policy):
+                return gate.wrap_tool_call(request, handler)
+
+        first = invoke("first")
+        assert first.status == "success", first.content
+        assert "private adapter detail" not in first.content
+        if fail_attestation:
+            assert context.ifc_state.has_untrusted_active_ingest()
+            second = invoke("second")
+            assert second.status == "error"
+            assert "untrusted outside content" in second.content
+            assert "private adapter detail" not in second.content
+            assert calls == ["first"]
+        else:
+            assert not context.ifc_state.has_untrusted_active_ingest()
+            second = invoke("second")
+            assert second.status == "success", second.content
+            assert calls == ["first", "second"]
+            args = {"repository": "owner/repo", "issue": 220, "body": "third"}
+            with policy_scope(policy):
+                decision = ToolRegistry().authorize_tool(
+                    "issue_comment", context, enforce=True, arguments=args, policy=policy,
+                )
+                attested = SourceLabel(
+                    principal=principal, domain="repository", resource_id="owner/repo#issue/220",
+                    bridge_instance="forge", sensitivity="internal",
+                    authorized_principals=frozenset({principal}),
+                    source_kind="protected_tool", integrity="trusted",
+                    integrity_effect="active_ingest",
+                )
+                provenance = ProtectedResultProvenance((attested,))
+                def classified(**changes):
+                    return classify_protected_result(
+                        "issue_comment", changes.pop("arguments", args), context,
+                        changes.pop("decision", decision), provenance=changes.pop("provenance", provenance),
+                        failed=changes.pop("failed", False),
+                    )
+                assert next(iter(classified().sources)).integrity == "trusted"
+                for changes in (
+                    {"arguments": {**args, "issue": 221}},
+                    {"decision": replace(decision, allowed=False)},
+                    {"decision": replace(decision, resolved_sink_target="owner/repo#issue/221")},
+                    {"provenance": ProtectedResultProvenance(())},
+                    {"provenance": ProtectedResultProvenance((replace(attested, integrity="untrusted"),))},
+                    {"failed": True},
+                ):
+                    assert classified(**changes).has_untrusted_active_ingest
+
+    run()
+    run(fail_attestation=True)
+
+
 def test_selected_repository_inventory_and_fallback_roots_do_not_import_core_repository(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

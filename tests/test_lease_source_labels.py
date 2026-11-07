@@ -811,7 +811,7 @@ def test_cultivate_forge_read_provenance_fails_closed_without_binding(
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_non_repository_forge_result_cannot_use_pr_read_classification(tmp_path: Path) -> None:
+def test_rerequest_write_requires_published_repository_provenance(tmp_path: Path) -> None:
     from mimir.plugins.core import selected_policy_registry
 
     auth, scope, _lease, _, _ = _real_attested_lease(tmp_path)
@@ -823,15 +823,22 @@ def test_non_repository_forge_result_cannot_use_pr_read_classification(tmp_path:
         authorized_principals=frozenset({principal}), source_kind="protected_tool",
         integrity="trusted", integrity_effect="active_ingest",
     )
-    labels = classify_protected_result(
-        "pr_rerequest_review", {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
-        auth, ToolAuthorization(
-            tool_name="pr_rerequest_review", decision="resource_scoped", allowed=True,
-            repo_pr_action_scope=scope, policy=selected_policy_registry(),
-        ), result={"ok": True}, provenance=ProtectedResultProvenance((source,)),
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    decision = ToolAuthorization(
+        tool_name="pr_rerequest_review", decision="resource_scoped", allowed=True,
+        repo_pr_action_scope=scope, policy=selected_policy_registry(),
     )
-    assert labels.has_untrusted_active_ingest
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:pr_rerequest_review>"
+    labels = classify_protected_result(
+        "pr_rerequest_review", args, auth, decision, result={"ok": True},
+        provenance=ProtectedResultProvenance((source,)),
+    )
+    assert not labels.has_untrusted_active_ingest
+    assert labels.sources[0].resource_id == source.resource_id
+    missing = classify_protected_result(
+        "pr_rerequest_review", args, auth, decision, result={"ok": True},
+    )
+    assert missing.has_untrusted_active_ingest
+    assert missing.sources[0].resource_id == source.resource_id
 
 
 @pytest.mark.usefixtures("selected_repository_policy")

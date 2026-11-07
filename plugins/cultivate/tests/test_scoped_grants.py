@@ -386,6 +386,48 @@ def _commit_remediation(state, invoke, message):
     return _git(state.checkout_lease.path, "rev-parse", "HEAD")
 
 
+@pytest.mark.parametrize("attestation_unavailable", [False, True])
+def test_rerequest_result_does_not_block_following_comment(
+    tmp_path, monkeypatch, attestation_unavailable,
+):
+    from mimir_cultivate import forge
+    from mimir_cultivate.forge import CommentProjection, PullRequestProjection
+
+    _, scope, _, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
+    calls = []
+    def read_pr(_):
+        if attestation_unavailable:
+            raise forge.ForgeError("private adapter detail")
+        return PullRequestProjection(
+            scope.pr_number, "Title", "open", "bot", False, "main", "branch",
+            scope.observed_head_sha, True, "created", "updated",
+        )
+
+    client = SimpleNamespace(
+        rerequest_review=lambda *_: calls.append("rerequest"),
+        add_pull_request_comment=lambda _scope, body: (
+            calls.append("comment") or CommentProjection("1", "bot", body, "now", "now")
+        ),
+        get_pull_request=read_pr,
+        author_is_trusted=lambda *_: True,
+    )
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
+    first = invoke("pr_rerequest_review", reviewer="reviewer")
+    assert first.status == "success", first.content
+    assert "private adapter detail" not in first.content
+    second = invoke("pr_comment", body="Summary")
+    if attestation_unavailable:
+        assert second.status == "error"
+        assert calls == ["rerequest"]
+        assert auth.ifc_state.has_untrusted_active_ingest()
+        assert "private adapter detail" not in second.content
+    else:
+        assert second.status == "success", second.content
+        assert calls == ["rerequest", "comment"]
+        assert not auth.ifc_state.has_untrusted_active_ingest()
+
+
 def test_remediation_grants_survive_two_commits_and_pushes(tmp_path, monkeypatch):
     origin, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
     for number in (1, 2):

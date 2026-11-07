@@ -12332,6 +12332,47 @@ def _bound_unsupported_operation_result(
     )
 
 
+def _bound_issue_write_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any,
+    provenance: ProtectedResultProvenance | None, failed: bool,
+) -> "InformationFlowLabels | None":
+    """Trust only a successful issue write attested at its authorized sink."""
+    from .models import InformationFlowLabels, SourceLabel
+
+    target = authorization.repo_pr_action_scope
+    if not (
+        registered.owner == "cultivate" and tool_name == "issue_comment"
+        and registered.flow == "sink"
+        and registered.descriptor is not None
+        and registered.descriptor.sink_destination == "configured_repository_issue"
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.ADMIN_REQUIRED
+        and not failed
+        and target is not None
+        and isinstance(arguments.get("repository"), str)
+        and type(arguments.get("issue")) is int
+        and arguments["repository"].lower() == target.canonical_repo.lower()
+        and arguments["issue"] == target.issue_number
+        and authorization.resolved_sink_target == target.sink_destination
+    ):
+        return None
+    principal = getattr(auth_context, "canonical_principal", None)
+    if getattr(auth_context, "is_service", False) and principal:
+        principal = f"service:{principal}"
+    expected = SourceLabel(
+        principal=principal, domain="repository", resource_id=target.sink_destination,
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    )
+    if provenance is None or provenance.sources != (expected,):
+        return None
+    labels = InformationFlowLabels().with_source(expected)
+    channel = getattr(auth_context, "channel_id", None)
+    return labels.with_channel(channel) if channel else labels
+
+
 @scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
@@ -12367,6 +12408,13 @@ def classify_protected_result(
         )
     retained_verified = False
     if registered is not None and registered.owner != "core":
+        if tool_name == "issue_comment":
+            issue_labels = _bound_issue_write_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, provenance, failed,
+            )
+            if issue_labels is not None:
+                return issue_labels
         scope = getattr(auth_context, "retained_factory_scope", None)
         retained_candidate = (
             "retained_repo_tools" in registered.memberships

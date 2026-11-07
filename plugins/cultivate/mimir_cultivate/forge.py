@@ -2156,6 +2156,28 @@ def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: R
         log.warning("forge write completed; result attestation unavailable")
 
 
+def _publish_issue_write_projection(runtime: ToolRuntime[AuthContext] | None, target: IssueTarget) -> None:
+    """Attest only the server-resolved target of a completed issue write."""
+    from mimir.access_control import publish_protected_result
+    from mimir.models import SourceLabel
+
+    context = getattr(runtime, "context", None)
+    if context is None:
+        return
+    principal = context.canonical_principal
+    if context.is_service and principal:
+        principal = f"service:{principal}"
+    try:
+        publish_protected_result((SourceLabel(
+            principal=principal, domain="repository", resource_id=target.sink_destination,
+            bridge_instance="forge", sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+        ),))
+    except Exception:  # noqa: BLE001 — a completed write must not be retried
+        log.warning("forge write completed; result attestation unavailable")
+
+
 def _check_url_matches_scope(url: str, scope: RepoPRActionScope) -> bool:
     from urllib.parse import unquote, urlsplit
 
@@ -2966,9 +2988,11 @@ def issue_comment(
     """Add one comment to a server-resolved open issue in a configured repository."""
     safe_body = _body(body)
     target = resolve_issue_comment_target(repository, issue)
-    return asdict(_call(lambda: _client_for_repository(target.canonical_repo).add_issue_comment(
+    result = asdict(_call(lambda: _client_for_repository(target.canonical_repo).add_issue_comment(
         target.canonical_repo, target.issue_number, safe_body,
     )))
+    _publish_issue_write_projection(runtime, target)
+    return result
 
 
 @tool
@@ -2986,6 +3010,7 @@ def pr_rerequest_review(
             "or hyphens; for example, reviewer='octocat'"
         )
     _call(lambda: _client(scope).rerequest_review(scope, reviewer))
+    _publish_write_projection(runtime, scope)
     return {"status": "review_rerequested", "reviewer": reviewer}
 
 
