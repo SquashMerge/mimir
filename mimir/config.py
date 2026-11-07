@@ -69,6 +69,18 @@ def trusted_github_bot_logins() -> frozenset[str]:
     )
 
 
+def github_agent_logins() -> frozenset[str]:
+    """Exact, case-insensitive GitHub logins of other agents' accounts.
+
+    Like our own replies, an agent's reply never saw text withheld from it, so
+    it never vouches for the comments above it however trusted the account is.
+    """
+    return frozenset(
+        login.casefold() for entry in _env("MIMIR_GITHUB_AGENT_LOGINS").split(",")
+        if (login := entry.strip()) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", login)
+    )
+
+
 def _load_home_dotenv(home: Path) -> list[str]:
     """Load ``<home>/.env`` as runtime defaults.
 

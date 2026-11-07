@@ -2360,15 +2360,19 @@ def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope
     # cannot prove which text it saw: untrusted reviews are never vouched for.
     created, modified = (("submitted_at", None) if tool == "pr_reviews"
                          else ("created_at", "updated_at"))
+    from mimir.config import github_agent_logins
+
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip().casefold()
+    agents = github_agent_logins()
 
     def can_vouch(item: dict[str, Any]) -> bool:
         # Only a trusted person attests to what they replied under. Our own
-        # replies and app identities never saw withheld text; with no known
-        # self login, nothing can be told apart from our own replies.
+        # replies, other agents' and app identities never saw withheld text, so
+        # posting a comment never attests the PR; with no known self login,
+        # nothing can be told apart from our own replies.
         author = item["author"]
         return (bool(self_login) and isinstance(author, str) and not _BOT_LOGIN.fullmatch(author)
-                and author.casefold() != self_login)
+                and author.casefold() != self_login and author.casefold() not in agents)
 
     kept, withheld = github_trust.partition(
         projected, lambda item: item["author"],
