@@ -1268,6 +1268,7 @@ def _recover_pr_checkout_lease_unlocked(
     ttl: timedelta = timedelta(hours=2),
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
+    attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Recover exact-scope work after revalidating its original remote PR head."""
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
@@ -1370,6 +1371,19 @@ def _recover_pr_checkout_lease_unlocked(
             f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
             f"fetched head is {remote_head}"
         )
+    if attest_resume is not None:
+        if not lease.is_active:
+            raise LeaseAttestationRefusal("inactive_lease", existing=True)
+        if review_state is not None:
+            review_state.attach_checkout_lease(lease)
+            review_state.record_git_head(scope.scope_id, head)
+        # Refusals must leave the recorded expiry and recovery identity intact.
+        try:
+            attest_resume(lease)
+        except BaseException:
+            if review_state is not None:
+                review_state.revoke_checkout_lease(lease)
+            raise
     lease = replace(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
@@ -2043,6 +2057,7 @@ def acquire_pr_checkout_lease(
     ttl: timedelta = timedelta(hours=2),
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
+    attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> tuple[PRCheckoutLease, tuple[str, ...]]:
     """Resume the sole exact-scope lease, refusing divergent retained fixes."""
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
@@ -2274,6 +2289,7 @@ def acquire_pr_checkout_lease(
                     ttl=ttl,
                     review_state=review_state,
                     runner=runner,
+                    attest_resume=attest_resume,
                 )
             if unpublished:
                 _report_retained_candidates(
@@ -5310,6 +5326,17 @@ def repo_checkout(
     return checkout_scoped_pr(repository, pull_request, runtime)
 
 
+class LeaseAttestationRefusal(ToolPolicyRefusal):
+    """A server-classified refusal with no checkout authority to return."""
+
+    def __init__(self, reason: str, *, existing: bool = False) -> None:
+        from mimir.access_control import LeaseAttestationReason
+
+        self.reason = LeaseAttestationReason(reason).value
+        detail = "existing lease attestation refused" if existing else "lease attestation refused"
+        super().__init__(f"repository checkout rejected: {detail} ({self.reason})")
+
+
 def checkout_scoped_pr(
     repository: str, pull_request: int,
     runtime: ToolRuntime[AuthContext],
@@ -5340,49 +5367,78 @@ def checkout_scoped_pr(
             and framework[0] == (str(existing.path), existing.recovery_id)):
         from mimir.access_control import pr_checkout_lease_attestation
 
-        if not pr_checkout_lease_attestation(context, scope, existing).ok:
-            raise ToolPolicyRefusal("repository checkout rejected: existing lease attestation refused")
+        attestation = pr_checkout_lease_attestation(context, scope, existing)
+        if not attestation.ok:
+            refusal = LeaseAttestationRefusal(attestation.reason, existing=True)
+            if getattr(runtime, "pre_turn_checkout", False):
+                context.ifc_state.framework_pr_checkouts.pop(scope.scope_id, None)
+                state.revoke_checkout_lease(existing)
+                return {"status": "attestation_refused", "reason": refusal.reason}
+            raise refusal
         _publish_attested_lease_result(runtime, state)
         return {
             "status": "resumed", "path": str(existing.path), "scope_id": existing.scope_id,
             "head_sha": existing.head_sha,
             "candidate_commits": framework[1],
         }
+    author_resolved = False
+
+    def resolve_author_trust() -> None:
+        nonlocal author_resolved
+        if author_resolved:
+            return
+        author_resolved = True
+        # Record only turn-local authority, never trust checkout metadata.
+        context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
+        context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
+        client = _client(scope)
+        from .forge import _BOT_LOGIN, _author_verdict
+
+        if callable(getattr(client, "author_is_trusted", None)) or (
+            isinstance(scope.pull_request_author, str) and _BOT_LOGIN.fullmatch(scope.pull_request_author)
+        ):
+            authors, _ = _call(lambda: _pr_content_authors(client, scope))
+            if authors == (scope.pull_request_author,) and scope.pull_request_author:
+                from mimir.pollers import _github_author_trust_cause
+
+                _github_author_trust_cause.set(None)
+                verdict = _author_verdict(context, scope, scope.pull_request_author, client)
+                context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+                if verdict is None:
+                    from mimir.pollers import github_author_trust_cause
+
+                    context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
+                        github_author_trust_cause() or "author_unresolved"
+                    )
+                else:
+                    context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
+
+    def attest_resume(lease: PRCheckoutLease) -> None:
+        from mimir.access_control import pr_checkout_lease_attestation
+
+        resolve_author_trust()
+        attestation = pr_checkout_lease_attestation(context, scope, lease)
+        if not attestation.ok:
+            raise LeaseAttestationRefusal(attestation.reason, existing=True)
+
     try:
         lease, candidates = acquire_pr_checkout_lease(
-            state.action_scope,
-            owner=state.action_scope.principal,
+            state.action_scope, owner=state.action_scope.principal,
             review_state=state,
+            attest_resume=attest_resume if getattr(runtime, "pre_turn_checkout", False) else None,
         )
+    except LeaseAttestationRefusal as exc:
+        attached = state.checkout_lease
+        if attached is not None:
+            state.revoke_checkout_lease(attached)
+        if getattr(runtime, "pre_turn_checkout", False):
+            return {"status": "attestation_refused", "reason": exc.reason}
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
         _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
-    # Record only turn-local authority, never trust in checkout-controlled metadata.
-    # Clear an earlier verdict before fetching metadata, so failures stay closed.
-    context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
-    context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
-    client = _client(scope)
-    from .forge import _BOT_LOGIN, _author_verdict
-
-    if callable(getattr(client, "author_is_trusted", None)) or (
-        isinstance(scope.pull_request_author, str) and _BOT_LOGIN.fullmatch(scope.pull_request_author)
-    ):
-        authors, _ = _call(lambda: _pr_content_authors(client, scope))
-        if authors == (scope.pull_request_author,) and scope.pull_request_author:
-            from mimir.pollers import _github_author_trust_cause
-
-            _github_author_trust_cause.set(None)
-            verdict = _author_verdict(context, scope, scope.pull_request_author, client)
-            context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
-            if verdict is None:
-                from mimir.pollers import github_author_trust_cause
-
-                context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
-                    github_author_trust_cause() or "author_unresolved"
-                )
-            else:
-                context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
+    resolve_author_trust()
     _publish_attested_lease_result(runtime, state)
     return {
         "status": "resumed" if candidates else "checked_out",

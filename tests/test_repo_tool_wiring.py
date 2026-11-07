@@ -330,7 +330,7 @@ def test_checkout_proof_is_isolated_to_named_pr(
     registry = context.repo_pr_scope_registry
     assert registry is not None
 
-    def fake_checkout(scope, *, owner, review_state):
+    def fake_checkout(scope, *, owner, review_state, attest_resume=None):
         lease = SimpleNamespace(
             path=tmp_path / str(scope.pr_number), scope_id=scope.scope_id,
             head_sha=scope.observed_head_sha, owner=owner, is_active=True,
@@ -646,6 +646,9 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
         return lease, ("candidate",)
 
     monkeypatch.setattr(repository, "acquire_pr_checkout_lease", checkout_once)
+    if checkout is True:
+        monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                            lambda *_args: SimpleNamespace(ok=True))
     seen = []
 
     class FirstRead(_FakeAgent):
@@ -721,9 +724,16 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
         assert len(fetches) == 1
         with pytest.raises(ToolException, match="existing lease attestation refused"):
             monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
-                                lambda *_args: SimpleNamespace(ok=False))
+                                lambda *_args: SimpleNamespace(ok=False, reason="ancestry_failure"))
             repo_checkout.func(scope.canonical_repo, scope.pr_number,
                                runtime=SimpleNamespace(context=auth))
+        from mimir_cultivate.repository import checkout_scoped_pr
+
+        refused = checkout_scoped_pr(scope.canonical_repo, scope.pr_number,
+                                    SimpleNamespace(context=auth, pre_turn_checkout=True))
+        assert refused == {"status": "attestation_refused", "reason": "ancestry_failure"}
+        assert not auth.ifc_state.framework_pr_checkouts
+        assert state.checkout_lease is None
         assert len(fetches) == 1
     else:
         assert state.checkout_lease is None
@@ -781,6 +791,9 @@ async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
             review_state=kwargs["review_state"],
         ), ("candidate",)),
     )
+    if outcome == "reminted":
+        monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                            lambda *_args: SimpleNamespace(ok=True))
     seen = []
 
     class FirstRead(_FakeAgent):
@@ -819,6 +832,144 @@ async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
     assert str(fresh.checkout_lease.path) in seen[0][1]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["ancestry_failure", "no_author_trust", "checkout_state_mismatch"])
+async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
+    tmp_path, monkeypatch, selected_repo_policy, reason,
+):
+    import json
+
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.models import AgentEvent
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import forge
+    from tests.test_agent import _build_agent, _FakeAgent, _FakeSessionManager
+    from tests.test_repo_tools import _repo_scope_and_state
+
+    _, _, scope, original = _repo_scope_and_state(tmp_path)
+    lease = original.checkout_lease
+    state = RepoReviewState(scope)
+    auth = replace(
+        _auth(scope), repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state,
+        trigger="poller", canonical_principal="poller:github-activity",
+        service_authority=replace(_auth(scope).service_authority,
+            canonical="poller:github-activity", trigger="poller", authority_profile="github",
+            capabilities=("pr_metadata", "repo_checkout", "pr_comment")),
+        scoped_pr_grants=ScopedPRGrants(
+            "poller:github-activity", (scope,), protocols=selected_repo_policy.scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        ),
+    )
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr("mimir.agent._create_turn_auth_context", lambda *a, **k: auth)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                        lambda *_: SimpleNamespace(ok=False, reason=reason,
+                                                  detail="fatal: adapter-secret"))
+    original_hook = selected_repo_policy.turn_hooks[("cultivate", "pr_checkout")]
+
+    def hook(*args):
+        result = original_hook(*args)
+        if result["status"] == "attestation_refused":
+            result["message"] = "fatal: adapter-secret"
+        return result
+
+    monkeypatch.setitem(selected_repo_policy._turn_hooks, ("cultivate", "pr_checkout"), hook)
+    metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+    before = json.loads(metadata.read_text())
+    seen = []
+
+    class FirstRead(_FakeAgent):
+        async def astream(self, inputs, *, config, context=None, stream_mode="values"):
+            seen.append(str(inputs))
+            yield {"messages": []}
+
+    agent = _build_agent(tmp_path, fake_agent=FirstRead([]), fake_saga=None,
+                         session_manager=_FakeSessionManager())
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+        policy=selected_repo_policy, plugins=(), turn_preflight=None,
+    ))
+    with policy_scope(selected_repo_policy):
+        await agent.run_turn(AgentEvent(
+            trigger="poller", channel_id="poller:github-activity", content="review",
+        ))
+
+    events = [json.loads(line) for line in (tmp_path / "home/logs/events.jsonl").read_text().splitlines()]
+    assert not [event for event in events if event.get("type") == "turn_failed"]
+    completed = [event for event in events if event.get("type") == "turn_completed"]
+    assert len(completed) == 1
+    assert completed[0]["attempt_disposition"] == "exempt_hard_refusal"
+    assert completed[0]["attempt_reason"] == f"lease_attestation_refused:{reason}"
+    assert len(seen) == 1
+    assert "Current PR remediation" in seen[0]
+    assert reason in seen[0]
+    assert "adapter-secret" not in seen[0]
+    assert "may comment on the PR or escalate" in seen[0]
+    assert "cannot read or write PR content this turn" in seen[0]
+    assert str(lease.path) not in seen[0]
+    assert not auth.ifc_state.framework_pr_checkouts
+    assert state.checkout_lease is None
+    assert json.loads(metadata.read_text())["expires_at"] == before["expires_at"]
+    assert json.loads(metadata.read_text())["recovery_id"] == before["recovery_id"]
+
+
+def test_tool_refused_resume_keeps_expiry_and_reports_reason(
+    tmp_path, monkeypatch,
+):
+    import json
+
+    from mimir.access_control import LeaseAttestation
+    from mimir_cultivate import forge
+    from tests.test_repo_tools import _repo_scope_and_state
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    _, _, scope, original = _repo_scope_and_state(tmp_path)
+    lease = original.checkout_lease
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    auth = replace(_auth(scope), repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state)
+    auth.ifc_state.framework_pr_checkouts[scope.scope_id] = (
+        (str(lease.path), lease.recovery_id), (),
+    )
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                        lambda *_: LeaseAttestation(False, "ancestry_failure"))
+    metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+    before = json.loads(metadata.read_text())
+    with pytest.raises(ToolPolicyRefusal, match="existing lease attestation refused \\(ancestry_failure\\)"):
+        repo_checkout.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    assert json.loads(metadata.read_text()) == before
+
+
+def test_tool_attested_resume_renews_lease(tmp_path, monkeypatch):
+    import json
+
+    from mimir.access_control import LeaseAttestation
+    from mimir_cultivate import forge
+    from tests.test_repo_tools import _repo_scope_and_state
+
+    _, _, scope, original = _repo_scope_and_state(tmp_path)
+    lease = original.checkout_lease
+    state = RepoReviewState(scope)
+    auth = replace(_auth(scope), repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                        lambda *_: LeaseAttestation(True, "ok"))
+    metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+    before = json.loads(metadata.read_text())
+    result = repo_checkout.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    after = json.loads(metadata.read_text())
+    assert result["status"] == "checked_out"
+    assert result["path"] == str(lease.path)
+    assert after["expires_at"] > before["expires_at"]
+    assert state.checkout_lease.expires_at.isoformat() == after["expires_at"]
+
+
 def test_core_only_head_advance_cannot_dispatch_without_owner(monkeypatch):
     from mimir.plugins.core import core_policy_registry
 
@@ -848,7 +999,7 @@ def test_stale_own_remediation_head_is_reminted_and_checked_out(
     ))
     checked_out: list[RepoPRActionScope] = []
 
-    def fake_checkout(scope, *, owner, review_state):  # type: ignore[no-untyped-def]
+    def fake_checkout(scope, *, owner, review_state, attest_resume=None):  # type: ignore[no-untyped-def]
         checked_out.append(scope)
         lease = SimpleNamespace(
             path=tmp_path / "fresh", scope_id=scope.scope_id,
@@ -917,7 +1068,7 @@ def test_remediation_head_advancing_twice_does_not_remint_again(
     live_heads = iter((second_head, third_head))
     checked_out_heads: list[str] = []
 
-    def fake_checkout(scope, *, owner, review_state):  # type: ignore[no-untyped-def]
+    def fake_checkout(scope, *, owner, review_state, attest_resume=None):  # type: ignore[no-untyped-def]
         live_head = next(live_heads)
         checked_out_heads.append(scope.observed_head_sha)
         if scope.observed_head_sha != live_head:
