@@ -35,6 +35,23 @@ def _in_worklink_gate() -> bool:
     return os.environ.get("MIMIR_WORKLINK_GATE") == "1"
 
 
+# A process-directed signal is delivered to any thread that does not block it,
+# and only a delivery to main wakes a main thread parked in teardown: delivered to
+# the wakeup observer instead, the repeat signal's Python handler never runs. Tests
+# of main-thread escalation pin delivery to main by blocking supported signals in
+# every other Python thread before it runs. Worker delivery is covered separately
+# by test_blocked_main_signal_delivery_matrix, where the watchdog bounds the exit.
+_MAIN_THREAD_SIGNAL_DELIVERY = r'''
+import signal as _signal, threading as _threading
+_SUPPORTED_SIGNALS = {_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP}
+_thread_bootstrap_inner = _threading.Thread._bootstrap_inner
+def _main_delivery_bootstrap_inner(self):
+    _signal.pthread_sigmask(_signal.SIG_BLOCK, _SUPPORTED_SIGNALS)
+    _thread_bootstrap_inner(self)
+_threading.Thread._bootstrap_inner = _main_delivery_bootstrap_inner
+'''
+
+
 def _journal_source(progress: Path, *, controlled_exit: bool = False) -> str:
     # Keep C-level bytes separate: they have no line framing and must not alter
     # the existing text journal's ordered prefix. Neither file needs pipe EOF.
@@ -805,6 +822,33 @@ async def _signal_exit_protocol(
         await asyncio.gather(task, return_exceptions=True)
 
 
+def test_main_thread_signal_delivery_prelude_blocks_every_worker(tmp_path: Path) -> None:
+    import subprocess
+
+    # The prelude must mask workers started by any path: a plain Thread, a
+    # Timer (the watchdog), and the journal's tee forwarder. Main stays unmasked.
+    source = _MAIN_THREAD_SIGNAL_DELIVERY + _journal_source(tmp_path / "child-progress") + r'''
+import signal, sys, threading
+supported = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+masks = {}
+def report(name):
+    masks[name] = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+worker = threading.Thread(target=report, args=("thread",))
+worker.start(); worker.join()
+timer = threading.Timer(0, report, args=("timer",))
+timer.start(); timer.join()
+report("main")
+assert supported <= masks["thread"] and supported <= masks["timer"], masks
+assert not supported & masks["main"], masks
+print("ok")
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, timeout=60,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"ok\n", b"")
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(0)  # The 600s asyncio backstop fails normally, including under xdist.
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
@@ -814,7 +858,9 @@ async def test_signal_exit_bounds_entire_teardown(
     signum: signal.Signals, repeat: bool, stage: str, tmp_path: Path,
 ) -> None:
     progress = tmp_path / "child-progress"
-    source = _journal_source(progress, controlled_exit=True) + r'''
+    # The parent's signals are process-directed; the kernel, not this test,
+    # would otherwise choose the receiving thread (#2118).
+    source = _MAIN_THREAD_SIGNAL_DELIVERY + _journal_source(progress, controlled_exit=True) + r'''
 import atexit, asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
