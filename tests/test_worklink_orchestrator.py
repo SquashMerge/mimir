@@ -6493,6 +6493,13 @@ def test_post_merge_factory_failure_pushes_branch_before_record_becomes_failed(
         return Publication()
 
     monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", capture)
+    local: list[tuple[str, str]] = []
+    # #2114: the pushed feature branch holds only merged slices; the local
+    # snapshot of the whole sandbox is still taken as the next attempt's record.
+    monkeypatch.setattr(
+        orchestrator.WorklinkRunner, "_preserve_factory_attempt",
+        lambda self, claims, record, reason, runner: local.append((record.run_id, reason)),
+    )
     result, _, _, _ = _run_factory_preflight_case(
         tmp_path,
         monkeypatch,
@@ -6500,6 +6507,7 @@ def test_post_merge_factory_failure_pushes_branch_before_record_becomes_failed(
         outcome="post_merge_refusal",
     )
 
+    assert local == [("chainlink-700", "factory status field validator is malformed")]
     assert pushed == ["feature/chainlink-700"]
     assert result.status == "failed"
     assert result.preserved_ref == "origin/feature/chainlink-700"
@@ -14169,3 +14177,41 @@ def test_dispatch_sweep_failure_never_blocks_dispatch(
     result, backend = _dispatch_attempt_two(tmp_path, repo, runner)
     assert backend.orders, "the backend still ran"
     assert result.attempt == 2 and result.status in {"completed", "blocked"}
+
+
+def test_dispatch_sweep_applies_retention_to_swept_attempts(tmp_path: Path) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.preserved import list_preserved
+
+    def git(repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    forge = tmp_path / "forge.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(forge)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    git(repo, "config", "user.name", "Op")
+    git(repo, "config", "user.email", "op@example.test")
+    (repo / "app.py").write_text("print('base')\n")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-q", "-m", "base")
+    git(repo, "remote", "add", "origin", str(forge))
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+    for attempt in (1, 2):
+        crashed = repo.parent / ".worklink" / repo.name / f"441-{attempt}"
+        crashed.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", str(repo), str(crashed)], check=True)
+        (crashed / f"crash_{attempt}.py").write_text("WORK = True\n")
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  preserved_attempts_keep: 1\n")
+    comments: list[str] = []
+    # Repeated crashes are swept at one dispatch; retention still holds the issue at N.
+    orchestrator._sweep_retained_attempts(
+        tmp_path, repo, 441, 3,
+        runner=lambda args, **kw: subprocess.run(args, capture_output=True, text=True),
+        comment=lambda _issue, text: comments.append(text),
+    )
+    assert [record["attempt"] for record in list_preserved(tmp_path, 441)] == [2]
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", "refs/worklink/441/1"],
+                          capture_output=True).returncode != 0
+    assert any(text.startswith("WORKLINK_PRESERVED_PRUNED issue=441 attempts=[1]") for text in comments)

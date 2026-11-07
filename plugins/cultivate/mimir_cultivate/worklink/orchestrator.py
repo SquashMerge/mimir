@@ -465,6 +465,11 @@ def _sweep_retained_attempts(
         factory_records = listing.records
     except Exception:  # noqa: BLE001 - leaf attempts need no factory records
         factory_records = ()
+    keep = 3
+    try:
+        keep = WorklinkConfig.load(home / "worklink.yaml").defaults.preserved_attempts_keep
+    except Exception:  # noqa: BLE001 - the documented default still bounds retention
+        pass
     try:
         default_base = WorklinkConfig.load(home / "worklink.yaml").defaults.base_branch
     except Exception:  # noqa: BLE001
@@ -483,6 +488,7 @@ def _sweep_retained_attempts(
         _log_event("worklink_preservation_sweep_failed", issue_id=issue_id, attempt=attempt,
                    error=str(exc))
         return
+    swept = False
     for child in sorted(candidates, key=lambda path: attempt_numbers(path.name)[1]):
         try:
             preserved = preserve_retained_attempt(
@@ -495,9 +501,23 @@ def _sweep_retained_attempts(
             _log_event("worklink_attempt_preserved", issue_id=issue_id, attempt=preserved.attempt,
                        ref=preserved.ref, error=preserved.error, trigger="dispatch")
             comment(issue_id, preserved_line(preserved))
+            swept = True
         except Exception as exc:  # noqa: BLE001 - never blocks dispatch
             _log_event("worklink_preservation_sweep_failed", issue_id=issue_id, attempt=attempt,
                        attempt_dir=str(child), error=str(exc))
+    if not swept:
+        return
+    try:
+        # Swept records count toward retention like any other; a later TTL
+        # pass skips recorded attempts, so prune here or never.
+        pruned = prune_preserved(home, repo, issue_id, keep=keep, runner=_list_runner(runner))
+        if pruned:
+            _log_event("worklink_preserved_pruned", issue_id=issue_id, attempts=pruned)
+            comment(issue_id, f"WORKLINK_PRESERVED_PRUNED issue={issue_id} "
+                              f"attempts={json.dumps(pruned)} reason=retention keep={keep}")
+    except Exception as exc:  # noqa: BLE001 - never blocks dispatch
+        _log_event("worklink_preservation_sweep_failed", issue_id=issue_id, attempt=attempt,
+                   error=str(exc))
 
 
 def _record_dispatch_spec_best_effort(home: Path, issue: "IssueContext", attempt: int) -> None:
@@ -3287,9 +3307,11 @@ class WorklinkRunner:
                 reason += f"; completed work preserved at {preserved_ref}"
             elif preservation_error is not None:
                 reason += f"; completed work preservation failed: {preservation_error}"
-            if not published and preserved_ref is None and current is not None:
+            if not published and current is not None:
                 # #2114: the unpublished epic attempt is kept locally as reference
-                # for the next attempt, never pushed.
+                # for the next attempt, never pushed. A pushed feature branch
+                # (above) holds only merged slices, not the sandbox's other or
+                # uncommitted work, and gives the next prompt no record.
                 local = await asyncio.to_thread(
                     self._preserve_factory_attempt, claims, current, original_reason, runner,
                 )

@@ -220,3 +220,32 @@ def test_failed_epic_attempt_is_preserved_locally(rig) -> None:
     forge_refs = subprocess.run(["git", "--git-dir", str(forge), "for-each-ref"],
                                 capture_output=True, text=True, check=True).stdout
     assert "refs/worklink" not in forge_refs and "epic/7" not in forge_refs
+
+
+@pytest.mark.parametrize("layout", [("checkout",), ()], ids=["worker", "controller"])
+def test_retained_epic_attempt_preserves_its_factory_sandbox(rig, tmp_path: Path, layout) -> None:
+    from types import SimpleNamespace
+
+    from mimir_cultivate.worklink.preserved import preserve_retained_attempt
+
+    home, operator, _forge, _checkout, _base = rig
+    attempt_dir = tmp_path / "attempts" / "9-2"
+    intake = attempt_dir.joinpath(*layout)
+    intake.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", "-q", str(operator), str(intake)], check=True)
+    sandbox = intake / ".factory-sandboxes" / "chainlink-9"
+    subprocess.run(["git", "clone", "-q", str(operator), str(sandbox)], check=True)
+    _git(sandbox, "checkout", "-q", "-b", "feature/chainlink-9")
+    # Only the sandbox changed: the factory's implementation lives there.
+    (sandbox / "factory_work.py").write_text("DONE = True\n")
+    record = SimpleNamespace(sandbox=str(sandbox), branch="feature/chainlink-9")
+    stranger = SimpleNamespace(sandbox=str(tmp_path / "attempts" / "9-1" / "checkout"
+                                           / ".factory-sandboxes" / "chainlink-9"), branch="x")
+    preserved = preserve_retained_attempt(
+        home=home, trusted_repo=operator, attempt_dir=attempt_dir,
+        factory_records=(stranger, record), default_base="main", runner=_run,
+        reason_if_unknown="interrupted",
+    )
+    assert preserved is not None and preserved.error is None
+    assert "factory_work.py" in preserved.files
+    assert "factory_work.py" in _git(operator, "show", "--stat", "refs/worklink/9/2")

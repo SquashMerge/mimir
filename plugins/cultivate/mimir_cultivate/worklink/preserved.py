@@ -262,6 +262,21 @@ def attempt_numbers(name: str) -> tuple[int, int] | None:
     return int(left), int(right)
 
 
+def _factory_sandbox_of(attempt_dir: Path, sandbox: Any) -> bool:
+    """Whether ``sandbox`` is this attempt's factory sandbox, in either layout.
+
+    A worker checkout nests the factory's sandboxes in ``<attempt>/checkout``;
+    a controller checkout is the attempt directory itself. The implementation
+    lives in the sandbox, so matching neither would snapshot the intake
+    checkout and lose the factory's work.
+    """
+    try:
+        relative = Path(sandbox).resolve().relative_to(attempt_dir.resolve())
+    except (TypeError, ValueError, OSError):
+        return False
+    return relative.parts[:-1] in ((".factory-sandboxes",), ("checkout", ".factory-sandboxes"))
+
+
 def preserve_retained_attempt(
     *,
     home: Path,
@@ -293,7 +308,7 @@ def preserve_retained_attempt(
     if evidence.get("pr_url"):
         return None  # Published attempts keep today's behaviour.
     matching = [record for record in factory_records
-                if Path(record.sandbox).parent.parent.parent.resolve() == attempt_dir.resolve()]
+                if _factory_sandbox_of(attempt_dir, record.sandbox)]
     if matching:
         checkout, branch = Path(matching[0].sandbox), matching[0].branch
     else:
