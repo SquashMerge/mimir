@@ -109,6 +109,9 @@ class RepoReviewState:
     """Immutable PR authority plus typed checkout-lease and execution evidence."""
 
     action_scope: RepoPRActionScope
+    checkout_recovery_notices: list[dict[str, str]] = field(
+        default_factory=list, init=False, repr=False, compare=False,
+    )
     checked_out: bool = field(default=False, init=False, compare=False)
     checkout_lease: object = field(default=None, init=False, repr=False, compare=False)
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
@@ -795,7 +798,7 @@ _DESCRIPTORS = MappingProxyType({
     "pr_job_log": _D(result_origin=_E | _R),
     "pr_list": _D(result_origin=_E | _R),
     "pr_metadata": _D(result_origin=_E | _R),
-    "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
+    "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "pr_review_requests": _D(result_origin=_E | _R),
     "pr_reviews": _D(result_origin=_E | _R),
     "pr_spec": _D(result_origin=_R),
@@ -853,7 +856,7 @@ _RESULT_DOMAIN = MappingProxyType({
     "tracker_status": TRACKER_TOOL_NAMES,
     "repository": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
         pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
-        pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment
+        pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review
         repo_checkout repo_fetch repo_status repo_test repo_diff repo_file_at_revision repo_unmerged repo_commit
         repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"""),
 })

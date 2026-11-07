@@ -811,7 +811,7 @@ def test_cultivate_forge_read_provenance_fails_closed_without_binding(
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_non_repository_forge_result_cannot_use_pr_read_classification(tmp_path: Path) -> None:
+def test_rerequest_write_requires_published_repository_provenance(tmp_path: Path) -> None:
     from mimir.plugins.core import selected_policy_registry
 
     auth, scope, _lease, _, _ = _real_attested_lease(tmp_path)
@@ -823,15 +823,22 @@ def test_non_repository_forge_result_cannot_use_pr_read_classification(tmp_path:
         authorized_principals=frozenset({principal}), source_kind="protected_tool",
         integrity="trusted", integrity_effect="active_ingest",
     )
-    labels = classify_protected_result(
-        "pr_rerequest_review", {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
-        auth, ToolAuthorization(
-            tool_name="pr_rerequest_review", decision="resource_scoped", allowed=True,
-            repo_pr_action_scope=scope, policy=selected_policy_registry(),
-        ), result={"ok": True}, provenance=ProtectedResultProvenance((source,)),
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    decision = ToolAuthorization(
+        tool_name="pr_rerequest_review", decision="resource_scoped", allowed=True,
+        repo_pr_action_scope=scope, policy=selected_policy_registry(),
     )
-    assert labels.has_untrusted_active_ingest
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:pr_rerequest_review>"
+    labels = classify_protected_result(
+        "pr_rerequest_review", args, auth, decision, result={"ok": True},
+        provenance=ProtectedResultProvenance((source,)),
+    )
+    assert not labels.has_untrusted_active_ingest
+    assert labels.sources[0].resource_id == source.resource_id
+    missing = classify_protected_result(
+        "pr_rerequest_review", args, auth, decision, result={"ok": True},
+    )
+    assert missing.has_untrusted_active_ingest
+    assert missing.sources[0].resource_id == source.resource_id
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
@@ -1915,7 +1922,9 @@ def test_non_author_content_repository_results_remain_untrusted(
     ("verdict", "mismatch"),
     [(True, None), (False, None), (None, None),
      (True, "number"), (True, "head_sha"), (True, "verified_own_push"),
-     (True, "author"), (True, "missing_author"), (True, "no_attestation")],
+     (True, "author"), (True, "missing_author"), (True, "no_attestation"),
+     (True, "same_repo"), (True, "same_repo_missing_author"),
+     (True, "same_repo_verified_own_push")],
 )
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_checkout_records_native_author_trust_for_file_reads(
@@ -1927,8 +1936,15 @@ def test_checkout_records_native_author_trust_for_file_reads(
     from mimir_cultivate.forge import PullRequestProjection
     from mimir_cultivate import forge, repository as repo
 
+    same_repo = mismatch is not None and mismatch.startswith("same_repo")
+    if same_repo:
+        mismatch = {"same_repo": None, "same_repo_missing_author": "missing_author",
+                    "same_repo_verified_own_push": "verified_own_push"}[mismatch]
     author = "" if mismatch == "missing_author" else "collaborator"
     scope = _scope(author=author)
+    if not same_repo:
+        scope = replace(scope, head_repo="external/repo", head_remote="source",
+                        event_type="pr_opened")
     if mismatch == "verified_own_push":
         import uuid
 
@@ -1974,6 +1990,10 @@ def test_checkout_records_native_author_trust_for_file_reads(
 
     client = SimpleNamespace(
         get_pull_request=lambda scope: metadata,
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=metadata.number, head_sha=metadata.head_sha, author=metadata.author,
+            repo=scope.canonical_repo, head_repo=scope.head_repo),
+        get_head_commit_identity=lambda _: (True, "collaborator"),
         get_diff=lambda scope: "diff --git a/src/work.py b/src/work.py",
         author_is_trusted=attest,
     )
@@ -1986,7 +2006,7 @@ def test_checkout_records_native_author_trust_for_file_reads(
     assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is (
         verdict if mismatch is None else None
     )
-    assert calls == ([] if mismatch else [("owner/repo", "collaborator")])
+    assert calls == ([] if mismatch or same_repo else [("owner/repo", "collaborator")])
 
     # The checkout's own tool result carries the same exact-scope provenance
     # as subsequent lease reads, but only after an affirmative native verdict.
@@ -2009,7 +2029,11 @@ def test_checkout_records_native_author_trust_for_file_reads(
             "trusted" if verdict is True and mismatch is None else "untrusted"
         )
     trusted_checkout = verdict is True and mismatch is None
-    assert checkout_labels.sources[0].integrity == ("trusted" if trusted_checkout else "untrusted")
+    # Fork checkout results retain the own-origin-only provenance guard;
+    # same-repository positive controls retain their trusted result labels.
+    assert checkout_labels.sources[0].integrity == (
+        "trusted" if same_repo and trusted_checkout else "untrusted"
+    )
     assert checkout_labels.sources[0].resource_id == (
         f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted_checkout
         else "<unresolved-resource:protected_tool:repo_checkout>"
@@ -2041,7 +2065,7 @@ def test_checkout_records_native_author_trust_for_file_reads(
         return
 
     # Definitive verdicts are shared; unavailable attestations must be retried.
-    if verdict is None:
+    if verdict is None or same_repo:
         monkeypatch.setattr(client, "author_is_trusted", attest)
     token = begin_protected_result_capture()
     try:
@@ -2092,7 +2116,8 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
     from mimir_cultivate import forge, repository as repo
 
     monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", allowlist)
-    scope = _scope(author=author)
+    scope = replace(_scope(author=author), head_repo="external/repo", head_remote="source",
+                    event_type="pr_opened")
     auth = _auth(scope=scope, recorded_verdict=False)
     runtime = SimpleNamespace(context=auth)
     root = tmp_path / "leases"
@@ -2114,6 +2139,10 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
     # No collaborator adapter: the mixed-case bot path must still attest.
     monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(
         get_pull_request=lambda _: metadata,
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=metadata.number, head_sha=metadata.head_sha, author=metadata.author,
+            repo=scope.canonical_repo, head_repo=scope.head_repo),
+        get_head_commit_identity=lambda _: (True, author),
     ))
     token = begin_protected_result_capture()
     try:
@@ -2128,7 +2157,8 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
     if provenance is not None and provenance.sources:
         assert provenance.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
         assert (provenance.sources[0].integrity == "trusted") is trusted
-    assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is trusted
+    assert labels.sources[0].integrity == "untrusted"
     assert labels.sources[0].resource_id == (
         f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted
         else "<unresolved-resource:protected_tool:repo_checkout>"
@@ -2692,6 +2722,9 @@ def test_metadata_failure_after_acquisition_clears_recorded_trust(
     )
     client = SimpleNamespace(
         get_pull_request=lambda scope: metadata,
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=metadata.number, head_sha=metadata.head_sha, author=metadata.author,
+            repo=scope.canonical_repo, head_repo=scope.head_repo),
         get_diff=lambda scope: "diff --git a/src/work.py b/src/work.py",
         author_is_trusted=lambda repository, author: True,
     )
@@ -2703,10 +2736,10 @@ def test_metadata_failure_after_acquisition_clears_recorded_trust(
 
     # Re-acquisition where the metadata fetch raises, as a forge transport
     # failure does. The recorded verdict must not survive it.
-    def failing_metadata(scope):
+    def failing_metadata(*_):
         raise ConnectionError("forge transport failed")
 
-    monkeypatch.setattr(client, "get_pull_request", failing_metadata)
+    monkeypatch.setattr(client, "get_pull_request_identity", failing_metadata)
     with pytest.raises(Exception):
         repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
     assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None

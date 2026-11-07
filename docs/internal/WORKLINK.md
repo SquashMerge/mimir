@@ -1194,14 +1194,46 @@ Current slice-1 recovery is manual:
   Repository, origin, source root, owner, PR, destination, branch, and live-turn
   identity guards still apply. Missing live head objects are fetched and verified
   before ancestry classification; fetch or ancestry errors fail closed. Existing
-  patch-equivalent rebase reuse applies only when recorded and live heads agree,
-  never by comparing against a stale recorded head. Genuinely divergent stale
-  work is preserved in a verified recovery bundle before replacing its checkout.
-- **Stranded rebased PR lease:** do not reset or delete the checkout. Preserve its
-  HEAD as a verified Git bundle under the lease root's `.recovery/` directory
-  (and archive dirty worktree files), then have the operator inspect and publish
-  the recovered commits with an explicit force-with-lease operation. Remove the
-  stranded checkout only after publication is independently verified.
+  divergent history is never resumed: acquisition checks ancestry before renewal
+  or rebinding. Lineage records clean local provenance, not publication; rebase
+  recording is kept so same-turn tools can track agent-created unpublished work.
+- **Stranded rebased PR lease:** acquisition retires it under the lease-root lock
+  using the reaper's tombstone rename and live-path recheck, then creates a fresh
+  lease at the scoped PR head. Only clean work with verbatim per-commit diffs
+  matching published commits may be discarded (whitespace is significant).
+  Stashes, extra local refs, ignored files or unique changes force preservation.
+  Source heads/tags copied by the local clone are exempt when the ref name and
+  object ID match the source, or the same ref name still exists in source and
+  its old tip is reachable from current source refs or published origin history.
+  New ref names and lease-only objects remain protected. Recovery writes a
+  verified incremental bundle (`--all HEAD --reflog --not --remotes=origin`);
+  incremental mode requires a ref tip (including HEAD) outside origin history.
+  When all ref tips are origin-reachable, it writes a full bundle including
+  reflog-only commits instead: those commits alone cannot supply the advertised
+  tip Git requires for an incremental bundle. Recovery also writes a checkout
+  archive including Git metadata but excluding
+  `.git/objects`, a binary patch and a local
+  `refs/worklink-lease/<pr>/<recovery_id>` ref in the source repository. These
+  recovery refs are never pushed. The structured event, warning and checkout
+  result identify the recovery artifacts for operator inspection. Failed
+  preservation leaves the checkout untouched; active checkouts cannot be retired.
+  Force-push approval remains explicit and turn-scoped; a fresh lease does not
+  inherit any discarded lease's grants.
+- **Recovery storage and manual cleanup:** `.recovery/` is not automatically
+  pruned: unpublished work must not age out silently. Operators should monitor
+  its disk usage, inspect each notice and recover or intentionally discard that
+  work, then remove the matching bundle, `.checkout.tar.gz`, patch and any older
+  `.worktree.tar.gz`, plus its source `refs/worklink-lease/<pr>/<recovery_id>` ref.
+  Do not remove a recovery set until its work is independently verified as saved
+  or intentionally abandoned. Incremental bundles require published origin
+  prerequisites. To restore, extract the archive into a private directory and
+  clone the recorded origin into a separate bare repository. Run `git bundle
+  verify <bundle>` and `git bundle unbundle <bundle>` inside that bare repository,
+  then copy its `objects/` into the extracted `.git/objects`. Import into the
+  intact bare repository first: restored refs cannot negotiate a fetch or verify
+  prerequisite reachability until their missing local objects are imported.
+  If origin no longer has a prerequisite, retain the recovery set and obtain it
+  from the source repository or backup before continuing.
 - **Parked factory epic:** when factory ownership is the cause, run the factory's
   `amend-paths` recovery first, then relaunch the epic normally. The factory
   amends paths in-band on a running run, so this recovery is needed only

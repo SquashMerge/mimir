@@ -338,10 +338,15 @@ def build_turn_prompt(
             "an operator alert. No checkout lease was acquired.",
         )
     for refusal in prechecked_pr_refusals:
+        from .access_control import LeaseAttestationReason
+
+        reason = LeaseAttestationReason(refusal["reason"])
+        if reason is LeaseAttestationReason.OK:
+            raise ValueError("invalid attestation refusal")
         _add_labeled(
             "Current PR remediation",
             f"The framework could not attest the checkout for {refusal['repository']} "
-            f"PR #{refusal['pull_request']} (reason: {refusal['reason']}). "
+            f"PR #{refusal['pull_request']} (reason: {reason.value}). "
             "No checkout lease was acquired. You may comment on the PR or escalate, "
             "but you cannot read or write PR content this turn.",
         )

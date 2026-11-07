@@ -6,6 +6,7 @@ from __future__ import annotations
 # Repository inventory
 import re
 import os
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -757,6 +758,7 @@ def _report_retained_candidates(
     event_type: str,
     scope: RepoPRActionScope,
     candidates: Sequence[tuple[Path, str]],
+    **details: object,
 ) -> None:
     """Best-effort structured evidence for retained work and reconciliation refusals."""
     try:
@@ -770,6 +772,7 @@ def _report_retained_candidates(
             candidates=[
                 {"commit": head, "path": str(path)} for path, head in candidates
             ],
+            **details,
         )
     except Exception:  # noqa: BLE001 - evidence failure must not change lease safety
         pass
@@ -1371,23 +1374,21 @@ def _recover_pr_checkout_lease_unlocked(
             f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
             f"fetched head is {remote_head}"
         )
-    if attest_resume is not None:
-        if not lease.is_active:
-            raise LeaseAttestationRefusal("inactive_lease", existing=True)
-        if review_state is not None:
-            review_state.attach_checkout_lease(lease)
-            review_state.record_git_head(scope.scope_id, head)
-        # Refusals must leave the recorded expiry and recovery identity intact.
-        try:
-            attest_resume(lease)
-        except BaseException:
-            if review_state is not None:
-                review_state.revoke_checkout_lease(lease)
-            raise
+    ancestry = runner([
+        "git", "-C", str(path), "merge-base", "--is-ancestor", remote_head, head,
+    ])
+    if ancestry.returncode == 1 and attest_resume is not None:
+        raise LeaseAttestationRefusal("ancestry_failure", existing=True)
+    if ancestry.returncode != 0:
+        raise RuntimeError("divergent PR checkout lease cannot be renewed")
+    # Attest a renewed in-memory candidate, including expired but valid work.
+    # Nothing on disk changes until the callback accepts the candidate.
+    prior = lease
     lease = replace(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
     )
+    _attest_resume_candidate(lease, scope, head, review_state, attest_resume, prior=prior)
     (path / _METADATA).write_text(
         json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
     )
@@ -1547,8 +1548,10 @@ def _unexplained_publication_paths(
     return tuple(unexplained)
 
 
-def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -> Path:
-    """Atomically preserve the complete history reachable from a lease HEAD."""
+def _preserve_checkout_head(
+    lease: PRCheckoutLease, head: str, runner: Runner, *, incremental: bool = False,
+) -> Path:
+    """Preserve local history; divergent recovery can reuse origin prerequisites."""
     recovery_root = lease.lease_root / _RECOVERY_DIRECTORY
     if recovery_root.is_symlink():
         raise RuntimeError("PR checkout lease recovery directory may not be a symlink")
@@ -1557,7 +1560,7 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
     if recovery_root.parent != lease.lease_root.resolve(strict=True):
         raise RuntimeError("PR checkout lease recovery directory escapes its lease root")
     bundle = recovery_root / f"{lease.path.name}-{lease.recovery_id}.bundle"
-    if bundle.exists():
+    if bundle.exists() and not incremental:
         verified = runner([
             "git", "-C", str(lease.path), "bundle", "verify", str(bundle),
         ])
@@ -1568,14 +1571,34 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
             ["git", "-C", str(lease.path), "bundle", "list-heads", str(bundle)],
             "existing PR checkout lease recovery bundle has no heads",
         )
-        if head not in {line.split()[0].lower() for line in heads.splitlines() if line}:
+        retained_heads = {tuple(line.split()) for line in heads.splitlines() if line}
+        if (head, "HEAD") not in retained_heads:
             raise RuntimeError("existing PR checkout lease recovery bundle has another HEAD")
+        refs = _run(runner, [
+            "git", "-C", str(lease.path), "for-each-ref", "--format=%(objectname) %(refname)",
+        ], "PR checkout lease recovery refs inspection failed")
+        if not {tuple(line.split()) for line in refs.splitlines() if line} <= retained_heads:
+            raise RuntimeError("existing PR checkout lease recovery bundle lacks current refs")
         return bundle
+    # Git needs a non-excluded ref tip to advertise an incremental bundle.
+    # Reflog-only commits contribute pack objects, but cannot provide that tip.
+    # Probe refs plus HEAD without reflogs; if all tips are origin-reachable,
+    # use a full bundle while still retaining reflog-only objects in its pack.
+    bundle_revisions = ["--all", "HEAD"]
+    if incremental:
+        bundle_revisions.append("--reflog")
+        unpublished = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", "--all", "HEAD", "--not", "--remotes=origin", "--",
+        ], "PR checkout lease recovery revision inspection failed")
+        if unpublished:
+            bundle_revisions.extend(["--not", "--remotes=origin"])
     staging = recovery_root / f".{bundle.name}.{uuid.uuid4().hex}.tmp"
     try:
         _run(
             runner,
-            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "HEAD"],
+            ["git", "-C", str(lease.path), "bundle", "create", str(staging),
+             *bundle_revisions],
             "PR checkout lease recovery bundle creation failed",
         )
         _run(
@@ -1591,10 +1614,14 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
     return bundle
 
 
-def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
-    """Atomically archive dirty tracked and untracked files without changing them."""
-    archive = bundle.with_suffix(".worktree.tar.gz")
-    if archive.exists():
+def _preserve_dirty_worktree(
+    lease: PRCheckoutLease, bundle: Path, *, include_git: bool = False,
+) -> Path:
+    """Archive worktree state, optionally including local refs and stash reflogs."""
+    archive = bundle.with_suffix(".checkout.tar.gz" if include_git else ".worktree.tar.gz")
+    # A prior failed retirement may have left a snapshot behind. Refresh the
+    # complete checkout atomically rather than deleting later work with it stale.
+    if archive.exists() and not include_git:
         if not archive.is_file() or archive.stat().st_size == 0:
             raise RuntimeError("existing dirty-worktree recovery archive is invalid")
         with tarfile.open(archive, "r:gz") as retained:
@@ -1605,9 +1632,15 @@ def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
     staging = archive.with_name(f".{archive.name}.{uuid.uuid4().hex}.tmp")
     try:
         with tarfile.open(staging, "w:gz") as retained:
+            def metadata_without_objects(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+                if info.name == "worktree/.git/objects" or info.name.startswith("worktree/.git/objects/"):
+                    return None
+                return info
+
             for entry in lease.path.iterdir():
-                if entry.name != ".git":
-                    retained.add(entry, arcname=str(Path("worktree") / entry.name))
+                if include_git or entry.name != ".git":
+                    retained.add(entry, arcname=str(Path("worktree") / entry.name),
+                                 filter=metadata_without_objects)
         with tarfile.open(staging, "r:gz") as retained:
             if not retained.getmembers():
                 raise RuntimeError("dirty-worktree recovery archive is empty")
@@ -1964,7 +1997,38 @@ def _foreign_candidate_head(
             (ancestor.stderr or ancestor.stdout).strip()
             or "PR checkout lease candidate ancestry inspection failed"
         )
+    # A matching published anchor is enough to inspect a divergent candidate;
+    # it is NOT sufficient to renew or attest it. Acquisition classifies its
+    # patches and retires it before any rebind.
+    if published.returncode == 0 and published.stdout.strip().lower() == observed_head:
+        return head, True
     return head, False
+
+
+def _attest_resume_candidate(
+    lease: PRCheckoutLease,
+    scope: RepoPRActionScope,
+    head: str,
+    review_state: RepoReviewState | None,
+    attest_resume: Callable[[PRCheckoutLease], None] | None,
+    *, prior: PRCheckoutLease,
+) -> None:
+    """Attach tentative authority only while verifying, and revoke on failure."""
+    if attest_resume is None:
+        return
+    if review_state is not None:
+        review_state.attach_checkout_lease(lease)
+        review_state.record_git_head(scope.scope_id, head)
+    try:
+        from mimir.access_control import pr_checkout_resume_metadata
+
+        with pr_checkout_resume_metadata(lease, prior):
+            attest_resume(lease)
+    except BaseException:
+        lease.revoke()
+        if review_state is not None:
+            review_state.revoke_checkout_lease(lease)
+        raise
 
 
 def _rebind_foreign_candidate(
@@ -1975,6 +2039,7 @@ def _rebind_foreign_candidate(
     ttl: timedelta,
     review_state: RepoReviewState | None,
     runner: Runner,
+    attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Move a proven same-PR lease onto the current immutable turn scope."""
     _run(
@@ -2020,6 +2085,13 @@ def _rebind_foreign_candidate(
         "retained PR checkout has no HEAD",
     ).lower() != head:
         raise RuntimeError("retained PR checkout HEAD changed during lease recovery")
+    ancestry = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", remote_head, head,
+    ])
+    if ancestry.returncode == 1 and attest_resume is not None:
+        raise LeaseAttestationRefusal("ancestry_failure", existing=True)
+    if ancestry.returncode != 0:
+        raise RuntimeError("divergent PR checkout lease cannot be rebound")
 
     rebound = replace(
         lease,
@@ -2034,6 +2106,7 @@ def _rebind_foreign_candidate(
         lineage=lease.lineage,
         verified_base_sha=actual_base,
     )
+    _attest_resume_candidate(rebound, scope, head, review_state, attest_resume, prior=lease)
     metadata_path = lease.path / _METADATA
     staging = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -2049,6 +2122,200 @@ def _rebind_foreign_candidate(
     return rebound
 
 
+def _discard_divergent_candidate(
+    lease: PRCheckoutLease, scope: RepoPRActionScope, *, runner: Runner,
+    notices: list[dict[str, str]] | None = None,
+) -> bool:
+    """Retire a divergent checkout, retaining anything not proven redundant."""
+    from .scheduler import active_pr_checkout_lease_paths
+
+    def active() -> set[Path]:
+        return {path.resolve(strict=False) for path in active_pr_checkout_lease_paths()}
+
+    head = _run(
+        runner, ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+        "retained PR checkout has no HEAD",
+    ).lower()
+    scoped = scope.observed_head_sha.lower()
+    ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", scoped, head,
+    ])
+    if ancestor.returncode == 0:
+        return False
+    if ancestor.returncode != 1:
+        raise RuntimeError("PR checkout lease ancestry inspection failed")
+    if lease.path.resolve(strict=False) in active():
+        raise RuntimeError("live PR checkout lease cannot be retired")
+    origin = _run(runner, [
+        "git", "-C", str(lease.path), "config", "--get", "remote.origin.url",
+    ], "retained PR checkout has no origin")
+    branch = _run(runner, [
+        "git", "-C", str(lease.path), "symbolic-ref", "--quiet", "--short", "HEAD",
+    ], "retained PR checkout has no branch")
+    if (origin != scope.canonical_origin or lease.canonical_origin != origin
+            or branch != scope.head_ref or lease.destination_ref != scope.destination_ref):
+        raise RuntimeError("divergent PR checkout lease identity mismatch")
+    _assert_self_contained_checkout(lease.path, runner=runner)
+    _run(runner, [
+        "git", "-C", str(lease.path), "fetch", "--no-tags", "origin",
+        scope.checkout_ref or scope.destination_ref,
+    ], "PR head fetch failed during divergent lease inspection")
+    remote_head = _run(runner, [
+        "git", "-C", str(lease.path), "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+    ], "PR head missing during divergent lease inspection").lower()
+    if remote_head != scoped:
+        raise RuntimeError("PR head advanced during divergent lease inspection")
+    status = _run(runner, [
+        "git", "-C", str(lease.path), "status", "--porcelain=v1",
+        "--untracked-files=all", "--ignored",
+    ], "retained PR checkout status inspection failed")
+    refs = _run(runner, [
+        "git", "-C", str(lease.path), "for-each-ref", "--format=%(objectname) %(refname)",
+    ], "retained PR checkout refs inspection failed").splitlines()
+    # A local clone inherits source heads/tags. Exact pairs are redundant;
+    # after the source advances, an inherited tip is also redundant if it is
+    # reachable from current source refs or published origin history. New ref
+    # names and lease-only objects remain protected.
+    source_refs = set(_run(runner, [
+        "git", "-C", str(lease.source_root), "for-each-ref",
+        "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/",
+    ], "source checkout refs inspection failed").splitlines())
+    source_names = {entry.split()[1] for entry in source_refs}
+
+    def redundant_ref(entry: str) -> bool:
+        object_id, ref = entry.split()
+        if (ref == scope.destination_ref or ref == PUBLISHED_HEAD_REF
+                or ref.startswith("refs/remotes/origin/") or entry in source_refs):
+            return True
+        if ref not in source_names:
+            return False
+        origin_only = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", object_id, "--not", "--remotes=origin", "--",
+        ], "inherited checkout ref origin inspection failed")
+        if not origin_only:
+            return True
+        exists = runner([
+            "git", "-C", str(lease.source_root), "cat-file", "-e", f"{object_id}^{{commit}}",
+        ])
+        if exists.returncode != 0:
+            return False  # Missing/uncertain source objects cannot justify discard.
+        source_only = _run(runner, [
+            "git", "-C", str(lease.source_root), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", object_id, "--not", "--branches", "--tags", "--remotes=origin", "--",
+        ], "inherited checkout ref source inspection failed")
+        return not source_only
+
+    extra_refs = [entry for entry in refs if not redundant_ref(entry)]
+    base = lease.base_sha.lower()
+    # A lease created before the scoped base advanced may have been rebased
+    # without updating its metadata. Exclude only a scoped, verified base that
+    # is itself an ancestor of the checkout; never infer one from the checkout.
+    scoped_base = scope.observed_base_sha.lower()
+    for older, newer in ((base, scoped_base), (scoped_base, head)):
+        precondition = runner([
+            "git", "-C", str(lease.path), "merge-base", "--is-ancestor", older, newer,
+        ])
+        if precondition.returncode not in {0, 1}:
+            raise RuntimeError("PR checkout lease base substitution inspection failed")
+        if precondition.returncode == 1:
+            break
+    else:
+        base = scoped_base
+    base_ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", base, head,
+    ])
+    equivalent = False
+    if base_ancestor.returncode == 0 and not status and not extra_refs:
+        # Compare verbatim diffs, not git cherry/patch-id (which erase whitespace).
+        # Context changes may conservatively preserve an otherwise redundant replay.
+        commits = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--max-count=501",
+            head, "--not", scoped, base, "--",
+        ], "retained PR checkout commit inspection failed").splitlines()
+        published = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--max-count=501",
+            scoped, "--not", base, "--",
+        ], "published PR commit inspection failed").splitlines()
+
+        def verbatim(commit: str) -> str | None:
+            parents = _run(runner, [
+                "git", "-C", str(lease.path), "rev-list", "--parents", "-n", "1", commit,
+            ], "retained PR commit parent inspection failed").split()
+            if len(parents) != 2:
+                return None  # Never discard merge resolutions or root commits.
+            result = runner([
+                "git", "-C", str(lease.path), "diff-tree", "--no-commit-id", "-r",
+                "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff",
+                "--no-textconv", "--no-color", parents[1], commit, "--",
+            ])
+            if result.returncode != 0:
+                raise RuntimeError("retained PR checkout verbatim diff inspection failed")
+            return result.stdout  # Do not strip any patch bytes.
+
+        if len(commits) <= 500 and len(published) <= 500:
+            patches = {patch for commit in published if (patch := verbatim(commit))}
+            equivalent = all(
+                (patch := verbatim(commit)) is not None and patch in patches
+                for commit in commits
+            )
+    elif base_ancestor.returncode not in {0, 1}:
+        raise RuntimeError("PR checkout lease base ancestry inspection failed")
+
+    if equivalent:
+        _report_retained_candidates(
+            "pr_checkout_lease_discarded_equivalent", scope, [(lease.path, head)],
+        )
+    else:
+        # Refresh incremental recovery on retries rather than reusing a stale
+        # snapshot. Published origin objects are prerequisites, not duplicated
+        # in both a full bundle and a checkout archive.
+        bundle = _preserve_checkout_head(lease, head, runner, incremental=True)
+        # Include Git metadata, index and ignored files, but not .git/objects.
+        # Restore published prerequisites from origin before importing the bundle.
+        archive = _preserve_dirty_worktree(lease, bundle, include_git=True)
+        patch = bundle.with_suffix(".patch")
+        # A binary tree diff retains merge resolutions too; the bundle is the
+        # authoritative history and the patch is for operator inspection.
+        diff = _run(runner, [
+            "git", "-C", str(lease.path), "diff", "--binary", base, head, "--",
+        ], "retained PR checkout patch creation failed")
+        staging = patch.with_name(f".{patch.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            staging.write_text(diff + "\n", encoding="utf-8")
+            os.replace(staging, patch)
+        finally:
+            staging.unlink(missing_ok=True)
+        ref = f"refs/worklink-lease/{scope.pr_number}/{lease.recovery_id}"
+        _run(runner, [
+            "git", "-C", str(lease.source_root), "fetch", "--no-tags",
+            str(lease.path), f"{head}:{ref}",
+        ], "retained PR checkout recovery ref creation failed")
+        if _run(runner, [
+            "git", "-C", str(lease.source_root), "rev-parse", "--verify", ref,
+        ], "retained PR checkout recovery ref verification failed").lower() != head:
+            raise RuntimeError("retained PR checkout recovery ref differs from HEAD")
+        notice = {
+            "head": head, "ref": ref, "source_root": str(lease.source_root),
+            "patch": str(patch), "bundle": str(bundle), "archive": str(archive),
+        }
+        _report_retained_candidates(
+            "pr_checkout_lease_preserved_divergent", scope, [(patch, head)], **notice,
+        )
+        logging.getLogger(__name__).warning(
+            "Divergent PR checkout preserved: %s at %s; patch %s; bundle %s; archive %s",
+            ref, lease.source_root, patch, bundle, archive,
+        )
+        if notices is not None:
+            notices.append(notice)
+    try:
+        _reclaim_tombstone(lease, active, lambda _step: None)
+    except _LeaseBecameActive as exc:
+        raise RuntimeError("live PR checkout lease cannot be retired") from exc
+    lease.revoke()
+    return True
+
+
 def acquire_pr_checkout_lease(
     scope: RepoPRActionScope,
     *,
@@ -2059,7 +2326,7 @@ def acquire_pr_checkout_lease(
     runner: Runner = _default_runner,
     attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> tuple[PRCheckoutLease, tuple[str, ...]]:
-    """Resume the sole exact-scope lease, refusing divergent retained fixes."""
+    """Resume an ancestral lease or replace divergent work after recovery."""
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
         raise RuntimeError("scope does not grant PR checkout")
     if owner != scope.principal:
@@ -2240,6 +2507,16 @@ def acquire_pr_checkout_lease(
                 else:
                     foreign_candidates.append((lease.path, head))
 
+        # Classify before _recover or _rebind writes a new expiry. A checkout
+        # on a different base cannot attest even if its recorded lineage is clean.
+        for path, _head in tuple(candidates):
+            existing = _lease_from_recorded_metadata(path, root)
+            if _discard_divergent_candidate(
+                existing, scope, runner=runner,
+                notices=review_state.checkout_recovery_notices if review_state else None,
+            ):
+                candidates = [(p, h) for p, h in candidates if p != path]
+                rebound_candidates.pop(path, None)
         unpublished = [
             (path, head) for path, head in candidates
             if head != scope.observed_head_sha.lower()
@@ -2278,6 +2555,7 @@ def acquire_pr_checkout_lease(
                     ttl=ttl,
                     review_state=review_state,
                     runner=runner,
+                    attest_resume=attest_resume,
                 )
             else:
                 lease = _recover_pr_checkout_lease_unlocked(
@@ -3733,7 +4011,8 @@ class RepoGitTools:
                     "force_push_refused",
                     "push would not be a fast-forward; use repo_merge to merge the base "
                     "and scoped published PR head, resolve any conflicts, then repo_push; "
-                    "retained work can also be resumed by a later turn for this PR",
+                    "a later checkout replaces divergent history: proven byte-equivalent work "
+                    "is discarded; other work is preserved for operator recovery, not resumed",
                 )
             try:
                 push_remote, auth_env, sensitive_values = self._push_remote()
@@ -5332,7 +5611,10 @@ class LeaseAttestationRefusal(ToolPolicyRefusal):
     def __init__(self, reason: str, *, existing: bool = False) -> None:
         from mimir.access_control import LeaseAttestationReason
 
-        self.reason = LeaseAttestationReason(reason).value
+        code = LeaseAttestationReason(reason)
+        if code is LeaseAttestationReason.OK:
+            raise ValueError("invalid attestation refusal")
+        self.reason = code.value
         detail = "existing lease attestation refused" if existing else "lease attestation refused"
         super().__init__(f"repository checkout rejected: {detail} ({self.reason})")
 
@@ -5342,7 +5624,7 @@ def checkout_scoped_pr(
     runtime: ToolRuntime[AuthContext],
 ) -> dict[str, Any]:
     """Shared checkout implementation for the host and the callable tool."""
-    from .forge import _call, _client, _pr_content_authors, remediation_checkout_preflight
+    from .forge import _client, pr_trust_verdict, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
     state, stopped = remediation_checkout_preflight(context, repository, pull_request)
@@ -5369,10 +5651,14 @@ def checkout_scoped_pr(
 
         attestation = pr_checkout_lease_attestation(context, scope, existing)
         if not attestation.ok:
+            from mimir.access_control import log_pr_checkout_lease_attestation_refused
+
             refusal = LeaseAttestationRefusal(attestation.reason, existing=True)
+            log_pr_checkout_lease_attestation_refused(context, scope, refusal.reason)
+            context.ifc_state.framework_pr_checkouts.pop(scope.scope_id, None)
+            existing.revoke()
+            state.revoke_checkout_lease(existing)
             if getattr(runtime, "pre_turn_checkout", False):
-                context.ifc_state.framework_pr_checkouts.pop(scope.scope_id, None)
-                state.revoke_checkout_lease(existing)
                 return {"status": "attestation_refused", "reason": refusal.reason}
             raise refusal
         _publish_attested_lease_result(runtime, state)
@@ -5380,6 +5666,8 @@ def checkout_scoped_pr(
             "status": "resumed", "path": str(existing.path), "scope_id": existing.scope_id,
             "head_sha": existing.head_sha,
             "candidate_commits": framework[1],
+            **({"preserved_prior_work": state.checkout_recovery_notices}
+               if state.checkout_recovery_notices else {}),
         }
     author_resolved = False
 
@@ -5392,26 +5680,17 @@ def checkout_scoped_pr(
         context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
         context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
         client = _client(scope)
-        from .forge import _BOT_LOGIN, _author_verdict
+        from mimir.pollers import _github_author_trust_cause, github_author_trust_cause
 
-        if callable(getattr(client, "author_is_trusted", None)) or (
-            isinstance(scope.pull_request_author, str) and _BOT_LOGIN.fullmatch(scope.pull_request_author)
-        ):
-            authors, _ = _call(lambda: _pr_content_authors(client, scope))
-            if authors == (scope.pull_request_author,) and scope.pull_request_author:
-                from mimir.pollers import _github_author_trust_cause
-
-                _github_author_trust_cause.set(None)
-                verdict = _author_verdict(context, scope, scope.pull_request_author, client)
-                context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
-                if verdict is None:
-                    from mimir.pollers import github_author_trust_cause
-
-                    context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
-                        github_author_trust_cause() or "author_unresolved"
-                    )
-                else:
-                    context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
+        _github_author_trust_cause.set(None)
+        verdict = pr_trust_verdict(context, scope, client)
+        context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+        if verdict is None:
+            context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
+                github_author_trust_cause() or "author_unresolved"
+            )
+        else:
+            context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
 
     def attest_resume(lease: PRCheckoutLease) -> None:
         from mimir.access_control import pr_checkout_lease_attestation
@@ -5425,9 +5704,13 @@ def checkout_scoped_pr(
         lease, candidates = acquire_pr_checkout_lease(
             state.action_scope, owner=state.action_scope.principal,
             review_state=state,
-            attest_resume=attest_resume if getattr(runtime, "pre_turn_checkout", False) else None,
+            # Tool and framework resumes share the no-renewal-on-refusal rule.
+            attest_resume=attest_resume,
         )
     except LeaseAttestationRefusal as exc:
+        from mimir.access_control import log_pr_checkout_lease_attestation_refused
+
+        log_pr_checkout_lease_attestation_refused(context, scope, exc.reason)
         attached = state.checkout_lease
         if attached is not None:
             state.revoke_checkout_lease(attached)
@@ -5446,6 +5729,7 @@ def checkout_scoped_pr(
         "scope_id": lease.scope_id,
         "head_sha": lease.head_sha,
         "candidate_commits": candidates,
+        "preserved_prior_work": state.checkout_recovery_notices,
     }
 
 

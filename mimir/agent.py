@@ -2719,6 +2719,16 @@ class Agent:
                             discovered.resolve(scope.canonical_repo, scope.pr_number)
                             if discovered is not None else None
                         ) or state
+                        if refused_state is not state:
+                            # Reserve the reminted grant even on refusal. Otherwise
+                            # later tool authorization can issue it all over again.
+                            grants.issue(refused_state.action_scope)
+                            consume_scoped_pr_checkout(
+                                auth_ctx, refused_state.action_scope, refused_state.action_scope.owner,
+                            )
+                        from .access_control import log_pr_checkout_lease_attestation_refused
+
+                        log_pr_checkout_lease_attestation_refused(auth_ctx, refused_state.action_scope, reason.value)
                         if refused_state.checkout_lease is not None:
                             refused_state.revoke_checkout_lease(refused_state.checkout_lease)
                         ctx.prechecked_pr_refusals.append({
@@ -2754,6 +2764,11 @@ class Agent:
                     attestation = pr_checkout_lease_attestation(auth_ctx, scope, live)
                     if not attestation.ok:
                         reason = LeaseAttestationReason(attestation.reason)
+                        if reason is LeaseAttestationReason.OK:
+                            raise RuntimeError("repository checkout rejected: invalid attestation refusal")
+                        from .access_control import log_pr_checkout_lease_attestation_refused
+
+                        log_pr_checkout_lease_attestation_refused(auth_ctx, scope, reason.value)
                         if state.checkout_lease is not None:
                             state.revoke_checkout_lease(state.checkout_lease)
                         ctx.prechecked_pr_refusals.append({
@@ -3828,8 +3843,14 @@ class Agent:
         # A completed no-work checkout refusal does not spend the poller's
         # remediation budget. Unrelated model failures retain their disposition.
         refusal_is_exempt = bool(
-            (hard_refusals or (checkout_refusals and not outcome_is_error))
-            and not remediation_effects
+            (hard_refusals and not remediation_effects
+             and (not checkout_refusals or not outcome_is_error))
+            or (
+                checkout_refusals and not outcome_is_error
+                and not any(effect not in {
+                    "pr_comment", "unsupported_operation", "operator_alert",
+                } for effect in remediation_effects)
+            )
         )
         hard_refusals.extend(checkout_refusals)
         outcome_fields = {

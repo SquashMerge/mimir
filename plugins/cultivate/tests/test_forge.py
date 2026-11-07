@@ -161,6 +161,57 @@ def test_forge_surface_has_all_scoped_tools() -> None:
     assert all(callable(item.func) and callable(item.coroutine) for item in forge.FORGE_TOOLS)
 
 
+def test_registered_forge_writes_all_publish_provenance() -> None:
+    """Inventory writes from the adapter's HTTP verbs, not a maintained tool list."""
+    tree = ast.parse(Path(forge.__file__).read_text(encoding="utf-8"))
+    adapter = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == "GitHubForgeClient")
+    mutations = set()
+    for node in adapter.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_request"):
+                continue
+            # A variable verb must not silently disappear from this inventory.
+            assert call.args and isinstance(call.args[0], ast.Constant), node.name
+            assert call.args[0].value in {"GET", "POST", "PATCH", "PUT", "DELETE"}, node.name
+            if call.args[0].value != "GET":
+                mutations.add(node.name)
+    assert mutations
+    registered = {item.name for item in forge.FORGE_TOOLS}
+    handlers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    covered = set()
+    for name in registered & handlers.keys():
+        calls = {call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
+                 for call in ast.walk(handlers[name]) if isinstance(call, ast.Call)
+                 and isinstance(call.func, (ast.Attribute, ast.Name))}
+        writes = calls & mutations
+        if writes:
+            covered.update(writes)
+            expected = "_publish_issue_write_projection" if name == "issue_comment" else "_publish_write_projection"
+            assert expected in calls, f"{name} writes via {writes} without attestation"
+            # Require a top-level attestation after every write-containing statement
+            # and before the return, not merely an unreachable/conditional call.
+            statements = handlers[name].body
+            attestations = [index for index, statement in enumerate(statements)
+                            if isinstance(statement, ast.Expr)
+                            and isinstance(statement.value, ast.Call)
+                            and isinstance(statement.value.func, ast.Name)
+                            and statement.value.func.id == expected]
+            write_statements = [index for index, statement in enumerate(statements)
+                                if any(isinstance(call, ast.Call)
+                                       and isinstance(call.func, ast.Attribute)
+                                       and call.func.attr in writes
+                                       for call in ast.walk(statement))]
+            returns = [index for index, statement in enumerate(statements)
+                       if any(isinstance(node, ast.Return) for node in ast.walk(statement))]
+            assert len(attestations) == 1, name
+            assert max(write_statements) < attestations[0] < min(returns), name
+    assert covered == mutations, f"unregistered forge writes: {mutations - covered}"
+
+
 def test_provider_forge_has_no_core_repository_fallback() -> None:
     tree = ast.parse(Path(forge.__file__).read_text(encoding="utf-8"))
     imports = (
@@ -429,9 +480,12 @@ def test_every_plugin_forge_tool_executes_scoped_behavior(
             provenance = access_control.end_protected_result_capture(token)
         if name in {"pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_checks",
                     "pr_job_log", "pr_review_requests", "pr_comment", "pr_edit_body",
-                    "pr_inline_review_comment", "pr_submit_review"}:
+                    "pr_inline_review_comment", "pr_submit_review", "pr_rerequest_review"}:
             assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
             assert provenance.sources[0].integrity == "untrusted"
+        if name == "issue_comment":
+            assert provenance.sources[0].resource_id == "owner/repo#issue/23"
+            assert provenance.sources[0].integrity == "trusted"
         if operation is not None:
             assert operation in [call[0] for call in client.calls]
         if "pull_request" in arguments and name not in {"pr_spec", "unsupported_operation"}:

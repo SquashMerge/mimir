@@ -68,6 +68,9 @@ def _scope_from(event: dict):
         repo=event.get("repo"),
         principal=event.get("pr_author") if event.get("event_type") == "pr_synchronize"
         else event.get("author"),
+        pull_request_author=event.get("pr_author") or event.get("author"),
+        actor=event.get("actor"),
+        author_is_trusted=event.get("author_is_trusted"),
         event_type=event.get("event_type"),
         review_state=event.get("state"),
         pr_author_is_trusted=event.get("pr_author_is_trusted"),

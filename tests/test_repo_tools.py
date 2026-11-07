@@ -733,7 +733,7 @@ def _selected_checkout_and_follow_on_with_live_grants(
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir_cultivate import forge as selected_forge, repository
 
-    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    _, _, scope, state = _repo_scope_and_state(tmp_path, pull_request_author="mimir-bot")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
     selected = load_plugins(enable="cultivate").policy
     labels = InformationFlowLabels()
@@ -751,7 +751,14 @@ def _selected_checkout_and_follow_on_with_live_grants(
         ), enforcement_enabled=True, _plugin_slot_policy=selected,
     )
     monkeypatch.setattr(selected_forge, "remediation_checkout_preflight", lambda *_: (state, None))
-    monkeypatch.setattr(selected_forge, "_client", lambda _: object())
+    monkeypatch.setattr(selected_forge, "_client", lambda _: SimpleNamespace(
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=scope.pr_number, head_sha=scope.observed_head_sha,
+            author=scope.pull_request_author, repo=scope.canonical_repo,
+            head_repo=scope.head_repo,
+        ),
+    ))
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", scope.principal)
     git_operations = []
     if operation != "repo_fetch":
         def execute(_tools, git_operation):
@@ -803,7 +810,9 @@ def _selected_checkout_and_follow_on_with_live_grants(
         )
         assert checked_out.status != "error", checked_out.content
         assert calls == ["repo_checkout"]
-        assert auth.ifc_state.has_untrusted_active_ingest()
+        # Exact canonical-origin tests may attest checkout output; the other
+        # grant tests intentionally leave this fixture's local origin unbound.
+        assert auth.ifc_state.has_untrusted_active_ingest() is git_ok
 
         clean_labels = InformationFlowLabels()
         follow_on = replace(
@@ -895,6 +904,9 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     client = SimpleNamespace(
         author_is_trusted=lambda _repo, author: author in {"collaborator", "reviewer"},
         get_pull_request=lambda _: metadata,
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=metadata.number, head_sha=metadata.head_sha, author=metadata.author,
+            repo=scope.canonical_repo, head_repo=scope.head_repo),
         list_reviews=lambda _: (ReviewProjection("1", "reviewer", "approve", "ok", "now", scope.observed_head_sha),),
         list_comments=lambda _: (CommentProjection("1", "reviewer", "note", "now", "now"),),
     )
@@ -920,7 +932,16 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     for tool in (forge.pr_reviews, forge.pr_comments, forge.pr_metadata, forge.pr_spec, repo.repo_checkout):
         token = access_control.begin_protected_result_capture()
         try:
-            result = tool.func("owner/repo", 7, runtime=runtime)
+            try:
+                result = tool.func("owner/repo", 7, runtime=runtime)
+            except repo.LeaseAttestationRefusal as exc:
+                assert tool is repo.repo_checkout
+                assert case in {"head_mismatch", "git_timeout"}
+                assert exc.reason == ("git_timeout" if case == "git_timeout" else "no_author_trust")
+                assert state.checkout_lease is None
+                assert not auth.ifc_state.framework_pr_checkouts
+                assert auth.ifc_state.has_untrusted_active_ingest()
+                return  # Refused tool resumes never expose checkout content.
         finally:
             provenance = access_control.end_protected_result_capture(token)
         added = access_control.classify_protected_result(
@@ -934,6 +955,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
             else None
         )
         auth.ifc_state.merge(added)
+    assert case in {"collaborator", "outsider"}, "refused resume unexpectedly succeeded"
     # Put fixed attestation reasons first: CI's short summary truncates the
     # integrity map and full event payload before reaching the useful diagnostic.
     refusal_reasons = [
@@ -944,18 +966,20 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         "pr_reviews": "trusted", "pr_comments": "trusted",
         "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
         "pr_spec": "trusted",
-        "repo_checkout": None if case != "collaborator" else "trusted",
+        # A base-repository head is trusted independently of its PR author's
+        # collaborator status; forge content keeps its author attestation.
+        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else None,
     }, f"lease_refusals={refusal_reasons}; observed={observed_provenance}; events={events}"
     assert observed == {
         "pr_reviews": "untrusted", "pr_comments": "untrusted",
         "pr_metadata": "untrusted", "pr_spec": "untrusted",
-        "repo_checkout": "trusted" if case == "collaborator" else "untrusted",
+        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else "untrusted",
     }
     assert auth.ifc_state.has_untrusted_active_ingest()
-    if case in {"collaborator", "git_timeout"}:
+    if case in {"collaborator", "outsider", "git_timeout"}:
         assert status_probes  # The positive/timeout controls reached the real proof boundary.
     assert refusal_reasons == (
-        [] if case == "collaborator" else
+        [] if case in {"collaborator", "outsider"} else
         ["git_timeout"] if case == "git_timeout" else ["no_author_trust"]
     )
     # Read actual lease content before exercising the real edit-file gate.
@@ -967,7 +991,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     )
     auth.ifc_state.merge(read)
     assert read.sources[0].integrity == (
-        "trusted" if case == "collaborator" else "untrusted"
+        "trusted" if case in {"collaborator", "outsider"} else "untrusted"
     )
     decision = access_control.ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=True, target_channel=str(target),
@@ -978,7 +1002,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     assert fallbacks == []
 
 
-@pytest.mark.parametrize("case", ["unavailable", "missing_cause", "false", "true", "author_mismatch"])
+@pytest.mark.parametrize("case", ["unavailable", "missing_cause", "false", "true"])
 def test_checkout_records_fresh_turn_local_author_cause(tmp_path, monkeypatch, case):
     from mimir import pollers
     from mimir_cultivate import forge, repository as repo
@@ -991,22 +1015,18 @@ def test_checkout_records_fresh_turn_local_author_cause(tmp_path, monkeypatch, c
     try:
         monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
         monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *a, **k: (state.checkout_lease, []))
-        monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(author_is_trusted=lambda *_: None))
+        monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace())
         monkeypatch.setattr(repo, "_publish_attested_lease_result", lambda *_: None)
 
-        def authors(*_):
+        def verdict(*_):
             assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None
             assert causes[scope.scope_id] == "author_unresolved"
-            return (("other",) if case == "author_mismatch" else ("owner",)), None
-
-        def verdict(*_):
             assert pollers.github_author_trust_cause() is None
             if case == "unavailable":
                 pollers._github_author_trust_cause.set("collaborator_timeout")
             return {"false": False, "true": True}.get(case)
 
-        monkeypatch.setattr(forge, "_pr_content_authors", authors)
-        monkeypatch.setattr(forge, "_author_verdict", verdict)
+        monkeypatch.setattr(forge, "pr_trust_verdict", verdict)
         repo.repo_checkout.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
         assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is {
             "false": False, "true": True,
@@ -1094,9 +1114,11 @@ def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(
 @pytest.mark.parametrize("lineage", [
     "clean", "tainted", "tainted_flip", "tainted_base", "missing", "unrecorded", "corrupt",
 ])
+@pytest.mark.parametrize("foreign", [False, True])
+@pytest.mark.parametrize("expired", [False, True])
 @pytest.mark.usefixtures("selected_repo_inventory")
 def test_resumed_local_commit_requires_clean_producing_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lineage: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lineage: str, foreign: bool, expired: bool,
 ) -> None:
     from mimir import access_control
     # The local bare remote stands in for the configured GitHub origin.
@@ -1145,23 +1167,46 @@ def test_resumed_local_commit_requires_clean_producing_turn(
             else {head: "trusted"}
         )
         (lease.path / _METADATA).write_text(json.dumps(record))
+    if expired:
+        from datetime import UTC, datetime, timedelta
+
+        metadata = lease.path / _METADATA
+        record = json.loads(metadata.read_text())
+        record["expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        metadata.write_text(json.dumps(record))
     # Turn 1 did not push: a failed/refused test leaves the PR remote pinned.
     assert _git(_origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    if foreign:
+        scope = replace(scope, event_type="pr_ci_failure")
     second = RepoReviewState(scope)
     turn2 = _lineage_turn(scope, second)
     from mimir_cultivate import forge as forge_module, repository as repo_module
+    monkeypatch.setattr(repo_module, "_observe_current_pr_head", lambda _: scope.observed_head_sha)
     monkeypatch.setattr(forge_module, "remediation_checkout_preflight", lambda *_: (second, None))
     monkeypatch.setattr(forge_module, "_client", lambda _: SimpleNamespace(
-        author_is_trusted=lambda *_: True,
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=scope.pr_number, head_sha=scope.observed_head_sha,
+            author=scope.pull_request_author,
+            repo=scope.canonical_repo, head_repo=scope.head_repo,
+        ),
     ))
-    monkeypatch.setattr(forge_module, "_pr_content_authors", lambda *_: ((scope.principal,), None))
-    monkeypatch.setattr(forge_module, "_author_verdict", lambda *_: True)
     from mimir.access_control import (
         SinkGate, ToolAuthorization, begin_protected_result_capture,
         classify_protected_result, end_protected_result_capture, protected_result_source,
     )
+    before_resume = (lease.path / _METADATA).read_bytes()
     token = begin_protected_result_capture()
     try:
+        if lineage != "clean":
+            with pytest.raises(repo_module.LeaseAttestationRefusal) as refusal:
+                repo_module.repo_checkout.func(
+                    "owner/repo", 7, runtime=SimpleNamespace(context=turn2),
+                )
+            assert refusal.value.reason in {"lineage_commit_mismatch", "lineage_record_missing"}
+            assert second.checkout_lease is None
+            assert (lease.path / _METADATA).read_bytes() == before_resume
+            assert not turn2.ifc_state.framework_pr_checkouts
+            return
         checkout = repo_module.repo_checkout.func(
             "owner/repo", 7, runtime=SimpleNamespace(context=turn2),
         )
@@ -1733,7 +1778,7 @@ def test_rebase_is_refused_when_lease_cannot_publish_rewritten_history(
     assert not (lease.path / ".git" / "rebase-merge").exists()
 
 
-def test_retained_non_fast_forward_fix_can_resume_and_publish_next_turn(
+def test_equivalent_retained_rebase_is_replaced_before_publishing_next_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     origin, source, scope, original_state = _repo_scope_and_state(tmp_path)
@@ -1752,44 +1797,19 @@ def test_retained_non_fast_forward_fix_can_resume_and_publish_next_turn(
         lambda _scope: scope.observed_head_sha,
     )
     state = RepoReviewState(scope)
-    resumed, _ = acquire_pr_checkout_lease(
+    fresh, candidates = acquire_pr_checkout_lease(
         scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
     )
-    assert resumed.path == lease.path
+    assert fresh.path != lease.path
+    assert not lease.path.exists()
+    assert candidates == ()
     tools = RepoGitTools(state)
-    (lease.path / "fix.txt").write_text("retained fix\n")
-    tools.execute(GitCommit(("fix.txt",), "fix after retained rebase"))
-    fix_head = _git(lease.path, "rev-parse", "HEAD")
-    with pytest.raises(GitRefusal) as refused:
-        tools.execute(GitPush())
-    assert refused.value.code == "force_push_refused"
-    # Reproduce the old fallback exactly: base is already included, so merging
-    # it alone cannot reconcile the published PR history.
-    assert "Already up to date" in _git(lease.path, "merge", "--no-edit", advanced_base)
-    with pytest.raises(GitRefusal) as refused:
-        tools.execute(GitPush())
-    assert refused.value.code == "force_push_refused"
-    with pytest.raises(GitRefusal) as refused:
-        tools.execute(GitRebase())
-    assert refused.value.code == "rebase_in_lease_refused"
-
-    later_scope = replace(scope, event_type="pr_review_submitted")
-    assert later_scope.scope_id != scope.scope_id
-    later_state = RepoReviewState(later_scope)
-    later_lease, candidates = acquire_pr_checkout_lease(
-        later_scope, owner=scope.principal, lease_root=lease.lease_root,
-        review_state=later_state,
-    )
-    assert later_lease.path == lease.path
-    assert candidates == (fix_head,)
-    assert _git(lease.path, "rev-parse", "HEAD") == fix_head
-    later_tools = RepoGitTools(later_state)
-    assert later_tools.execute(GitMerge()).ok
-    assert _git(lease.path, "merge-base", "--is-ancestor", scope.observed_head_sha, "HEAD") == ""
-    assert _git(lease.path, "merge-base", "--is-ancestor", fix_head, "HEAD") == ""
-    assert later_tools.execute(GitPush()).ok
-    assert _git(origin, "rev-parse", scope.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
-    assert (lease.path / "fix.txt").read_text() == "retained fix\n"
+    (fresh.path / "fix.txt").write_text("new fix\n")
+    tools.execute(GitCommit(("fix.txt",), "fix after fresh checkout"))
+    assert tools.execute(GitMerge()).ok
+    assert tools.execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(fresh.path, "rev-parse", "HEAD")
+    assert (fresh.path / "fix.txt").read_text() == "new fix\n"
 
 
 def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ from pydantic import Field
 from mimir._context import get_current_turn
 from mimir.access_control import (
     CapabilityTier, RepoBindingResolution, build_trigger_service_principal,
+    pr_checkout_lease_attestation,
 )
 from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel, NormalizedPullRequestSnapshot
 from mimir.plugins.manager import load_plugins
@@ -34,6 +35,138 @@ def cultivate_policy(monkeypatch):
     monkeypatch.setattr(forge, "_github_identity_degraded_error", None)
     with policy_scope(load_plugins(enable="cultivate").policy):
         yield
+
+
+@pytest.mark.parametrize("push_author", ["different-pusher", None])
+def test_synchronize_scope_records_pr_author_not_push_author(tmp_path, monkeypatch, push_author):
+    from mimir import access_control
+
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    repo, template = _repo_and_scope(tmp_path)
+    monkeypatch.setattr(access_control, "_canonical_repo_binding_resolution", lambda _:
+        RepoBindingResolution((str(repo.resolve()), template.canonical_origin),
+                              (str(repo.resolve()),), 1))
+    item = {
+        "event_type": "pr_synchronize", "repo": template.canonical_repo,
+        "number": template.pr_number, "author": push_author,
+        "pr_author": "collaborator", "pr_author_is_trusted": True,
+        "head_repo": template.head_repo, "head_remote": "origin",
+        "head_ref": template.head_ref, "head_sha": template.observed_head_sha,
+        "base_ref": template.base_ref, "base_sha": template.observed_base_sha,
+    }
+    registry = access_control._repo_review_state_from_event(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity",
+                   extra={"items": [item]}),
+        SimpleNamespace(authority_profile="github"),
+    )
+    assert registry is not None
+    state = registry.resolve(template.canonical_repo, template.pr_number)
+    assert state is not None
+    assert state.action_scope.pull_request_author == "collaborator"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["pr_checks_completed", "issue_comment"])
+@pytest.mark.usefixtures("stub_opencode")
+async def test_dependabot_checks_completed_pre_turn_checkout(tmp_path, monkeypatch, event_type):
+    """The checks follow-up has a host-pinned head and a real pre-model checkout."""
+    from mimir import access_control
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:test")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    monkeypatch.setenv("GITHUB_REPOS", "SquashMerge/trellis")
+    selected = load_plugins(enable="cultivate")
+    repo, template = _repo_and_scope(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin",
+                    "HEAD:refs/pull/35/head"], check=True)
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(leases))
+    monkeypatch.setattr(access_control, "_canonical_repo_binding_resolution", lambda _:
+        RepoBindingResolution((str(repo.resolve()), template.canonical_origin),
+                              (str(repo.resolve()),), 1))
+    real_remote_repo = access_control._github_repo_from_remote
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda remote:
+        "squashmerge/trellis" if remote == template.canonical_origin else real_remote_repo(remote))
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
+    client = SimpleNamespace(
+        get_pull_request_snapshot=lambda repository, number: NormalizedPullRequestSnapshot(
+            repo="squashmerge/trellis", number=number, state="open", author="dependabot[bot]",
+            head_repo="squashmerge/trellis", head_remote="origin", head_ref=template.head_ref,
+            head_sha=template.observed_head_sha, base_ref=template.base_ref,
+            base_sha=template.observed_base_sha),
+        get_pull_request=lambda scope: forge.PullRequestProjection(
+            scope.pr_number, "Untrusted title", "open", "dependabot[bot]", False,
+            "main", "worklink/7", template.observed_head_sha, True, "created", "updated"),
+        author_is_trusted=lambda *_: True,
+    )
+    client.get_pull_request_identity = client.get_pull_request_snapshot
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+    agent = _make_agent(tmp_path, monkeypatch)
+    agent._config = replace(agent._config, plugin_manager=selected)
+    agent._session_manager = _FakeSessionManager()
+
+    class Model(GenericFakeChatModel):
+        requests: list = Field(default_factory=list)
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, *args, **kwargs):
+            turn = get_current_turn()
+            state = turn.auth_context.repo_pr_scope_registry.resolve("squashmerge/trellis", 35)
+            assert turn.auth_context._plugin_slot_policy is selected.policy
+            assert state.action_scope.pull_request_author == "dependabot[bot]"
+            assert pr_checkout_lease_attestation(
+                turn.auth_context, state.action_scope, state.checkout_lease,
+            ).ok
+            self.requests.append(list(messages))
+            return super()._generate(messages, *args, **kwargs)
+
+    args = {"repository": "SquashMerge/trellis", "pull_request": 35}
+    model = Model(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "pr_metadata", "args": args, "id": "first-metadata", "type": "tool_call",
+        }]),
+        AIMessage(content="reviewed"),
+    ]), disable_streaming=True)
+    agent._agent_model = model
+    authority = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("repo_checkout", "pr_metadata"), creation_path="test",
+        policy=selected.policy, poller_owner="cultivate",
+    )
+    item = {
+        "event_type": "pr_checks_completed", "repo": "SquashMerge/trellis",
+        "number": 35, "author": "dependabot[bot]",
+        "pr_author_is_trusted": True,
+        "head_repo": "SquashMerge/trellis", "head_remote": "origin",
+        "head_ref": template.head_ref, "head_sha": template.observed_head_sha,
+        "base_ref": template.base_ref, "base_sha": template.observed_base_sha,
+    }
+    if event_type == "issue_comment":
+        # The comment emitter rewrites author to the PR user and records the
+        # collaborator requesting review separately as actor.
+        item.update(event_type=event_type, actor="jason-squashmerge",
+                    author_is_trusted=True, pr_state="open")
+    assert "pr_author" not in item
+    await agent.run_turn(AgentEvent(
+        trigger="poller", channel_id=authority.canonical, source="poller",
+        service_principal=authority.canonical, service_authority=authority,
+        content="Review PR 35", extra={"poller_name": "github-activity", "items": [item]},
+        ifc_labels=InformationFlowLabels().with_source(SourceLabel(
+            principal=authority.canonical, domain="channel", resource_id=authority.canonical,
+            bridge_instance="poller", sensitivity="internal", source_kind="service",
+            authorized_principals=frozenset({authority.canonical}),
+            integrity="trusted", integrity_effect="active_ingest")),
+    ), turn_id="dependabot-checks", saga_session_id="dependabot-session")
+    results = [message for request in model.requests for message in request
+               if isinstance(message, ToolMessage) and message.tool_call_id == "first-metadata"]
+    assert len(results) == 1 and results[0].status != "error", results
 
 
 @pytest.mark.asyncio
@@ -90,6 +223,7 @@ async def test_real_poller_review_sequence(tmp_path, monkeypatch, channel, exter
             posted.append(scope.pr_number) or forge.ReviewProjection(
                 "1", "mimir-bot", "COMMENTED", body, "now", scope.observed_head_sha)),
     )
+    client.get_pull_request_identity = client.get_pull_request_snapshot
     monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
     agent = _make_agent(tmp_path, monkeypatch)
     agent._config = replace(agent._config, plugin_manager=selected)

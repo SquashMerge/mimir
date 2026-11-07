@@ -1059,6 +1059,7 @@ def _repo_pr_scope_resolution(
     provenance: str,
     repo: object,
     principal: object,
+    pull_request_author: object = None,
     event_type: object,
     number: object,
     head_repo: object,
@@ -1196,7 +1197,7 @@ def _repo_pr_scope_resolution(
         base_ref=base_ref,
         observed_base_sha=base_sha.lower(),
         checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
-        pull_request_author=principal,
+        pull_request_author=pull_request_author if pull_request_author is not None else principal,
     )
     return RepoPRScopeResolution(scope=scope_type(
         is_remediation=is_remediation, **scope_fields,
@@ -1364,8 +1365,11 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             policy=policy,
             provenance="poller_payload",
             repo=item.get("repo"),
+            # Synchronize's author is an optional push identity, not the PR
+            # principal. Keep the established PR-author mapping for admission.
             principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"
                        else item.get("author")),
+            pull_request_author=item.get("pr_author") or item.get("author"),
             event_type=item.get("event_type"),
             review_state=item.get("state"),
             actor=item.get("actor"),
@@ -6758,7 +6762,11 @@ _REPOSITORY_RESULT_RESOURCE = re.compile(
 
 
 def _trusted_forge_repository_source(source: Any) -> bool:
-    """Author-attested repository content needs no destination scope binding."""
+    """Any complete, trusted repository source needs no destination binding.
+
+    This includes author-attested content and server-attested issue-write echoes;
+    untrusted repository content still goes through the exact scope checks below.
+    """
     return (
         source.domain == "repository"
         and source.domain_qualifier is None
@@ -11000,6 +11008,25 @@ def _attested_pr_checkout_lease(
     return pr_checkout_lease_attestation(auth_context, scope, lease).ok
 
 
+_resume_metadata_identity: ContextVar[tuple[Any, Any] | None] = ContextVar(
+    "resume_metadata_identity", default=None,
+)
+
+
+@contextmanager
+def pr_checkout_resume_metadata(candidate: Any, prior: Any):
+    """Bind pre-persistence lineage reads to the server-validated prior lease.
+
+    Only the synchronous recovery transaction uses this context; it does not
+    survive publication or authorize a later reconstructed lease.
+    """
+    token = _resume_metadata_identity.set((candidate, prior))
+    try:
+        yield
+    finally:
+        _resume_metadata_identity.reset(token)
+
+
 def pr_checkout_lease_attestation(
     auth_context: "AuthContext | None", scope: Any, lease: Any,
 ) -> LeaseAttestation:
@@ -11199,7 +11226,9 @@ def _lease_has_clean_lineage(
     try:
         if current_head != getattr(lease, "head_sha", "").lower():
             return _lease_refuse(LeaseAttestationReason.LINEAGE_HEAD_MISMATCH)
-        if not isinstance(raw, dict) or any(raw.get(key) != getattr(lease, key) for key in (
+        resume = _resume_metadata_identity.get()
+        recorded_lease = resume[1] if resume is not None and resume[0] is lease else lease
+        if not isinstance(raw, dict) or any(raw.get(key) != getattr(recorded_lease, key) for key in (
             "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
         )):
             return _lease_refuse(LeaseAttestationReason.LINEAGE_METADATA_MISMATCH)
@@ -12332,6 +12361,47 @@ def _bound_unsupported_operation_result(
     )
 
 
+def _bound_issue_write_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any,
+    provenance: ProtectedResultProvenance | None, failed: bool,
+) -> "InformationFlowLabels | None":
+    """Trust only a successful issue write attested at its authorized sink."""
+    from .models import InformationFlowLabels, SourceLabel
+
+    target = authorization.repo_pr_action_scope
+    if not (
+        registered.owner == "cultivate" and tool_name == "issue_comment"
+        and registered.flow == "sink"
+        and registered.descriptor is not None
+        and registered.descriptor.sink_destination == "configured_repository_issue"
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.ADMIN_REQUIRED
+        and not failed
+        and target is not None
+        and isinstance(arguments.get("repository"), str)
+        and type(arguments.get("issue")) is int
+        and arguments["repository"].lower() == target.canonical_repo.lower()
+        and arguments["issue"] == target.issue_number
+        and authorization.resolved_sink_target == target.sink_destination
+    ):
+        return None
+    principal = getattr(auth_context, "canonical_principal", None)
+    if getattr(auth_context, "is_service", False) and principal:
+        principal = f"service:{principal}"
+    expected = SourceLabel(
+        principal=principal, domain="repository", resource_id=target.sink_destination,
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    )
+    if provenance is None or provenance.sources != (expected,):
+        return None
+    labels = InformationFlowLabels().with_source(expected)
+    channel = getattr(auth_context, "channel_id", None)
+    return labels.with_channel(channel) if channel else labels
+
+
 @scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
@@ -12367,6 +12437,13 @@ def classify_protected_result(
         )
     retained_verified = False
     if registered is not None and registered.owner != "core":
+        if tool_name == "issue_comment":
+            issue_labels = _bound_issue_write_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, provenance, failed,
+            )
+            if issue_labels is not None:
+                return issue_labels
         scope = getattr(auth_context, "retained_factory_scope", None)
         retained_candidate = (
             "retained_repo_tools" in registered.memberships
