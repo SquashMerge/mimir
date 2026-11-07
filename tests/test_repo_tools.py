@@ -947,7 +947,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
                 assert exc.reason == ("git_timeout" if case == "git_timeout" else "no_author_trust")
                 assert state.checkout_lease is None
                 assert not auth.ifc_state.framework_pr_checkouts
-                assert auth.ifc_state.has_untrusted_active_ingest()
+                assert not auth.ifc_state.has_untrusted_active_ingest()
                 result = None  # Refused resumes expose no checkout content.
         finally:
             provenance = access_control.end_protected_result_capture(token)
@@ -988,7 +988,8 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         "pr_metadata": "refused" if unattested_text else "trusted", "pr_spec": "trusted",
         "repo_checkout": "trusted" if attested else "refused",
     }
-    assert auth.ifc_state.has_untrusted_active_ingest() is not attested
+    # Forge results are independently attested; refused checkout exposes no content.
+    assert not auth.ifc_state.has_untrusted_active_ingest()
     if case in {"collaborator", "outsider", "git_timeout"}:
         assert status_probes  # The positive/timeout controls reached the real proof boundary.
     assert refusal_reasons == (

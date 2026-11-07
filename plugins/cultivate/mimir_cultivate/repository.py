@@ -1389,9 +1389,15 @@ def _recover_pr_checkout_lease_unlocked(
         recovery_id=uuid.uuid4().hex,
     )
     _attest_resume_candidate(lease, scope, head, review_state, attest_resume, prior=prior)
-    (path / _METADATA).write_text(
-        json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
-    )
+    try:
+        (path / _METADATA).write_text(
+            json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
+        )
+    except BaseException:
+        lease.revoke()
+        if review_state is not None:
+            review_state.revoke_checkout_lease(lease)
+        raise
     if review_state is not None:
         review_state.attach_checkout_lease(lease)
         review_state.record_git_head(scope.scope_id, head)
@@ -2026,9 +2032,12 @@ def _attest_resume_candidate(
             attest_resume(lease)
     except BaseException:
         lease.revoke()
+        raise
+    finally:
+        # Tentative attachment is only for the synchronous attestation call.
+        # Persistence and its cleanup must finish before authority is attached.
         if review_state is not None:
             review_state.revoke_checkout_lease(lease)
-        raise
 
 
 def _rebind_foreign_candidate(
@@ -2110,12 +2119,18 @@ def _rebind_foreign_candidate(
     metadata_path = lease.path / _METADATA
     staging = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        staging.write_text(
-            json.dumps(_metadata(rebound), sort_keys=True) + "\n", encoding="utf-8",
-        )
-        os.replace(staging, metadata_path)
-    finally:
-        staging.unlink(missing_ok=True)
+        try:
+            staging.write_text(
+                json.dumps(_metadata(rebound), sort_keys=True) + "\n", encoding="utf-8",
+            )
+            os.replace(staging, metadata_path)
+        finally:
+            staging.unlink(missing_ok=True)
+    except BaseException:
+        rebound.revoke()
+        if review_state is not None:
+            review_state.revoke_checkout_lease(rebound)
+        raise
     if review_state is not None:
         review_state.attach_checkout_lease(rebound)
         review_state.record_git_head(scope.scope_id, head)
@@ -5658,8 +5673,6 @@ def checkout_scoped_pr(
             context.ifc_state.framework_pr_checkouts.pop(scope.scope_id, None)
             existing.revoke()
             state.revoke_checkout_lease(existing)
-            if getattr(runtime, "pre_turn_checkout", False):
-                return {"status": "attestation_refused", "reason": refusal.reason}
             raise refusal
         _publish_attested_lease_result(runtime, state)
         return {
@@ -5720,7 +5733,8 @@ def checkout_scoped_pr(
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
-        _publish_attested_lease_result(runtime, state)
+        if state.checkout_lease is not None:
+            _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
     resolve_author_trust()
     _publish_attested_lease_result(runtime, state)
