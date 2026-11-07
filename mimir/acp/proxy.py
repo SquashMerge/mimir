@@ -1269,6 +1269,8 @@ class _ShutdownHooks:
         self._watchdog: threading.Timer | None = None
         self._watchdog_lock = threading.RLock()
         self._signal_dispatched = False
+        # Written only by the wakeup observer, when it sees a supported signal.
+        self._signal_observed = False
         self._failure_detail: bytes | None = None
         self._signals: dict[int, Any] = {}
         self._handler = self._handle_signal
@@ -1298,6 +1300,13 @@ class _ShutdownHooks:
         while data := reader.recv(4096):
             for signum in data:
                 if signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                    if self._signal_observed:
+                        # A repeated supported signal abandons graceful draining
+                        # here, not only in the Python handler: that runs on main
+                        # and is lost while main is parked in teardown, whichever
+                        # thread the kernel delivered the signal to.
+                        os._exit(128 + signum)
+                    self._signal_observed = True
                     self._arm_watchdog(signum)
             try:
                 writer.send(data)

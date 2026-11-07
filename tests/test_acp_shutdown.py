@@ -35,23 +35,6 @@ def _in_worklink_gate() -> bool:
     return os.environ.get("MIMIR_WORKLINK_GATE") == "1"
 
 
-# A process-directed signal is delivered to any thread that does not block it,
-# and only a delivery to main wakes a main thread parked in teardown: delivered to
-# the wakeup observer instead, the repeat signal's Python handler never runs. Tests
-# of main-thread escalation pin delivery to main by blocking supported signals in
-# every other Python thread before it runs. Worker delivery is covered separately
-# by test_blocked_main_signal_delivery_matrix, where the watchdog bounds the exit.
-_MAIN_THREAD_SIGNAL_DELIVERY = r'''
-import signal as _signal, threading as _threading
-_SUPPORTED_SIGNALS = {_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP}
-_thread_bootstrap_inner = _threading.Thread._bootstrap_inner
-def _main_delivery_bootstrap_inner(self):
-    _signal.pthread_sigmask(_signal.SIG_BLOCK, _SUPPORTED_SIGNALS)
-    _thread_bootstrap_inner(self)
-_threading.Thread._bootstrap_inner = _main_delivery_bootstrap_inner
-'''
-
-
 def _journal_source(progress: Path, *, controlled_exit: bool = False) -> str:
     # Keep C-level bytes separate: they have no line framing and must not alter
     # the existing text journal's ordered prefix. Neither file needs pipe EOF.
@@ -822,31 +805,65 @@ async def _signal_exit_protocol(
         await asyncio.gather(task, return_exceptions=True)
 
 
-def test_main_thread_signal_delivery_prelude_blocks_every_worker(tmp_path: Path) -> None:
+@pytest.mark.parametrize("parked", ["lock_wait", "c_recv"])
+def test_repeat_signal_escalates_while_main_is_parked(parked: str, tmp_path: Path) -> None:
     import subprocess
 
-    # The prelude must mask workers started by any path: a plain Thread, a
-    # Timer (the watchdog), and the journal's tee forwarder. Main stays unmasked.
-    source = _MAIN_THREAD_SIGNAL_DELIVERY + _journal_source(tmp_path / "child-progress") + r'''
-import signal, sys, threading
-supported = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
-masks = {}
-def report(name):
-    masks[name] = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-worker = threading.Thread(target=report, args=("thread",))
-worker.start(); worker.join()
-timer = threading.Timer(0, report, args=("timer",))
-timer.start(); timer.join()
-report("main")
-assert supported <= masks["thread"] and supported <= masks["timer"], masks
-assert not supported & masks["main"], masks
-print("ok")
+    # The Python handler runs only on main, so it is lost while main is parked
+    # in teardown; the wakeup observer sees every C delivery and must escalate
+    # whichever thread received the repeat (#2118). The watchdog is disabled so
+    # only escalation can end the child.
+    source = r'''
+import asyncio, ctypes, os, signal, socket, sys, threading
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+proxy.SIGNAL_EXIT_TIMEOUT = 600
+parked = sys.argv[1]
+reader, writer = socket.socketpair()
+
+def park():
+    os.write(1, b"parked\n")
+    if parked == "lock_wait":
+        threading.Event().wait()
+    else:
+        libc = ctypes.CDLL(None)
+        libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        buffer = ctypes.create_string_buffer(1)
+        libc.recv(reader.fileno(), buffer, 1, 0)
+    raise AssertionError("parked main returned")
+
+def repeat():
+    assert os.read(0, 1) == b"r"
+    # Delivered to this worker, never to main.
+    signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=park))
+    hooks.install()
+    threading.Thread(target=repeat, daemon=True).start()
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.sleep(60)
+
+asyncio.run(run())
 '''
-    result = subprocess.run(
-        [sys.executable, "-c", source], capture_output=True, timeout=60,
+    process = subprocess.Popen(
+        [sys.executable, "-c", source, parked], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
-    assert (result.returncode, result.stdout, result.stderr) == (0, b"ok\n", b"")
+    try:
+        assert process.stdout.readline() == b"parked\n"
+        process.stdin.write(b"r")
+        process.stdin.flush()
+        # Hang guard only: without observer escalation the child never exits.
+        returncode = process.wait(timeout=60)
+        stderr = process.stderr.read()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    assert (returncode, stderr) == (128 + signal.SIGINT, b"")
 
 
 @pytest.mark.asyncio
@@ -858,9 +875,7 @@ async def test_signal_exit_bounds_entire_teardown(
     signum: signal.Signals, repeat: bool, stage: str, tmp_path: Path,
 ) -> None:
     progress = tmp_path / "child-progress"
-    # The parent's signals are process-directed; the kernel, not this test,
-    # would otherwise choose the receiving thread (#2118).
-    source = _MAIN_THREAD_SIGNAL_DELIVERY + _journal_source(progress, controlled_exit=True) + r'''
+    source = _journal_source(progress, controlled_exit=True) + r'''
 import atexit, asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
@@ -979,7 +994,13 @@ raise SystemExit(bootstrap.main([]))
         assert "watchdog-timed-wait" not in diagnostics
         if repeat:
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
-            assert f"signal-enter:{delivered[-1]}" in progress.read_text().splitlines()
+            # Either the wakeup observer or the Python handler may escalate; the
+            # handler cannot run while main is parked (#2118), so its
+            # signal-enter marker is optional. The repeat's exit code and the
+            # C-level delivery bytes below prove escalation either way.
+            lines = progress.read_text().splitlines()
+            assert f"exit-ready:{128 + delivered[-1]}" in lines
+            assert "watchdog-fired" not in lines
         else:
             assert progress.read_text().splitlines()[-3:] == [
                 "watchdog-fired", "force-exit-enter", f"exit-ready:{128 + signum}",
@@ -1829,10 +1850,12 @@ asyncio.run(run())
     try:
         async with _shutdown_ceiling(process, progress, lambda: "blocked main handshake"):
             assert await process.stdout.readline() == b"blocked\n"
-        # The real, unchanged five-second watchdog must release this child: main
-        # is blocked in an untimed recv, so exit 128+signum (asserted below) can
-        # only come from the watchdog. This timeout is a hang guard, not a
-        # latency bound; a 6s ceiling failed under parallel full-suite load.
+        # Main is blocked in an untimed recv, so its Python handler never runs.
+        # A single signal is released by the real, unchanged five-second
+        # watchdog (exit 128+SIGTERM). A repeated signal escalates through the
+        # wakeup observer whichever thread receives it (exit 128+SIGINT, #2118).
+        # This timeout is a hang guard, not a latency bound; a 6s ceiling failed
+        # under parallel full-suite load.
         async with asyncio.timeout(60):
             process.stdin.write(b"x")
             await process.stdin.drain()
@@ -1842,12 +1865,12 @@ asyncio.run(run())
                 process.stdin.write(b"y")
                 await process.stdin.drain()
             stdout, stderr = await process.communicate()
-        expected = signal.SIGINT if delivery == "main-main" else signal.SIGTERM
+        expected = signal.SIGINT if "-" in delivery else signal.SIGTERM
         _assert_blocked_main_exit(process.returncode, stdout, stderr, 128 + expected, progress)
         if journal:
             state = progress.read_text()
             assert state.count("watchdog-start-enter") == 1
-            assert ("watchdog-fired" in state) == (delivery != "main-main")
+            assert ("watchdog-fired" in state) == ("-" not in delivery)
             if delivery == "worker":
                 assert "signal-enter:" not in state
                 assert "signal-dispatch:" not in progress.with_suffix(".diagnostics").read_text()

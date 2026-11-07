@@ -1,0 +1,1 @@
+- Escalate a repeated Ctrl-C/SIGTERM/SIGHUP during ACP teardown through the wakeup observer thread, so it exits immediately even when the main thread is parked in teardown and its Python signal handler cannot run. Previously that case waited for the 5-second watchdog. This also fixes the remaining `test_signal_exit_bounds_entire_teardown` hang on macOS CI (#2118).
