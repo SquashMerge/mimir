@@ -586,7 +586,7 @@ def test_render_dockerfile_has_base_layer():
 def test_render_dockerfile_uses_mirrored_base_image(mode):
     out = render_dockerfile([], mode=mode)
     instructions = [line for line in out.splitlines() if line.startswith(("ARG ", "FROM "))]
-    assert DEFAULT_BASE_IMAGE == "public.ecr.aws/docker/library/python:3.11-slim"
+    assert DEFAULT_BASE_IMAGE == "public.ecr.aws/docker/library/python:3.11-slim-trixie"
     assert instructions[0] == f"ARG BASE_IMAGE={DEFAULT_BASE_IMAGE}"
     assert instructions[1] == "FROM ${BASE_IMAGE}"
     assert not any(line.startswith("FROM python:") for line in instructions)

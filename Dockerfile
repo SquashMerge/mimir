@@ -27,8 +27,9 @@
 # ─────────────────────────────────────────────────────────────────────
 
 # ECR Public mirrors the same Docker Official Image; switch back with
-# --build-arg BASE_IMAGE=python:3.11-slim if needed.
-ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
+# --build-arg BASE_IMAGE=python:3.11-slim-trixie if needed. Keep the Debian
+# codename pinned and equal to mimir.scaffold_docker.DEFAULT_BASE_IMAGE.
+ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-trixie
 # BuildKit resolves stage dependencies before RUN shell conditions. Keep the
 # Rust builder unreachable unless the caller explicitly selects its artifact.
 ARG CHAINLINK_ARTIFACT_STAGE=chainlink-none

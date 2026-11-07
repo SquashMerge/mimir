@@ -69,14 +69,16 @@ def test_stable_first_and_verified_download():
     assert resolve_release("2.0.0rc1", fetch=fetch).version == "2.0.0rc1"
 
 
-def test_newest_common_modern_manylinux_pair_on_bookworm():
+def test_newest_common_modern_manylinux_pair_on_the_pinned_base():
+    # The pinned trixie base has glibc 2.41: a 2.37 wheel installs there (it did
+    # not on the former bookworm pin), and a 2.42 wheel still does not (#2121).
     old = pair("1.0.0")
-    recent = (wheel("mimir-agent", "2.0.0", tag="cp311-cp311-manylinux_2_28_x86_64"),
+    recent = (wheel("mimir-agent", "2.0.0", tag="cp311-cp311-manylinux_2_37_x86_64"),
               wheel("mimir-cultivate", "2.0.0", dependency="2.0.0",
-                    tag="cp311-cp311-manylinux_2_28_x86_64"))
-    too_new = (wheel("mimir-agent", "3.0.0", tag="cp311-cp311-manylinux_2_37_x86_64"),
+                    tag="cp311-cp311-manylinux_2_37_x86_64"))
+    too_new = (wheel("mimir-agent", "3.0.0", tag="cp311-cp311-manylinux_2_42_x86_64"),
                wheel("mimir-cultivate", "3.0.0", dependency="3.0.0",
-                     tag="cp311-cp311-manylinux_2_37_x86_64"))
+                     tag="cp311-cp311-manylinux_2_42_x86_64"))
     fetch, _ = index({"1.0.0": [old[0]], "2.0.0": [recent[0]], "3.0.0": [too_new[0]]},
                      {"1.0.0": [old[1]], "2.0.0": [recent[1]], "3.0.0": [too_new[1]]})
     selected = resolve_release(fetch=fetch, architecture="x86_64")

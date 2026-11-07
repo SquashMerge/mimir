@@ -12,7 +12,7 @@ def test_root_dockerfile_uses_mirrored_base_image() -> None:
     instructions = [
         line for line in text.splitlines() if line.startswith(("ARG ", "FROM "))
     ]
-    assert DEFAULT_BASE_IMAGE == "public.ecr.aws/docker/library/python:3.11-slim"
+    assert DEFAULT_BASE_IMAGE == "public.ecr.aws/docker/library/python:3.11-slim-trixie"
     assert instructions[0] == f"ARG BASE_IMAGE={DEFAULT_BASE_IMAGE}"
     first_from = next(line for line in instructions if line.startswith("FROM "))
     assert first_from == "FROM ${BASE_IMAGE} AS provenance-validation"

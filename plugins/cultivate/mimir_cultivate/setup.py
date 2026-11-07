@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections.abc import Iterable
 from datetime import datetime, timezone
 import getpass
 import hashlib
@@ -31,6 +32,7 @@ import urllib.request
 import yaml
 
 from mimir._reasoning_effort import validate_effort
+from mimir.scaffold_docker import DEFAULT_BASE_IMAGE
 
 from .repository import valid_repository_slug
 from .release_resolver import ReleaseError, resolve_release
@@ -171,11 +173,57 @@ _ALERT_ENV_KEYS = frozenset({"MIMIR_OPERATOR_ALERT_CHANNEL", "DISCORD_TOKEN", "S
                             "MIMIR_DISCORD_REQUIRE_MENTION", "MIMIR_SLACK_ALLOWED_CHANNELS",
                             "MIMIR_SLACK_REQUIRE_MENTION"})
 _DOCKER_ARCHITECTURES = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}
-_PYTHON_BASE_IMAGE = "public.ecr.aws/docker/library/python:3.11-slim-bookworm"
+# Cultivate deployments share the root Dockerfile's pinned base, so saved
+# Debian package names and wheel tags stay valid across setups (#2121).
+_PYTHON_BASE_IMAGE = DEFAULT_BASE_IMAGE
 
 
 class SetupError(Exception):
     """Actionable error; never include an untrusted response body or a secret."""
+
+
+class _CommandFailed(SetupError):
+    """A failed command; only a caller that redacts may relay its output."""
+
+    def __init__(self, message: str, output: str) -> None:
+        super().__init__(message)
+        self.output = output
+
+
+_SECRET_ENV_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PAT\b", re.IGNORECASE)
+_SECRET_PATTERNS = (
+    re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))=\S+"),
+)
+_BUILD_TAIL_LINES = 40
+
+
+def _redacted_tail(output: str, known: Iterable[str], *, lines: int = _BUILD_TAIL_LINES) -> str:
+    """The last ``lines`` lines of build output with every known secret removed."""
+    tail = [line[:300] for line in output.replace("\r", "\n").splitlines() if line.strip()][-lines:]
+    text = "\n".join(tail)
+    for secret in sorted({value for value in known if isinstance(value, str) and len(value) >= 8},
+                         key=len, reverse=True):
+        text = text.replace(secret, "<redacted>")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(lambda match: (match.group(1) + "=<redacted>") if match.groups() else "<redacted>",
+                           text)
+    return text
+
+
+def _deployment_secrets(deploy: Path, values: dict[str, str]) -> list[str]:
+    """Secret-named values setup holds or the deployment's compose.env stores."""
+    found = [value for name, value in values.items() if _SECRET_ENV_NAME.search(name)]
+    try:
+        for line in (deploy / "compose.env").read_text().splitlines():
+            name, separator, value = line.partition("=")
+            if separator and _SECRET_ENV_NAME.search(name):
+                found.append(value.strip())
+    except OSError:
+        pass
+    return found
 
 
 def _installed_license() -> tuple[bytes, str]:
@@ -1078,7 +1126,8 @@ def _run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None
                 raise SetupError(f"Modified Cultivate skill cultivate:{name}; reconcile it or run "
                                  f"mimir skills install cultivate:{name} --restore "
                                  "(or rerun setup with --force to back up and restore it).")
-        raise SetupError(f"{args[0]} operation failed (exit {result.returncode}); inspect the deployment without publishing secrets.")
+        raise _CommandFailed(f"{args[0]} operation failed (exit {result.returncode}); inspect the deployment without publishing secrets.",
+                             (result.stdout or "") + "\n" + (result.stderr or ""))
     return result.stdout.strip()
 
 
@@ -1681,7 +1730,12 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Cannot record the setup Python interpreter for later builds.")
     build_script = ("#!/bin/sh\nset -eu\ncd \"$(dirname \"$0\")\"\n"
                      + "context=$(mktemp -d)\ntrap 'rm -rf \"$context\"' EXIT HUP INT TERM\n"
+                     # Prefer the interpreter setup ran with; a later rebuild must not
+                     # depend on it surviving (e.g. a removed setup venv, #2121).
                      + "interpreter=" + shlex.quote(interpreter) + "\n"
+                     + "[ -x \"$interpreter\" ] || interpreter=$(command -v python3 || true)\n"
+                     + "[ -n \"$interpreter\" ] || { echo 'build.sh needs python3 on PATH: the "
+                     + "interpreter setup used is gone' >&2; exit 1; }\n"
                      + "\"$interpreter\" -I -S -c 'import hashlib, pathlib, sys; "
                      + "sys.exit(0 if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() == sys.argv[2] "
                      + "else \"build context helper differs from setup; refusing rebuild\")' "
@@ -1767,12 +1821,22 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.
     no_start = bool(getattr(args, "no_start", False))
-    def docker_step(step: str, argv: list[str]) -> str:
+    def docker_step(step: str, argv: list[str], *, image: str | None = None) -> str:
         try:
             return run(argv, cwd=deploy)
         except SetupError as exc:
             if str(exc) in {_PUSH_PROBE_HELP, _PUSH_PROBE_UNREACHABLE_HELP, _WORKLINK_EDITED_HELP} or str(exc).startswith("Modified Cultivate skill cultivate:"):
                 raise
+            if image is not None and isinstance(exc, _CommandFailed):
+                # An image build's output is the only diagnosis (e.g. a system
+                # package missing on the base image). Its arguments and context
+                # carry no secrets; still redact every value setup or
+                # compose.env holds (#2121).
+                tail = _redacted_tail(exc.output, _deployment_secrets(deploy, env_updates))
+                raise SetupError(
+                    f"Docker {step} failed ({image}). Last build output:\n{tail}\n"
+                    f"Fix the cause, for example a --system-packages name that {_PYTHON_BASE_IMAGE} "
+                    "does not provide, then rerun setup.") from None
             # Do not interpolate subprocess output (including compose.env values).
             raise SetupError(f"Docker {step} failed; inspect the deployment and docker compose logs.") from None
 
@@ -1788,8 +1852,10 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                                cultivate_sha256=release.cultivate.sha256)
         except (ValueError, OSError) as exc:
             raise SetupError("Cannot assemble verified wheel Docker context; check released wheel resources.") from None
-        docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)])
-    docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", layer_tag, "-f", "Dockerfile.toolchain", "."])
+        docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)],
+                    image="Mimir root image")
+    docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", layer_tag, "-f", "Dockerfile.toolchain", "."],
+                image="agent toolchain layer")
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])
     if was_running:
         docker_step("stop", ["docker", "compose", "stop", "agent"])

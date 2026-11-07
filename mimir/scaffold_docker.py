@@ -41,7 +41,11 @@ from .plugin_dockerfile import (assemble_services, cultivate_scripts, has_truste
                                 pinned_packages, render_stage, select_plugins, services)
 
 
-DEFAULT_BASE_IMAGE = "public.ecr.aws/docker/library/python:3.11-slim"
+# Pin the Debian codename: the unqualified ``-slim`` tag moves with Debian
+# releases. Every image built from this repository, and every Cultivate
+# deployment, shares this base and its glibc (wheel compatibility, #2121).
+DEFAULT_BASE_IMAGE = "public.ecr.aws/docker/library/python:3.11-slim-trixie"
+DEFAULT_BASE_IMAGE_GLIBC = (2, 41)
 
 
 # ── Data shapes ──────────────────────────────────────────────────────
