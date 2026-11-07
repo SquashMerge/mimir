@@ -468,7 +468,10 @@ def test_pre_extraction_coding_policy_is_frozen(
         assert tool.flow == tables["flow"].get(name)
         assert tool.tier == tables["tier"].get(name)
         assert tool.operation_class == tables["catalog"][name]
-        assert tool.result_domain == tables["protected_domains"].get(name)
+        # The re-request write now publishes scoped forge provenance (#2117).
+        expected_domain = ("repository" if name == "pr_rerequest_review"
+                           else tables["protected_domains"].get(name))
+        assert tool.result_domain == expected_domain
         assert tool.readable_domain == tables["readable_domains"].get(name)
         assert tool.descriptor is not None
         assert tool.descriptor.sink_category == descriptor["sink_category"]
