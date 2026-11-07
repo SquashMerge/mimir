@@ -89,6 +89,10 @@ from mimir.otel_credentials import filter_otlp_env
 from ..repository import RepositoryInventory
 from mimir.secret_scan import secret_matches
 from .safe_git import ControllerGitPublication, _git_credential_settings
+from .preserved import (
+    load_dispatch_spec, preserve_attempt, preserved_line, prior_attempts_section,
+    prune_preserved, record_dispatch_spec, spec_text,
+)
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
     FactoryStatus,
@@ -423,11 +427,31 @@ def _autonomous_leaf_block_reason(home: Path, issue_id: int) -> str | None:
     return None
 
 
-def _epic_prompt(issue: "IssueContext") -> str:
+def _epic_prompt(issue: "IssueContext", prior_attempts: str | None = None) -> str:
     header = issue.title.strip()
     body = _render_chainlink_text(strip_external_record(issue.description).strip())
     base = f"{header}\n\n{body}".strip() if body else header
-    return base
+    return f"{base}\n\n{prior_attempts}" if prior_attempts else base
+
+
+def _prior_attempts(home: Path, issue: "IssueContext", attempt: int) -> str | None:
+    """Untrusted reference to the latest preserved attempt (#2114); never fatal."""
+    try:
+        return prior_attempts_section(
+            home, issue.issue_id, attempt, spec_text(issue.title, issue.description),
+        )
+    except Exception as exc:  # noqa: BLE001 - reference material is best effort
+        _log_event("worklink_prior_attempts_unavailable", issue_id=issue.issue_id,
+                   attempt=attempt, error=str(exc))
+        return None
+
+
+def _record_dispatch_spec_best_effort(home: Path, issue: "IssueContext", attempt: int) -> None:
+    try:
+        record_dispatch_spec(home, issue.issue_id, attempt, issue.title, issue.description)
+    except Exception as exc:  # noqa: BLE001 - spec history must not block dispatch
+        _log_event("worklink_dispatch_spec_unrecorded", issue_id=issue.issue_id,
+                   attempt=attempt, error=str(exc))
 
 
 def _render_chainlink_text(text: str) -> str:
@@ -947,10 +971,11 @@ def _demote_template_invalid_ready_leaf(
 
 
 def render_work_order(
-    issue: IssueContext, *, template_path: Path, backend_name: str, test_command: str
+    issue: IssueContext, *, template_path: Path, backend_name: str, test_command: str,
+    prior_attempts: str | None = None,
 ) -> str:
     template = template_path.read_text(encoding="utf-8")
-    return template.format(
+    rendered = template.format(
         issue_id=issue.issue_id,
         title=issue.title,
         description=_render_chainlink_text(strip_external_record(issue.description).strip()),
@@ -959,6 +984,8 @@ def render_work_order(
         backend=backend_name,
         test_command=test_command,
     )
+    # After the spec: reference only, never part of what the leaf must do.
+    return f"{rendered.rstrip()}\n\n{prior_attempts}\n" if prior_attempts else rendered
 
 
 @dataclass(frozen=True)
@@ -1222,10 +1249,15 @@ class WorklinkRunner:
             backend=selected_name,
         )
         _request_tracker_transition(self.home, issue, "build_started")
+        _record_dispatch_spec_best_effort(self.home, issue, record.attempt)
 
         lease: CheckoutLease | None = None
         publication: ControllerGitPublication | None = None
         delete_authorized_checkout = False
+        # #2114: an attempt that ends without a published PR is preserved before
+        # its checkout can be removed, whatever way it ended.
+        attempt_published = False
+        preserve_reason: str | None = None
         executor_report_dir: Path | None = None
         spec = None
         try:
@@ -1289,6 +1321,7 @@ class WorklinkRunner:
                 template_path=template_path,
                 backend_name=selected_name,
                 test_command=(test_cmd or "PR CI (no local gate)") if gate_mode == "ci" else test_cmd,
+                prior_attempts=_prior_attempts(self.home, issue, record.attempt),
             )
             order = WorkOrder(
                 issue_id=issue.issue_id,
@@ -1425,6 +1458,8 @@ class WorklinkRunner:
                 claims=claims,
                 record=record,
             )
+            attempt_published = bool(result.pr_url)
+            preserve_reason = result.reason or result.status
             delete_authorized_checkout = bool(
                 worker_uid_drop and result.review_ready and result.pr_url
             )
@@ -1454,6 +1489,7 @@ class WorklinkRunner:
                 raise
             transition_applied = False
             transition_error = None
+            preserve_reason = str(exc)
             terminal_release.retain_for_recovery = True
             try:
                 try:
@@ -1514,6 +1550,7 @@ class WorklinkRunner:
             # No terminal routing occurred. Keep both recovery handles, even
             # when the finally block below requests release after teardown.
             terminal_release.retain_for_recovery = True
+            preserve_reason = f"interrupted: {type(exc).__name__}: {exc}"
             try:
                 incident = incident_owner.record(
                     producer="leaf_interruption",
@@ -1544,6 +1581,14 @@ class WorklinkRunner:
         finally:
             try:
                 try:
+                    if lease is not None and lease.isolated_checkout and not attempt_published:
+                        # Before capabilities close: the publication handle is the
+                        # controller's only safe view of the worker's checkout.
+                        await asyncio.to_thread(
+                            self._preserve_unpublished_attempt,
+                            claims, lease, publication, preserve_reason, runner,
+                            config.defaults.preserved_attempts_keep,
+                        )
                     if executor_report_dir is not None:
                         # Worker cleanup needs the still-live checkout. Even a
                         # cancellation here must close capabilities below.
@@ -1577,6 +1622,71 @@ class WorklinkRunner:
                             )
             finally:
                 terminal_release()
+
+    def _preserve_factory_attempt(
+        self, claims: ChainlinkClaims, record: FactoryRunRecord, reason: str, runner: Runner,
+    ) -> Any:
+        try:
+            config = WorklinkConfig.load(self.home / "worklink.yaml")
+            base = config.defaults.base_branch
+            preserved = preserve_attempt(
+                home=self.home, trusted_repo=self.repo, checkout=Path(record.sandbox),
+                branch=record.branch, issue_id=record.issue_id, attempt=record.attempt,
+                base_candidates=(f"origin/{base}", base), reason=reason,
+                runner=_list_runner(runner),
+            )
+            if preserved is None:
+                return None
+            _log_event("worklink_attempt_preserved", issue_id=record.issue_id,
+                       attempt=record.attempt, ref=preserved.ref, error=preserved.error)
+            claims._run(  # noqa: SLF001
+                "issue", "comment", str(record.issue_id), preserved_line(preserved),
+            )
+            prune_preserved(self.home, self.repo, record.issue_id,
+                            keep=config.defaults.preserved_attempts_keep,
+                            runner=_list_runner(runner))
+            return preserved
+        except Exception as exc:  # noqa: BLE001 - never replaces the failure being reported
+            _log_event("worklink_preservation_failed", issue_id=record.issue_id,
+                       attempt=record.attempt, error=str(exc))
+            return None
+
+    def _preserve_unpublished_attempt(
+        self,
+        claims: ChainlinkClaims,
+        lease: CheckoutLease,
+        publication: ControllerGitPublication | None,
+        reason: str | None,
+        runner: Runner,
+        keep: int,
+    ) -> None:
+        """Keep an unpublished attempt's work and report it; never raises (#2114)."""
+        try:
+            preserved = preserve_attempt(
+                home=self.home, trusted_repo=self.repo, checkout=lease.path,
+                branch=lease.branch, issue_id=lease.issue_id, attempt=lease.attempt,
+                base_candidates=(lease.local_base, f"origin/{lease.base_ref}", lease.base_ref),
+                reason=reason, runner=_list_runner(runner), publication=publication,
+            )
+            if preserved is None:
+                return
+            _log_event("worklink_attempt_preserved", issue_id=lease.issue_id,
+                       attempt=lease.attempt, ref=preserved.ref, error=preserved.error)
+            claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
+                "issue", "comment", str(lease.issue_id), preserved_line(preserved),
+            )
+            pruned = prune_preserved(self.home, self.repo, lease.issue_id, keep=keep,
+                                     runner=_list_runner(runner))
+            if pruned:
+                _log_event("worklink_preserved_pruned", issue_id=lease.issue_id, attempts=pruned)
+                claims._run(  # noqa: SLF001
+                    "issue", "comment", str(lease.issue_id),
+                    f"WORKLINK_PRESERVED_PRUNED issue={lease.issue_id} attempts={json.dumps(pruned)} "
+                    f"reason=retention keep={keep}",
+                )
+        except Exception as exc:  # noqa: BLE001 - never blocks the transition
+            _log_event("worklink_preservation_failed", issue_id=lease.issue_id,
+                       attempt=lease.attempt, error=str(exc))
 
     async def _finalize(
         self,
@@ -3009,9 +3119,11 @@ class WorklinkRunner:
                     runner=_list_runner(runner),
                     worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
                 )
+                _record_dispatch_spec_best_effort(self.home, issue, claim_record.attempt)
                 order, publishing_identity = self._factory_launch_order(
                     issue=issue, checkout=lease.path,
                     work_item_json=work_item_json, runner=runner,
+                    attempt=claim_record.attempt,
                 )
                 spec = selected.work_spec(
                     order,
@@ -3108,6 +3220,14 @@ class WorklinkRunner:
                 reason += f"; completed work preserved at {preserved_ref}"
             elif preservation_error is not None:
                 reason += f"; completed work preservation failed: {preservation_error}"
+            if not published and preserved_ref is None and current is not None:
+                # #2114: the unpublished epic attempt is kept locally as reference
+                # for the next attempt, never pushed.
+                local = await asyncio.to_thread(
+                    self._preserve_factory_attempt, claims, current, original_reason, runner,
+                )
+                if local is not None and local.ref is not None:
+                    reason += f"; attempt preserved locally at {local.ref}"
             if current is not None:
                 save_factory_record(
                     self.home,
@@ -3241,6 +3361,7 @@ class WorklinkRunner:
 
     def _factory_launch_order(
         self, *, issue: IssueContext, checkout: Path, work_item_json: str, runner: Runner,
+        attempt: int | None = None,
     ) -> tuple[WorkOrder, str]:
         """Build the order for a fresh ``/feature`` driver.
 
@@ -3265,7 +3386,9 @@ class WorklinkRunner:
         order = WorkOrder(
             issue_id=issue.issue_id,
             checkout=checkout,
-            prompt=_epic_prompt(issue),
+            prompt=_epic_prompt(
+                issue, _prior_attempts(self.home, issue, attempt) if attempt is not None else None,
+            ),
             rules=None,
             timeout_s=int(_epic_run_timeout_s()),
             env={
@@ -5997,6 +6120,10 @@ def _write_evidence(home: Path, evidence: WorklinkEvidence, *, review_ready: boo
     payload = _evidence_json(evidence)
     if review_ready is not None:
         payload["review_ready"] = review_ready
+    spec = load_dispatch_spec(home, evidence.issue, evidence.attempt)
+    if spec is not None:
+        payload["spec"] = {"sha256": spec["sha256"], "text": spec["text"],
+                           "truncated": bool(spec.get("truncated"))}
     atomic_write_json(path, payload)
     return path
 

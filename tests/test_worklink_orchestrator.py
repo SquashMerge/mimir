@@ -13923,3 +13923,143 @@ def test_factory_startup_deadline_resolves_or_announces(
         assert events[0][1]["value"] == raw
     else:
         assert announced == [], announced
+
+
+# --- #2114: unpublished attempts are preserved as reference ------------------
+
+
+def _record_preservation(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.preserved import PreservedAttempt
+
+    order: list[tuple[str, dict]] = []
+
+    def preserve(**kwargs):
+        order.append(("preserve", kwargs))
+        return PreservedAttempt(
+            issue=kwargs["issue_id"], attempt=kwargs["attempt"],
+            ref=f"refs/worklink/{kwargs['issue_id']}/{kwargs['attempt']}",
+            base_sha="b" * 40, head_sha="c" * 40, files=["changed.txt"],
+            reason=kwargs["reason"],
+        )
+
+    close = orchestrator._close_attempt_capabilities
+    monkeypatch.setattr(orchestrator, "preserve_attempt", preserve)
+    monkeypatch.setattr(orchestrator, "_close_attempt_capabilities",
+                        lambda *a, **k: order.append(("close", {})) or close(*a, **k))
+    return order
+
+
+def _blocking_push_runner(repo: Path, worktree: Path):
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(args, **kwargs):
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "push"]:
+            calls.append(args)
+            return cp(args, returncode=128, stderr="remote rejected publication\n")
+        return base_runner(args, **kwargs)
+
+    return calls, runner
+
+
+def test_blocked_leaf_is_preserved_before_its_checkout_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order = _record_preservation(monkeypatch)
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _blocking_push_runner(repo, worktree)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+    assert result.status == "blocked"
+    assert [step for step, _ in order] == ["preserve", "close"]
+    kwargs = order[0][1]
+    assert kwargs["checkout"] == worktree and kwargs["trusted_repo"] == repo
+    assert (kwargs["issue_id"], kwargs["attempt"]) == (441, 1)
+    assert kwargs["reason"] == "publication push failed: remote rejected publication"
+    comments = [args for args in calls if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]]
+    assert any(args[4].startswith("WORKLINK_PRESERVED issue=441 attempt=1 ") for args in comments)
+    # Preserved material never seeds the run: no command touches its refs.
+    assert not any("refs/worklink" in " ".join(map(str, args))
+                   for args in calls if isinstance(args, list) and args[:1] == ["git"])
+
+
+def test_published_leaf_is_not_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    order = _record_preservation(monkeypatch)
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _, runner = _orchestrator_runner(repo, worktree)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+    assert result.status == "completed" and result.pr_url
+    assert [step for step, _ in order] == ["close"]
+
+
+@pytest.mark.parametrize("raised, expected", [
+    (RuntimeError("opencode execution timed out"), "opencode execution timed out"),
+    (KeyboardInterrupt(), "interrupted: KeyboardInterrupt"),
+])
+def test_failed_or_interrupted_leaf_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: BaseException, expected: str,
+) -> None:
+    order = _record_preservation(monkeypatch)
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _, runner = _orchestrator_runner(repo, worktree)
+
+    class Raising(FakeBackend):
+        async def interpret(self, order_, result):
+            (order_.checkout / "changed.txt").write_text("partial\n", encoding="utf-8")
+            raise raised
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(Raising())
+    wl = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+    if isinstance(raised, KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(wl.run(441, backend_name="fake", test_command="echo ok"))
+    else:
+        result = asyncio.run(wl.run(441, backend_name="fake", test_command="echo ok"))
+        assert result.status == "failed"
+    assert [step for step, _ in order][:2] == ["preserve", "close"]
+    assert order[0][1]["reason"].startswith(expected)
+
+
+def test_next_attempt_prompt_carries_prior_attempts_after_the_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    asked = []
+    monkeypatch.setattr(orchestrator, "prior_attempts_section",
+                        lambda home, issue, attempt, spec: asked.append((issue, attempt, spec))
+                        or "## Prior attempts\nPRIOR-SENTINEL")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _, runner = _orchestrator_runner(repo, worktree)
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+    prompt = backend.orders[0].prompt
+    assert prompt.rstrip().endswith("PRIOR-SENTINEL")
+    issue = json.loads(ISSUE_JSON)
+    assert asked == [(441, 1, f"{issue['title']}\n\n{issue['description']}")]
+    # The dispatched spec is recorded and carried in the evidence record.
+    evidence = json.loads((tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text())
+    assert evidence["spec"]["text"] == f"{issue['title']}\n\n{issue['description']}"
+    assert len(evidence["spec"]["sha256"]) == 64

@@ -395,13 +395,126 @@ def prune_stale_attempt_checkouts_for_home(
                 (record := records.get(child.resolve())) is None
                 or record.publication_outcome != "determined-unpublished"
             ),
-            prepare_prune=lambda child: _prepare_factory_runtime_prune(child, factory_records),
+            prepare_prune=lambda child: (
+                _preserve_before_prune(home, Path(repo_raw), child, factory_records,
+                                       run=run, defaults=defaults)
+                or _prepare_factory_runtime_prune(child, factory_records)
+            ),
         )
         for child in pruned:
             record = records.get(child.resolve())
             if record is not None and record.publication_outcome == "undetermined":
                 _clear_pruned_orphan_block(home, record, run=run)
+        _prune_preserved_for_closed_issues(home, Path(repo_raw), run=run)
         return pruned
+
+
+def _log_best_effort(event: str, **fields: Any) -> None:
+    try:
+        log_event_sync(event, **fields)
+    except Exception:  # noqa: BLE001 - telemetry must not change the prune outcome
+        pass
+
+
+def _comment_best_effort(run: Callable[[Sequence[str]], Any], issue_id: int, text: str) -> None:
+    try:
+        run([chainlink_bin(), "issue", "comment", str(issue_id), text])
+    except Exception:  # noqa: BLE001 - reporting must not change the prune outcome
+        pass
+
+
+def _preserve_before_prune(
+    home: Path, repo: Path, child: Path, factory_records: Sequence[object], *,
+    run: Callable[[Sequence[str]], Any], defaults: Any,
+) -> bool:
+    """Backstop for attempts whose run never reached its own preservation (#2114).
+
+    Runs only once an attempt is about to be pruned. Always returns False so the
+    prune decision stays with the existing hooks; preservation never blocks it.
+    """
+    from .preserved import is_preserved, preserve_attempt, preserved_line, prune_preserved
+
+    left, sep, right = child.name.partition("-")
+    if not (sep and left.isdigit() and right.isdigit()) or int(left) < 1 or int(right) < 1:
+        return False
+    issue_id, attempt = int(left), int(right)
+    try:
+        if is_preserved(home, issue_id, attempt):
+            return False
+        evidence_path = home / "state" / "worklink" / "evidence" / f"{issue_id}-{attempt}.json"
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        if evidence.get("pr_url"):
+            return False  # Published attempts keep today's behaviour.
+        matching = [record for record in factory_records
+                    if Path(record.sandbox).parent.parent.parent.resolve() == child.resolve()]
+        if matching:
+            checkout, branch = Path(matching[0].sandbox), matching[0].branch
+        else:
+            checkout = child / "checkout" if (child / "checkout" / ".git").is_dir() else child
+            branch = f"issue/{issue_id}-a{attempt}"
+        if not (checkout / ".git").is_dir():
+            return False
+        base = str(evidence.get("base_ref") or defaults.base_branch)
+        reason = (evidence.get("blocked_reason") or evidence.get("failure_reason")
+                  or (f"status={evidence['status']}" if evidence.get("status") else None)
+                  or "retained attempt reached the prune TTL without a recorded outcome")
+        preserved = preserve_attempt(
+            home=home, trusted_repo=repo, checkout=checkout, branch=branch,
+            issue_id=issue_id, attempt=attempt, base_candidates=(f"origin/{base}", base),
+            reason=str(reason), runner=lambda args: run(list(args)),
+        )
+        if preserved is None:
+            return False
+        _log_best_effort("worklink_attempt_preserved", issue_id=issue_id, attempt=attempt,
+                       ref=preserved.ref, error=preserved.error, trigger="prune")
+        _comment_best_effort(run, issue_id, preserved_line(preserved))
+        pruned = prune_preserved(home, repo, issue_id, keep=defaults.preserved_attempts_keep,
+                                 runner=lambda args: run(list(args)))
+        if pruned:
+            _log_best_effort("worklink_preserved_pruned", issue_id=issue_id, attempts=pruned)
+    except Exception as exc:  # noqa: BLE001 - never blocks pruning
+        _log_best_effort("worklink_preservation_failed", issue_id=issue_id,
+                         attempt=attempt, error=str(exc), trigger="prune")
+    return False
+
+
+def _prune_preserved_for_closed_issues(
+    home: Path, repo: Path, *, run: Callable[[Sequence[str]], Any],
+) -> None:
+    """A closed issue keeps no preserved attempts (#2114)."""
+    from .preserved import prune_preserved
+
+    root = home / "state" / "worklink" / "preserved"
+    try:
+        issues = sorted(int(path.name) for path in root.iterdir()
+                        if path.is_dir() and path.name.isdigit())
+    except OSError:
+        return
+    for issue_id in issues:
+        try:
+            shown = run([chainlink_bin(), "issue", "show", str(issue_id), "--json"])
+            if getattr(shown, "returncode", 1) != 0:
+                continue
+            payload = json.loads(shown.stdout or "{}")
+            if not isinstance(payload, dict) or payload.get("status") != "closed":
+                continue
+            pruned = prune_preserved(home, repo, issue_id, keep=0,
+                                     runner=lambda args: run(list(args)))
+            if pruned:
+                _log_best_effort("worklink_preserved_pruned", issue_id=issue_id,
+                               attempts=pruned, reason="issue_closed")
+                _comment_best_effort(
+                    run, issue_id,
+                    f"WORKLINK_PRESERVED_PRUNED issue={issue_id} attempts={json.dumps(pruned)} "
+                    "reason=issue_closed",
+                )
+        except Exception:  # noqa: BLE001 - retention is best effort per issue
+            continue
 
 
 def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object]) -> bool:

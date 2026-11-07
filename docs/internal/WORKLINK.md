@@ -1343,6 +1343,7 @@ defaults:
   max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
   reaper_ttl_s: 86400       # >= 2 * timeout_s; backend + gates heartbeat; lower values warn + clamp
   factory_resumable_retention_s: 86400 # >= reaper_ttl_s; grace since last durable factory observation
+  preserved_attempts_keep: 3 # unpublished attempts kept per issue as refs/worklink/<issue>/<attempt> (#2114)
   allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
