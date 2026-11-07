@@ -8,6 +8,58 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc3] — 2026-11-07
+
+- **Third release candidate for 1.0.0.** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly: `mimir-agent==1.0.0rc3 mimir-cultivate==1.0.0rc3`, or `--prerelease allow`.
+  - **Cultivate decides GitHub trust before fetching anything.** A PR's verdict comes from identity-only facts about its last contributor, the GitHub-verified committer. When a PR isn't trusted, its content is never fetched, so the turn stays clean instead of being tainted after the fact.
+  - **The framework checks out a PR before the turn starts**, recovers divergent and expired leases, and treats a refused resume as a quiet no-work outcome.
+  - **Unpublished Worklink attempts are preserved** as reference for the next attempt.
+
+- Make PyPI Cultivate controller package trees root-owned and read-only so scrubbed subprocess imports cannot create bytecode drift; run live image protocol and health proofs as the controller, reserving root for drift fixture mutations and restoration.
+
+- Preserve the image's no-bytecode policy in interactive and direct shell subprocesses so ordinary CLI imports do not invalidate PyPI Cultivate identity; require provenance validation even when an unknown install mode selects an external assembly name. Exercise minimal shell environments with the no-bytecode policy both set and unset, including worker-UID CI.
+
+- Keep pre-work infrastructure failures from exhausting GitHub review-request attempts; retry them with a separate bounded backoff and report the cause on give-up (#2106).
+
+- Pre-check out scoped poller PRs before review and remediation turns, and surface checkout-first refusal guidance.
+
+- Show open pull requests from all configured repositories and the home origin on the Cultivate ops dashboard.
+
+- Bound Worklink factory control projections without dropping progress rows or gates, report worker-computed slice totals, and retain published epic PRs for operator review after controller errors. Deployment requires rebuilding the root executor image together with the controller: the executor protocol changes from v12 to v13 (`worklink-executor-v13-control-output-size`); a v12 executor refuses launches with the stale-executor diagnostic.
+
+- Run ordered, environment-allowlisted legs in Cultivate repository test suites so review fixes can check both core and Cultivate tests.
+
+- Grant authenticated operator chat turns scoped PR tools after server-verified PR discovery, including checkout and lease-bound follow-on work.
+
+- Attest PR checkout trust from pinned native identity and the verified committer (never author email), preserve collaborator push-sync scopes, and record specific unresolved lookup causes.
+
+- Decide a pull request's trust verdict before fetching its content. `pr_metadata`, `pr_diff`, `pr_files`, `pr_file_content` and `pr_job_log` compute the identity-only verdict for the scoped head first.
+  - An untrusted or unresolved verdict returns a content-free refusal, fetches nothing, and leaves the turn clean.
+  - A head that moves during a read discards the content.
+  - PR title and body also require the PR author to be trusted.
+  - In comment threads, a trusted person's reply vouches for earlier comments that existed when it was written. The bot's own replies and app accounts never vouch, and untrusted reviews are never vouched for (#2113).
+
+- Preserve every unpublished Worklink attempt (blocked, failed or interrupted) that changed anything. The work, including uncommitted and untracked files, is kept as `refs/worklink/<issue>/<attempt>` in the operator repository (never pushed) plus a bounded patch, and reported on the issue as a `WORKLINK_PRESERVED` line. Each attempt records the spec it was dispatched with. The next attempt still starts fresh from the current base, but its prompt gains a `Prior attempts` section with the latest attempt's diff, why it stopped, and how the spec changed, as untrusted reference. `defaults.preserved_attempts_keep` (default 3) bounds retention, and a closed issue's preserved attempts are pruned.
+
+- Recover divergent PR checkout leases without losing unpublished work or blocking subsequent turns.
+
+- Treat refused PR checkout attestation as a no-work remediation turn without renewing the refused lease. This deliberately changes the model's `repo_checkout` resume policy: tainted, missing or corrupt producing-turn lineage, or any otherwise unattested lease, now refuses checkout instead of returning readable untrusted content with writes blocked by taint. Git-class attestation refusals, including `git_timeout`, are also quiet, operator-gated outcomes: the poller stops after two deliveries and does not self-clear a transient Git timeout; the operator must clear the gate. Typed transport failures retain transient failure handling. Tentative resume authority is detached after attestation and revoked if metadata persistence fails.
+
+- Attest Cultivate review re-requests and issue comments so their results do not block later forge writes (#2117).
+
+- Fix a hang in the ACP teardown escalation test on macOS. The repeated signal is now delivered to the main thread, because a process-directed signal delivered to another thread never wakes a main thread parked in teardown (#2118).
+
+- Make `pr_checks` and `pr_review_requests` decide trust before fetching, and replace malformed reviewer entries with a placeholder instead of tainting the turn. Write results are labelled as our own echo without reading the PR, and posting a comment never attests the PR.
+  - Add `MIMIR_GITHUB_AGENT_LOGINS`: other agents' accounts whose replies never vouch for earlier untrusted comments (#2119).
+
+- Attest Cultivate PR forge results by the label the tool publishes rather than by the checkout lease. Reading a thread whose untrusted items were withheld no longer taints the turn. Repository actions still require an attested lease (#2120).
+
+- Build Cultivate deployments exclusively from matched, SHA-256-verified PyPI wheel releases, with explicit version selection and source-era upgrade refusal.
+- Preserve the selected release on setup reruns, preflight released build resources before writing deployment artifacts, and exercise the generated platform/base/extras build in image-identity CI; keep the provider-dependent generated-build regression in the Cultivate-enabled suite rather than requiring Cultivate in core-only jobs.
+- Reject first-party bytecode and compare package inventories with immutable wheels off the health event loop; pin startup hooks to root-owned build-time allowlists, retain legacy source-mode health and assembler compatibility, and use CPU embeddings and a pinned, preseeded uv toolchain in PyPI workers.
+- Refuse changed wheel filenames or hashes for a saved release, keep pip installs bytecode-free explicitly, and route omitted Docker install modes to the actionable provenance diagnostic.
+- Initialize the required controller-owned PR lease directory before starting either direct-run image proof, matching setup's Compose initialization without weakening startup checks.
+
 ## [1.0.0rc2] — 2026-11-05
 
 - **Second release candidate for 1.0.0.** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly (`mimir-agent==1.0.0rc2` or `--prerelease allow`).
