@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import fcntl
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -19,7 +20,7 @@ from langchain_core.messages import ToolMessage
 
 from mimir_cultivate import repository
 from mimir._context import reset_current_turn, set_current_turn
-from mimir_cultivate.policy import RepoPRScopeRegistry
+from mimir_cultivate.policy import RepoPRScopeRegistry, RepoReviewState
 from mimir.plugins.manager import load_plugins
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from tests.test_budget_gate_and_alias import (
@@ -27,8 +28,9 @@ from tests.test_budget_gate_and_alias import (
 )
 from tests.test_repo_tools import (
     _configure_test_suites, _configure_worklink_test, _fixture_git_env,
-    _repo_scope_and_state, _test_checkout_factory,
+    _git, _lineage_turn, _repo_scope_and_state, _test_checkout_factory,
 )
+from tests.lease_attestation_helper import assert_lease_attested
 
 
 @pytest.mark.parametrize("args, stderr, transport", [
@@ -172,6 +174,550 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
     assert repository.RepoGitTools(state).validated_checkout_root() == state.checkout_lease.path
     assert repository.cleanup_pr_checkout_lease(lease, runner=run) is True
     assert not os.path.lexists(lease.path)
+
+
+def _rebased_divergent_lease(tmp_path: Path, *, production_clone: bool = False):
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-qm", "advance base")
+    advanced = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    if production_clone:
+        _git(source, "tag", "fixture-release")
+        # Create the lease with the canonical source on main and tagged, using
+        # the real clone path. Remove the unused fixture lease first.
+        repository.cleanup_pr_checkout_lease(lease)
+        lease = repository.create_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease.lease_root,
+        )
+        assert _git(lease.path, "rev-parse", "refs/heads/main") == advanced
+        assert _git(lease.path, "rev-parse", "refs/tags/fixture-release") == advanced
+    _git(lease.path, "fetch", "origin", "main")
+    _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "rebase", "origin/main")
+    assert _git(lease.path, "rev-parse", "HEAD") != scope.observed_head_sha
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    return source, scope, replace(scope, observed_base_sha=advanced), lease
+
+
+@pytest.mark.parametrize("production_clone", [False, True])
+def test_divergent_patch_equivalent_lease_is_discarded_before_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, production_clone: bool,
+) -> None:
+    source, original_scope, scope, lease = _rebased_divergent_lease(
+        tmp_path, production_clone=production_clone,
+    )
+    metadata = lease.path / repository._METADATA
+    original_expiry = json.loads(metadata.read_text())["expires_at"]
+    with pytest.raises(RuntimeError, match="cannot be renewed"):
+        repository.recover_pr_checkout_lease(
+            lease.path, original_scope, owner=scope.principal, lease_root=lease.lease_root,
+        )
+    assert json.loads(metadata.read_text())["expires_at"] == original_expiry
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_, **_details: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh_state = RepoReviewState(scope)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=fresh_state,
+    )
+    assert "pr_checkout_lease_discarded_equivalent" in events
+    assert not lease.path.exists()
+    assert fresh.path != lease.path and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert_lease_attested(_lineage_turn(scope, fresh_state), scope, fresh)
+
+
+def test_divergent_unique_work_is_preserved_and_fresh_lease_acquired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    source, _original_scope, scope, lease = _rebased_divergent_lease(tmp_path)
+    (lease.path / "unique.txt").write_text("unpublished work\n")
+    _git(lease.path, "add", "unique.txt")
+    _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "-qm", "unique fix")
+    unique_head = _git(lease.path, "rev-parse", "HEAD")
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_, **_details: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(scope),
+    )
+    ref = f"refs/worklink-lease/{scope.pr_number}/{lease.recovery_id}"
+    patch = lease.lease_root / ".recovery" / f"{lease.path.name}-{lease.recovery_id}.patch"
+    assert _git(source, "rev-parse", ref) == unique_head
+    assert "unique.txt" in patch.read_text()
+    assert "pr_checkout_lease_preserved_divergent" in events
+    assert "pr_checkout_lease_discarded_equivalent" not in events
+    assert ref in caplog.text and str(patch) in caplog.text
+    assert not lease.path.exists()
+    assert fresh.path != lease.path and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+
+
+def test_repo_rebase_records_unpublished_replay_and_next_turn_discards_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-qm", "advance base")
+    advanced = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        repository.RepoGitTools(
+            state, auth_context=_lineage_turn(scope, state),
+        ).execute(repository.GitRebase())
+    rebased = _git(lease.path, "rev-parse", "HEAD")
+    assert json.loads((lease.path / repository._METADATA).read_text())["lineage"][rebased] is True
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    next_scope = replace(scope, observed_base_sha=advanced, event_type="pr_review_requested")
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: next_scope.observed_head_sha)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        next_scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(next_scope),
+    )
+    assert fresh.path != lease.path and candidates == ()
+    assert not lease.path.exists()
+
+
+def test_dirty_equivalent_checkout_is_preserved_not_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
+    (lease.path / "draft.txt").write_text("working tree draft\n")
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_, **_details: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh, _ = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(scope),
+    )
+    archive = (lease.lease_root / ".recovery" /
+               f"{lease.path.name}-{lease.recovery_id}.checkout.tar.gz")
+    assert archive.is_file()
+    assert "pr_checkout_lease_preserved_divergent" in events
+    assert "pr_checkout_lease_discarded_equivalent" not in events
+    assert fresh.path != lease.path
+
+
+@pytest.mark.parametrize("content", ["pull\trequest\n", "    pull request\n", "pullrequest\n"])
+def test_divergent_whitespace_is_unique_work(tmp_path: Path, content: str) -> None:
+    source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
+    (lease.path / "tracked.txt").write_text(content)
+    _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "--amend", "-qam", "whitespace resolution")
+    head = _git(lease.path, "rev-parse", "HEAD")
+    notices = []
+    assert repository._discard_divergent_candidate(
+        lease, scope, runner=repository._default_runner, notices=notices,
+    )
+    shown = subprocess.run(
+        ["git", "-C", str(source), "show", f"{notices[0]['ref']}:tracked.txt"],
+        capture_output=True, text=True, check=True, env=_fixture_git_env(),
+    )
+    assert shown.stdout == content
+    assert _git(source, "rev-parse", notices[0]["ref"]) == head
+    assert Path(notices[0]["bundle"]).is_file()
+    assert Path(notices[0]["archive"]).is_file()
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/fixture-release"])
+def test_modified_inherited_clone_ref_forces_preservation(tmp_path: Path, ref: str) -> None:
+    source, _original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    head = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "update-ref", ref, head)
+    assert _git(source, "rev-parse", ref) != head
+    notices = []
+    assert repository._discard_divergent_candidate(
+        lease, scope, runner=repository._default_runner, notices=notices,
+    )
+    assert notices and Path(notices[0]["bundle"]).is_file()
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/fixture-release"])
+@pytest.mark.parametrize("reachable_from", ["source", "origin"])
+def test_moved_source_ref_does_not_force_preservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: str, reachable_from: str,
+) -> None:
+    source, _original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    inherited = _git(lease.path, "rev-parse", ref)
+    (source / "later.txt").write_text("source advanced again\n")
+    _git(source, "add", "later.txt")
+    _git(source, "commit", "-qm", "advance source refs")
+    _git(source, "update-ref", ref, "HEAD")
+    if reachable_from == "source":
+        # Remove origin reachability to isolate the source-current-refs lane.
+        _git(lease.path, "update-ref", "-d", "refs/remotes/origin/main")
+    else:
+        # Move source refs to unrelated history. The inherited tip is now
+        # redundant solely through the lease's published origin tracking ref.
+        _git(source, "update-ref", "refs/heads/main", scope.observed_head_sha)
+        _git(source, "update-ref", "refs/tags/fixture-release", scope.observed_head_sha)
+    assert _git(source, "rev-parse", ref) != inherited
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_, **_details: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(scope),
+    )
+    assert events == ["pr_checkout_lease_discarded_equivalent"]
+    assert not lease.path.exists() and fresh.path != lease.path and candidates == ()
+    assert not (lease.lease_root / ".recovery").exists()
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/fixture-release"])
+@pytest.mark.parametrize("control", ["missing_name", "unreachable_source_object"])
+def test_inherited_ref_without_source_reachability_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: str, control: str,
+) -> None:
+    source, _original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    inherited = _git(lease.path, "rev-parse", ref)
+    if control == "missing_name":
+        _git(source, "update-ref", "-d", ref)
+        # Published reachability alone must not exempt a name absent in source.
+        assert not _git(lease.path, "rev-list", inherited, "--not", "--remotes=origin", "--")
+    else:
+        _git(lease.path, "update-ref", "-d", "refs/remotes/origin/main")
+        _git(source, "update-ref", "refs/heads/main", scope.observed_head_sha)
+        _git(source, "update-ref", "refs/tags/fixture-release", scope.observed_head_sha)
+        _git(source, "update-ref", "-d", "refs/remotes/origin/main")
+        assert _git(source, "cat-file", "-t", inherited) == "commit"
+        assert _git(source, "rev-parse", ref) != inherited
+        assert _git(source, "rev-list", inherited, "--not", "--branches", "--tags",
+                    "--remotes=origin", "--")
+        assert _git(lease.path, "rev-list", inherited, "--not", "--remotes=origin", "--")
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_, **_details: events.append(event))
+    state = RepoReviewState(scope)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+    )
+    notice, = state.checkout_recovery_notices
+    assert events == ["pr_checkout_lease_preserved_divergent"]
+    assert fresh.path != lease.path and not lease.path.exists() and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    import shutil
+    import tarfile
+
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    with tarfile.open(notice["archive"]) as archive:
+        archive.extractall(restored, filter="data")
+    tree = restored / "worktree"
+    seed = tmp_path / "published.git"
+    subprocess.run(["git", "clone", "--bare", scope.canonical_origin, str(seed)],
+                   check=True, capture_output=True, env=_fixture_git_env())
+    _git(seed, "bundle", "unbundle", notice["bundle"])
+    shutil.copytree(seed / "objects", tree / ".git/objects")
+    assert _git(tree, "rev-parse", ref) == inherited
+    assert _git(tree, "show", f"{ref}:base-update.txt") == "advanced base"
+
+
+@pytest.mark.parametrize("reflog_state", ["expired", "replay", "unique_commit"])
+def test_behind_head_with_untracked_file_recovers_empty_incremental_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reflog_state: str,
+) -> None:
+    import shutil
+    import tarfile
+
+    source, original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    replay = _git(lease.path, "rev-parse", "HEAD")
+    reflog_commits = [replay]
+    if reflog_state == "unique_commit":
+        (lease.path / "reflog-only.txt").write_text("unique reflog draft\n")
+        _git(lease.path, "add", "reflog-only.txt")
+        _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+             "commit", "-qm", "reflog-only work")
+        reflog_commits.append(_git(lease.path, "rev-parse", "HEAD"))
+    _git(lease.path, "reset", "--hard", original.observed_base_sha)
+    if reflog_state == "expired":
+        _git(lease.path, "reflog", "expire", "--expire=now", "--all")
+        reflog_commits = []
+    # Every advertised ref tip is published, regardless of reflog-only work.
+    assert not _git(lease.path, "rev-list", "--all", "HEAD",
+                    "--not", "--remotes=origin", "--")
+    unpublished = _git(lease.path, "rev-list", "--all", "HEAD", "--reflog",
+                       "--not", "--remotes=origin", "--").splitlines()
+    assert set(reflog_commits) <= set(unpublished)
+    if reflog_state == "expired":
+        assert not unpublished
+    (lease.path / "draft.txt").write_text("untracked draft survives\n")
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    state = RepoReviewState(scope)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+    )
+    notice, = state.checkout_recovery_notices
+    assert fresh.path != lease.path and not lease.path.exists() and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert _git(source, "rev-parse", notice["ref"]) == original.observed_base_sha
+    assert Path(notice["patch"]).is_file()
+    bundle = Path(notice["bundle"])
+    assert bundle.is_file()
+    # Full fallback must be self-contained, not an empty placeholder.
+    header = bundle.read_bytes().split(b"\n\n", 1)[0]
+    assert not any(line.startswith(b"-") for line in header.splitlines())
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    with tarfile.open(notice["archive"]) as archive:
+        archive.extractall(restored, filter="data")
+    tree = restored / "worktree"
+    seed = tmp_path / "empty.git"
+    seed.mkdir()
+    _git(seed, "init", "--bare")
+    _git(seed, "bundle", "verify", str(bundle))
+    _git(seed, "bundle", "unbundle", str(bundle))
+    # Verify object presence in an empty object store, not the original lease
+    # or an origin clone that could mask missing bundle contents.
+    for commit in reflog_commits:
+        assert _git(seed, "cat-file", "-t", commit) == "commit"
+    shutil.copytree(seed / "objects", tree / ".git/objects")
+    for commit in reflog_commits:
+        assert commit in _git(tree, "reflog", "show", "--format=%H", "HEAD").splitlines()
+        assert _git(tree, "show", f"{commit}:tracked.txt") == "pull request"
+    if reflog_state == "unique_commit":
+        assert _git(tree, "show", f"{reflog_commits[-1]}:reflog-only.txt") == "unique reflog draft"
+    assert (tree / "draft.txt").read_text() == "untracked draft survives\n"
+    assert _git(tree, "rev-parse", "HEAD") == original.observed_base_sha
+    assert _git(tree, "show", "HEAD:tracked.txt")
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert_lease_attested(_lineage_turn(scope, state), scope, fresh)
+
+
+@pytest.mark.parametrize("state_kind", ["stash", "two_stashes", "ignored", "branch", "tag"])
+def test_divergent_hidden_state_is_recoverable(tmp_path: Path, state_kind: str) -> None:
+    import tarfile
+
+    _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
+    if state_kind == "ignored":
+        (lease.path / ".git/info/exclude").write_text("secret-draft.txt\n")
+        (lease.path / "secret-draft.txt").write_text("ignored work\n")
+    else:
+        (lease.path / "tracked.txt").write_text("hidden work\n")
+        if state_kind in {"stash", "two_stashes"}:
+            _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                 "stash", "push", "-m", "saved draft")
+            if state_kind == "two_stashes":
+                (lease.path / "tracked.txt").write_text("newer hidden work\n")
+                _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                     "stash", "push", "-m", "second draft")
+        else:
+            _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                 "commit", "-qam", "hidden work")
+            _git(lease.path, "branch" if state_kind == "branch" else "tag", "saved-draft")
+            _git(lease.path, "reset", "--hard", "HEAD~1")
+    assert not _git(lease.path, "status", "--porcelain")
+    notices = []
+    assert repository._discard_divergent_candidate(
+        lease, scope, runner=repository._default_runner, notices=notices,
+    )
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    with tarfile.open(notices[0]["archive"]) as archive:
+        archive.extractall(restored, filter="data")
+    tree = restored / "worktree"
+    assert not (tree / ".git/objects").exists()
+    # Seed objects through a separate origin clone: fetching directly into the
+    # restored metadata would negotiate using refs whose objects are absent.
+    import shutil
+    seed = tmp_path / "published.git"
+    subprocess.run(["git", "clone", "--bare", scope.canonical_origin, str(seed)],
+                   check=True, capture_output=True, env=_fixture_git_env())
+    # Incremental recovery must actually exclude published objects, not merely
+    # pass the flag: its header advertises prerequisite commits from origin.
+    header = Path(notices[0]["bundle"]).read_bytes().split(b"\n\n", 1)[0]
+    assert any(line.startswith(b"-") for line in header.splitlines())
+    imported = subprocess.run(
+        ["git", "-C", str(seed), "bundle", "unbundle", notices[0]["bundle"]],
+        capture_output=True, text=True, env=_fixture_git_env(),
+    )
+    assert imported.returncode == 0, imported.stderr
+    shutil.copytree(seed / "objects", tree / ".git/objects")
+    if state_kind == "ignored":
+        assert (tree / "secret-draft.txt").read_text() == "ignored work\n"
+    else:
+        ref = "refs/stash" if state_kind in {"stash", "two_stashes"} else (
+            "refs/heads/saved-draft" if state_kind == "branch" else "refs/tags/saved-draft"
+        )
+        expected = "newer hidden work" if state_kind == "two_stashes" else "hidden work"
+        assert _git(tree, "show", f"{ref}:tracked.txt") == expected
+        if state_kind == "two_stashes":
+            assert _git(tree, "show", "stash@{1}:tracked.txt") == "hidden work"
+        heads = _git(tree, "bundle", "list-heads", notices[0]["bundle"])
+        assert ref in heads
+
+
+@pytest.mark.parametrize("gate", [
+    "scoped", "base", "substitution", "recovery_ref", "diff",
+    "recovery_revisions", "bundle_create", "bundle_verify",
+])
+def test_divergent_probe_errors_preserve_lease(tmp_path: Path, gate: str) -> None:
+    _source, original, scope, lease = _rebased_divergent_lease(tmp_path)
+    if gate in {"recovery_ref", "recovery_revisions", "bundle_create", "bundle_verify"}:
+        (lease.path / "draft.txt").write_text("draft")
+    before = (lease.path / repository._METADATA).read_bytes()
+    head = _git(lease.path, "rev-parse", "HEAD")
+    reached = []
+    base_probes = []
+
+    def runner(argv):
+        is_base_probe = argv[3:] == ["merge-base", "--is-ancestor", scope.observed_base_sha, head]
+        if is_base_probe:
+            base_probes.append(argv)
+        fail = (
+            (gate == "scoped" and argv[3:] == ["merge-base", "--is-ancestor", scope.observed_head_sha, head])
+            or (gate == "base" and is_base_probe and len(base_probes) == 2)
+            or (gate == "substitution" and argv[3:] == ["merge-base", "--is-ancestor", lease.base_sha, scope.observed_base_sha])
+            or (gate == "recovery_ref" and argv[3:5] == ["rev-parse", "--verify"] and argv[-1].startswith("refs/worklink-lease/"))
+            or (gate == "diff" and "diff-tree" in argv)
+            or (gate == "recovery_revisions" and argv[3:] == [
+                "rev-list", "--objects", "--no-object-names", "--max-count=1",
+                "--all", "HEAD", "--not", "--remotes=origin", "--",
+            ])
+            or (gate == "bundle_create" and argv[3:5] == ["bundle", "create"])
+            or (gate == "bundle_verify" and argv[3:5] == ["bundle", "verify"])
+        )
+        if fail:
+            reached.append(argv)
+            return subprocess.CompletedProcess(argv, 128, stdout="", stderr="injected probe failure")
+        return repository._default_runner(argv)
+
+    expected = "base ancestry inspection failed" if gate == "base" else None
+    with pytest.raises(RuntimeError, match=expected):
+        repository._discard_divergent_candidate(lease, scope, runner=runner)
+    assert reached
+    if gate == "base":
+        assert len(base_probes) == 2  # substitution passed; final ancestry failed
+    assert lease.path.is_dir()
+    assert (lease.path / repository._METADATA).read_bytes() == before
+
+
+@pytest.mark.parametrize("probe_error", [False, True])
+def test_foreign_rebind_ancestry_gate_does_not_renew(tmp_path: Path, probe_error: bool) -> None:
+    _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
+    before = (lease.path / repository._METADATA).read_bytes()
+    head = _git(lease.path, "rev-parse", "HEAD")
+    reached = []
+    def runner(argv):
+        if argv[3:] == ["merge-base", "--is-ancestor", scope.observed_head_sha, head]:
+            reached.append(argv)
+            if probe_error:
+                return subprocess.CompletedProcess(argv, 128, stdout="", stderr="probe failed")
+        return repository._default_runner(argv)
+    with pytest.raises(RuntimeError, match="cannot be rebound"):
+        repository._rebind_foreign_candidate(
+            lease, scope, head=head, ttl=timedelta(hours=2), review_state=None,
+            runner=runner,
+        )
+    assert reached
+    assert (lease.path / repository._METADATA).read_bytes() == before
+
+
+@pytest.mark.parametrize("control", ["alternates", "cap", "merge", "old_base", "nonancestor_base"])
+def test_divergent_equivalence_guards(tmp_path: Path, control: str) -> None:
+    _source, original, scope, lease = _rebased_divergent_lease(tmp_path)
+    if control == "alternates":
+        (lease.path / ".git/objects/info/alternates").write_text("/missing/objects\n")
+        with pytest.raises(RuntimeError):
+            repository._discard_divergent_candidate(lease, scope, runner=repository._default_runner)
+        assert lease.path.is_dir()
+        return
+    if control == "nonancestor_base":
+        # The published PR head is not an ancestor of the rebased checkout.
+        scope = replace(scope, observed_base_sha=original.observed_head_sha)
+    if control == "old_base":
+        scope = original
+    if control == "merge":
+        _git(lease.path, "checkout", "-b", "side", scope.observed_base_sha)
+        (lease.path / "side.txt").write_text("merge resolution\n")
+        _git(lease.path, "add", "side.txt")
+        _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+             "commit", "-qm", "side")
+        _git(lease.path, "checkout", scope.head_ref)
+        _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+             "merge", "--no-ff", "side", "-m", "merge resolution")
+        _git(lease.path, "branch", "-D", "side")
+    reached = []
+    def runner(argv):
+        result = repository._default_runner(argv)
+        if control == "cap" and argv[3:5] == ["rev-list", "--max-count=501"]:
+            reached.append(argv)
+            commit = result.stdout.splitlines()[0]
+            return subprocess.CompletedProcess(argv, 0, stdout=(commit + "\n") * 501, stderr="")
+        return result
+    notices = []
+    assert repository._discard_divergent_candidate(lease, scope, runner=runner, notices=notices)
+    assert notices and Path(notices[0]["bundle"]).is_file()
+    if control == "cap":
+        assert reached
+
+
+def test_divergent_live_recheck_prevents_retirement(tmp_path: Path, monkeypatch) -> None:
+    from mimir_cultivate import scheduler
+
+    _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
+    calls = []
+    def active():
+        calls.append(True)
+        return set() if len(calls) == 1 else {lease.path}
+    monkeypatch.setattr(scheduler, "active_pr_checkout_lease_paths", active)
+    with pytest.raises(RuntimeError, match="live PR checkout"):
+        repository._discard_divergent_candidate(lease, scope, runner=repository._default_runner)
+    assert len(calls) == 2 and lease.path.is_dir()
+
+
+def test_preserved_notice_reaches_real_checkout_result(tmp_path: Path, monkeypatch) -> None:
+    from mimir.plugins.core import policy_scope
+    from langgraph.prebuilt import ToolRuntime
+
+    _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
+    (lease.path / "draft.txt").write_text("recover me\n")
+    state = RepoReviewState(scope)
+    monkeypatch.setattr(repository, "_observe_current_pr_head", lambda _scope: scope.observed_head_sha)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_review_state=state, repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    from mimir_cultivate import forge
+    monkeypatch.setattr(forge, "_client", lambda _scope: SimpleNamespace())
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        result = repository.checkout_scoped_pr(
+            scope.canonical_repo, scope.pr_number,
+            ToolRuntime(state={}, context=auth, config={}, stream_writer=lambda _: None,
+                        tool_call_id="checkout", store=None),
+        )
+    notice, = result["preserved_prior_work"]
+    assert notice["ref"] == f"refs/worklink-lease/{scope.pr_number}/{lease.recovery_id}"
+    assert Path(notice["bundle"]).is_file() and Path(notice["archive"]).is_file()
+    assert result["path"] != str(lease.path)
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

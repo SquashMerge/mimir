@@ -109,6 +109,9 @@ class RepoReviewState:
     """Immutable PR authority plus typed checkout-lease and execution evidence."""
 
     action_scope: RepoPRActionScope
+    checkout_recovery_notices: list[dict[str, str]] = field(
+        default_factory=list, init=False, repr=False, compare=False,
+    )
     checked_out: bool = field(default=False, init=False, compare=False)
     checkout_lease: object = field(default=None, init=False, repr=False, compare=False)
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)

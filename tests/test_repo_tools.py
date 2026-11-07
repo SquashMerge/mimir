@@ -1733,7 +1733,7 @@ def test_rebase_is_refused_when_lease_cannot_publish_rewritten_history(
     assert not (lease.path / ".git" / "rebase-merge").exists()
 
 
-def test_retained_non_fast_forward_fix_can_resume_and_publish_next_turn(
+def test_equivalent_retained_rebase_is_replaced_before_publishing_next_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     origin, source, scope, original_state = _repo_scope_and_state(tmp_path)
@@ -1752,44 +1752,19 @@ def test_retained_non_fast_forward_fix_can_resume_and_publish_next_turn(
         lambda _scope: scope.observed_head_sha,
     )
     state = RepoReviewState(scope)
-    resumed, _ = acquire_pr_checkout_lease(
+    fresh, candidates = acquire_pr_checkout_lease(
         scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
     )
-    assert resumed.path == lease.path
+    assert fresh.path != lease.path
+    assert not lease.path.exists()
+    assert candidates == ()
     tools = RepoGitTools(state)
-    (lease.path / "fix.txt").write_text("retained fix\n")
-    tools.execute(GitCommit(("fix.txt",), "fix after retained rebase"))
-    fix_head = _git(lease.path, "rev-parse", "HEAD")
-    with pytest.raises(GitRefusal) as refused:
-        tools.execute(GitPush())
-    assert refused.value.code == "force_push_refused"
-    # Reproduce the old fallback exactly: base is already included, so merging
-    # it alone cannot reconcile the published PR history.
-    assert "Already up to date" in _git(lease.path, "merge", "--no-edit", advanced_base)
-    with pytest.raises(GitRefusal) as refused:
-        tools.execute(GitPush())
-    assert refused.value.code == "force_push_refused"
-    with pytest.raises(GitRefusal) as refused:
-        tools.execute(GitRebase())
-    assert refused.value.code == "rebase_in_lease_refused"
-
-    later_scope = replace(scope, event_type="pr_review_submitted")
-    assert later_scope.scope_id != scope.scope_id
-    later_state = RepoReviewState(later_scope)
-    later_lease, candidates = acquire_pr_checkout_lease(
-        later_scope, owner=scope.principal, lease_root=lease.lease_root,
-        review_state=later_state,
-    )
-    assert later_lease.path == lease.path
-    assert candidates == (fix_head,)
-    assert _git(lease.path, "rev-parse", "HEAD") == fix_head
-    later_tools = RepoGitTools(later_state)
-    assert later_tools.execute(GitMerge()).ok
-    assert _git(lease.path, "merge-base", "--is-ancestor", scope.observed_head_sha, "HEAD") == ""
-    assert _git(lease.path, "merge-base", "--is-ancestor", fix_head, "HEAD") == ""
-    assert later_tools.execute(GitPush()).ok
-    assert _git(origin, "rev-parse", scope.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
-    assert (lease.path / "fix.txt").read_text() == "retained fix\n"
+    (fresh.path / "fix.txt").write_text("new fix\n")
+    tools.execute(GitCommit(("fix.txt",), "fix after fresh checkout"))
+    assert tools.execute(GitMerge()).ok
+    assert tools.execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(fresh.path, "rev-parse", "HEAD")
+    assert (fresh.path / "fix.txt").read_text() == "new fix\n"
 
 
 def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) -> None:
