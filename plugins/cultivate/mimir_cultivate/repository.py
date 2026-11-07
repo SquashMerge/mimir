@@ -6,6 +6,7 @@ from __future__ import annotations
 # Repository inventory
 import re
 import os
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -1370,6 +1371,11 @@ def _recover_pr_checkout_lease_unlocked(
             f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
             f"fetched head is {remote_head}"
         )
+    ancestry = runner([
+        "git", "-C", str(path), "merge-base", "--is-ancestor", remote_head, head,
+    ])
+    if ancestry.returncode != 0:
+        raise RuntimeError("divergent PR checkout lease cannot be renewed")
     lease = replace(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
@@ -1950,6 +1956,11 @@ def _foreign_candidate_head(
             (ancestor.stderr or ancestor.stdout).strip()
             or "PR checkout lease candidate ancestry inspection failed"
         )
+    # A matching published anchor is enough to inspect a divergent candidate;
+    # it is NOT sufficient to renew or attest it. Acquisition classifies its
+    # patches and retires it before any rebind.
+    if published.returncode == 0 and published.stdout.strip().lower() == observed_head:
+        return head, True
     return head, False
 
 
@@ -2006,6 +2017,11 @@ def _rebind_foreign_candidate(
         "retained PR checkout has no HEAD",
     ).lower() != head:
         raise RuntimeError("retained PR checkout HEAD changed during lease recovery")
+    ancestry = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", remote_head, head,
+    ])
+    if ancestry.returncode != 0:
+        raise RuntimeError("divergent PR checkout lease cannot be rebound")
 
     rebound = replace(
         lease,
@@ -2035,6 +2051,117 @@ def _rebind_foreign_candidate(
     return rebound
 
 
+def _discard_divergent_candidate(
+    lease: PRCheckoutLease, scope: RepoPRActionScope, *, runner: Runner,
+) -> bool:
+    """Retire a divergent checkout, retaining anything not proven redundant."""
+    head = _run(
+        runner, ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+        "retained PR checkout has no HEAD",
+    ).lower()
+    scoped = scope.observed_head_sha.lower()
+    ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", scoped, head,
+    ])
+    if ancestor.returncode == 0:
+        return False
+    if ancestor.returncode != 1:
+        raise RuntimeError("PR checkout lease ancestry inspection failed")
+    origin = _run(runner, [
+        "git", "-C", str(lease.path), "config", "--get", "remote.origin.url",
+    ], "retained PR checkout has no origin")
+    branch = _run(runner, [
+        "git", "-C", str(lease.path), "symbolic-ref", "--quiet", "--short", "HEAD",
+    ], "retained PR checkout has no branch")
+    if (origin != scope.canonical_origin or lease.canonical_origin != origin
+            or branch != scope.head_ref or lease.destination_ref != scope.destination_ref):
+        raise RuntimeError("divergent PR checkout lease identity mismatch")
+    _assert_self_contained_checkout(lease.path, runner=runner)
+    _run(runner, [
+        "git", "-C", str(lease.path), "fetch", "--no-tags", "origin",
+        scope.checkout_ref or scope.destination_ref,
+    ], "PR head fetch failed during divergent lease inspection")
+    remote_head = _run(runner, [
+        "git", "-C", str(lease.path), "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+    ], "PR head missing during divergent lease inspection").lower()
+    if remote_head != scoped:
+        raise RuntimeError("PR head advanced during divergent lease inspection")
+    status = _run(runner, [
+        "git", "-C", str(lease.path), "status", "--porcelain=v1",
+        "--untracked-files=all",
+    ], "retained PR checkout status inspection failed")
+    base = lease.base_sha.lower()
+    # A lease created before the scoped base advanced may have been rebased
+    # without updating its metadata. Exclude only a scoped, verified base that
+    # is itself an ancestor of the checkout; never infer one from the checkout.
+    scoped_base = scope.observed_base_sha.lower()
+    if runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", base, scoped_base,
+    ]).returncode == 0 and runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", scoped_base, head,
+    ]).returncode == 0:
+        base = scoped_base
+    base_ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", base, head,
+    ])
+    equivalent = False
+    if base_ancestor.returncode == 0 and not status:
+        # A base advance is not PR work. Only commits outside the verified
+        # base may be dropped, and git cherry must classify *every* one.
+        commits = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--max-count=501",
+            head, "--not", scoped, base, "--",
+        ], "retained PR checkout commit inspection failed").splitlines()
+        cherry = _run(runner, [
+            "git", "-C", str(lease.path), "cherry", scoped, head, base,
+        ], "retained PR checkout patch inspection failed").splitlines()
+        equivalent = len(commits) <= 500 and len(cherry) == len(commits) and (
+            set(commits) == {line[2:] for line in cherry if line.startswith("- ")}
+        )
+    elif base_ancestor.returncode not in {0, 1}:
+        raise RuntimeError("PR checkout lease base ancestry inspection failed")
+
+    if equivalent:
+        _report_retained_candidates(
+            "pr_checkout_lease_discarded_equivalent", scope, [(lease.path, head)],
+        )
+    else:
+        bundle = _recover_retained_checkout(
+            lease, head=head, dirty=bool(status), runner=runner,
+        )
+        patch = bundle.with_suffix(".patch")
+        # A binary tree diff retains merge resolutions too; the bundle is the
+        # authoritative history and the patch is for operator inspection.
+        diff = _run(runner, [
+            "git", "-C", str(lease.path), "diff", "--binary", base, head, "--",
+        ], "retained PR checkout patch creation failed")
+        staging = patch.with_name(f".{patch.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            staging.write_text(diff + "\n", encoding="utf-8")
+            os.replace(staging, patch)
+        finally:
+            staging.unlink(missing_ok=True)
+        ref = f"refs/worklink-lease/{scope.pr_number}/{lease.recovery_id}"
+        _run(runner, [
+            "git", "-C", str(lease.source_root), "fetch", "--no-tags",
+            str(lease.path), f"{head}:{ref}",
+        ], "retained PR checkout recovery ref creation failed")
+        if _run(runner, [
+            "git", "-C", str(lease.source_root), "rev-parse", "--verify", ref,
+        ], "retained PR checkout recovery ref verification failed").lower() != head:
+            raise RuntimeError("retained PR checkout recovery ref differs from HEAD")
+        _report_retained_candidates(
+            "pr_checkout_lease_preserved_divergent", scope, [(patch, head)],
+        )
+        logging.getLogger(__name__).warning(
+            "Divergent PR checkout preserved: %s at %s; patch %s; bundle %s",
+            ref, lease.source_root, patch, bundle,
+        )
+    rmtree_missing_ok(lease.path)
+    lease.revoke()
+    return True
+
+
 def acquire_pr_checkout_lease(
     scope: RepoPRActionScope,
     *,
@@ -2044,7 +2171,7 @@ def acquire_pr_checkout_lease(
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
 ) -> tuple[PRCheckoutLease, tuple[str, ...]]:
-    """Resume the sole exact-scope lease, refusing divergent retained fixes."""
+    """Resume an ancestral lease or replace divergent work after recovery."""
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
         raise RuntimeError("scope does not grant PR checkout")
     if owner != scope.principal:
@@ -2225,6 +2352,13 @@ def acquire_pr_checkout_lease(
                 else:
                     foreign_candidates.append((lease.path, head))
 
+        # Classify before _recover or _rebind writes a new expiry. A checkout
+        # on a different base cannot attest even if its recorded lineage is clean.
+        for path, _head in tuple(candidates):
+            existing = _lease_from_recorded_metadata(path, root)
+            if _discard_divergent_candidate(existing, scope, runner=runner):
+                candidates = [(p, h) for p, h in candidates if p != path]
+                rebound_candidates.pop(path, None)
         unpublished = [
             (path, head) for path, head in candidates
             if head != scope.observed_head_sha.lower()

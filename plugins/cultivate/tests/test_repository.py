@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import fcntl
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -19,7 +20,7 @@ from langchain_core.messages import ToolMessage
 
 from mimir_cultivate import repository
 from mimir._context import reset_current_turn, set_current_turn
-from mimir_cultivate.policy import RepoPRScopeRegistry
+from mimir_cultivate.policy import RepoPRScopeRegistry, RepoReviewState
 from mimir.plugins.manager import load_plugins
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from tests.test_budget_gate_and_alias import (
@@ -27,8 +28,9 @@ from tests.test_budget_gate_and_alias import (
 )
 from tests.test_repo_tools import (
     _configure_test_suites, _configure_worklink_test, _fixture_git_env,
-    _repo_scope_and_state, _test_checkout_factory,
+    _git, _lineage_turn, _repo_scope_and_state, _test_checkout_factory,
 )
+from tests.lease_attestation_helper import assert_lease_attested
 
 
 @pytest.mark.parametrize("args, stderr, transport", [
@@ -172,6 +174,135 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
     assert repository.RepoGitTools(state).validated_checkout_root() == state.checkout_lease.path
     assert repository.cleanup_pr_checkout_lease(lease, runner=run) is True
     assert not os.path.lexists(lease.path)
+
+
+def _rebased_divergent_lease(tmp_path: Path):
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-qm", "advance base")
+    advanced = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    _git(lease.path, "fetch", "origin", "main")
+    _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "rebase", "origin/main")
+    assert _git(lease.path, "rev-parse", "HEAD") != scope.observed_head_sha
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    return source, scope, replace(scope, observed_base_sha=advanced), lease
+
+
+def test_divergent_patch_equivalent_lease_is_discarded_before_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, original_scope, scope, lease = _rebased_divergent_lease(tmp_path)
+    metadata = lease.path / repository._METADATA
+    original_expiry = json.loads(metadata.read_text())["expires_at"]
+    with pytest.raises(RuntimeError, match="cannot be renewed"):
+        repository.recover_pr_checkout_lease(
+            lease.path, original_scope, owner=scope.principal, lease_root=lease.lease_root,
+        )
+    assert json.loads(metadata.read_text())["expires_at"] == original_expiry
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh_state = RepoReviewState(scope)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=fresh_state,
+    )
+    assert "pr_checkout_lease_discarded_equivalent" in events
+    assert not lease.path.exists()
+    assert fresh.path != lease.path and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert_lease_attested(_lineage_turn(scope, fresh_state), scope, fresh)
+
+
+def test_divergent_unique_work_is_preserved_and_fresh_lease_acquired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    source, _original_scope, scope, lease = _rebased_divergent_lease(tmp_path)
+    (lease.path / "unique.txt").write_text("unpublished work\n")
+    _git(lease.path, "add", "unique.txt")
+    _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "-qm", "unique fix")
+    unique_head = _git(lease.path, "rev-parse", "HEAD")
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(scope),
+    )
+    ref = f"refs/worklink-lease/{scope.pr_number}/{lease.recovery_id}"
+    patch = lease.lease_root / ".recovery" / f"{lease.path.name}-{lease.recovery_id}.patch"
+    assert _git(source, "rev-parse", ref) == unique_head
+    assert "unique.txt" in patch.read_text()
+    assert "pr_checkout_lease_preserved_divergent" in events
+    assert "pr_checkout_lease_discarded_equivalent" not in events
+    assert ref in caplog.text and str(patch) in caplog.text
+    assert not lease.path.exists()
+    assert fresh.path != lease.path and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+
+
+def test_repo_rebase_records_unpublished_replay_and_next_turn_discards_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    _git(source, "checkout", "-q", "main")
+    (source / "base-update.txt").write_text("advanced base\n")
+    _git(source, "add", "base-update.txt")
+    _git(source, "commit", "-qm", "advance base")
+    advanced = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        repository.RepoGitTools(
+            state, auth_context=_lineage_turn(scope, state),
+        ).execute(repository.GitRebase())
+    rebased = _git(lease.path, "rev-parse", "HEAD")
+    assert json.loads((lease.path / repository._METADATA).read_text())["lineage"][rebased] is True
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    next_scope = replace(scope, observed_base_sha=advanced, event_type="pr_review_requested")
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: next_scope.observed_head_sha)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        next_scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(next_scope),
+    )
+    assert fresh.path != lease.path and candidates == ()
+    assert not lease.path.exists()
+
+
+def test_dirty_equivalent_checkout_is_preserved_not_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
+    (lease.path / "draft.txt").write_text("working tree draft\n")
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh, _ = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(scope),
+    )
+    archive = (lease.lease_root / ".recovery" /
+               f"{lease.path.name}-{lease.recovery_id}.worktree.tar.gz")
+    assert archive.is_file()
+    assert "pr_checkout_lease_preserved_divergent" in events
+    assert "pr_checkout_lease_discarded_equivalent" not in events
+    assert fresh.path != lease.path
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
