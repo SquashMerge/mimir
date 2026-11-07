@@ -1194,14 +1194,21 @@ Current slice-1 recovery is manual:
   Repository, origin, source root, owner, PR, destination, branch, and live-turn
   identity guards still apply. Missing live head objects are fetched and verified
   before ancestry classification; fetch or ancestry errors fail closed. Existing
-  patch-equivalent rebase reuse applies only when recorded and live heads agree,
-  never by comparing against a stale recorded head. Genuinely divergent stale
-  work is preserved in a verified recovery bundle before replacing its checkout.
-- **Stranded rebased PR lease:** do not reset or delete the checkout. Preserve its
-  HEAD as a verified Git bundle under the lease root's `.recovery/` directory
-  (and archive dirty worktree files), then have the operator inspect and publish
-  the recovered commits with an explicit force-with-lease operation. Remove the
-  stranded checkout only after publication is independently verified.
+  divergent history is never resumed: acquisition checks ancestry before renewal
+  or rebinding. Lineage records clean local provenance, not publication; rebase
+  recording is kept so same-turn tools can track agent-created unpublished work.
+- **Stranded rebased PR lease:** acquisition retires it under the lease-root lock
+  using the reaper's tombstone rename and live-path recheck, then creates a fresh
+  lease at the scoped PR head. Only clean work with verbatim per-commit diffs
+  matching published commits may be discarded (whitespace is significant).
+  Stashes, extra local refs, ignored files or unique changes force preservation:
+  a verified bundle of all refs, a complete checkout archive (including Git
+  metadata), a binary patch and a local `refs/worklink-lease/<pr>/<recovery_id>`
+  ref in the source repository. These recovery refs are never pushed. The
+  structured event, warning and checkout result identify the recovery artifacts
+  for operator inspection. Failed preservation leaves the checkout untouched;
+  active checkouts cannot be retired. Force-push approval remains explicit and
+  turn-scoped; a fresh lease does not inherit any discarded lease's grants.
 - **Parked factory epic:** when factory ownership is the cause, run the factory's
   `amend-paths` recovery first, then relaunch the epic normally. The factory
   amends paths in-band on a running run, so this recovery is needed only

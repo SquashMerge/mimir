@@ -758,6 +758,7 @@ def _report_retained_candidates(
     event_type: str,
     scope: RepoPRActionScope,
     candidates: Sequence[tuple[Path, str]],
+    **details: object,
 ) -> None:
     """Best-effort structured evidence for retained work and reconciliation refusals."""
     try:
@@ -771,6 +772,7 @@ def _report_retained_candidates(
             candidates=[
                 {"commit": head, "path": str(path)} for path, head in candidates
             ],
+            **details,
         )
     except Exception:  # noqa: BLE001 - evidence failure must not change lease safety
         pass
@@ -1560,14 +1562,20 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
             ["git", "-C", str(lease.path), "bundle", "list-heads", str(bundle)],
             "existing PR checkout lease recovery bundle has no heads",
         )
-        if head not in {line.split()[0].lower() for line in heads.splitlines() if line}:
+        retained_heads = {tuple(line.split()) for line in heads.splitlines() if line}
+        if (head, "HEAD") not in retained_heads:
             raise RuntimeError("existing PR checkout lease recovery bundle has another HEAD")
+        refs = _run(runner, [
+            "git", "-C", str(lease.path), "for-each-ref", "--format=%(objectname) %(refname)",
+        ], "PR checkout lease recovery refs inspection failed")
+        if not {tuple(line.split()) for line in refs.splitlines() if line} <= retained_heads:
+            raise RuntimeError("existing PR checkout lease recovery bundle lacks current refs")
         return bundle
     staging = recovery_root / f".{bundle.name}.{uuid.uuid4().hex}.tmp"
     try:
         _run(
             runner,
-            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "HEAD"],
+            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "--all", "HEAD"],
             "PR checkout lease recovery bundle creation failed",
         )
         _run(
@@ -1583,10 +1591,14 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
     return bundle
 
 
-def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
-    """Atomically archive dirty tracked and untracked files without changing them."""
-    archive = bundle.with_suffix(".worktree.tar.gz")
-    if archive.exists():
+def _preserve_dirty_worktree(
+    lease: PRCheckoutLease, bundle: Path, *, include_git: bool = False,
+) -> Path:
+    """Archive worktree state, optionally including local refs and stash reflogs."""
+    archive = bundle.with_suffix(".checkout.tar.gz" if include_git else ".worktree.tar.gz")
+    # A prior failed retirement may have left a snapshot behind. Refresh the
+    # complete checkout atomically rather than deleting later work with it stale.
+    if archive.exists() and not include_git:
         if not archive.is_file() or archive.stat().st_size == 0:
             raise RuntimeError("existing dirty-worktree recovery archive is invalid")
         with tarfile.open(archive, "r:gz") as retained:
@@ -1598,7 +1610,7 @@ def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
     try:
         with tarfile.open(staging, "w:gz") as retained:
             for entry in lease.path.iterdir():
-                if entry.name != ".git":
+                if include_git or entry.name != ".git":
                     retained.add(entry, arcname=str(Path("worktree") / entry.name))
         with tarfile.open(staging, "r:gz") as retained:
             if not retained.getmembers():
@@ -2053,8 +2065,14 @@ def _rebind_foreign_candidate(
 
 def _discard_divergent_candidate(
     lease: PRCheckoutLease, scope: RepoPRActionScope, *, runner: Runner,
+    notices: list[dict[str, str]] | None = None,
 ) -> bool:
     """Retire a divergent checkout, retaining anything not proven redundant."""
+    from .scheduler import active_pr_checkout_lease_paths
+
+    def active() -> set[Path]:
+        return {path.resolve(strict=False) for path in active_pr_checkout_lease_paths()}
+
     head = _run(
         runner, ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
         "retained PR checkout has no HEAD",
@@ -2067,6 +2085,8 @@ def _discard_divergent_candidate(
         return False
     if ancestor.returncode != 1:
         raise RuntimeError("PR checkout lease ancestry inspection failed")
+    if lease.path.resolve(strict=False) in active():
+        raise RuntimeError("live PR checkout lease cannot be retired")
     origin = _run(runner, [
         "git", "-C", str(lease.path), "config", "--get", "remote.origin.url",
     ], "retained PR checkout has no origin")
@@ -2088,36 +2108,67 @@ def _discard_divergent_candidate(
         raise RuntimeError("PR head advanced during divergent lease inspection")
     status = _run(runner, [
         "git", "-C", str(lease.path), "status", "--porcelain=v1",
-        "--untracked-files=all",
+        "--untracked-files=all", "--ignored",
     ], "retained PR checkout status inspection failed")
+    refs = _run(runner, [
+        "git", "-C", str(lease.path), "for-each-ref", "--format=%(refname)",
+    ], "retained PR checkout refs inspection failed").splitlines()
+    extra_refs = [ref for ref in refs if not (
+        ref == scope.destination_ref or ref == PUBLISHED_HEAD_REF
+        or ref.startswith("refs/remotes/origin/")
+    )]
     base = lease.base_sha.lower()
     # A lease created before the scoped base advanced may have been rebased
     # without updating its metadata. Exclude only a scoped, verified base that
     # is itself an ancestor of the checkout; never infer one from the checkout.
     scoped_base = scope.observed_base_sha.lower()
-    if runner([
-        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", base, scoped_base,
-    ]).returncode == 0 and runner([
-        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", scoped_base, head,
-    ]).returncode == 0:
+    for older, newer in ((base, scoped_base), (scoped_base, head)):
+        precondition = runner([
+            "git", "-C", str(lease.path), "merge-base", "--is-ancestor", older, newer,
+        ])
+        if precondition.returncode not in {0, 1}:
+            raise RuntimeError("PR checkout lease base substitution inspection failed")
+        if precondition.returncode == 1:
+            break
+    else:
         base = scoped_base
     base_ancestor = runner([
         "git", "-C", str(lease.path), "merge-base", "--is-ancestor", base, head,
     ])
     equivalent = False
-    if base_ancestor.returncode == 0 and not status:
-        # A base advance is not PR work. Only commits outside the verified
-        # base may be dropped, and git cherry must classify *every* one.
+    if base_ancestor.returncode == 0 and not status and not extra_refs:
+        # Compare verbatim diffs, not git cherry/patch-id (which erase whitespace).
+        # Context changes may conservatively preserve an otherwise redundant replay.
         commits = _run(runner, [
             "git", "-C", str(lease.path), "rev-list", "--max-count=501",
             head, "--not", scoped, base, "--",
         ], "retained PR checkout commit inspection failed").splitlines()
-        cherry = _run(runner, [
-            "git", "-C", str(lease.path), "cherry", scoped, head, base,
-        ], "retained PR checkout patch inspection failed").splitlines()
-        equivalent = len(commits) <= 500 and len(cherry) == len(commits) and (
-            set(commits) == {line[2:] for line in cherry if line.startswith("- ")}
-        )
+        published = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--max-count=501",
+            scoped, "--not", base, "--",
+        ], "published PR commit inspection failed").splitlines()
+
+        def verbatim(commit: str) -> str | None:
+            parents = _run(runner, [
+                "git", "-C", str(lease.path), "rev-list", "--parents", "-n", "1", commit,
+            ], "retained PR commit parent inspection failed").split()
+            if len(parents) != 2:
+                return None  # Never discard merge resolutions or root commits.
+            result = runner([
+                "git", "-C", str(lease.path), "diff-tree", "--no-commit-id", "-r",
+                "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff",
+                "--no-textconv", "--no-color", parents[1], commit, "--",
+            ])
+            if result.returncode != 0:
+                raise RuntimeError("retained PR checkout verbatim diff inspection failed")
+            return result.stdout  # Do not strip any patch bytes.
+
+        if len(commits) <= 500 and len(published) <= 500:
+            patches = {patch for commit in published if (patch := verbatim(commit))}
+            equivalent = all(
+                (patch := verbatim(commit)) is not None and patch in patches
+                for commit in commits
+            )
     elif base_ancestor.returncode not in {0, 1}:
         raise RuntimeError("PR checkout lease base ancestry inspection failed")
 
@@ -2129,6 +2180,9 @@ def _discard_divergent_candidate(
         bundle = _recover_retained_checkout(
             lease, head=head, dirty=bool(status), runner=runner,
         )
+        # Include Git metadata so stash reflogs, extra refs, index and ignored
+        # files survive too, not just the history reachable from HEAD.
+        archive = _preserve_dirty_worktree(lease, bundle, include_git=True)
         patch = bundle.with_suffix(".patch")
         # A binary tree diff retains merge resolutions too; the bundle is the
         # authoritative history and the patch is for operator inspection.
@@ -2150,14 +2204,23 @@ def _discard_divergent_candidate(
             "git", "-C", str(lease.source_root), "rev-parse", "--verify", ref,
         ], "retained PR checkout recovery ref verification failed").lower() != head:
             raise RuntimeError("retained PR checkout recovery ref differs from HEAD")
+        notice = {
+            "head": head, "ref": ref, "source_root": str(lease.source_root),
+            "patch": str(patch), "bundle": str(bundle), "archive": str(archive),
+        }
         _report_retained_candidates(
-            "pr_checkout_lease_preserved_divergent", scope, [(patch, head)],
+            "pr_checkout_lease_preserved_divergent", scope, [(patch, head)], **notice,
         )
         logging.getLogger(__name__).warning(
-            "Divergent PR checkout preserved: %s at %s; patch %s; bundle %s",
-            ref, lease.source_root, patch, bundle,
+            "Divergent PR checkout preserved: %s at %s; patch %s; bundle %s; archive %s",
+            ref, lease.source_root, patch, bundle, archive,
         )
-    rmtree_missing_ok(lease.path)
+        if notices is not None:
+            notices.append(notice)
+    try:
+        _reclaim_tombstone(lease, active, lambda _step: None)
+    except _LeaseBecameActive as exc:
+        raise RuntimeError("live PR checkout lease cannot be retired") from exc
     lease.revoke()
     return True
 
@@ -2356,7 +2419,10 @@ def acquire_pr_checkout_lease(
         # on a different base cannot attest even if its recorded lineage is clean.
         for path, _head in tuple(candidates):
             existing = _lease_from_recorded_metadata(path, root)
-            if _discard_divergent_candidate(existing, scope, runner=runner):
+            if _discard_divergent_candidate(
+                existing, scope, runner=runner,
+                notices=review_state.checkout_recovery_notices if review_state else None,
+            ):
                 candidates = [(p, h) for p, h in candidates if p != path]
                 rebound_candidates.pop(path, None)
         unpublished = [
@@ -3851,7 +3917,8 @@ class RepoGitTools:
                     "force_push_refused",
                     "push would not be a fast-forward; use repo_merge to merge the base "
                     "and scoped published PR head, resolve any conflicts, then repo_push; "
-                    "retained work can also be resumed by a later turn for this PR",
+                    "a later checkout replaces divergent history: proven byte-equivalent work "
+                    "is discarded; other work is preserved for operator recovery, not resumed",
                 )
             try:
                 push_remote, auth_env, sensitive_values = self._push_remote()
@@ -5481,6 +5548,8 @@ def checkout_scoped_pr(
             "status": "resumed", "path": str(existing.path), "scope_id": existing.scope_id,
             "head_sha": existing.head_sha,
             "candidate_commits": framework[1],
+            **({"preserved_prior_work": state.checkout_recovery_notices}
+               if state.checkout_recovery_notices else {}),
         }
     try:
         lease, candidates = acquire_pr_checkout_lease(
@@ -5524,6 +5593,7 @@ def checkout_scoped_pr(
         "scope_id": lease.scope_id,
         "head_sha": lease.head_sha,
         "candidate_commits": candidates,
+        "preserved_prior_work": state.checkout_recovery_notices,
     }
 
 
