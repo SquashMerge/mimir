@@ -920,12 +920,23 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **kw: events.append((name, kw)))
     observed = {}
     observed_provenance = {}
+    # The outsider's PR text and a moved head's text are never fetched.
+    unattested_text = case in {"outsider", "head_mismatch"}
     for tool in (forge.pr_reviews, forge.pr_comments, forge.pr_metadata, forge.pr_spec, repo.repo_checkout):
         token = access_control.begin_protected_result_capture()
         try:
-            result = tool.func("owner/repo", 7, runtime=runtime)
+            if tool is forge.pr_metadata and unattested_text:
+                with pytest.raises(ToolPolicyRefusal, match="no content was fetched"):
+                    tool.func("owner/repo", 7, runtime=runtime)
+                result = None
+            else:
+                result = tool.func("owner/repo", 7, runtime=runtime)
         finally:
             provenance = access_control.end_protected_result_capture(token)
+        if result is None:
+            assert provenance is None or not provenance.sources
+            observed[tool.name] = observed_provenance[tool.name] = "refused"
+            continue
         added = access_control.classify_protected_result(
             tool.name, {"repository": "owner/repo", "pull_request": 7}, auth,
             ToolAuthorization(tool_name=tool.name, decision="resource_scoped", allowed=True,
@@ -945,7 +956,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     ]
     assert observed_provenance == {
         "pr_reviews": "trusted", "pr_comments": "trusted",
-        "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
+        "pr_metadata": "refused" if unattested_text else "trusted",
         "pr_spec": "trusted",
         # A base-repository head is trusted independently of its PR author's
         # collaborator status; forge content keeps its author attestation.
@@ -953,7 +964,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     }, f"lease_refusals={refusal_reasons}; observed={observed_provenance}; events={events}"
     assert observed == {
         "pr_reviews": "untrusted", "pr_comments": "untrusted",
-        "pr_metadata": "untrusted", "pr_spec": "untrusted",
+        "pr_metadata": "refused" if unattested_text else "untrusted", "pr_spec": "untrusted",
         "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else "untrusted",
     }
     assert auth.ifc_state.has_untrusted_active_ingest()

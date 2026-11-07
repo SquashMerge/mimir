@@ -597,6 +597,7 @@ GITHUB_AUTHOR_UNAVAILABLE_CAUSES = frozenset({
     "pr_number_mismatch", "pr_head_sha_mismatch", "pr_author_mismatch",
     "pr_repository_mismatch", "pr_head_repository_mismatch",
     "head_committer_unavailable", "github_identity_verification_failed",
+    "scope_binding_mismatch",
 }) | frozenset(
     f"{request}_{failure}" for request in ("collaborator", "membership")
     for failure in GITHUB_AUTHOR_FAILURE_CLASSES

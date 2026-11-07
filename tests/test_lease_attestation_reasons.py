@@ -440,6 +440,7 @@ def test_lease_missing_and_false_verdicts_are_not_author_resolution_failures(
         "pr_number_mismatch", "pr_head_sha_mismatch", "pr_author_mismatch",
         "pr_repository_mismatch", "pr_head_repository_mismatch",
         "head_committer_unavailable", "github_identity_verification_failed",
+        "scope_binding_mismatch",
     )],
     *[(f"{stage}_{failure}", f"{stage}_{failure}")
       for stage in ("pr_identity", "head_identity", "contributor_trust")

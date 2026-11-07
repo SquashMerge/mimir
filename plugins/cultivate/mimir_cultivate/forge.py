@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from mimir.models import NormalizedPullRequestSnapshot
 from .policy import RepoPRActionScope
@@ -2204,6 +2204,139 @@ def pr_trust_verdict(
     return verdict
 
 
+def _publish_trusted_pr_label(
+    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope, head_sha: str,
+) -> None:
+    from mimir.access_control import publish_protected_result
+    from mimir.models import SourceLabel
+
+    context = getattr(runtime, "context", None)
+    if context is None:
+        return
+    principal = context.canonical_principal
+    if context.is_service and principal:
+        principal = f"service:{principal}"
+    publish_protected_result((SourceLabel(
+        principal=principal, domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    ),))
+
+
+def _live_pr_head(client: Any, scope: RepoPRActionScope) -> str | None:
+    read_snapshot = getattr(client, "get_pull_request_identity", None)
+    if not callable(read_snapshot):
+        return None
+    try:
+        identity = read_snapshot(scope.canonical_repo, scope.pr_number)
+    except ForgeError:
+        return None
+    head = getattr(identity, "head_sha", None)
+    return head if getattr(identity, "number", None) == scope.pr_number and isinstance(head, str) else None
+
+
+def _refuse_pr_content(tool: str, verdict: bool | None, who: str = "latest contributor") -> NoReturn:
+    """Content-free refusal: nothing was fetched, so the turn stays clean."""
+    from mimir.pollers import bounded_github_author_cause, github_author_trust_cause
+
+    reason = "non_collaborator" if verdict is False else "attestation_unavailable"
+    _withheld_event(tool, "pull_request", reason)
+    if verdict is False:
+        raise ToolPolicyRefusal(
+            f"{tool} withheld: the pull request's {who} is not trusted; no content was fetched"
+        )
+    raise ToolPolicyRefusal(
+        f"{tool} withheld: contributor attestation unavailable "
+        f"({bounded_github_author_cause(github_author_trust_cause())}); no content was fetched"
+    )
+
+
+def _trusted_pr_head(
+    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope, client: Any, tool: str,
+) -> str:
+    """Decide the PR verdict from identity before any content request.
+
+    Failing closed means not fetching: an untrusted or unresolved verdict
+    refuses without content instead of labelling fetched text untrusted. A
+    verified own push keeps the scope's verdict; any other head move leaves the
+    scope's head unattested. Returns the head the content must be read at.
+    """
+    from mimir.pollers import _github_author_trust_cause, github_author_trust_cause
+
+    from .repository import was_verified_push
+
+    context = getattr(runtime, "context", None)
+    if context is None or context.ifc_state is None:
+        _github_author_trust_cause.set("ifc_state_missing")
+        _refuse_pr_content(tool, None)
+    state = context.ifc_state
+    if _scope_binding_misbound(scope):
+        # Nothing binds this scope's server checkout to the attested repository.
+        _github_author_trust_cause.set("scope_binding_mismatch")
+        _refuse_pr_content(tool, None)
+    _github_author_trust_cause.set(None)
+    verdict = pr_trust_verdict(context, scope, client)
+    if verdict is True:
+        state.pr_content_trusted_scopes.add(scope.scope_id)
+        return scope.observed_head_sha
+    if verdict is None and github_author_trust_cause() == "pr_head_sha_mismatch" and (
+        scope.scope_id in state.pr_content_trusted_scopes
+        or state.pr_checkout_author_trust.get(scope.scope_id) is True
+    ):
+        live = _live_pr_head(client, scope)
+        if live is not None and was_verified_push(
+            scope.canonical_repo, scope.pr_number, scope.observed_head_sha, live,
+        ):
+            state.record_own_push(scope.canonical_repo, scope.pr_number, scope.observed_head_sha)
+            return live
+    _refuse_pr_content(tool, verdict)
+
+
+def _confirm_pr_head(
+    scope: RepoPRActionScope, client: Any, tool: str, head_sha: str, read_head: str | None = None,
+) -> None:
+    """Discard what was read across a head move; never label it after the fact."""
+    if (read_head if read_head is not None else _live_pr_head(client, scope)) != head_sha:
+        _withheld_event(tool, "pull_request", "attestation_unavailable")
+        raise ToolPolicyRefusal(
+            f"{tool} withheld: the pull request head moved during the read; nothing was returned"
+        )
+
+
+def _read_pr_content(
+    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope, client: Any,
+    tool: str, fetch: Any, *, read_head: Any = None, label_head: str | None = None,
+    text_author: str | None = None,
+) -> Any:
+    """Fetch PR-owned text only after its verdict, and return it only at that head.
+
+    The head verdict attests commits, not text another person wrote: a PR's
+    title and body need their own ``text_author`` to be trusted as well.
+    """
+    head_sha = _trusted_pr_head(runtime, scope, client, tool)
+    if text_author is not None:
+        from mimir.pollers import _github_author_trust_cause
+
+        _github_author_trust_cause.set(None)
+        verdict = _author_verdict(runtime.context, scope, text_author, client)
+        if verdict is not True:
+            _refuse_pr_content(tool, verdict, "author")
+    # The verdict, not the fetched text, decides the label, so an adapter
+    # error about the attested head is trusted. Text from a moved head is
+    # refused below, never labelled after the fact.
+    _publish_trusted_pr_label(runtime, scope, label_head or head_sha)
+    try:
+        result = _call(fetch, runtime=runtime, scope=scope)
+    except (ToolException, ToolPolicyRefusal):
+        _confirm_pr_head(scope, client, tool, head_sha)
+        raise
+    _confirm_pr_head(scope, client, tool, head_sha,
+                     read_head(result) if read_head is not None else None)
+    return result
+
+
 def _withheld_event(tool: str, kind: str, reason: str, count: int = 1) -> None:
     from mimir.event_logger import log_event_sync
 
@@ -2223,11 +2356,31 @@ def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope
     ), repository=scope.canonical_repo) for item in items]
     from . import github_trust
 
+    # GitHub reports no edit time for a review body, so a later trusted reply
+    # cannot prove which text it saw: untrusted reviews are never vouched for.
+    created, modified = (("submitted_at", None) if tool == "pr_reviews"
+                         else ("created_at", "updated_at"))
+    self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip().casefold()
+
+    def can_vouch(item: dict[str, Any]) -> bool:
+        # Only a trusted person attests to what they replied under. Our own
+        # replies and app identities never saw withheld text; with no known
+        # self login, nothing can be told apart from our own replies.
+        author = item["author"]
+        return (bool(self_login) and isinstance(author, str) and not _BOT_LOGIN.fullmatch(author)
+                and author.casefold() != self_login)
+
     kept, withheld = github_trust.partition(
         projected, lambda item: item["author"],
         lambda author: _author_verdict(context, scope, author, client),
+        vouched=github_trust.vouched_by_later_trusted(
+            lambda item: item.get(created),
+            lambda item: item.get(modified) if modified else None, can_vouch,
+        ),
     )
-    _publish_author_attestation(runtime, scope, tuple(item["author"] for item in kept), tool)
+    # Kept text is trusted or vouched for by a later trusted item; withheld
+    # text never reaches the model, so the result carries no author taint.
+    _publish_trusted_pr_label(runtime, scope, scope.observed_head_sha)
     for item in withheld:
         _withheld_event(tool, item.kind, item.reason)
     result = [{key: value for key, value in item.items() if key not in {"kind", "repository"}}
@@ -2465,19 +2618,24 @@ def _pr_content_authors(
     return _pr_attestation(client.get_pull_request(scope), scope, runtime)
 
 
+def _scope_binding_misbound(scope: RepoPRActionScope) -> bool:
+    """An own-repository scope must be bound to this GitHub origin and PR ref."""
+    return (scope.head_repo == scope.canonical_repo
+            or scope.head_remote == "origin" and scope.checkout_ref is None) and (
+        scope.head_repo != scope.canonical_repo
+        or scope.head_remote != "origin"
+        or not _github_origin_matches(scope)
+        or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
+    )
+
+
 def _attest_scoped_read(
     runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope,
     client: ForgeClient, tool: str, *, scoped_head: bool = False,
 ) -> tuple[tuple[str, ...], str] | None:
     if not callable(getattr(client, "author_is_trusted", None)):
         return None
-    if (scope.head_repo == scope.canonical_repo
-            or scope.head_remote == "origin" and scope.checkout_ref is None) and (
-        scope.head_repo != scope.canonical_repo
-        or scope.head_remote != "origin"
-        or not _github_origin_matches(scope)
-        or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
-    ):
+    if _scope_binding_misbound(scope):
         return None
     authors, head_sha = _call(
         lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope,
@@ -2602,15 +2760,13 @@ def pr_metadata(
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    before = _attest_scoped_read(runtime, scope, client, "pr_metadata")
-    try:
-        metadata = _call(lambda: client.get_pull_request(scope), runtime=runtime, scope=scope)
-    except (ToolException, ToolPolicyRefusal):
-        _verify_scoped_read_head(runtime, scope, client, "pr_metadata", before)
-        raise
-    authors, head_sha = _pr_attestation(metadata, scope, runtime)
-    if before is None or (authors, head_sha) != before:
-        _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
+    # The verdict compared the live PR author with the scope's; its title and
+    # body are that author's text, whoever pushed the head.
+    metadata = _read_pr_content(
+        runtime, scope, client, "pr_metadata", lambda: client.get_pull_request(scope),
+        read_head=lambda item: item.head_sha if item.number == scope.pr_number else "",
+        text_author=scope.pull_request_author or "",
+    )
     return asdict(metadata)
 
 
@@ -2653,21 +2809,7 @@ def pr_spec(
 ) -> dict[str, Any]:
     """Read the armed Chainlink spec of record bound by Worklink evidence to this PR."""
     scope = _scope(runtime, repository, pull_request)
-    from mimir.access_control import publish_protected_result
-    from mimir.models import SourceLabel
-
-    context = getattr(runtime, "context", None)
-    if context is not None:
-        principal = context.canonical_principal
-        if context.is_service and principal:
-            principal = f"service:{principal}"
-        publish_protected_result((SourceLabel(
-            principal=principal, domain="repository",
-            resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
-            bridge_instance="forge", sensitivity="internal",
-            authorized_principals=frozenset({principal}) if principal else frozenset(),
-            source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
-        ),))
+    _publish_trusted_pr_label(runtime, scope, scope.observed_head_sha)
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     issue_id = _issue_bound_to_pr(Path(home), scope.canonical_repo, scope.pr_number) if home else None
@@ -2708,11 +2850,7 @@ def pr_files(
     """List bounded file projections for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    before = _attest_scoped_read(runtime, scope, client, "pr_files")
-    try:
-        items = _call(lambda: client.list_files(scope), runtime=runtime, scope=scope)
-    finally:
-        _verify_scoped_read_head(runtime, scope, client, "pr_files", before)
+    items = _read_pr_content(runtime, scope, client, "pr_files", lambda: client.list_files(scope))
     return [asdict(item) for item in items]
 
 
@@ -2725,12 +2863,7 @@ def pr_diff(
     """Read the bounded unified diff for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    before = _attest_scoped_read(runtime, scope, client, "pr_diff")
-    try:
-        diff = _call(lambda: client.get_diff(scope), runtime=runtime, scope=scope)
-    finally:
-        _verify_scoped_read_head(runtime, scope, client, "pr_diff", before)
-    return diff
+    return _read_pr_content(runtime, scope, client, "pr_diff", lambda: client.get_diff(scope))
 
 
 @tool
@@ -2743,12 +2876,12 @@ def pr_file_content(
     """Read one regular file at the pull request's verified head."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    before = _attest_scoped_read(runtime, scope, client, "pr_file_content")
-    try:
-        content = _call(lambda: client.get_file_content(scope, path), runtime=runtime, scope=scope)
-    finally:
-        _verify_scoped_read_head(runtime, scope, client, "pr_file_content", before)
-    return content
+    # The adapter walks the scope's immutable observed head, so after a verified
+    # own push the bytes, and therefore the label, are the observed head's.
+    return _read_pr_content(
+        runtime, scope, client, "pr_file_content", lambda: client.get_file_content(scope, path),
+        label_head=scope.observed_head_sha,
+    )
 
 
 @tool
@@ -2805,12 +2938,11 @@ def pr_job_log(
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
     client = _client(scope)
-    before = _attest_scoped_read(runtime, scope, client, "pr_job_log", scoped_head=True)
-    try:
-        excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id), runtime=runtime, scope=scope)
-    finally:
-        _verify_scoped_read_head(runtime, scope, client, "pr_job_log", before)
-    return excerpt
+    # A job excerpt belongs to the scoped run, not to a head pushed since.
+    return _read_pr_content(
+        runtime, scope, client, "pr_job_log", lambda: client.get_job_log(scope, job_id, run_id),
+        label_head=scope.observed_head_sha,
+    )
 
 
 def _attest_ci_runs(runtime: ToolRuntime[AuthContext] | None, repository: str,
