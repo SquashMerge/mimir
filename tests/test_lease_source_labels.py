@@ -790,9 +790,10 @@ def test_cultivate_forge_reads_match_core_result_and_review_sink(
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("tool_name", ["pr_diff", "repo_diff"])
 @pytest.mark.parametrize("boundary", ["missing_lease", "stale_head", "wrong_repository", "missing_author_trust"])
 def test_cultivate_forge_read_provenance_fails_closed_without_binding(
-    tmp_path: Path, boundary: str,
+    tmp_path: Path, boundary: str, tool_name: str,
 ) -> None:
     from mimir.plugins.core import selected_policy_registry
 
@@ -814,11 +815,19 @@ def test_cultivate_forge_read_provenance_fails_closed_without_binding(
     if boundary == "stale_head":
         source = replace(source, resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{'b' * 40}")
     labels = classify_protected_result(
-        "pr_diff", args, auth, ToolAuthorization(
-            tool_name="pr_diff", decision="resource_scoped", allowed=True,
+        tool_name, args, auth, ToolAuthorization(
+            tool_name=tool_name, decision="resource_scoped", allowed=True,
             repo_pr_action_scope=scope, policy=selected_policy_registry(),
         ), result={"content": "PR text"}, provenance=ProtectedResultProvenance((source,)),
     )
+    if tool_name == "pr_diff" and boundary in {"missing_lease", "missing_author_trust"}:
+        # A forge result's own label is its attestation (#2120): the forge tool
+        # decided the verdict before fetching, so no checkout lease is needed.
+        assert not labels.has_untrusted_active_ingest
+        assert labels.sources[0].integrity == "trusted"
+        return
+    # A label at another head or repository never matches the scope, and a
+    # repository action's checkout content keeps requiring the attested lease.
     assert labels.has_untrusted_active_ingest
 
 
