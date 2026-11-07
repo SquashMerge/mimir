@@ -650,6 +650,7 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
         monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
                             lambda *_args: SimpleNamespace(ok=True))
     seen = []
+    checkout_results = []
 
     class FirstRead(_FakeAgent):
         async def astream(self, inputs, *, config, context=None, stream_mode="values"):
@@ -668,13 +669,9 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
                     value = repo_checkout.func(**args, runtime=request.runtime)
                     return ToolMessage(content=json.dumps(value), tool_call_id=request.tool_call["id"])
 
-                result = await BudgetGateMiddleware(selected_repo_policy).awrap_tool_call(
+                checkout_results.append(await BudgetGateMiddleware(selected_repo_policy).awrap_tool_call(
                     _make_request("repo_checkout", "reuse-checkout", context, args), execute,
-                )
-                # #39 keeps the active-ingest write veto mandatory even for
-                # framework checkouts. The binding still permits the PR read.
-                assert result.status == "error"
-                assert "untrusted" in result.content
+                ))
             yield {"messages": []}
 
     agent = _build_agent(tmp_path, fake_agent=FirstRead([]), fake_saga=None,
@@ -708,6 +705,19 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
         assert failed[0]["attempt_disposition"] == "transient_provider"
         assert not seen
         return
+    events = [json.loads(line) for line in (
+        tmp_path / "home" / "logs" / "events.jsonl"
+    ).read_text().splitlines()]
+    terminal = [entry for entry in events if entry.get("type") in {"turn_failed", "turn_completed"}]
+    assert len(terminal) == 1
+    assert terminal[0]["type"] == "turn_completed"
+    assert len(checkout_results) == int(checkout is True)
+    if checkout is True:
+        # Assert outside astream: run_turn catches exceptions from the model.
+        # #39 keeps the active-ingest write veto mandatory even for framework
+        # checkouts. The binding still permits the PR read.
+        assert checkout_results[0].status == "error"
+        assert "untrusted" in checkout_results[0].content
     assert len(seen) == 1
     if checkout:
         assert seen[0][0].allowed, seen[0][0]
@@ -918,13 +928,14 @@ async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
     metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
     before = json.loads(metadata.read_text())
     seen = []
+    observed_refusals = []
 
     class FirstRead(_FakeAgent):
         async def astream(self, inputs, *, config, context=None, stream_mode="values"):
             seen.append(str(inputs))
             from mimir.tools.budget_gate import _get_current_turn_context, _record_tool_outcome
 
-            assert _get_current_turn_context().prechecked_pr_refusals
+            observed_refusals.append(tuple(_get_current_turn_context().prechecked_pr_refusals))
             if followup == "hard_refusal_model_error":
                 _get_current_turn_context().hard_boundary_denials.append({
                     "boundary": "write", "reason": "write_blocked_by_untrusted_ingest",
@@ -950,6 +961,9 @@ async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
 
     events = [json.loads(line) for line in (tmp_path / "home/logs/events.jsonl").read_text().splitlines()]
     terminal = [event for event in events if event.get("type") in {"turn_failed", "turn_completed"}]
+    assert observed_refusals == [({
+        "repository": scope.canonical_repo, "pull_request": scope.pr_number, "reason": reason,
+    },)]
     assert len(terminal) == 1
     assert terminal[0]["type"] == ("turn_failed" if followup in {"model_error", "hard_refusal_model_error"} else "turn_completed")
     charged = followup in {"repo_push", "model_error", "hard_refusal_model_error"}
