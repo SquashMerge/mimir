@@ -962,12 +962,15 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         # collaborator status; forge content keeps its author attestation.
         "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else None,
     }, f"lease_refusals={refusal_reasons}; observed={observed_provenance}; events={events}"
+    attested = case in {"collaborator", "outsider"}
+    # Forge results label themselves (#2120): their classification is their
+    # published label, whatever the lease. Checkout content still needs it.
     assert observed == {
-        "pr_reviews": "untrusted", "pr_comments": "untrusted",
-        "pr_metadata": "refused" if unattested_text else "untrusted", "pr_spec": "untrusted",
-        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else "untrusted",
+        "pr_reviews": "trusted", "pr_comments": "trusted",
+        "pr_metadata": "refused" if unattested_text else "trusted", "pr_spec": "trusted",
+        "repo_checkout": "trusted" if attested else "untrusted",
     }
-    assert auth.ifc_state.has_untrusted_active_ingest()
+    assert auth.ifc_state.has_untrusted_active_ingest() is not attested
     if case in {"collaborator", "outsider", "git_timeout"}:
         assert status_probes  # The positive/timeout controls reached the real proof boundary.
     assert refusal_reasons == (
@@ -988,8 +991,12 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     decision = access_control.ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=True, target_channel=str(target),
     )
-    assert not decision.allowed, (decision.reason, observed, events)
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    if attested:
+        # Reading the PR no longer taints the remediation turn: it may edit.
+        assert decision.allowed, (decision.reason, observed, events)
+    else:
+        assert not decision.allowed, (decision.reason, observed, events)
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
     fallbacks = [kw for name, kw in events if name == "repository_result_untrusted_default"]
     assert fallbacks == []
 

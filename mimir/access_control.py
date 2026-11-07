@@ -12075,7 +12075,31 @@ def _provider_pr_lease_result_is_bound(
         )
     return (
         state is not None and getattr(state, "action_scope", None) is scope
-        and _attested_pr_checkout_lease(auth_context, scope, getattr(state, "checkout_lease", None))
+        and (_forge_pr_result_labels_itself(registered) or _attested_pr_checkout_lease(
+            auth_context, scope, getattr(state, "checkout_lease", None),
+        ))
+    )
+
+
+def _forge_pr_result_labels_itself(registered: Any) -> bool:
+    """A forge result's own published label is its attestation; no lease applies.
+
+    The checkout lease attests checkout content, which a forge result does not
+    contain. Forge tools decide the PR verdict before fetching and publish a
+    trusted label only for content they vouch for: a trusted head's text,
+    trusted or vouched-for thread items, or our own completed write (#2113,
+    #2119). Admission only lets the repository classifier validate that label
+    at the exact scope; a result that published none stays untrusted.
+    Repository actions read checkout content and keep requiring the lease.
+    """
+    descriptor = registered.descriptor
+    return (
+        registered.owner == "cultivate"
+        and "forge_actions" in registered.memberships
+        and "repo_actions" not in registered.memberships
+        and descriptor is not None
+        and bool(descriptor.result_origin & ResultOriginKind.REPOSITORY)
+        and not descriptor.git_operation_result
     )
 
 

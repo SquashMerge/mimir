@@ -2077,7 +2077,7 @@ def _publish_scoped_error(runtime: ToolRuntime[AuthContext] | None, scope: RepoP
         return
     try:
         if _author_verdict(context, scope, author, _client(scope)) is True:
-            _publish_author_attestation(runtime, scope, (author,), "forge_error")
+            _publish_trusted_pr_label(runtime, scope, scope.observed_head_sha)
     except ForgeError:
         return
 
@@ -2360,15 +2360,19 @@ def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope
     # cannot prove which text it saw: untrusted reviews are never vouched for.
     created, modified = (("submitted_at", None) if tool == "pr_reviews"
                          else ("created_at", "updated_at"))
+    from mimir.config import github_agent_logins
+
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip().casefold()
+    agents = github_agent_logins()
 
     def can_vouch(item: dict[str, Any]) -> bool:
         # Only a trusted person attests to what they replied under. Our own
-        # replies and app identities never saw withheld text; with no known
-        # self login, nothing can be told apart from our own replies.
+        # replies, other agents' and app identities never saw withheld text, so
+        # posting a comment never attests the PR; with no known self login,
+        # nothing can be told apart from our own replies.
         author = item["author"]
         return (bool(self_login) and isinstance(author, str) and not _BOT_LOGIN.fullmatch(author)
-                and author.casefold() != self_login)
+                and author.casefold() != self_login and author.casefold() not in agents)
 
     kept, withheld = github_trust.partition(
         projected, lambda item: item["author"],
@@ -2392,27 +2396,18 @@ def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope
     return result
 
 
-def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
-    """Independently attest a validated server-owned projection at its scope.
-
-    Never depend on another parallel read warming the author cache. These
-    bounded projections belong to the authorized scope, not a later live head;
-    _pr_content_authors still rejects an unrelated live-head change.
-    """
-    _attest_scoped_read(runtime, scope, _client(scope), "forge_projection", scoped_head=True)
-
-
 def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
-    """Best-effort attestation must not turn a completed write into a retry.
+    """Attest our own completed write's result echo at the scoped head.
 
-    On adapter/read failure publish no trusted provenance: result classification
-    retains its default untrusted label. Never reuse cached trust as a fallback.
+    Call only after the adapter write returned: a failed write keeps result
+    classification's default untrusted label. The echo is server-authored, so
+    no author verdict applies and nothing PR-owned is fetched. A misbound scope
+    publishes nothing, likewise keeping the untrusted default.
     """
-    try:
-        _publish_trusted_projection(runtime, scope)
-    except (ForgeError, ToolException):
-        # Do not expose arbitrary adapter error text after the write succeeded.
-        log.warning("forge write completed; result attestation unavailable")
+    if _scope_binding_misbound(scope):
+        log.warning("forge write completed; result attestation refused for a misbound scope")
+        return
+    _publish_trusted_pr_label(runtime, scope, scope.observed_head_sha)
 
 
 def _publish_issue_write_projection(runtime: ToolRuntime[AuthContext] | None, target: IssueTarget) -> None:
@@ -2469,6 +2464,21 @@ def _check_url_matches_scope(url: str, scope: RepoPRActionScope) -> bool:
     return True
 
 
+def _safe_review_request_projection(item: Any, index: int) -> dict[str, Any]:
+    """Withhold a malformed reviewer instead of labelling the listing untrusted."""
+    if (item.kind in {"user", "team"} and isinstance(item.reviewer, str)
+            and _REVIEWER.fullmatch(item.reviewer) is not None):
+        return asdict(item)
+    from mimir.event_logger import log_event_sync
+
+    try:
+        log_event_sync("pr_review_request_withheld", request_index=index)
+    except RuntimeError:
+        pass
+    return {**asdict(item), "kind": item.kind if item.kind in {"user", "team"} else "user",
+            "reviewer": "<withheld-reviewer>"}
+
+
 def _safe_check_projection(check: Any, scope: RepoPRActionScope, index: int) -> dict[str, Any]:
     from mimir.event_logger import log_event_sync
 
@@ -2496,128 +2506,6 @@ def _safe_check_projection(check: Any, scope: RepoPRActionScope, index: int) -> 
     return result
 
 
-def _publish_author_attestation(
-    runtime: ToolRuntime[AuthContext] | None,
-    scope: RepoPRActionScope,
-    authors: tuple[str, ...],
-    tool: str,
-    head_sha: str | None = None,
-) -> None:
-    """Publish provenance only for authors obtained from native forge projections.
-
-    Missing actors/adapters and unavailable attestation fail closed for this
-    result. Only definitive verdicts enter the turn-local cache; no PR-level
-    verdict is persisted. Contained ``repo_test`` output is a function of the
-    attested checked-in checkout and inherits its lease attestation. Scoped CI
-    job logs inherit the PR author verdict; checks and forge mutation output
-    have separate provenance rules.
-    """
-    from mimir.access_control import publish_protected_result
-    from mimir.models import SourceLabel
-
-    context = getattr(runtime, "context", None)
-    if context is None:
-        return
-    client = _client(scope)
-    if not callable(getattr(client, "author_is_trusted", None)) and not any(
-        isinstance(author, str) and _BOT_LOGIN.fullmatch(author) for author in authors
-    ):
-        return
-    trusted = True
-    failed_authors = []
-    unavailable_authors = []
-    for author in dict.fromkeys(authors):
-        if not isinstance(author, str) or not author or author == "<head-mismatch>":
-            trusted = False
-            failed_authors.append(
-                "<head-mismatch>" if author == "<head-mismatch>" else "<missing-author>"
-            )
-            continue
-        verdict = _author_verdict(context, scope, author, client)
-        trusted = trusted and verdict is True
-        # Only identifiers, never arbitrary adapter strings, enter diagnostics.
-        diagnostic_author = author if _DIAGNOSTIC_LOGIN.fullmatch(author) else "<invalid-author>"
-        if verdict is not True:
-            failed_authors.append(diagnostic_author)
-        if verdict is None:
-            unavailable_authors.append(diagnostic_author)
-            context.ifc_state.record_author_attestation_unavailable()
-    principal = context.canonical_principal
-    if context.is_service and principal:
-        principal = f"service:{principal}"
-    resource_id = f"{scope.canonical_repo}#pull/{scope.pr_number}@{head_sha or scope.observed_head_sha}"
-    publish_protected_result((SourceLabel(
-        principal=principal, domain="repository",
-        resource_id=resource_id,
-        bridge_instance="forge", sensitivity="internal",
-        authorized_principals=frozenset({principal}) if principal else frozenset(),
-        source_kind="protected_tool", integrity="trusted" if trusted else "untrusted",
-        integrity_effect="active_ingest",
-    ),))
-    if not trusted:
-        try:
-            from mimir._context import get_current_turn
-            from mimir.event_logger import log_event_sync
-
-            turn = get_current_turn()
-            log_event_sync(
-                "forge_author_attestation_downgraded",
-                session_id=context.channel_id,
-                turn_id=turn.turn_id if turn is not None else None,
-                repository=scope.canonical_repo,
-                resource_id=resource_id,
-                tool=tool,
-                integrity="untrusted", integrity_effect="active_ingest",
-                failed_authors=failed_authors,
-                unavailable_authors=unavailable_authors,
-            )
-        except Exception as exc:  # noqa: BLE001 — telemetry must not alter the read
-            # Observability must not turn a successful read into a tool failure.
-            log.warning(
-                "forge_author_attestation_downgraded: repository=%s resource_id=%s "
-                "tool=%s failed_authors=%s unavailable_authors=%s "
-                "(event logging failed: %s)",
-                scope.canonical_repo,
-                resource_id,
-                tool, failed_authors, unavailable_authors, exc,
-            )
-
-
-def _pr_attestation(
-    metadata: PullRequestProjection,
-    scope: RepoPRActionScope,
-    runtime: ToolRuntime[AuthContext] | None,
-) -> tuple[tuple[str, ...], str]:
-    """Bind PR-owned text to the observed head or an exact verified own push."""
-    if metadata.number != scope.pr_number:
-        return ("",), scope.observed_head_sha
-    if metadata.head_sha != scope.observed_head_sha:
-        # Runtime-less callers (notably checkout) retain observed-head-only
-        # trust; accepting a new head requires per-turn lineage recording.
-        if runtime is None:
-            return ("<head-mismatch>",), scope.observed_head_sha
-        from .repository import was_verified_push
-
-        if not was_verified_push(
-            scope.canonical_repo, scope.pr_number, scope.observed_head_sha, metadata.head_sha,
-        ):
-            return ("<head-mismatch>",), scope.observed_head_sha
-        context = getattr(runtime, "context", None)
-        if context is not None and context.ifc_state is not None:
-            context.ifc_state.record_own_push(
-                scope.canonical_repo, scope.pr_number, scope.observed_head_sha,
-            )
-    return (metadata.author,), metadata.head_sha
-
-
-def _pr_content_authors(
-    client: ForgeClient, scope: RepoPRActionScope,
-    runtime: ToolRuntime[AuthContext] | None = None,
-) -> tuple[tuple[str, ...], str]:
-    """Bind PR-owned diff/file text to API authorship at its verified head."""
-    return _pr_attestation(client.get_pull_request(scope), scope, runtime)
-
-
 def _scope_binding_misbound(scope: RepoPRActionScope) -> bool:
     """An own-repository scope must be bound to this GitHub origin and PR ref."""
     return (scope.head_repo == scope.canonical_repo
@@ -2627,40 +2515,6 @@ def _scope_binding_misbound(scope: RepoPRActionScope) -> bool:
         or not _github_origin_matches(scope)
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
     )
-
-
-def _attest_scoped_read(
-    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope,
-    client: ForgeClient, tool: str, *, scoped_head: bool = False,
-) -> tuple[tuple[str, ...], str] | None:
-    if not callable(getattr(client, "author_is_trusted", None)):
-        return None
-    if _scope_binding_misbound(scope):
-        return None
-    authors, head_sha = _call(
-        lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope,
-    )
-    _publish_author_attestation(
-        runtime, scope, authors, tool,
-        head_sha=scope.observed_head_sha if scoped_head else head_sha,
-    )
-    return authors, head_sha
-
-
-def _verify_scoped_read_head(
-    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope,
-    client: ForgeClient, tool: str, before: tuple[tuple[str, ...], str] | None,
-) -> None:
-    if before is None:
-        return
-    try:
-        after = _call(
-            lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope,
-        )
-    except (ToolException, ToolPolicyRefusal):
-        after = None
-    if after != before:
-        _publish_author_attestation(runtime, scope, ("<head-mismatch>",), tool)
 
 
 @tool
@@ -2893,11 +2747,10 @@ def pr_checks(
     """List bounded check projections for the bound pull request head."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    before = _attest_scoped_read(runtime, scope, client, "forge_projection", scoped_head=True)
-    try:
-        checks = _call(lambda: client.list_checks(scope), runtime=runtime, scope=scope)
-    finally:
-        _verify_scoped_read_head(runtime, scope, client, "forge_projection", before)
+    checks = _read_pr_content(
+        runtime, scope, client, "pr_checks", lambda: client.list_checks(scope),
+        label_head=scope.observed_head_sha,
+    )
     return [_safe_check_projection(item, scope, index) for index, item in enumerate(checks)]
 
 
@@ -3126,17 +2979,11 @@ def pr_review_requests(
     """List bounded pending review requests for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    before = _attest_scoped_read(runtime, scope, client, "forge_projection", scoped_head=True)
-    try:
-        items = _call(lambda: client.list_review_requests(scope), runtime=runtime, scope=scope)
-    finally:
-        _verify_scoped_read_head(runtime, scope, client, "forge_projection", before)
-    if not all(
-        item.kind in {"user", "team"} and isinstance(item.reviewer, str)
-        and _REVIEWER.fullmatch(item.reviewer) is not None for item in items
-    ):
-        _publish_author_attestation(runtime, scope, ("",), "pr_review_requests")
-    return [asdict(item) for item in items]
+    items = _read_pr_content(
+        runtime, scope, client, "pr_review_requests", lambda: client.list_review_requests(scope),
+        label_head=scope.observed_head_sha,
+    )
+    return [_safe_review_request_projection(item, index) for index, item in enumerate(items)]
 
 
 @tool
