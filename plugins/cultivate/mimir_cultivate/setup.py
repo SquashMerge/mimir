@@ -201,16 +201,25 @@ _BUILD_TAIL_LINES = 40
 
 
 def _redacted_tail(output: str, known: Iterable[str], *, lines: int = _BUILD_TAIL_LINES) -> str:
-    """The last ``lines`` lines of build output with every known secret removed."""
-    tail = [line[:300] for line in output.replace("\r", "\n").splitlines() if line.strip()][-lines:]
-    text = "\n".join(tail)
-    for secret in sorted({value for value in known if isinstance(value, str) and len(value) >= 8},
-                         key=len, reverse=True):
-        text = text.replace(secret, "<redacted>")
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub(lambda match: (match.group(1) + "=<redacted>") if match.groups() else "<redacted>",
-                           text)
-    return text
+    """The last ``lines`` lines of build output with every known secret removed.
+
+    Redact each complete line before bounding it: a secret that crosses the
+    length limit would otherwise no longer match its known value, and its
+    prefix would be printed.
+    """
+    secrets = sorted({value for value in known if isinstance(value, str) and len(value) >= 8},
+                     key=len, reverse=True)
+    tail = [line for line in output.replace("\r", "\n").splitlines() if line.strip()][-lines:]
+    rendered = []
+    for line in tail:
+        for secret in secrets:
+            line = line.replace(secret, "<redacted>")
+        for pattern in _SECRET_PATTERNS:
+            line = pattern.sub(
+                lambda match: (match.group(1) + "=<redacted>") if match.groups() else "<redacted>", line,
+            )
+        rendered.append(line[:300])
+    return "\n".join(rendered)
 
 
 def _deployment_secrets(deploy: Path, values: dict[str, str]) -> list[str]:

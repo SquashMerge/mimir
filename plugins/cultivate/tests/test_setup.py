@@ -4215,3 +4215,21 @@ def test_setup_base_image_is_the_root_dockerfiles_pinned_base() -> None:
     newest = max(int(tag.platform.split('_')[2]) for tag in _target_tags('aarch64')
                  if tag.platform.startswith('manylinux_2_'))
     assert newest == DEFAULT_BASE_IMAGE_GLIBC[1]
+
+
+@pytest.mark.parametrize('offset', [257, 280, 290, 299])
+def test_redacted_tail_never_leaks_a_secret_crossing_the_line_limit(offset):
+    # #2121: redact the complete line before bounding it; a known secret cut at
+    # the limit would no longer match its value and its prefix would print.
+    known = 'Zq8vN3pLw0XcT7rB2mKs9YdHf4GjA6uE1oWiRtQyPnM'  # opaque, unprefixed, 43 chars
+    token = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'
+    output = '\n'.join([
+        'x' * offset + known + ' trailing',
+        'y' * offset + 'GH=' + token,
+        'z' * (offset - 1) + ' ' + token,
+    ])
+    text = installer._redacted_tail(output, [known])
+    for secret in (known, token):
+        for start in range(0, len(secret) - 4):
+            assert secret[start:start + 5] not in text, (secret[:4], start)
+    assert all(len(line) <= 300 for line in text.splitlines())
