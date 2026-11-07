@@ -322,9 +322,10 @@ def bound_diff(diff: str) -> str:
 
 
 class _GitHubRequestError(ForgeError):
-    def __init__(self, message: str, *, retryable: bool) -> None:
+    def __init__(self, message: str, *, retryable: bool, status_code: int | None = None) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
 
 
 class GitHubIdentityVerificationError(ForgeError, _core_identity.GitHubIdentityVerificationError):
@@ -491,6 +492,7 @@ class GitHubForgeClient:
             raise _GitHubRequestError(
                 reasons.get(response.status_code, "forge request failed"),
                 retryable=response.status_code == 429 or response.status_code >= 500,
+                status_code=response.status_code,
             )
         if not raw:
             return "" if accept == "application/vnd.github.raw" else None
@@ -654,7 +656,7 @@ class GitHubForgeClient:
         )
 
     def get_head_commit_identity(self, scope: RepoPRActionScope) -> tuple[bool, str | None] | None:
-        """Return GitHub's verification and linked author for the pinned head."""
+        """Return GitHub's verification and linked committer for the pinned head."""
         data = self._request(
             "GET", f"/repos/{scope.head_repo}/commits/{scope.observed_head_sha}",
         )
@@ -665,8 +667,10 @@ class GitHubForgeClient:
         verified = verification.get("verified") if isinstance(verification, Mapping) else None
         if type(verified) is not bool:
             return None
-        author = data.get("author")
-        login = author.get("login") if isinstance(author, Mapping) else None
+        # GitHub links the author from freely chosen email text; only the
+        # verified committer is bound to the signing identity.
+        committer = data.get("committer")
+        login = committer.get("login") if isinstance(committer, Mapping) else None
         return verified, login if isinstance(login, str) and login else None
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection:
@@ -2127,49 +2131,77 @@ def pr_trust_verdict(
 
     The event actor and unsigned commit email are never evidence of authorship.
     A base-repository head is writable only by principals with repository write
-    access. On a fork, GitHub verification binds the head author; without it,
-    only the repository owner can vouch for the head.
+    access. On a fork, GitHub verification binds the committer, not the author.
+    Web-flow signatures cannot identify a contributor; use the repository owner.
     """
+    from mimir.pollers import _github_author_trust_cause, github_author_trust_cause
+
+    def unresolved(cause: str) -> None:
+        _github_author_trust_cause.set(cause)
+        return None
+
+    def lookup_failed(stage: str, exc: ForgeError) -> None:
+        if isinstance(exc, GitHubIdentityVerificationError):
+            _latch_github_identity_degraded(exc)
+            return unresolved("github_identity_verification_failed")
+        if isinstance(exc, _GitHubRequestError):
+            status = exc.status_code
+            kind = ("rate_limited" if status == 429 else
+                    "server_error" if status is not None and status >= 500 else
+                    "request_refused" if status is not None else "transport_failed")
+            return unresolved(f"{stage}_{kind}")
+        return unresolved(f"{stage}_unavailable")
+
     if context.ifc_state is None:
-        return None
-    # The native adapter's snapshot reads only identity/ref fields. Legacy
-    # adapters expose the same fields through their PR projection.
+        return unresolved("ifc_state_missing")
+    # A content projection lacks live repository identity. Do not trust the
+    # poller-supplied head_repo as a substitute, including for legacy adapters.
     read_snapshot = getattr(client, "get_pull_request_identity", None)
-    read_pr = getattr(client, "get_pull_request", None)
-    if not callable(read_snapshot) and not callable(read_pr):
-        return None
+    if not callable(read_snapshot):
+        return unresolved("pr_identity_reader_missing")
     try:
-        metadata = (read_snapshot(scope.canonical_repo, scope.pr_number)
-                    if callable(read_snapshot) else read_pr(scope))
-    except ForgeError:
-        return None
-    if (
-        metadata.number != scope.pr_number
-        or metadata.head_sha != scope.observed_head_sha
-        or not isinstance(metadata.author, str) or not metadata.author
-        or metadata.author != scope.pull_request_author
-        or (callable(read_snapshot) and (
-            metadata.repo.casefold() != scope.canonical_repo.casefold()
-            or metadata.head_repo.casefold() != scope.head_repo.casefold()
-        ))
+        metadata = read_snapshot(scope.canonical_repo, scope.pr_number)
+    except ForgeError as exc:
+        return lookup_failed("pr_identity", exc)
+    for field, expected, cause in (
+        ("number", scope.pr_number, "pr_number_mismatch"),
+        ("head_sha", scope.observed_head_sha, "pr_head_sha_mismatch"),
+        ("author", scope.pull_request_author, "pr_author_mismatch"),
     ):
-        return None
+        value = getattr(metadata, field, None)
+        if value != expected or (field == "author" and (not isinstance(value, str) or not value)):
+            return unresolved(cause)
+    for field, expected, cause in (
+        ("repo", scope.canonical_repo, "pr_repository_mismatch"),
+        ("head_repo", scope.head_repo, "pr_head_repository_mismatch"),
+    ):
+        value = getattr(metadata, field, None)
+        if not isinstance(value, str) or value.casefold() != expected.casefold():
+            return unresolved(cause)
     if scope.head_repo.casefold() == scope.canonical_repo.casefold():
         return True
     lookup = getattr(client, "get_head_commit_identity", None)
     if not callable(lookup):
-        return None
+        return unresolved("head_identity_reader_missing")
     try:
         head = lookup(scope)
-    except ForgeError:
-        return None
+    except ForgeError as exc:
+        return lookup_failed("head_identity", exc)
     if head is None or not isinstance(head, tuple) or len(head) != 2 or type(head[0]) is not bool:
-        return None
-    verified, author = head
-    if verified:
-        return _author_verdict(context, scope.canonical_repo, author, client)
+        return unresolved("head_identity_unavailable")
+    verified, committer = head
     owner = scope.head_repo.split("/", 1)[0]
-    return _author_verdict(context, scope.canonical_repo, owner, client)
+    web_flow = isinstance(committer, str) and committer.casefold() == "web-flow"
+    contributor = committer if verified and not web_flow else owner
+    if not isinstance(contributor, str) or not contributor:
+        return unresolved("head_committer_unavailable")
+    try:
+        verdict = _author_verdict(context, scope.canonical_repo, contributor, client)
+    except ForgeError as exc:
+        return lookup_failed("contributor_trust", exc)
+    if verdict is None and github_author_trust_cause() is None:
+        return unresolved("contributor_trust_unavailable")
+    return verdict
 
 
 def _withheld_event(tool: str, kind: str, reason: str, count: int = 1) -> None:

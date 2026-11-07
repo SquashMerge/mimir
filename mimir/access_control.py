@@ -1365,9 +1365,10 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             policy=policy,
             provenance="poller_payload",
             repo=item.get("repo"),
-            # The actor remains the subject of the outsider admission check;
-            # the PR author is a separate identity bound into the scope.
-            principal=item.get("author"),
+            # Synchronize's author is an optional push identity, not the PR
+            # principal. Keep the established PR-author mapping for admission.
+            principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"
+                       else item.get("author")),
             pull_request_author=item.get("pr_author") or item.get("author"),
             event_type=item.get("event_type"),
             review_state=item.get("state"),

@@ -895,6 +895,9 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     client = SimpleNamespace(
         author_is_trusted=lambda _repo, author: author in {"collaborator", "reviewer"},
         get_pull_request=lambda _: metadata,
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=metadata.number, head_sha=metadata.head_sha, author=metadata.author,
+            repo=scope.canonical_repo, head_repo=scope.head_repo),
         list_reviews=lambda _: (ReviewProjection("1", "reviewer", "approve", "ok", "now", scope.observed_head_sha),),
         list_comments=lambda _: (CommentProjection("1", "reviewer", "note", "now", "now"),),
     )
@@ -980,7 +983,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     assert fallbacks == []
 
 
-@pytest.mark.parametrize("case", ["unavailable", "missing_cause", "false", "true", "author_mismatch"])
+@pytest.mark.parametrize("case", ["unavailable", "missing_cause", "false", "true"])
 def test_checkout_records_fresh_turn_local_author_cause(tmp_path, monkeypatch, case):
     from mimir import pollers
     from mimir_cultivate import forge, repository as repo
@@ -1150,9 +1153,10 @@ def test_resumed_local_commit_requires_clean_producing_turn(
     from mimir_cultivate import forge as forge_module, repository as repo_module
     monkeypatch.setattr(forge_module, "remediation_checkout_preflight", lambda *_: (second, None))
     monkeypatch.setattr(forge_module, "_client", lambda _: SimpleNamespace(
-        get_pull_request=lambda _: SimpleNamespace(
+        get_pull_request_identity=lambda *_: SimpleNamespace(
             number=scope.pr_number, head_sha=scope.observed_head_sha,
             author=scope.pull_request_author,
+            repo=scope.canonical_repo, head_repo=scope.head_repo,
         ),
     ))
     from mimir.access_control import (

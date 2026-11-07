@@ -38,9 +38,9 @@ def cultivate_policy(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("event_author", ["dependabot[bot]", "jason-squashmerge"])
+@pytest.mark.parametrize("event_type", ["pr_checks_completed", "issue_comment"])
 @pytest.mark.usefixtures("stub_opencode")
-async def test_dependabot_checks_completed_pre_turn_checkout(tmp_path, monkeypatch, event_author):
+async def test_dependabot_checks_completed_pre_turn_checkout(tmp_path, monkeypatch, event_type):
     """The checks follow-up has a host-pinned head and a real pre-model checkout."""
     from mimir import access_control
 
@@ -114,12 +114,18 @@ async def test_dependabot_checks_completed_pre_turn_checkout(tmp_path, monkeypat
     )
     item = {
         "event_type": "pr_checks_completed", "repo": "SquashMerge/trellis",
-        "number": 35, "author": event_author, "pr_author": "dependabot[bot]",
+        "number": 35, "author": "dependabot[bot]",
         "pr_author_is_trusted": True,
         "head_repo": "SquashMerge/trellis", "head_remote": "origin",
         "head_ref": template.head_ref, "head_sha": template.observed_head_sha,
         "base_ref": template.base_ref, "base_sha": template.observed_base_sha,
     }
+    if event_type == "issue_comment":
+        # The comment emitter rewrites author to the PR user and records the
+        # collaborator requesting review separately as actor.
+        item.update(event_type=event_type, actor="jason-squashmerge",
+                    author_is_trusted=True, pr_state="open")
+    assert "pr_author" not in item
     await agent.run_turn(AgentEvent(
         trigger="poller", channel_id=authority.canonical, source="poller",
         service_principal=authority.canonical, service_authority=authority,
@@ -189,6 +195,7 @@ async def test_real_poller_review_sequence(tmp_path, monkeypatch, channel, exter
             posted.append(scope.pr_number) or forge.ReviewProjection(
                 "1", "mimir-bot", "COMMENTED", body, "now", scope.observed_head_sha)),
     )
+    client.get_pull_request_identity = client.get_pull_request_snapshot
     monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
     agent = _make_agent(tmp_path, monkeypatch)
     agent._config = replace(agent._config, plugin_manager=selected)
