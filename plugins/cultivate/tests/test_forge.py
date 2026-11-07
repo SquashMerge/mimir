@@ -503,14 +503,16 @@ def test_every_plugin_forge_tool_executes_scoped_behavior(
                 assert expected in str(result)
         finally:
             provenance = access_control.end_protected_result_capture(token)
-        if name in {"pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_job_log"}:
-            # PR-owned text is fetched only after the identity verdict trusts it.
+        if name in {"pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_job_log",
+                    "pr_checks", "pr_review_requests"}:
+            # PR reads are fetched only after the identity verdict trusts them.
             assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
             assert provenance.sources[0].integrity == "trusted"
-        if name in {"pr_checks", "pr_review_requests", "pr_comment", "pr_edit_body",
-                    "pr_inline_review_comment", "pr_submit_review", "pr_rerequest_review"}:
+        if name in {"pr_comment", "pr_edit_body", "pr_inline_review_comment",
+                    "pr_submit_review", "pr_rerequest_review"}:
+            # Our own write echo is trusted whoever wrote the PR (#2119).
             assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
-            assert provenance.sources[0].integrity == "untrusted"
+            assert provenance.sources[0].integrity == "trusted"
         if name == "issue_comment":
             assert provenance.sources[0].resource_id == "owner/repo#issue/23"
             assert provenance.sources[0].integrity == "trusted"

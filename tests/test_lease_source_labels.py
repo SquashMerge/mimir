@@ -1661,36 +1661,33 @@ def test_forge_error_rejects_misbound_scope(tmp_path, monkeypatch, field, value)
 
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
     # Keep the cached author verdict and authorization matched to this scope:
-    # only the producer's own-repository guard can reject this error. Checks
-    # still fetch before attesting, so their error reaches that guard.
+    # only the producer's own-repository guard can reject this error. Verdict-
+    # first reads refuse a misbound scope before fetching (#2119); the thread
+    # read still fetches before filtering authors, so its error reaches the guard.
     object.__setattr__(scope, field, value)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     calls = []
 
-    def fail_checks(*_):
-        calls.append("list_checks")
+    def fail_comments(*_):
+        calls.append("list_comments")
         raise ForgeError("misbound server failure")
 
     monkeypatch.setattr(forge, "_scope", lambda *_: scope)
     monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
         author_is_trusted=lambda *_: True,
-        get_pull_request=lambda *_: SimpleNamespace(
-            number=scope.pr_number, head_sha=scope.observed_head_sha,
-            author=scope.pull_request_author,
-        ),
-        list_checks=fail_checks,
+        list_comments=fail_comments,
     ))
     token = begin_protected_result_capture()
     try:
         with pytest.raises(ToolException, match="misbound server failure") as raised:
-            forge.pr_checks.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+            forge.pr_comments.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
     finally:
         provenance = end_protected_result_capture(token)
-    assert calls == ["list_checks"]
+    assert calls == ["list_comments"]
     assert provenance is None
     labels = classify_protected_result(
-        "pr_checks", {"repository": "owner/repo", "pull_request": 7}, auth,
-        ToolAuthorization(tool_name="pr_checks", decision="resource_scoped", allowed=True,
+        "pr_comments", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="pr_comments", decision="resource_scoped", allowed=True,
                           repo_pr_action_scope=scope), result=raised.value,
         provenance=provenance, failed=True,
     )
@@ -1871,6 +1868,39 @@ def test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_n
     assert source.principal is None
     assert source.integrity == "untrusted"
     assert labels.has_untrusted_active_ingest
+
+
+@pytest.mark.parametrize("author_trusted", [True, False])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_forge_error_label_follows_the_pr_author_verdict(tmp_path, monkeypatch, author_trusted):
+    from langchain_core.tools import ToolException
+    from mimir_cultivate.forge import ForgeError
+    from mimir_cultivate import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+
+    def fail_comments(*_):
+        raise ForgeError("server failure text")
+
+    monkeypatch.setattr(forge, "_scope", lambda *_: scope)
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
+        author_is_trusted=lambda *_: author_trusted, list_comments=fail_comments,
+    ))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="server failure text"):
+            forge.pr_comments.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    # Server error text is attested only for a trusted PR author's own-repository
+    # scope; an untrusted author's error keeps classification's untrusted default.
+    if author_trusted:
+        assert [(source.integrity, source.resource_id) for source in provenance.sources] == [
+            ("trusted", f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"),
+        ]
+    else:
+        assert provenance is None
 
 
 @pytest.mark.parametrize("field,value,guard", [

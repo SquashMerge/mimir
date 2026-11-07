@@ -397,6 +397,7 @@ def test_rerequest_result_does_not_block_following_comment(
     _, scope, _, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
     calls = []
     def read_pr(_):
+        calls.append("read_pr")  # write attestation must not read PR text
         if attestation_unavailable:
             raise forge.ForgeError("private adapter detail")
         return PullRequestProjection(
@@ -419,9 +420,11 @@ def test_rerequest_result_does_not_block_following_comment(
     assert "private adapter detail" not in first.content
     second = invoke("pr_comment", body="Summary")
     if attestation_unavailable:
-        assert second.status == "error"
-        assert calls == ["rerequest"]
-        assert auth.ifc_state.has_untrusted_active_ingest()
+        # Our own write echo needs no PR read: an unavailable metadata read can
+        # no longer leave the result unattested and block the next write.
+        assert second.status == "success", second.content
+        assert calls == ["rerequest", "comment"]
+        assert not auth.ifc_state.has_untrusted_active_ingest()
         assert "private adapter detail" not in second.content
     else:
         assert second.status == "success", second.content
@@ -1506,11 +1509,14 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
     assert auth.repo_pr_action_scope is not None
     state = auth.repo_pr_scope_registry.resolve("squashmerge/trellis", 7)
     scope = state.action_scope
+    identity = SimpleNamespace(
+        repo=scope.canonical_repo, number=scope.pr_number, state="open",
+        head_sha=scope.observed_head_sha, author=scope.pull_request_author,
+        head_repo=scope.head_repo,
+    )
     client = SimpleNamespace(
-        get_pull_request_snapshot=lambda *_: SimpleNamespace(
-            repo=scope.canonical_repo, number=scope.pr_number,
-            state="open", head_sha=scope.observed_head_sha,
-        ),
+        get_pull_request_snapshot=lambda *_: identity,
+        get_pull_request_identity=lambda *_: identity,
         get_pull_request=lambda _: PullRequestProjection(
             7, "Title", "open", "test", False, "main", "worklink/7",
             scope.observed_head_sha, True, "created", "updated",

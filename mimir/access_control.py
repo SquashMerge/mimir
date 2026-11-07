@@ -12075,7 +12075,32 @@ def _provider_pr_lease_result_is_bound(
         )
     return (
         state is not None and getattr(state, "action_scope", None) is scope
-        and _attested_pr_checkout_lease(auth_context, scope, getattr(state, "checkout_lease", None))
+        and (_own_forge_pr_write_result(registered) or _attested_pr_checkout_lease(
+            auth_context, scope, getattr(state, "checkout_lease", None),
+        ))
+    )
+
+
+def _own_forge_pr_write_result(registered: Any) -> bool:
+    """Our own PR write's echo needs no checkout attestation; its label still decides.
+
+    The lease attests checkout content, which a forge write result does not
+    contain: on an outsider's PR it is never attested, yet the write's echo is
+    ours. Admission only lets the repository classifier validate the label the
+    write published after succeeding at the exact scope (#2119); a failed write
+    publishes none and stays untrusted. Repository actions operate on checkout
+    content and keep requiring the attested lease.
+    """
+    descriptor = registered.descriptor
+    return (
+        registered.owner == "cultivate"
+        and "forge_actions" in registered.memberships
+        and "repo_actions" not in registered.memberships
+        and registered.flow == "sink"
+        and descriptor is not None
+        and descriptor.sink_destination == "bound_pull_request"
+        and descriptor.result_origin == ResultOriginKind.REPOSITORY
+        and not descriptor.git_operation_result
     )
 
 
