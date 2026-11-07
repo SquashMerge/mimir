@@ -139,7 +139,14 @@ def _force_exit(self):
     return _journal_force_exit(self)
 proxy._ShutdownHooks._force_exit = _force_exit
 _journal_exit = os._exit
+_exit_claimed = threading.Lock()
 def _exit(code):
+    # Both the wakeup observer and the Python handler may escalate one repeated
+    # signal (#2118); the real os._exit is idempotent, so this stub must be too.
+    # Never block here: a caller may be inside a signal handler.
+    if not _exit_claimed.acquire(blocking=False):
+        diagnose(f'exit-dispatch-duplicate:{code}')
+        threading.Event().wait()  # the first caller is already exiting
     _stop_stack_dumps()
     diagnose(f'exit-dispatch:{code}')
     if _controlled_exit:
@@ -803,6 +810,40 @@ async def _signal_exit_protocol(
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_controlled_exit_stub_is_reentrant(tmp_path: Path) -> None:
+    # The observer and the Python handler can both escalate one repeated signal
+    # (#2118). The harness's os._exit stub must let the first caller exit and
+    # park any other, never let a second one contend for the exit handshake.
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress, controlled_exit=True) + r'''
+import os, threading, time
+first = threading.Thread(target=os._exit, args=(7,), daemon=True)
+first.start()
+while b"exit-ready:7" not in open(_journal_path, "rb").read():
+    time.sleep(0.01)
+threading.Thread(target=os._exit, args=(7,), daemon=True).start()
+threading.Event().wait()
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with asyncio.timeout(60):  # hang guard, not a latency bound
+            await _await_diagnostic(progress, "exit-dispatch-duplicate:7", timeout=None)
+        assert progress.read_text().splitlines().count("exit-ready:7") == 1
+        process.stdin.write(b"e")
+        await process.stdin.drain()
+        stdout, stderr = await process.communicate()
+        assert (process.returncode, stdout, stderr) == (7, b"", b"")
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
 
 
 @pytest.mark.parametrize("parked", ["lock_wait", "c_recv"])
