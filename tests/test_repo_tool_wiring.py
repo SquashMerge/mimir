@@ -781,13 +781,17 @@ async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
 
     monkeypatch.setattr(forge, "remediation_checkout_preflight", preflight)
     monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
-    monkeypatch.setattr(
-        repository, "acquire_pr_checkout_lease",
-        lambda target, **kwargs: (create_pr_checkout_lease(
+    issued = []
+
+    def acquire(target, **kwargs):
+        candidate = create_pr_checkout_lease(
             target, owner=target.principal, lease_root=lease.lease_root,
             review_state=kwargs["review_state"],
-        ), ("candidate",)),
-    )
+        )
+        issued.append(candidate)
+        return candidate, ("candidate",)
+
+    monkeypatch.setattr(repository, "acquire_pr_checkout_lease", acquire)
     if outcome in {"reminted", "post_refused", "post_ok_refusal"}:
         monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
                             lambda *_args: SimpleNamespace(
@@ -796,9 +800,11 @@ async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
     if outcome in {"refused", "invalid_reason", "ok_refusal"}:
         def refused_hook(*args):
             cache.remember(fresh)
-            fresh.attach_checkout_lease(create_pr_checkout_lease(
+            candidate = create_pr_checkout_lease(
                 fresh.action_scope, owner=scope.principal, lease_root=lease.lease_root,
-            ))
+            )
+            issued.append(candidate)
+            fresh.attach_checkout_lease(candidate)
             reason = {"refused": "ancestry_failure", "invalid_reason": "adapter-secret",
                       "ok_refusal": "ok"}[outcome]
             return {"status": "attestation_refused", "reason": reason}
@@ -843,6 +849,7 @@ async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
         assert state.checkout_lease is None and fresh.checkout_lease is None
         return
     if outcome in {"refused", "post_refused"}:
+        assert len(issued) == 1 and issued[0].revoked
         assert fresh.checkout_lease is None and state.checkout_lease is None
         assert not auth.ifc_state.framework_pr_checkouts
         # Re-issuing through the normal authorization path cannot undo refusal.

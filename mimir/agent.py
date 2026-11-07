@@ -2730,6 +2730,7 @@ class Agent:
 
                         log_pr_checkout_lease_attestation_refused(auth_ctx, refused_state.action_scope, reason.value)
                         if refused_state.checkout_lease is not None:
+                            refused_state.checkout_lease.revoke()
                             refused_state.revoke_checkout_lease(refused_state.checkout_lease)
                         ctx.prechecked_pr_refusals.append({
                             "repository": scope.canonical_repo,
@@ -2770,6 +2771,7 @@ class Agent:
 
                         log_pr_checkout_lease_attestation_refused(auth_ctx, scope, reason.value)
                         if state.checkout_lease is not None:
+                            state.checkout_lease.revoke()
                             state.revoke_checkout_lease(state.checkout_lease)
                         ctx.prechecked_pr_refusals.append({
                             "repository": scope.canonical_repo,

@@ -5713,6 +5713,7 @@ def checkout_scoped_pr(
         log_pr_checkout_lease_attestation_refused(context, scope, exc.reason)
         attached = state.checkout_lease
         if attached is not None:
+            attached.revoke()
             state.revoke_checkout_lease(attached)
         if getattr(runtime, "pre_turn_checkout", False):
             return {"status": "attestation_refused", "reason": exc.reason}
