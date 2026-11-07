@@ -994,7 +994,13 @@ raise SystemExit(bootstrap.main([]))
         assert "watchdog-timed-wait" not in diagnostics
         if repeat:
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
-            assert f"signal-enter:{delivered[-1]}" in progress.read_text().splitlines()
+            # Either the wakeup observer or the Python handler may escalate; the
+            # handler cannot run while main is parked (#2118), so its
+            # signal-enter marker is optional. The repeat's exit code and the
+            # C-level delivery bytes below prove escalation either way.
+            lines = progress.read_text().splitlines()
+            assert f"exit-ready:{128 + delivered[-1]}" in lines
+            assert "watchdog-fired" not in lines
         else:
             assert progress.read_text().splitlines()[-3:] == [
                 "watchdog-fired", "force-exit-enter", f"exit-ready:{128 + signum}",
