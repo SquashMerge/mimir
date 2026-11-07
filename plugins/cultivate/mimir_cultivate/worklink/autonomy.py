@@ -432,46 +432,24 @@ def _preserve_before_prune(
     Runs only once an attempt is about to be pruned. Always returns False so the
     prune decision stays with the existing hooks; preservation never blocks it.
     """
-    from .preserved import is_preserved, preserve_attempt, preserved_line, prune_preserved
+    from .preserved import (
+        attempt_numbers, preserve_retained_attempt, preserved_line, prune_preserved,
+    )
 
-    left, sep, right = child.name.partition("-")
-    if not (sep and left.isdigit() and right.isdigit()) or int(left) < 1 or int(right) < 1:
+    numbers = attempt_numbers(child.name)
+    if numbers is None:
         return False
-    issue_id, attempt = int(left), int(right)
+    issue_id, attempt = numbers
     try:
-        if is_preserved(home, issue_id, attempt):
-            return False
-        evidence_path = home / "state" / "worklink" / "evidence" / f"{issue_id}-{attempt}.json"
-        try:
-            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            evidence = {}
-        if not isinstance(evidence, dict):
-            evidence = {}
-        if evidence.get("pr_url"):
-            return False  # Published attempts keep today's behaviour.
-        matching = [record for record in factory_records
-                    if Path(record.sandbox).parent.parent.parent.resolve() == child.resolve()]
-        if matching:
-            checkout, branch = Path(matching[0].sandbox), matching[0].branch
-        else:
-            checkout = child / "checkout" if (child / "checkout" / ".git").is_dir() else child
-            branch = f"issue/{issue_id}-a{attempt}"
-        if not (checkout / ".git").is_dir():
-            return False
-        base = str(evidence.get("base_ref") or defaults.base_branch)
-        reason = (evidence.get("blocked_reason") or evidence.get("failure_reason")
-                  or (f"status={evidence['status']}" if evidence.get("status") else None)
-                  or "retained attempt reached the prune TTL without a recorded outcome")
-        preserved = preserve_attempt(
-            home=home, trusted_repo=repo, checkout=checkout, branch=branch,
-            issue_id=issue_id, attempt=attempt, base_candidates=(f"origin/{base}", base),
-            reason=str(reason), runner=lambda args: run(list(args)),
+        preserved = preserve_retained_attempt(
+            home=home, trusted_repo=repo, attempt_dir=child, factory_records=factory_records,
+            default_base=defaults.base_branch, runner=lambda args: run(list(args)),
+            reason_if_unknown="retained attempt reached the prune TTL without a recorded outcome",
         )
         if preserved is None:
             return False
         _log_best_effort("worklink_attempt_preserved", issue_id=issue_id, attempt=attempt,
-                       ref=preserved.ref, error=preserved.error, trigger="prune")
+                         ref=preserved.ref, error=preserved.error, trigger="prune")
         _comment_best_effort(run, issue_id, preserved_line(preserved))
         pruned = prune_preserved(home, repo, issue_id, keep=defaults.preserved_attempts_keep,
                                  runner=lambda args: run(list(args)))

@@ -14063,3 +14063,109 @@ def test_next_attempt_prompt_carries_prior_attempts_after_the_spec(
     evidence = json.loads((tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text())
     assert evidence["spec"]["text"] == f"{issue['title']}\n\n{issue['description']}"
     assert len(evidence["spec"]["sha256"]) == 64
+
+
+def _crashed_attempt_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A real operator repo and a retained attempt-1 clone that crashed unrecorded."""
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import ClaimRecord
+
+    def git(repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    forge = tmp_path / "forge.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(forge)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    git(repo, "config", "user.name", "Op")
+    git(repo, "config", "user.email", "op@example.test")
+    (repo / "app.py").write_text("print('base')\n")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-q", "-m", "base")
+    git(repo, "remote", "add", "origin", str(forge))
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+    crashed = repo.parent / ".worklink" / repo.name / "441-1"
+    crashed.parent.mkdir(parents=True)
+    subprocess.run(["git", "clone", "-q", str(repo), str(crashed)], check=True)
+    (crashed / "half_built.py").write_text("CRASHED_ATTEMPT_WORK = True\n")
+    worktree = repo.parent / ".worklink" / repo.name / "441-2"
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "next_attempt", lambda self, comments: 2)
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "claim_issue",
+        lambda self, *a, **k: (k.get("before_claim") or (lambda: None))() or ClaimResult(
+            True, ClaimRecord(441, 2, "mimir-worklink", datetime.now(UTC)),
+        ),
+    )
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(args, **kwargs):
+        # The trusted operator repository is real; the rest of the run stays faked.
+        if (isinstance(args, list) and args[:3] == ["git", "-C", str(repo)]
+                and args[3] in {"merge-base", "diff", "update-ref", "rev-parse"}):
+            calls.append(args)
+            return subprocess.run(args, capture_output=True, text=True)
+        return base_runner(args, **kwargs)
+
+    return repo, crashed, calls, runner
+
+
+def _dispatch_attempt_two(tmp_path: Path, repo: Path, runner) -> tuple[Any, FakeBackend]:
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+    return result, backend
+
+
+def test_crashed_attempt_is_swept_into_the_next_dispatch_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, crashed, calls, runner = _crashed_attempt_rig(tmp_path, monkeypatch)
+    result, backend = _dispatch_attempt_two(tmp_path, repo, runner)
+    assert result.attempt == 2
+    prompt = backend.orders[0].prompt
+    assert "## Prior attempts" in prompt and "CRASHED_ATTEMPT_WORK = True" in prompt
+    assert "interrupted: the run ended without recording an outcome" in prompt
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", "refs/worklink/441/1"],
+                          capture_output=True).returncode == 0
+    comments = [args[4] for args in calls if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]]
+    assert any(text.startswith("WORKLINK_PRESERVED issue=441 attempt=1 ") for text in comments)
+
+
+def test_dispatch_sweep_never_re_preserves_a_recorded_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir_cultivate.worklink.preserved as preserved_mod
+
+    repo, crashed, calls, runner = _crashed_attempt_rig(tmp_path, monkeypatch)
+    record = tmp_path / "state" / "worklink" / "preserved" / "441" / "1.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({"issue": 441, "attempt": 1, "ref": None, "error": "earlier"}))
+    preserved_calls = []
+    real = preserved_mod.preserve_attempt
+    monkeypatch.setattr(preserved_mod, "preserve_attempt",
+                        lambda **kw: preserved_calls.append(kw["attempt"]) or real(**kw))
+    _dispatch_attempt_two(tmp_path, repo, runner)
+    assert 1 not in preserved_calls
+    assert json.loads(record.read_text())["error"] == "earlier"
+
+
+def test_dispatch_sweep_failure_never_blocks_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    repo, crashed, calls, runner = _crashed_attempt_rig(tmp_path, monkeypatch)
+
+    def broken(**_):
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(orchestrator, "preserve_retained_attempt", broken)
+    result, backend = _dispatch_attempt_two(tmp_path, repo, runner)
+    assert backend.orders, "the backend still ran"
+    assert result.attempt == 2 and result.status in {"completed", "blocked"}

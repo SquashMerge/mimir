@@ -90,8 +90,8 @@ from ..repository import RepositoryInventory
 from mimir.secret_scan import secret_matches
 from .safe_git import ControllerGitPublication, _git_credential_settings
 from .preserved import (
-    load_dispatch_spec, preserve_attempt, preserved_line, prior_attempts_section,
-    prune_preserved, record_dispatch_spec, spec_text,
+    attempt_numbers, load_dispatch_spec, preserve_attempt, preserve_retained_attempt,
+    preserved_line, prior_attempts_section, prune_preserved, record_dispatch_spec, spec_text,
 )
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
@@ -444,6 +444,60 @@ def _prior_attempts(home: Path, issue: "IssueContext", attempt: int) -> str | No
         _log_event("worklink_prior_attempts_unavailable", issue_id=issue.issue_id,
                    attempt=attempt, error=str(exc))
         return None
+
+
+def _sweep_retained_attempts(
+    home: Path, repo: Path, issue_id: int, attempt: int, *, runner: Runner,
+    comment: Callable[[int, str], Any],
+) -> None:
+    """Preserve this issue's earlier retained attempts that never got a record.
+
+    A run killed without its ``finally`` (e.g. a container recreate during a
+    deploy) leaves its attempt directory behind; preserving it here, before the
+    prompt renders, makes it the next attempt's reference (#2114). Never blocks
+    dispatch and never re-preserves an attempt that has a record.
+    """
+    from .checkout import _attempt_roots
+    from .factory_state import list_factory_records
+
+    try:
+        listing = list_factory_records(home)
+        factory_records = listing.records
+    except Exception:  # noqa: BLE001 - leaf attempts need no factory records
+        factory_records = ()
+    try:
+        default_base = WorklinkConfig.load(home / "worklink.yaml").defaults.base_branch
+    except Exception:  # noqa: BLE001
+        default_base = "main"
+    candidates: list[Path] = []
+    try:
+        for root, _isolated in _attempt_roots(repo, ".worklink"):
+            if not root.is_dir():
+                continue
+            for child in root.iterdir():
+                numbers = attempt_numbers(child.name)
+                if (numbers is not None and numbers[0] == issue_id and numbers[1] < attempt
+                        and child.is_dir() and not child.is_symlink()):
+                    candidates.append(child)
+    except Exception as exc:  # noqa: BLE001
+        _log_event("worklink_preservation_sweep_failed", issue_id=issue_id, attempt=attempt,
+                   error=str(exc))
+        return
+    for child in sorted(candidates, key=lambda path: attempt_numbers(path.name)[1]):
+        try:
+            preserved = preserve_retained_attempt(
+                home=home, trusted_repo=repo, attempt_dir=child, factory_records=factory_records,
+                default_base=default_base, runner=_list_runner(runner),
+                reason_if_unknown="interrupted: the run ended without recording an outcome",
+            )
+            if preserved is None:
+                continue
+            _log_event("worklink_attempt_preserved", issue_id=issue_id, attempt=preserved.attempt,
+                       ref=preserved.ref, error=preserved.error, trigger="dispatch")
+            comment(issue_id, preserved_line(preserved))
+        except Exception as exc:  # noqa: BLE001 - never blocks dispatch
+            _log_event("worklink_preservation_sweep_failed", issue_id=issue_id, attempt=attempt,
+                       attempt_dir=str(child), error=str(exc))
 
 
 def _record_dispatch_spec_best_effort(home: Path, issue: "IssueContext", attempt: int) -> None:
@@ -1316,6 +1370,12 @@ class WorklinkRunner:
                     ),
                 )
             root_dirty_before = _dirty_paths(self.repo, runner=runner)
+            await asyncio.to_thread(
+                _sweep_retained_attempts, self.home, self.repo, issue.issue_id, record.attempt,
+                runner=runner, comment=lambda issue_id, text: claims._run(  # noqa: SLF001
+                    "issue", "comment", str(issue_id), text,
+                ),
+            )
             prompt = render_work_order(
                 issue,
                 template_path=template_path,
@@ -3120,6 +3180,13 @@ class WorklinkRunner:
                     worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
                 )
                 _record_dispatch_spec_best_effort(self.home, issue, claim_record.attempt)
+                await asyncio.to_thread(
+                    _sweep_retained_attempts, self.home, self.repo, issue_id,
+                    claim_record.attempt, runner=runner,
+                    comment=lambda target, text: claims._run(  # noqa: SLF001
+                        "issue", "comment", str(target), text,
+                    ),
+                )
                 order, publishing_identity = self._factory_launch_order(
                     issue=issue, checkout=lease.path,
                     work_item_json=work_item_json, runner=runner,

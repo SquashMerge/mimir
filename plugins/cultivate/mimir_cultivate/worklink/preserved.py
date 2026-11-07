@@ -255,6 +255,63 @@ def preserve_attempt(
     return record
 
 
+def attempt_numbers(name: str) -> tuple[int, int] | None:
+    left, sep, right = name.partition("-")
+    if not (sep and left.isdigit() and right.isdigit()) or int(left) < 1 or int(right) < 1:
+        return None
+    return int(left), int(right)
+
+
+def preserve_retained_attempt(
+    *,
+    home: Path,
+    trusted_repo: Path,
+    attempt_dir: Path,
+    factory_records: Sequence[Any],
+    default_base: str,
+    runner: Runner,
+    reason_if_unknown: str,
+) -> PreservedAttempt | None:
+    """Preserve a retained ``<issue>-<attempt>`` directory that has no record yet.
+
+    ``None`` means skipped: already preserved, published, not a checkout, or
+    nothing changed. Never raises past the per-attempt failure record.
+    """
+    numbers = attempt_numbers(attempt_dir.name)
+    if numbers is None:
+        return None
+    issue_id, attempt = numbers
+    if is_preserved(home, issue_id, attempt):
+        return None
+    try:
+        evidence = json.loads((home / "state" / "worklink" / "evidence"
+                               / f"{issue_id}-{attempt}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        evidence = {}
+    if not isinstance(evidence, dict):
+        evidence = {}
+    if evidence.get("pr_url"):
+        return None  # Published attempts keep today's behaviour.
+    matching = [record for record in factory_records
+                if Path(record.sandbox).parent.parent.parent.resolve() == attempt_dir.resolve()]
+    if matching:
+        checkout, branch = Path(matching[0].sandbox), matching[0].branch
+    else:
+        checkout = attempt_dir / "checkout" if (attempt_dir / "checkout" / ".git").is_dir() else attempt_dir
+        branch = f"issue/{issue_id}-a{attempt}"
+    if not (checkout / ".git").is_dir():
+        return None
+    base = str(evidence.get("base_ref") or default_base)
+    reason = (evidence.get("blocked_reason") or evidence.get("failure_reason")
+              or (f"status={evidence['status']}" if evidence.get("status") else None)
+              or reason_if_unknown)
+    return preserve_attempt(
+        home=home, trusted_repo=trusted_repo, checkout=checkout, branch=branch,
+        issue_id=issue_id, attempt=attempt, base_candidates=(f"origin/{base}", base),
+        reason=str(reason), runner=runner,
+    )
+
+
 def preserved_line(record: PreservedAttempt) -> str:
     fields = {
         "ref": record.ref, "base": record.base_sha, "head": record.head_sha,
