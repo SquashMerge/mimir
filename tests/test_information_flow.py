@@ -7079,21 +7079,20 @@ def test_shell_gate_after_real_source_labelling(
     )
     review_state = RepoReviewState(scope) if profile == "github" else None
     if source in {"collaborator_pr", "noncollaborator_pr", "noncollaborator_pr_diff"}:
-        monkeypatch.setitem(forge._clients, scope.canonical_repo, SimpleNamespace(
-            author_is_trusted=lambda repo, author: source == "collaborator_pr",
-        ))
-        token = access_control.begin_protected_result_capture()
-        try:
-            forge._publish_author_attestation(
-                SimpleNamespace(context=auth), scope, ("author",),
-                "pr_diff" if source == "noncollaborator_pr_diff" else "pr_metadata",
-            )
-        finally:
-            provenance = access_control.end_protected_result_capture(token)
-        assert provenance is not None
-        assert provenance.sources[0].integrity == (
-            "trusted" if source == "collaborator_pr" else "untrusted"
-        )
+        # A trusted verdict publishes the forge read's label before fetching. An
+        # untrusted PR is refused before any fetch (#2113), so the only way its
+        # result can still reach classification is unattested: no provenance.
+        provenance = None
+        if source == "collaborator_pr":
+            token = access_control.begin_protected_result_capture()
+            try:
+                forge._publish_trusted_pr_label(
+                    SimpleNamespace(context=auth), scope, scope.observed_head_sha,
+                )
+            finally:
+                provenance = access_control.end_protected_result_capture(token)
+            assert provenance is not None
+            assert provenance.sources[0].integrity == "trusted"
         forge_tool = "pr_diff" if source == "noncollaborator_pr_diff" else "pr_metadata"
         added = classify_protected_result(
             forge_tool, {}, auth,

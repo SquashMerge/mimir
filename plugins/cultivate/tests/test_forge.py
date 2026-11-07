@@ -21,7 +21,7 @@ from mimir_cultivate.forge import (
     PullRequestProjection, PullRequestSummary, ReviewProjection,
     ReviewRequestProjection, ReviewVerdict,
 )
-from mimir.models import AuthContext, InformationFlowLabels
+from mimir.models import AuthContext, InformationFlowLabels, NormalizedPullRequestSnapshot
 from mimir_cultivate.policy import (
     RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
 )
@@ -37,7 +37,7 @@ def _runtime() -> ToolRuntime[AuthContext]:
         allowed_operations=frozenset(action.value for action in RepoPRAction),
         pr_number=17, head_repo="contributor/repo", head_remote="source",
         destination_ref="refs/heads/change", observed_head_sha="a" * 40,
-        base_ref="main", observed_base_sha="b" * 40,
+        base_ref="main", observed_base_sha="b" * 40, pull_request_author="author",
     )
     state = RepoReviewState(scope)
     context = AuthContext(
@@ -57,8 +57,28 @@ def _runtime() -> ToolRuntime[AuthContext]:
 
 
 class _Forge:
+    # The unsigned fork head is attributed to its owner, ``contributor``, and
+    # the PR text to its author; only those pre-fetch verdicts are decided
+    # here, so every write result keeps an untrusted label.
+    contributor_trusted = True
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
+
+    def get_pull_request_identity(self, repository, number):
+        self.calls.append(("identity", (repository, number)))
+        return NormalizedPullRequestSnapshot(
+            repo=repository, state="open", number=number, author="author",
+            head_repo="contributor/repo", head_remote="source", head_ref="change",
+            head_sha="a" * 40, base_ref="main", base_sha="b" * 40,
+        )
+
+    _text_attestation = False
+
+    def get_head_commit_identity(self, scope):
+        self.calls.append(("head_identity", scope.observed_head_sha))
+        self._text_attestation = True
+        return (False, None)
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection:
         self.calls.append(("metadata", scope))
@@ -69,7 +89,12 @@ class _Forge:
 
     def author_is_trusted(self, repository: str, author: str) -> bool:
         self.calls.append(("attest", (repository, author)))
-        return False
+        # The PR author is attested only for the text read the head verdict
+        # armed, so write results keep their untrusted PR-author label.
+        if author == "author":
+            text_author, self._text_attestation = self._text_attestation, False
+            return text_author and self.contributor_trusted
+        return author == "contributor" and self.contributor_trusted
 
     def add_pull_request_comment(self, scope: RepoPRActionScope, body: str):
         self.calls.append(("comment", (scope, body)))
@@ -478,11 +503,16 @@ def test_every_plugin_forge_tool_executes_scoped_behavior(
                 assert expected in str(result)
         finally:
             provenance = access_control.end_protected_result_capture(token)
-        if name in {"pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_checks",
-                    "pr_job_log", "pr_review_requests", "pr_comment", "pr_edit_body",
-                    "pr_inline_review_comment", "pr_submit_review", "pr_rerequest_review"}:
+        if name in {"pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_job_log",
+                    "pr_checks", "pr_review_requests"}:
+            # PR reads are fetched only after the identity verdict trusts them.
             assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
-            assert provenance.sources[0].integrity == "untrusted"
+            assert provenance.sources[0].integrity == "trusted"
+        if name in {"pr_comment", "pr_edit_body", "pr_inline_review_comment",
+                    "pr_submit_review", "pr_rerequest_review"}:
+            # Our own write echo is trusted whoever wrote the PR (#2119).
+            assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
+            assert provenance.sources[0].integrity == "trusted"
         if name == "issue_comment":
             assert provenance.sources[0].resource_id == "owner/repo#issue/23"
             assert provenance.sources[0].integrity == "trusted"
@@ -516,23 +546,25 @@ def test_every_plugin_forge_tool_executes_scoped_behavior(
 @pytest.mark.asyncio
 async def test_plugin_call_site_preserves_scope_head_and_untrusted_taint() -> None:
     client = _Forge()
+    client.contributor_trusted = False
     forge.set_forge_client(client)
     runtime = _runtime()
     metadata = next(tool for tool in forge.FORGE_TOOLS if tool.name == "pr_metadata")
     comment = next(tool for tool in forge.FORGE_TOOLS if tool.name == "pr_comment")
     token = access_control.begin_protected_result_capture()
     try:
-        result = await metadata.coroutine("owner/repo", 17, runtime=runtime)
+        # Fail closed is not fetching: the untrusted PR's text is never read.
+        with pytest.raises(ToolPolicyRefusal, match="not trusted; no content was fetched"):
+            await metadata.coroutine("owner/repo", 17, runtime=runtime)
     finally:
         provenance = access_control.end_protected_result_capture(token)
-    assert result["title"] == "Title"
     assert client.calls == [
-        ("metadata", runtime.context.repo_pr_action_scope),
-        ("attest", ("owner/repo", "author")),
-        ("metadata", runtime.context.repo_pr_action_scope),
+        ("identity", ("owner/repo", 17)),
+        ("head_identity", "a" * 40),
+        ("attest", ("owner/repo", "contributor")),
     ]
-    assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
-    assert provenance.sources[0].integrity == "untrusted"
+    assert provenance is None or not provenance.sources
+    assert not runtime.context.ifc_state.has_untrusted_active_ingest()
     try:
         assert comment.func("owner/repo", 17, "posted", runtime=runtime)["body"] == "posted"
         with pytest.raises(ToolPolicyRefusal, match="not configured"):

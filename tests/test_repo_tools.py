@@ -929,11 +929,18 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **kw: events.append((name, kw)))
     observed = {}
     observed_provenance = {}
+    # The outsider's PR text and a moved head's text are never fetched.
+    unattested_text = case in {"outsider", "head_mismatch"}
     for tool in (forge.pr_reviews, forge.pr_comments, forge.pr_metadata, forge.pr_spec, repo.repo_checkout):
         token = access_control.begin_protected_result_capture()
         try:
             try:
-                result = tool.func("owner/repo", 7, runtime=runtime)
+                if tool is forge.pr_metadata and unattested_text:
+                    with pytest.raises(ToolPolicyRefusal, match="no content was fetched"):
+                        tool.func("owner/repo", 7, runtime=runtime)
+                    result = None
+                else:
+                    result = tool.func("owner/repo", 7, runtime=runtime)
             except repo.LeaseAttestationRefusal as exc:
                 assert tool is repo.repo_checkout
                 assert case in {"head_mismatch", "git_timeout"}
@@ -941,9 +948,13 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
                 assert state.checkout_lease is None
                 assert not auth.ifc_state.framework_pr_checkouts
                 assert auth.ifc_state.has_untrusted_active_ingest()
-                return  # Refused tool resumes never expose checkout content.
+                result = None  # Refused resumes expose no checkout content.
         finally:
             provenance = access_control.end_protected_result_capture(token)
+        if result is None:
+            assert provenance is None or not provenance.sources
+            observed[tool.name] = observed_provenance[tool.name] = "refused"
+            continue
         added = access_control.classify_protected_result(
             tool.name, {"repository": "owner/repo", "pull_request": 7}, auth,
             ToolAuthorization(tool_name=tool.name, decision="resource_scoped", allowed=True,
@@ -955,7 +966,6 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
             else None
         )
         auth.ifc_state.merge(added)
-    assert case in {"collaborator", "outsider"}, "refused resume unexpectedly succeeded"
     # Put fixed attestation reasons first: CI's short summary truncates the
     # integrity map and full event payload before reaching the useful diagnostic.
     refusal_reasons = [
@@ -964,24 +974,31 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     ]
     assert observed_provenance == {
         "pr_reviews": "trusted", "pr_comments": "trusted",
-        "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
+        "pr_metadata": "refused" if unattested_text else "trusted",
         "pr_spec": "trusted",
         # A base-repository head is trusted independently of its PR author's
         # collaborator status; forge content keeps its author attestation.
-        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else None,
+        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else "refused",
     }, f"lease_refusals={refusal_reasons}; observed={observed_provenance}; events={events}"
+    attested = case in {"collaborator", "outsider"}
+    # Forge results label themselves (#2120): their classification is their
+    # published label, whatever the lease. Checkout content still needs it.
     assert observed == {
-        "pr_reviews": "untrusted", "pr_comments": "untrusted",
-        "pr_metadata": "untrusted", "pr_spec": "untrusted",
-        "repo_checkout": "trusted" if case in {"collaborator", "outsider"} else "untrusted",
+        "pr_reviews": "trusted", "pr_comments": "trusted",
+        "pr_metadata": "refused" if unattested_text else "trusted", "pr_spec": "trusted",
+        "repo_checkout": "trusted" if attested else "refused",
     }
-    assert auth.ifc_state.has_untrusted_active_ingest()
+    assert auth.ifc_state.has_untrusted_active_ingest() is not attested
     if case in {"collaborator", "outsider", "git_timeout"}:
         assert status_probes  # The positive/timeout controls reached the real proof boundary.
     assert refusal_reasons == (
         [] if case in {"collaborator", "outsider"} else
         ["git_timeout"] if case == "git_timeout" else ["no_author_trust"]
     )
+    if not attested:
+        assert state.checkout_lease is None
+        assert not [kw for name, kw in events if name == "repository_result_untrusted_default"]
+        return  # All forge/result/diagnostic assertions ran; there is no lease to read.
     # Read actual lease content before exercising the real edit-file gate.
     target = state.checkout_lease.path / "tracked.txt"
     read = access_control.classify_protected_result(
@@ -996,8 +1013,12 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     decision = access_control.ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=True, target_channel=str(target),
     )
-    assert not decision.allowed, (decision.reason, observed, events)
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    if attested:
+        # Reading the PR no longer taints the remediation turn: it may edit.
+        assert decision.allowed, (decision.reason, observed, events)
+    else:
+        assert not decision.allowed, (decision.reason, observed, events)
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
     fallbacks = [kw for name, kw in events if name == "repository_result_untrusted_default"]
     assert fallbacks == []
 

@@ -239,18 +239,18 @@ def test_forge_job_log_uses_provider_capture_only_after_head_binding(monkeypatch
 def test_forge_unattested_thread_withholds_through_provider_trust(monkeypatch):
     from mimir_cultivate import forge, github_trust
 
-    scope = SimpleNamespace(canonical_repo="owner/repo")
+    scope = SimpleNamespace(canonical_repo="owner/repo", observed_head_sha="a" * 40)
     runtime = SimpleNamespace(context=object())
     monkeypatch.setattr(forge, "_client", lambda _scope: object())
     monkeypatch.setattr(forge, "_author_verdict", lambda *_args: None)
-    monkeypatch.setattr(forge, "_publish_author_attestation", lambda *_args: None)
+    monkeypatch.setattr(forge, "_publish_trusted_pr_label", lambda *_args: None)
     monkeypatch.setattr(forge, "_withheld_event", lambda *_args: None)
     calls = []
     original = github_trust.partition
 
-    def traced(*args):
+    def traced(*args, **kwargs):
         calls.append(True)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(github_trust, "partition", traced)
     item = forge.CommentProjection("1", "outsider", "secret content", "now", "now")

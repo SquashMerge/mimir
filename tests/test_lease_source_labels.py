@@ -31,9 +31,11 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    NormalizedPullRequestSnapshot,
     SourceLabel,
     TurnInteractivity,
 )
+from mimir.tools.refusals import ToolPolicyRefusal
 if importlib.util.find_spec("mimir_cultivate") is not None:
     from mimir_cultivate.policy import RepoPRActionScope, RepoReviewState
 from tests.lease_attestation_helper import assert_lease_attested
@@ -192,6 +194,16 @@ def _core_auth() -> AuthContext:
         event_ingress=None, trigger="user_message", channel_id="channel-1",
         interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
         ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+    )
+
+
+def _identity(scope, *, head_sha=None):
+    """The identity-only PR snapshot GitHub reports for this scope."""
+    return NormalizedPullRequestSnapshot(
+        repo=scope.canonical_repo, state="open", number=scope.pr_number,
+        author=scope.pull_request_author, head_repo=scope.head_repo, head_remote="origin",
+        head_ref="worklink/7", head_sha=head_sha or scope.observed_head_sha,
+        base_ref="main", base_sha="b" * 40,
     )
 
 
@@ -778,9 +790,10 @@ def test_cultivate_forge_reads_match_core_result_and_review_sink(
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("tool_name", ["pr_diff", "repo_diff"])
 @pytest.mark.parametrize("boundary", ["missing_lease", "stale_head", "wrong_repository", "missing_author_trust"])
 def test_cultivate_forge_read_provenance_fails_closed_without_binding(
-    tmp_path: Path, boundary: str,
+    tmp_path: Path, boundary: str, tool_name: str,
 ) -> None:
     from mimir.plugins.core import selected_policy_registry
 
@@ -802,11 +815,19 @@ def test_cultivate_forge_read_provenance_fails_closed_without_binding(
     if boundary == "stale_head":
         source = replace(source, resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{'b' * 40}")
     labels = classify_protected_result(
-        "pr_diff", args, auth, ToolAuthorization(
-            tool_name="pr_diff", decision="resource_scoped", allowed=True,
+        tool_name, args, auth, ToolAuthorization(
+            tool_name=tool_name, decision="resource_scoped", allowed=True,
             repo_pr_action_scope=scope, policy=selected_policy_registry(),
         ), result={"content": "PR text"}, provenance=ProtectedResultProvenance((source,)),
     )
+    if tool_name == "pr_diff" and boundary in {"missing_lease", "missing_author_trust"}:
+        # A forge result's own label is its attestation (#2120): the forge tool
+        # decided the verdict before fetching, so no checkout lease is needed.
+        assert not labels.has_untrusted_active_ingest
+        assert labels.sources[0].integrity == "trusted"
+        return
+    # A label at another head or repository never matches the scope, and a
+    # repository action's checkout content keeps requiring the attested lease.
     assert labels.has_untrusted_active_ingest
 
 
@@ -1546,6 +1567,7 @@ def test_attested_forge_error_after_scope_resolution(tmp_path, monkeypatch):
             number=scope.pr_number, head_sha=scope.observed_head_sha,
             author=scope.pull_request_author,
         ),
+        get_pull_request_identity=lambda *_: _identity(scope),
         get_diff=lambda *_: (_ for _ in ()).throw(ForgeError("server failure")),
     ))
     token = begin_protected_result_capture()
@@ -1569,15 +1591,17 @@ def test_attested_forge_error_after_scope_resolution(tmp_path, monkeypatch):
     ).allowed
 
 
-@pytest.mark.parametrize("author,verdict,moved,allowed", [
-    ("collaborator", True, False, True),
-    ("dependabot[bot]", False, False, True),
-    ("outsider", False, False, False),
-    ("collaborator", True, True, False),
+@pytest.mark.parametrize("author,verdict,moved", [
+    ("collaborator", True, False),
+    ("dependabot[bot]", False, False),
+    # A same-repository head is pushed only by a writer, whoever opened the PR.
+    ("outsider", False, False),
+    # Error text from a moved head is discarded, so it cannot taint the turn.
+    ("collaborator", True, True),
 ])
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_missing_scoped_pr_file_preserves_edit_decision(
-    tmp_path, monkeypatch, author, verdict, moved, allowed,
+    tmp_path, monkeypatch, author, verdict, moved,
 ):
     from langchain_core.tools import ToolException
     from mimir_cultivate.forge import ForgeError, PullRequestProjection
@@ -1602,11 +1626,13 @@ def test_missing_scoped_pr_file_preserves_edit_decision(
             7, "Title", "open", author, False, "main", "worklink/7",
             head[0], True, "created", "updated",
         ),
+        get_pull_request_identity=lambda *_: _identity(scope, head_sha=head[0]),
         get_file_content=missing,
     ))
     token = begin_protected_result_capture()
     try:
-        with pytest.raises(ToolException, match="path not found at scoped head") as raised:
+        expected = "head moved during the read" if moved else "path not found at scoped head"
+        with pytest.raises(ToolException, match=expected) as raised:
             forge.pr_file_content.func("owner/repo", 7, ".github/workflows/ci.yml",
                                        runtime=SimpleNamespace(context=auth))
     finally:
@@ -1618,18 +1644,16 @@ def test_missing_scoped_pr_file_preserves_edit_decision(
         result=ToolMessage(content=f"Error: {raised.value}", tool_call_id="missing", status="error"),
         provenance=provenance, failed=True,
     )
-    assert labels.has_untrusted_active_ingest is not (allowed and not moved)
+    if moved:
+        assert "path not found" not in str(raised.value)
+    assert not labels.has_untrusted_active_ingest
     auth.ifc_state.merge(labels)
-    assert auth.ifc_state.has_untrusted_active_ingest() is not (allowed and not moved)
+    assert not auth.ifc_state.has_untrusted_active_ingest()
     decision = ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=True, target_channel=str(target),
         arguments={"file_path": str(target)},
     )
-    if allowed and not moved:
-        assert decision.reason != "write_blocked_by_untrusted_ingest"
-    else:
-        assert not decision.allowed
-        assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.reason != "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.parametrize("field,value", [
@@ -1640,6 +1664,54 @@ def test_missing_scoped_pr_file_preserves_edit_decision(
 ])
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_forge_error_rejects_misbound_scope(tmp_path, monkeypatch, field, value):
+    from langchain_core.tools import ToolException
+    from mimir_cultivate.forge import ForgeError
+    from mimir_cultivate import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    # Keep the cached author verdict and authorization matched to this scope:
+    # only the producer's own-repository guard can reject this error. Verdict-
+    # first reads refuse a misbound scope before fetching (#2119); the thread
+    # read still fetches before filtering authors, so its error reaches the guard.
+    object.__setattr__(scope, field, value)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    calls = []
+
+    def fail_comments(*_):
+        calls.append("list_comments")
+        raise ForgeError("misbound server failure")
+
+    monkeypatch.setattr(forge, "_scope", lambda *_: scope)
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
+        author_is_trusted=lambda *_: True,
+        list_comments=fail_comments,
+    ))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="misbound server failure") as raised:
+            forge.pr_comments.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert calls == ["list_comments"]
+    assert provenance is None
+    labels = classify_protected_result(
+        "pr_comments", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="pr_comments", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=raised.value,
+        provenance=provenance, failed=True,
+    )
+    assert labels.sources[0].integrity == "untrusted"
+    assert labels.has_untrusted_active_ingest
+
+
+@pytest.mark.parametrize("field,value", [
+    ("head_repo", "outsider/fork"),
+    ("head_remote", "upstream"),
+    ("canonical_origin", "https://github.com/outsider/repo.git"),
+    ("checkout_ref", "refs/pull/8/head"),
+])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_misbound_scope_content_is_never_fetched(tmp_path, monkeypatch, field, value):
     from langchain_core.tools import ToolException
     from mimir_cultivate.forge import ForgeError
     from mimir_cultivate import forge
@@ -1662,24 +1734,20 @@ def test_forge_error_rejects_misbound_scope(tmp_path, monkeypatch, field, value)
             number=scope.pr_number, head_sha=scope.observed_head_sha,
             author=scope.pull_request_author,
         ),
+        get_pull_request_identity=lambda *_: _identity(scope),
+        get_head_commit_identity=lambda *_: (True, "collaborator"),
         get_diff=fail_diff,
     ))
     token = begin_protected_result_capture()
     try:
-        with pytest.raises(ToolException, match="misbound server failure") as raised:
+        # A misbound scope is unattested before any request, so no server
+        # error text exists to be labelled.
+        with pytest.raises(ToolPolicyRefusal, match=r"\(scope_binding_mismatch\)"):
             forge.pr_diff.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
     finally:
         provenance = end_protected_result_capture(token)
-    assert calls == ["get_diff"]
+    assert calls == []
     assert provenance is None
-    labels = classify_protected_result(
-        "pr_diff", {"repository": "owner/repo", "pull_request": 7}, auth,
-        ToolAuthorization(tool_name="pr_diff", decision="resource_scoped", allowed=True,
-                          repo_pr_action_scope=scope), result=raised.value,
-        provenance=provenance, failed=True,
-    )
-    assert labels.sources[0].integrity == "untrusted"
-    assert labels.has_untrusted_active_ingest
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
@@ -1809,6 +1877,39 @@ def test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_n
     assert source.principal is None
     assert source.integrity == "untrusted"
     assert labels.has_untrusted_active_ingest
+
+
+@pytest.mark.parametrize("author_trusted", [True, False])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_forge_error_label_follows_the_pr_author_verdict(tmp_path, monkeypatch, author_trusted):
+    from langchain_core.tools import ToolException
+    from mimir_cultivate.forge import ForgeError
+    from mimir_cultivate import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+
+    def fail_comments(*_):
+        raise ForgeError("server failure text")
+
+    monkeypatch.setattr(forge, "_scope", lambda *_: scope)
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
+        author_is_trusted=lambda *_: author_trusted, list_comments=fail_comments,
+    ))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="server failure text"):
+            forge.pr_comments.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    # Server error text is attested only for a trusted PR author's own-repository
+    # scope; an untrusted author's error keeps classification's untrusted default.
+    if author_trusted:
+        assert [(source.integrity, source.resource_id) for source in provenance.sources] == [
+            ("trusted", f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"),
+        ]
+    else:
+        assert provenance is None
 
 
 @pytest.mark.parametrize("field,value,guard", [
@@ -2067,6 +2168,20 @@ def test_checkout_records_native_author_trust_for_file_reads(
     # Definitive verdicts are shared; unavailable attestations must be retried.
     if verdict is None or same_repo:
         monkeypatch.setattr(client, "author_is_trusted", attest)
+    if not trusted:
+        from mimir.tools.refusals import ToolPolicyRefusal
+
+        # An unattested PR's diff is never fetched: a content-free refusal.
+        token = begin_protected_result_capture()
+        try:
+            with pytest.raises(ToolPolicyRefusal, match="no content was fetched"):
+                forge.pr_diff.func("owner/repo", 7, runtime=runtime)
+        finally:
+            provenance = end_protected_result_capture(token)
+        assert provenance is None or not provenance.sources
+        # Both checkouts and the refused read ask again while unavailable.
+        assert len(calls) == (3 if verdict is None else 1)
+        return
     token = begin_protected_result_capture()
     try:
         result = forge.pr_diff.func("owner/repo", 7, runtime=runtime)
@@ -2098,7 +2213,8 @@ def test_checkout_records_native_author_trust_for_file_reads(
     )
     auth.ifc_state.merge(labels)
     assert auth.ifc_state.has_untrusted_active_ingest() is not trusted
-    assert len(calls) == (3 if verdict is None else 1)
+    # A same-repository head is attested by the push rule, never by asking.
+    assert len(calls) == (0 if same_repo else 1)
 
 
 @pytest.mark.parametrize("allowlist,author,trusted", [

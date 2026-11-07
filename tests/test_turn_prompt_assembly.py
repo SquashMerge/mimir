@@ -2954,13 +2954,12 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
     })
     assert forge_sources == Counter({
         ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
-         "_publish_author_attestation", "SourceLabel"): 1,
-        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
          "_publish_issue_write_projection", "SourceLabel"): 1,
         ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
          "_attest_ci_runs", "SourceLabel"): 1,
         ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_list", "SourceLabel"): 1,
-        ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_spec", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
+         "_publish_trusted_pr_label", "SourceLabel"): 1,
     })
 
 

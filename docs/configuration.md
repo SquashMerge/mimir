@@ -892,6 +892,7 @@ by the core proposals helper that verifies social-outbox merge approval.
 | `MIMIR_GITHUB_REVIEW_SKILL_PATH` | path | `""` | Path to the review-skill file preloaded when the above is on. |
 | `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. Also the identity `GITHUB_TOKEN` must belong to before an authorized service-shell `gh` command runs; when unset, those `gh` commands are refused. |
 | `MIMIR_GITHUB_TRUSTED_BOT_LOGINS` | csv exact logins | `""` (none) | Operator action: explicitly trust PR authors that are GitHub bots/apps, e.g. `dependabot[bot]`, on both forge reads and github-poller event payloads. The github-poller forwards this setting via `pass_env`. Case-insensitive exact match only; other bots remain untrusted. Set only for bot identities whose repository output you intend to attest. |
+| `MIMIR_GITHUB_AGENT_LOGINS` | csv exact logins | `""` (none) | GitHub accounts of other agents (e.g. another Mimir bot) that may comment on PRs this agent reads. Their comments never vouch for earlier untrusted comments in a PR thread, just as this agent's own (`MIMIR_GITHUB_SELF_LOGIN`) and `[bot]` accounts never do. Case-insensitive exact match. |
 | `MIMIR_GITHUB_REPOS` | str | unset | Non-secret repository selector available to pollers that explicitly forward it; the bundled GitHub poller uses `GITHUB_REPOS`. |
 
 ## Bridges (credentials)
