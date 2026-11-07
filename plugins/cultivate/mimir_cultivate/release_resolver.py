@@ -99,8 +99,11 @@ def fetch_bytes(url: str, limit: int) -> bytes:
 def _target_tags(architecture: str) -> set[Tag]:
     if architecture not in {"x86_64", "aarch64"}:
         raise ReleaseError("Unsupported Linux image architecture; choose x86_64 or aarch64.")
-    # setup pins python:3.11-slim-bookworm (Debian 12, glibc 2.36).
-    platforms = [f"manylinux_2_{minor}_{architecture}" for minor in range(36, 16, -1)]
+    # Setup builds on the root Dockerfile's pinned base; accept wheels for its glibc.
+    from mimir.scaffold_docker import DEFAULT_BASE_IMAGE_GLIBC
+
+    major, newest = DEFAULT_BASE_IMAGE_GLIBC
+    platforms = [f"manylinux_{major}_{minor}_{architecture}" for minor in range(newest, 16, -1)]
     platforms.append(f"manylinux2014_{architecture}")
     if architecture == "x86_64":
         platforms.extend(("manylinux2010_x86_64", "manylinux1_x86_64"))

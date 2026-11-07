@@ -1285,7 +1285,7 @@ Single-process build. SAGA runs in-process (workspace dependency, not a sidecar)
 
 The checked-in root `Dockerfile` is the canonical deployment image. The Python
 base defaults to the ECR Public mirror of the Docker Official Image; operators
-can switch back with `--build-arg BASE_IMAGE=python:3.11-slim`. Its root-owned
+can switch back with `--build-arg BASE_IMAGE=python:3.11-slim-trixie`. Its root-owned
 Worklink executor makes provenance arguments mandatory; a complete build must
 name the remote ref and its exact controller/executor commit:
 
@@ -1304,7 +1304,7 @@ The abbreviated PyPI-only layout below explains the non-root controller layers;
 it is not the canonical root-executor build contract:
 
 ```dockerfile
-ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
+ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-trixie
 FROM ${BASE_IMAGE} AS base
 
 # Node.js tooling

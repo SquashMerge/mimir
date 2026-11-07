@@ -1166,7 +1166,8 @@ def test_saved_build_runs_without_host_mimir_or_python(setup_environment, monkey
                       '  for last do :; done\n  cp -R "$last" "$CAPTURE"\nfi\n')
     docker.chmod(0o755)
     for command in ('dirname', 'mktemp', 'rm', 'cp'):
-        (binary / command).symlink_to('/usr/bin/' + command)
+        # Resolve the host's own tools: macOS keeps cp and rm in /bin.
+        (binary / command).symlink_to(shutil.which(command))
     capture = tmp_path / 'captured'
     environment = {'PATH': str(binary), 'CAPTURE': str(capture),
                    'PYTHONPATH': str(tmp_path / 'nonexistent'), 'HOME': str(tmp_path)}
@@ -1187,6 +1188,23 @@ def test_saved_build_runs_without_host_mimir_or_python(setup_environment, monkey
     assert (capture / 'plugins/cultivate/mimir_cultivate/docker/base.sh').read_text() == (
         'mimir-cultivate:mimir_cultivate/docker/base.sh')
     assert not (capture / 'compose.env').exists()
+
+    # #2121: the rebuild survives the interpreter setup ran with disappearing
+    # (e.g. a removed setup venv) by resolving python3 at build time.
+    script = (deploy / 'build.sh').read_text()
+    recorded = re.search(r"^interpreter=(.+)$", script, re.M).group(1)
+    (deploy / 'build.sh').write_text(script.replace(
+        'interpreter=' + recorded + '\n', 'interpreter=' + str(tmp_path / 'gone-venv/bin/python') + '\n'))
+    shutil.rmtree(capture)
+    result = rebuild()
+    assert result.returncode != 0 and 'needs python3 on PATH' in result.stderr
+    assert not capture.exists()
+    (binary / 'python3').symlink_to(Path(sys.executable).resolve())
+    result = rebuild()
+    assert result.returncode == 0, result.stderr
+    assert (capture / 'Dockerfile').read_text() == 'mimir-agent:mimir/docker_context/Dockerfile'
+    (binary / 'python3').unlink()
+    (deploy / 'build.sh').write_text(script)
 
     (deploy / 'build_context.py').write_text('raise SystemExit("tampered")\n')
     capture.rename(tmp_path / 'previous-capture')
@@ -1665,6 +1683,49 @@ def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
     with pytest.raises(installer.SetupError, match=f'Docker {step} failed') as caught:
         installer.setup(args, request=request, run=run)
     assert 'secret-from-compose-env' not in str(caught.value)
+
+@pytest.mark.parametrize('image', ['Mimir root image', 'agent toolchain layer'])
+def test_image_build_failure_shows_redacted_build_output(tmp_path, monkeypatch, image):
+    monkeypatch.setattr(installer, '_license_gate', lambda args: None)
+    fields = {'repo': 'org/repo', 'branch': 'main', 'bot_login': 'bot',
+              'bot_email': 'bot@example.com', 'owner': 'owner', 'display_name': 'Owner',
+              'owner_email': 'owner@example.com', 'deploy': str(tmp_path / 'deploy'),
+              'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
+              'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
+              'source_repo': 'org/mimir', 'test_command': 'npm test', 'review_tests': 'targeted',
+              'auto_review': 'all', 'port': '8123'}
+    monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
+    monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret-from-compose-env')
+    monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
+    monkeypatch.setattr(installer, '_content', lambda *a: '{"engines":{"node":"22.16.0"}}' if a[2] == 'package.json' else None)
+    monkeypatch.setattr(installer, '_verify_script', lambda *a: None)
+
+    def request(url, token):
+        return 200, {'object': {'sha': SHA}}
+
+    def run(argv, *, cwd):
+        if argv[-3:] == ['ps', '-q', 'agent']:
+            return ''
+        toolchain = argv[1] == 'build' and 'Dockerfile.toolchain' in argv
+        if argv[1] == 'build' and toolchain == (image == 'agent toolchain layer'):
+            # #2121: the apt failure is the only diagnosis, but build output can
+            # never relay a secret that setup or compose.env holds.
+            raise installer._CommandFailed('docker operation failed (exit 1)', '\n'.join([
+                *(f'#5 step {n}' for n in range(80)),
+                '#5 6.451 E: Unable to locate package libasound2t64',
+                'leaked secret-from-compose-env and GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwx',
+                'ERROR: failed to solve: process "/bin/sh -c apt-get install" did not complete',
+            ]))
+        return ''
+
+    args = argparse.Namespace(rotate_web_key=False, reembed=False, force=False)
+    with pytest.raises(installer.SetupError, match=f'Docker build failed \\({image}\\)') as caught:
+        installer.setup(args, request=request, run=run)
+    message = str(caught.value)
+    assert 'E: Unable to locate package libasound2t64' in message
+    assert 'failed to solve' in message and '--system-packages' in message
+    assert 'secret-from-compose-env' not in message and 'ghp_' not in message
+    assert '#5 step 10' not in message  # bounded to the last lines
 
 
 def test_pinned_auxiliary_tools_and_repo_override():
@@ -4138,3 +4199,37 @@ def test_plain_jira_email_is_stripped(setup_environment, tmp_path, monkeypatch):
     args.jira_email = "  svc-plain@example.com \n"
     invoke()
     assert _compose_env(deploy)["JIRA_EMAIL"] == "svc-plain@example.com"
+
+
+def test_setup_base_image_is_the_root_dockerfiles_pinned_base() -> None:
+    # #2121: setup once pinned Debian 12 while the root image moved to 13, so
+    # saved Debian package names (and wheel glibc tags) stopped matching.
+    from mimir.scaffold_docker import DEFAULT_BASE_IMAGE, DEFAULT_BASE_IMAGE_GLIBC
+    from mimir_cultivate.release_resolver import _target_tags
+
+    dockerfile = (Path(__file__).resolve().parents[3] / 'Dockerfile').read_text()
+    declared = re.findall(r'^ARG BASE_IMAGE=(.+)$', dockerfile, re.M)
+    assert declared == [installer._PYTHON_BASE_IMAGE] == [DEFAULT_BASE_IMAGE]
+    assert re.search(r'-slim-[a-z]+$', installer._PYTHON_BASE_IMAGE), 'pin the Debian codename'
+    assert installer._PYTHON_BASE_IMAGE.endswith('-trixie') and DEFAULT_BASE_IMAGE_GLIBC == (2, 41)
+    newest = max(int(tag.platform.split('_')[2]) for tag in _target_tags('aarch64')
+                 if tag.platform.startswith('manylinux_2_'))
+    assert newest == DEFAULT_BASE_IMAGE_GLIBC[1]
+
+
+@pytest.mark.parametrize('offset', [257, 280, 290, 299])
+def test_redacted_tail_never_leaks_a_secret_crossing_the_line_limit(offset):
+    # #2121: redact the complete line before bounding it; a known secret cut at
+    # the limit would no longer match its value and its prefix would print.
+    known = 'Zq8vN3pLw0XcT7rB2mKs9YdHf4GjA6uE1oWiRtQyPnM'  # opaque, unprefixed, 43 chars
+    token = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'
+    output = '\n'.join([
+        'x' * offset + known + ' trailing',
+        'y' * offset + 'GH=' + token,
+        'z' * (offset - 1) + ' ' + token,
+    ])
+    text = installer._redacted_tail(output, [known])
+    for secret in (known, token):
+        for start in range(0, len(secret) - 4):
+            assert secret[start:start + 5] not in text, (secret[:4], start)
+    assert all(len(line) <= 300 for line in text.splitlines())
