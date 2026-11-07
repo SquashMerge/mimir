@@ -3973,3 +3973,87 @@ def test_close_merged_chainlinks_empty_queue(tmp_path: Path) -> None:
         aut.make_claims = orig_make_claims
 
     assert results == []
+
+
+def _real_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str = "7-1") -> tuple[Path, Path]:
+    import os
+    import subprocess
+
+    def git(repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "600")
+    _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
+    forge = tmp_path / "forge.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(forge)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    git(repo, "config", "user.name", "Op")
+    git(repo, "config", "user.email", "op@example.test")
+    (repo / "a.py").write_text("a = 0\n")
+    git(repo, "add", "a.py")
+    git(repo, "commit", "-q", "-m", "base")
+    git(repo, "remote", "add", "origin", str(forge))
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q", "origin")
+    attempt = tmp_path / ".worklink" / repo.name / name
+    attempt.parent.mkdir(parents=True)
+    subprocess.run(["git", "clone", "-q", str(repo), str(attempt)], check=True)
+    (attempt / "work.py").write_text("unpublished = True\n")
+    mtime = datetime.now().timestamp() - 7200
+    os.utime(attempt, (mtime, mtime))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    return repo, attempt
+
+
+def test_ttl_prune_preserves_an_unpreserved_attempt_before_removing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    repo, attempt = _real_attempt(tmp_path, monkeypatch)
+    pruned = autonomy.prune_stale_attempt_checkouts_for_home(tmp_path)
+    assert pruned == [attempt] and not attempt.exists()
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "refs/worklink/7/1"],
+                          capture_output=True, text=True)
+    assert head.returncode == 0
+    record = json.loads((tmp_path / "state" / "worklink" / "preserved" / "7" / "1.json").read_text())
+    assert record["files"] == ["work.py"] and record["ref"] == "refs/worklink/7/1"
+    assert "prune TTL" in record["reason"]
+
+
+def test_ttl_prune_leaves_a_published_attempt_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, attempt = _real_attempt(tmp_path, monkeypatch)
+    evidence = tmp_path / "state" / "worklink" / "evidence" / "7-1.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text(json.dumps({"status": "blocked", "pr_url": "https://github.com/o/r/pull/1"}))
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path) == [attempt]
+    assert not (tmp_path / "state" / "worklink" / "preserved" / "7").exists()
+
+
+def test_closed_issue_prunes_every_preserved_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    repo, attempt = _real_attempt(tmp_path, monkeypatch)
+    autonomy.prune_stale_attempt_checkouts_for_home(tmp_path)
+    assert (tmp_path / "state" / "worklink" / "preserved" / "7" / "1.json").exists()
+    comments = []
+
+    def run(args):
+        args = list(args)
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"id": 7, "status": "closed"}), "")
+        if args[1:3] == ["issue", "comment"]:
+            comments.append(args[4])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.run(args, capture_output=True, text=True)
+
+    autonomy._prune_preserved_for_closed_issues(tmp_path, repo, run=run)
+    assert not (tmp_path / "state" / "worklink" / "preserved" / "7" / "1.json").exists()
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", "refs/worklink/7/1"],
+                          capture_output=True).returncode != 0
+    assert comments == ["WORKLINK_PRESERVED_PRUNED issue=7 attempts=[1] reason=issue_closed"]

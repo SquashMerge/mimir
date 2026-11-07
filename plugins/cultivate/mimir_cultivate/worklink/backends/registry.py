@@ -160,6 +160,9 @@ class WorklinkDefaults:
     max_concurrent: int = 2
     reaper_ttl_s: int = 86400
     factory_resumable_retention_s: int = 86400
+    # chainlink #2114: unpublished attempts kept as refs/worklink/<issue>/<attempt>
+    # per issue; older ones are pruned, and all of them when the issue closes.
+    preserved_attempts_keep: int = 3
     # Autonomy safety posture (#460, #832). local_subprocess runs the backend with
     # full container-filesystem access (no sandbox) — fine for an operator who
     # accepts the blast radius, unsafe as an autonomous default. Autonomous
@@ -192,6 +195,8 @@ class WorklinkDefaults:
             raise ValueError("worklink ci_wait_timeout_s must be a positive integer")
         if type(self.max_new_untracked_files) is not int or self.max_new_untracked_files < 0:
             raise ValueError("worklink max_new_untracked_files must be a nonnegative integer")
+        if type(self.preserved_attempts_keep) is not int or self.preserved_attempts_keep < 1:
+            raise ValueError("worklink preserved_attempts_keep must be a positive integer")
         required_reaper_ttl_s = minimum_reaper_ttl_s(self.timeout_s)
         if self.reaper_ttl_s < required_reaper_ttl_s:
             raise WorklinkDefaultsValidationError(
@@ -348,6 +353,9 @@ class WorklinkConfig:
             factory_resumable_retention_s=defaults_data.get(
                 "factory_resumable_retention_s",
                 max(default_values.factory_resumable_retention_s, reaper_ttl_s),
+            ),
+            preserved_attempts_keep=defaults_data.get(
+                "preserved_attempts_keep", default_values.preserved_attempts_keep,
             ),
             allow_autonomous_local_subprocess=_coerce_safety_bool(
                 defaults_data.get("allow_autonomous_local_subprocess", False)
