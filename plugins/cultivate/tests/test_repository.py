@@ -386,19 +386,85 @@ def test_moved_source_ref_does_not_force_preservation(
     assert not (lease.lease_root / ".recovery").exists()
 
 
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/fixture-release"])
+@pytest.mark.parametrize("control", ["missing_name", "unreachable_source_object"])
+def test_inherited_ref_without_source_reachability_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: str, control: str,
+) -> None:
+    source, _original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    inherited = _git(lease.path, "rev-parse", ref)
+    if control == "missing_name":
+        _git(source, "update-ref", "-d", ref)
+        # Published reachability alone must not exempt a name absent in source.
+        assert not _git(lease.path, "rev-list", inherited, "--not", "--remotes=origin", "--")
+    else:
+        _git(lease.path, "update-ref", "-d", "refs/remotes/origin/main")
+        _git(source, "update-ref", "refs/heads/main", scope.observed_head_sha)
+        _git(source, "update-ref", "refs/tags/fixture-release", scope.observed_head_sha)
+        _git(source, "update-ref", "-d", "refs/remotes/origin/main")
+        assert _git(source, "cat-file", "-t", inherited) == "commit"
+        assert _git(source, "rev-parse", ref) != inherited
+        assert _git(source, "rev-list", inherited, "--not", "--branches", "--tags",
+                    "--remotes=origin", "--")
+        assert _git(lease.path, "rev-list", inherited, "--not", "--remotes=origin", "--")
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_, **_details: events.append(event))
+    state = RepoReviewState(scope)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+    )
+    notice, = state.checkout_recovery_notices
+    assert events == ["pr_checkout_lease_preserved_divergent"]
+    assert fresh.path != lease.path and not lease.path.exists() and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    import shutil
+    import tarfile
+
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    with tarfile.open(notice["archive"]) as archive:
+        archive.extractall(restored, filter="data")
+    tree = restored / "worktree"
+    seed = tmp_path / "published.git"
+    subprocess.run(["git", "clone", "--bare", scope.canonical_origin, str(seed)],
+                   check=True, capture_output=True, env=_fixture_git_env())
+    _git(seed, "bundle", "unbundle", notice["bundle"])
+    shutil.copytree(seed / "objects", tree / ".git/objects")
+    assert _git(tree, "rev-parse", ref) == inherited
+    assert _git(tree, "show", f"{ref}:base-update.txt") == "advanced base"
+
+
+@pytest.mark.parametrize("reflog_state", ["expired", "replay", "unique_commit"])
 def test_behind_head_with_untracked_file_recovers_empty_incremental_bundle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reflog_state: str,
 ) -> None:
     import shutil
     import tarfile
 
     source, original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    replay = _git(lease.path, "rev-parse", "HEAD")
+    reflog_commits = [replay]
+    if reflog_state == "unique_commit":
+        (lease.path / "reflog-only.txt").write_text("unique reflog draft\n")
+        _git(lease.path, "add", "reflog-only.txt")
+        _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+             "commit", "-qm", "reflog-only work")
+        reflog_commits.append(_git(lease.path, "rev-parse", "HEAD"))
     _git(lease.path, "reset", "--hard", original.observed_base_sha)
-    # Remove the fixture's unpublished replay from reflogs: every retained tip
-    # is now origin-reachable, exactly the empty incremental-bundle case.
-    _git(lease.path, "reflog", "expire", "--expire=now", "--all")
-    assert not _git(lease.path, "rev-list", "--all", "HEAD", "--reflog",
+    if reflog_state == "expired":
+        _git(lease.path, "reflog", "expire", "--expire=now", "--all")
+        reflog_commits = []
+    # Every advertised ref tip is published, regardless of reflog-only work.
+    assert not _git(lease.path, "rev-list", "--all", "HEAD",
                     "--not", "--remotes=origin", "--")
+    unpublished = _git(lease.path, "rev-list", "--all", "HEAD", "--reflog",
+                       "--not", "--remotes=origin", "--").splitlines()
+    assert set(reflog_commits) <= set(unpublished)
+    if reflog_state == "expired":
+        assert not unpublished
     (lease.path / "draft.txt").write_text("untracked draft survives\n")
     monkeypatch.setattr(repository, "_observe_current_pr_head",
                         lambda _scope: scope.observed_head_sha)
@@ -426,7 +492,16 @@ def test_behind_head_with_untracked_file_recovers_empty_incremental_bundle(
     _git(seed, "init", "--bare")
     _git(seed, "bundle", "verify", str(bundle))
     _git(seed, "bundle", "unbundle", str(bundle))
+    # Verify object presence in an empty object store, not the original lease
+    # or an origin clone that could mask missing bundle contents.
+    for commit in reflog_commits:
+        assert _git(seed, "cat-file", "-t", commit) == "commit"
     shutil.copytree(seed / "objects", tree / ".git/objects")
+    for commit in reflog_commits:
+        assert commit in _git(tree, "reflog", "show", "--format=%H", "HEAD").splitlines()
+        assert _git(tree, "show", f"{commit}:tracked.txt") == "pull request"
+    if reflog_state == "unique_commit":
+        assert _git(tree, "show", f"{reflog_commits[-1]}:reflog-only.txt") == "unique reflog draft"
     assert (tree / "draft.txt").read_text() == "untracked draft survives\n"
     assert _git(tree, "rev-parse", "HEAD") == original.observed_base_sha
     assert _git(tree, "show", "HEAD:tracked.txt")
@@ -521,7 +596,10 @@ def test_divergent_probe_errors_preserve_lease(tmp_path: Path, gate: str) -> Non
             or (gate == "substitution" and argv[3:] == ["merge-base", "--is-ancestor", lease.base_sha, scope.observed_base_sha])
             or (gate == "recovery_ref" and argv[3:5] == ["rev-parse", "--verify"] and argv[-1].startswith("refs/worklink-lease/"))
             or (gate == "diff" and "diff-tree" in argv)
-            or (gate == "recovery_revisions" and argv[3] == "rev-list" and "--reflog" in argv)
+            or (gate == "recovery_revisions" and argv[3:] == [
+                "rev-list", "--objects", "--no-object-names", "--max-count=1",
+                "--all", "HEAD", "--not", "--remotes=origin", "--",
+            ])
             or (gate == "bundle_create" and argv[3:5] == ["bundle", "create"])
             or (gate == "bundle_verify" and argv[3:5] == ["bundle", "verify"])
         )

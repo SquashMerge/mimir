@@ -1207,8 +1207,10 @@ Current slice-1 recovery is manual:
   its old tip is reachable from current source refs or published origin history.
   New ref names and lease-only objects remain protected. Recovery writes a
   verified incremental bundle (`--all HEAD --reflog --not --remotes=origin`);
-  when that revision set is empty, it writes a full bundle including reflog tips
-  instead (Git cannot create an empty bundle). Recovery also writes a checkout
+  incremental mode requires a ref tip (including HEAD) outside origin history.
+  When all ref tips are origin-reachable, it writes a full bundle including
+  reflog-only commits instead: those commits alone cannot supply the advertised
+  tip Git requires for an incremental bundle. Recovery also writes a checkout
   archive including Git metadata but excluding
   `.git/objects`, a binary patch and a local
   `refs/worklink-lease/<pr>/<recovery_id>` ref in the source repository. These

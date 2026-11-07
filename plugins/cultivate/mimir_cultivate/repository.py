@@ -1573,16 +1573,16 @@ def _preserve_checkout_head(
         if not {tuple(line.split()) for line in refs.splitlines() if line} <= retained_heads:
             raise RuntimeError("existing PR checkout lease recovery bundle lacks current refs")
         return bundle
-    # Git refuses an empty incremental bundle. Probe the exact revision set
-    # first, rather than treating arbitrary bundle failures as harmless. A
-    # hidden-state-only checkout still needs a restorable archive, so use a
-    # full bundle in this case (including deeper stash/reflog tips).
+    # Git needs a non-excluded ref tip to advertise an incremental bundle.
+    # Reflog-only commits contribute pack objects, but cannot provide that tip.
+    # Probe refs plus HEAD without reflogs; if all tips are origin-reachable,
+    # use a full bundle while still retaining reflog-only objects in its pack.
     bundle_revisions = ["--all", "HEAD"]
     if incremental:
         bundle_revisions.append("--reflog")
         unpublished = _run(runner, [
             "git", "-C", str(lease.path), "rev-list", "--objects", "--no-object-names",
-            "--max-count=1", *bundle_revisions, "--not", "--remotes=origin", "--",
+            "--max-count=1", "--all", "HEAD", "--not", "--remotes=origin", "--",
         ], "PR checkout lease recovery revision inspection failed")
         if unpublished:
             bundle_revisions.extend(["--not", "--remotes=origin"])
