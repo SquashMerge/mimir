@@ -11008,6 +11008,25 @@ def _attested_pr_checkout_lease(
     return pr_checkout_lease_attestation(auth_context, scope, lease).ok
 
 
+_resume_metadata_identity: ContextVar[tuple[Any, Any] | None] = ContextVar(
+    "resume_metadata_identity", default=None,
+)
+
+
+@contextmanager
+def pr_checkout_resume_metadata(candidate: Any, prior: Any):
+    """Bind pre-persistence lineage reads to the server-validated prior lease.
+
+    Only the synchronous recovery transaction uses this context; it does not
+    survive publication or authorize a later reconstructed lease.
+    """
+    token = _resume_metadata_identity.set((candidate, prior))
+    try:
+        yield
+    finally:
+        _resume_metadata_identity.reset(token)
+
+
 def pr_checkout_lease_attestation(
     auth_context: "AuthContext | None", scope: Any, lease: Any,
 ) -> LeaseAttestation:
@@ -11207,7 +11226,9 @@ def _lease_has_clean_lineage(
     try:
         if current_head != getattr(lease, "head_sha", "").lower():
             return _lease_refuse(LeaseAttestationReason.LINEAGE_HEAD_MISMATCH)
-        if not isinstance(raw, dict) or any(raw.get(key) != getattr(lease, key) for key in (
+        resume = _resume_metadata_identity.get()
+        recorded_lease = resume[1] if resume is not None and resume[0] is lease else lease
+        if not isinstance(raw, dict) or any(raw.get(key) != getattr(recorded_lease, key) for key in (
             "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
         )):
             return _lease_refuse(LeaseAttestationReason.LINEAGE_METADATA_MISMATCH)

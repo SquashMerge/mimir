@@ -2676,8 +2676,9 @@ class Agent:
             # Only host-issued checkout grants qualify; never infer a checkout
             # target from the prompt or model arguments.
             from .access_control import (
-                ScopedPRGrants, _valid_scoped_pr_grant,
+                LeaseAttestationReason, ScopedPRGrants, _valid_scoped_pr_grant,
                 consume_scoped_pr_checkout, observe_scoped_pr_checkout,
+                pr_checkout_lease_attestation,
             )
             grants = getattr(auth_ctx, "scoped_pr_grants", None)
             registry = getattr(auth_ctx, "repo_pr_scope_registry", None)
@@ -2685,6 +2686,7 @@ class Agent:
             checkout_hooks = self._config.plugin_manager.policy.turn_hooks
             ctx.prechecked_pr_leases = []
             ctx.prechecked_pr_stops = []
+            ctx.prechecked_pr_refusals = []
             if event.trigger == "poller" and isinstance(grants, ScopedPRGrants):
                 for state in states:
                     scope = state.action_scope
@@ -2706,8 +2708,36 @@ class Agent:
                         raise RuntimeError("repository checkout rejected: checkout provider unavailable")
                     result = await asyncio.to_thread(
                         hook, scope.canonical_repo, scope.pr_number,
-                        SimpleNamespace(context=auth_ctx),
+                        SimpleNamespace(context=auth_ctx, pre_turn_checkout=True),
                     )
+                    if result.get("status") == "attestation_refused":
+                        reason = LeaseAttestationReason(result["reason"])
+                        if reason is LeaseAttestationReason.OK:
+                            raise RuntimeError("repository checkout rejected: invalid attestation refusal")
+                        discovered = getattr(auth_ctx, "server_discovered_pr_states", None)
+                        refused_state = (
+                            discovered.resolve(scope.canonical_repo, scope.pr_number)
+                            if discovered is not None else None
+                        ) or state
+                        if refused_state is not state:
+                            # Reserve the reminted grant even on refusal. Otherwise
+                            # later tool authorization can issue it all over again.
+                            grants.issue(refused_state.action_scope)
+                            consume_scoped_pr_checkout(
+                                auth_ctx, refused_state.action_scope, refused_state.action_scope.owner,
+                            )
+                        from .access_control import log_pr_checkout_lease_attestation_refused
+
+                        log_pr_checkout_lease_attestation_refused(auth_ctx, refused_state.action_scope, reason.value)
+                        if refused_state.checkout_lease is not None:
+                            refused_state.checkout_lease.revoke()
+                            refused_state.revoke_checkout_lease(refused_state.checkout_lease)
+                        ctx.prechecked_pr_refusals.append({
+                            "repository": scope.canonical_repo,
+                            "pull_request": scope.pr_number,
+                            "reason": reason.value,
+                        })
+                        continue
                     if result.get("status") == "stopped":
                         # A closed PR or resolved checks is a no-work outcome:
                         # the grant stays consumed and the turn ends quietly.
@@ -2731,11 +2761,28 @@ class Agent:
                         token = consume_scoped_pr_checkout(auth_ctx, scope, scope.owner)
                         if token is None:
                             raise RuntimeError("repository checkout rejected: refreshed PR scope has no checkout grant")
+                    live = protocol.live_lease(scope, state) if protocol.live_lease is not None else None
+                    attestation = pr_checkout_lease_attestation(auth_ctx, scope, live)
+                    if not attestation.ok:
+                        reason = LeaseAttestationReason(attestation.reason)
+                        if reason is LeaseAttestationReason.OK:
+                            raise RuntimeError("repository checkout rejected: invalid attestation refusal")
+                        from .access_control import log_pr_checkout_lease_attestation_refused
+
+                        log_pr_checkout_lease_attestation_refused(auth_ctx, scope, reason.value)
+                        if state.checkout_lease is not None:
+                            state.checkout_lease.revoke()
+                            state.revoke_checkout_lease(state.checkout_lease)
+                        ctx.prechecked_pr_refusals.append({
+                            "repository": scope.canonical_repo,
+                            "pull_request": scope.pr_number,
+                            "reason": reason.value,
+                        })
+                        continue
                     if not observe_scoped_pr_checkout(
                         auth_ctx, scope, state, token, scope.owner, protocol,
                     ):
                         raise RuntimeError("repository checkout rejected: lease attestation refused")
-                    live = protocol.live_lease(scope, state) if protocol.live_lease is not None else None
                     if live is None or auth_ctx.ifc_state is None:
                         raise RuntimeError("repository checkout rejected: lease attestation refused")
                     auth_ctx.ifc_state.framework_pr_checkouts[scope.scope_id] = (
@@ -3789,9 +3836,25 @@ class Agent:
             if result_fields["result_subtype"] in (None, "success"):
                 result_fields["result_subtype"] = "error_turn"
         hard_refusals = list(getattr(ctx, "hard_boundary_denials", []) or [])
+        checkout_refusals = [
+            {"boundary": "pr_checkout", "reason": f"lease_attestation_refused:{item['reason']}"}
+            for item in getattr(ctx, "prechecked_pr_refusals", ())
+        ]
         remediation_effects = list(getattr(ctx, "remediation_effects", []) or [])
-        refusal_is_exempt = bool(hard_refusals and not remediation_effects)
         outcome_is_error = bool(error or result_fields["result_is_error"])
+        # A completed no-work checkout refusal does not spend the poller's
+        # remediation budget. Unrelated model failures retain their disposition.
+        refusal_is_exempt = bool(
+            (hard_refusals and not remediation_effects
+             and (not checkout_refusals or not outcome_is_error))
+            or (
+                checkout_refusals and not outcome_is_error
+                and not any(effect not in {
+                    "pr_comment", "unsupported_operation", "operator_alert",
+                } for effect in remediation_effects)
+            )
+        )
+        hard_refusals.extend(checkout_refusals)
         outcome_fields = {
             "result_subtype": result_fields["result_subtype"],
             "result_is_error": result_fields["result_is_error"],
@@ -5743,6 +5806,7 @@ class Agent:
             ),
             prechecked_pr_leases=getattr(ctx, "prechecked_pr_leases", ()),
             prechecked_pr_stops=getattr(ctx, "prechecked_pr_stops", ()),
+            prechecked_pr_refusals=getattr(ctx, "prechecked_pr_refusals", ()),
             stable_prefix_out=stable_prefix_out,
         )
         ctx.ifc_labels = _merge_ifc_labels(

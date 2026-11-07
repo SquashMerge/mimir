@@ -1271,6 +1271,7 @@ def _recover_pr_checkout_lease_unlocked(
     ttl: timedelta = timedelta(hours=2),
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
+    attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Recover exact-scope work after revalidating its original remote PR head."""
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
@@ -1376,15 +1377,27 @@ def _recover_pr_checkout_lease_unlocked(
     ancestry = runner([
         "git", "-C", str(path), "merge-base", "--is-ancestor", remote_head, head,
     ])
+    if ancestry.returncode == 1 and attest_resume is not None:
+        raise LeaseAttestationRefusal("ancestry_failure", existing=True)
     if ancestry.returncode != 0:
         raise RuntimeError("divergent PR checkout lease cannot be renewed")
+    # Attest a renewed in-memory candidate, including expired but valid work.
+    # Nothing on disk changes until the callback accepts the candidate.
+    prior = lease
     lease = replace(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
     )
-    (path / _METADATA).write_text(
-        json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
-    )
+    _attest_resume_candidate(lease, scope, head, review_state, attest_resume, prior=prior)
+    try:
+        (path / _METADATA).write_text(
+            json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
+        )
+    except BaseException:
+        lease.revoke()
+        if review_state is not None:
+            review_state.revoke_checkout_lease(lease)
+        raise
     if review_state is not None:
         review_state.attach_checkout_lease(lease)
         review_state.record_git_head(scope.scope_id, head)
@@ -1998,6 +2011,35 @@ def _foreign_candidate_head(
     return head, False
 
 
+def _attest_resume_candidate(
+    lease: PRCheckoutLease,
+    scope: RepoPRActionScope,
+    head: str,
+    review_state: RepoReviewState | None,
+    attest_resume: Callable[[PRCheckoutLease], None] | None,
+    *, prior: PRCheckoutLease,
+) -> None:
+    """Attach tentative authority only while verifying, and revoke on failure."""
+    if attest_resume is None:
+        return
+    if review_state is not None:
+        review_state.attach_checkout_lease(lease)
+        review_state.record_git_head(scope.scope_id, head)
+    try:
+        from mimir.access_control import pr_checkout_resume_metadata
+
+        with pr_checkout_resume_metadata(lease, prior):
+            attest_resume(lease)
+    except BaseException:
+        lease.revoke()
+        raise
+    finally:
+        # Tentative attachment is only for the synchronous attestation call.
+        # Persistence and its cleanup must finish before authority is attached.
+        if review_state is not None:
+            review_state.revoke_checkout_lease(lease)
+
+
 def _rebind_foreign_candidate(
     lease: PRCheckoutLease,
     scope: RepoPRActionScope,
@@ -2006,6 +2048,7 @@ def _rebind_foreign_candidate(
     ttl: timedelta,
     review_state: RepoReviewState | None,
     runner: Runner,
+    attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Move a proven same-PR lease onto the current immutable turn scope."""
     _run(
@@ -2054,6 +2097,8 @@ def _rebind_foreign_candidate(
     ancestry = runner([
         "git", "-C", str(lease.path), "merge-base", "--is-ancestor", remote_head, head,
     ])
+    if ancestry.returncode == 1 and attest_resume is not None:
+        raise LeaseAttestationRefusal("ancestry_failure", existing=True)
     if ancestry.returncode != 0:
         raise RuntimeError("divergent PR checkout lease cannot be rebound")
 
@@ -2070,15 +2115,22 @@ def _rebind_foreign_candidate(
         lineage=lease.lineage,
         verified_base_sha=actual_base,
     )
+    _attest_resume_candidate(rebound, scope, head, review_state, attest_resume, prior=lease)
     metadata_path = lease.path / _METADATA
     staging = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        staging.write_text(
-            json.dumps(_metadata(rebound), sort_keys=True) + "\n", encoding="utf-8",
-        )
-        os.replace(staging, metadata_path)
-    finally:
-        staging.unlink(missing_ok=True)
+        try:
+            staging.write_text(
+                json.dumps(_metadata(rebound), sort_keys=True) + "\n", encoding="utf-8",
+            )
+            os.replace(staging, metadata_path)
+        finally:
+            staging.unlink(missing_ok=True)
+    except BaseException:
+        rebound.revoke()
+        if review_state is not None:
+            review_state.revoke_checkout_lease(rebound)
+        raise
     if review_state is not None:
         review_state.attach_checkout_lease(rebound)
         review_state.record_git_head(scope.scope_id, head)
@@ -2287,6 +2339,7 @@ def acquire_pr_checkout_lease(
     ttl: timedelta = timedelta(hours=2),
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
+    attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> tuple[PRCheckoutLease, tuple[str, ...]]:
     """Resume an ancestral lease or replace divergent work after recovery."""
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
@@ -2517,6 +2570,7 @@ def acquire_pr_checkout_lease(
                     ttl=ttl,
                     review_state=review_state,
                     runner=runner,
+                    attest_resume=attest_resume,
                 )
             else:
                 lease = _recover_pr_checkout_lease_unlocked(
@@ -2528,6 +2582,7 @@ def acquire_pr_checkout_lease(
                     ttl=ttl,
                     review_state=review_state,
                     runner=runner,
+                    attest_resume=attest_resume,
                 )
             if unpublished:
                 _report_retained_candidates(
@@ -5565,6 +5620,20 @@ def repo_checkout(
     return checkout_scoped_pr(repository, pull_request, runtime)
 
 
+class LeaseAttestationRefusal(ToolPolicyRefusal):
+    """A server-classified refusal with no checkout authority to return."""
+
+    def __init__(self, reason: str, *, existing: bool = False) -> None:
+        from mimir.access_control import LeaseAttestationReason
+
+        code = LeaseAttestationReason(reason)
+        if code is LeaseAttestationReason.OK:
+            raise ValueError("invalid attestation refusal")
+        self.reason = code.value
+        detail = "existing lease attestation refused" if existing else "lease attestation refused"
+        super().__init__(f"repository checkout rejected: {detail} ({self.reason})")
+
+
 def checkout_scoped_pr(
     repository: str, pull_request: int,
     runtime: ToolRuntime[AuthContext],
@@ -5595,8 +5664,16 @@ def checkout_scoped_pr(
             and framework[0] == (str(existing.path), existing.recovery_id)):
         from mimir.access_control import pr_checkout_lease_attestation
 
-        if not pr_checkout_lease_attestation(context, scope, existing).ok:
-            raise ToolPolicyRefusal("repository checkout rejected: existing lease attestation refused")
+        attestation = pr_checkout_lease_attestation(context, scope, existing)
+        if not attestation.ok:
+            from mimir.access_control import log_pr_checkout_lease_attestation_refused
+
+            refusal = LeaseAttestationRefusal(attestation.reason, existing=True)
+            log_pr_checkout_lease_attestation_refused(context, scope, refusal.reason)
+            context.ifc_state.framework_pr_checkouts.pop(scope.scope_id, None)
+            existing.revoke()
+            state.revoke_checkout_lease(existing)
+            raise refusal
         _publish_attested_lease_result(runtime, state)
         return {
             "status": "resumed", "path": str(existing.path), "scope_id": existing.scope_id,
@@ -5605,32 +5682,61 @@ def checkout_scoped_pr(
             **({"preserved_prior_work": state.checkout_recovery_notices}
                if state.checkout_recovery_notices else {}),
         }
+    author_resolved = False
+
+    def resolve_author_trust() -> None:
+        nonlocal author_resolved
+        if author_resolved:
+            return
+        author_resolved = True
+        # Record only turn-local authority, never trust checkout metadata.
+        context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
+        context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
+        client = _client(scope)
+        from mimir.pollers import _github_author_trust_cause, github_author_trust_cause
+
+        _github_author_trust_cause.set(None)
+        verdict = pr_trust_verdict(context, scope, client)
+        context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+        if verdict is None:
+            context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
+                github_author_trust_cause() or "author_unresolved"
+            )
+        else:
+            context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
+
+    def attest_resume(lease: PRCheckoutLease) -> None:
+        from mimir.access_control import pr_checkout_lease_attestation
+
+        resolve_author_trust()
+        attestation = pr_checkout_lease_attestation(context, scope, lease)
+        if not attestation.ok:
+            raise LeaseAttestationRefusal(attestation.reason, existing=True)
+
     try:
         lease, candidates = acquire_pr_checkout_lease(
-            state.action_scope,
-            owner=state.action_scope.principal,
+            state.action_scope, owner=state.action_scope.principal,
             review_state=state,
+            # Tool and framework resumes share the no-renewal-on-refusal rule.
+            attest_resume=attest_resume,
         )
+    except LeaseAttestationRefusal as exc:
+        from mimir.access_control import log_pr_checkout_lease_attestation_refused
+
+        log_pr_checkout_lease_attestation_refused(context, scope, exc.reason)
+        attached = state.checkout_lease
+        if attached is not None:
+            attached.revoke()
+            state.revoke_checkout_lease(attached)
+        if getattr(runtime, "pre_turn_checkout", False):
+            return {"status": "attestation_refused", "reason": exc.reason}
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
-        _publish_attested_lease_result(runtime, state)
+        if state.checkout_lease is not None:
+            _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
-    # Record only turn-local authority, never trust in checkout-controlled metadata.
-    # Clear an earlier verdict before fetching metadata, so failures stay closed.
-    context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
-    context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
-    client = _client(scope)
-    from mimir.pollers import _github_author_trust_cause, github_author_trust_cause
-
-    _github_author_trust_cause.set(None)
-    verdict = pr_trust_verdict(context, scope, client)
-    context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
-    if verdict is None:
-        context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
-            github_author_trust_cause() or "author_unresolved"
-        )
-    else:
-        context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
+    resolve_author_trust()
     _publish_attested_lease_result(runtime, state)
     return {
         "status": "resumed" if candidates else "checked_out",

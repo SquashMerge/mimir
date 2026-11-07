@@ -278,6 +278,7 @@ def build_turn_prompt(
     turn_scratch_path: str | None = None,
     prechecked_pr_leases: Iterable[Mapping[str, object]] = (),
     prechecked_pr_stops: Iterable[Mapping[str, object]] = (),
+    prechecked_pr_refusals: Iterable[Mapping[str, object]] = (),
     stable_prefix_out: list[str] | None = None,
 ) -> str:
     """Assemble stable channel/session context before live context and event.
@@ -335,6 +336,19 @@ def build_turn_prompt(
             f"The framework found nothing to remediate on {stop['repository']} "
             f"PR #{stop['pull_request']}: {stop['message']}. End this turn without "
             "an operator alert. No checkout lease was acquired.",
+        )
+    for refusal in prechecked_pr_refusals:
+        from .access_control import LeaseAttestationReason
+
+        reason = LeaseAttestationReason(refusal["reason"])
+        if reason is LeaseAttestationReason.OK:
+            raise ValueError("invalid attestation refusal")
+        _add_labeled(
+            "Current PR remediation",
+            f"The framework could not attest the checkout for {refusal['repository']} "
+            f"PR #{refusal['pull_request']} (reason: {reason.value}). "
+            "No checkout lease was acquired. You may comment on the PR or escalate, "
+            "but you cannot read or write PR content this turn.",
         )
 
     # Materialize once if we need to scan it twice (identity + render).
