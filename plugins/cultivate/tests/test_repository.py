@@ -176,7 +176,7 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
     assert not os.path.lexists(lease.path)
 
 
-def _rebased_divergent_lease(tmp_path: Path):
+def _rebased_divergent_lease(tmp_path: Path, *, production_clone: bool = False):
     origin, source, scope, state = _repo_scope_and_state(tmp_path)
     lease = state.checkout_lease
     _git(source, "checkout", "-q", "main")
@@ -185,6 +185,16 @@ def _rebased_divergent_lease(tmp_path: Path):
     _git(source, "commit", "-qm", "advance base")
     advanced = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:main")
+    if production_clone:
+        _git(source, "tag", "fixture-release")
+        # Create the lease with the canonical source on main and tagged, using
+        # the real clone path. Remove the unused fixture lease first.
+        repository.cleanup_pr_checkout_lease(lease)
+        lease = repository.create_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease.lease_root,
+        )
+        assert _git(lease.path, "rev-parse", "refs/heads/main") == advanced
+        assert _git(lease.path, "rev-parse", "refs/tags/fixture-release") == advanced
     _git(lease.path, "fetch", "origin", "main")
     _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
          "rebase", "origin/main")
@@ -193,10 +203,13 @@ def _rebased_divergent_lease(tmp_path: Path):
     return source, scope, replace(scope, observed_base_sha=advanced), lease
 
 
+@pytest.mark.parametrize("production_clone", [False, True])
 def test_divergent_patch_equivalent_lease_is_discarded_before_renewal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, production_clone: bool,
 ) -> None:
-    source, original_scope, scope, lease = _rebased_divergent_lease(tmp_path)
+    source, original_scope, scope, lease = _rebased_divergent_lease(
+        tmp_path, production_clone=production_clone,
+    )
     metadata = lease.path / repository._METADATA
     original_expiry = json.loads(metadata.read_text())["expires_at"]
     with pytest.raises(RuntimeError, match="cannot be renewed"):
@@ -298,7 +311,7 @@ def test_dirty_equivalent_checkout_is_preserved_not_discarded(
         review_state=RepoReviewState(scope),
     )
     archive = (lease.lease_root / ".recovery" /
-               f"{lease.path.name}-{lease.recovery_id}.worktree.tar.gz")
+               f"{lease.path.name}-{lease.recovery_id}.checkout.tar.gz")
     assert archive.is_file()
     assert "pr_checkout_lease_preserved_divergent" in events
     assert "pr_checkout_lease_discarded_equivalent" not in events
@@ -324,6 +337,19 @@ def test_divergent_whitespace_is_unique_work(tmp_path: Path, content: str) -> No
     assert _git(source, "rev-parse", notices[0]["ref"]) == head
     assert Path(notices[0]["bundle"]).is_file()
     assert Path(notices[0]["archive"]).is_file()
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/fixture-release"])
+def test_modified_inherited_clone_ref_forces_preservation(tmp_path: Path, ref: str) -> None:
+    source, _original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    head = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "update-ref", ref, head)
+    assert _git(source, "rev-parse", ref) != head
+    notices = []
+    assert repository._discard_divergent_candidate(
+        lease, scope, runner=repository._default_runner, notices=notices,
+    )
+    assert notices and Path(notices[0]["bundle"]).is_file()
 
 
 @pytest.mark.parametrize("state_kind", ["stash", "ignored", "branch", "tag"])
@@ -354,6 +380,23 @@ def test_divergent_hidden_state_is_recoverable(tmp_path: Path, state_kind: str) 
     with tarfile.open(notices[0]["archive"]) as archive:
         archive.extractall(restored, filter="data")
     tree = restored / "worktree"
+    assert not (tree / ".git/objects").exists()
+    # Seed objects through a separate origin clone: fetching directly into the
+    # restored metadata would negotiate using refs whose objects are absent.
+    import shutil
+    seed = tmp_path / "published.git"
+    subprocess.run(["git", "clone", "--bare", scope.canonical_origin, str(seed)],
+                   check=True, capture_output=True, env=_fixture_git_env())
+    # Incremental recovery must actually exclude published objects, not merely
+    # pass the flag: its header advertises prerequisite commits from origin.
+    header = Path(notices[0]["bundle"]).read_bytes().split(b"\n\n", 1)[0]
+    assert any(line.startswith(b"-") for line in header.splitlines())
+    imported = subprocess.run(
+        ["git", "-C", str(seed), "bundle", "unbundle", notices[0]["bundle"]],
+        capture_output=True, text=True, env=_fixture_git_env(),
+    )
+    assert imported.returncode == 0, imported.stderr
+    shutil.copytree(seed / "objects", tree / ".git/objects")
     if state_kind == "ignored":
         assert (tree / "secret-draft.txt").read_text() == "ignored work\n"
     else:
@@ -368,18 +411,20 @@ def test_divergent_hidden_state_is_recoverable(tmp_path: Path, state_kind: str) 
 @pytest.mark.parametrize("gate", ["scoped", "base", "substitution", "recovery_ref", "diff"])
 def test_divergent_probe_errors_preserve_lease(tmp_path: Path, gate: str) -> None:
     _source, original, scope, lease = _rebased_divergent_lease(tmp_path)
-    if gate == "base":
-        scope = original  # avoid substituting the advanced base
     if gate == "recovery_ref":
         (lease.path / "draft.txt").write_text("draft")
     before = (lease.path / repository._METADATA).read_bytes()
     head = _git(lease.path, "rev-parse", "HEAD")
     reached = []
+    base_probes = []
 
     def runner(argv):
+        is_base_probe = argv[3:] == ["merge-base", "--is-ancestor", scope.observed_base_sha, head]
+        if is_base_probe:
+            base_probes.append(argv)
         fail = (
             (gate == "scoped" and argv[3:] == ["merge-base", "--is-ancestor", scope.observed_head_sha, head])
-            or (gate == "base" and argv[3:] == ["merge-base", "--is-ancestor", lease.base_sha, head])
+            or (gate == "base" and is_base_probe and len(base_probes) == 2)
             or (gate == "substitution" and argv[3:] == ["merge-base", "--is-ancestor", lease.base_sha, scope.observed_base_sha])
             or (gate == "recovery_ref" and argv[3:5] == ["rev-parse", "--verify"] and argv[-1].startswith("refs/worklink-lease/"))
             or (gate == "diff" and "diff-tree" in argv)
@@ -389,9 +434,12 @@ def test_divergent_probe_errors_preserve_lease(tmp_path: Path, gate: str) -> Non
             return subprocess.CompletedProcess(argv, 128, stdout="", stderr="injected probe failure")
         return repository._default_runner(argv)
 
-    with pytest.raises(RuntimeError):
+    expected = "base ancestry inspection failed" if gate == "base" else None
+    with pytest.raises(RuntimeError, match=expected):
         repository._discard_divergent_candidate(lease, scope, runner=runner)
     assert reached
+    if gate == "base":
+        assert len(base_probes) == 2  # substitution passed; final ancestry failed
     assert lease.path.is_dir()
     assert (lease.path / repository._METADATA).read_bytes() == before
 

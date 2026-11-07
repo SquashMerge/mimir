@@ -1541,8 +1541,10 @@ def _unexplained_publication_paths(
     return tuple(unexplained)
 
 
-def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -> Path:
-    """Atomically preserve the complete history reachable from a lease HEAD."""
+def _preserve_checkout_head(
+    lease: PRCheckoutLease, head: str, runner: Runner, *, incremental: bool = False,
+) -> Path:
+    """Preserve local history; divergent recovery can reuse origin prerequisites."""
     recovery_root = lease.lease_root / _RECOVERY_DIRECTORY
     if recovery_root.is_symlink():
         raise RuntimeError("PR checkout lease recovery directory may not be a symlink")
@@ -1551,7 +1553,7 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
     if recovery_root.parent != lease.lease_root.resolve(strict=True):
         raise RuntimeError("PR checkout lease recovery directory escapes its lease root")
     bundle = recovery_root / f"{lease.path.name}-{lease.recovery_id}.bundle"
-    if bundle.exists():
+    if bundle.exists() and not incremental:
         verified = runner([
             "git", "-C", str(lease.path), "bundle", "verify", str(bundle),
         ])
@@ -1575,7 +1577,8 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
     try:
         _run(
             runner,
-            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "--all", "HEAD"],
+            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "--all", "HEAD",
+             *(["--reflog", "--not", "--remotes=origin"] if incremental else [])],
             "PR checkout lease recovery bundle creation failed",
         )
         _run(
@@ -1609,9 +1612,15 @@ def _preserve_dirty_worktree(
     staging = archive.with_name(f".{archive.name}.{uuid.uuid4().hex}.tmp")
     try:
         with tarfile.open(staging, "w:gz") as retained:
+            def metadata_without_objects(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+                if info.name == "worktree/.git/objects" or info.name.startswith("worktree/.git/objects/"):
+                    return None
+                return info
+
             for entry in lease.path.iterdir():
                 if include_git or entry.name != ".git":
-                    retained.add(entry, arcname=str(Path("worktree") / entry.name))
+                    retained.add(entry, arcname=str(Path("worktree") / entry.name),
+                                 filter=metadata_without_objects)
         with tarfile.open(staging, "r:gz") as retained:
             if not retained.getmembers():
                 raise RuntimeError("dirty-worktree recovery archive is empty")
@@ -2111,11 +2120,19 @@ def _discard_divergent_candidate(
         "--untracked-files=all", "--ignored",
     ], "retained PR checkout status inspection failed")
     refs = _run(runner, [
-        "git", "-C", str(lease.path), "for-each-ref", "--format=%(refname)",
+        "git", "-C", str(lease.path), "for-each-ref", "--format=%(objectname) %(refname)",
     ], "retained PR checkout refs inspection failed").splitlines()
-    extra_refs = [ref for ref in refs if not (
-        ref == scope.destination_ref or ref == PUBLISHED_HEAD_REF
-        or ref.startswith("refs/remotes/origin/")
+    # A local clone inherits the source's current branch and tags. Those exact
+    # (object, name) pairs are redundant, not unpublished lease work. Comparing
+    # both fields is essential: a lease-local edit to an inherited ref must
+    # still be preserved. If the source has moved since cloning, preserve too.
+    source_refs = set(_run(runner, [
+        "git", "-C", str(lease.source_root), "for-each-ref",
+        "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/",
+    ], "source checkout refs inspection failed").splitlines())
+    extra_refs = [entry for entry in refs if not (
+        (ref := entry.split()[1]) == scope.destination_ref or ref == PUBLISHED_HEAD_REF
+        or ref.startswith("refs/remotes/origin/") or entry in source_refs
     )]
     base = lease.base_sha.lower()
     # A lease created before the scoped base advanced may have been rebased
@@ -2177,11 +2194,12 @@ def _discard_divergent_candidate(
             "pr_checkout_lease_discarded_equivalent", scope, [(lease.path, head)],
         )
     else:
-        bundle = _recover_retained_checkout(
-            lease, head=head, dirty=bool(status), runner=runner,
-        )
-        # Include Git metadata so stash reflogs, extra refs, index and ignored
-        # files survive too, not just the history reachable from HEAD.
+        # Refresh incremental recovery on retries rather than reusing a stale
+        # snapshot. Published origin objects are prerequisites, not duplicated
+        # in both a full bundle and a checkout archive.
+        bundle = _preserve_checkout_head(lease, head, runner, incremental=True)
+        # Include Git metadata, index and ignored files, but not .git/objects.
+        # Restore published prerequisites from origin before importing the bundle.
         archive = _preserve_dirty_worktree(lease, bundle, include_git=True)
         patch = bundle.with_suffix(".patch")
         # A binary tree diff retains merge resolutions too; the bundle is the
