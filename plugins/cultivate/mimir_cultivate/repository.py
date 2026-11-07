@@ -1573,12 +1573,25 @@ def _preserve_checkout_head(
         if not {tuple(line.split()) for line in refs.splitlines() if line} <= retained_heads:
             raise RuntimeError("existing PR checkout lease recovery bundle lacks current refs")
         return bundle
+    # Git refuses an empty incremental bundle. Probe the exact revision set
+    # first, rather than treating arbitrary bundle failures as harmless. A
+    # hidden-state-only checkout still needs a restorable archive, so use a
+    # full bundle in this case (including deeper stash/reflog tips).
+    bundle_revisions = ["--all", "HEAD"]
+    if incremental:
+        bundle_revisions.append("--reflog")
+        unpublished = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", *bundle_revisions, "--not", "--remotes=origin", "--",
+        ], "PR checkout lease recovery revision inspection failed")
+        if unpublished:
+            bundle_revisions.extend(["--not", "--remotes=origin"])
     staging = recovery_root / f".{bundle.name}.{uuid.uuid4().hex}.tmp"
     try:
         _run(
             runner,
-            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "--all", "HEAD",
-             *(["--reflog", "--not", "--remotes=origin"] if incremental else [])],
+            ["git", "-C", str(lease.path), "bundle", "create", str(staging),
+             *bundle_revisions],
             "PR checkout lease recovery bundle creation failed",
         )
         _run(
@@ -2122,18 +2135,41 @@ def _discard_divergent_candidate(
     refs = _run(runner, [
         "git", "-C", str(lease.path), "for-each-ref", "--format=%(objectname) %(refname)",
     ], "retained PR checkout refs inspection failed").splitlines()
-    # A local clone inherits the source's current branch and tags. Those exact
-    # (object, name) pairs are redundant, not unpublished lease work. Comparing
-    # both fields is essential: a lease-local edit to an inherited ref must
-    # still be preserved. If the source has moved since cloning, preserve too.
+    # A local clone inherits source heads/tags. Exact pairs are redundant;
+    # after the source advances, an inherited tip is also redundant if it is
+    # reachable from current source refs or published origin history. New ref
+    # names and lease-only objects remain protected.
     source_refs = set(_run(runner, [
         "git", "-C", str(lease.source_root), "for-each-ref",
         "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/",
     ], "source checkout refs inspection failed").splitlines())
-    extra_refs = [entry for entry in refs if not (
-        (ref := entry.split()[1]) == scope.destination_ref or ref == PUBLISHED_HEAD_REF
-        or ref.startswith("refs/remotes/origin/") or entry in source_refs
-    )]
+    source_names = {entry.split()[1] for entry in source_refs}
+
+    def redundant_ref(entry: str) -> bool:
+        object_id, ref = entry.split()
+        if (ref == scope.destination_ref or ref == PUBLISHED_HEAD_REF
+                or ref.startswith("refs/remotes/origin/") or entry in source_refs):
+            return True
+        if ref not in source_names:
+            return False
+        origin_only = _run(runner, [
+            "git", "-C", str(lease.path), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", object_id, "--not", "--remotes=origin", "--",
+        ], "inherited checkout ref origin inspection failed")
+        if not origin_only:
+            return True
+        exists = runner([
+            "git", "-C", str(lease.source_root), "cat-file", "-e", f"{object_id}^{{commit}}",
+        ])
+        if exists.returncode != 0:
+            return False  # Missing/uncertain source objects cannot justify discard.
+        source_only = _run(runner, [
+            "git", "-C", str(lease.source_root), "rev-list", "--objects", "--no-object-names",
+            "--max-count=1", object_id, "--not", "--branches", "--tags", "--remotes=origin", "--",
+        ], "inherited checkout ref source inspection failed")
+        return not source_only
+
+    extra_refs = [entry for entry in refs if not redundant_ref(entry)]
     base = lease.base_sha.lower()
     # A lease created before the scoped base advanced may have been rebased
     # without updating its metadata. Exclude only a scoped, verified base that

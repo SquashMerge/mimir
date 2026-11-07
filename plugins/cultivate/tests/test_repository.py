@@ -352,7 +352,90 @@ def test_modified_inherited_clone_ref_forces_preservation(tmp_path: Path, ref: s
     assert notices and Path(notices[0]["bundle"]).is_file()
 
 
-@pytest.mark.parametrize("state_kind", ["stash", "ignored", "branch", "tag"])
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/fixture-release"])
+@pytest.mark.parametrize("reachable_from", ["source", "origin"])
+def test_moved_source_ref_does_not_force_preservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: str, reachable_from: str,
+) -> None:
+    source, _original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    inherited = _git(lease.path, "rev-parse", ref)
+    (source / "later.txt").write_text("source advanced again\n")
+    _git(source, "add", "later.txt")
+    _git(source, "commit", "-qm", "advance source refs")
+    _git(source, "update-ref", ref, "HEAD")
+    if reachable_from == "source":
+        # Remove origin reachability to isolate the source-current-refs lane.
+        _git(lease.path, "update-ref", "-d", "refs/remotes/origin/main")
+    else:
+        # Move source refs to unrelated history. The inherited tip is now
+        # redundant solely through the lease's published origin tracking ref.
+        _git(source, "update-ref", "refs/heads/main", scope.observed_head_sha)
+        _git(source, "update-ref", "refs/tags/fixture-release", scope.observed_head_sha)
+    assert _git(source, "rev-parse", ref) != inherited
+    events = []
+    monkeypatch.setattr(repository, "_report_retained_candidates",
+                        lambda event, *_, **_details: events.append(event))
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        review_state=RepoReviewState(scope),
+    )
+    assert events == ["pr_checkout_lease_discarded_equivalent"]
+    assert not lease.path.exists() and fresh.path != lease.path and candidates == ()
+    assert not (lease.lease_root / ".recovery").exists()
+
+
+def test_behind_head_with_untracked_file_recovers_empty_incremental_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import shutil
+    import tarfile
+
+    source, original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
+    _git(lease.path, "reset", "--hard", original.observed_base_sha)
+    # Remove the fixture's unpublished replay from reflogs: every retained tip
+    # is now origin-reachable, exactly the empty incremental-bundle case.
+    _git(lease.path, "reflog", "expire", "--expire=now", "--all")
+    assert not _git(lease.path, "rev-list", "--all", "HEAD", "--reflog",
+                    "--not", "--remotes=origin", "--")
+    (lease.path / "draft.txt").write_text("untracked draft survives\n")
+    monkeypatch.setattr(repository, "_observe_current_pr_head",
+                        lambda _scope: scope.observed_head_sha)
+    state = RepoReviewState(scope)
+    fresh, candidates = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+    )
+    notice, = state.checkout_recovery_notices
+    assert fresh.path != lease.path and not lease.path.exists() and candidates == ()
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert _git(source, "rev-parse", notice["ref"]) == original.observed_base_sha
+    assert Path(notice["patch"]).is_file()
+    bundle = Path(notice["bundle"])
+    assert bundle.is_file()
+    # Full fallback must be self-contained, not an empty placeholder.
+    header = bundle.read_bytes().split(b"\n\n", 1)[0]
+    assert not any(line.startswith(b"-") for line in header.splitlines())
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    with tarfile.open(notice["archive"]) as archive:
+        archive.extractall(restored, filter="data")
+    tree = restored / "worktree"
+    seed = tmp_path / "empty.git"
+    seed.mkdir()
+    _git(seed, "init", "--bare")
+    _git(seed, "bundle", "verify", str(bundle))
+    _git(seed, "bundle", "unbundle", str(bundle))
+    shutil.copytree(seed / "objects", tree / ".git/objects")
+    assert (tree / "draft.txt").read_text() == "untracked draft survives\n"
+    assert _git(tree, "rev-parse", "HEAD") == original.observed_base_sha
+    assert _git(tree, "show", "HEAD:tracked.txt")
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert_lease_attested(_lineage_turn(scope, state), scope, fresh)
+
+
+@pytest.mark.parametrize("state_kind", ["stash", "two_stashes", "ignored", "branch", "tag"])
 def test_divergent_hidden_state_is_recoverable(tmp_path: Path, state_kind: str) -> None:
     import tarfile
 
@@ -362,9 +445,13 @@ def test_divergent_hidden_state_is_recoverable(tmp_path: Path, state_kind: str) 
         (lease.path / "secret-draft.txt").write_text("ignored work\n")
     else:
         (lease.path / "tracked.txt").write_text("hidden work\n")
-        if state_kind == "stash":
+        if state_kind in {"stash", "two_stashes"}:
             _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
                  "stash", "push", "-m", "saved draft")
+            if state_kind == "two_stashes":
+                (lease.path / "tracked.txt").write_text("newer hidden work\n")
+                _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                     "stash", "push", "-m", "second draft")
         else:
             _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
                  "commit", "-qam", "hidden work")
@@ -400,18 +487,24 @@ def test_divergent_hidden_state_is_recoverable(tmp_path: Path, state_kind: str) 
     if state_kind == "ignored":
         assert (tree / "secret-draft.txt").read_text() == "ignored work\n"
     else:
-        ref = "refs/stash" if state_kind == "stash" else (
+        ref = "refs/stash" if state_kind in {"stash", "two_stashes"} else (
             "refs/heads/saved-draft" if state_kind == "branch" else "refs/tags/saved-draft"
         )
-        assert _git(tree, "show", f"{ref}:tracked.txt") == "hidden work"
+        expected = "newer hidden work" if state_kind == "two_stashes" else "hidden work"
+        assert _git(tree, "show", f"{ref}:tracked.txt") == expected
+        if state_kind == "two_stashes":
+            assert _git(tree, "show", "stash@{1}:tracked.txt") == "hidden work"
         heads = _git(tree, "bundle", "list-heads", notices[0]["bundle"])
         assert ref in heads
 
 
-@pytest.mark.parametrize("gate", ["scoped", "base", "substitution", "recovery_ref", "diff"])
+@pytest.mark.parametrize("gate", [
+    "scoped", "base", "substitution", "recovery_ref", "diff",
+    "recovery_revisions", "bundle_create", "bundle_verify",
+])
 def test_divergent_probe_errors_preserve_lease(tmp_path: Path, gate: str) -> None:
     _source, original, scope, lease = _rebased_divergent_lease(tmp_path)
-    if gate == "recovery_ref":
+    if gate in {"recovery_ref", "recovery_revisions", "bundle_create", "bundle_verify"}:
         (lease.path / "draft.txt").write_text("draft")
     before = (lease.path / repository._METADATA).read_bytes()
     head = _git(lease.path, "rev-parse", "HEAD")
@@ -428,6 +521,9 @@ def test_divergent_probe_errors_preserve_lease(tmp_path: Path, gate: str) -> Non
             or (gate == "substitution" and argv[3:] == ["merge-base", "--is-ancestor", lease.base_sha, scope.observed_base_sha])
             or (gate == "recovery_ref" and argv[3:5] == ["rev-parse", "--verify"] and argv[-1].startswith("refs/worklink-lease/"))
             or (gate == "diff" and "diff-tree" in argv)
+            or (gate == "recovery_revisions" and argv[3] == "rev-list" and "--reflog" in argv)
+            or (gate == "bundle_create" and argv[3:5] == ["bundle", "create"])
+            or (gate == "bundle_verify" and argv[3:5] == ["bundle", "verify"])
         )
         if fail:
             reached.append(argv)

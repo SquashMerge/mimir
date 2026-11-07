@@ -1202,10 +1202,14 @@ Current slice-1 recovery is manual:
   lease at the scoped PR head. Only clean work with verbatim per-commit diffs
   matching published commits may be discarded (whitespace is significant).
   Stashes, extra local refs, ignored files or unique changes force preservation.
-  Source heads/tags copied by the local clone are exempt only when both the ref
-  name and object ID still match the source; a changed inherited ref is preserved.
-  Recovery writes a verified incremental bundle (`--all HEAD --reflog --not
-  --remotes=origin`), a checkout archive including Git metadata but excluding
+  Source heads/tags copied by the local clone are exempt when the ref name and
+  object ID match the source, or the same ref name still exists in source and
+  its old tip is reachable from current source refs or published origin history.
+  New ref names and lease-only objects remain protected. Recovery writes a
+  verified incremental bundle (`--all HEAD --reflog --not --remotes=origin`);
+  when that revision set is empty, it writes a full bundle including reflog tips
+  instead (Git cannot create an empty bundle). Recovery also writes a checkout
+  archive including Git metadata but excluding
   `.git/objects`, a binary patch and a local
   `refs/worklink-lease/<pr>/<recovery_id>` ref in the source repository. These
   recovery refs are never pushed. The structured event, warning and checkout
