@@ -383,7 +383,10 @@ def test_pr_comment_after_push_keeps_raw_scope_but_refuses_incomplete_result(
             assert not runtime.context.ifc_state.has_untrusted_active_ingest()
             return
         assert provenance is not None and len(provenance.sources) == 1
-        assert provenance.sources[0].resource_id == f"owner/repo#pull/17@{new_head}"
+        # File bytes come from the scope's immutable head; text from live endpoints
+        # comes from the pushed head.
+        labelled = old_head if read_tool is pr_file_content else new_head
+        assert provenance.sources[0].resource_id == f"owner/repo#pull/17@{labelled}"
         labels = access_control.classify_protected_result(
             read_tool.name, {"repository": "owner/repo", "pull_request": 17},
             runtime.context,
@@ -1362,7 +1365,10 @@ def test_pr_read_attests_only_exact_verified_push(monkeypatch, read_tool, public
         if publication == "verified":
             label, = provenance.sources
             assert label.integrity == "trusted"
-            assert label.resource_id == f"owner/repo#pull/17@{pushed}"
+            # File bytes are read at the scope's immutable head, not the pushed one.
+            assert label.resource_id == (
+                f"owner/repo#pull/17@{observed if read_tool is pr_file_content else pushed}"
+            )
             assert recorded == []
             assert runtime.context.ifc_state.own_push_lineage() == {
                 ("owner/repo", 17): frozenset({observed}),
@@ -6119,6 +6125,46 @@ def test_verified_own_push_keeps_the_scope_verdict_only_once_proven(
         assert runtime.context.ifc_state.own_push_lineage() == {
             ("owner/repo", 17): frozenset({observed}),
         }
+
+
+def test_file_content_after_own_push_is_labelled_at_the_commit_it_read(monkeypatch):
+    import uuid
+
+    from mimir_cultivate.forge import GitHubForgeClient
+    from mimir_cultivate.repository import _record_verified_push
+
+    from tests.test_forge_github import Response, Session, _file_responses
+
+    observed, pushed = (uuid.uuid4().hex + "0" * 8 for _ in range(2))
+    scope = _scope(RepoPRAction.INSPECT, head_sha=observed)
+    runtime = _runtime(scope)
+    runtime.context.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    client = FakeForge()
+    live = [observed]
+    metadata = client.get_pull_request
+    client.get_pull_request = lambda target: replace(metadata(target), head_sha=live[0])
+    # The production adapter walks the scope's immutable observed head, not
+    # the pushed one: the label must name the commit whose bytes it returns.
+    session = Session([*_file_responses("src/app.py", observed),
+                       Response("bytes at the observed head", content_type="text/plain")])
+    adapter = GitHubForgeClient(session=session)
+    client.get_file_content = lambda target, path: adapter.get_file_content(target, path)
+    set_forge_client(client)
+    try:
+        _record_verified_push(scope, observed, pushed)
+        live[0] = pushed
+        token = access_control.begin_protected_result_capture()
+        try:
+            content = pr_file_content.func("owner/repo", 17, "src/app.py", runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+    finally:
+        set_forge_client(None)
+    assert content == "bytes at the observed head"
+    assert session.calls[0][1].endswith(f"/git/commits/{observed}")
+    assert [(source.integrity, source.resource_id) for source in provenance.sources] == [
+        ("trusted", f"owner/repo#pull/17@{observed}"),
+    ]
 
 
 @pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content],

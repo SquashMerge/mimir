@@ -2876,8 +2876,11 @@ def pr_file_content(
     """Read one regular file at the pull request's verified head."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
+    # The adapter walks the scope's immutable observed head, so after a verified
+    # own push the bytes, and therefore the label, are the observed head's.
     return _read_pr_content(
         runtime, scope, client, "pr_file_content", lambda: client.get_file_content(scope, path),
+        label_head=scope.observed_head_sha,
     )
 
 
