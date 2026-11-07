@@ -612,6 +612,11 @@ class InformationFlowState:
     pr_checkout_author_trust_cause: dict[str, str] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )
+    # Scope IDs whose PR verdict a content read proved trusted in this turn;
+    # a verified own push keeps that verdict for the pushed head.
+    pr_content_trusted_scopes: set[str] = field(
+        default_factory=set, repr=False, compare=False, init=False,
+    )
     # Leases the framework checked out before the model loop, keyed by scope ID:
     # ``(lease path, recovery id)`` and the candidate commits it reported.
     # Written only by turn setup; ``repo_checkout`` may resume exactly these.

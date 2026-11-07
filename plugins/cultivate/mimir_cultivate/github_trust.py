@@ -7,7 +7,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Iterable, Literal, Mapping, TypeVar
+from typing import Callable, Iterable, Literal, Mapping, Sequence, TypeVar
 
 import requests
 
@@ -112,13 +112,19 @@ T = TypeVar("T", bound=Mapping[str, object])
 def partition(
     items: Iterable[T], author_of: Callable[[T], str],
     verdict_for: Callable[[str], bool | None],
+    *, vouched: Callable[[T, Sequence[T]], bool] | None = None,
 ) -> tuple[list[T], list[WithheldItem]]:
+    """Keep trusted items, and untrusted ones a trusted item vouches for."""
+    entries = [(item, author_of(item)) for item in items]
+    verdicts = [verdict_for(author) for _, author in entries]
+    trusted = [item for (item, _), verdict in zip(entries, verdicts) if verdict is True]
     kept: list[T] = []
     withheld: list[WithheldItem] = []
-    for item in items:
-        author = author_of(item)
-        verdict = verdict_for(author)
+    for (item, author), verdict in zip(entries, verdicts):
         if verdict is True:
+            kept.append(item)
+            continue
+        if vouched is not None and vouched(item, trusted):
             kept.append(item)
             continue
         reason: Reason = (
@@ -135,3 +141,30 @@ def partition(
             reason=reason,
         ))
     return kept, withheld
+
+
+def _instant(value: object) -> datetime | None:
+    stamp = sanitize_timestamp(value)
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ") if stamp is not None else None
+
+
+def vouched_by_later_trusted(
+    created_of: Callable[[T], object], modified_of: Callable[[T], object],
+    can_vouch: Callable[[T], bool],
+) -> Callable[[T, Sequence[T]], bool]:
+    """A trusted person's item vouches for content that existed when it was written.
+
+    An item is vouched only when its last modification strictly precedes the
+    creation of a trusted item that ``can_vouch``; an edit after that reply was
+    never seen by its author. Items without valid timestamps cannot be ordered,
+    so stay withheld.
+    """
+    def vouched(item: T, trusted: Sequence[T]) -> bool:
+        modified = _instant(modified_of(item))
+        return modified is not None and any(
+            can_vouch(voucher)
+            and (created := _instant(created_of(voucher))) is not None and modified < created
+            for voucher in trusted
+        )
+
+    return vouched
