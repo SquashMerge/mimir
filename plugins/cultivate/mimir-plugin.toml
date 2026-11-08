@@ -1,7 +1,7 @@
 name = "cultivate"
-version = "1.0.0rc3"
+version = "1.0.0rc4"
 license = "BUSL-1.1"
-requires_mimir = "==1.0.0rc3"
+requires_mimir = "==1.0.0rc4"
 themes = ["skins/squashmerge.json"]
 
 [cli]
@@ -15,7 +15,7 @@ module = "frontend/cultivate.v1.js"
 css = "frontend/cultivate.v1.css"
 
 [defaults]
-version = "1.0.0rc3"
+version = "1.0.0rc4"
 skills = [
   "defaults/skills/chainlink-orchestrator",
   "defaults/skills/worklink-tool-pins",

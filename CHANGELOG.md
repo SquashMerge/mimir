@@ -8,6 +8,18 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc4] — 2026-11-07
+
+- **Fourth release candidate for 1.0.0.** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly: `mimir-agent==1.0.0rc4 mimir-cultivate==1.0.0rc4`, or `--prerelease allow`.
+  - **Cultivate's PyPI setup builds on Debian 13 (trixie) again**, matching the root Dockerfile and existing deployments. rc3's setup pinned Debian 12 and failed on saved trixie package names. Build failures now show a redacted tail of the build output, and a generated `build.sh` no longer depends on the setup venv.
+  - **A repeated Ctrl-C/SIGTERM ends a stuck ACP teardown immediately**, through the wakeup observer, instead of waiting for the 5-second watchdog.
+
+- Escalate a repeated Ctrl-C/SIGTERM/SIGHUP during ACP teardown through the wakeup observer thread, so it exits immediately even when the main thread is parked in teardown and its Python signal handler cannot run. Previously that case waited for the 5-second watchdog. This also fixes the remaining `test_signal_exit_bounds_entire_teardown` hang on macOS CI (#2118).
+
+- Build Cultivate deployments on the root Dockerfile's base image, now pinned to `python:3.11-slim-trixie`. Setup had pinned Debian 12 (bookworm), so Debian 13 package names saved in `--system-packages` failed and wheels were limited to glibc 2.36.
+  - When an image build fails, setup now shows the failing image and the last lines of build output, with secrets redacted.
+  - A rebuild with `build.sh` no longer depends on the interpreter setup ran with: it falls back to `python3` on PATH (#2121).
+
 ## [1.0.0rc3] — 2026-11-07
 
 - **Third release candidate for 1.0.0.** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly: `mimir-agent==1.0.0rc3 mimir-cultivate==1.0.0rc3`, or `--prerelease allow`.
