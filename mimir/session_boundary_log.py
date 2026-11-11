@@ -58,7 +58,7 @@ _GITHUB_REF_RE = re.compile(
     re.IGNORECASE,
 )
 _PR_REF_RE = re.compile(r"\b(?:PR|pull request)\s*#?(\d+)\b", re.IGNORECASE)
-_ISSUE_REF_RE = re.compile(r"\b(?:issue|chainlink)\s*#?(\d+)\b", re.IGNORECASE)
+_ISSUE_REF_RE = re.compile(r"\bissue\s*#?(\d+)\b", re.IGNORECASE)
 _LOCAL_PUSH_CLAIM_RE = re.compile(
     r"\b(?:not (?:yet )?pushed|unpushed|locally committed|"
     r"local (?:branch|commit)|but not pushed)\b",
@@ -270,7 +270,7 @@ def _lookup_github_artifacts(
         ["gh", "api", "graphql", "-f", f"query={query}"],
         capture_output=True, text=True, timeout=15, env=env,
     )
-    if result.returncode != 0 or not result.stdout.strip():
+    if not result.stdout.strip():
         raise RuntimeError(result.stderr.strip() or "empty GitHub response")
     payload = json.loads(result.stdout)
     data = payload.get("data")
@@ -299,6 +299,24 @@ def _lookup_github_artifacts(
             )
         else:
             statuses[artifact] = "REMOTE" if repository.get("ref") else None
+    if result.returncode != 0:
+        errors = payload.get("errors")
+        # gh exits non-zero even when GraphQL returns useful data alongside
+        # per-alias NOT_FOUND errors. Other errors must still fail open.
+        if not (
+            any(status is not None for status in statuses.values())
+            and isinstance(errors, list) and errors
+            and all(
+                isinstance(error, dict)
+                and error.get("type") == "NOT_FOUND"
+                and isinstance(error.get("path"), list)
+                and error["path"]
+                and error["path"][0] in data
+                and error["path"][0] in {f"a{i}" for i in range(len(artifacts))}
+                for error in errors
+            )
+        ):
+            raise RuntimeError(result.stderr.strip() or "GitHub validation failed")
     return statuses
 
 

@@ -8,6 +8,7 @@ markers, the ``closed_since`` corrective-overrides applier, and
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -217,6 +218,92 @@ def test_validation_drops_closed_issue():
         lookup=lambda refs: {refs[0]: "CLOSED"},
     )
     assert boundaries[0]["unfinished"] == []
+
+
+@pytest.mark.parametrize("chainlink_ref", ["chainlink #2116", "chainlink 2116"])
+def test_validation_chainlink_does_not_use_lookup_slot_next_to_merged_pr(
+    monkeypatch: pytest.MonkeyPatch, chainlink_ref: str,
+) -> None:
+    chainlink_item = f"Follow up on {chainlink_ref}"
+    pr_item = "PR #1187 awaits merge"
+    calls: list[str] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args[-1])
+        assert "issueOrPullRequest(number:1187)" in args[-1]
+        assert "number:2116" not in args[-1]
+        return subprocess.CompletedProcess(
+            args, 0,
+            json.dumps({"data": {"a0": {"issueOrPullRequest": {
+                "__typename": "PullRequest", "state": "MERGED",
+            }}}}), "",
+        )
+
+    monkeypatch.setattr("mimir.session_boundary_log.subprocess.run", fake_run)
+    boundaries = validate_unfinished_work(
+        _boundary(chainlink_item, pr_item), default_repo="octo/repo", max_lookups=1,
+    )
+    assert len(calls) == 1
+    assert boundaries[0]["unfinished"] == [chainlink_item]
+
+
+def test_validation_partial_not_found_only_marks_missing_alias_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 1,
+            json.dumps({
+                "data": {
+                    "a0": {"issueOrPullRequest": {
+                        "__typename": "PullRequest", "state": "MERGED",
+                    }},
+                    "a1": {"issueOrPullRequest": None},
+                    "a2": {"issueOrPullRequest": {
+                        "__typename": "Issue", "state": "OPEN",
+                    }},
+                },
+                "errors": [{
+                    "type": "NOT_FOUND", "path": ["a1", "issueOrPullRequest"],
+                    "message": "Could not resolve to an issue or pull request",
+                }],
+            }), "gh: Could not resolve to an issue or pull request\n",
+        )
+
+    monkeypatch.setattr("mimir.session_boundary_log.subprocess.run", fake_run)
+    boundaries = validate_unfinished_work(
+        _boundary("PR #1187 merged", "issue #2116 queued", "issue #50 open"),
+        default_repo="octo/repo",
+    )
+    assert boundaries[0]["unfinished"] == [
+        "issue #2116 queued [unverified]", "issue #50 open",
+    ]
+
+
+@pytest.mark.parametrize("stdout", [
+    json.dumps({"errors": [{"type": "UNAUTHORIZED"}]}),
+    "not json",
+    json.dumps({
+        "data": {"a0": {"issueOrPullRequest": {
+            "__typename": "PullRequest", "state": "MERGED",
+        }}},
+        "errors": [{"type": "UNAUTHORIZED", "path": ["a1"]}],
+    }),
+])
+def test_validation_full_github_failure_marks_all_unverified(
+    monkeypatch: pytest.MonkeyPatch, stdout: str,
+) -> None:
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout, "gh: auth failed\n")
+
+    monkeypatch.setattr("mimir.session_boundary_log.subprocess.run", fake_run)
+    boundaries = validate_unfinished_work(
+        _boundary("PR #1187 merged", "issue #2116 queued"),
+        default_repo="octo/repo",
+    )
+    assert boundaries[0]["unfinished"] == [
+        "PR #1187 merged [unverified]", "issue #2116 queued [unverified]",
+    ]
 
 
 def test_validation_failure_keeps_item_unverified_and_stale_hedge():
