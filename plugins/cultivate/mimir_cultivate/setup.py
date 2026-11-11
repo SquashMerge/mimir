@@ -14,7 +14,7 @@ import getpass
 import hashlib
 from importlib import metadata, resources
 import json
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import os
 import platform
 from pathlib import Path
@@ -32,6 +32,7 @@ import urllib.request
 import yaml
 
 from mimir._reasoning_effort import validate_effort
+from mimir.otel_credentials import sensitive_otlp_endpoint
 from mimir.scaffold_docker import DEFAULT_BASE_IMAGE
 
 from .repository import valid_repository_slug
@@ -172,6 +173,9 @@ _ALERT_ENV_KEYS = frozenset({"MIMIR_OPERATOR_ALERT_CHANNEL", "DISCORD_TOKEN", "S
                             "SLACK_APP_TOKEN", "MIMIR_DISCORD_ALLOWED_CHANNELS",
                             "MIMIR_DISCORD_REQUIRE_MENTION", "MIMIR_SLACK_ALLOWED_CHANNELS",
                             "MIMIR_SLACK_REQUIRE_MENTION"})
+_TRACING_ENV_KEYS = frozenset({"MIMIR_TRACING_ENABLED", "MIMIR_OTLP_ENDPOINT",
+                              "MIMIR_OTEL_SERVICE_NAME", "MIMIR_TRACING_CAPTURE_CONTENT",
+                              "OTEL_EXPORTER_OTLP_HEADERS"})
 _DOCKER_ARCHITECTURES = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}
 # Cultivate deployments share the root Dockerfile's pinned base, so saved
 # Debian package names and wheel tags stay valid across setups (#2121).
@@ -190,7 +194,7 @@ class _CommandFailed(SetupError):
         self.output = output
 
 
-_SECRET_ENV_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PAT\b", re.IGNORECASE)
+_SECRET_ENV_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PAT\b|OTLP_HEADERS", re.IGNORECASE)
 _SECRET_PATTERNS = (
     re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
@@ -405,7 +409,8 @@ def _field(args: argparse.Namespace, name: str, explanation: str, *, default: st
     return validate(name, value or "")
 
 
-def _secret(args: argparse.Namespace, name: str, explanation: str, *, previous: str | None = None) -> str:
+def _secret(args: argparse.Namespace, name: str, explanation: str, *, previous: str | None = None,
+            optional_clear: bool = False) -> str:
     sources = [getattr(args, name + "_file", None), getattr(args, name + "_stdin", False)]
     if sources[0] is not None and sources[1]:
         raise SetupError(f"Choose only one source for {name.replace('_', ' ')}.")
@@ -417,15 +422,86 @@ def _secret(args: argparse.Namespace, name: str, explanation: str, *, previous: 
     elif sources[1]:
         value = sys.stdin.readline().strip()
     else:
-        value = os.environ.get("MIMIR_CULTIVATE_" + name.upper()) or previous
+        value = os.environ.get("MIMIR_CULTIVATE_" + name.upper())
+        if value is None or (not value and not optional_clear):
+            value = previous
         if value is None:
             if not sys.stdin.isatty():
                 raise SetupError(f"Missing {name.replace('_', ' ')}; use --{name.replace('_', '-')}-file, --{name.replace('_', '-')}-stdin or MIMIR_CULTIVATE_{name.upper()}.")
             print(explanation)
             value = getpass.getpass(f"{name.replace('_', ' ').title()}: ")
-    if not value or any(c in value for c in "\r\n\0"):
+    if (not value and not optional_clear) or any(c in value for c in "\r\n\0"):
         raise SetupError(f"Invalid {name.replace('_', ' ')}; provide a single non-empty line.")
     return value
+
+
+def _tracing_settings(args: argparse.Namespace, previous: dict, prior: dict[str, str], slug: str
+                      ) -> tuple[dict[str, str], dict[str, object]]:
+    """Resolve setup-owned tracing settings without exposing collector credentials."""
+    endpoint = getattr(args, "otlp_endpoint", None)
+    if endpoint is None:
+        endpoint = os.environ.get("MIMIR_CULTIVATE_OTLP_ENDPOINT")
+    if endpoint is None:
+        endpoint = prior.get("MIMIR_OTLP_ENDPOINT")
+    if endpoint is None and not previous and sys.stdin.isatty():
+        endpoint = input("OTLP collector base URL (optional; leave blank to disable): ").strip()
+    if endpoint == "none" or endpoint == "":
+        endpoint = None
+    if endpoint is not None:
+        if sensitive_otlp_endpoint(endpoint):
+            raise SetupError("Invalid OTLP endpoint; use an http(s) base URL without credentials or userinfo.")
+        if urlsplit(endpoint).path.rstrip("/").endswith("/v1/traces"):
+            raise SetupError("OTLP endpoint must be a base URL; remove the trailing /v1/traces (Mimir appends it).")
+
+    service = getattr(args, "otel_service_name", None)
+    service = service if service is not None else os.environ.get("MIMIR_CULTIVATE_OTEL_SERVICE_NAME")
+    service = service if service is not None else prior.get("MIMIR_OTEL_SERVICE_NAME")
+    capture = getattr(args, "tracing_capture_content", None)
+    capture = capture if capture is not None else os.environ.get("MIMIR_CULTIVATE_TRACING_CAPTURE_CONTENT")
+    capture = capture if capture is not None else prior.get("MIMIR_TRACING_CAPTURE_CONTENT")
+    headers_requested = (getattr(args, "otlp_headers_file", None) is not None or
+                         getattr(args, "otlp_headers_stdin", False) or
+                         os.environ.get("MIMIR_CULTIVATE_OTLP_HEADERS") is not None)
+    if endpoint is None:
+        if service is not None and (getattr(args, "otel_service_name", None) is not None or
+                                    os.environ.get("MIMIR_CULTIVATE_OTEL_SERVICE_NAME") is not None):
+            raise SetupError("OTLP endpoint is required when setting the OTel service name.")
+        if capture is not None and (getattr(args, "tracing_capture_content", None) is not None or
+                                    os.environ.get("MIMIR_CULTIVATE_TRACING_CAPTURE_CONTENT") is not None):
+            raise SetupError("OTLP endpoint is required when setting tracing capture content.")
+        if headers_requested:
+            raise SetupError("OTLP endpoint is required when setting collector headers.")
+        return {}, {"tracing_enabled": False, "otlp_headers_present": False}
+    if service is None and sys.stdin.isatty():
+        service = input(f"OTel service name [cultivate-{slug.replace('/', '-')}]: ").strip() or None
+    service = validate("otel_service_name", service or "cultivate-" + slug.replace("/", "-"))
+    if capture is None and sys.stdin.isatty():
+        capture = input("Capture trace content? [no]: ").strip() or "no"
+    if capture is None:
+        capture_enabled = False
+    elif isinstance(capture, bool):
+        capture_enabled = capture
+    elif capture.lower() in {"1", "true", "yes", "on"}:
+        capture_enabled = True
+    elif capture.lower() in {"0", "false", "no", "off"}:
+        capture_enabled = False
+    else:
+        raise SetupError("Invalid tracing capture content; use true or false.")
+    headers = None
+    if headers_requested:
+        headers = _secret(args, "otlp_headers", "Collector headers (input hidden).", optional_clear=True) or None
+    elif "OTEL_EXPORTER_OTLP_HEADERS" in prior:
+        headers = prior["OTEL_EXPORTER_OTLP_HEADERS"]
+    elif sys.stdin.isatty():
+        headers = getpass.getpass("OTLP collector headers (optional; hidden): ").strip() or None
+    if headers is not None and (not headers or any(c in headers for c in "\r\n\0")):
+        raise SetupError("Invalid OTLP headers; provide a single non-empty line.")
+    env = {"MIMIR_TRACING_ENABLED": "1", "MIMIR_OTLP_ENDPOINT": endpoint,
+           "MIMIR_OTEL_SERVICE_NAME": service,
+           "MIMIR_TRACING_CAPTURE_CONTENT": "1" if capture_enabled else "0"}
+    if headers is not None:
+        env["OTEL_EXPORTER_OTLP_HEADERS"] = headers
+    return env, {"tracing_enabled": True, "otlp_headers_present": headers is not None}
 
 
 def _alert_settings(args: argparse.Namespace, owner: str, previous: dict, prior_env: dict[str, str]):
@@ -928,13 +1004,15 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
 
 
 def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False,
-         managed_model: bool = False) -> str:
+         managed_model: bool = False, manage_tracing: bool = False) -> str:
     path = deploy / "compose.env"
     existing = path.read_text() if path.exists() else ""
     lines = existing.splitlines()
     current = dict(line.split("=", 1) for line in lines if re.match(r"^[A-Z_][A-Z0-9_]*=", line))
     if manage_alerts:
         lines = [line for line in lines if line.split("=", 1)[0] not in _ALERT_ENV_KEYS]
+    if manage_tracing:
+        lines = [line for line in lines if line.split("=", 1)[0] not in _TRACING_ENV_KEYS]
     if managed_model:
         # Model selection is installer-owned. Drop obsolete paid-provider keys
         # when migrating to a subscription, including duplicate stale lines.
@@ -943,7 +1021,7 @@ def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False,
         current = {k: v for k, v in current.items() if k in updates or k not in
                    {"MIMIR_MODEL_SPEC", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"}}
     for key, value in updates.items():
-        if key in _ALERT_ENV_KEYS and manage_alerts:
+        if (key in _ALERT_ENV_KEYS and manage_alerts) or (key in _TRACING_ENV_KEYS and manage_tracing):
             lines.append(f"{key}={value}")
         elif key not in current:
             lines.append(f"{key}={value}")
@@ -1499,6 +1577,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("model-spec", "provider:model (codex-plus:... subscription, openai:... or anthropic:...)."),
         ("saga-model-spec", "Memory model (codex-plus:model[:effort], openai:model[:effort] or anthropic:model[:effort])."),
         ("embedding", "local, openai:model, or voyage:model (default: local)."),
+        ("otlp-endpoint", "OTLP http(s) base URL (without /v1/traces); none disables saved tracing."),
+        ("otel-service-name", "Tracing service name (default: cultivate-<agent slug>)."),
         ("deploy", "Absolute deployment directory (default: ./cultivate-agent)."),
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
@@ -1512,7 +1592,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate; omit to preserve the saved version (fresh setup: latest common stable, then prerelease).")
     setup.add_argument("--platform", choices=tuple(_DOCKER_ARCHITECTURES),
                        help="Docker target platform (linux/amd64 or linux/arm64; default: host architecture, or saved platform on rerun).")
-    for name in ("github-token", "model-key", "saga-model-key", "embedding-key"):
+    for name in ("github-token", "model-key", "saga-model-key", "embedding-key", "otlp-headers"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
     setup.add_argument("--tracker", action="append", choices=_TRACKER_CHOICES + ("none",),
@@ -1540,6 +1620,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         setup.add_argument("--" + name + "-file", help="Read the bot credential from a mode-600 file.")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read the bot credential from stdin.")
     setup.add_argument("--accept-license", action="store_true", help="Explicitly accept the shipped Cultivate BSL 1.1 license for unattended setup.")
+    setup.add_argument("--tracing-capture-content", action="store_true", default=None,
+                       help="Capture trace content (off by default; use MIMIR_CULTIVATE_TRACING_CAPTURE_CONTENT=false to clear).")
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
     setup.add_argument("--reembed", action="store_true", help="Re-embed existing Saga vectors offline when changing embeddings.")
     setup.add_argument("--no-start", action="store_true", help="Build and provision but leave the agent stopped; start it later from the deployment directory.")
@@ -1637,6 +1719,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Deployment directory must be a real directory; choose a new --deploy path.")
     existing_env = (deploy / "compose.env").read_text() if (deploy / "compose.env").is_file() else ""
     prior = dict(line.split("=", 1) for line in existing_env.splitlines() if re.match(r"^[A-Z_][A-Z0-9_]*=", line))
+    tracing_env, tracing_manifest = _tracing_settings(args, previous, prior, repo.lower())
     alert_adapter, alert_channel_id, alert_env = _alert_settings(args, owner, previous, prior)
     print("Operator alerts: " + alert_adapter + (" (" + alert_channel_id + ")" if alert_channel_id else ""))
     token = _secret(args, "github_token", "Bot PAT: create it with the settings above; input is hidden.", previous=prior.get("GITHUB_TOKEN"))
@@ -1722,6 +1805,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     tag = "mimir-cultivate-root:" + identity
     layer_tag = "mimir-cultivate-agent:" + identity + "-" + kind + version.replace(".", "-")
     extras = {provider, saga_provider, "mcp", "local-embeddings"}
+    if tracing_env:
+        extras.add("otel")
     if alert_adapter in {"discord", "slack"}:
         extras.add(alert_adapter)
     build_args = ["--build-arg BASE_IMAGE=" + _PYTHON_BASE_IMAGE,
@@ -1801,13 +1886,13 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         "MIMIR_API_KEY": secrets.token_urlsafe(32), "GITHUB_TOKEN": token, "GH_TOKEN": token,
         "GH_USER_NAME": bot, "GH_USER_EMAIL": bot_email, "MIMIR_GITHUB_SELF_LOGIN": bot,
         "GITHUB_REPOS": repo, "MIMIR_MODEL_SPEC": spec,
-          "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys, **alert_env, **tracker_env,
+          "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys, **alert_env, **tracker_env, **tracing_env,
     }
     if key_name:
         env_updates[key_name] = model_key
     api_key = _env(deploy, env_updates,
                    manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous,
-                   managed_model=provider == "codex-plus")
+                   managed_model=provider == "codex-plus", manage_tracing=True)
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
@@ -1825,7 +1910,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
                     "mimir_install_mode": "pypi", "mimir_version": mimir_version, "wheels": wheels,
                     "toolchain_version": version, "layer_tag": layer_tag, "docker_platform": docker_platform,
-                   "generated_sha256": {name: _digest(text) for name, text in generated.items()}}
+                    "generated_sha256": {name: _digest(text) for name, text in generated.items()},
+                    **(tracing_manifest if tracing_env else {})}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.

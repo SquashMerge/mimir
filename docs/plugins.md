@@ -86,6 +86,22 @@ key. The image includes the `codex-plus` extra and the agent receives the
 subscription spec as `MIMIR_MODEL_SPEC`; setup removes an obsolete
 `OPENAI_API_KEY` from `compose.env` when no selected model or embedding uses it.
 
+To trace the Cultivate agent, pass `--otlp-endpoint https://collector.example.com`
+(the HTTP(S) **base URL**, without `/v1/traces`). Setup rejects URL userinfo;
+Mimir appends `/v1/traces`. `--otel-service-name` defaults to
+`cultivate-<owner>-<repo>` from the repository slug. Use
+`--tracing-capture-content` only when trace content is intended to leave the
+agent. Collector headers are secrets: provide `--otlp-headers-file` (a mode-600
+file), `--otlp-headers-stdin`, or `MIMIR_CULTIVATE_OTLP_HEADERS`; interactive
+setup offers a hidden optional prompt. `MIMIR_CULTIVATE_OTLP_ENDPOINT`,
+`MIMIR_CULTIVATE_OTEL_SERVICE_NAME`, and
+`MIMIR_CULTIVATE_TRACING_CAPTURE_CONTENT=true|false` also configure these
+settings. Setup installs the `otel` image extra and stores the headers only in
+mode-600 `compose.env`; the manifest records only whether headers exist.
+Reruns preserve tracing settings. Use `--otlp-endpoint none` to remove tracing
+and its image extra, or an empty headers file/stdin (or empty
+`MIMIR_CULTIVATE_OTLP_HEADERS`) to clear saved headers.
+
 Setup creates a private `<deploy>/codex` directory and mounts it at
 `/home/mimir/.codex` in the agent. From the deployment directory, run the
 **exact one-line login command printed by setup**:
