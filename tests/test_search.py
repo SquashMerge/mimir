@@ -8,6 +8,7 @@ isn't appropriate for unit tests.
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import sqlite3
 import time
@@ -214,6 +215,73 @@ async def test_sweep_indexes_memory_and_state(tmp_path: Path):
     stats = await idx.stats()
     assert stats.files == 4  # excludes core + 2 INDEX.md
     assert stats.chunks >= 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vanished", ["directory", "file"])
+async def test_sweep_indexes_survivors_when_entry_vanishes_mid_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vanished: str,
+) -> None:
+    memory = tmp_path / "memory"
+    state = tmp_path / "state"
+    memory.mkdir()
+    state.mkdir()
+    (memory / "survivor.md").write_text("memory survivor")
+    (state / "survivor.md").write_text("state survivor")
+    disappearing = state / "vanishing"
+    disappearing.mkdir()
+    (disappearing / "gone.md").write_text("short-lived file")
+    trigger = disappearing if vanished == "directory" else state
+    scanned = False
+    real_scandir = os.scandir
+
+    def remove_before_scan(path):
+        nonlocal scanned
+        if Path(path) == trigger and not scanned:
+            scanned = True
+            (disappearing / "gone.md").unlink()
+            if vanished == "directory":
+                disappearing.rmdir()
+        return real_scandir(path)
+
+    idx = _make_indexer(tmp_path)
+    idx.init_schema()
+    monkeypatch.setattr(os, "scandir", remove_before_scan)
+    try:
+        result = await idx.sweep()
+    except FileNotFoundError as exc:
+        pytest.fail(f"vanished entry aborted the sweep: {exc}")
+    assert scanned, "test did not inject a mid-walk disappearance"
+    assert result == {"added": 2, "updated": 0, "removed": 0}
+    with sqlite3.connect(idx._db_path) as conn:
+        indexed = {row[0] for row in conn.execute("SELECT path FROM files")}
+    assert indexed == {"memory/survivor.md", "state/survivor.md"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [PermissionError("denied"), OSError(errno.EIO, "I/O error")])
+async def test_sweep_surfaces_non_missing_walk_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError,
+) -> None:
+    target = tmp_path / "state" / "unreadable"
+    target.mkdir(parents=True)
+    real_scandir = os.scandir
+    scanned = False
+
+    def fail_before_scan(path):
+        nonlocal scanned
+        if Path(path) == target:
+            scanned = True
+            raise error
+        return real_scandir(path)
+
+    idx = _make_indexer(tmp_path)
+    idx.init_schema()
+    monkeypatch.setattr(os, "scandir", fail_before_scan)
+    with pytest.raises(OSError) as caught:
+        await idx.sweep()
+    assert scanned
+    assert caught.value is error
 
 
 @pytest.mark.asyncio

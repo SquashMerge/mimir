@@ -29,6 +29,7 @@ import asyncio
 import functools
 import logging
 import math
+import os
 import sqlite3
 import struct
 import threading
@@ -574,18 +575,29 @@ class Indexer:
     def _walk_indexable(self) -> list[Path]:
         roots = [self._home / "memory", self._home / "state"]
         out: list[Path] = []
+
+        def on_walk_error(error: OSError) -> None:
+            # Only a vanished directory is expected during traversal.
+            # Surface permission and other I/O failures to the sweep loop.
+            if not isinstance(error, FileNotFoundError):
+                raise error
+
         for root in roots:
             if not live_loader_path_allowed(root, self._home) or not root.is_dir():
                 continue
-            for p in root.rglob("*.md"):
-                if not p.is_file():
-                    continue
-                rel = self._resolve_rel(p)
-                if rel is None:
-                    continue
-                if _classify_scope(rel, self._home) is None:
-                    continue
-                out.append(p)
+            for dirpath, _dirs, files in os.walk(root, onerror=on_walk_error):
+                for name in files:
+                    if not name.endswith(".md"):
+                        continue
+                    p = Path(dirpath) / name
+                    if not p.is_file():
+                        continue
+                    rel = self._resolve_rel(p)
+                    if rel is None:
+                        continue
+                    if _classify_scope(rel, self._home) is None:
+                        continue
+                    out.append(p)
         return sorted(out)
 
     def _reindex_sync(self, rel_path: str) -> bool:
