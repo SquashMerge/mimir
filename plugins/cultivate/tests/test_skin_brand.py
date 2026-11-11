@@ -1,8 +1,7 @@
-"""Cultivate's packaged skin and artwork follow the SquashMerge dark contract."""
+"""Cultivate's packaged skin and frontend follow the SquashMerge dark contract."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -91,34 +90,30 @@ def test_dark_skin_flat_text_and_control_contrast() -> None:
 
 
 def test_artwork_and_frontend_use_local_resources_only() -> None:
-    assert hashlib.sha256(LOGO.read_bytes()).digest() == hashlib.sha256(
-        (REPO / "brand/logos/cultivate-logo-dark-v1.png").read_bytes()
-    ).digest()
+    assert not LOGO.exists()
     skin = json.loads(SKIN.read_text())
-    assert skin["assets"] == ["brand/cultivate-logo-dark-v1.png"]
+    assert skin["assets"] == []
     source = (ROOT / "frontend/src/runs.tsx").read_text()
-    assert 'data-testid="cultivate-overview-logo"' in source
-    assert 'alt="Cultivate, a Mimir plugin by SquashMerge"' in source
-    assert re.search(r'!selected\s*\?\s*<div className="cultivate-identity"', source)
-    assert 'data-testid="cultivate-mobile-name">Cultivate</span>' in source
+    assert re.search(
+        r'return <div className="cultivate" data-testid="cultivate-factory-runs">\s*'
+        r'<UI.DashboardHeader title="Factory Runs">', source,
+    )
     css = (ROOT / "frontend/src/style.css").read_text()
-    assert "width: min(100%, 400px)" in css
+    for removed in ("cultivate-identity", "cultivate-logo", "cultivate-mobile-name", "cultivate-overview-logo"):
+        assert removed not in source
+        assert removed not in css
+    assert "<img" not in source
     assert "min-height: 44px" in css
     assert "prefers-reduced-motion: reduce" in css
     assert "outline-offset: 3px" in css
     assert not re.search(r"@import|https?://|fonts\.googleapis", css, re.I)
 
 
-def test_emitted_overview_has_wide_artwork_and_mobile_text() -> None:
+def test_emitted_overview_has_no_identity_artwork_or_mobile_text() -> None:
     css = (ROOT / "mimir_cultivate/frontend/cultivate.v1.css").read_text()
     js = (ROOT / "mimir_cultivate/frontend/cultivate.v1.js").read_text()
-    assert "Cultivate, a Mimir plugin by SquashMerge" in js
-    assert "cultivate-overview-logo" in js
-    assert "cultivate-mobile-name" in js
-    assert re.search(r"\.cultivate-logo\{[^}]*display:block", css)
-    assert ".cultivate-mobile-name{display:none" in css
-    mobile = css.split("@media (width<=420px)", 1)
-    assert len(mobile) == 2
-    assert ".cultivate-logo{display:none}" in mobile[1]
-    assert re.search(r"\.cultivate-mobile-name\{[^}]*display:block", mobile[1])
+    assert "Factory Runs" in js
+    for removed in ("cultivate-identity", "cultivate-logo", "cultivate-mobile-name", "cultivate-overview-logo", ".png"):
+        assert removed not in js
+        assert removed not in css
     assert '.skin-root[data-skin=squashmerge] .ui-button:active:not(:disabled){color:var(--mimir-color-background)}' in css

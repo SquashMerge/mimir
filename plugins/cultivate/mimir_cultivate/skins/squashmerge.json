@@ -3,7 +3,7 @@
   "label": "SquashMerge",
   "version": "1.0.0",
   "default": true,
-  "assets": ["brand/cultivate-logo-dark-v1.png"],
+  "assets": [],
   "tokens": {
     "--mimir-color-text": "#F7F7FB",
     "--mimir-color-text-muted": "#B8BAC8",

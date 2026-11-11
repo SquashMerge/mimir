@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from "react";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import * as components from "../../../../frontend/src/ui";
 import type { PluginHost, PluginRoute } from "../../../../frontend/src/dashboardExtensions";
 
@@ -20,8 +20,25 @@ beforeAll(async () => {
 });
 
 beforeEach(() => { fetcher.mockReset(); window.history.replaceState(null, "", "/cultivate/factory-runs"); });
+afterEach(cleanup);
 
 describe("Cultivate bundle", () => {
+  it.each([320, 1280])("starts the overview with Factory Runs and no identity artwork at %ipx", async width => {
+    vi.stubGlobal("innerWidth", width);
+    try {
+      fetcher.mockImplementation(() => reply({ runs: [] }));
+      const Route = routes[0].component;
+      render(<Route />);
+      const overview = screen.getByTestId("cultivate-factory-runs");
+      expect(overview.firstElementChild?.contains(screen.getByRole("heading", { name: "Factory Runs" }))).toBe(true);
+      expect(overview.querySelector("img, .cultivate-identity, .cultivate-logo, .cultivate-mobile-name, [data-testid='cultivate-mobile-name']")).toBeNull();
+      expect(await screen.findByText("No factory runs found")).toBeTruthy();
+      expect(fetcher.mock.calls.map(call => call[0])).toEqual(["/api/v1/plugins/cultivate/factory-runs"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("registers only the manifest-backed route and renders empty/error states", async () => {
     expect(routes.map(route => [route.id, route.path])).toEqual([["cultivate-factory-runs", "/cultivate/factory-runs"]]);
     fetcher.mockImplementationOnce(() => reply({ runs: [] })).mockImplementationOnce(() => reply({}, 403));
