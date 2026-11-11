@@ -26,6 +26,123 @@ from mimir_cultivate import setup as installer
 
 SHA = "a" * 40
 VERSION = "1.0.0rc2"
+REAL_SECRET = installer._secret
+
+
+@pytest.mark.parametrize("endpoint", ["ftp://collector.example", "https://user:pass@collector.example",
+                                          "https://collector.example/v1/traces", "https://collector.example/v1/traces/"])
+def test_tracing_rejects_unsafe_or_trace_path_endpoint(endpoint):
+    args = argparse.Namespace(otlp_endpoint=endpoint)
+    with pytest.raises(installer.SetupError, match="OTLP endpoint|/v1/traces"):
+        installer._tracing_settings(args, {}, {}, "org/repo")
+
+
+def test_tracing_secret_sources_and_interactive_prompt(tmp_path, monkeypatch):
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    secret = "Authorization=" + "Bearer " + os.environ.get("USER", "operator") + "-" + "collector-key"
+    path = tmp_path / "headers"
+    path.write_text(secret)
+    path.chmod(0o600)
+    args = parser.parse_args(["cultivate", "setup", "--otlp-endpoint", "https://collector.example",
+                              "--otlp-headers-file", str(path)])
+    env, manifest = installer._tracing_settings(args, {}, {}, "org/repo")
+    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == secret
+    assert env["MIMIR_OTEL_SERVICE_NAME"] == "cultivate-org-repo"
+    assert env["MIMIR_TRACING_CAPTURE_CONTENT"] == "0"
+    assert manifest == {"tracing_enabled": True, "otlp_headers_present": True}
+    assert secret not in json.dumps(manifest)
+    monkeypatch.setenv("MIMIR_CULTIVATE_OTLP_HEADERS", secret)
+    monkeypatch.setenv("MIMIR_CULTIVATE_TRACING_CAPTURE_CONTENT", "true")
+    args.otlp_headers_file = None
+    env, _ = installer._tracing_settings(args, {}, {}, "org/repo")
+    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == secret
+    assert env["MIMIR_TRACING_CAPTURE_CONTENT"] == "1"
+    monkeypatch.delenv("MIMIR_CULTIVATE_OTLP_HEADERS")
+    monkeypatch.delenv("MIMIR_CULTIVATE_TRACING_CAPTURE_CONTENT")
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "custom-service" if "service" in prompt else "no")
+    monkeypatch.setattr(installer.getpass, "getpass", lambda prompt: secret)
+    env, _ = installer._tracing_settings(args, {}, {}, "org/repo")
+    assert env["MIMIR_OTEL_SERVICE_NAME"] == "custom-service"
+    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == secret
+
+
+def test_tracing_env_and_stdin_clear(monkeypatch):
+    monkeypatch.setenv("MIMIR_CULTIVATE_OTLP_ENDPOINT", "https://collector.example")
+    monkeypatch.setenv("MIMIR_CULTIVATE_OTEL_SERVICE_NAME", "my-agent")
+    args = argparse.Namespace(otlp_headers_stdin=True)
+    monkeypatch.setattr(installer.sys, "stdin", io.StringIO("x-api-key=" + "stdin" + "-key\n"))
+    env, manifest = installer._tracing_settings(args, {}, {}, "org/repo")
+    assert env["MIMIR_OTLP_ENDPOINT"] == "https://collector.example"
+    assert env["MIMIR_OTEL_SERVICE_NAME"] == "my-agent"
+    assert manifest["otlp_headers_present"] is True
+    monkeypatch.setattr(installer.sys, "stdin", io.StringIO("\n"))
+    env, manifest = installer._tracing_settings(args, {}, {"OTEL_EXPORTER_OTLP_HEADERS": "old"}, "org/repo")
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in env
+    assert manifest["otlp_headers_present"] is False
+    monkeypatch.setenv("MIMIR_CULTIVATE_OTLP_ENDPOINT", "https://user:password@collector.example")
+    with pytest.raises(installer.SetupError, match="OTLP endpoint"):
+        installer._tracing_settings(argparse.Namespace(), {}, {}, "org/repo")
+
+
+def test_tracing_setup_reconciles_endpoint_and_headers_without_secret_leaks(
+        setup_environment, tmp_path, monkeypatch, capsys, caplog):
+    deploy, args, state, calls, invoke = setup_environment
+    secret = "Authorization=" + "Bearer " + os.environ.get("USER", "operator") + "-" + "collector-key"
+    other = "x-api-key=" + "replacement" + "-collector-key"
+    path = tmp_path / "headers"
+    path.write_text(secret)
+    path.chmod(0o600)
+    monkeypatch.setattr(installer, "_secret", lambda a, name, *rest, **kw:
+                        REAL_SECRET(a, name, *rest, **kw) if name == "otlp_headers" else "secret")
+    invoke()
+    invoke()
+    original = {name: (deploy / name).read_bytes() for name in ("compose.env", "manifest.json", "build.sh")}
+    assert not any(key in original["compose.env"] for key in (b"MIMIR_TRACING_", b"OTEL_EXPORTER_OTLP_HEADERS"))
+    args.otlp_endpoint = "https://collector.example/base"
+    args.otlp_headers_file = str(path)
+    args.tracing_capture_content = True
+    invoke()
+    env = (deploy / "compose.env").read_text()
+    assert "MIMIR_TRACING_ENABLED=1\n" in env
+    assert "MIMIR_OTLP_ENDPOINT=https://collector.example/base\n" in env
+    assert "MIMIR_OTEL_SERVICE_NAME=cultivate-org-repo\n" in env
+    assert "MIMIR_TRACING_CAPTURE_CONTENT=1\n" in env
+    assert "OTEL_EXPORTER_OTLP_HEADERS=" + secret + "\n" in env
+    assert (deploy / "compose.env").stat().st_mode & 0o777 == 0o600
+    assert "otel" in (deploy / "build.sh").read_text()
+    assert any("otel" in str(argv) for argv in calls if argv[:2] == ["docker", "build"])
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["tracing_enabled"] is True and manifest["otlp_headers_present"] is True
+    args.otlp_headers_file = None
+    invoke()  # Omitted secrets and endpoint persist.
+    assert (deploy / "compose.env").read_text() == env
+    path.write_text(other)
+    args.otlp_headers_file = str(path)
+    args.otlp_endpoint = "https://new-collector.example"
+    invoke()
+    assert other in (deploy / "compose.env").read_text()
+    assert secret not in (deploy / "compose.env").read_text()
+    path.write_text("")
+    invoke()  # Empty private file clears just the headers.
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in (deploy / "compose.env").read_text()
+    assert json.loads((deploy / "manifest.json").read_text())["otlp_headers_present"] is False
+    args.otlp_endpoint = "none"
+    args.otlp_headers_file = None
+    args.tracing_capture_content = None
+    invoke()
+    assert (deploy / "compose.env").read_bytes() == original["compose.env"]
+    assert (deploy / "manifest.json").read_bytes() == original["manifest.json"]
+    assert (deploy / "build.sh").read_bytes() == original["build.sh"]
+    assert not any(key in (deploy / "compose.env").read_text() for key in installer._TRACING_ENV_KEYS)
+    output = capsys.readouterr()
+    for value in (secret, other):
+        assert value not in output.out + output.err + caplog.text
+        assert value not in "".join(str(argv) for argv in calls)
+        for file in deploy.iterdir():
+            if file.is_file() and file.name != "compose.env":
+                assert value not in file.read_text(errors="replace")
 
 
 @pytest.fixture(autouse=True)
