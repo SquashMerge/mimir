@@ -1347,6 +1347,17 @@ blocked_after_exit_ready()
     )
     try:
         assert await process.stdout.readline() == b"exit-ready\n"
+        # The ceiling below reports a periodic snapshot only if one exists when it
+        # expires. Wait for the child's first faulthandler dump instead of assuming
+        # it lands inside the 0.1s ceiling, which a loaded runner does not guarantee.
+        # The outer bound is a hang guard, not a latency assertion.
+        stacks = progress.with_suffix(".stacks")
+
+        async def first_snapshot_written() -> None:
+            while not (stacks.exists() and stacks.stat().st_size):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(first_snapshot_written(), timeout=30)
         with pytest.raises(pytest.fail.Exception) as failure:
             async with _shutdown_ceiling(
                 process, progress, lambda: "exit-ready", timeout=0.1,
