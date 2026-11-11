@@ -289,6 +289,21 @@ def test_validation_partial_not_found_only_marks_missing_alias_unverified(
         }}},
         "errors": [{"type": "UNAUTHORIZED", "path": ["a1"]}],
     }),
+    *[
+        pytest.param(
+            json.dumps({
+                "data": {
+                    "a0": {"issueOrPullRequest": {
+                        "__typename": "PullRequest", "state": "MERGED",
+                    }},
+                    "a1": None,
+                },
+                "errors": [{"type": error_type, "path": ["a1"]}],
+            }),
+            id=f"present-alias-{error_type.lower()}",
+        )
+        for error_type in ("FORBIDDEN", "UNAUTHORIZED")
+    ],
 ])
 def test_validation_full_github_failure_marks_all_unverified(
     monkeypatch: pytest.MonkeyPatch, stdout: str,
