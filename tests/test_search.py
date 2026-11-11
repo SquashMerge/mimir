@@ -8,9 +8,12 @@ isn't appropriate for unit tests.
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import os
 import sqlite3
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -214,6 +217,107 @@ async def test_sweep_indexes_memory_and_state(tmp_path: Path):
     stats = await idx.stats()
     assert stats.files == 4  # excludes core + 2 INDEX.md
     assert stats.chunks >= 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vanished", ["directory", "file"])
+async def test_sweep_indexes_survivors_when_entry_vanishes_mid_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vanished: str,
+) -> None:
+    memory = tmp_path / "memory"
+    state = tmp_path / "state"
+    memory.mkdir()
+    state.mkdir()
+    (memory / "survivor.md").write_text("memory survivor")
+    (state / "survivor.md").write_text("state survivor")
+    disappearing = state / "vanishing"
+    disappearing.mkdir()
+    (disappearing / "gone.md").write_text("short-lived file")
+    trigger = disappearing if vanished == "directory" else state
+    scanned = False
+    real_scandir = os.scandir
+
+    def remove_before_scan(path):
+        nonlocal scanned
+        if Path(path) == trigger and not scanned:
+            scanned = True
+            (disappearing / "gone.md").unlink()
+            if vanished == "directory":
+                disappearing.rmdir()
+        return real_scandir(path)
+
+    idx = _make_indexer(tmp_path)
+    idx.init_schema()
+    monkeypatch.setattr(os, "scandir", remove_before_scan)
+    try:
+        result = await idx.sweep()
+    except FileNotFoundError as exc:
+        pytest.fail(f"vanished entry aborted the sweep: {exc}")
+    assert scanned, "test did not inject a mid-walk disappearance"
+    assert result == {"added": 2, "updated": 0, "removed": 0}
+    with sqlite3.connect(idx._db_path) as conn:
+        indexed = {row[0] for row in conn.execute("SELECT path FROM files")}
+    assert indexed == {"memory/survivor.md", "state/survivor.md"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO], ids=["permission", "io"])
+async def test_sweep_warns_and_indexes_survivors_on_walk_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, error_number: int,
+) -> None:
+    memory = tmp_path / "memory"
+    state = tmp_path / "state"
+    memory.mkdir()
+    target = state / "unreadable"
+    target.mkdir(parents=True)
+    (target / "hidden.md").write_text("cannot be scanned")
+    (memory / "survivor.md").write_text("memory survivor")
+    sibling = state / "readable"
+    sibling.mkdir()
+    (sibling / "survivor.md").write_text("state survivor")
+    error = OSError(error_number, os.strerror(error_number), str(target))
+    real_scandir = os.scandir
+    scanned = False
+
+    class OrderedScandir(nullcontext):
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.enter_result)
+
+    def fail_before_scan(path):
+        nonlocal scanned
+        if Path(path) == target:
+            scanned = True
+            raise error
+        # Visit the failing subtree before its sibling, proving that the
+        # warning allows traversal to continue rather than merely retaining
+        # files discovered before the failure. Avoid filesystem-order luck.
+        if Path(path) == state:
+            with real_scandir(path) as entries:
+                ordered = sorted(entries, key=lambda entry: entry.name != target.name)
+            return OrderedScandir(iter(ordered))
+        return real_scandir(path)
+
+    idx = _make_indexer(tmp_path)
+    idx.init_schema()
+    monkeypatch.setattr(os, "scandir", fail_before_scan)
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        result = await idx.sweep()
+    assert scanned, "test did not inject a walk error"
+    assert result == {"added": 2, "updated": 0, "removed": 0}
+    with sqlite3.connect(idx._db_path) as conn:
+        indexed = {row[0] for row in conn.execute("SELECT path FROM files")}
+    assert indexed == {"memory/survivor.md", "state/readable/survivor.md"}
+    assert any(
+        record.name == "mimir.search"
+        and record.levelno == logging.WARNING
+        and str(target) in record.getMessage()
+        and str(error) in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
