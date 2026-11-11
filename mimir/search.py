@@ -577,10 +577,10 @@ class Indexer:
         out: list[Path] = []
 
         def on_walk_error(error: OSError) -> None:
-            # Only a vanished directory is expected during traversal.
-            # Surface permission and other I/O failures to the sweep loop.
+            # Vanished entries are routine; report other failures without
+            # letting one unreadable subtree abort indexing the survivors.
             if not isinstance(error, FileNotFoundError):
-                raise error
+                log.warning("Skipping indexer subtree %s: %s", error.filename, error)
 
         for root in roots:
             if not live_loader_path_allowed(root, self._home) or not root.is_dir():

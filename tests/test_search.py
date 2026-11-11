@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import logging
 import os
 import sqlite3
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -259,29 +261,63 @@ async def test_sweep_indexes_survivors_when_entry_vanishes_mid_walk(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [PermissionError("denied"), OSError(errno.EIO, "I/O error")])
-async def test_sweep_surfaces_non_missing_walk_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError,
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO], ids=["permission", "io"])
+async def test_sweep_warns_and_indexes_survivors_on_walk_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, error_number: int,
 ) -> None:
-    target = tmp_path / "state" / "unreadable"
+    memory = tmp_path / "memory"
+    state = tmp_path / "state"
+    memory.mkdir()
+    target = state / "unreadable"
     target.mkdir(parents=True)
+    (target / "hidden.md").write_text("cannot be scanned")
+    (memory / "survivor.md").write_text("memory survivor")
+    sibling = state / "readable"
+    sibling.mkdir()
+    (sibling / "survivor.md").write_text("state survivor")
+    error = OSError(error_number, os.strerror(error_number), str(target))
     real_scandir = os.scandir
     scanned = False
+
+    class OrderedScandir(nullcontext):
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.enter_result)
 
     def fail_before_scan(path):
         nonlocal scanned
         if Path(path) == target:
             scanned = True
             raise error
+        # Visit the failing subtree before its sibling, proving that the
+        # warning allows traversal to continue rather than merely retaining
+        # files discovered before the failure. Avoid filesystem-order luck.
+        if Path(path) == state:
+            with real_scandir(path) as entries:
+                ordered = sorted(entries, key=lambda entry: entry.name != target.name)
+            return OrderedScandir(iter(ordered))
         return real_scandir(path)
 
     idx = _make_indexer(tmp_path)
     idx.init_schema()
     monkeypatch.setattr(os, "scandir", fail_before_scan)
-    with pytest.raises(OSError) as caught:
-        await idx.sweep()
-    assert scanned
-    assert caught.value is error
+    with caplog.at_level(logging.WARNING, logger="mimir.search"):
+        result = await idx.sweep()
+    assert scanned, "test did not inject a walk error"
+    assert result == {"added": 2, "updated": 0, "removed": 0}
+    with sqlite3.connect(idx._db_path) as conn:
+        indexed = {row[0] for row in conn.execute("SELECT path FROM files")}
+    assert indexed == {"memory/survivor.md", "state/readable/survivor.md"}
+    assert any(
+        record.name == "mimir.search"
+        and record.levelno == logging.WARNING
+        and str(target) in record.getMessage()
+        and str(error) in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
