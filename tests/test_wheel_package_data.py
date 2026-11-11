@@ -19,7 +19,6 @@ no ``uv`` / ``hatchling`` / ``pathspec`` dependency.
 from __future__ import annotations
 
 import re
-import hashlib
 import shutil
 import subprocess
 import tomllib
@@ -146,7 +145,7 @@ def test_coding_prompts_ship_only_in_cultivate() -> None:
                         for pattern in wheel.get("exclude", ()))
 
 
-def test_cultivate_wheel_contains_original_logo_and_both_licenses(tmp_path: Path) -> None:
+def test_cultivate_wheel_omits_unused_logo_and_contains_both_licenses(tmp_path: Path) -> None:
     result = subprocess.run(
         ["uv", "build", "--package", "mimir-cultivate", "--wheel", "--out-dir", str(tmp_path)],
         cwd=REPO_ROOT, capture_output=True, text=True, check=False,
@@ -156,10 +155,7 @@ def test_cultivate_wheel_contains_original_logo_and_both_licenses(tmp_path: Path
     wheel, = tmp_path.glob("*.whl")
     with ZipFile(wheel) as archive:
         logo = "mimir_cultivate/brand/cultivate-logo-dark-v1.png"
-        assert archive.namelist().count(logo) == 1
-        assert hashlib.sha256(archive.read(logo)).digest() == hashlib.sha256(
-            (REPO_ROOT / "brand/logos/cultivate-logo-dark-v1.png").read_bytes()
-        ).digest()
+        assert logo not in archive.namelist()
         for license_path in ("LICENSE", "brand/LICENSE"):
             original = (REPO_ROOT / "plugins/cultivate" / license_path).read_bytes()
             assert original in (archive.read(name) for name in archive.namelist()
