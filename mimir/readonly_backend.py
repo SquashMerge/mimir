@@ -1781,7 +1781,9 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         """Publish the path only after backend resolution and a successful read."""
         self._publish_read_paths([file_path])
 
-    def _publish_read_paths(self, file_paths: list[str]) -> None:
+    def _publish_read_paths(
+        self, file_paths: list[str], *, listed_directory: str | None = None,
+    ) -> None:
         """Publish every exact resource in a successful backend collection result."""
         from ._context import get_current_turn
         from .access_control import (
@@ -1796,9 +1798,33 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         auth_context = getattr(turn, "auth_context", None)
         resolved_paths = []
         artifact_root = framework_large_tool_results_root()
+        evicted_ids = getattr(turn, "evicted_tool_result_ids", ()) if turn is not None else ()
         for file_path in dict.fromkeys(file_paths):
             try:
-                resolved = self._resolve_path(file_path).resolve(strict=True)
+                requested = self._resolve_path(file_path)
+                resolved = requested.resolve(strict=True)
+                raw_path = Path(file_path)
+                lexical_path = (
+                    raw_path if raw_path.is_relative_to(self.cwd)
+                    else self.cwd / file_path.lstrip("/")
+                )
+                # A listing of this turn's own offload directory discloses only
+                # its own result names if *all* on-disk entries are known spills.
+                # Check the directory itself, not just the returned (filtered)
+                # entries, and never exempt a symlinked listing.
+                if (
+                    file_path == listed_directory and artifact_root is not None
+                    and evicted_ids and turn is not None
+                    and resolved.parent == artifact_root
+                    and resolved.name == turn.turn_id
+                    and not lexical_path.is_symlink()
+                    and all(
+                        entry.name in evicted_ids and entry.is_file()
+                        and not entry.is_symlink()
+                        for entry in resolved.iterdir()
+                    )
+                ):
+                    continue
             except (OSError, RuntimeError, ValueError):
                 invalidate_protected_result_capture()
                 return
@@ -1806,7 +1832,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             if (
                 turn is not None and artifact_root is not None
                 and resolved.parent == artifact_root / str(getattr(turn, "turn_id", ""))
-                and resolved.name in getattr(turn, "evicted_tool_result_ids", ())
+                and resolved.name in evicted_ids
             ):
                 continue
             resolved_paths.append(str(resolved))
@@ -1852,7 +1878,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
                 invalidate_protected_result_capture()
             else:
-                self._publish_read_paths(read_paths)
+                self._publish_read_paths(read_paths, listed_directory=path)
         return result
 
     async def als(self, path: str) -> LsResult:
