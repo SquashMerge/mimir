@@ -1,0 +1,40 @@
+{
+  "run_id": "57da8181c3305e8c6c2dcee298db178a6112d3de",
+  "issue_key": null,
+  "valid": true,
+  "sandbox_path": "/private/tmp/claude-501/-Users-jcarreira-projects-odin-mimir/dc73a7f7-c01c-42bf-b3d3-5268481650cf/scratchpad/ff-fixture/repo/.factory-sandboxes/57da8181c3305e8c6c2dcee298db178a6112d3de",
+  "status": "running",
+  "mode": "interactive",
+  "branch": "feature/fixture-mcp",
+  "pr_base": "main",
+  "max_retries": 3,
+  "publishing_identity": "fixture-bot",
+  "park_snapshot": null,
+  "restore": null,
+  "pr_draft": true,
+  "mcp_servers": [
+    "fixture-mcp"
+  ],
+  "lock": "absent",
+  "dead_lock": false,
+  "lock_session": null,
+  "gates": {},
+  "steps": [],
+  "slices": [],
+  "retry_extensions": [],
+  "remediations": {
+    "opened": 0,
+    "limit": 2,
+    "granted": 0
+  },
+  "handoffs": [],
+  "validator": null,
+  "pr_url": null,
+  "terminal_result": null,
+  "operator_decision": null,
+  "next_action": {
+    "kind": "gate",
+    "subject": "story"
+  },
+  "next": "gate:story"
+}
