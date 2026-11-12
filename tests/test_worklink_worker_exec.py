@@ -339,17 +339,19 @@ async def test_real_session_boundary_racing_cancel_and_unverified_retention(sess
 
 
 @pytest.mark.asyncio
-async def test_output_fd_overflow_is_not_silent_success(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stdout_limit", [None, 2])
+async def test_output_fd_overflow_is_not_silent_success(tmp_path, monkeypatch, stdout_limit):
     from mimir_cultivate.worklink import compute
     from mimir_cultivate.worklink.backends.base import LaunchHandle
 
-    monkeypatch.setattr(compute, "_worklink_output_limits", lambda: (2, 2))
+    monkeypatch.setattr(compute, "_worklink_output_limits", lambda: (2 if stdout_limit is None else 1024 * 1024, 2))
     packets = []
     class Channel:
         def sendmsg(self, buffers, ancillary):
             request = json.loads(buffers[0])
             packets.append(request["op"])
             if request["op"] == "session_observe":
+                assert request["stdout_limit"] == 2
                 os.write(ancillary[0][2][1], "éx".encode())
         def recv(self, size):
             if packets[-1] == "session_cancel":
@@ -361,10 +363,25 @@ async def test_output_fd_overflow_is_not_silent_success(tmp_path, monkeypatch):
         client = WorkerClient(authorization)
         monkeypatch.setattr(client, "_connect", lambda *args: Channel())
         handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
-        result = await compute.OpenCodeDaemonComputeBackend(client=client).wait(handle, 5)
+        result = await compute.OpenCodeDaemonComputeBackend(client=client, stdout_limit=stdout_limit).wait(handle, 5)
     assert result.output_overflow and result.exit_code != 0
     assert result.stdout == "é"
     assert packets == ["session_observe", "session_cancel"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [True, 0, -1, 67108865, 1.5, "1024"])
+async def test_session_observation_rejects_invalid_output_limit(tmp_path, monkeypatch, limit):
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+
+    with _authorization(_issued(tmp_path)) as authorization:
+        client = WorkerClient(authorization)
+        def unexpected_connect(*args):
+            pytest.fail("invalid output bound reached executor")
+        monkeypatch.setattr(client, "_connect", unexpected_connect)
+        handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+        with pytest.raises(ValueError, match="stdout limit"):
+            await client.session_observe(handle, stdout_limit=limit)
 
 
 def test_checkout_authorization_cannot_be_constructed_by_a_client(tmp_path: Path) -> None:

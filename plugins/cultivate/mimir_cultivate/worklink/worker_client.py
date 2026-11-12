@@ -242,7 +242,11 @@ class WorkerClient:
             from mimir.output_capture import open_output_sink
             from .compute import _worklink_output_limits
 
-            limit, _ = _worklink_output_limits()
+            limit = payload.get("stdout_limit")
+            if limit is None:
+                limit, _ = _worklink_output_limits()
+            if type(limit) is not int or not 0 < limit <= 64 * 1024 * 1024:
+                raise ValueError("session stdout limit must be between 1 and 67108864 bytes")
             output = open_output_sink(None, limit)
             request["stdout_limit"] = limit
         try:
@@ -297,18 +301,24 @@ class WorkerClient:
         return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid,
                             launch_generation=str(generation))
 
-    async def _session_handle_rpc(self, operation: str, handle: LaunchHandle) -> dict[str, Any]:
+    async def _session_handle_rpc(self, operation: str, handle: LaunchHandle, *,
+                                  stdout_limit: int | None = None) -> dict[str, Any]:
         if (handle.substrate != "opencode_daemon" or handle.identifier != handle.opencode_session_id
                 or not handle.launch_generation):
             raise ValueError("invalid daemon session handle")
-        return await self._session_rpc(operation, {
+        payload: dict[str, object] = {
             "generation": handle.launch_generation, "opencode_session_id": handle.opencode_session_id,
-        })
+        }
+        if stdout_limit is not None:
+            if operation != "session_observe":
+                raise ValueError("only session observation accepts an output limit")
+            payload["stdout_limit"] = stdout_limit
+        return await self._session_rpc(operation, payload)
 
-    async def session_observe(self, handle: LaunchHandle) -> SessionOutcome:
+    async def session_observe(self, handle: LaunchHandle, *, stdout_limit: int | None = None) -> SessionOutcome:
         from .backends.base import SessionError, SessionOutcome
 
-        response = await self._session_handle_rpc("session_observe", handle)
+        response = await self._session_handle_rpc("session_observe", handle, stdout_limit=stdout_limit)
         if response.get("transport_lost") is True:
             raise SessionTransportLostError("session observation transport lost")
         if response.get("opencode_session_id") != handle.identifier:

@@ -213,13 +213,14 @@ def _worker_classes() -> tuple[Any, Any]:
 
 
 async def execute_contained_session(directory: CheckoutCapability, request: Any, *,
-                                    timeout_s: int, pass_env: Mapping[str, str] | None = None) -> Any:
+                                    timeout_s: int, pass_env: Mapping[str, str] | None = None,
+                                    stdout_limit: int = 1024 * 1024) -> Any:
     """Use the shared daemon substrate without changing generic process dispatch."""
     from .worklink.compute import OpenCodeDaemonComputeBackend
 
     client_class, _ = _worker_classes()
     client = getattr(directory, "_contained_worker_client", None) or client_class(directory)
-    backend = OpenCodeDaemonComputeBackend(client=client)
+    backend = OpenCodeDaemonComputeBackend(client=client, stdout_limit=stdout_limit)
     handle = await client.session_create(request, timeout_s=timeout_s, pass_env=dict(pass_env or {}))
     try:
         return await backend.wait(handle, timeout_s)

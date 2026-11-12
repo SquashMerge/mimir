@@ -149,7 +149,11 @@ class OpenCodeDaemonComputeBackend:
 
     name = "opencode_daemon"
 
-    def __init__(self, checkout: CheckoutCapability | None = None, *, client: WorkerClient | None = None) -> None:
+    def __init__(self, checkout: CheckoutCapability | None = None, *, client: WorkerClient | None = None,
+                 stdout_limit: int | None = None) -> None:
+        if stdout_limit is not None and (type(stdout_limit) is not int or not 0 < stdout_limit <= 64 * 1024 * 1024):
+            raise ValueError("invalid session stdout limit")
+        self._stdout_limit = stdout_limit
         if client is None:
             from .worker_client import WorkerClient
             client = WorkerClient(checkout)
@@ -183,7 +187,7 @@ class OpenCodeDaemonComputeBackend:
             async with asyncio.timeout(min(timeout_s, max(0, remaining))):
                 while True:
                     try:
-                        outcome = await self._client.session_observe(handle)
+                        outcome = await self._observe(handle)
                     except SessionTransportLostError:
                         await asyncio.sleep(0.1)
                         continue
@@ -212,8 +216,13 @@ class OpenCodeDaemonComputeBackend:
                                  session_outcome=outcome, session_error=error)
 
     async def logs(self, handle: LaunchHandle) -> str:
-        outcome = await self._client.session_observe(handle)
+        outcome = await self._observe(handle)
         return outcome.stdout
+
+    async def _observe(self, handle: LaunchHandle) -> SessionOutcome:
+        if self._stdout_limit is None:
+            return await self._client.session_observe(handle)
+        return await self._client.session_observe(handle, stdout_limit=self._stdout_limit)
 
     async def cancel(self, handle: LaunchHandle) -> None:
         await self._client.session_cancel(handle)
