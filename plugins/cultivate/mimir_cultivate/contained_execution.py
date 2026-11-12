@@ -212,6 +212,24 @@ def _worker_classes() -> tuple[Any, Any]:
     return WorkerClient, Projection
 
 
+async def execute_contained_session(directory: CheckoutCapability, request: Any, *,
+                                    timeout_s: int, pass_env: Mapping[str, str] | None = None) -> Any:
+    """Use the shared daemon substrate without changing generic process dispatch."""
+    from .worklink.compute import OpenCodeDaemonComputeBackend
+
+    client_class, _ = _worker_classes()
+    client = getattr(directory, "_contained_worker_client", None) or client_class(directory)
+    backend = OpenCodeDaemonComputeBackend(client=client)
+    handle = await client.session_create(request, timeout_s=timeout_s, pass_env=dict(pass_env or {}))
+    try:
+        return await backend.wait(handle, timeout_s)
+    except asyncio.CancelledError:
+        await asyncio.shield(backend.cancel(handle))
+        raise
+    finally:
+        await asyncio.shield(backend.cleanup(handle))
+
+
 async def execute_contained(
     argv: Sequence[str],
     directory: CheckoutCapability,

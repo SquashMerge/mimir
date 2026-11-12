@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 import sys
 import uuid
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol, Sequence
 
 from mimir.output_capture import OutputSink, open_output_pair
 from mimir.otel_credentials import filter_otlp_env, is_sensitive_otlp_env
@@ -29,7 +29,10 @@ from ..contained_execution import (
     execute_contained,
     opencode_worker_environment,
 )
-from .backends.base import LaunchHandle
+from .backends.base import LaunchHandle, SessionRequest, SessionOutcome, SessionError, SessionTransportLostError
+
+if TYPE_CHECKING:
+    from .worker_client import CheckoutCapability, WorkerClient
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,7 @@ class WorkSpec:
     local_argv: Sequence[str] | None = None
     output_root: Path | None = None
     factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    session_request: SessionRequest | None = None
 
 
 def with_worker_environment(
@@ -116,6 +120,8 @@ class ComputeResult:
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     children_reaped: bool = False
+    session_outcome: SessionOutcome | None = None
+    session_error: SessionError | None = None
 
 
 class ComputeLaunchError(RuntimeError):
@@ -136,6 +142,85 @@ class ComputeBackend(Protocol):
     async def cancel(self, handle: LaunchHandle) -> None: ...
 
     async def cleanup(self, handle: LaunchHandle) -> None: ...
+
+
+class OpenCodeDaemonComputeBackend:
+    """Session identity and authoritative outcomes, not helper PIDs or exits."""
+
+    name = "opencode_daemon"
+
+    def __init__(self, checkout: CheckoutCapability | None = None, *, client: WorkerClient | None = None) -> None:
+        if client is None:
+            from .worker_client import WorkerClient
+            client = WorkerClient(checkout)
+        self._client = client
+        self._deadlines: dict[str, float] = {}
+
+    def capabilities(self) -> ComputeCaps:
+        return ComputeCaps(True, False, True, True)
+
+    async def launch(self, spec: WorkSpec) -> LaunchHandle:
+        if spec.session_request is None:
+            raise ComputeLaunchError("daemon compute requires a typed session request")
+        requested = spec.backend_config.get("pass_env", ())
+        if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
+            raise ComputeLaunchError("session pass_env must be a sequence")
+        deadline = asyncio.get_running_loop().time() + spec.timeout_s
+        handle = await self._client.session_create(
+            spec.session_request, timeout_s=spec.timeout_s,
+            pass_env={name: spec.env[name] for name in requested if name in spec.env},
+            git_settings=spec.factory_credential_settings,
+        )
+        self._deadlines[handle.identifier] = deadline
+        return handle
+
+    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+        deadline = self._deadlines.get(handle.identifier, float("inf"))
+        remaining = deadline - asyncio.get_running_loop().time()
+        try:
+            if remaining <= 0:
+                raise TimeoutError
+            async with asyncio.timeout(min(timeout_s, max(0, remaining))):
+                while True:
+                    try:
+                        outcome = await self._client.session_observe(handle)
+                    except SessionTransportLostError:
+                        await asyncio.sleep(0.1)
+                        continue
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError
+                    if outcome.output_overflow:
+                        await self.cancel(handle)
+                        return ComputeResult(1, outcome.stdout, "", output_overflow=True,
+                                             handle=handle, session_outcome=outcome)
+                    if outcome.execution_state in {"succeeded", "failed", "interrupted", "incomplete"}:
+                        return ComputeResult(
+                            0 if outcome.execution_state == "succeeded" else 1, outcome.stdout, "",
+                            handle=handle, session_outcome=outcome, session_error=outcome.error,
+                            timed_out=outcome.error is not None and outcome.error.type == "timeout",
+                        )
+                    await asyncio.sleep(0.1)
+        except TimeoutError:
+            cancellation = "verified"
+            try:
+                await self.cancel(handle)
+            except RuntimeError:
+                cancellation = "unverified"
+            error = SessionError("timeout", "Worklink session deadline exceeded")
+            outcome = SessionOutcome(handle.identifier, "incomplete", cancellation, error)
+            return ComputeResult(1, "", "", timed_out=True, handle=handle,
+                                 session_outcome=outcome, session_error=error)
+
+    async def logs(self, handle: LaunchHandle) -> str:
+        outcome = await self._client.session_observe(handle)
+        return outcome.stdout
+
+    async def cancel(self, handle: LaunchHandle) -> None:
+        await self._client.session_cancel(handle)
+
+    async def cleanup(self, handle: LaunchHandle) -> None:
+        await self._client.session_release(handle)
+        self._deadlines.pop(handle.identifier, None)
 
 
 _LOCAL_ENV_INFRA = (
