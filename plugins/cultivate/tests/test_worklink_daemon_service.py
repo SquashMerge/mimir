@@ -124,6 +124,34 @@ def test_atomic_write_does_not_follow_destination_link(tmp_path, monkeypatch):
     assert other.read_text() == "unchanged"
 
 
+def test_private_state_through_search_only_parent(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("requires an unprivileged permission check")
+    parent = tmp_path / "search-only"
+    parent.mkdir()
+    directory = parent / "private"
+    directory.mkdir(mode=0o700)
+    target = directory / "api.json"
+    target.write_text('{"version":1}')
+    target.chmod(0o600)
+    parent.chmod(0o111)
+    try:
+        with pytest.raises(PermissionError):
+            os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        assert service.read_json(target, uid=os.getuid(), mode=0o600) == {"version": 1}
+        service.atomic_json(target, {"version": 2}, uid=os.getuid(), gid=os.getgid(), mode=0o600)
+        assert service.read_json(target, uid=os.getuid(), mode=0o600) == {"version": 2}
+        # The final descriptor still supports preparation and durable writes.
+        with service.directory_fd(directory) as fd:
+            os.fchmod(fd, 0o700)
+            os.fsync(fd)
+        directory.chmod(0o755)
+        with pytest.raises(service.PrivateStateError, match="invalid state directory"):
+            service.read_json(target, uid=os.getuid(), mode=0o600)
+    finally:
+        parent.chmod(0o700)
+
+
 def test_no_same_interpreter_uid_drop_or_secret_argv():
     tree = ast.parse(Path(service.__file__).read_text())
     calls = [node.func.attr for node in ast.walk(tree)

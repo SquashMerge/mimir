@@ -58,10 +58,13 @@ def directory_fd(path: Path):
     """Walk every component without following links, including parents."""
     if not path.is_absolute() or ".." in path.parts:
         raise PrivateStateError("invalid state path")
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open("/", (os.O_RDONLY if path == Path("/") else os.O_PATH) | os.O_DIRECTORY)
     try:
-        for component in path.parts[1:]:
-            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        for index, component in enumerate(path.parts[1:], start=1):
+            # Parents may be search-only (the image's root-owned 0711 state
+            # root). Keep the final fd readable for fchmod/fchown and fsync.
+            access = os.O_RDONLY if index == len(path.parts) - 1 else os.O_PATH
+            next_fd = os.open(component, access | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = next_fd
         yield fd

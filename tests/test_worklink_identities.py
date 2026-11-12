@@ -188,6 +188,7 @@ get_identities()
 
 @pytest.mark.parametrize("mutation", ["none", "uid", "gid", "groups", "caps"])
 def test_supervisor_checks_actual_identity_groups_and_capabilities(monkeypatch, mutation):
+    pytest.importorskip("mimir_cultivate")
     from mimir_cultivate.worklink import identities
 
     ids = identities.WorklinkIdentities(42001, 42002, 42003)

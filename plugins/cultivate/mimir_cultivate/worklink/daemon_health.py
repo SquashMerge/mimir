@@ -178,14 +178,14 @@ def daemon_health(environ: dict[str, str], *, paths: RuntimePaths = RuntimePaths
         identities = identities or get_identities()
         status = parse_status(read_json(paths.status, uid=identities.worklink_uid, mode=0o644))
         snapshot = parse_launch_snapshot(read_json(paths.snapshot, uid=identities.mimir_uid, mode=0o600))
-        if not snapshot_matches(snapshot, environ, status["launch_generation"]):
-            return {"daemon_enabled": True, "ok": False, "daemon_error": "bot_token_stale"}
         ready = status["daemon_state"] == "ready" and status["login_state"] in ALLOWED_LOGIN
         result = {"daemon_enabled": True, "ok": ready, **status}
         if status["login_state"] == "refreshable_unverified":
             result["daemon_warning"] = "Native login refresh is unverified; provider validity is not checked"
         if status["telemetry_state"] == "disabled_sensitive_otlp":
             result["telemetry_warning"] = "Worklink telemetry disabled: sensitive or invalid OTLP configuration"
+        if not snapshot_matches(snapshot, environ, status["launch_generation"]):
+            result.update(ok=False, daemon_error="bot_token_stale")
         return result
     except (OSError, ValueError, RuntimeError, TypeError, RecursionError):
         return {"daemon_enabled": True, "ok": False, "daemon_error": "daemon_status_unavailable"}
