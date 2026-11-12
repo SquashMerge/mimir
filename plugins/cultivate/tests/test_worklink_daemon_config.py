@@ -21,10 +21,27 @@ def test_mutation_capture_off_logs():
     assert result.config["plugins"][1]["options"]["logsEnabled"] is False
 
 
+def test_token_padding_stripped_before_control_validation():
+    env = {"GH_TOKEN": "\tbot\r\n", "GITHUB_TOKEN": "bot",
+           "MIMIR_FACTORY_PUBLISHING_IDENTITY": "account"}
+    before = dict(env)
+    assert resolve_daemon_credentials(env).bot_token == "bot"
+    assert resolve_epic_credentials(env, repository_config={}).bot_token == "bot"
+    assert env == before
+
+
 @pytest.mark.parametrize("gh,github,expected,epic_ok", [
     (None, None, None, False), ("", " ", None, False),
     (" bot ", None, "bot", False), (None, " bot ", "bot", True),
     (" bot", "bot ", "bot", True),
+    ("\t\r\n ", None, None, False), (None, "\t\r\n ", None, False),
+    ("\t\r\n ", " \r\n\t", None, False),
+    ("\tbot\r\n", None, "bot", False),
+    ("\tbot\r\n", " \t\r\n", "bot", False),
+    (None, "\tbot\r\n", "bot", True),
+    ("\tbot\r\n", "bot", "bot", True),
+    ("bot", "\tbot\r\n", "bot", True),
+    ("\tbot\r\n", "\r\nbot\t", "bot", True),
 ])
 def test_distinct_daemon_and_epic_token_contracts(gh, github, expected, epic_ok):
     env = {"MIMIR_FACTORY_PUBLISHING_IDENTITY": " bot-account "}
@@ -46,18 +63,41 @@ def test_distinct_daemon_and_epic_token_contracts(gh, github, expected, epic_ok)
     else:
         with pytest.raises(DaemonConfigError, match="requires GITHUB_TOKEN"):
             resolve_epic_credentials(env, repository_config={})
+    canonical_env = {"MIMIR_FACTORY_PUBLISHING_IDENTITY": "bot-account"}
+    if expected is not None:
+        canonical_env["GITHUB_TOKEN"] = expected
+    snapshot = make_launch_snapshot(resolve_daemon_credentials(canonical_env), str(uuid4()))
+    assert snapshot_matches(snapshot, env, snapshot.launch_generation)
     assert env == original
 
 
-def test_conflicts_and_diagnostics_do_not_disclose_values():
+@pytest.mark.parametrize("padding", ["", "\t\r\n"])
+def test_conflicts_and_diagnostics_do_not_disclose_values(padding):
     first = "gh" + "p_" + "runtime-first"
     second = "gh" + "p_" + "runtime-second"
-    env = {"GH_TOKEN": first, "GITHUB_TOKEN": second}
+    env = {"GH_TOKEN": padding + first + padding, "GITHUB_TOKEN": padding + second + padding}
+    before = dict(env)
     for resolver in (lambda: resolve_daemon_credentials(env),
                      lambda: resolve_epic_credentials(env, repository_config={})):
         with pytest.raises(DaemonConfigError) as error:
             resolver()
         assert first not in str(error.value) and second not in str(error.value)
+    assert env == before
+
+
+@pytest.mark.parametrize("name", ["GH_TOKEN", "GITHUB_TOKEN"])
+@pytest.mark.parametrize("value", ["bo\tt", "bo\rt", "bo\nt", "\x00bot", "bot\x7f"])
+def test_token_controls_remaining_after_strip_refused(name, value):
+    env = {name: value, "MIMIR_FACTORY_PUBLISHING_IDENTITY": "account"}
+    before = dict(env)
+    with pytest.raises(DaemonConfigError, match=f"invalid {name}"):
+        resolve_daemon_credentials(env)
+    with pytest.raises(DaemonConfigError, match=f"invalid {name}"):
+        resolve_epic_credentials(env, repository_config={})
+    snapshot = make_launch_snapshot(PublishingCredentials(None, "account"), str(uuid4()))
+    with pytest.raises(DaemonConfigError, match=f"invalid {name}"):
+        snapshot_matches(snapshot, env, snapshot.launch_generation)
+    assert env == before
 
 
 def test_optional_identity_has_no_ambient_fallback():
@@ -68,7 +108,7 @@ def test_optional_identity_has_no_ambient_fallback():
         resolve_epic_credentials({"GITHUB_TOKEN": "bot"}, repository_config={})
 
 
-@pytest.mark.parametrize("value", [None, "", " ", 7, "bot\naccount", "bot\x00", "bot\x7f"])
+@pytest.mark.parametrize("value", [None, "", " ", 7, "bot\naccount", "bot\x00", "bot\x7f", "\tbot\r\n"])
 def test_explicit_invalid_identity_refused(value):
     with pytest.raises(DaemonConfigError, match="invalid MIMIR_FACTORY_PUBLISHING_IDENTITY"):
         resolve_daemon_credentials({"MIMIR_FACTORY_PUBLISHING_IDENTITY": value})
@@ -114,7 +154,7 @@ def test_closed_environment_exact_values_and_no_parent_changes():
     assert set(optional) == set(expected) - {"GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY"}
 
 
-@pytest.mark.parametrize("password", ["", " ", "pass\nword", " pass ", None])
+@pytest.mark.parametrize("password", ["", " ", "pass\nword", " pass ", None, "\tpassword\r\n"])
 def test_private_password_validation(password):
     with pytest.raises(DaemonConfigError):
         daemon_environment(resolve_daemon_credentials({}), api_password=password)

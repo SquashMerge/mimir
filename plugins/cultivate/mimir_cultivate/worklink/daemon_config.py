@@ -43,6 +43,12 @@ def _text(value: object, *, label: str, optional: bool = True) -> str | None:
     return value
 
 
+def _token(value: object, *, label: str) -> str | None:
+    # Preserve the publishing resolver's strip-first token semantics without
+    # relaxing control-character validation for identities or API passwords.
+    return _text(value.strip() if isinstance(value, str) else value, label=label)
+
+
 @dataclass(frozen=True)
 class PublishingCredentials:
     bot_token: str | None = field(repr=False)
@@ -64,8 +70,8 @@ class PublishingCredentials:
 
 def resolve_daemon_credentials(environ: Mapping[str, object]) -> PublishingCredentials:
     """Normalize optional daemon aliases without changing the caller's mapping."""
-    gh = _text(environ.get("GH_TOKEN"), label="GH_TOKEN")
-    github = _text(environ.get("GITHUB_TOKEN"), label="GITHUB_TOKEN")
+    gh = _token(environ.get("GH_TOKEN"), label="GH_TOKEN")
+    github = _token(environ.get("GITHUB_TOKEN"), label="GITHUB_TOKEN")
     if gh and github and gh != github:
         raise DaemonConfigError("conflicting GH_TOKEN and GITHUB_TOKEN")
     identity = None
@@ -90,7 +96,7 @@ def resolve_epic_credentials(
             "MIMIR_FACTORY_PUBLISHING_IDENTITY"
         )
     credentials = resolve_daemon_credentials(environ)
-    if not _text(environ.get("GITHUB_TOKEN"), label="GITHUB_TOKEN"):
+    if not _token(environ.get("GITHUB_TOKEN"), label="GITHUB_TOKEN"):
         raise DaemonConfigError("factory publication requires GITHUB_TOKEN")
     if credentials.publishing_identity is None:
         raise DaemonConfigError("factory publication requires MIMIR_FACTORY_PUBLISHING_IDENTITY")

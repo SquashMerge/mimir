@@ -6,6 +6,10 @@ cd "$(dirname "$0")/.."
 PATH=/usr/local/bin:/usr/bin:/bin
 export PATH
 unset MIMIR_PLUGINS MIMIR_ACCESS_CONTROL_ENFORCED
+uv sync --locked --all-packages --extra dev --extra bench
+# Keep the complete locked workspace available during root-package uv runs.
+UV_NO_SYNC=1
+export UV_NO_SYNC
 uv run python -m py_compile mimir/worklink_daemon_activation.py plugins/cultivate/mimir_cultivate/worklink/daemon_config.py
 uv run pytest -q tests/test_worklink_daemon_activation.py
 env MIMIR_PLUGINS=cultivate uv run pytest -q plugins/cultivate/tests/test_worklink_daemon_config.py
