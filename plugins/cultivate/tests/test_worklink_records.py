@@ -84,6 +84,37 @@ def test_factory_record_refuses_symlinked_store(tmp_path: Path) -> None:
         save_factory_record(home, _factory_record(tmp_path))
 
 
+def test_session_handle_roundtrip_and_historical_defaults(tmp_path: Path) -> None:
+    record = _factory_record(tmp_path)
+    historical = record.to_json()
+    historical["handle"].pop("opencode_session_id")
+    historical["handle"].pop("launch_generation")
+    assert FactoryRunRecord.from_json(historical) == record
+    session = replace(record, handle=LaunchHandle(
+        "opencode_daemon", "ses_owned", opencode_session_id="ses_owned",
+        launch_generation="generation-1",
+    ))
+    assert FactoryRunRecord.from_json(session.to_json()) == session
+    payload = session.to_json()
+    payload["handle"]["unknown"] = True
+    with pytest.raises(FactoryRecordError, match="handle is invalid"):
+        FactoryRunRecord.from_json(payload)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("identifier", "ses_foreign"), ("launch_generation", None),
+    ("shim_pid", 123), ("process_start_ticks", True),
+])
+def test_session_handle_rejects_invalid_binding(tmp_path: Path, field, value) -> None:
+    record = replace(_factory_record(tmp_path), handle=LaunchHandle(
+        "opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="gen",
+    ))
+    payload = record.to_json()
+    payload["handle"][field] = value
+    with pytest.raises(FactoryRecordError):
+        FactoryRunRecord.from_json(payload)
+
+
 def test_populated_factory_record_recovers_legacy_status_and_handle(tmp_path: Path) -> None:
     record = _factory_record(tmp_path)
     status = parse_factory_status({

@@ -12,6 +12,10 @@ ROOT = Path(__file__).resolve().parents[1] / "plugins" / "cultivate" / "mimir_cu
 # Each entry is an ending or a guard, with its reason. Reconcile this inventory
 # before adding any cancellation/deletion call in the Worklink package.
 SITES = {
+    ("compute.py", "cancel", "self._client.session_cancel"): (1, "daemon cancellation must verify owned input quiescence"),
+    ("daemon_sessions.py", "cancel", "self.client.delete_inbox"): (1, "delete only admitted owned queued input before reconciliation"),
+    ("daemon_sessions.py", "cancel", "self.client.interrupt"): (1, "resume=false; response is not cancellation proof"),
+    ("daemon_sessions.py", "_executor_operation", "rmtree_missing_ok"): (1, "attempt HOME only after verified session release"),
     ("control.py", "stop_worklink", "WorkerClient(None).cancel_factory_handle"): (1, "explicit operator stop; verified process identity"),
     ("control.py", "stop_worklink", "LocalSubprocessComputeBackend().cancel"): (2, "explicit operator stop for factory or leaf; verified process identity"),
     ("orchestrator.py", "invoke_backend", "compute.cancel"): (1, "leaf launch-state failure, not a factory handle"),
@@ -45,6 +49,7 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
         "cancel_once", "compute.cancel", "_cancel_and_cleanup_factory_handle",
         "WorkerClient(None).cancel_factory_handle", "LocalSubprocessComputeBackend().cancel",
         "prune_attempt_checkouts", "cleanup_checkout", "shutil.rmtree", "rmtree_missing_ok",
+        "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
     }
     for path in ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -62,8 +67,9 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
                     if ast.unparse(child.func) in {
                         "cancel_once", "compute.cancel", "_cancel_and_cleanup_factory_handle",
                         "WorkerClient(None).cancel_factory_handle", "LocalSubprocessComputeBackend().cancel",
-                        "prune_attempt_checkouts", "cleanup_checkout",
-                    } or (key[0] in {"checkout.py", "orchestrator.py"} and key[2] in {"shutil.rmtree", "rmtree_missing_ok"}):
+                         "prune_attempt_checkouts", "cleanup_checkout",
+                         "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
+                    } or (key[0] in {"checkout.py", "orchestrator.py", "daemon_sessions.py"} and key[2] in {"shutil.rmtree", "rmtree_missing_ok"}):
                         calls[key] += 1
     expected = Counter({key: count for key, (count, reason) in SITES.items() if reason})
     assert sorted((calls - expected).items()) == []

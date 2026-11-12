@@ -14,6 +14,54 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 
+class SessionTransportLostError(RuntimeError):
+    """Observation can reconnect to the durable session, without readmission."""
+
+
+@dataclass(frozen=True)
+class SessionRequest:
+    kind: str
+    model: Mapping[str, str]
+    text: str
+    shell_allowlist: tuple[str, ...] = ()
+    spawn_depth: int = 1
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"leaf", "spawn", "epic"}:
+            raise ValueError("invalid session kind")
+        if type(self.spawn_depth) is not int or not 0 <= self.spawn_depth <= 1000:
+            raise ValueError("invalid server-generated spawn depth")
+        if (not isinstance(self.model, Mapping) or not {"providerID", "id"} <= self.model.keys()
+                or self.model.keys() - {"providerID", "id", "variant"}
+                or any(not isinstance(v, str) or not v or len(v.encode()) > 1024 or "\x00" in v
+                       for v in self.model.values())):
+            raise ValueError("invalid session model reference")
+        if not isinstance(self.text, str) or "\x00" in self.text or len(self.text.encode()) > 1024 * 1024:
+            raise ValueError("invalid session input")
+        if (not isinstance(self.shell_allowlist, (tuple, list)) or len(self.shell_allowlist) > 128
+                or any(not isinstance(rule, str) or not rule or len(rule.encode()) > 1024
+                       or any(char in rule for char in "\x00\r\n") for rule in self.shell_allowlist)):
+            raise ValueError("invalid session shell allowlist")
+
+
+@dataclass(frozen=True)
+class SessionError:
+    type: str
+    message: str
+    body: str = ""
+    retry_after_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class SessionOutcome:
+    opencode_session_id: str
+    execution_state: str
+    cancellation_state: str = "none"
+    error: SessionError | None = None
+    stdout: str = ""
+    output_overflow: bool = False
+
+
 @dataclass(frozen=True)
 class WorkSpec:
     issue_id: int
@@ -33,6 +81,7 @@ class WorkSpec:
     local_argv: Sequence[str] | None = None
     output_root: Path | None = None
     factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    session_request: SessionRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +90,8 @@ class LaunchHandle:
     identifier: str
     process_start_ticks: int | None = None
     shim_pid: int | None = None
+    opencode_session_id: str | None = None
+    launch_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +107,8 @@ class ComputeResult:
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     children_reaped: bool = False
+    session_outcome: SessionOutcome | None = None
+    session_error: SessionError | None = None
 
 
 class ComputeLaunchError(RuntimeError):

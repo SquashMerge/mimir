@@ -317,10 +317,18 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
         not stat.S_ISDIR(boundary.st_mode)
         or boundary.st_uid != get_identities().mimir_uid
         or boundary.st_gid != get_identities().worklink_gid
-        or stat.S_IMODE(boundary.st_mode) != 0o700
+        or stat.S_IMODE(boundary.st_mode) not in (
+            {0o700, 0o710} if request.get("op", "").startswith("session_") else {0o700}
+        )
     ):
         raise RuntimeError("issued checkout isolation boundary is invalid")
-    if observed.st_uid != get_identities().mimir_uid or observed.st_gid != get_identities().worklink_gid:
+    session = request.get("op", "").startswith("session_")
+    owner_uid = (
+        get_identities().worklink_uid
+        if session and stat.S_IMODE(boundary.st_mode) == 0o710
+        else get_identities().mimir_uid
+    )
+    if observed.st_uid != owner_uid or observed.st_gid != get_identities().worklink_gid:
         raise RuntimeError("issued checkout ownership is invalid")
     if stat.S_IMODE(observed.st_mode) != 0o2770:
         raise RuntimeError("issued checkout mode is invalid")
@@ -1016,7 +1024,9 @@ def _handle_cancel_factory_handle(
         raise RuntimeError("factory cancel request must carry the exact contract and no FDs")
     _validate_executor_identity(request)
     handle = request["handle"]
-    if not isinstance(handle, dict) or set(handle) != _FACTORY_HANDLE_FIELDS:
+    if not isinstance(handle, dict) or not (
+        _FACTORY_HANDLE_FIELDS <= set(handle) <= _FACTORY_HANDLE_FIELDS | {"opencode_session_id", "launch_generation"}
+    ) or handle.get("opencode_session_id") is not None or handle.get("launch_generation") is not None:
         raise RuntimeError("invalid factory handle")
     identifier = handle["identifier"]
     if not isinstance(identifier, str):
@@ -1306,6 +1316,71 @@ def _handle_launch_factory(connection: socket.socket, request: dict[str, Any], f
     _handle_launch(connection, request, fds)
 
 
+def _handle_session(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
+    from .daemon_config import PublishingCredentials, parse_launch_snapshot
+    from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
+
+    common = {"version", "op", "executor_identity", "issue", "attempt", "device", "inode", "path", "generation"}
+    create = request["op"] == "session_create"
+    expected = common | ({"request", "timeout_s", "pass_env", "git_settings"} if create else {"opencode_session_id"})
+    observe = request["op"] == "session_observe"
+    if observe:
+        expected |= {"stdout_limit"}
+    count = 2 if observe else 1
+    if set(request) != expected or len(fds) not in {count, count - 1}:
+        raise RuntimeError("session operation requires the exact contract and checkout FD")
+    _validate_executor_identity(request)
+    path_addressed = len(fds) == count - 1
+    if path_addressed:
+        if Path(request["path"]).name != "checkout":
+            raise RuntimeError("session checkout requires an issued FD capability")
+        validated = {**request, "run_uid": get_identities().worklink_uid}
+        fds.insert(0, _open_factory_checkout(validated, for_launch=create))
+        observed = os.fstat(fds[0])
+        if (observed.st_dev, observed.st_ino) != (request["device"], request["inode"]):
+            raise RuntimeError("session checkout identity mismatch")
+    else:
+        _validate_checkout(fds[0], request)
+    checkout = Path(os.readlink(f"/proc/self/fd/{fds[0]}"))
+    if str(checkout) != request["path"] or checkout.resolve() != checkout:
+        raise RuntimeError("session checkout path does not match capability")
+    paths = RuntimePaths()
+    identities = get_identities()
+    snapshot = parse_launch_snapshot(read_json(paths.snapshot, uid=identities.mimir_uid, mode=0o600))
+    if create and snapshot.launch_generation != request["generation"]:
+        raise RuntimeError("session launch generation is stale")
+    environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+    environment.update(PublishingCredentials(snapshot.bot_token, snapshot.publishing_identity).environment())
+    if create:
+        # Only the launch snapshot, never ambient aliases or caller pass_env,
+        # supplies the daemon generation's publishing identity.
+        if not path_addressed:
+            boundary_fd = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[0])
+            try:
+                fcntl.flock(boundary_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if stat.S_IMODE(os.fstat(boundary_fd).st_mode) == 0o700:
+                    _normalize_checkout_fd(fds[0], owner_uid=identities.worklink_uid, group_gid=identities.worklink_gid)
+                    os.fchmod(boundary_fd, 0o710)
+            finally:
+                os.close(boundary_fd)
+    if observe:
+        if not stat.S_ISREG(os.fstat(fds[1]).st_mode) or _positive_integer(request, "stdout_limit") > 64 * 1024 * 1024:
+            raise RuntimeError("invalid session output capability")
+        environment["WORKLINK_SESSION_OUTPUT_FD"] = str(fds[1])
+    process = subprocess.run(
+        [UID_HELPER, "worklink", PYTHON, "-I", "-m", "mimir_cultivate.worklink.daemon_sessions"],
+        input=json.dumps(request).encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=environment, cwd="/", timeout=32, check=False,
+        pass_fds=(fds[1],) if observe else (),
+    )
+    if process.returncode != 0 or len(process.stdout) > MAX_REQUEST_BYTES:
+        raise RuntimeError("session operation failed; retain controller and checkout")
+    response = json.loads(process.stdout)
+    if not isinstance(response, dict):
+        raise RuntimeError("invalid session helper response")
+    _send(connection, response)
+
+
 def handle_connection(connection: socket.socket) -> None:
     fds: list[int] = []
     identifier: str | None = None
@@ -1322,7 +1397,9 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker request")
         raw_identifier = request.get("id")
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
-        if request.get("op") in {"launch", "launch_path"}:
+        if request.get("op") in {"session_create", "session_observe", "session_cancel", "session_release"}:
+            _handle_session(connection, request, fds)
+        elif request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)
         elif request.get("op") in {"launch_factory", "launch_factory_control"}:
             _handle_launch_factory(connection, request, fds)

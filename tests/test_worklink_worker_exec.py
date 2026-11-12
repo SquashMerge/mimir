@@ -49,6 +49,86 @@ def _authorization(path: Path) -> CheckoutAuthorization:
     return _mint_checkout_authorization(path, 41, 2, fd)
 
 
+@pytest.mark.asyncio
+async def test_session_rpc_carries_checkout_fd_and_bound_handle(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+
+    checkout = _issued(tmp_path)
+    packets = []
+
+    class Channel:
+        def sendmsg(self, buffers, ancillary):
+            request = json.loads(buffers[0])
+            packets.append(request)
+            fd = ancillary[0][2][0]
+            assert os.fstat(fd).st_ino == checkout.stat().st_ino
+
+        def recv(self, size):
+            return b'{"opencode_session_id":"ses_owned","execution_state":"started","cancellation_state":"none","error_detail":null}'
+
+        def close(self):
+            pass
+
+    with _authorization(checkout) as authorization:
+        client = WorkerClient(authorization)
+        monkeypatch.setattr(client, "_connect", lambda *args: Channel())
+        handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+        outcome = await client.session_observe(handle)
+    assert outcome.execution_state == "started"
+    assert packets == [{
+        "version": 1, "op": "session_observe", "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+        "issue": 41, "attempt": 2, "device": checkout.stat().st_dev, "inode": checkout.stat().st_ino,
+        "path": str(checkout), "generation": "generation", "opencode_session_id": "ses_owned",
+        "stdout_limit": 64 * 1024 * 1024,
+    }]
+
+
+def test_session_executor_clean_exec_uses_only_launch_snapshot(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import daemon_service
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    generation = str(uuid.uuid4())
+    token = "fixture-" + "launch-token"
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-" + "provider-secret")
+    monkeypatch.setenv("GH_TOKEN", "fixture-" + "ambient-token")
+    monkeypatch.setattr(worker_exec, "_validate_checkout", Mock())
+    normalize = Mock()
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", normalize)
+    monkeypatch.setattr(daemon_service, "read_json", lambda *args, **kwargs: {
+        "version": 1, "launch_generation": generation, "bot_token": token, "publishing_identity": None,
+    })
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout=b'{"opencode_session_id":"ses_owned"}'))
+    monkeypatch.setattr(worker_exec.subprocess, "run", run)
+    connection = Mock()
+    request = {"version": 1, "executor_identity": EXECUTOR_PROTOCOL_IDENTITY, "op": "session_create",
+               "issue": 41, "attempt": 2, "device": checkout.stat().st_dev, "inode": checkout.stat().st_ino,
+               "path": str(checkout), "generation": generation, "request": {}, "timeout_s": 60,
+               "pass_env": {}, "git_settings": []}
+    try:
+        worker_exec._handle_session(connection, request, [fd])
+    finally:
+        os.close(fd)
+    assert run.call_args.args[0] == [daemon_service.UID_HELPER, "worklink", daemon_service.PYTHON,
+                                     "-I", "-m", "mimir_cultivate.worklink.daemon_sessions"]
+    assert run.call_args.kwargs["env"] == {
+        "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "GH_TOKEN": token, "GITHUB_TOKEN": token,
+    }
+    assert json.loads(run.call_args.kwargs["input"]) == request
+    assert run.call_args.kwargs["cwd"] == "/"
+    assert "preexec_fn" not in run.call_args.kwargs
+    assert run.call_args.kwargs["stderr"] is subprocess.DEVNULL
+    normalize.assert_called_once_with(fd, owner_uid=identities.get_identities().worklink_uid,
+                                      group_gid=identities.get_identities().worklink_gid)
+
+
+@pytest.mark.parametrize("operation", ["session_create", "session_observe", "session_cancel", "session_release"])
+def test_session_executor_rejects_open_contract(operation):
+    with pytest.raises(RuntimeError, match="exact contract"):
+        worker_exec._handle_session(Mock(), {"op": operation, "url": "http://foreign"}, [])
+
+
 def test_checkout_authorization_cannot_be_constructed_by_a_client(tmp_path: Path) -> None:
     path = _issued(tmp_path)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)

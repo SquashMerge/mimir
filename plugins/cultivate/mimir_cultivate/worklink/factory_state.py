@@ -386,12 +386,38 @@ class FactoryRunRecord:
         handle_data = data["handle"]
         if handle_data is None:
             handle = None
-        elif isinstance(handle_data, dict) and set(handle_data) == {
+        elif isinstance(handle_data, dict) and {
             "substrate",
             "identifier",
             "process_start_ticks",
             "shim_pid",
+        } <= set(handle_data) <= {
+            "substrate", "identifier", "process_start_ticks", "shim_pid",
+            "opencode_session_id", "launch_generation",
         }:
+            for name in ("substrate", "identifier"):
+                if not isinstance(handle_data[name], str) or not handle_data[name]:
+                    raise FactoryRecordError("factory record handle is invalid")
+            for name in ("process_start_ticks", "shim_pid"):
+                value = handle_data[name]
+                if value is not None and (type(value) is not int or value < 0):
+                    raise FactoryRecordError("factory record handle is invalid")
+            for name in ("opencode_session_id", "launch_generation"):
+                value = handle_data.get(name)
+                if value is not None and (not isinstance(value, str) or not value or len(value) > 128):
+                    raise FactoryRecordError("factory record handle is invalid")
+            daemon = handle_data["substrate"] == "opencode_daemon"
+            if daemon != (handle_data.get("opencode_session_id") is not None):
+                raise FactoryRecordError("factory record session handle is invalid")
+            if not daemon and handle_data.get("launch_generation") is not None:
+                raise FactoryRecordError("factory record session handle is invalid")
+            if daemon and (
+                handle_data["identifier"] != handle_data["opencode_session_id"]
+                or not handle_data.get("launch_generation")
+                or handle_data["shim_pid"] is not None
+                or handle_data["process_start_ticks"] is not None
+            ):
+                raise FactoryRecordError("factory record session handle is invalid")
             handle = LaunchHandle(
                 substrate=str(handle_data["substrate"]),
                 identifier=str(handle_data["identifier"]),
@@ -401,6 +427,8 @@ class FactoryRunRecord:
                     else None
                 ),
                 shim_pid=int(handle_data["shim_pid"]) if handle_data["shim_pid"] is not None else None,
+                opencode_session_id=handle_data.get("opencode_session_id"),
+                launch_generation=handle_data.get("launch_generation"),
             )
         else:
             raise FactoryRecordError("factory record handle is invalid")
