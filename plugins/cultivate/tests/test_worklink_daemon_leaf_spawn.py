@@ -88,8 +88,7 @@ async def test_leaf_production_create_prompt_model_and_permissions(tmp_path):
         assert raw.opencode_session_id == result.handle.identifier
 
 
-@pytest.mark.parametrize("mutation", ["leaf_shell_deny_removed", "leaf_allowlist_broadened", "external_directory_deny_removed"])
-async def test_named_leaf_permission_mutations(tmp_path, mutation):
+async def assert_leaf_permission_mutation(tmp_path, mutation):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         await leaf(tmp_path, daemon, client)
         rules = next(body["permissions"] for method, route, _, body in daemon.requests if method == "POST" and route == "/api/session")
@@ -110,6 +109,37 @@ async def test_named_leaf_permission_mutations(tmp_path, mutation):
             assert effective_permission("external_directory", "/outside", agent=agent, session=changed) != "deny"
 
 
+async def test_mutation_leaf_shell_deny_removed(tmp_path):
+    await assert_leaf_permission_mutation(tmp_path, "leaf_shell_deny_removed")
+
+
+async def test_mutation_leaf_allowlist_broadened(tmp_path):
+    await assert_leaf_permission_mutation(tmp_path, "leaf_allowlist_broadened")
+
+
+async def test_mutation_shell_outside_allowlist(tmp_path):
+    await assert_leaf_permission_mutation(tmp_path, "leaf_allowlist_broadened")
+
+
+async def test_mutation_external_directory_deny_removed(tmp_path):
+    await assert_leaf_permission_mutation(tmp_path, "external_directory_deny_removed")
+
+
+async def test_leaf_runtime_otlp_fragment_absent_from_all_result_sinks(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    secret = "opaque-" + "header-" + "fragment"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", secret)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, result, raw = await leaf(tmp_path, daemon, client, text=secret,
+                                      error={"type": "future." + secret, "message": secret, "response": {"body": secret}})
+        assert raw.backend_status == "failed"
+        assert secret not in json.dumps(asdict(raw), default=str)
+        assert secret not in raw.transcript_path.read_text()
+        assert secret not in json.dumps(dict(spec.env))
+        for state in daemon.sessions.values():
+            assert secret not in json.dumps(state.environment)
+
+
 @pytest.mark.parametrize("error_type, expected", [
     ("provider.auth", "auth_error"),
     *[(name, "quota_exhausted") for name in (
@@ -118,7 +148,7 @@ async def test_named_leaf_permission_mutations(tmp_path, mutation):
     *[(name, "failed") for name in (
         "provider.content-filter", "provider.error", "provider.internal", "provider.invalid-output",
         "provider.invalid-request", "provider.no-route", "provider.timeout", "provider.transport",
-        "provider.unknown", "provider.unsupported-operation", "future.quota-auth")],
+        "provider.unknown", "provider.unsupported-operation", "future.quota-auth", "timeout", "backend_error")],
 ])
 async def test_leaf_exact_typed_outcomes(tmp_path, error_type, expected):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
@@ -165,3 +195,26 @@ async def test_contained_spawn_wire_agent_and_broad_shell(tmp_path, monkeypatch,
 def test_invalid_agent_refused(agent):
     with pytest.raises(ValueError, match="agent"):
         SessionRequest("spawn", {"providerID": "openai", "id": "gpt-test"}, "build", agent=agent)
+
+
+@pytest.mark.parametrize("retry, expected", [(1, 1), (691200000, 691200000), (0, None),
+                                            (-1, None), (691200001, None), (True, None), ("1000", None)])
+async def test_leaf_retry_after_is_bounded_and_not_coerced(tmp_path, retry, expected):
+    from mimir_cultivate.worklink.backends.base import SessionOutcome
+    error = SessionError("provider.quota", "synthetic quota", retry_after_ms=retry)
+    result = ComputeResult(1, "", "", session_error=error,
+                           session_outcome=SessionOutcome("ses_quota", "failed", error=error))
+    raw = await OpenCodeBackend().interpret(WorkOrder(2125, tmp_path, "build", None, 30,
+                                                    transcript_root=tmp_path / "transcripts"), result)
+    assert raw.backend_status == "quota_exhausted"
+    assert raw.retry_after_ms == expected
+    assert raw.opencode_session_id == "ses_quota"
+
+
+async def test_lost_prompt_ack_recovers_same_leaf_without_replay(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.faults[("POST", "/api/session/ses_000000000000000000000001/prompt")].append(
+            SyntheticFault(disconnect=True, after=True))
+        _, _, raw = await leaf(tmp_path, daemon, client)
+        assert raw.backend_status == "success"
+        assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == 1

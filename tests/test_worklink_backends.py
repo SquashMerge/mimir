@@ -18,7 +18,7 @@ from tests.nested_pytest import pytest_command
 from tests.opencode_fixtures import opencode_binary
 
 from mimir_cultivate.opencode import OpenCodeInvocation
-from mimir_cultivate.worklink.backends.base import RawResult, WorkOrder, blocked_reason_from_output
+from mimir_cultivate.worklink.backends.base import RawResult, WorkOrder, blocked_reason_from_output, SessionOutcome, SessionError
 from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
 from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
 from mimir_cultivate.worklink.backends.registry import (
@@ -31,6 +31,12 @@ from mimir_cultivate.worklink.compute import (
 )
 import mimir_cultivate.worklink.compute as compute_module
 import mimir_cultivate.worklink.backends.opencode as opencode_module
+
+
+def session_result(code=0, stdout="", stderr="", *, error_type=None):
+    error = SessionError(error_type, stderr or stdout) if error_type else None
+    outcome = SessionOutcome("ses_owned", "failed" if code else "succeeded", error=error, stdout=stdout)
+    return ComputeResult(code, stdout, stderr, session_outcome=outcome, session_error=error)
 
 
 class FakeProcess:
@@ -853,11 +859,10 @@ def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
 
 
 def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> None:
-    result = ComputeResult(
-        exit_code=1,
+    result = session_result(
+        code=0,
         stdout="I cannot implement this safely.\nWORKLINK_BLOCKED: design requires raw docker.sock access",
         stderr="",
-        command=("opencode",),
     )
     order = WorkOrder(
         issue_id=466,
@@ -876,7 +881,7 @@ def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_opencode_retries_transient_sqlite_startup_contention() -> None:
+async def test_opencode_never_replays_invocation_for_sqlite_text() -> None:
     attempts = 0
     sleeps: list[float] = []
     events: list[tuple[str, dict[str, object]]] = []
@@ -899,18 +904,10 @@ async def test_opencode_retries_transient_sqlite_startup_contention() -> None:
         sleeper=sleep,
     )
 
-    assert result.exit_code == 0
-    assert attempts == 3
-    assert sleeps == [0.1, 0.2]
-    assert [(event, payload["outcome"]) for event, payload in events] == [
-        ("worklink_backend_startup_contention", "retrying"),
-        ("worklink_backend_startup_contention", "retrying"),
-        ("worklink_backend_startup_contention", "succeeded"),
-    ]
-    assert all(
-        payload["resource"] == "opencode_sqlite_session_store"
-        for _event, payload in events
-    )
+    assert result.exit_code == 1
+    assert attempts == 1
+    assert sleeps == []
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -940,17 +937,11 @@ async def test_opencode_persistent_sqlite_contention_exhausts_with_named_reason(
     order = WorkOrder(1085, tmp_path, "p", None, 30, transcript_root=tmp_path / "t")
     raw = await backend.interpret(order, result)
 
-    assert attempts == 5
-    assert sleeps == [0.1, 0.2, 0.4, 0.8]
-    assert raw.error == "opencode_startup_sqlite_contention_exhausted"
-    assert [event["outcome"] for event in events] == [
-        "retrying",
-        "retrying",
-        "retrying",
-        "retrying",
-        "exhausted",
-    ]
-    assert events[-1]["max_attempts"] == 5
+    assert attempts == 1
+    assert sleeps == []
+    assert raw.backend_status == "backend_error"
+    assert raw.error == "OpenCode session outcome unavailable"
+    assert events == []
     assert raw.transcript_path is not None
     transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
     assert "SQLITE_BUSY" in transcript["stderr"]
@@ -1219,29 +1210,19 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         branch="issue/782-a1",
         test_command="uv run pytest -q",
     )
-    compute = LocalSubprocessComputeBackend()
-    handle = await compute.launch(spec)
-    compute_result = await compute.wait(handle, spec.timeout_s)
-    await compute.cleanup(handle)
+    assert spec.local_argv is None
+    assert spec.session_request.text == "-starts with dash"
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "high"}
+    compute_result = session_result(stdout="done")
     result = await backend.interpret(order, compute_result)
 
     assert result.backend_status == "success"
-    assert calls[0]["args"] == (
-        str(binary), "run", "--dir", str(order.checkout),
-        "-m", "openai/gpt-5.6-luna", "--variant", "high", "--", "-starts with dash"
-    )
-    assert calls[0]["args"].count("-m") == 1
+    assert calls == []
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
-    assert spec.backend_config["model_diverged"] is False
     assert spec.backend_config["variant"] == "high"
-    assert spec.backend_config["variant_source"] == "agent"
     assert spec.test_command == "uv run pytest -q"
-    assert "MIMIR_MODEL_SPEC" not in calls[0]["kwargs"]["env"]
-    permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
-    assert permission == {
-        "external_directory": {"/**": "deny"},
-        "bash": {"*": "deny", "git *": "allow", "uv *": "allow"},
-    }
+    assert spec.env == {}
+    assert spec.session_request.shell_allowlist == ("git *", "uv *")
     assert result.transcript_path is not None
     assert result.transcript_path.parent == transcript_root
     transcript = json.loads(result.transcript_path.read_text())
@@ -1386,10 +1367,9 @@ def test_opencode_backend_logs_native_model_divergence_from_home_default(
             test_command="true",
         )
 
-    assert spec.backend_config["model"] == "openai/gpt-native"
-    assert spec.backend_config["configured_model"] == "openai/gpt-agent"
-    assert spec.backend_config["model_diverged"] is True
-    assert "differs from configured agent model" in caplog.text
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent"}
+    assert spec.env == {}
+    assert "differs from configured agent model" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1406,21 +1386,21 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     backend = OpenCodeBackend()
 
     blocked = await backend.interpret(
-        order, ComputeResult(0, "some work\nWORKLINK_BLOCKED: needs a decision", "")
+        order, session_result(0, "some work\nWORKLINK_BLOCKED: needs a decision", "")
     )
     assert blocked.backend_status == "blocked"
     assert blocked.blocked_reason == "needs a decision"
 
-    auth = await backend.interpret(order, ComputeResult(1, "", "provider: unauthorized token"))
+    auth = await backend.interpret(order, session_result(1, "", "provider: unauthorized token", error_type="provider.auth"))
     assert auth.backend_status == "auth_error"
-    assert "provider 'unknown'" in (auth.error or "")
+    assert "provider.auth" in (auth.error or "")
 
-    quota = await backend.interpret(order, ComputeResult(1, "Error: Rate limit exceeded", ""))
+    quota = await backend.interpret(order, session_result(1, "Error: Rate limit exceeded", "", error_type="provider.quota"))
     assert quota.backend_status == "quota_exhausted"
 
-    plain = await backend.interpret(order, ComputeResult(3, "", "boom"))
+    plain = await backend.interpret(order, session_result(3, "", "boom", error_type="provider.error"))
     assert plain.backend_status == "failed"
-    assert plain.error == "boom"
+    assert plain.error == "provider.error: boom"
 
 
 @pytest.mark.parametrize("line", [
@@ -1640,10 +1620,8 @@ async def test_opencode_backend_transcript_filename_contract(
         branch="issue/831-a1",
         test_command="echo ok",
     )
-    compute = LocalSubprocessComputeBackend()
-    handle = await compute.launch(spec)
-    compute_result = await compute.wait(handle, spec.timeout_s)
-    await compute.cleanup(handle)
+    assert spec.local_argv is None
+    compute_result = session_result(stdout="done")
     result = await backend.interpret(order, compute_result)
 
     assert result == RawResult(
@@ -1651,6 +1629,7 @@ async def test_opencode_backend_transcript_filename_contract(
         transcript_path=result.transcript_path,
         backend_status="success",
         error=None,
+        opencode_session_id="ses_owned",
     )
     assert result.transcript_path is not None
     filename = result.transcript_path.name
@@ -1780,21 +1759,20 @@ def test_registry_derives_only_configured_non_python_runner(
     config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
 
     backend = BackendRegistry(config).get("opencode")
-    permission = json.loads(
-        backend.work_spec(
+    spec = backend.work_spec(
             WorkOrder(1, Path("/tmp/worktree"), "p", None, 30, {}),
             attempt=1,
             repo_url="u",
             base_ref="main",
             branch="issue/1-a1",
             test_command=test_command,
-        ).env["OPENCODE_PERMISSION"]
-    )
+        )
 
     assert backend.bash_allowlist == ("git *", runner_pattern)
-    assert permission["bash"] == {"*": "deny", "git *": "allow", runner_pattern: "allow"}
-    assert "uv *" not in permission["bash"]
-    assert "rm *" not in permission["bash"]
+    assert spec.session_request.shell_allowlist == ("git *", runner_pattern)
+    assert "uv *" not in spec.session_request.shell_allowlist
+    assert "rm *" not in spec.session_request.shell_allowlist
+    assert "OPENCODE_PERMISSION" not in spec.env
 
 
 def test_operator_bash_allowlist_beats_derivation() -> None:
@@ -1857,14 +1835,11 @@ async def test_opencode_permission_refusal_names_effective_allowlist(tmp_path: P
 
     result = await backend.interpret(
         order,
-        ComputeResult(0, "Error: permission denied for bash command rm -rf build", ""),
+        session_result(1, "Error: permission denied for bash command rm -rf build", "", error_type="provider.invalid-request"),
     )
 
     assert result.backend_status == "failed"
-    assert result.error == (
-        "OpenCode refused an executor shell command because it is not allowed by "
-        "backends.opencode.bash_allowlist; effective patterns: ['git *', 'npm *']"
-    )
+    assert result.error == "provider.invalid-request: Error: permission denied for bash command rm -rf build"
 
 
 @pytest.mark.asyncio
@@ -1878,10 +1853,10 @@ async def test_opencode_startup_permission_error_surfaces_backend_stderr(
         "  '/var/lib/mimir-worklink/checkouts/scope/1259-1/checkout'"
     )
 
-    result = await backend.interpret(order, ComputeResult(1, "", stderr))
+    result = await backend.interpret(order, session_result(1, "", stderr, error_type="provider.error"))
 
     assert result.backend_status == "failed"
-    assert result.error == stderr
+    assert result.error == "provider.error: " + stderr
     assert "bash_allowlist" not in result.error
 
 
@@ -1962,7 +1937,7 @@ async def test_permission_words_in_executor_source_do_not_fail_a_successful_run(
 
     raw = await backend.interpret(
         order,
-        ComputeResult(0, f"edited a file\n{_AUTHZ_SOURCE_LINE}\nall todos complete", ""),
+        session_result(0, f"edited a file\n{_AUTHZ_SOURCE_LINE}\nall todos complete", ""),
     )
 
     assert raw.backend_status == "success"
@@ -1986,12 +1961,11 @@ async def test_permission_refusal_that_stopped_the_executor_still_fails_with_its
     backend = OpenCodeBackend(bash_allowlist=("git *",))
 
     raw = await backend.interpret(
-        order, ComputeResult(1, "", "permission denied: bash command not allowed")
+        order, session_result(1, "", "permission denied: bash command not allowed", error_type="provider.invalid-request")
     )
 
     assert raw.backend_status == "failed"
-    assert "OpenCode refused an executor shell command" in (raw.error or "")
-    assert "git *" in (raw.error or "")
+    assert raw.error == "provider.invalid-request: permission denied: bash command not allowed"
 
 
 @pytest.mark.asyncio
@@ -2019,15 +1993,16 @@ async def test_midstream_refusal_that_crashed_the_executor_is_still_reported(
 
     raw = await backend.interpret(
         order,
-        ComputeResult(
+        session_result(
             2,
             "",
             "permission denied for bash command\naborting run\nsession closed",
+            error_type="provider.error",
         ),
     )
 
     assert raw.backend_status == "failed"
-    assert "OpenCode refused an executor shell command" in (raw.error or "")
+    assert "provider.error: permission denied for bash command" in (raw.error or "")
 
 
 def test_blocked_marker_in_echoed_output_does_not_block_a_completed_run() -> None:
@@ -2128,13 +2103,10 @@ def test_opencode_leaf_reasoning_variant(
         attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
         test_command="uv run pytest -q",
     )
-    args = spec.backend_config["args"]
-    assert args[:2] == ["-m", "openai/gpt-agent"]
-    assert args[2:] == (["--variant", expected] if expected else [])
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent",
+                                          **({"variant": expected} if expected else {})}
     assert spec.backend_config["variant"] == expected
-    assert spec.backend_config["variant_source"] == source
-    assert spec.backend_config["model_source"] == "agent_model"
-    assert spec.local_argv[4:4 + len(args)] == tuple(args)
+    assert spec.local_argv is None
 
 
 @pytest.mark.usefixtures("stub_opencode")
@@ -2156,9 +2128,8 @@ def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(tmp_path: Pat
         attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
         test_command="true",
     )
-    assert spec.backend_config["args"] == ["-m", "openai/gpt-native", "--variant", "xhigh"]
-    assert spec.backend_config["model_source"] == "opencode_config"
-    assert spec.backend_config["variant_source"] == "worklink_override"
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent", "variant": "xhigh"}
+    assert spec.local_argv is None
 
 
 @pytest.mark.parametrize("name", ["MIMIR_MODEL_REASONING_EFFORT", "MIMIR_WORKLINK_REASONING_EFFORT"])
@@ -2188,9 +2159,7 @@ def test_opencode_leaf_other_provider_passes_variant_through(tmp_path: Path) -> 
         attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
         test_command="true",
     )
-    assert spec.backend_config["args"] == [
-        "-m", "openrouter/anthropic/claude-opus", "--variant", "turbo",
-    ]
+    assert spec.session_request.model == {"providerID": "openrouter", "id": "anthropic/claude-opus", "variant": "turbo"}
 
 
 @pytest.mark.parametrize("credential", ["saved_auth", "ambient_key"])

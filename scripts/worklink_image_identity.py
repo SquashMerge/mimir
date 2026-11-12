@@ -19,6 +19,101 @@ IMAGE = f"mimir-worklink-identity:{os.getpid()}"
 CONTAINER = f"mimir-worklink-identity-{os.getpid()}"
 
 
+async def prove_offline(directory: Path) -> dict[str, object]:
+    """Exercise production session consumers, not native UID isolation or a provider."""
+    from types import SimpleNamespace
+    import uuid
+    from mimir_cultivate import contained_execution, opencode
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, WorkOrder
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir.tools.registry import _STATE, set_spawn_config
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+
+    checkout = directory / "checkout"
+    checkout.mkdir()
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as api:
+        class Executor:
+            def __init__(self, path):
+                self.path = path
+
+            async def session_create(self, request, *, timeout_s, pass_env=None, git_settings=()):
+                self.controller = await SessionController.create(
+                    api, directory / (uuid.uuid4().hex + ".json"), request=request,
+                    issue_id=2125, attempt=1, generation="offline-generation", checkout=self.path,
+                    environment={"PATH": "/usr/bin:/bin", **(pass_env or {})}, timeout_s=timeout_s)
+                sid = self.controller.record.opencode_session_id
+                if request.kind == "spawn":
+                    (self.path / "generated.txt").write_text("offline proposal\n")
+                daemon.finish(sid)
+                return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation="offline-generation")
+
+            async def session_observe(self, handle, *, stdout_limit=64 * 1024 * 1024):
+                return await self.controller.observe(stdout_limit=stdout_limit)
+
+            async def session_cancel(self, handle):
+                if not await self.controller.cancel(timeout_s=1):
+                    raise RuntimeError("offline cancellation unverified")
+
+            async def session_release(self, handle):
+                await self.controller.release()
+
+        backend = OpenCodeBackend()
+        order = WorkOrder(2125, checkout, "offline leaf", "rules", 30,
+                          {"MIMIR_MODEL_SPEC": "codex-plus:fixture-model#high", "MIMIR_HOME": str(directory)}, directory / "transcripts")
+        spec = backend.work_spec(order, attempt=1, repo_url="offline", base_ref="main",
+                                 branch="issue/2125-a1", test_command="uv run pytest")
+        compute = OpenCodeDaemonComputeBackend(client=Executor(checkout))
+        handle = await compute.launch(spec)
+        raw = await backend.interpret(order, await compute.wait(handle, 30))
+        assert raw.backend_status == "success" and raw.opencode_session_id == handle.identifier
+        await compute.cleanup(handle)
+
+        seed = directory / "seed"
+        seed.mkdir()
+        for args in (("init", "-q"), ("config", "user.name", "Offline Fixture"),
+                     ("config", "user.email", "offline@example.invalid"),
+                     ("commit", "--allow-empty", "-qm", "seed")):
+            subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                            "-C", str(seed), *args], check=True, capture_output=True, env=opencode._sanitized_git_env())
+
+        class Checkout:
+            def __init__(self):
+                self.path = directory / "spawn-checkout"
+                subprocess.run(["git", "clone", "-q", str(seed), str(self.path)], check=True, env=opencode._sanitized_git_env())
+                self.base_tree = subprocess.check_output(["git", "-C", str(self.path), "rev-parse", "HEAD^{tree}"], text=True,
+                                                        env=opencode._sanitized_git_env()).strip()
+                self.capability = SimpleNamespace(_contained_worker_client=Executor(self.path))
+
+            def close(self, *, retain=False):
+                assert not retain
+
+        previous = _STATE["spawn_config"]
+        try:
+            set_spawn_config({"default_cwd": seed, "artifact_root": directory / "artifacts"})
+            spawned = json.loads(await opencode._spawn_open_code_impl(
+                "offline spawn", str(seed), 30, model="openai/fixture-model", agent="build",
+                contained_runner=contained_execution.execute_contained_session,
+                checkout_factory=lambda *args, **kwargs: Checkout()))
+        finally:
+            _STATE["spawn_config"] = previous
+        assert spawned["status"] == "succeeded" and spawned["proposal"]
+        assert spawned["opencode_session_id"] != raw.opencode_session_id
+        creates = [body for method, path, _, body in daemon.requests if method == "POST" and path == "/api/session"]
+        assert len(creates) == 2
+        assert creates[0]["permissions"][:2] == [
+            {"action": "external_directory", "resource": "*", "effect": "deny"},
+            {"action": "shell", "resource": "*", "effect": "deny"}]
+        assert creates[1]["permissions"] == [
+            {"action": "external_directory", "resource": "*", "effect": "deny"},
+            {"action": "shell", "resource": "*", "effect": "allow"}]
+        assert creates[1]["agent"] == "build"
+        return {"leaf_session": raw.opencode_session_id, "spawn_session": spawned["opencode_session_id"],
+                "creates": creates, "uid_isolation_proven": False}
+
+
 def run(args: list[str], *, input_text: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         args, cwd=ROOT, input=input_text, text=True, stdout=subprocess.PIPE,
@@ -97,7 +192,7 @@ import subprocess
 from mimir_cultivate.worklink.backends.base import WorkOrder
 from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
 from mimir_cultivate.worklink.checkout import cleanup_checkout, create_isolated_checkout
-from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
 from mimir_cultivate.worklink.evidence import observe_evidence
 from mimir_cultivate.worklink.safe_git import ControllerGitPublication
 
@@ -113,8 +208,8 @@ test "$(cat tracked)" = worker-modified
 test "$(cat created)" = worker-created
 test "$(cat controller-continuation)" = continued
 ! test -e deleted
-test -r "$HOME/.config/opencode/opencode.json"
-test -r "$HOME/.local/share/opencode/auth.json"
+! test -e "$HOME/.config/opencode/opencode.json"
+! test -e "$HOME/.local/share/opencode/auth.json"
 ! cat /home/mimir/worklink-canary
 '''
 
@@ -149,8 +244,8 @@ async def main():
         )
     finally:
         os.close(checkout_fd)
-    compute = LocalSubprocessComputeBackend.for_path_checkout(1002)
-    backend = OpenCodeBackend(bin=CLI)
+    compute = OpenCodeDaemonComputeBackend()
+    backend = OpenCodeBackend()
     order = WorkOrder(
         issue_id=1410,
         checkout=lease.path,
@@ -170,8 +265,8 @@ async def main():
         test_command=GATE_TEST,
     )
     projections = spec.backend_config.get("worker_projections", ())
-    if len(projections) != 2:
-        raise RuntimeError("configured provider config and auth were not projected")
+    if projections or spec.local_argv is not None:
+        raise RuntimeError("daemon leaf attempted a legacy auth projection or process launch")
     handle = await compute.launch(spec)
     try:
         result = await compute.wait(handle, spec.timeout_s)
@@ -343,15 +438,8 @@ async def main():
         raise RuntimeError("live spawn did not return its relative artifact handle")
     if "spawn-euid=1002" not in result["stdout"]:
         raise RuntimeError("live fake OpenCode did not report worker identity")
-    identifier_line = next(
-        (line for line in result["stdout"].splitlines() if line.startswith("spawn-identifier=")),
-        None,
-    )
-    if identifier_line is None:
-        raise RuntimeError("live fake OpenCode did not report its execution identifier")
-    identifier = uuid.UUID(identifier_line.partition("=")[2])
-    if identifier.version != 4 or str(identifier) != identifier_line.partition("=")[2]:
-        raise RuntimeError("live fake OpenCode did not receive a canonical UUIDv4 identifier")
+    if not isinstance(result.get("opencode_session_id"), str) or not result["opencode_session_id"].startswith("ses_"):
+        raise RuntimeError("spawn did not preserve its owned OpenCode session identity")
     proposal = result.get("proposal")
     if not isinstance(proposal, dict):
         raise RuntimeError("live spawn did not produce a proposal")
@@ -804,10 +892,8 @@ def local_exec(argv, *, cwd):
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
 setup._run = local_exec
-binary = setup._verify_opencode_binary(Path('/tmp'))
-for model in ('openai/gpt-6.1-sol', 'openai/gpt-6-luna', 'anthropic/claude-haiku-5-5'):
-    setup._verify_opencode_model(Path('/tmp'), binary, model)
-assert calls == ['mimir', 'worklink', 'worklink', 'worklink', 'worklink']
+setup._verify_opencode_daemon(Path('/tmp'))
+assert calls == ['mimir']
 print('real-image setup OpenCode probe passed')
 ''')
 
@@ -1031,11 +1117,19 @@ def main() -> None:
 
 def cli() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("source", "pypi"), required=True)
+    parser.add_argument("--mode", choices=("source", "pypi", "offline"), required=True)
     parser.add_argument("--agent-wheel", type=Path)
     parser.add_argument("--cultivate-wheel", type=Path)
     args = parser.parse_args()
-    if args.mode == "source":
+    if args.mode == "offline":
+        import asyncio
+        if args.agent_wheel or args.cultivate_wheel:
+            parser.error("offline mode does not accept wheels")
+        with tempfile.TemporaryDirectory(prefix="worklink-session-proof-") as directory:
+            os.environ.update(HOME=directory, MIMIR_HOME=directory, MIMIR_MODEL_SPEC="codex-plus:fixture-model")
+            result = asyncio.run(prove_offline(Path(directory)))
+            print(json.dumps(result, sort_keys=True))
+    elif args.mode == "source":
         if args.agent_wheel or args.cultivate_wheel:
             parser.error("source mode does not accept wheels")
         prove_source()

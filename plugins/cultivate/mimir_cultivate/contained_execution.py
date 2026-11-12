@@ -15,6 +15,21 @@ if TYPE_CHECKING:
 
 WorkerClient: Any = None
 
+
+class SessionCleanupError(RuntimeError):
+    """The owned session must retain its checkout and recovery identity."""
+
+    def __init__(self, handle: Any) -> None:
+        super().__init__("session quiescence unverified; retain checkout")
+        self.handle = handle
+
+
+class SessionCancelledError(asyncio.CancelledError):
+    def __init__(self, handle: Any, verified: bool) -> None:
+        super().__init__("contained session cancelled")
+        self.handle = handle
+        self.verified = verified
+
 __all__ = (
     "CollectedExecutionResult",
     "SensitiveMaterialScrubber",
@@ -223,12 +238,28 @@ async def execute_contained_session(directory: CheckoutCapability, request: Any,
     backend = OpenCodeDaemonComputeBackend(client=client, stdout_limit=stdout_limit)
     handle = await client.session_create(request, timeout_s=timeout_s, pass_env=dict(pass_env or {}))
     try:
-        return await backend.wait(handle, timeout_s)
+        result = await backend.wait(handle, timeout_s)
     except asyncio.CancelledError:
-        await asyncio.shield(backend.cancel(handle))
+        verified = False
+        try:
+            await asyncio.shield(backend.cancel(handle))
+            await asyncio.shield(backend.cleanup(handle))
+            verified = True
+        except (OSError, RuntimeError, ValueError):
+            pass
+        raise SessionCancelledError(handle, verified) from None
+    except BaseException:
+        try:
+            await asyncio.shield(backend.cancel(handle))
+            await asyncio.shield(backend.cleanup(handle))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SessionCleanupError(handle) from exc
         raise
-    finally:
+    try:
         await asyncio.shield(backend.cleanup(handle))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SessionCleanupError(handle) from exc
+    return result
 
 
 async def execute_contained(

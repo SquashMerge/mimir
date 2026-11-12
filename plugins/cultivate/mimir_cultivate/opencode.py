@@ -262,20 +262,36 @@ def resolve_daemon_model(env: Mapping[str, str], explicit_model: str | None = No
     """Resolve the session model without opening provider or agent auth files."""
     from mimir._reasoning_effort import validate_effort
 
-    selected = explicit_model or opencode_model_from_agent_spec(env.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC))
-    model, separator, variant = selected.strip().partition("#")
+    selected = (explicit_model or opencode_model_from_agent_spec(env.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC))).strip()
+    model, separator, variant = selected.partition("#")
     provider = _provider_from_model(model)
     if any(not char.isprintable() or char.isspace() for char in selected):
         raise OpenCodeConfigError("config_provider_selection")
     effort = env.get("MIMIR_WORKLINK_REASONING_EFFORT") or env.get("MIMIR_MODEL_REASONING_EFFORT", "")
     if not separator and effort:
-        variant = validate_effort("codex-plus", effort) if provider == "openai" else effort
+        try:
+            variant = validate_effort("codex-plus", effort) if provider == "openai" else effort
+        except ValueError as exc:
+            name = "MIMIR_WORKLINK_REASONING_EFFORT" if env.get("MIMIR_WORKLINK_REASONING_EFFORT") else "MIMIR_MODEL_REASONING_EFFORT"
+            raise ValueError(f"{name}: {exc}") from exc
     if separator and not variant:
         raise OpenCodeConfigError("config_provider_selection")
     reference = {"providerID": provider, "id": model.split("/", 1)[1]}
     if variant and variant != "none":
         reference["variant"] = variant
+    if any(not value or len(value.encode()) > 1024 for value in reference.values()):
+        raise OpenCodeConfigError("config_provider_selection")
     return reference
+
+
+def redact_daemon_output(text: str) -> str:
+    from mimir.otel_credentials import is_sensitive_otlp_env
+    from mimir.redaction import redact_text
+
+    for name, value in os.environ.items():
+        if value and is_sensitive_otlp_env(name, value):
+            text = text.replace(value, "<redacted>")
+    return redact_text(text)
 
 
 def resolve_opencode_invocation(
@@ -1062,6 +1078,10 @@ async def _spawn_open_code_impl(
         home=home, checkout=seed, artifact_root=artifact_root,
         source_paths=(config_path, auth_path),
     )
+    from mimir.otel_credentials import is_sensitive_otlp_env
+    for key, value in os.environ.items():
+        if value and is_sensitive_otlp_env(key, value):
+            scrubber.add_scalar(value)
     selected_artifact_root = Path(
         artifact_root or cfg.get("artifact_root") or (home / ".factory" / "runs")
     ).expanduser()
@@ -1092,6 +1112,7 @@ async def _spawn_open_code_impl(
             "reason_code": terminal.reason_code, "exit_code": None,
             "stdout": "", "result": "", "stderr": "Artifact storage unavailable",
             "artifact_dir": None, "name": name, "proposal": None,
+            "opencode_session_id": None,
         }, indent=2)
 
     stdout = b""
@@ -1102,6 +1123,7 @@ async def _spawn_open_code_impl(
     terminal = None
     seed_tree = None
     retain_checkout = False
+    session_id = None
     try:
         try:
             reference = resolve_daemon_model(dict(os.environ), model)
@@ -1181,11 +1203,16 @@ async def _spawn_open_code_impl(
                         checkout.capability, request, timeout_s=timeout_s,
                         stdout_limit=1024 * 1024,
                     )
+                    session_id = execution.handle.opencode_session_id if execution.handle else None
                     retain_checkout = False
-                from mimir.redaction import redact_text
-                stdout = redact_text(execution.stdout).encode()
-                stderr = redact_text(execution.stderr).encode()
-            except (OSError, RuntimeError, ValueError):
+                stdout = redact_daemon_output(execution.stdout).encode()
+                stderr = redact_daemon_output(execution.stderr).encode()
+            except ValueError:
+                retain_checkout = False
+                terminal = classify_spawn_terminal_state(containment_available=False)
+            except (OSError, RuntimeError) as exc:
+                if isinstance(exc, contained_execution.SessionCleanupError):
+                    session_id = exc.handle.opencode_session_id
                 terminal = classify_spawn_terminal_state(containment_available=False)
 
         if terminal is None and execution is not None and checkout is not None:
@@ -1202,7 +1229,20 @@ async def _spawn_open_code_impl(
                 worker_authentication_required=auth_required,
                 proposal_result=proposal_result,
             )
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, contained_execution.SessionCancelledError):
+            session_id = exc.handle.opencode_session_id
+            retain_checkout = not exc.verified
+            descriptor = os.open("manifest.json", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                                 dir_fd=artifact_directory_fd)
+            try:
+                with os.fdopen(descriptor, "w", closefd=False) as stream:
+                    json.dump({"schema_version": 2, "run_id": run_id, "launcher": "mimir.spawn_open_code",
+                               "status": "interrupted", "reason_code": "cancelled",
+                               "opencode_session_id": session_id,
+                               "cancellation_state": "verified" if exc.verified else "unverified"}, stream)
+            finally:
+                os.close(descriptor)
         os.close(artifact_directory_fd)
         artifact_directory_fd = -1
         if execution is None:
@@ -1236,7 +1276,7 @@ async def _spawn_open_code_impl(
         "output_overflow": bool(execution and execution.output_overflow),
         "stdout_dropped_bytes": 0,
         "stderr_dropped_bytes": 0,
-        "opencode_session_id": execution.handle.opencode_session_id if execution and execution.handle else None,
+        "opencode_session_id": session_id,
     }
     artifact_handle = run_id
     try:

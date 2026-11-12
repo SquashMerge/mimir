@@ -40,7 +40,7 @@ def valid_repository_slug(value: object) -> bool:
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
 SHIPPING_BACKENDS = frozenset({"feature_factory", "opencode"})
-SHIPPING_COMPUTE_BACKENDS = frozenset({"local_subprocess"})
+SHIPPING_COMPUTE_BACKENDS = frozenset({"local_subprocess", "opencode_daemon"})
 DEFAULT_FACTORY_RUN_TIMEOUT_S = 43200.0
 _PUBLICATION_REFERENCE = re.compile(r"#\d+|https?://\S+|(?<!\w)/(?:[\w.-]+/)+[\w.-]+", re.I)
 _PUBLICATION_CLOSING = re.compile(r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\b", re.I)
@@ -781,6 +781,11 @@ class BackendRegistry:
 
     @staticmethod
     def _build_compute_backend(name: str, settings: Mapping[str, Any]) -> ComputeBackend:
+        if name == "opencode_daemon":
+            from ..compute import OpenCodeDaemonComputeBackend
+            if settings:
+                raise ValueError("worklink daemon compute does not accept settings")
+            return OpenCodeDaemonComputeBackend()
         if name == "local_subprocess":
             if settings:
                 raise ValueError(

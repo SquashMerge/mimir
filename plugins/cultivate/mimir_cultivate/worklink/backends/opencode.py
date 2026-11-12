@@ -1,4 +1,4 @@
-"""OpenCode CLI Worklink backend (chainlink #830)."""
+"""OpenCode daemon leaf backend and retained factory process helpers."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from mimir_cultivate.opencode import (
     reconcile_codex_auth,
     resolve_opencode_invocation,
     resolve_daemon_model,
+    redact_daemon_output,
 )
 from mimir.redaction import redact_text
 from mimir.otel_credentials import filter_otlp_env
@@ -158,13 +159,7 @@ def resolve_worklink_opencode_invocation(
 
 @dataclass(frozen=True)
 class OpenCodeBackend:
-    """Adapter for ``opencode run`` Worklink jobs.
-
-    The provider-agnostic coding substrate from the #830 pivot: opencode
-    routes to whichever model provider its own config selects, so per-leaf
-    worklink no longer cares which subscription executes the build. Runs
-    non-interactively in the leaf checkout via ``opencode run --dir``.
-    """
+    """Render a single daemon input and interpret its authoritative outcome."""
 
     bin: str = "opencode"
     extra_args: Sequence[str] = field(default_factory=tuple)
@@ -176,19 +171,15 @@ class OpenCodeBackend:
     def __post_init__(self) -> None:
         validate_extra_args(self.extra_args)
         validate_test_env(self.test_env)
+        if (not self.bash_allowlist or len(self.bash_allowlist) > 128
+                or any(not isinstance(rule, str) or not rule or rule.strip() == "*"
+                       or len(rule.encode()) > 1024 or any(char in rule for char in "\x00\r\n")
+                       for rule in self.bash_allowlist)):
+            raise ValueError("worklink opencode bash_allowlist requires explicit nonempty shell patterns")
 
     def refresh_codex_projections(self, spec: WorkSpec, env: Mapping[str, str]) -> WorkSpec:
-        """Use the just-reconciled token, not a pre-launch work-spec snapshot."""
-        if not spec.backend_config.get("codex") or "worker_projections" not in spec.backend_config:
-            return spec
-        invocation = resolve_worklink_opencode_invocation(env).invocation
-        if invocation.model != spec.backend_config["model"]:
-            raise OpenCodeConfigError("config_provider_selection")
-        documents = opencode_worker_documents(invocation, filter_otlp_env({**os.environ, **env}))
-        projections = [WorkerProjection(".config/opencode/opencode.json", documents.config_document)]
-        if documents.auth_document is not None:
-            projections.append(WorkerProjection(".local/share/opencode/auth.json", documents.auth_document))
-        return replace(spec, env=filter_otlp_env(spec.env), backend_config={**spec.backend_config, "worker_projections": projections})
+        """Compatibility hook: daemon login is independent and never projected."""
+        return replace(spec, env=filter_otlp_env(spec.env))
 
     def capabilities(self) -> Caps:
         return Caps(
@@ -210,17 +201,22 @@ class OpenCodeBackend:
         test_command: str,
     ) -> WorkSpec:
         prompt = _prompt_for_order(order)
+        model_home = order.env.get("MIMIR_HOME") or os.environ.get("MIMIR_HOME")
+        configured = model_spec_at_call_time(Path(model_home) if model_home else None)
         values = {**os.environ, **order.env}
-        values.setdefault("MIMIR_MODEL_SPEC", model_spec_at_call_time(
-            Path(values["MIMIR_HOME"]) if values.get("MIMIR_HOME") else None))
+        values.setdefault("MIMIR_MODEL_SPEC", configured)
         reference = resolve_daemon_model(values)
+        allowlist = tuple(self.bash_allowlist)
         model = f"{reference['providerID']}/{reference['id']}"
         if self.extra_args:
             raise ValueError("daemon leaf sessions do not accept CLI arguments")
         backend_config: dict[str, object] = {
-            "bash_allowlist": list(self.bash_allowlist),
+            "bash_allowlist": list(allowlist),
             "model": model,
             "variant": reference.get("variant"),
+            "variant_source": ("none" if "variant" not in reference else
+                               "model_spec" if "#" in values["MIMIR_MODEL_SPEC"] else
+                               "worklink_override" if values.get("MIMIR_WORKLINK_REASONING_EFFORT") else "agent"),
             "test_env": dict(self.test_env),
             "pass_env": tuple(self.test_env),
         }
@@ -238,7 +234,7 @@ class OpenCodeBackend:
             env=dict(self.test_env),
             backend_config=backend_config,
             local_checkout=order.checkout,
-            session_request=SessionRequest("leaf", reference, prompt, tuple(self.bash_allowlist)),
+            session_request=SessionRequest("leaf", reference, prompt, allowlist),
             output_root=order.transcript_root,
         )
 
@@ -258,51 +254,8 @@ class OpenCodeBackend:
         env: Mapping[str, str] | None = None,
         refreshed_path: Path | None = None,
     ) -> ComputeResult:
-        """Retry transient SQLite contention only before the run can mutate work."""
-        max_attempts = max(1, max_attempts)
-        initial_backoff_s = max(0.0, initial_backoff_s)
-        startup_window_s = max(0.0, startup_window_s)
-        initial_checkout = checkout_snapshot()
-        result: ComputeResult | None = None
-        for attempt in range(1, max_attempts + 1):
-            invoked_at = clock()
-            # A refreshed token must reach the other store even when the run
-            # fails, times out or is cancelled. Each retry is a new invocation.
-            if codex:
-                reconcile_codex_auth(env)
-            try:
-                result = await invoke()
-            finally:
-                if codex:
-                    reconcile_codex_auth(env, refreshed_path=refreshed_path)
-            elapsed_s = max(0.0, clock() - invoked_at)
-            retryable = (
-                _is_sqlite_contention(result)
-                and elapsed_s <= startup_window_s
-                and checkout_snapshot() == initial_checkout
-            )
-            if not retryable:
-                if attempt > 1 and result.exit_code == 0:
-                    _emit_startup_contention(
-                        event_logger, issue_id, attempt, max_attempts, "succeeded"
-                    )
-                return result
-
-            if attempt < max_attempts:
-                _emit_startup_contention(
-                    event_logger, issue_id, attempt, max_attempts, "retrying"
-                )
-                await sleeper(initial_backoff_s * (2 ** (attempt - 1)))
-
-        assert result is not None
-        _emit_startup_contention(
-            event_logger, issue_id, max_attempts, max_attempts, "exhausted"
-        )
-        detail = result.stderr.rstrip()
-        stderr = f"{detail}\n{STARTUP_CONTENTION_EXHAUSTED_REASON}" if detail else (
-            STARTUP_CONTENTION_EXHAUSTED_REASON
-        )
-        return replace(result, stderr=stderr)
+        """Compatibility hook: recovery observes the owned session, never re-admits."""
+        return await invoke()
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
@@ -314,16 +267,17 @@ class OpenCodeBackend:
                 command=list(result.command),
                 exit_code=None,
                 status="backend_error",
-                stdout=result.stdout,
-                stderr=result.stderr,
+                stdout=redact_daemon_output(result.stdout),
+                stderr=redact_daemon_output(result.stderr),
                 timed_out=False,
                 output_overflow=False,
                 stdout_path=result.stdout_path,
                 stderr_path=result.stderr_path,
             )
-            return RawResult(-1, transcript_file, "backend_error", result.launch_error)
+            return RawResult(-1, transcript_file, "backend_error", redact_daemon_output(result.launch_error),
+                             opencode_session_id=result.handle.opencode_session_id if result.handle else None)
 
-        stdout, stderr = redact_text(result.stdout), redact_text(result.stderr)
+        stdout, stderr = redact_daemon_output(result.stdout), redact_daemon_output(result.stderr)
         outcome = result.session_outcome
         typed_error = result.session_error or (outcome.error if outcome else None)
         blocked_reason = None
@@ -335,9 +289,10 @@ class OpenCodeBackend:
         elif outcome is None:
             status, error = "backend_error", "OpenCode session outcome unavailable"
         elif typed_error is not None:
-            status = session_error_status(typed_error.type)
-            error = ": ".join((redact_text(typed_error.type).encode()[:128].decode("utf-8", "ignore"),
-                               redact_text(typed_error.message).encode()[:2048].decode("utf-8", "ignore")))
+            status = ("backend_error" if outcome.execution_state == "incomplete" and typed_error.type == "backend_error"
+                      else session_error_status(typed_error.type))
+            error = ": ".join((redact_daemon_output(typed_error.type).encode()[:128].decode("utf-8", "ignore"),
+                               redact_daemon_output(typed_error.message).encode()[:2048].decode("utf-8", "ignore")))
             retry = typed_error.retry_after_ms
             if type(retry) is int and 0 < retry <= 8 * 86400 * 1000:
                 retry_after = retry
@@ -382,8 +337,6 @@ def session_error_status(error_type: str) -> str:
         return "auth_error"
     if error_type in _QUOTA_TYPES:
         return "quota_exhausted"
-    if error_type in {"backend_error", "protocol", "daemon.protocol"}:
-        return "backend_error"
     return "failed"
 
 
@@ -448,30 +401,6 @@ def validate_extra_args(args: Sequence[str]) -> None:
 
 def _prompt_for_order(order: WorkOrder) -> str:
     return order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
-
-
-def _local_argv(
-    bin_name: str,
-    args: Sequence[str],
-    checkout: Path,
-    prompt: str,
-    *,
-    fd_anchored: bool = False,
-) -> tuple[str, ...]:
-    # ``--`` so a prompt that begins with ``-`` is never parsed as a flag.
-    directory = "." if fd_anchored else str(checkout)
-    return (bin_name, "run", "--dir", directory, *args, "--", prompt)
-
-
-def _permission_override(bash_allowlist: Sequence[str]) -> str:
-    # OpenCode evaluates the last matching rule. Keep the deny first and append
-    # only explicit operator grants so unmatched commands cannot prompt or run.
-    bash = {"*": "deny"}
-    bash.update((pattern, "allow") for pattern in bash_allowlist)
-    return json.dumps({
-        "external_directory": {"/**": "deny"},
-        "bash": bash,
-    }, separators=(",", ":"))
 
 
 def _permission_refusal_reason(

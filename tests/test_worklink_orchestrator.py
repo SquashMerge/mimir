@@ -2786,7 +2786,7 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
     monkeypatch.setattr(orch.ControllerGitPublication, "capture", lambda *a, **kw: SimpleNamespace(close=lambda: None))
 
     class WorkerCompute(FakeCompute):
-        name = "local_subprocess"
+        name = "opencode_daemon"
 
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             if spec.local_argv and spec.local_argv[0] == "/bin/sh":
@@ -2821,6 +2821,7 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
             return RawResult(1, order.transcript_root / "fake.json", "failed", "build failed")
 
     bound = WorkerCompute(shared_filesystem=True)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: bound)
     monkeypatch.setattr(orch, "OpenCodeBackend", WorkerBackend)
     monkeypatch.setattr(LocalSubprocessComputeBackend, "for_path_checkout", classmethod(lambda cls, uid: bound))
     registry = BackendRegistry(WorklinkConfig())
@@ -13531,7 +13532,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             assert spec.local_checkout is not None
             assert spec.local_checkout.resolve(strict=True).is_dir()
             assert publication.closed == 0
-            if spec.local_argv[:2] == ("/bin/sh", "-c") and "shutil.rmtree" in spec.local_argv[2]:
+            if spec.local_argv and spec.local_argv[:2] == ("/bin/sh", "-c") and "shutil.rmtree" in spec.local_argv[2]:
                 cleanup_specs.append(spec)
                 return LaunchHandle("local_subprocess", "123e4567-e89b-42d3-a456-426614174004")
             bound_specs.append(spec)
@@ -13590,11 +13591,15 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
     worker_uid = 4242
     bound = BoundCompute(_worker_uid=worker_uid)
+    daemon = BoundCompute(_worker_uid=worker_uid)
+    daemon.name = "opencode_daemon"
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: daemon)
 
     class WorkerBackend(FakeBackend):
         name = "opencode"
 
         def work_spec(self, order, **kwargs):
+            from mimir_cultivate.worklink.backends.base import SessionRequest
             if scenario == "work_spec_exception":
                 raise RuntimeError("work spec failed")
             return WorkSpec(
@@ -13612,6 +13617,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                 backend_config={"pass_env": ()},
                 local_checkout=order.checkout,
                 local_argv=("opencode", "run"),
+                session_request=SessionRequest("leaf", {"providerID": "openai", "id": "test"}, order.prompt),
             )
 
         async def invoke_with_startup_retry(self, invoke, **kwargs):
@@ -13734,7 +13740,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         return
     assert result is not None
     assert checkout_kwargs["worker_eligible"] is True
-    assert requested_uids == [worker_uid]
+    assert requested_uids == [worker_uid] * (
+        max(0, len(bound_specs) - 1) + len(cleanup_specs) + (scenario == "publication_exception"))
     assert lifecycle.count("publication-acquired") == 1
     assert lifecycle[-1:] == ["publication"]
     assert publication.closed == 1
@@ -13749,7 +13756,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     }
     assert result.status == (
         "completed" if expected_published else ("blocked" if expected_blocked else "failed")
-    )
+    ), result.reason
     assert checkout.exists() is (not expected_published)
     assert sibling_marker.read_text() == "keep me\n"
     expected_launches = {

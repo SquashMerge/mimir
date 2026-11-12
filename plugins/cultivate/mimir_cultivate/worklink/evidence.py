@@ -681,6 +681,12 @@ async def _observe_evidence_from_ref(
         ):
             raise ComputeLaunchError("Cultivate factory evidence gate requires the recorded worker sandbox")
     if backend != "feature_factory" and worker_uid_drop and test_command and not skip_test_reason:
+        if getattr(compute, "name", None) == "opencode_daemon":
+            from .compute import LocalSubprocessComputeBackend
+            from .identities import get_identities
+            if work_spec is None or work_spec.session_request is None or work_spec.session_request.kind != "leaf":
+                raise ComputeLaunchError("daemon evidence gate requires the leaf session work spec")
+            compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
         authorization = getattr(compute, "_authorized_checkout", None)
         worker_bound = (
             getattr(compute, "name", None) != "local_subprocess"
@@ -991,7 +997,7 @@ async def _run_compute_gate(
             ),
         )
     gate_spec = replace(gate_spec, env=filter_otlp_env(gate_spec.env))
-    if compute.name == "opencode_daemon":
+    if getattr(compute, "name", None) == "opencode_daemon":
         from .compute import LocalSubprocessComputeBackend
         from .identities import get_identities
         compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)

@@ -1338,6 +1338,7 @@ class WorklinkRunner:
         executor_report_dir: Path | None = None
         spec = None
         retain_session = False
+        session_handle = None
         try:
             lease = _create_backend_checkout(
                 self.repo,
@@ -1420,6 +1421,8 @@ class WorklinkRunner:
                 branch=lease.branch,
                 test_command=test_cmd or "",
             )
+            if publication is not None:
+                spec = replace(spec, factory_credential_settings=getattr(publication, "credential_settings", ()))
             executor_report_dir = _make_executor_report_dir(
                 issue.issue_id, record.attempt, worker_uid_drop=worker_uid_drop
             )
@@ -1449,11 +1452,13 @@ class WorklinkRunner:
                     configured_model=spec.backend_config.get("configured_model"),
                 )
             async def invoke_backend() -> ComputeResult:
-                nonlocal spec, retain_session
+                nonlocal spec, retain_session, session_handle
                 handle = None
                 try:
                     handle = await compute.launch(spec)
                     retain_session = handle.substrate == "opencode_daemon"
+                    if retain_session:
+                        session_handle = handle
                     # Atomically replace the provisional controller record with
                     # the real cancellable worker handle immediately after spawn.
                     try:
@@ -1562,6 +1567,23 @@ class WorklinkRunner:
                 raise
             transition_applied = False
             transition_error = None
+            from .compute import ComputeCleanupError
+            if isinstance(exc, ComputeCleanupError):
+                retain_session = True
+                session_handle = exc.handle
+            exception_evidence = None
+            if isinstance(backend, OpenCodeBackend):
+                try:
+                    from mimir_cultivate.opencode import redact_daemon_output
+                    exception_evidence = _write_evidence(self.home, WorklinkEvidence(
+                        issue=issue.issue_id, attempt=record.attempt, backend=selected_name,
+                        branch=lease.branch if lease else "", checkout=str(lease.path) if lease else "",
+                        started_at=datetime.now(UTC).isoformat(), finished_at=datetime.now(UTC).isoformat(),
+                        files_changed=[], diff_stat="", commands=[], tests=None, pr_url=None, status="failed",
+                        diff_observed=False, failure_reason=redact_daemon_output(str(exc)),
+                        opencode_session_id=session_handle.opencode_session_id if session_handle else None))
+                except OSError:
+                    _log_event("worklink_evidence_write_failed", issue_id=issue.issue_id, attempt=record.attempt)
             preserve_reason = str(exc)
             terminal_release.retain_for_recovery = True
             try:
@@ -1617,6 +1639,7 @@ class WorklinkRunner:
                 reason=str(exc),
                 checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,
+                evidence_path=exception_evidence,
                 incident_recorded=autonomous,
             )
         except BaseException as exc:
@@ -2116,11 +2139,9 @@ class WorklinkRunner:
                         repair_order, attempt=attempt, repo_url=spec.repo_url,
                         base_ref=spec.base_ref, branch=lease.branch, test_command=test_cmd or "",
                     )
-                    repair_spec = replace(repair_spec, backend_config={
+                    repair_spec = replace(repair_spec, factory_credential_settings=spec.factory_credential_settings, backend_config={
                         **repair_spec.backend_config, "test_env": spec.backend_config.get("test_env", {}),
                     })
-                    if isinstance(backend, OpenCodeBackend) and repair_spec.backend_config.get("codex"):
-                        repair_spec = backend.refresh_codex_projections(repair_spec, repair_order.env)
                     handle = await compute.launch(repair_spec)
                     try:
                         _persist_run_state(
@@ -2131,6 +2152,8 @@ class WorklinkRunner:
                         )
                         repair_result = await compute.wait(handle, repair_spec.timeout_s)
                     finally:
+                        if handle.substrate == "opencode_daemon":
+                            await compute.cancel(handle)
                         await compute.cleanup(handle)
                     raw = await backend.interpret(repair_order, repair_result)
                     if operator_stop_requested(self.home, issue.issue_id, attempt):
@@ -2277,11 +2300,12 @@ class WorklinkRunner:
         if transition_status == "failed":
             try:
                 quota_failure = selected_name == "opencode" and raw.backend_status == "quota_exhausted"
-                reset_at, reset_source = _worklink_quota_reset(self.home, raw.error or "") if quota_failure else (None, "")
                 if quota_failure and raw.retry_after_ms is not None:
                     from datetime import timedelta
                     reset_at = datetime.now(UTC) + timedelta(milliseconds=raw.retry_after_ms)
                     reset_source = "provider.retryAfterMs"
+                else:
+                    reset_at, reset_source = _worklink_quota_reset(self.home, raw.error or "") if quota_failure else (None, "")
                 incident = incident_owner.record(
                     producer="leaf_result",
                     home=self.home,
@@ -2654,6 +2678,8 @@ class WorklinkRunner:
         )
 
         lease: CheckoutLease | None = None
+        publication = None
+        retain_session = state.handle_substrate == "opencode_daemon"
         try:
             lease = CheckoutLease(
                 issue_id=issue_id, attempt=state.attempt, repo=self.repo, path=Path(state.checkout),
@@ -2668,6 +2694,14 @@ class WorklinkRunner:
                 branch=state.branch,
                 runner=_list_runner(runner),
             )
+            if state.handle_substrate == "opencode_daemon":
+                checkout_fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    publication = ControllerGitPublication.capture(
+                        checkout_fd, self.repo, lease.branch,
+                        self.home / "state" / "worklink" / "publication")
+                finally:
+                    os.close(checkout_fd)
             started = _parse_chainlink_datetime(state.started_at) or datetime.now(UTC)
             prompt = render_work_order(
                 issue,
@@ -2710,7 +2744,10 @@ class WorklinkRunner:
                     record=claim_record,
                 )
             finally:
+                if retain_session:
+                    await compute.cancel(handle)
                 await compute.cleanup(handle)
+                retain_session = False
             if _reattach_worker_lost(compute_result):
                 # Broker/substrate can no longer produce the result (e.g. it also
                 # restarted): the compute is wasted. Fall back to redispatch
@@ -2756,6 +2793,7 @@ class WorklinkRunner:
                     test_cmd=test_cmd,
                     root_dirty_before=(),
                     runner=runner,
+                    publication=publication,
                     terminal_release=terminal_release,
                     autonomous=autonomous,
                 ),
@@ -2779,7 +2817,7 @@ class WorklinkRunner:
                 pass
             else:
                 terminal_release.label_transition_applied = True
-                terminal_release.retain_for_recovery = False
+                terminal_release.retain_for_recovery = retain_session
                 terminal_release()
             _log_event(
                 "worklink_reattach_failed", issue_id=issue_id, attempt=state.attempt, error=str(exc)
@@ -2815,6 +2853,8 @@ class WorklinkRunner:
             raise
         finally:
             try:
+                if publication is not None:
+                    publication.close()
                 if lease is not None and state.handle_substrate != "opencode_daemon":
                     try:
                         _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
@@ -5977,7 +6017,7 @@ def _persist_run_state(
             issue_id=issue.issue_id,
             attempt=attempt,
             backend=backend_name,
-            compute_name=compute.name,
+            compute_name=handle.substrate if compute.name == "opencode_daemon" else compute.name,
             handle_substrate=handle.substrate,
             opencode_session_id=handle.opencode_session_id,
             launch_generation=handle.launch_generation,

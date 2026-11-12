@@ -202,7 +202,7 @@ raise SystemExit(daemon_sessions.main())
                 return local
             monkeypatch.setattr(client, "_connect", native_peer)
             yield SimpleNamespace(client=client, checkout=checkout, generation=generation, daemon=daemon,
-                                  records=root / "sessions", identities=ids)
+                                  records=root / "sessions", identities=ids, connect=native_peer)
             for future in pending:
                 await asyncio.to_thread(future.result, 35)
 
@@ -233,6 +233,84 @@ async def _ordinary_boundary_command(boundary):
     finally:
         stdout.close()
         stderr.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", [None, "issue", "inode", "mode", "outside"])
+async def test_path_addressed_leaf_session_uses_existing_checkout_guard(session_boundary, tmp_path, monkeypatch, mutation):
+    boundary = session_boundary
+    root = tmp_path / "leaf-root"
+    checkout = root / "repository" / "2125-1"
+    checkout.mkdir(parents=True)
+    checkout.chmod(0o2770)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    client = WorkerClient.for_path_checkout(checkout, issue_id=2125, attempt=1,
+                                           run_uid=boundary.identities.worklink_uid)
+    monkeypatch.setattr(client, "_connect", boundary.connect)
+    leaf = SimpleNamespace(**{**vars(boundary), "client": client, "checkout": checkout})
+    handle = await _boundary_create(leaf)
+    assert stat.S_IMODE(checkout.stat().st_mode) == 0o2770
+    assert checkout.stat().st_uid == boundary.identities.mimir_uid
+    if mutation == "issue":
+        client.issue_id = 2126
+    elif mutation == "mode":
+        checkout.chmod(0o2777)
+    elif mutation == "outside":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        client.path_checkout = outside
+    if mutation:
+        if mutation == "inode":
+            with pytest.raises(RuntimeError):
+                await client._session_rpc("session_observe", {
+                    "generation": boundary.generation, "opencode_session_id": handle.identifier,
+                    "inode": checkout.stat().st_ino + 1})
+        else:
+            with pytest.raises(RuntimeError):
+                await client.session_observe(handle)
+    else:
+        boundary.daemon.finish(handle.identifier)
+        assert (await client.session_observe(handle)).execution_state == "succeeded"
+    client.issue_id, client.path_checkout = 2125, checkout
+    checkout.chmod(0o2770)
+    await client.session_cancel(handle)
+    await client.session_release(handle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified", [True, False])
+async def test_operator_stop_cancels_owned_leaf_session_and_retains_unknown(session_boundary, tmp_path, monkeypatch, verified):
+    from mimir_cultivate.worklink.control import stop_worklink
+    from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+    from tests.worklink_daemon_fixtures import SyntheticFault
+
+    boundary = session_boundary
+    handle = await _boundary_create(boundary)
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    state = WorklinkRunState(41, 2, "opencode", "opencode_daemon", "opencode_daemon", handle.identifier,
+                            "issue/41-a2", "main", "main", str(tmp_path), "offline", "uv run pytest",
+                            "2026-11-12T00:00:00+00:00", checkout=str(boundary.checkout),
+                            opencode_session_id=handle.identifier, launch_generation=boundary.generation)
+    save_run_state(home, state)
+    monkeypatch.setattr(WorkerClient, "for_path_checkout", classmethod(lambda cls, *args, **kwargs: boundary.client))
+    if not verified:
+        route = f"/api/experimental/session/{handle.identifier}/log"
+        boundary.daemon.faults[("GET", route)].append(SyntheticFault(status=401))
+    result = await asyncio.to_thread(stop_worklink, home, 41,
+                                    runner=lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+    assert result.stopped is verified
+    if verified:
+        assert load_run_state(home, 41) is None
+        assert not boundary.daemon.sessions[handle.identifier].active
+        assert not list(boundary.records.glob("*.json"))
+    else:
+        retained = load_run_state(home, 41)
+        assert retained is not None and retained.opencode_session_id == handle.identifier
+        assert boundary.daemon.sessions[handle.identifier].active
+        assert list(boundary.records.glob("*.json"))
+        await boundary.client.session_cancel(handle)
+        await boundary.client.session_release(handle)
 
 
 @pytest.mark.asyncio

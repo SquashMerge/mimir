@@ -1233,58 +1233,6 @@ def _agent_exec(deploy: Path, *argv: str) -> str:
     return _run(["docker", "compose", "exec", "-T", "-u", "mimir", "agent", *argv], cwd=deploy)
 
 
-# The worklink uid cannot traverse the controller's private venv. Resolve there
-# as mimir, then run a stdlib-only probe with the system interpreter as worklink.
-_OPENCODE_RESOLVE_PROBE = """\
-try:
- from mimir_cultivate.worklink.backends.opencode import resolve_opencode_binary
- print(resolve_opencode_binary())
-except (ImportError, OSError, ValueError):
- print('opencode_missing')
-"""
-_OPENCODE_WORKER_PROBE = """\
-import subprocess
-import sys
-import tempfile
-try:
- with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
-  env = {
-   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
-   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
-   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
-   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
-  }
-  result = subprocess.run([sys.argv[1], '--version'], env=env, cwd='/tmp',
-   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-  print('ok' if result.returncode == 0 else 'opencode_missing')
-except (OSError, subprocess.TimeoutExpired, ValueError):
- print('opencode_missing')
-"""
-_OPENCODE_MODEL_PROBE = """\
-import subprocess
-import sys
-import tempfile
-try:
- with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
-  env = {
-   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
-   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
-   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
-   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
-  }
-  # The catalog command requires a configured provider. This is an inert
-  # placeholder, never the operator's API key and never used for a completion.
-  env[sys.argv[2].upper() + '_API_KEY'] = 'model-catalog-probe'
-  result = subprocess.run([sys.argv[1], 'models', sys.argv[2]], env=env, cwd='/tmp',
-   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-  print('ok' if result.returncode == 0 and sys.argv[3] in result.stdout.splitlines()
-        else 'opencode_model_unknown')
-except (OSError, subprocess.TimeoutExpired, ValueError):
- print('opencode_model_unknown')
-"""
-
 _TOOLCHAIN_WORKER_PROBE = """\
 import json
 from pathlib import Path
@@ -1417,7 +1365,9 @@ try:
   from mimir_cultivate.worklink.daemon_gate import wait_for_daemon
   resolve_daemon_model(dict(os.environ))
   health = wait_for_daemon(dict(os.environ))
-  result = {'ok': health.get('ok') is True, 'daemon_enabled': True}
+  result = {'ok': health.get('ok') is True, 'daemon_enabled': True,
+            'refresh_unverified': health.get('login_state') == 'refreshable_unverified',
+            'sensitive_telemetry_disabled': health.get('telemetry_state') == 'disabled_sensitive_otlp'}
 except (ActivationError, ValueError, OSError):
  result = {'ok': False, 'daemon_enabled': True}
 print(json.dumps(result))
@@ -1432,30 +1382,10 @@ def _verify_opencode_daemon(deploy: Path) -> None:
     if not isinstance(state, dict) or state.get("ok") is not True:
         raise SetupError("OpenCode daemon verification failed; inspect installation, readiness, native login and stale bot-token health. "
                          "Native login: docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
-
-
-def _verify_opencode_binary(deploy: Path) -> str:
-    binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
-    check = "opencode_missing"
-    if binary.startswith("/") and "\n" not in binary and "\x00" not in binary:
-        check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
-                      "agent", "/usr/local/bin/python", "-c", _OPENCODE_WORKER_PROBE, binary], cwd=deploy)
-    if check != "ok":
-        raise SetupError("OpenCode leaf executable verification failed (opencode_missing); rebuild the agent image and check its OpenCode installation.")
-    return binary
-
-
-def _verify_opencode_model(deploy: Path, binary: str, model: str) -> None:
-    # Only the provider/model crosses into the isolated worker probe, never the
-    # configured credential or the controller's private OpenCode config.
-    if not re.fullmatch(r"(openai|anthropic)/[A-Za-z0-9_.-]+", model):
-        raise SetupError("OpenCode model verification failed (opencode_model_unknown); check the configured provider/model.")
-    provider = model.split("/", 1)[0]
-    check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
-                  "agent", "/usr/local/bin/python", "-c", _OPENCODE_MODEL_PROBE,
-                  binary, provider, model], cwd=deploy)
-    if check != "ok":
-        raise SetupError(f"OpenCode model verification failed (opencode_model_unknown): {model}; update the agent image or choose a listed model.")
+    if state.get("refresh_unverified") is True:
+        print("Native login refresh is unverified; local health does not prove provider validity.")
+    if state.get("sensitive_telemetry_disabled") is True:
+        print("Worklink telemetry is disabled because sensitive OTLP configuration is present.")
 
 
 def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
@@ -1486,7 +1416,8 @@ def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
 
 def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str,
              system_packages: list[str] | None = None, alert_adapter: str = "none",
-             *, trackers: tuple[str, ...] = ()) -> None:
+              *, trackers: tuple[str, ...] = ()) -> None:
+    _verify_opencode_daemon(deploy)
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -1548,7 +1479,6 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, versi
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
     _verify_toolchain(deploy, kind, version)
     _verify_system_packages(deploy, system_packages or [])
-    _verify_opencode_daemon(deploy)
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}
