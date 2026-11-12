@@ -63,6 +63,21 @@ async def test_daemon_compute_reconnects_without_readmission():
     client.session_create.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_daemon_wait_does_not_refresh_expired_launch_budget():
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    client = SimpleNamespace(session_observe=AsyncMock(), session_cancel=AsyncMock(side_effect=RuntimeError("unverified")))
+    backend = compute.OpenCodeDaemonComputeBackend(client=client)
+    backend._deadlines[handle.identifier] = asyncio.get_running_loop().time() - 1
+    result = await backend.wait(handle, 60)
+    assert result.timed_out and result.session_error.type == "timeout"
+    assert result.session_outcome.cancellation_state == "unverified"
+    client.session_observe.assert_not_awaited()
+    client.session_cancel.assert_awaited_once_with(handle)
+
+
 def test_authorized_checkout_binds_configured_worker_uid(monkeypatch, tmp_path) -> None:
     from mimir_cultivate.worklink import identities
     from mimir_cultivate.worklink.checkout import _mint_checkout_authorization

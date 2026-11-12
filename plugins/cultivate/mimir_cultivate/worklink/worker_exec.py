@@ -317,15 +317,12 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
         not stat.S_ISDIR(boundary.st_mode)
         or boundary.st_uid != get_identities().mimir_uid
         or boundary.st_gid != get_identities().worklink_gid
-        or stat.S_IMODE(boundary.st_mode) not in (
-            {0o700, 0o710} if request.get("op", "").startswith("session_") else {0o700}
-        )
+        or stat.S_IMODE(boundary.st_mode) not in {0o700, 0o710}
     ):
         raise RuntimeError("issued checkout isolation boundary is invalid")
-    session = request.get("op", "").startswith("session_")
     owner_uid = (
         get_identities().worklink_uid
-        if session and stat.S_IMODE(boundary.st_mode) == 0o710
+        if stat.S_IMODE(boundary.st_mode) == 0o710
         else get_identities().mimir_uid
     )
     if observed.st_uid != owner_uid or observed.st_gid != get_identities().worklink_gid:

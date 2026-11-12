@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 from dataclasses import asdict, dataclass, replace
 import json
+import math
 import os
 import posixpath
 from pathlib import Path
@@ -16,6 +17,63 @@ import uuid
 
 from .backends.base import SessionError, SessionOutcome, SessionRequest
 from .daemon_client import DaemonClientError, OpenCodeDaemonClient
+
+
+def _number(value: object) -> bool:
+    return type(value) in {int, float} and math.isfinite(value)
+
+
+def _identifier(value: object, prefix: str) -> bool:
+    return isinstance(value, str) and re.fullmatch(prefix + r"_[A-Za-z0-9_-]{1,128}", value) is not None
+
+
+def _structured_error(value: object) -> dict:
+    if (not isinstance(value, dict) or not {"type", "message"} <= value.keys()
+            or value.keys() - {"type", "message", "status", "response", "retryAfterMs"}
+            or not isinstance(value["type"], str) or not isinstance(value["message"], str)):
+        raise DaemonClientError("invalid structured error")
+    if "status" in value and (type(value["status"]) is not int or not 100 <= value["status"] <= 599):
+        raise DaemonClientError("invalid structured error")
+    if "response" in value and (not isinstance(value["response"], dict)
+            or set(value["response"]) != {"body"} or not isinstance(value["response"]["body"], str)):
+        raise DaemonClientError("invalid structured error")
+    if "retryAfterMs" in value and (type(value["retryAfterMs"]) is not int or not 0 <= value["retryAfterMs"] <= 9007199254740991):
+        raise DaemonClientError("invalid structured error")
+    return value
+
+
+def _message(value: object, *, session_id: str | None = None) -> dict:
+    if (not isinstance(value, dict) or not _identifier(value.get("id"), "msg")
+            or not isinstance(value.get("time"), dict) or not _number(value["time"].get("created"))
+            or not isinstance(value.get("type"), str)):
+        raise DaemonClientError("invalid session message")
+    if session_id is not None:
+        if (set(value) != {"id", "time", "type", "sessionID", "payload", "delivery"}
+                or set(value["time"]) != {"created"}
+                or value.get("sessionID") != session_id or value["type"] != "user"
+                or not isinstance(value.get("payload"), dict)
+                or not isinstance(value["payload"].get("text"), str)
+                or value.get("delivery") not in {"queue", "steer"}):
+            raise DaemonClientError("invalid session inbox")
+    elif value["type"] in {"user", "idle"}:
+        allowed = {"id", "time", "type", "metadata"} | (
+            {"text", "files", "agents", "skills"} if value["type"] == "user" else {"outcome", "error"})
+        if value.keys() - allowed or set(value["time"]) != {"created"}:
+            raise DaemonClientError("invalid outcome history")
+    if value["type"] == "user" and session_id is None and not isinstance(value.get("text"), str):
+        raise DaemonClientError("invalid user history")
+    elif value["type"] == "idle" and value.get("outcome") not in {"succeeded", "failed", "interrupted"}:
+        raise DaemonClientError("invalid idle history")
+    elif value["type"] == "assistant":
+        if not isinstance(value.get("content"), list):
+            raise DaemonClientError("invalid assistant history")
+        for part in value["content"]:
+            if (not isinstance(part, dict) or not isinstance(part.get("type"), str)
+                    or (part["type"] == "text" and not isinstance(part.get("text"), str))):
+                raise DaemonClientError("invalid assistant content")
+    if "error" in value:
+        _structured_error(value["error"])
+    return value
 
 
 @dataclass(frozen=True)
@@ -101,6 +159,37 @@ class SessionController:
         self.record = record
         self._lock = asyncio.Lock()
         self.sensitive_values: tuple[str, ...] = ()
+        self._failure_error: SessionError | None = None
+        self._cancelling = False
+
+    async def _bounded(self, operation):
+        if self._cancelling:
+            return await operation
+        remaining = (self.record.deadline_at_ms - time.time() * 1000) / 1000
+        if remaining <= 0:
+            operation.close()
+            raise TimeoutError("session deadline exceeded")
+        async with asyncio.timeout(remaining):
+            result = await operation
+        if time.time() * 1000 >= self.record.deadline_at_ms:
+            raise TimeoutError("session deadline exceeded")
+        return result
+
+    def _error(self, raw: dict) -> SessionError:
+        raw = _structured_error(raw)
+        retry = raw.get("retryAfterMs")
+        return SessionError(self._redacted(raw["type"], 128), self._redacted(raw["message"], 2048),
+                            self._redacted(raw.get("response", {}).get("body", ""), 8192),
+                            retry if type(retry) is int and 0 < retry <= 8 * 86400000 else None)
+
+    async def _inbox(self) -> list[dict]:
+        response = await self._bounded(self.client.inbox(self.record.opencode_session_id))
+        if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+            raise DaemonClientError("invalid session inbox")
+        items = [_message(item, session_id=self.record.opencode_session_id) for item in response["data"]]
+        if len({item["id"] for item in items}) != len(items):
+            raise DaemonClientError("duplicate inbox identity")
+        return items
 
     def _redacted(self, value: str, bound: int) -> str:
         from mimir.redaction import redact_text
@@ -157,24 +246,29 @@ class SessionController:
         environment.update(MIMIR_MODEL_SPEC=model_spec, MIMIR_SPAWN_DEPTH=str(request.spawn_depth),
                            MIMIR_WORKLINK_GATE="1")
         info = checkout.stat()
-        response = await client.create_session(directory=str(checkout), model=request.model,
-                                               permissions=session_permissions(request))
+        deadline = int(time.time() * 1000) + timeout_s * 1000
+        async with asyncio.timeout(timeout_s):
+            response = await client.create_session(directory=str(checkout), model=request.model,
+                                                   permissions=session_permissions(request))
         sid = response["data"]["id"]
         record = ControllerRecord(1, str(uuid.uuid4()), issue_id, attempt, request.kind, sid,
                                   generation, str(checkout), info.st_dev, info.st_ino, 0, 0, [],
                                   None, "created", "pending", False, "none",
-                                  int(time.time() * 1000) + timeout_s * 1000)
+                                  deadline)
         controller = cls(client, path, record)
         controller.sensitive_values = tuple(environment[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in environment)
         controller._persist()
         try:
             await controller._read_log(baseline=True)
             messages = await controller._messages()
-            inbox = (await client.inbox(sid))["data"]
+            inbox = await controller._inbox()
             if len(messages) > 16 or inbox or any(m.get("type") == "user" for m in messages) or controller.record.execution_state != "pending":
                 raise DaemonClientError("session is not fresh")
             controller._persist(baseline_message_ids=[m["id"] for m in messages])
-            await client.set_environment(sid, environment)
+            await controller._bounded(client.set_environment(sid, environment))
+        except TimeoutError:
+            await controller.cancel()
+            return controller
         except DaemonClientError:
             if controller.record.execution_state == "pending":
                 controller._persist(execution_state="incomplete")
@@ -182,10 +276,14 @@ class SessionController:
         controller._persist(admission_state="dispatching")
         try:
             if request.kind == "epic":
-                await client.command(sid, name="feature", text=request.text)
+                await controller._bounded(client.command(sid, name="feature", text=request.text))
             else:
-                admitted = await client.prompt(sid, request.text, resume=True)
+                admitted = await controller._bounded(client.prompt(sid, request.text, resume=True))
+                _message(admitted["data"], session_id=sid)
                 controller._persist(input_id=admitted["data"]["id"], admission_state="admitted")
+        except TimeoutError:
+            controller._persist(admission_state="uncertain")
+            await controller.cancel()
         except DaemonClientError as exc:
             controller._persist(admission_state="uncertain", **(
                 {"execution_state": "incomplete"} if exc.status == 401 else {}
@@ -197,9 +295,17 @@ class SessionController:
         cursor = None
         size = 0
         while True:
-            page = await self.client.messages(self.record.opencode_session_id, cursor=cursor,
-                                              order="asc" if cursor is None else None, limit=100)
-            messages.extend(page["data"])
+            page = await self._bounded(self.client.messages(self.record.opencode_session_id, cursor=cursor,
+                                              order="asc" if cursor is None else None, limit=100))
+            if (not isinstance(page, dict) or not isinstance(page.get("data"), list)
+                    or not isinstance(page.get("cursor"), dict)
+                    or set(page["cursor"]) != {"previous", "next"}
+                    or any(v is not None and (not isinstance(v, str) or len(v.encode()) > 4096)
+                           for v in page["cursor"].values())):
+                raise DaemonClientError("invalid message page")
+            messages.extend(_message(item) for item in page["data"])
+            if len({item["id"] for item in messages}) != len(messages):
+                raise DaemonClientError("duplicate history identity")
             size += len(json.dumps(page).encode())
             if len(messages) > 4096 or size > 64 * 1024 * 1024:
                 raise DaemonClientError("session history exceeds bound")
@@ -212,51 +318,87 @@ class SessionController:
 
     async def _read_log(self, *, baseline: bool = False) -> None:
         sid = self.record.opencode_session_id
-        stream = self.client.log(sid, after=self.record.last_seq, follow=True)
+        replay = self.record.execution_state == "failed"
+        cursor = self.record.baseline_seq if replay else self.record.last_seq
+        state = "pending" if replay else self.record.execution_state
+        stream = self.client.log(sid, after=cursor, follow=True)
         try:
-            async for frame in stream:
+            while True:
+                try:
+                    frame = await self._bounded(anext(stream))
+                except StopAsyncIteration:
+                    break
                 event = frame.data
+                if not isinstance(event, dict):
+                    raise DaemonClientError("invalid session log item")
                 if event.get("type") == "log.synced":
-                    if (event.get("aggregateID") != sid or type(event.get("seq")) is not int
-                            or event["seq"] < self.record.last_seq):
+                    if (set(event) != {"type", "aggregateID", "seq"}
+                            or event.get("aggregateID") != sid or type(event.get("seq")) is not int
+                            or not max(cursor, self.record.last_seq) <= event["seq"] <= 9007199254740991):
                         raise DaemonClientError("invalid log watermark")
+                    if replay and self._failure_error is None:
+                        raise DaemonClientError("missing durable failure witness")
                     if baseline:
                         self._persist(baseline_seq=event["seq"], last_seq=event["seq"])
                     return
                 durable = event.get("durable", {})
+                if not isinstance(durable, dict) or not isinstance(event.get("data"), dict):
+                    raise DaemonClientError("invalid durable session event")
                 seq = durable.get("seq")
                 if durable.get("aggregateID") != sid or event.get("data", {}).get("sessionID") != sid:
                     raise DaemonClientError("foreign session event")
-                if type(seq) is not int or seq < 1:
-                    raise DaemonClientError("invalid log sequence")
-                if seq <= self.record.last_seq:
+                if (not _identifier(event.get("id"), "evt") or not _number(event.get("created"))
+                        or event.keys() - {"id", "created", "type", "durable", "data", "metadata", "location"}
+                        or not isinstance(event.get("type"), str) or not event["type"].startswith("session.")
+                        or set(durable) != {"aggregateID", "seq", "version"}
+                        or type(durable["version"]) is not int or durable["version"] != 1
+                        or type(seq) is not int or not 1 <= seq <= 9007199254740991):
+                    raise DaemonClientError("invalid durable session event")
+                kind = event["type"]
+                data = event["data"]
+                if kind.startswith("session.execution."):
+                    fields = {"sessionID"} | ({"error"} if kind == "session.execution.failed" else
+                                             {"reason"} if kind == "session.execution.interrupted" else set())
+                    if kind not in {"session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"} or set(data) != fields:
+                        raise DaemonClientError("invalid execution event")
+                    if kind == "session.execution.failed":
+                        self._failure_error = self._error(data["error"])
+                    if kind == "session.execution.interrupted" and data["reason"] not in {"user", "shutdown", "superseded", "inactivity"}:
+                        raise DaemonClientError("invalid execution interruption")
+                if kind.startswith("session.inbox.") and not _identifier(data.get("inboxID"), "msg"):
+                    raise DaemonClientError("invalid inbox event")
+                if seq <= cursor:
                     continue
-                state = self.record.execution_state
-                kind = event.get("type", "").removeprefix("session.execution.")
+                cursor = seq
                 if (event.get("type") == "session.inbox.cancelled"
                         and event.get("data", {}).get("inboxID") == self.record.input_id
                         and self.record.stop_requested and state == "pending"):
                     state = "interrupted"
-                if kind == "started":
+                if kind == "session.execution.started":
                     state = "started"
-                elif kind in {"succeeded", "failed", "interrupted"}:
+                elif kind in {"session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"}:
                     if state != "started":
                         raise DaemonClientError("execution terminal without start")
-                    state = kind
-                self._persist(last_seq=seq, execution_state=state)
+                    state = kind[len("session.execution."):]
+                if seq > self.record.last_seq:
+                    self._persist(last_seq=seq, execution_state=state)
         finally:
             await stream.aclose()
         raise DaemonClientError("missing log watermark")
 
     async def observe(self, *, stdout_limit: int = 64 * 1024 * 1024) -> SessionOutcome:
-        if int(time.time() * 1000) >= self.record.deadline_at_ms:
+        try:
+            return await self._bounded(self._observe(stdout_limit=stdout_limit))
+        except TimeoutError:
             await self.cancel()
             return SessionOutcome(self.record.opencode_session_id, "incomplete", self.record.cancellation_state,
-                                  SessionError("timeout", "Worklink session deadline exceeded"))
+                                   SessionError("timeout", "Worklink session deadline exceeded"))
+
+    async def _observe(self, *, stdout_limit: int) -> SessionOutcome:
         async with self._lock:
             await self._read_log()
             messages = await self._messages()
-            inbox = (await self.client.inbox(self.record.opencode_session_id))["data"]
+            inbox = await self._inbox()
             users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                      and m["id"] not in self.record.baseline_message_ids}
             if len(users) > 1 or (self.record.input_id and users and users != {self.record.input_id}):
@@ -271,19 +413,13 @@ class SessionController:
                 admitted = next((i for i, m in enumerate(history) if m["id"] == self.record.input_id and m.get("type") == "user"), None)
                 if admitted is None or not any(m.get("type") == "idle" and m.get("outcome") == "succeeded" for m in history[admitted + 1:]):
                     state = "incomplete"
-            error = None
+            error = self._failure_error if state == "failed" else None
             if state == "incomplete":
                 error = SessionError("backend_error", "OpenCode session protocol witness incomplete")
             for message in reversed(messages):
-                if message.get("type") == "idle" and isinstance(message.get("error"), dict):
+                if error is None and message.get("type") == "idle" and isinstance(message.get("error"), dict):
                     raw = message["error"]
-                    retry = raw.get("retryAfterMs")
-                    error = SessionError(
-                        self._redacted(str(raw.get("type", "unknown")), 128),
-                        self._redacted(str(raw.get("message", "")), 2048),
-                        self._redacted(str(raw.get("response", {}).get("body", "")), 8192),
-                        retry if type(retry) is int and 0 < retry <= 8 * 86400000 else None,
-                    )
+                    error = self._error(raw)
                     break
             chunks = []
             size = 0
@@ -295,7 +431,7 @@ class SessionController:
                     if part.get("type") != "text" or not isinstance(part.get("text"), str):
                         continue
                     raw = self._redacted(part["text"], 1024 * 1024)
-                    size += len(raw.encode())
+                    size += len(raw.encode()) + (1 if chunks else 0)
                     if size > stdout_limit:
                         overflow = True
                         break
@@ -307,14 +443,15 @@ class SessionController:
 
     async def cancel(self, timeout_s: float = 25) -> bool:
         async with self._lock:
-            self._persist(stop_requested=True, cancellation_state="requested")
+            self._cancelling = True
             try:
+                self._persist(stop_requested=True, cancellation_state="requested")
                 async with asyncio.timeout(min(timeout_s, 25)):
                     while True:
                         try:
                             await self._read_log()
                             messages = await self._messages()
-                            inbox = (await self.client.inbox(self.record.opencode_session_id))["data"]
+                            inbox = await self._inbox()
                             users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user" and m["id"] not in self.record.baseline_message_ids}
                             if len(users) > 1 or (self.record.input_id and users - {self.record.input_id}):
                                 raise DaemonClientError("ambiguous cancellation ownership")
@@ -341,6 +478,8 @@ class SessionController:
             except (TimeoutError, DaemonClientError):
                 self._persist(cancellation_state="unverified")
                 return False
+            finally:
+                self._cancelling = False
 
     async def release(self) -> None:
         if not await self.cancel():

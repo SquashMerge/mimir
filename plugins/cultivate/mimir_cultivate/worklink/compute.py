@@ -154,6 +154,7 @@ class OpenCodeDaemonComputeBackend:
             from .worker_client import WorkerClient
             client = WorkerClient(checkout)
         self._client = client
+        self._deadlines: dict[str, float] = {}
 
     def capabilities(self) -> ComputeCaps:
         return ComputeCaps(True, False, True, True)
@@ -164,21 +165,30 @@ class OpenCodeDaemonComputeBackend:
         requested = spec.backend_config.get("pass_env", ())
         if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
             raise ComputeLaunchError("session pass_env must be a sequence")
-        return await self._client.session_create(
+        deadline = asyncio.get_running_loop().time() + spec.timeout_s
+        handle = await self._client.session_create(
             spec.session_request, timeout_s=spec.timeout_s,
             pass_env={name: spec.env[name] for name in requested if name in spec.env},
             git_settings=spec.factory_credential_settings,
         )
+        self._deadlines[handle.identifier] = deadline
+        return handle
 
     async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+        deadline = self._deadlines.get(handle.identifier, float("inf"))
+        remaining = deadline - asyncio.get_running_loop().time()
         try:
-            async with asyncio.timeout(timeout_s):
+            if remaining <= 0:
+                raise TimeoutError
+            async with asyncio.timeout(min(timeout_s, max(0, remaining))):
                 while True:
                     try:
                         outcome = await self._client.session_observe(handle)
                     except SessionTransportLostError:
                         await asyncio.sleep(0.1)
                         continue
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError
                     if outcome.output_overflow:
                         await self.cancel(handle)
                         return ComputeResult(1, outcome.stdout, "", output_overflow=True,
@@ -191,8 +201,15 @@ class OpenCodeDaemonComputeBackend:
                         )
                     await asyncio.sleep(0.1)
         except TimeoutError:
-            await self.cancel(handle)
-            return ComputeResult(1, "", "", timed_out=True, handle=handle)
+            cancellation = "verified"
+            try:
+                await self.cancel(handle)
+            except RuntimeError:
+                cancellation = "unverified"
+            error = SessionError("timeout", "Worklink session deadline exceeded")
+            outcome = SessionOutcome(handle.identifier, "incomplete", cancellation, error)
+            return ComputeResult(1, "", "", timed_out=True, handle=handle,
+                                 session_outcome=outcome, session_error=error)
 
     async def logs(self, handle: LaunchHandle) -> str:
         outcome = await self._client.session_observe(handle)
@@ -203,6 +220,7 @@ class OpenCodeDaemonComputeBackend:
 
     async def cleanup(self, handle: LaunchHandle) -> None:
         await self._client.session_release(handle)
+        self._deadlines.pop(handle.identifier, None)
 
 
 _LOCAL_ENV_INFRA = (

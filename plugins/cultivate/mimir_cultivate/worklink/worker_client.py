@@ -266,7 +266,9 @@ class WorkerClient:
             if not isinstance(response, dict) or "error" in response:
                 raise RuntimeError("session executor operation failed")
             if output is not None:
-                response["stdout"] = output.read_bounded()[0].decode("utf-8", "replace")
+                captured, dropped = output.read_bounded()
+                response["stdout"] = captured.decode("utf-8", "ignore")
+                response["output_overflow"] = bool(response.get("output_overflow") or dropped or output.did_overflow)
             return response
         finally:
             if fd >= 0:
