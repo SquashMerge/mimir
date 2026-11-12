@@ -430,18 +430,15 @@ def stop_worklink(
             async def cancel_owned_session() -> None:
                 backend = OpenCodeDaemonComputeBackend(client=client)
                 await backend.cancel(handle)
-                await backend.cleanup(handle)
             _mark_operator_stop(home, issue_id, state.attempt)
             try:
                 asyncio.run(cancel_owned_session())
             except (RuntimeError, OSError, ValueError):
                 return WorklinkStopResult(issue_id, False, reason="session cancellation unverified; recovery state retained")
-            clear_run_state(home, issue_id)
-            release = run([chainlink_bin, "locks", "release", str(issue_id)])
-            unlabel = run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"])
-            return WorklinkStopResult(issue_id, True, state_cleared=True,
-                                      claim_released=release.returncode == 0,
-                                      label_cleared=unlabel.returncode == 0)
+            # The waiter still needs its correlation record to observe the stop.
+            # Finalization (or explicit reattach) releases it and routes the claim.
+            return WorklinkStopResult(issue_id, True,
+                reason="session cancelled; controller finalization or reattach is required")
         if not process_identity_verified(state):
             return WorklinkStopResult(
                 issue_id, False, reason="live PID could not be verified; refusing to signal it"

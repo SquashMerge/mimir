@@ -17,6 +17,8 @@ uv run pytest -q tests/test_worklink_evidence.py
 uv run pytest -q tests/test_worklink_reattach.py
 uv run pytest -q tests/test_worklink_stop.py
 uv run pytest -q tests/test_spawn_opencode.py
+uv run pytest -q tests/test_spawn_caps.py
+uv run pytest -q tests/test_pollers.py
 uv run pytest -q tests/test_opencode_config.py
 uv run pytest -q tests/test_worklink_image_identity.py
 uv run pytest -q tests/test_worklink_factory_endings.py
@@ -33,3 +35,9 @@ sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED uv
 sh scripts/heavy_run.sh env -u MIMIR_PLUGINS MIMIR_ACCESS_CONTROL_ENFORCED=1 uv run --extra dev --extra bench pytest -q -n 6
 sh scripts/heavy_run.sh env -u MIMIR_ACCESS_CONTROL_ENFORCED MIMIR_PLUGINS=cultivate uv run --extra dev --extra bench pytest -q -n 6
 sh scripts/heavy_run.sh env MIMIR_PLUGINS=cultivate MIMIR_ACCESS_CONTROL_ENFORCED=1 uv run --extra dev --extra bench pytest -q -n 6
+# Verify optional-provider guards independently of the installed workspace matrix.
+unset UV_NO_SYNC
+uv sync --locked
+UV_NO_SYNC=1
+export UV_NO_SYNC
+sh scripts/heavy_run.sh uv run pytest -q --tb=short

@@ -279,7 +279,7 @@ async def test_path_addressed_leaf_session_uses_existing_checkout_guard(session_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verified", [True, False])
-async def test_operator_stop_cancels_owned_leaf_session_and_retains_unknown(session_boundary, tmp_path, monkeypatch, verified):
+async def test_operator_stop_preserves_correlation_until_waiter_finalizes(session_boundary, tmp_path, monkeypatch, verified):
     from mimir_cultivate.worklink.control import stop_worklink
     from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
     from tests.worklink_daemon_fixtures import SyntheticFault
@@ -294,23 +294,44 @@ async def test_operator_stop_cancels_owned_leaf_session_and_retains_unknown(sess
                             opencode_session_id=handle.identifier, launch_generation=boundary.generation)
     save_run_state(home, state)
     monkeypatch.setattr(WorkerClient, "for_path_checkout", classmethod(lambda cls, *args, **kwargs: boundary.client))
-    if not verified:
-        route = f"/api/experimental/session/{handle.identifier}/log"
-        boundary.daemon.faults[("GET", route)].append(SyntheticFault(status=401))
-    result = await asyncio.to_thread(stop_worklink, home, 41,
-                                    runner=lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
-    assert result.stopped is verified
-    if verified:
-        assert load_run_state(home, 41) is None
-        assert not boundary.daemon.sessions[handle.identifier].active
-        assert not list(boundary.records.glob("*.json"))
-    else:
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    observed, resume = asyncio.Event(), asyncio.Event()
+    original_observe = boundary.client.session_observe
+    async def pause_after_first_observation(owned, **kwargs):
+        outcome = await original_observe(owned, **kwargs)
+        if not observed.is_set():
+            observed.set()
+            await resume.wait()
+        return outcome
+    monkeypatch.setattr(boundary.client, "session_observe", pause_after_first_observation)
+    waiter = asyncio.create_task(OpenCodeDaemonComputeBackend(client=boundary.client).wait(handle, 30))
+    try:
+        await asyncio.wait_for(observed.wait(), 10)
+        if not verified:
+            route = f"/api/experimental/session/{handle.identifier}/log"
+            boundary.daemon.faults[("GET", route)].append(SyntheticFault(status=401))
+        result = await asyncio.to_thread(stop_worklink, home, 41,
+                                        runner=lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+        assert result.stopped is verified
         retained = load_run_state(home, 41)
         assert retained is not None and retained.opencode_session_id == handle.identifier
-        assert boundary.daemon.sessions[handle.identifier].active
+        assert not result.state_cleared and not result.claim_released
         assert list(boundary.records.glob("*.json"))
-        await boundary.client.session_cancel(handle)
-        await boundary.client.session_release(handle)
+        assert boundary.daemon.sessions[handle.identifier].active is not verified
+        if not verified:
+            await boundary.client.session_cancel(handle)
+        resume.set()
+        outcome = await asyncio.wait_for(waiter, 10)
+        assert outcome.exit_code != 0 and not outcome.timed_out
+        assert outcome.session_outcome.execution_state == "interrupted"
+        assert outcome.handle.opencode_session_id == handle.identifier
+    finally:
+        resume.set()
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+    await boundary.client.session_release(handle)
+    assert not list(boundary.records.glob("*.json"))
 
 
 @pytest.mark.asyncio
