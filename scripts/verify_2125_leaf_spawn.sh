@@ -13,6 +13,7 @@ uv run pytest -q tests/test_worklink_compute.py
 env MIMIR_PLUGINS=cultivate uv run pytest -q plugins/cultivate/tests/test_opencode.py
 env MIMIR_PLUGINS=cultivate uv run pytest -q plugins/cultivate/tests/test_setup.py
 env MIMIR_PLUGINS=cultivate uv run pytest -q plugins/cultivate/tests/test_contained_dispatch.py
+env MIMIR_PLUGINS=cultivate uv run pytest -q plugins/cultivate/tests/test_worklink_daemon_leaf_spawn.py
 sh scripts/heavy_run.sh uv run pytest -q --tb=short
 sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --extra dev --extra bench pytest -q -n 6
 sh scripts/heavy_run.sh env -u MIMIR_PLUGINS MIMIR_ACCESS_CONTROL_ENFORCED=1 uv run --extra dev --extra bench pytest -q -n 6

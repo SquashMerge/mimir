@@ -25,10 +25,15 @@ class SessionRequest:
     text: str
     shell_allowlist: tuple[str, ...] = ()
     spawn_depth: int = 1
+    agent: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"leaf", "spawn", "epic"}:
             raise ValueError("invalid session kind")
+        if self.agent is not None and (not isinstance(self.agent, str) or not self.agent
+                                      or len(self.agent.encode()) > 1024
+                                      or any(not char.isprintable() for char in self.agent)):
+            raise ValueError("invalid session agent")
         if type(self.spawn_depth) is not int or not 0 <= self.spawn_depth <= 1000:
             raise ValueError("invalid server-generated spawn depth")
         if (not isinstance(self.model, Mapping) or not {"providerID", "id"} <= self.model.keys()
@@ -232,6 +237,8 @@ class RawResult:
     error: str | None
     blocked_reason: str | None = None
     output_overflow: bool = False
+    opencode_session_id: str | None = None
+    retry_after_ms: int | None = None
 
 
 class ToolBackend(Protocol):

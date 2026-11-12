@@ -732,6 +732,8 @@ class BackendRegistry:
         self._compute_backends: dict[str, ComputeBackend] = {
             "local_subprocess": LocalSubprocessComputeBackend(),
         }
+        from ..compute import OpenCodeDaemonComputeBackend
+        self._compute_backends["opencode_daemon"] = OpenCodeDaemonComputeBackend()
         for name, settings in self.config.compute_backend_settings.items():
             self._compute_backends[name] = self._build_compute_backend(name, settings)
 

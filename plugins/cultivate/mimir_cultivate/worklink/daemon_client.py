@@ -150,9 +150,11 @@ class OpenCodeDaemonClient:
 
     async def create_session(
         self, *, directory: str, model: Mapping[str, str], permissions: list[dict[str, str]],
+        agent: str | None = None,
     ) -> dict[str, Any]:
         result = _object(await self._request("POST", "/api/session", payload={
             "location": {"directory": directory}, "model": dict(model), "permissions": permissions,
+            **({"agent": agent} if agent is not None else {}),
         }))
         data = _object(result.get("data"))
         try:

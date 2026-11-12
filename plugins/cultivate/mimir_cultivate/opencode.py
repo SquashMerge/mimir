@@ -258,6 +258,26 @@ def _provider_from_model(model: str) -> str:
     return provider
 
 
+def resolve_daemon_model(env: Mapping[str, str], explicit_model: str | None = None) -> dict[str, str]:
+    """Resolve the session model without opening provider or agent auth files."""
+    from mimir._reasoning_effort import validate_effort
+
+    selected = explicit_model or opencode_model_from_agent_spec(env.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC))
+    model, separator, variant = selected.strip().partition("#")
+    provider = _provider_from_model(model)
+    if any(not char.isprintable() or char.isspace() for char in selected):
+        raise OpenCodeConfigError("config_provider_selection")
+    effort = env.get("MIMIR_WORKLINK_REASONING_EFFORT") or env.get("MIMIR_MODEL_REASONING_EFFORT", "")
+    if not separator and effort:
+        variant = validate_effort("codex-plus", effort) if provider == "openai" else effort
+    if separator and not variant:
+        raise OpenCodeConfigError("config_provider_selection")
+    reference = {"providerID": provider, "id": model.split("/", 1)[1]}
+    if variant and variant != "none":
+        reference["variant"] = variant
+    return reference
+
+
 def resolve_opencode_invocation(
     explicit_model: str | None = None, *, env: Mapping[str, str] | None = None,
     config_path: Path | str | None = None,
@@ -1081,11 +1101,14 @@ async def _spawn_open_code_impl(
     execution = None
     terminal = None
     seed_tree = None
+    retain_checkout = False
     try:
         try:
-            invocation = resolve_opencode_invocation(model, config_path=cfg.get("opencode_config_path"))
-            documents = opencode_worker_documents(invocation)
-            scrubber = documents.scrubber
+            reference = resolve_daemon_model(dict(os.environ), model)
+            invocation = OpenCodeInvocation(
+                model=f"{reference['providerID']}/{reference['id']}", provider=reference['providerID'],
+                model_source="explicit" if model else "agent_model", config_path=config_path,
+                auth_path=auth_path, auth_type=None, scrubber=scrubber)
             scrubber.add_path(seed)
             scrubber.add_path(artifact_base)
         except OpenCodeAuthError as exc:
@@ -1110,22 +1133,11 @@ async def _spawn_open_code_impl(
 
         if terminal is None and invocation is not None:
             try:
-                spawn_arguments = shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
-                argv = ["opencode", "run", "--dir", ".", *spawn_arguments]
-                argv += ["-m", invocation.model]
-                if agent:
-                    argv += ["--agent", agent]
-                argv += ["--", prompt]
-                selectors = {
-                    "MIMIR_SPAWN_DEPTH": str(current_depth + 1),
-                    "OPENCODE_MODEL": invocation.model,
-                    "OPENCODE_PROVIDER": invocation.provider,
-                }
-                if agent:
-                    selectors["OPENCODE_AGENT"] = agent
-                worker_env = contained_execution.opencode_worker_environment(
-                    contained_execution.base_worker_environment(run_id), selectors,
-                )
+                from .worklink.backends.base import SessionRequest
+                if os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", "").strip():
+                    raise ValueError("daemon sessions do not accept CLI arguments")
+                request = SessionRequest("spawn", reference, prompt,
+                                         spawn_depth=current_depth + 1, agent=agent)
             except ValueError:
                 terminal = classify_spawn_terminal_state(configuration_reason="config_provider_selection")
 
@@ -1135,7 +1147,7 @@ async def _spawn_open_code_impl(
                     value, agent_home=home,
                     source_paths=(invocation.config_path, invocation.auth_path),
                 ) is not None
-                for value in (*argv, *worker_env.values())
+                for value in reference.values()
             )
             if sensitive_execution_value:
                 terminal = classify_spawn_terminal_state(configuration_reason="config_provider_selection")
@@ -1144,11 +1156,7 @@ async def _spawn_open_code_impl(
             try:
                 checkout = checkout_factory(
                     seed, default_cwd=default_cwd,
-                    known_sensitive=tuple(
-                        document for document in (
-                            documents.config_document, documents.auth_document,
-                        ) if document is not None
-                    ),
+                    known_sensitive=(),
                 )
                 seed_tree = checkout.base_tree
             except SnapshotCredentialsRefused:
@@ -1165,28 +1173,18 @@ async def _spawn_open_code_impl(
                 terminal = classify_spawn_terminal_state(provisioning_reason="provisioning_unavailable")
 
         if terminal is None and invocation is not None and checkout is not None:
-            projections = [WorkerProjection(
-                path=".config/opencode/opencode.json",
-                document=documents.config_document,
-            )]
-            if documents.auth_document is not None:
-                projections.append(WorkerProjection(
-                    path=".local/share/opencode/auth.json",
-                    document=documents.auth_document,
-                ))
             assert guard.sem is not None
             try:
                 async with guard.sem:
+                    retain_checkout = True
                     execution = await contained_runner(
-                        argv, checkout.capability, worker_env, tuple(projections),
-                        identifier=execution_identifier or run_id,
-                        timeout_s=timeout_s,
+                        checkout.capability, request, timeout_s=timeout_s,
                         stdout_limit=1024 * 1024,
-                        stderr_limit=1024 * 1024,
-                        scrubber=scrubber,
                     )
-                stdout = execution.stdout
-                stderr = execution.stderr
+                    retain_checkout = False
+                from mimir.redaction import redact_text
+                stdout = redact_text(execution.stdout).encode()
+                stderr = redact_text(execution.stderr).encode()
             except (OSError, RuntimeError, ValueError):
                 terminal = classify_spawn_terminal_state(containment_available=False)
 
@@ -1196,12 +1194,7 @@ async def _spawn_open_code_impl(
                 proposal_result = build_opencode_proposal(
                     checkout.path, scrubber=scrubber, base_tree=seed_tree,
                 )
-            auth_required = False
-            if execution.exit_code not in (None, 0):
-                blob = scrubber.scrub_text(stderr + b"\n" + stdout).lower()
-                auth_required = any(marker in blob for marker in (
-                    "unauthorized", "not logged in", "credential", "auth", "401",
-                ))
+            auth_required = execution.session_error is not None and execution.session_error.type == "provider.auth"
             terminal = classify_spawn_terminal_state(
                 timed_out=execution.timed_out,
                 output_overflow=execution.output_overflow,
@@ -1218,6 +1211,9 @@ async def _spawn_open_code_impl(
     finally:
         if checkout is not None:
             try:
+                if retain_checkout:
+                    checkout.close(retain=True)
+                    raise RuntimeError("session quiescence unverified; checkout retained")
                 checkout.close()
             except (OSError, RuntimeError):
                 event = cleanup_failure_event(run_id)
@@ -1238,8 +1234,9 @@ async def _spawn_open_code_impl(
         "exit_code": terminal.exit_code, "seed_tree": seed_tree,
         "timed_out": bool(execution and execution.timed_out),
         "output_overflow": bool(execution and execution.output_overflow),
-        "stdout_dropped_bytes": execution.stdout_dropped_bytes if execution else 0,
-        "stderr_dropped_bytes": execution.stderr_dropped_bytes if execution else 0,
+        "stdout_dropped_bytes": 0,
+        "stderr_dropped_bytes": 0,
+        "opencode_session_id": execution.handle.opencode_session_id if execution and execution.handle else None,
     }
     artifact_handle = run_id
     try:
@@ -1323,6 +1320,7 @@ async def _spawn_open_code_impl(
         "stdout": safe_stdout, "result": safe_stdout, "stderr": safe_stderr,
         "artifact_dir": artifact_handle, "name": name,
         "proposal": terminal.proposal.as_dict() if terminal.proposal else None,
+        "opencode_session_id": manifest["opencode_session_id"],
     }, indent=2)
 
 
@@ -1338,11 +1336,11 @@ async def spawn_open_code(
 ) -> str:
     """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
     from .contained_checkout import create_opencode_checkout
-    from .contained_execution import execute_contained
+    from .contained_execution import execute_contained_session
 
     return await _spawn_open_code_impl(
         prompt, cwd, timeout_s, name, model, agent, artifact_root,
-        contained_runner=execute_contained,
+        contained_runner=execute_contained_session,
         checkout_factory=create_opencode_checkout,
         execution_identifier=str(uuid.uuid4()),
     )

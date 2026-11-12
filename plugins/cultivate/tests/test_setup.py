@@ -1642,22 +1642,19 @@ def test_subscription_fresh_setup_requires_login_before_start(setup_environment,
     values = dict(line.split('=', 1) for line in (deploy / 'compose.env').read_text().splitlines())
     values.update(agent['environment'])
     values.update({'HOME': str(home), 'CODEX_HOME': str(deploy / 'codex')})
-    selected = opencode.resolve_opencode_invocation(env=values)
-    assert selected.auth_type == 'oauth' and selected.auth_path == opencode.opencode_auth_path(values)
-    assert selected.model == 'openai/gpt-5.6-luna'
-    assert json.loads(opencode.opencode_worker_documents(selected, values).auth_document)['openai']['type'] == 'oauth'
-    assert 'OPENAI_API_KEY' not in values and 'OPENAI_API_KEY' not in selected.pass_env
+    assert opencode.resolve_daemon_model(values) == {'providerID': 'openai', 'id': 'gpt-5.6-luna'}
+    assert 'OPENAI_API_KEY' not in values
     from mimir_cultivate.worklink import compute
     from mimir_cultivate.worklink.backends import opencode as backend_module
     from mimir_cultivate.worklink.backends.base import WorkOrder
-    monkeypatch.setattr(backend_module, '_coding_enabled', lambda: True)
-    monkeypatch.setattr(backend_module, 'resolve_opencode_binary', lambda _: '/usr/bin/opencode')
     order = WorkOrder(2075, tmp_path, 'prompt', None, 30, {**values, 'MIMIR_HOME': str(home)})
     work = backend_module.OpenCodeBackend().work_spec(
         order, attempt=1, repo_url='repo', base_ref='main', branch='issue/2075', test_command='true')
     worker = compute._enabled_child_env(work, 'test-worker')
     assert 'OPENAI_API_KEY' not in work.env and 'OPENAI_API_KEY' not in worker
-    assert 'OPENAI_API_KEY' not in json.dumps(work.backend_config['worker_projections'], default=str)
+    assert 'worker_projections' not in work.backend_config
+    assert work.session_request.model == {'providerID': 'openai', 'id': 'gpt-5.6-luna'}
+    assert 'OPENCODE_PERMISSION' not in work.env
 
 
 def test_subscription_upgrade_drops_stale_openai_key(upgrade_setup, monkeypatch):
@@ -1970,6 +1967,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     def run(argv, *, cwd):
         exec_calls.append(argv)
         assert cwd == tmp_path
+        if installer._OPENCODE_DAEMON_PROBE in argv:
+            return json.dumps({'ok': all(pending[name] == 'ok' for name in ('binary', 'auth', 'model')),
+                               'daemon_enabled': True})
         if installer._TOOLCHAIN_ENV_PROBE in argv:
             return json.dumps(installer.toolchain_probe_environment(SimpleNamespace(backend_settings={})))
         if installer._TOOLCHAIN_WORKER_PROBE in argv:
@@ -2013,12 +2013,11 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         installer._verify(tmp_path, 8123, "org/repo", "owner-key", 'rust', '1.99.1', **kwargs)
 
     verify()
-    assert len(exec_calls) == 11
+    assert len(exec_calls) == 7
     assert [argv[7:9] for argv in exec_calls] == [
         ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
         ["python", "-c"], ["/home/mimir/venv/bin/python", "-c"],
-        ["/tmp", "agent"], ["/home/mimir/venv/bin/python", "-c"],
-        ["/tmp", "agent"], ["python", "-c"], ["python", "-c"], ["/tmp", "agent"]]
+        ["/tmp", "agent"], ["python", "-c"]]
     assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'wrong@example.com'], check=True)
     reads.clear()
@@ -2053,19 +2052,19 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         verify()
     pending['toolchain'] = 'ok'
     pending["binary"] = "opencode_missing"
-    with pytest.raises(installer.SetupError, match="opencode_missing"):
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed"):
         verify()
     pending["binary"] = "ok"
     pending["auth"] = "auth_missing"
-    with pytest.raises(installer.SetupError, match="OpenCode credential resolution failed.*auth_missing"):
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed"):
         verify()
     pending["auth"] = "private-key-material"
-    with pytest.raises(installer.SetupError, match="unavailable") as raised:
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed") as raised:
         verify()
     assert "private-key-material" not in str(raised.value)
     pending["auth"] = "ok"
     pending["model"] = "opencode_model_unknown"
-    with pytest.raises(installer.SetupError, match="opencode_model_unknown.*openai/gpt-6.1-sol"):
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed"):
         verify()
     pending["model"] = "ok"
     pending["alerts"] = [{"repository": "org/repo"}]

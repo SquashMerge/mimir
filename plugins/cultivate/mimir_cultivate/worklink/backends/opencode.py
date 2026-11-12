@@ -23,6 +23,7 @@ from mimir_cultivate.opencode import (
     opencode_worker_documents,
     reconcile_codex_auth,
     resolve_opencode_invocation,
+    resolve_daemon_model,
 )
 from mimir.redaction import redact_text
 from mimir.otel_credentials import filter_otlp_env
@@ -34,6 +35,7 @@ from .base import (
     WorkOrder,
     blocked_reason_from_output,
     last_nonempty_line,
+    SessionRequest,
 )
 
 
@@ -207,79 +209,21 @@ class OpenCodeBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
-        binary = resolve_opencode_binary(self.bin)
         prompt = _prompt_for_order(order)
-        args = list(self.extra_args)
-        env = dict(order.env)
-        resolution = resolve_worklink_opencode_invocation(env)
-        invocation = resolution.invocation
-        resolution_env = resolution.env
-        args.extend(("-m", invocation.model))
-        override = resolution_env.get("MIMIR_WORKLINK_REASONING_EFFORT", "")
-        agent_effort = resolution_env.get("MIMIR_MODEL_REASONING_EFFORT", "")
-        effort_name = "MIMIR_WORKLINK_REASONING_EFFORT" if override else "MIMIR_MODEL_REASONING_EFFORT"
-        raw_effort = override or agent_effort
-        try:
-            effort = (
-                validate_effort("codex-plus", raw_effort)
-                if invocation.provider == "openai" else raw_effort
-            )
-        except ValueError as exc:
-            raise ValueError(f"{effort_name}: {exc}") from exc
-        variant = effort if effort and effort != "none" else None
-        variant_source = (
-            "worklink_override" if override else "agent"
-        ) if variant else "none"
-        if variant:
-            args.extend(("--variant", variant))
-        if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
-            env["OPENCODE_CONFIG"] = str(invocation.config_path)
-        for key in invocation.pass_env:
-            if key in os.environ:
-                env[key] = os.environ[key]
-        for key in invocation.remove_env:
-            # WorkSpec overrides an allowlisted parent environment; an empty
-            # value is required here because omission would inherit it again.
-            env[key] = ""
-        # Model selection is consumed above by the backend. Do not expose it to
-        # the executor or repository-controlled test processes it launches.
-        from mimir.tools._shell_env import scrub_model_selection_env
-
-        env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
+        values = {**os.environ, **order.env}
+        values.setdefault("MIMIR_MODEL_SPEC", model_spec_at_call_time(
+            Path(values["MIMIR_HOME"]) if values.get("MIMIR_HOME") else None))
+        reference = resolve_daemon_model(values)
+        model = f"{reference['providerID']}/{reference['id']}"
+        if self.extra_args:
+            raise ValueError("daemon leaf sessions do not accept CLI arguments")
         backend_config: dict[str, object] = {
-            "bin": binary,
-            "args": args,
             "bash_allowlist": list(self.bash_allowlist),
-            "model": invocation.model,
-            "configured_model": resolution.configured_model,
-            "model_diverged": resolution.model_diverged,
-            "model_source": invocation.model_source,
-            "codex": invocation.provider == "openai" and resolution_env.get("MIMIR_MODEL_SPEC", "").startswith("codex-plus:"),
-            "variant": variant,
-            "variant_source": variant_source,
+            "model": model,
+            "variant": reference.get("variant"),
             "test_env": dict(self.test_env),
+            "pass_env": tuple(self.test_env),
         }
-        enabled = _coding_enabled()
-        if enabled:
-            documents = opencode_worker_documents(invocation, resolution_env)
-            projections = [
-                WorkerProjection(
-                    ".config/opencode/opencode.json", documents.config_document
-                )
-            ]
-            if documents.auth_document is not None:
-                projections.append(
-                    WorkerProjection(
-                        ".local/share/opencode/auth.json", documents.auth_document
-                    )
-                )
-            env = {
-                "OPENCODE_PERMISSION": _permission_override(self.bash_allowlist),
-            }
-            backend_config["worker_projections"] = projections
-            backend_config["pass_env"] = tuple(self.test_env)
-        env.update(self.test_env)
-        scrub_model_selection_env(env)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -291,12 +235,10 @@ class OpenCodeBackend:
             test_command=test_command,
             backend=self.name,
             timeout_s=order.timeout_s,
-            env=filter_otlp_env(env),
+            env=dict(self.test_env),
             backend_config=backend_config,
             local_checkout=order.checkout,
-            local_argv=_local_argv(
-                binary, args, order.checkout, prompt, fd_anchored=enabled
-            ),
+            session_request=SessionRequest("leaf", reference, prompt, tuple(self.bash_allowlist)),
             output_root=order.transcript_root,
         )
 
@@ -381,33 +323,36 @@ class OpenCodeBackend:
             )
             return RawResult(-1, transcript_file, "backend_error", result.launch_error)
 
-        blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
-        permission_refusal = _permission_refusal_reason(
-            result.stdout, result.stderr, self.bash_allowlist, result.exit_code
-        )
-        status = "output_overflow" if result.output_overflow else (
-            "blocked" if blocked_reason else (
-                "failed" if permission_refusal else (
-                    "timeout" if result.timed_out else _status_from_output(
-                        result.exit_code, result.stdout, result.stderr
-                    )
-                )
-            )
-        )
-        error = (
-            "backend output exceeded configured Worklink limit"
-            if result.output_overflow
-            else blocked_reason or permission_refusal or _error_from_status(
-                status, result.stdout, result.stderr, result.command
-            )
-        )
+        stdout, stderr = redact_text(result.stdout), redact_text(result.stderr)
+        outcome = result.session_outcome
+        typed_error = result.session_error or (outcome.error if outcome else None)
+        blocked_reason = None
+        retry_after = None
+        if result.output_overflow:
+            status, error = "output_overflow", "backend output exceeded configured Worklink limit"
+        elif result.timed_out:
+            status, error = "timeout", "Worklink session deadline exceeded"
+        elif outcome is None:
+            status, error = "backend_error", "OpenCode session outcome unavailable"
+        elif typed_error is not None:
+            status = session_error_status(typed_error.type)
+            error = ": ".join((redact_text(typed_error.type).encode()[:128].decode("utf-8", "ignore"),
+                               redact_text(typed_error.message).encode()[:2048].decode("utf-8", "ignore")))
+            retry = typed_error.retry_after_ms
+            if type(retry) is int and 0 < retry <= 8 * 86400 * 1000:
+                retry_after = retry
+        elif outcome.execution_state == "succeeded":
+            blocked_reason = blocked_reason_from_output(stdout, stderr)
+            status, error = ("blocked", blocked_reason) if blocked_reason else ("success", None)
+        else:
+            status, error = "backend_error", "OpenCode session has no verified successful completion"
         write_transcript(
             transcript_file,
             command=list(result.command),
             exit_code=result.exit_code,
             status=status,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=stdout,
+            stderr=stderr,
             timed_out=result.timed_out,
             output_overflow=result.output_overflow,
             stdout_path=result.stdout_path,
@@ -420,7 +365,26 @@ class OpenCodeBackend:
             error,
             blocked_reason,
             output_overflow=result.output_overflow,
+            opencode_session_id=outcome.opencode_session_id if outcome else (
+                result.handle.opencode_session_id if result.handle else None),
+            retry_after_ms=retry_after,
         )
+
+
+_QUOTA_TYPES = frozenset({
+    "provider.quota", "provider.rate-limit", "provider.budget-limit", "provider.chatgpt-limit",
+    "provider.free-limit", "provider.go-limit", "provider.model-budget-limit",
+})
+
+
+def session_error_status(error_type: str) -> str:
+    if error_type == "provider.auth":
+        return "auth_error"
+    if error_type in _QUOTA_TYPES:
+        return "quota_exhausted"
+    if error_type in {"backend_error", "protocol", "daemon.protocol"}:
+        return "backend_error"
+    return "failed"
 
 
 def _coding_enabled() -> bool:

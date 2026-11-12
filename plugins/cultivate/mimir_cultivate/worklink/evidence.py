@@ -125,6 +125,7 @@ class WorklinkEvidence:
     # PR head observed after publication; may advance beyond the verified head_sha.
     observed_pr_head_sha: str | None = None
     test_env: dict[str, str] = field(default_factory=dict)
+    opencode_session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -966,6 +967,7 @@ async def _run_compute_gate(
     # the worker-side timeout must agree with that supervisor too.
     gate_spec = replace(
         work_spec,
+        session_request=None,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
         timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,
@@ -989,6 +991,10 @@ async def _run_compute_gate(
             ),
         )
     gate_spec = replace(gate_spec, env=filter_otlp_env(gate_spec.env))
+    if compute.name == "opencode_daemon":
+        from .compute import LocalSubprocessComputeBackend
+        from .identities import get_identities
+        compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
     if work_spec.backend == "feature_factory":
         from .compute import _local_child_env
         from .worker_client import run_factory_control

@@ -249,7 +249,8 @@ class SessionController:
         deadline = int(time.time() * 1000) + timeout_s * 1000
         async with asyncio.timeout(timeout_s):
             response = await client.create_session(directory=str(checkout), model=request.model,
-                                                   permissions=session_permissions(request))
+                                                   permissions=session_permissions(request),
+                                                   **({"agent": request.agent} if request.agent is not None else {}))
         sid = response["data"]["id"]
         record = ControllerRecord(1, str(uuid.uuid4()), issue_id, attempt, request.kind, sid,
                                   generation, str(checkout), info.st_dev, info.st_ino, 0, 0, [],

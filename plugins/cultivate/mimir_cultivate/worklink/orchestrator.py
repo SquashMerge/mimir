@@ -1146,11 +1146,14 @@ class WorklinkRunner:
             else registry.select(labels=issue.labels, repo=repo_slug)
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+        if isinstance(backend, OpenCodeBackend):
+            from .compute import OpenCodeDaemonComputeBackend
+            compute = OpenCodeDaemonComputeBackend()
         selected_name = backend.name
         worker_uid_drop = (
             _cultivate_selected()
             and isinstance(backend, OpenCodeBackend)
-            and compute.name == "local_subprocess"
+            and compute.name == "opencode_daemon"
         )
         test_cmd = (
             repository_config.quick_gate_command if gate_mode == "ci" else
@@ -1334,6 +1337,7 @@ class WorklinkRunner:
         preserve_reason: str | None = None
         executor_report_dir: Path | None = None
         spec = None
+        retain_session = False
         try:
             lease = _create_backend_checkout(
                 self.repo,
@@ -1347,14 +1351,9 @@ class WorklinkRunner:
                 worker_eligible=worker_uid_drop,
             )
             if worker_uid_drop:
-                if not isinstance(compute, LocalSubprocessComputeBackend):
-                    raise WorklinkError("worker uid drop requires local subprocess compute")
                 # Leaf builds run as the worklink uid through the root executor,
                 # in a path-addressed checkout the worker can traverse (base's
                 # model): coding CLIs and git need to stat their own tree.
-                compute = LocalSubprocessComputeBackend.for_path_checkout(
-                    get_identities().worklink_uid
-                )
                 checkout_fd = os.open(
                     lease.path,
                     os.O_RDONLY
@@ -1450,12 +1449,11 @@ class WorklinkRunner:
                     configured_model=spec.backend_config.get("configured_model"),
                 )
             async def invoke_backend() -> ComputeResult:
-                nonlocal spec
+                nonlocal spec, retain_session
                 handle = None
                 try:
-                    if isinstance(backend, OpenCodeBackend) and spec.backend_config.get("codex"):
-                        spec = backend.refresh_codex_projections(spec, order.env)
                     handle = await compute.launch(spec)
+                    retain_session = handle.substrate == "opencode_daemon"
                     # Atomically replace the provisional controller record with
                     # the real cancellable worker handle immediately after spawn.
                     try:
@@ -1495,21 +1493,16 @@ class WorklinkRunner:
                     )
                 finally:
                     if handle is not None:
+                        if retain_session:
+                            try:
+                                await compute.cancel(handle)
+                            except RuntimeError:
+                                terminal_release.retain_for_recovery = True
+                                raise
                         await compute.cleanup(handle)
+                        retain_session = False
 
-            if isinstance(backend, OpenCodeBackend):
-                compute_result = await backend.invoke_with_startup_retry(
-                    invoke_backend,
-                    issue_id=issue.issue_id,
-                    checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner, publication=publication),
-                    event_logger=_log_event,
-                    codex=bool(spec.backend_config.get("codex")),
-                    env=filter_otlp_env({**os.environ, **order.env}),
-                    refreshed_path=(lease.path.parent / ".factory-runtime/data/opencode/auth.json"
-                                    if worker_uid_drop else None),
-                )
-            else:
-                compute_result = await invoke_backend()
+            compute_result = await invoke_backend()
             # Gates (including reruns) can outlast the claim TTL independently
             # of the backend. Keep the claim alive through publication as well.
             result = await _heartbeat_while(
@@ -1596,7 +1589,7 @@ class WorklinkRunner:
                 )
                 transition_applied = True
                 terminal_release.label_transition_applied = True
-                terminal_release.retain_for_recovery = False
+                terminal_release.retain_for_recovery = retain_session
                 terminal_release()
             except Exception as transition_exc:
                 if (
@@ -1661,7 +1654,7 @@ class WorklinkRunner:
         finally:
             try:
                 try:
-                    if lease is not None and lease.isolated_checkout and not attempt_published:
+                    if lease is not None and lease.isolated_checkout and not attempt_published and not retain_session:
                         # Before capabilities close: the publication handle is the
                         # controller's only safe view of the worker's checkout.
                         await asyncio.to_thread(
@@ -1669,7 +1662,7 @@ class WorklinkRunner:
                             claims, lease, publication, preserve_reason, runner,
                             config.defaults.preserved_attempts_keep,
                         )
-                    if executor_report_dir is not None:
+                    if executor_report_dir is not None and not retain_session:
                         # Worker cleanup needs the still-live checkout. Even a
                         # cancellation here must close capabilities below.
                         await _remove_executor_basetemp_best_effort(
@@ -1813,6 +1806,7 @@ class WorklinkRunner:
                 diff_stat="", commands=[], tests=None, pr_url=None,
                 status="stopped", base_ref=lease.local_base or lease.base_ref,
                 diff_observed=False, failure_reason=reason,
+                opencode_session_id=compute_result.handle.opencode_session_id if compute_result.handle else None,
             )
             evidence_path = _write_evidence(self.home, evidence)
             stop = ShutdownAbortRecord(
@@ -1919,6 +1913,8 @@ class WorklinkRunner:
                 compute=compute,
                 on_gate_launch=persist_gate_handle,
             )
+            observed = replace(observed, evidence=replace(
+                observed.evidence, opencode_session_id=raw.opencode_session_id))
             if snapshot is None:
                 return observed
             after = _gate_checkout_snapshot(
@@ -2282,6 +2278,10 @@ class WorklinkRunner:
             try:
                 quota_failure = selected_name == "opencode" and raw.backend_status == "quota_exhausted"
                 reset_at, reset_source = _worklink_quota_reset(self.home, raw.error or "") if quota_failure else (None, "")
+                if quota_failure and raw.retry_after_ms is not None:
+                    from datetime import timedelta
+                    reset_at = datetime.now(UTC) + timedelta(milliseconds=raw.retry_after_ms)
+                    reset_source = "provider.retryAfterMs"
                 incident = incident_owner.record(
                     producer="leaf_result",
                     home=self.home,
@@ -2634,7 +2634,15 @@ class WorklinkRunner:
             state.handle_identifier,
             state.process_start_ticks,
             state.shim_pid,
+            state.opencode_session_id,
+            state.launch_generation,
         )
+        if state.handle_substrate == "opencode_daemon":
+            from .compute import OpenCodeDaemonComputeBackend
+            from .worker_client import WorkerClient
+            compute = OpenCodeDaemonComputeBackend(client=WorkerClient.for_path_checkout(
+                Path(state.checkout), issue_id=state.issue_id, attempt=state.attempt,
+                run_uid=get_identities().worklink_uid))
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
         test_cmd = state.test_command
         _log_event(
@@ -2647,7 +2655,11 @@ class WorklinkRunner:
 
         lease: CheckoutLease | None = None
         try:
-            lease = _create_observation_worktree(
+            lease = CheckoutLease(
+                issue_id=issue_id, attempt=state.attempt, repo=self.repo, path=Path(state.checkout),
+                branch=state.branch, base_ref=state.base_ref, local_base=state.local_base,
+                isolated_checkout=True, worker_authorized=True,
+            ) if state.handle_substrate == "opencode_daemon" else _create_observation_worktree(
                 self.repo,
                 issue_id=issue_id,
                 attempt=state.attempt,
@@ -2803,7 +2815,7 @@ class WorklinkRunner:
             raise
         finally:
             try:
-                if lease is not None:
+                if lease is not None and state.handle_substrate != "opencode_daemon":
                     try:
                         _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
                     except Exception as exc:  # noqa: BLE001 - teardown must continue
@@ -5967,6 +5979,8 @@ def _persist_run_state(
             backend=backend_name,
             compute_name=compute.name,
             handle_substrate=handle.substrate,
+            opencode_session_id=handle.opencode_session_id,
+            launch_generation=handle.launch_generation,
             handle_identifier=handle.identifier,
             branch=lease.branch,
             base_ref=lease.base_ref,

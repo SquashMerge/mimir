@@ -1359,7 +1359,7 @@ with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
 
 def toolchain_probe_environment(config) -> dict[str, str]:
     """Use the gate builder and persisted settings, never probe-only tool vars."""
-    from .worklink.backends.opencode import _permission_override, validate_test_env
+    from .worklink.backends.opencode import validate_test_env
     from .worklink.compute import WorkSpec, _enabled_child_env
 
     settings = config.backend_settings.get('opencode', {})
@@ -1367,8 +1367,7 @@ def toolchain_probe_environment(config) -> dict[str, str]:
     validate_test_env(test_env)
     spec = WorkSpec(issue_id=0, attempt=1, repo_url='', base_ref='', branch='',
                     prompt='', rules=None, test_command='', backend='opencode', timeout_s=30,
-                    env={'OPENCODE_PERMISSION': _permission_override(settings.get('bash_allowlist', [])),
-                         **test_env}, backend_config={'pass_env': tuple(test_env)})
+                    env=dict(test_env), backend_config={'pass_env': tuple(test_env)})
     return _enabled_child_env(spec, 'setup-toolchain-probe')
 
 
@@ -1403,6 +1402,36 @@ def _verify_system_packages(deploy: Path, packages: list[str]) -> None:
             status = ""
         if status != "install ok installed":
             raise SetupError(f"System package verification failed (system_package_missing: {name}); rebuild the agent image and check its package installation.")
+
+
+_OPENCODE_DAEMON_PROBE = """\
+import json
+import os
+from mimir.worklink_daemon_activation import ActivationError, resolve_activation
+try:
+ activation = resolve_activation(dict(os.environ))
+ if not activation.enabled:
+  result = {'ok': True, 'daemon_enabled': False}
+ else:
+  from mimir_cultivate.opencode import resolve_daemon_model
+  from mimir_cultivate.worklink.daemon_gate import wait_for_daemon
+  resolve_daemon_model(dict(os.environ))
+  health = wait_for_daemon(dict(os.environ))
+  result = {'ok': health.get('ok') is True, 'daemon_enabled': True}
+except (ActivationError, ValueError, OSError):
+ result = {'ok': False, 'daemon_enabled': True}
+print(json.dumps(result))
+"""
+
+
+def _verify_opencode_daemon(deploy: Path) -> None:
+    try:
+        state = json.loads(_agent_exec(deploy, "python", "-c", _OPENCODE_DAEMON_PROBE))
+    except (ValueError, TypeError):
+        state = {}
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        raise SetupError("OpenCode daemon verification failed; inspect installation, readiness, native login and stale bot-token health. "
+                         "Native login: docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
 
 
 def _verify_opencode_binary(deploy: Path) -> str:
@@ -1519,24 +1548,7 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, versi
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
     _verify_toolchain(deploy, kind, version)
     _verify_system_packages(deploy, system_packages or [])
-    binary = _verify_opencode_binary(deploy)
-    # Run in the agent container with its actual HOME, config and compose env.
-    # Only a stable reason code crosses the Docker boundary, never the bundle.
-    auth_check = _agent_exec(deploy, "python", "-c",
-        "from mimir_cultivate.opencode import resolve_opencode_invocation, OpenCodeAuthError, OpenCodeConfigError\n"
-        "try:\n resolve_opencode_invocation()\n print('ok')\n"
-        "except (OpenCodeAuthError, OpenCodeConfigError) as exc:\n print(exc.reason_code)")
-    if auth_check != "ok":
-        raise SetupError(
-            "OpenCode credential resolution failed (" + (
-                auth_check if auth_check in {"auth_missing", "auth_invalid", "auth_malformed", "auth_unreadable"}
-                else "unavailable"
-            ) + "); check the agent container's model API key or Codex OAuth login and OpenCode config."
-        )
-    model = _agent_exec(deploy, "python", "-c",
-        "from mimir_cultivate.opencode import resolve_opencode_invocation; "
-        "print(resolve_opencode_invocation().model)")
-    _verify_opencode_model(deploy, binary, model)
+    _verify_opencode_daemon(deploy)
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}

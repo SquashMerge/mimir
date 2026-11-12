@@ -166,15 +166,26 @@ class OpenCodeDaemonComputeBackend:
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
         if spec.session_request is None:
             raise ComputeLaunchError("daemon compute requires a typed session request")
+        if getattr(self._client, "checkout", False) is None and getattr(self._client, "path_checkout", False) is None:
+            if spec.local_checkout is None:
+                raise ComputeLaunchError("daemon compute requires a checkout")
+            from .worker_client import WorkerClient
+            from .identities import get_identities
+            self._client = WorkerClient.for_path_checkout(
+                spec.local_checkout, issue_id=spec.issue_id, attempt=spec.attempt,
+                run_uid=get_identities().worklink_uid)
         requested = spec.backend_config.get("pass_env", ())
         if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
             raise ComputeLaunchError("session pass_env must be a sequence")
         deadline = asyncio.get_running_loop().time() + spec.timeout_s
-        handle = await self._client.session_create(
-            spec.session_request, timeout_s=spec.timeout_s,
-            pass_env={name: spec.env[name] for name in requested if name in spec.env},
-            git_settings=spec.factory_credential_settings,
-        )
+        try:
+            handle = await self._client.session_create(
+                spec.session_request, timeout_s=spec.timeout_s,
+                pass_env={name: spec.env[name] for name in requested if name in spec.env},
+                git_settings=spec.factory_credential_settings,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ComputeLaunchError("OpenCode daemon session admission unavailable") from exc
         self._deadlines[handle.identifier] = deadline
         return handle
 
