@@ -545,7 +545,13 @@ async def _executor_operation(request: dict) -> dict:
     root = Path(DAEMON_ROOT) / "sessions"
     lock = os.open(root / f"{key}.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        recovering_admission = request["op"] == "session_observe" and request["opencode_session_id"] is None
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if recovering_admission:
+                return {"admission_state": "busy"}
+            raise
         async with OpenCodeDaemonClient(base_url=api["url"], username=api["username"], password=api["password"], timeout=5) as client:
             path = root / f"{key}.json"
             checkout = Path(request["path"])
@@ -553,10 +559,22 @@ async def _executor_operation(request: dict) -> dict:
             if (info.st_dev, info.st_ino) != (request["device"], request["inode"]):
                 raise ValueError("session checkout identity changed")
             home = root / f"{key}.home"
+            if recovering_admission:
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    return {"admission_state": "absent"}
+                controller = SessionController.recover(client, path, generation=request["generation"], checkout=checkout)
+                if (controller.record.issue_id, controller.record.attempt) != (request["issue"], request["attempt"]):
+                    raise ValueError("session attempt mismatch")
+                return {"admission_state": "retained", "opencode_session_id": controller.record.opencode_session_id}
             if request["op"] == "session_create":
                 launch = read_json(paths.daemon / "launch.json", uid=identities.worklink_uid, mode=0o600)
                 if launch.get("launch_generation") != request["generation"]:
                     raise ValueError("session daemon generation is stale")
+                if path.exists():
+                    retained = SessionController.recover(client, path, generation=request["generation"], checkout=checkout)
+                    return {"admission_state": "conflict", "opencode_session_id": retained.record.opencode_session_id}
                 home.mkdir(mode=0o700, exist_ok=True)
                 (home / "tmp").mkdir(mode=0o700, exist_ok=True)
                 env = session_environment(request["pass_env"], home=home, git_settings=request["git_settings"],

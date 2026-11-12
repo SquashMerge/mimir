@@ -22,7 +22,7 @@ SITES = {
     ("control.py", "cancel_owned_session", "backend.cancel"): (1, "operator stop uses owned session identity and verified cancellation"),
     ("evidence.py", "_run_compute_gate", "compute.cancel"): (2, "leaf evidence gate, not a factory handle"),
     ("orchestrator.py", "reattach", "LocalSubprocessComputeBackend().cancel"): (1, "explicit leaf reattach stop"),
-    ("orchestrator.py", "reattach", "compute.cancel"): (1, "reattached owned session must be quiescent before release"),
+    ("orchestrator.py", "reattach", "compute.cancel"): (2, "owned session must be quiescent before release, including after failure removed in-progress"),
     ("orchestrator.py", "_finalize", "compute.cancel"): (1, "CI repair session release requires owned-session quiescence"),
     ("orchestrator.py", "_run_factory_070_locked", "_cancel_and_cleanup_factory_handle"): (1, "factory record save failed immediately after launch; containment refused"),
     ("orchestrator.py", "_recover_factory_070", "_cancel_and_cleanup_factory_handle"): (2, "factory terminal declared or resumed launch record save refused"),

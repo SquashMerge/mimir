@@ -1080,7 +1080,7 @@ async def _spawn_open_code_impl(
     )
     from mimir.otel_credentials import is_sensitive_otlp_env
     for key, value in os.environ.items():
-        if value and is_sensitive_otlp_env(key, value):
+        if value and (is_sensitive_otlp_env(key, value) or key in {"GH_TOKEN", "GITHUB_TOKEN"}):
             scrubber.add_scalar(value)
     selected_artifact_root = Path(
         artifact_root or cfg.get("artifact_root") or (home / ".factory" / "runs")
@@ -1124,6 +1124,17 @@ async def _spawn_open_code_impl(
     seed_tree = None
     retain_checkout = False
     session_id = None
+    launch_generation = None
+
+    def admitted(handle) -> None:
+        nonlocal session_id, launch_generation
+        session_id = handle.opencode_session_id
+        launch_generation = handle.launch_generation
+
+    def quiescent() -> None:
+        nonlocal retain_checkout
+        retain_checkout = False
+
     try:
         try:
             reference = resolve_daemon_model(dict(os.environ), model)
@@ -1202,6 +1213,7 @@ async def _spawn_open_code_impl(
                     execution = await contained_runner(
                         checkout.capability, request, timeout_s=timeout_s,
                         stdout_limit=1024 * 1024,
+                        on_session=admitted, on_quiescence=quiescent,
                     )
                     session_id = execution.handle.opencode_session_id if execution.handle else None
                     retain_checkout = False
@@ -1211,6 +1223,12 @@ async def _spawn_open_code_impl(
                 retain_checkout = False
                 terminal = classify_spawn_terminal_state(containment_available=False)
             except (OSError, RuntimeError) as exc:
+                from .worklink.backends.base import SessionAdmissionError
+                if isinstance(exc, SessionAdmissionError):
+                    retain_checkout = exc.uncertain and not exc.quiescent
+                    launch_generation = exc.launch_generation
+                    if exc.handle is not None:
+                        session_id = exc.handle.opencode_session_id
                 if isinstance(exc, contained_execution.SessionCleanupError):
                     session_id = exc.handle.opencode_session_id
                 terminal = classify_spawn_terminal_state(containment_available=False)
@@ -1230,9 +1248,14 @@ async def _spawn_open_code_impl(
                 proposal_result=proposal_result,
             )
     except BaseException as exc:
+        from .worklink.backends.base import SessionAdmissionCancelled
+        if isinstance(exc, SessionAdmissionCancelled):
+            retain_checkout = exc.uncertain
+            launch_generation = exc.launch_generation
         if isinstance(exc, contained_execution.SessionCancelledError):
             session_id = exc.handle.opencode_session_id
             retain_checkout = not exc.verified
+        if session_id is not None or retain_checkout:
             descriptor = os.open("manifest.json", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
                                  dir_fd=artifact_directory_fd)
             try:
@@ -1240,12 +1263,14 @@ async def _spawn_open_code_impl(
                     json.dump({"schema_version": 2, "run_id": run_id, "launcher": "mimir.spawn_open_code",
                                "status": "interrupted", "reason_code": "cancelled",
                                "opencode_session_id": session_id,
-                               "cancellation_state": "verified" if exc.verified else "unverified"}, stream)
+                               "launch_generation": launch_generation,
+                               "admission_state": "uncertain" if session_id is None else "admitted",
+                               "cancellation_state": "unverified" if retain_checkout else "verified"}, stream)
             finally:
                 os.close(descriptor)
         os.close(artifact_directory_fd)
         artifact_directory_fd = -1
-        if execution is None and session_id is None:
+        if execution is None and session_id is None and not retain_checkout:
             await _spawn_release_rate_slot(guard, rate_token)
         raise
     finally:
@@ -1263,7 +1288,7 @@ async def _spawn_open_code_impl(
                 log.warning("spawn_open_code cleanup failed")
 
     assert terminal is not None
-    if execution is None and session_id is None:
+    if execution is None and session_id is None and not retain_checkout:
         await _spawn_release_rate_slot(guard, rate_token)
     manifest = {
         "schema_version": 2, "run_id": run_id, "launcher": "mimir.spawn_open_code",
@@ -1277,6 +1302,8 @@ async def _spawn_open_code_impl(
         "stdout_dropped_bytes": 0,
         "stderr_dropped_bytes": 0,
         "opencode_session_id": session_id,
+        "launch_generation": launch_generation,
+        "admission_state": "uncertain" if retain_checkout and session_id is None else "admitted" if session_id else "refused",
     }
     artifact_handle = run_id
     try:

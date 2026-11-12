@@ -57,7 +57,8 @@ def spawn_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, P
     seed.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "refresh-" + "secret")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "telemetry-" + "canary")
+    monkeypatch.setenv("GITHUB_TOKEN", "refresh-" + "secret")
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
@@ -139,7 +140,10 @@ async def test_run_uses_fresh_checkout_and_typed_session_without_oauth_projectio
     assert record["request"].agent == "build"
     assert record["request"].spawn_depth == 1
     assert record["request"].shell_allowlist == ()
-    assert record["kwargs"] == {"timeout_s": 30, "stdout_limit": 1024 * 1024}
+    assert record["kwargs"]["timeout_s"] == 30
+    assert record["kwargs"]["stdout_limit"] == 1024 * 1024
+    assert callable(record["kwargs"]["on_session"])
+    assert callable(record["kwargs"]["on_quiescence"])
     assert "refresh-secret" not in repr(record["request"])
     assert record["checkout"].closed
 
@@ -442,16 +446,15 @@ async def test_sensitive_material_absent_from_real_event_logger_and_caplog(
     home, seed = spawn_tree
     auth_path = home / ".local/share/opencode/auth.json"
     config_path = home / ".config/opencode/opencode.jsonc"
-    credential = b"opaque " + b"header 47!"
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", credential.decode())
-    auth_path.write_bytes(json.dumps({
-        "openai": {"type": "oauth", "refresh": credential.decode()}
-    }).encode())
+    credential = b"opaque " + b"publishing 47!"
+    telemetry = b"distinct " + b"header 48!"
+    monkeypatch.setenv("GITHUB_TOKEN", credential.decode())
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", telemetry.decode())
     event_path = tmp_path / "events.jsonl"
     event_logger._reset_logger_for_tests()
     event_logger.init_logger(event_path, "spawn-sensitive-test")
     record = {}
-    emitted = b" | ".join((credential, os.fsencode(auth_path), os.fsencode(config_path)))
+    emitted = b" | ".join((credential, telemetry, os.fsencode(auth_path), os.fsencode(config_path)))
     caplog.clear()
     try:
         payload = await invoke(
@@ -470,7 +473,7 @@ async def test_sensitive_material_absent_from_real_event_logger_and_caplog(
             *(path.read_bytes() for path in artifact.iterdir()),
         ]
         assert b"spawn_open_code_completed" in event_bytes
-        for sensitive in (credential, os.fsencode(auth_path), os.fsencode(config_path)):
+        for sensitive in (credential, telemetry, os.fsencode(auth_path), os.fsencode(config_path)):
             assert all(sensitive not in sink for sink in observed_sinks)
     finally:
         event_logger._reset_logger_for_tests()
@@ -730,7 +733,8 @@ async def test_terminal_state_contract(
             raise error
     elif case == "containment":
         async def runner(*args, **kwargs):
-            raise OSError("socket")
+            from mimir_cultivate.worklink.backends.base import SessionAdmissionError
+            raise SessionAdmissionError(uncertain=False)
     elif case in {"timeout", "overflow", "auth_worker", "failed"}:
         values = {
             "timeout": (None, False, True, b""),
@@ -789,9 +793,7 @@ async def test_terminal_state_contract(
         "reason_code": reason,
     })]
     if case == "containment":
-        expected_events.insert(0, ("spawn_open_code_cleanup_failed", {
-            "run_id": payload["run_id"], "reason_code": "cleanup_failed"}))
-        assert record["checkout"].retained
+        assert not record["checkout"].retained
     assert events == expected_events
     artifact = tmp_path / "home/artifacts" / payload["artifact_dir"]
     expected_artifacts = {"prompt.md", "stdout.txt", "stderr.txt", "manifest.json"}
@@ -986,3 +988,45 @@ async def test_cleanup_failure_does_not_mutate_terminal_result(
     assert payload["status"] == "succeeded"
     assert events[0][0] == "spawn_open_code_cleanup_failed"
     assert events[-1][0] == "spawn_open_code_completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_admission_refusal_only_retains_uncertain_checkout(spawn_tree, tmp_path, uncertain):
+    from mimir_cultivate.worklink.backends.base import SessionAdmissionError
+
+    home, seed = spawn_tree
+    record = {}
+    from mimir.tools import registry
+    guard = registry._spawn_guard_init()
+
+    async def runner(*args, **kwargs):
+        raise SessionAdmissionError(uncertain=uncertain, generation="generation")
+
+    payload = await invoke(seed, tmp_path, record, runner=runner)
+    assert record["checkout"].retained is uncertain
+    assert payload["opencode_session_id"] is None
+    manifest = json.loads((home / "artifacts" / payload["artifact_dir"] / "manifest.json").read_text())
+    assert manifest["admission_state"] == ("uncertain" if uncertain else "refused")
+    assert manifest["launch_generation"] == "generation"
+    assert len(guard.recent) == int(uncertain)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quiescent", [False, True])
+async def test_known_handle_exception_keeps_spawn_evidence(spawn_tree, tmp_path, quiescent):
+    home, seed = spawn_tree
+    record = {}
+
+    async def runner(*args, **kwargs):
+        kwargs["on_session"](LaunchHandle("opencode_daemon", "ses_current",
+                                         opencode_session_id="ses_current", launch_generation="generation"))
+        if quiescent:
+            kwargs["on_quiescence"]()
+        raise RuntimeError("ordinary failure after admission")
+
+    payload = await invoke(seed, tmp_path, record, runner=runner)
+    assert payload["opencode_session_id"] == "ses_current"
+    assert record["checkout"].retained is not quiescent
+    manifest = json.loads((home / "artifacts" / payload["artifact_dir"] / "manifest.json").read_text())
+    assert manifest["opencode_session_id"] == "ses_current"

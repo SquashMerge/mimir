@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from dataclasses import replace
 
 import pytest
@@ -218,3 +219,197 @@ async def test_lost_prompt_ack_recovers_same_leaf_without_replay(tmp_path):
         _, _, raw = await leaf(tmp_path, daemon, client)
         assert raw.backend_status == "success"
         assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == 1
+
+
+class AdmissionBoundary(SessionBoundary):
+    """Lose only the local executor acknowledgement, after real HTTP admission."""
+
+    def __init__(self, *args, lost_ack=False):
+        super().__init__(*args)
+        self.admitted = asyncio.Event()
+        self.acknowledge = asyncio.Event()
+        self.lost_ack = lost_ack
+        self.recoveries = 0
+        self.creates = 0
+        self.pause_after = 1
+
+    async def session_create(self, request, **kwargs):
+        from mimir_cultivate.worklink.worker_client import WorkerClient
+        return await WorkerClient.session_create(self, request, **kwargs)
+
+    def _admission_handle(self, response, generation):
+        from mimir_cultivate.worklink.worker_client import WorkerClient
+        return WorkerClient._admission_handle(response, generation)
+
+    async def session_recover_admission(self, generation):
+        from mimir_cultivate.worklink.worker_client import WorkerClient
+        return await WorkerClient.session_recover_admission(self, generation)
+
+    async def _session_rpc(self, operation, payload):
+        if operation == "session_create":
+            request = SessionRequest(**payload["request"])
+            handle = await super().session_create(request, timeout_s=payload["timeout_s"])
+            self.creates += 1
+            self.finish = True
+            if self.creates != self.pause_after:
+                return {"opencode_session_id": handle.identifier}
+            self.admitted.set()
+            await self.acknowledge.wait()
+            if self.lost_ack:
+                raise RuntimeError("local acknowledgement lost")
+            return {"opencode_session_id": handle.identifier}
+        assert operation == "session_observe" and payload["opencode_session_id"] is None
+        self.recoveries += 1
+        return {"admission_state": "retained", "opencode_session_id": self.controller.record.opencode_session_id}
+
+
+@pytest.mark.parametrize("consumer", ["leaf", "repair", "spawn"])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_admission_ack_window_keeps_owned_identity(tmp_path, monkeypatch, consumer, cancelled):
+    from types import SimpleNamespace
+    from mimir_cultivate import contained_execution
+    from mimir_cultivate.worklink.backends.base import SessionAdmissionCancelled
+
+    monkeypatch.setattr("mimir_cultivate.worklink.daemon_health.daemon_health",
+                        lambda env: {"ok": True, "launch_generation": "generation"})
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        boundary = AdmissionBoundary(daemon, client, tmp_path, lost_ack=True)
+        compute = OpenCodeDaemonComputeBackend(client=boundary)
+        order = WorkOrder(2125, tmp_path, "repair" if consumer == "repair" else "build", None, 30,
+                          transcript_root=tmp_path / "transcripts")
+        spec = OpenCodeBackend(bash_allowlist=("git *", "uv *")).work_spec(
+            order, attempt=1, repo_url="repo", base_ref="main", branch="issue/2125-a1", test_command="uv run pytest")
+        observed = []
+        if consumer == "spawn":
+            invocation = contained_execution.execute_contained_session(
+                SimpleNamespace(_contained_worker_client=boundary),
+                replace(spec.session_request, kind="spawn", shell_allowlist=()), timeout_s=30,
+                on_session=observed.append)
+        else:
+            invocation = compute.launch(spec)
+        task = asyncio.create_task(invocation)
+        await asyncio.wait_for(boundary.admitted.wait(), 5)
+        sid = boundary.controller.record.opencode_session_id
+        if cancelled:
+            task.cancel()
+        boundary.acknowledge.set()
+        if cancelled:
+            expected = contained_execution.SessionCancelledError if consumer == "spawn" else SessionAdmissionCancelled
+            with pytest.raises(expected) as caught:
+                await task
+            assert caught.value.handle.opencode_session_id == sid
+            assert boundary.controller.record.cancellation_state == "verified"
+            assert not boundary.controller.path.exists()
+        else:
+            result = await task
+            handle = result.handle if consumer == "spawn" else result
+            assert handle.opencode_session_id == sid
+            if consumer != "spawn":
+                await compute.cancel(handle)
+                await compute.cleanup(handle)
+        assert boundary.recoveries == 1
+        assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == 1
+        assert len(daemon.sessions) == 1
+
+
+async def test_controller_redacts_current_api_and_publishing_credentials(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        boundary = SessionBoundary(daemon, client, tmp_path)
+        request = SessionRequest("spawn", {"providerID": "openai", "id": "gpt-test"}, "build")
+        handle = await boundary.session_create(request, timeout_s=30)
+        api_secret = "current-" + "api-credential"
+        bot_secret = "current-" + "publishing-credential"
+        boundary.controller.sensitive_values = (api_secret, bot_secret)
+        boundary.text = api_secret + " " + bot_secret
+        boundary.error = {"type": "future." + api_secret, "message": bot_secret,
+                          "response": {"body": boundary.text}}
+        outcome = await boundary.session_observe(handle)
+        from dataclasses import asdict
+        for secret in (api_secret, bot_secret):
+            assert secret not in json.dumps(asdict(outcome))
+            assert secret not in boundary.controller.path.read_text()
+
+
+@pytest.mark.parametrize("phase, failure", [("initial", "cancel"), ("repair", "cancel"),
+                                            ("repair", "lost_ack"), ("repair", "exception")])
+async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path, monkeypatch, phase, failure):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink import orchestrator as orch
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+    from mimir_cultivate.worklink.checkout import CheckoutLease
+    from mimir_cultivate.worklink.evidence import EvidenceValidation, WorklinkEvidence
+    from mimir_cultivate.worklink.run_state import load_run_state
+    from tests.test_worklink_orchestrator import _orchestrator_runner
+
+    repo, checkout = tmp_path / "repo", tmp_path / "checkout"
+    checkout.mkdir()
+    _, runner = _orchestrator_runner(repo, checkout)
+    monkeypatch.setattr(orch, "_cultivate_selected", lambda: False)
+    monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:
+                        CheckoutLease(441, 1, repo, checkout, "issue/441-a1", "main", isolated_checkout=True))
+    monkeypatch.setattr(orch.WorklinkRunner, "_preserve_unpublished_attempt", lambda *args: None)
+    monkeypatch.setattr("mimir_cultivate.worklink.daemon_health.daemon_health",
+                        lambda env: {"ok": True, "launch_generation": "generation"})
+    monkeypatch.setattr(orch.RepositoryInventory, "load", lambda *args: SimpleNamespace(
+        declared=True, repository=lambda slug: SimpleNamespace(worklink_gate="ci", quick_gate_command="uv run pytest",
+                                                               base_branch="main")))
+    monkeypatch.setattr(orch, "_gate_checkout_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_with_outside_checkout_detection", lambda validation, **kwargs: validation)
+    for name in ("_commit_checkout_changes", "_ensure_clean_checkout", "_git_push"):
+        monkeypatch.setattr(orch, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_open_pr", lambda *args, **kwargs: "https://github.com/owner/repo/pull/1")
+    monkeypatch.setattr(orch, "_repo_slug", lambda *args, **kwargs: "owner/repo")
+    monkeypatch.setattr(orch, "_with_head_sha", lambda validation, *args, **kwargs: validation)
+
+    async def observe(**kwargs):
+        return EvidenceValidation("completed", True, (), WorklinkEvidence(
+            issue=441, attempt=1, backend="opencode", branch="issue/441-a1", checkout=str(checkout),
+            started_at="2026-11-12T00:00:00+00:00", finished_at="2026-11-12T00:00:01+00:00",
+            files_changed=["changed.py"], diff_stat="changed", commands=[], tests=None,
+            pr_url=None, status="completed", head_sha="abc123"))
+
+    async def red_ci(*args, **kwargs):
+        return SimpleNamespace(outcome="red", reason="test failed", excerpt="bounded log")
+
+    monkeypatch.setattr(orch, "observe_evidence", observe)
+    monkeypatch.setattr(orch, "wait_for_ci", red_ci)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        boundary = AdmissionBoundary(daemon, client, checkout, lost_ack=failure == "lost_ack")
+        boundary.pause_after = 1 if phase == "initial" else 2
+        compute = OpenCodeDaemonComputeBackend(client=boundary)
+        monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: compute)
+        backend = OpenCodeBackend(bash_allowlist=("git *", "uv *"))
+        original_interpret = backend.interpret
+
+        async def interpret(self, order, result):
+            if boundary.creates == 2 and failure == "exception":
+                raise RuntimeError("ordinary finalization failure")
+            return await original_interpret(order, result)
+
+        monkeypatch.setattr(OpenCodeBackend, "interpret", interpret)
+        registry = BackendRegistry(WorklinkConfig())
+        registry.register(backend)
+        task = asyncio.create_task(orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner,
+                                                       registry=registry).run(441, backend_name="opencode"))
+        admitted = asyncio.create_task(boundary.admitted.wait())
+        done, _ = await asyncio.wait((task, admitted), timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        assert admitted in done, task.result() if task.done() else "admission did not complete"
+        sid = boundary.controller.record.opencode_session_id
+        assert boundary.creates == (1 if phase == "initial" else 2)
+        if failure == "cancel":
+            task.cancel()
+        boundary.acknowledge.set()
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await task
+            assert result.status == "failed"
+        evidence_files = list((tmp_path / "state/worklink/evidence").rglob("*.json"))
+        assert evidence_files
+        evidence = json.loads(evidence_files[-1].read_text())
+        assert evidence["opencode_session_id"] == sid
+        state = load_run_state(tmp_path, 441)
+        if state is not None:
+            assert state.opencode_session_id == sid
+        assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == boundary.creates

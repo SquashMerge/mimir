@@ -222,7 +222,10 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     async def runner(directory, request, **kwargs):
         calls["requests"].append(request)
-        assert kwargs == {"timeout_s": 1800, "stdout_limit": 1024 * 1024}
+        assert kwargs["timeout_s"] == 1800
+        assert kwargs["stdout_limit"] == 1024 * 1024
+        assert callable(kwargs["on_session"])
+        assert callable(kwargs["on_quiescence"])
         handle = LaunchHandle("opencode_daemon", "ses_depth", opencode_session_id="ses_depth", launch_generation="generation")
         return ComputeResult(0, "", "", handle=handle,
                              session_outcome=SessionOutcome(handle.identifier, "succeeded"))

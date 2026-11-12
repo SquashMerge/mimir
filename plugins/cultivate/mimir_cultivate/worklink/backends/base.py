@@ -8,6 +8,7 @@ evidence validation, and state transitions stay in shared Worklink plumbing.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -16,6 +17,27 @@ from typing import Any, Mapping, Protocol, Sequence
 
 class SessionTransportLostError(RuntimeError):
     """Observation can reconnect to the durable session, without readmission."""
+
+
+class SessionAdmissionError(RuntimeError):
+    def __init__(self, *, uncertain: bool, generation: str | None = None,
+                 handle: LaunchHandle | None = None) -> None:
+        super().__init__("OpenCode admission uncertain; retain recovery state" if uncertain
+                         else "OpenCode daemon admission unavailable")
+        self.uncertain = uncertain
+        self.launch_generation = generation
+        self.handle = handle
+        self.quiescent = False
+
+
+class SessionAdmissionCancelled(asyncio.CancelledError):
+    def __init__(self, handle: LaunchHandle | None, *, uncertain: bool = False,
+                 generation: str | None = None) -> None:
+        super().__init__("OpenCode admission cancelled")
+        self.handle = handle
+        self.uncertain = uncertain
+        self.launch_generation = handle.launch_generation if handle else generation
+        self.quiescent = False
 
 
 @dataclass(frozen=True)

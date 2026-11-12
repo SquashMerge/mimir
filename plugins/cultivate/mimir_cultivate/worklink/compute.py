@@ -150,6 +150,29 @@ class ComputeCleanupError(RuntimeError):
         self.handle = handle
 
 
+async def admit_session(client: WorkerClient, request: SessionRequest, **kwargs: Any) -> LaunchHandle:
+    """Settle the one admission request before cancellation can lose its identity."""
+    from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
+    pending = asyncio.create_task(client.session_create(request, **kwargs))
+    cancelled = False
+    while True:
+        try:
+            handle = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            if pending.cancelled():
+                raise SessionAdmissionCancelled(None, uncertain=True) from None
+            cancelled = True
+            continue
+        except SessionAdmissionError as exc:
+            if cancelled:
+                raise SessionAdmissionCancelled(exc.handle, uncertain=exc.uncertain,
+                                                generation=exc.launch_generation) from None
+            raise
+        if cancelled:
+            raise SessionAdmissionCancelled(handle) from None
+        return handle
+
+
 class OpenCodeDaemonComputeBackend:
     """Session identity and authoritative outcomes, not helper PIDs or exits."""
 
@@ -170,7 +193,11 @@ class OpenCodeDaemonComputeBackend:
     def capabilities(self) -> ComputeCaps:
         return ComputeCaps(True, False, True, True)
 
+    async def recover_admission(self, generation: str) -> LaunchHandle | None:
+        return await self._client.session_recover_admission(generation)
+
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
+        from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
         if spec.session_request is None:
             raise ComputeLaunchError("daemon compute requires a typed session request")
         from .worker_client import WorkerClient
@@ -208,11 +235,20 @@ class OpenCodeDaemonComputeBackend:
             raise ComputeLaunchError("session environment refused") from exc
         deadline = asyncio.get_running_loop().time() + spec.timeout_s
         try:
-            handle = await self._client.session_create(
+            handle = await admit_session(self._client,
                 spec.session_request, timeout_s=spec.timeout_s,
                 pass_env=pass_env,
                 git_settings=spec.factory_credential_settings,
             )
+        except (SessionAdmissionCancelled, SessionAdmissionError) as exc:
+            if exc.handle is not None:
+                try:
+                    await asyncio.shield(self.cancel(exc.handle))
+                    await asyncio.shield(self.cleanup(exc.handle))
+                    exc.quiescent = True
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            raise
         except (OSError, RuntimeError, ValueError) as exc:
             raise ComputeLaunchError("OpenCode daemon session admission unavailable") from exc
         self._deadlines[handle.identifier] = deadline

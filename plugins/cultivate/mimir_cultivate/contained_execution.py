@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from mimir.output_capture import OutputSink, open_output_pair
 
@@ -229,34 +229,58 @@ def _worker_classes() -> tuple[Any, Any]:
 
 async def execute_contained_session(directory: CheckoutCapability, request: Any, *,
                                     timeout_s: int, pass_env: Mapping[str, str] | None = None,
-                                    stdout_limit: int = 1024 * 1024) -> Any:
+                                    stdout_limit: int = 1024 * 1024,
+                                    on_session: Callable[[Any], None] | None = None,
+                                    on_quiescence: Callable[[], None] | None = None) -> Any:
     """Use the shared daemon substrate without changing generic process dispatch."""
-    from .worklink.compute import OpenCodeDaemonComputeBackend
+    from .worklink.compute import OpenCodeDaemonComputeBackend, admit_session
+    from .worklink.backends.base import SessionAdmissionCancelled, SessionAdmissionError
 
     client_class, _ = _worker_classes()
     client = getattr(directory, "_contained_worker_client", None) or client_class(directory)
     backend = OpenCodeDaemonComputeBackend(client=client, stdout_limit=stdout_limit)
-    handle = await client.session_create(request, timeout_s=timeout_s, pass_env=dict(pass_env or {}))
+    handle = None
     try:
+        try:
+            handle = await admit_session(client, request, timeout_s=timeout_s, pass_env=dict(pass_env or {}))
+        except (SessionAdmissionCancelled, SessionAdmissionError) as exc:
+            handle = exc.handle
+            if handle is not None and on_session is not None:
+                on_session(handle)
+            raise
+        if on_session is not None:
+            on_session(handle)
         result = await backend.wait(handle, timeout_s)
     except asyncio.CancelledError:
+        if handle is None:
+            raise
         verified = False
         try:
             await asyncio.shield(backend.cancel(handle))
             await asyncio.shield(backend.cleanup(handle))
             verified = True
+            if on_quiescence is not None:
+                on_quiescence()
         except (OSError, RuntimeError, ValueError):
             pass
         raise SessionCancelledError(handle, verified) from None
-    except BaseException:
+    except BaseException as failure:
+        if handle is None:
+            raise
         try:
             await asyncio.shield(backend.cancel(handle))
             await asyncio.shield(backend.cleanup(handle))
+            if isinstance(failure, SessionAdmissionError):
+                failure.quiescent = True
+            if on_quiescence is not None:
+                on_quiescence()
         except (OSError, RuntimeError, ValueError) as exc:
             raise SessionCleanupError(handle) from exc
         raise
     try:
         await asyncio.shield(backend.cleanup(handle))
+        if on_quiescence is not None:
+            on_quiescence()
     except (OSError, RuntimeError, ValueError) as exc:
         raise SessionCleanupError(handle) from exc
     return result

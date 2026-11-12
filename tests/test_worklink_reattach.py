@@ -275,6 +275,98 @@ def test_run_state_roundtrip(tmp_path: Path) -> None:
     clear_run_state(tmp_path, 561)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["terminal", "interrupted", "failed"])
+async def test_failed_leaf_reattach_retains_until_real_session_quiescence(tmp_path, monkeypatch, recovery):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / ".worklink/repo/561-1"
+    checkout.mkdir(parents=True)
+    calls = []
+    labels = ["worklink:in-progress"]
+    runner = _remote_runner(repo, calls, issue_id=561, labels=labels)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await SessionController.create(
+            client, tmp_path / "controller.json",
+            request=SessionRequest("leaf", {"providerID": "openai", "id": "gpt-test"}, "build", ("git *",)),
+            issue_id=561, attempt=1, generation="generation", checkout=checkout,
+            environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+        sid = controller.record.opencode_session_id
+
+        class Boundary:
+            async def session_observe(self, handle):
+                if recovery == "interrupted":
+                    raise asyncio.CancelledError("reattach interrupted")
+                raise AssertionError("reattach observation failed")
+
+            async def session_cancel(self, handle):
+                assert (handle.identifier, handle.launch_generation) == (sid, "generation")
+                if not await controller.cancel(timeout_s=0.5):
+                    raise RuntimeError("unverified cancellation")
+
+            async def session_release(self, handle):
+                await controller.release()
+
+        boundary = Boundary()
+        monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *args, **kwargs: boundary)
+        registry = BackendRegistry(WorklinkConfig())
+        registry.register(OpenCodeBackend(bash_allowlist=("git *",)))
+        registry.register_compute(OpenCodeDaemonComputeBackend(client=boundary))
+        state = WorklinkRunState(
+            issue_id=561, attempt=1, backend="opencode", compute_name="opencode_daemon",
+            handle_substrate="opencode_daemon", handle_identifier=sid, branch="issue/561-a1",
+            base_ref="main", local_base="main", repo=str(repo), repo_url="repo", test_command=None,
+            started_at="2026-06-18T16:00:00+00:00", checkout=str(checkout),
+            opencode_session_id=sid, launch_generation="generation")
+        save_run_state(tmp_path, state)
+        claims = ChainlinkClaims(chainlink_bin="chainlink", agent_id="test", runner=lambda args: runner(args))
+        claims.transition_issue(561, status="failed", review_ready=False, attempt=1, reason="cleanup unverified")
+        labels[:] = ["worklink:failed"]
+        daemon.interrupt_noop = True
+        result = await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+        assert result.reason == "session quiescence unverified; recovery retained"
+        assert load_run_state(tmp_path, 561) == state
+        assert checkout.exists() and controller.path.exists()
+        assert ["chainlink", "locks", "release", "561"] not in calls
+        assert json.loads(result.evidence_path.read_text())["opencode_session_id"] == sid
+
+        daemon.interrupt_noop = False
+        if recovery != "terminal":
+            labels[:] = ["worklink:in-progress"]
+            from mimir_cultivate.worklink import orchestrator
+            monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture",
+                                lambda *args: SimpleNamespace(close=lambda: None))
+            if recovery == "interrupted":
+                with pytest.raises(asyncio.CancelledError):
+                    await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+                evidence = json.loads(result.evidence_path.read_text())
+                assert evidence["status"] == "interrupted"
+            else:
+                result = await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+                evidence = json.loads(result.evidence_path.read_text())
+                assert result.status == "failed"
+            assert evidence["opencode_session_id"] == sid
+            assert not controller.path.exists()
+            assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == 1
+            return
+        result = await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+        assert result.reason == "retained session cancellation verified"
+        assert load_run_state(tmp_path, 561) is None
+        assert not controller.path.exists()
+        assert ["chainlink", "locks", "release", "561"] in calls
+        assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == 1
+
+
 def test_list_run_states_skips_unparseable(tmp_path: Path) -> None:
     good = WorklinkRunState(
         issue_id=1, attempt=1, backend="codex", compute_name="fake_persistent",

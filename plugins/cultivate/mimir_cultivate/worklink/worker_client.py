@@ -286,20 +286,58 @@ class WorkerClient:
                              git_settings: Sequence[tuple[str, str]] = ()) -> LaunchHandle:
         from dataclasses import asdict
         from .daemon_health import daemon_health
+        from .backends.base import SessionAdmissionError
 
         health = daemon_health(dict(os.environ))
         if health.get("ok") is not True:
-            raise RuntimeError("OpenCode daemon admission unavailable")
+            raise SessionAdmissionError(uncertain=False)
         generation = health["launch_generation"]
-        response = await self._session_rpc("session_create", {
-            "generation": generation, "request": asdict(request), "timeout_s": timeout_s,
-            "pass_env": dict(pass_env or {}), "git_settings": list(git_settings),
-        })
+        try:
+            response = await self._session_rpc("session_create", {
+                "generation": generation, "request": asdict(request), "timeout_s": timeout_s,
+                "pass_env": dict(pass_env or {}), "git_settings": list(git_settings),
+            })
+        except (OSError, RuntimeError, ValueError):
+            recovered = await self.session_recover_admission(str(generation))
+            if recovered is None:
+                raise SessionAdmissionError(uncertain=False, generation=str(generation)) from None
+            return recovered
+        if response.get("admission_state") == "conflict":
+            raise SessionAdmissionError(uncertain=True, generation=str(generation),
+                                        handle=self._admission_handle(response, str(generation)))
+        return self._admission_handle(response, str(generation))
+
+    @staticmethod
+    def _admission_handle(response: Mapping[str, Any], generation: str) -> LaunchHandle:
+        from .backends.base import SessionAdmissionError
         sid = response.get("opencode_session_id")
         if not isinstance(sid, str) or not re.fullmatch(r"ses_[A-Za-z0-9_-]{1,128}", sid):
-            raise RuntimeError("invalid session executor identity")
+            raise SessionAdmissionError(uncertain=True, generation=generation)
         return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid,
-                            launch_generation=str(generation))
+                            launch_generation=generation)
+
+    async def session_recover_admission(self, generation: str) -> LaunchHandle | None:
+        """Read the owned attempt record; never repeat create or input admission."""
+        from .backends.base import SessionAdmissionError
+        try:
+            async with asyncio.timeout(35):
+                while True:
+                    try:
+                        response = await self._session_rpc("session_observe", {
+                            "generation": generation, "opencode_session_id": None})
+                    except (OSError, RuntimeError, ValueError):
+                        await asyncio.sleep(0.1)
+                        continue
+                    stage = response.get("admission_state")
+                    if stage == "absent":
+                        return None
+                    if stage == "retained":
+                        return self._admission_handle(response, generation)
+                    if stage != "busy":
+                        raise SessionAdmissionError(uncertain=True, generation=generation)
+                    await asyncio.sleep(0.1)
+        except TimeoutError:
+            raise SessionAdmissionError(uncertain=True, generation=generation) from None
 
     async def _session_handle_rpc(self, operation: str, handle: LaunchHandle, *,
                                   stdout_limit: int | None = None) -> dict[str, Any]:
