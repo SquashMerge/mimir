@@ -184,3 +184,21 @@ get_identities()
 
     assert result.returncode != 0
     assert message in result.stderr
+
+
+@pytest.mark.parametrize("mutation", ["none", "uid", "gid", "groups", "caps"])
+def test_supervisor_checks_actual_identity_groups_and_capabilities(monkeypatch, mutation):
+    from mimir_cultivate.worklink import identities
+
+    ids = identities.WorklinkIdentities(42001, 42002, 42003)
+    monkeypatch.setattr(identities.os, "getresuid", lambda: (0, 0, 0) if mutation == "uid" else (42002,) * 3)
+    monkeypatch.setattr(identities.os, "getresgid", lambda: (0, 0, 0) if mutation == "gid" else (42003,) * 3)
+    monkeypatch.setattr(identities.os, "getgroups", lambda: [42001] if mutation == "groups" else [42003])
+    monkeypatch.setattr(identities.Path, "read_text", lambda self: "\n".join(
+        f"{name}: {'1' if mutation == 'caps' and name == 'CapEff' else '0'}"
+        for name in ("CapInh", "CapPrm", "CapEff", "CapAmb")))
+    if mutation == "none":
+        identities.assert_worklink_identity(ids)
+    else:
+        with pytest.raises(RuntimeError):
+            identities.assert_worklink_identity(ids)
