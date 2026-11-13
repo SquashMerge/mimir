@@ -2566,6 +2566,32 @@ class WorklinkRunner:
             except OSError as write_exc:
                 incident_owner.bind(write_exc)
                 raise
+        if state.phase == "ci_wait" and session_handle is not None:
+            if process_is_alive(state):
+                from .control import _mark_operator_stop
+
+                _mark_operator_stop(self.home, issue_id, state.attempt)
+                reason = "CI waiter is still live; stop requested; session recovery retained"
+                evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                                  state.branch, state.checkout, session_handle, RuntimeError(reason))
+                return WorklinkRunResult(issue_id, state.attempt, "failed", reason=reason, evidence_path=evidence)
+            recovery_failure = await reconcile_current_session()
+            if recovery_failure is not None:
+                return recovery_failure
+            reason = "CI wait interrupted by controller restart; session cancellation verified"
+            evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                              state.branch, state.checkout, session_handle, RuntimeError(reason))
+            if evidence is None:
+                return WorklinkRunResult(issue_id, state.attempt, "failed",
+                                         reason="terminal evidence unavailable; session recovery retained")
+            fence_failure(reason)
+            claims.transition_issue(issue_id, status="failed", review_ready=False,
+                                    attempt=state.attempt, reason=reason)
+            terminal_release.label_transition_applied = True
+            terminal_release.retain_for_recovery = False
+            terminal_release()
+            return WorklinkRunResult(issue_id, state.attempt, "failed", reason=reason, evidence_path=evidence)
+
         if state.shim_pid is not None:
             handle = LaunchHandle(
                 state.handle_substrate,
@@ -2588,9 +2614,16 @@ class WorklinkRunner:
                                        state.branch, state.checkout, _state_session_handle(state), exc,
                                        status="interrupted")
                 raise
+            if cleanup_verified and session_handle is not None:
+                recovery_failure = await reconcile_current_session()
+                if recovery_failure is not None:
+                    return recovery_failure
             evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
                                               state.branch, state.checkout, _state_session_handle(state),
                                               RuntimeError(reason))
+            if session_handle is not None and evidence is None:
+                return WorklinkRunResult(issue_id, state.attempt, "failed",
+                                         reason="terminal evidence unavailable; session recovery retained")
             fence_failure(reason)
             claims.transition_issue(
                 issue_id,

@@ -345,6 +345,10 @@ def stop_worklink(
         state = load_run_state(home, issue_id)
         state_cleared = False
         if state is not None and not process_is_alive(state):
+            if state.opencode_session_id is not None:
+                _mark_operator_stop(home, issue_id, state.attempt)
+                return WorklinkStopResult(issue_id, True,
+                    reason="recorded gate or CI waiter has exited; session terminal recovery via reattach is required")
             clear_run_state(home, issue_id)
             state_cleared = load_run_state(home, issue_id) is None
             # Epic dispatch uses factory records, not leaf run state. A stale
@@ -516,7 +520,9 @@ def reconcile_run_states(
                     reason="unparseable run state",
                 )
     for state in known_paths.values():
-        if state.compute_name != "local_subprocess" or process_is_alive(state):
+        if state.opencode_session_id is not None or state.compute_name != "local_subprocess" or process_is_alive(state):
+            # Correlated gates and CI waiters need session-aware terminal
+            # evidence/routing, not the historical process-only orphan reaper.
             alive.append(state)
             continue
         with _claim_mutex(home):
