@@ -3151,6 +3151,173 @@ def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) ->
     assert load_run_state(tmp_path, 441) is None
 
 
+@pytest.mark.parametrize("worker_state,deadline,exit_code", [
+    pytest.param("exited", True, 0, id="exited-timeout"),
+    pytest.param("live", True, -15, id="live-timeout"),
+    pytest.param("exited", False, 7, id="exited-failure"),
+    pytest.param("exited", False, 0, id="exited-success"),
+])
+def test_deadline_before_worker_collection_records_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    worker_state: str, deadline: bool, exit_code: int,
+) -> None:
+    """Real executor/client/compute race, with terminal delivery held by a barrier."""
+    import socket
+    from mimir_cultivate.worklink import compute, worker_client, worker_exec
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  timeout_s: 37\n  reaper_ttl_s: 74\n", encoding="utf-8",
+    )
+    calls, runner = _orchestrator_runner(repo, worktree)
+    preservation = _record_preservation(monkeypatch)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr("mimir_cultivate.worklink.orchestrator._log_event",
+                        lambda name, **fields: events.append((name, fields)))
+    ready = threading.Event()
+    release = threading.Event()
+    threads: list[threading.Thread] = []
+    cancellations: list[str] = []
+    identifiers: list[str] = []
+    processes: list[subprocess.Popen] = []
+    results: list[ComputeResult] = []
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "worker-homes")
+    worker_exec.HOME_ROOT.mkdir()
+    monkeypatch.setattr(worker_exec, "_open_path_checkout",
+                        lambda request: os.open(request["path"], os.O_RDONLY | os.O_DIRECTORY))
+    monkeypatch.setattr(worker_exec.os, "chown", lambda *args: None)
+
+    def drop(checkout_fd):
+        os.setsid()
+        os.fchdir(checkout_fd)
+
+    # Only privileged launch boundaries are replaced. Process exit, job tracking,
+    # wire cancellation, terminal collection and deadline handling remain real.
+    monkeypatch.setattr(worker_exec, "_drop_worker", drop)
+    monitor = worker_exec._wait_with_output_limits
+    cleanup_home = worker_exec._cleanup_home
+    cancel = worker_exec._handle_cancel
+
+    def wait(proc, *args):
+        processes.append(proc)
+        if worker_state == "live":
+            ready.set()
+            assert release.wait(10), "controller did not cancel the live worker"
+        return monitor(proc, *args)
+
+    def cleanup(home):
+        if worker_state == "exited":
+            identifier = home.name
+            with worker_exec._jobs_lock:
+                assert identifier not in worker_exec._jobs
+            assert processes[0].returncode == exit_code
+            ready.set()
+            assert release.wait(10), "controller did not cancel the reaped worker"
+        cleanup_home(home)
+
+    def handle_cancel(connection, request, fds):
+        cancellations.append(request["id"])
+        try:
+            cancel(connection, request, fds)
+        finally:
+            release.set()
+
+    def connect(self, timeout_s=None):
+        local, remote = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        if timeout_s is not None:
+            local.settimeout(timeout_s)
+        thread = threading.Thread(target=worker_exec.handle_connection, args=(remote,))
+        threads.append(thread)
+        thread.start()
+        return local
+
+    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", wait)
+    monkeypatch.setattr(worker_exec, "_cleanup_home", cleanup)
+    monkeypatch.setattr(worker_exec, "_handle_cancel", handle_cancel)
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
+
+    class DeadlineCompute(compute.LocalSubprocessComputeBackend):
+        async def launch(self, spec):
+            script = "from pathlib import Path; Path('changed.txt').write_text('work done\\n'); "
+            script += (
+                "import signal; signal.pause()" if worker_state == "live"
+                else f"raise SystemExit({exit_code})"
+            )
+            handle = await self._launch_contained(spec, (sys.executable, "-c", script))
+            identifiers.append(handle.identifier)
+            return handle
+
+        async def wait(self, handle, timeout_s):
+            assert timeout_s == 37
+            assert await asyncio.to_thread(ready.wait, 10), "executor did not reach the race window"
+            # Expire the actual compute wait only after the executor reaches the
+            # controlled state. No startup latency or sleep orders this race.
+            if not deadline:
+                release.set()
+            result = await super().wait(handle, 0 if deadline else timeout_s)
+            results.append(result)
+            return result
+
+    class ResultBackend(FakeBackend):
+        def work_spec(self, *args, **kwargs):
+            return replace(super().work_spec(*args, **kwargs), env={})
+
+        async def interpret(self, order, result):
+            assert result.launch_error is None
+            return RawResult(
+                result.exit_code, order.transcript_root / "worker.json",
+                "failed" if result.exit_code else "success",
+                f"worker exited {result.exit_code}" if result.exit_code else None,
+            )
+
+    substrate = DeadlineCompute.for_path_checkout(os.getuid())
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(ResultBackend())
+    registry.register_compute(substrate)
+    try:
+        result = asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                441, backend_name="fake", test_command="echo ok",
+            )
+        )
+        assert len(results) == 1 and results[0].timed_out is deadline
+        assert results[0].exit_code == exit_code
+        assert len(cancellations) == int(deadline)
+        if not deadline and exit_code == 0:
+            assert result.status == "completed" and result.pr_url
+            assert [step for step, _ in preservation] == ["close"]
+            return
+        assert result.status == "failed", (result, events)
+        assert result.reason == (
+            "Worklink worker timed out (timeout_s=37)" if deadline else "worker exited 7"
+        )
+        failure = next(fields for name, fields in events if name == "worklink_run_failed")
+        transition = next(fields for name, fields in events if name == "worklink_transition")
+        assert failure["terminal_error"] == transition["reason"] == result.reason
+        assert any(
+            isinstance(call, list) and call[:4] == ["chainlink", "issue", "comment", "441"]
+            and call[4].endswith(result.reason)
+            for call in calls
+        )
+        assert not result.pr_url
+        assert [step for step, _ in preservation] == ["preserve", "close"]
+        assert preservation[0][1]["reason"] == result.reason
+        preserved = next(fields for name, fields in events if name == "worklink_attempt_preserved")
+        assert preserved["ref"] == "refs/worklink/441/1"
+    finally:
+        release.set()
+        for proc in processes:
+            if proc.poll() is None:
+                worker_exec._terminate_process_group(proc)
+        for thread in threads:
+            thread.join(10)
+            assert not thread.is_alive()
+        with worker_exec._jobs_lock:
+            for identifier in identifiers:
+                worker_exec._exited.discard(identifier)
+
+
 def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
