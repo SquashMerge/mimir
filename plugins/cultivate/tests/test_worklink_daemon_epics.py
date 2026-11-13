@@ -716,9 +716,120 @@ async def test_budget_park_requalifies_factory_after_session_cancellation(tmp_pa
         assert sum(route.endswith("/command") for _, route, _, _ in daemon.requests) == 1
 
 
+@pytest.fixture
+def supervisor_clock(monkeypatch):
+    from mimir_cultivate.worklink import orchestrator
+    clock = SimpleNamespace(now=0.0)
+    # Only the supervisor sees this clock; HTTP, asyncio timers and the session
+    # controller retain their real clocks and bounded cancellation deadlines.
+    monkeypatch.setattr(orchestrator, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "get_running_loop": lambda: SimpleNamespace(time=lambda: clock.now),
+    }))
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 100.0)
+    return clock
+
+
+@pytest.mark.parametrize("deadline_phase", ["before-verification", "during-snapshot"])
+@pytest.mark.parametrize("failure", [None, "missing-ack", "unverified-cancel"])
+async def test_budget_park_verifies_after_exhausted_work_deadline(
+    tmp_path, monkeypatch, supervisor_clock, deadline_phase, failure,
+):
+    from mimir_cultivate.worklink.factory_state import factory_checkout_interlock, factory_issue_resource_lock
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        boundary.cancel_verified = failure != "unverified-cancel"
+        calls = []
+        current = record.status
+        snapshot = Path(record.sandbox).parent.parent / ".factory/.parked" / record.run_id
+        real_cancel = compute.cancel
+        async def cancel(selected):
+            assert selected == handle
+            await real_cancel(selected)
+            calls.append("cancel")
+            if deadline_phase == "before-verification":
+                supervisor_clock.now = 101.0
+        monkeypatch.setattr(compute, "cancel", cancel)
+        class Factory:
+            poll_interval_s = 0.001
+            def status(self, *args, **kwargs):
+                calls.append("ack" if current.park_snapshot else "status")
+                if "snapshot" in calls and failure == "missing-ack":
+                    # Exhaust the finite acknowledgment window without waiting
+                    # on a real clock or accepting the writer's exit as proof.
+                    supervisor_clock.now += 301.0
+                return current
+            def heartbeat(self, *args, **kwargs):
+                assert kwargs["session"] == handle.identifier
+                supervisor_clock.now = 50.0
+            def terminal(self, *args, **kwargs):
+                nonlocal current
+                assert boundary.controller.record.cancellation_state == "verified"
+                assert supervisor_clock.now == (101.0 if deadline_phase == "before-verification" else 50.0)
+                assert args == (record.run_id, "needs-human")
+                calls.append("terminal")
+                current = replace(current, status="needs-human")
+            def snapshot(self, *args, **kwargs):
+                nonlocal current
+                calls.append("snapshot")
+                snapshot.mkdir(parents=True)
+                if deadline_phase == "during-snapshot":
+                    # Cross both the original work deadline and the first
+                    # verification window while the actual writer is running.
+                    supervisor_clock.now = 1000.0
+                if failure != "missing-ack":
+                    current = replace(current, park_snapshot=str(snapshot))
+        transitions = []
+        claims = SimpleNamespace(heartbeat_issue=lambda *a, **kw: None,
+            transition_issue=lambda *a, **kw: transitions.append((a, kw)))
+        with factory_checkout_interlock(tmp_path) as outer, factory_issue_resource_lock(tmp_path, 2125) as inner:
+            assert outer and inner
+            results = await asyncio.gather(WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+                issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)), claims=claims,
+                backend=Factory(), compute=compute, factory_record=record, test_cmd="pytest",
+                runner=lambda *a, **kw: None, started_at=datetime.now(UTC)), return_exceptions=True)
+        result = results[0]
+        if failure == "unverified-cancel":
+            assert isinstance(result, ComputeCleanupError)
+            assert "terminal" not in calls and "snapshot" not in calls
+            saved = load_factory_record(tmp_path, record.run_id)
+            assert saved.status.status == "running" and not saved.children_reaped
+            assert saved.session == saved.opencode_session_id == handle.identifier
+            assert boundary.controller.path.exists() and Path(record.sandbox).is_dir()
+            assert transitions == []
+            assert not (tmp_path / "state/worklink/clean-parks/2125-1.json").exists()
+            boundary.cancel_verified = True
+            await compute.cancel(handle)
+            await compute.cleanup(handle)
+            return
+        assert isinstance(result, WorklinkRunResult), f"park finalization failed: {result}"
+        assert result.status == "needs-human" and not result.review_ready
+        assert calls[calls.index("cancel"):] == ["cancel", "status", "terminal", "status", "snapshot",
+            "status" if failure == "missing-ack" else "ack"]
+        saved = load_factory_record(tmp_path, record.run_id)
+        assert saved.controller_phase == "parked" and saved.children_reaped
+        assert saved.session == saved.opencode_session_id == handle.identifier
+        assert saved.status.park_snapshot == (None if failure == "missing-ack" else str(snapshot))
+        assert saved.mcp_servers == ("fixture-mcp",)
+        assert not boundary.controller.path.exists() and Path(record.sandbox).is_dir()
+        assert not compute.job_alive(handle)
+        assert (tmp_path / "state/worklink/clean-parks/2125-1.json").is_file() == (failure is None)
+        if failure == "missing-ack":
+            assert "snapshot publication failed" in saved.controller_error
+            assert "snapshot publication failed" in result.reason
+        assert len(transitions) == 1 and transitions[0][1]["status"] == "blocked"
+        assert transitions[0][1]["review_ready"] is False
+        assert sum(route.endswith("/command") for _, route, _, _ in daemon.requests) == 1
+        with factory_checkout_interlock(tmp_path, pruning=True) as outer, factory_issue_resource_lock(tmp_path, 2125) as inner:
+            assert outer and inner
+
+
 @pytest.mark.parametrize("writer", ["release", "terminal", "snapshot", "heartbeat"])
 @pytest.mark.parametrize("cancellation", ["repeated", "timeout"])
-async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(tmp_path, monkeypatch, writer, cancellation):
+async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(
+    tmp_path, monkeypatch, supervisor_clock, writer, cancellation,
+):
     import threading
     from mimir_cultivate.worklink import orchestrator
     from mimir_cultivate.worklink.factory_state import factory_checkout_interlock, factory_issue_resource_lock
@@ -743,6 +854,7 @@ async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(tmp_path,
                     park_snapshot=str(tmp_path / "snapshot") if writer == "release" else None)
             def heartbeat(self, *args, **kwargs):
                 write("heartbeat")
+                supervisor_clock.now = 50.0
             def lock(self, *args, **kwargs):
                 assert args[1] == "release"
                 write("release")
@@ -753,7 +865,6 @@ async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(tmp_path,
             def snapshot(self, *args, **kwargs):
                 write("snapshot")
         factory = Factory(entrypoint=record.launcher, poll_interval_s=0.001)
-        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 0.08)
         monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: Path(record.sandbox))
         monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *a, **kw: "https://github.com/owner/repo.git")
         monkeypatch.setattr(WorklinkRunner, "_factory_launch_order", lambda self, **kw: (

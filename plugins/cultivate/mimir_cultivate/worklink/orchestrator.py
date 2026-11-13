@@ -4160,7 +4160,9 @@ class WorklinkRunner:
 
             snapshot_failure = "factory status reports park_snapshot null"
             snapshot_attempted = False
-            verification_deadline = max(deadline, loop.time() + startup_timeout) if startup_failure else deadline
+            # Model work is over. Cancellation and terminal control may already
+            # have spent its deadline; publication still needs a bounded read.
+            verification_deadline = loop.time() + startup_timeout
             while True:
                 remaining = verification_deadline - loop.time()
                 if remaining <= 0:
@@ -4202,6 +4204,9 @@ class WorklinkRunner:
                             break
                         # Read status again: a successful CLI exit alone is not a
                         # published snapshot until factory status reports it.
+                        # The bounded writer can outlast either deadline. Give
+                        # its acknowledgment a fresh, finite observation window.
+                        verification_deadline = loop.time() + startup_timeout
                         continue
                 except FactoryRunLockContended:
                     snapshot_failure = "factory run state stayed locked"
