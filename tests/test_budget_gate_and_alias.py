@@ -8094,7 +8094,7 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("selected_repository_policy")
-async def test_unsupported_repo_action_records_typed_boundary_without_trusting_result(
+async def test_non_ingesting_unsupported_repo_action_records_typed_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
@@ -8127,7 +8127,7 @@ async def test_unsupported_repo_action_records_typed_boundary_without_trusting_r
         "boundary": "typed_action_set",
         "reason": "unsupported_operation",
     }]
-    assert turn.ifc_labels.has_untrusted_active_ingest
+    assert not turn.ifc_labels.has_untrusted_active_ingest
 
 
 @pytest.mark.asyncio

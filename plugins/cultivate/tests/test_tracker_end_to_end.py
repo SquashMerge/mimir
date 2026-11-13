@@ -471,7 +471,7 @@ async def test_filing_then_comment_in_one_trusted_turn_and_real_taint_refuses_wr
 
 
 @pytest.mark.asyncio
-async def test_tracker_status_exemption_fails_closed_for_scope_shape_and_undeclared_plugin(
+async def test_tracker_non_ingesting_policy_applies_to_scope_shape_and_failures(
     capsys_rig, capsys: pytest.CaptureFixture[str],
 ) -> None:
     rig = capsys_rig("github_issues")
@@ -498,18 +498,17 @@ async def test_tracker_status_exemption_fails_closed_for_scope_shape_and_undecla
             labels = classify_protected_result(
                 "tracker_file_work", invalid_args, auth, decision, result=invalid_result,
             )
-            assert labels is not None
-            assert any(source.has_untrusted_active_ingest for source in labels.sources)
+            assert labels is None
         denied = classify_protected_result(
             "tracker_file_work", args, auth, replace(decision, would_block=True), result=result,
         )
-        assert denied is not None and any(source.has_untrusted_active_ingest for source in denied.sources)
+        assert denied is None
         failed = classify_protected_result(
             "tracker_file_work", args, auth, decision, result=result, failed=True,
         )
-        assert failed is not None and any(source.has_untrusted_active_ingest for source in failed.sources)
+        assert failed is None
         undeclared = classify_protected_result(
-            "unsupported_operation", args, auth, decision, result=result,
+            "undeclared_tracker_operation", args, auth, decision, result=result,
         )
         assert undeclared is not None
         assert any(source.domain == "unknown" and source.has_untrusted_active_ingest
@@ -525,7 +524,7 @@ async def test_tracker_status_exemption_fails_closed_for_scope_shape_and_undecla
      {"status": "created", "reason": "", "kind": "leaf", "missing": []}),
 ])
 @pytest.mark.parametrize("invalid_guard", ["extra_key", "non_cultivate_owner"])
-async def test_tracker_status_exact_shape_and_owner_guards_taint_turn(
+async def test_tracker_non_ingesting_policy_is_independent_of_result_shape_and_owner(
     tool_name: str, args_extra: dict, result: dict, invalid_guard: str,
     capsys_rig, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -555,17 +554,11 @@ async def test_tracker_status_exact_shape_and_owner_guards_taint_turn(
                 rig.selected.policy._tools, tool_name,
                 replace(registered, owner="other_tracker_plugin"),
             )
-        # Both raw results and the production ToolMessage form must fail closed.
+        # Result shape and owner cannot override the non-ingesting declaration.
         for payload in (result, ToolMessage(content=json.dumps(result), tool_call_id="status")):
             labels = classify_protected_result(tool_name, args, auth, decision, result=payload)
-            assert labels is not None
-            assert any(source.domain == "tracker_status" and source.principal is None
-                       and source.has_untrusted_active_ingest for source in labels.sources)
-            auth.ifc_state.merge(labels)
-            assert _effective_persisted_integrity(auth.ifc_state.current(), auth) == "untrusted"
-        assert tools.tracker_comment.func(
-            external_ref=args["external_ref"], body="Follow-up", runtime=SimpleNamespace(context=auth),
-        )["reason"] == "tainted_turn"
+            assert labels is None
+            assert _effective_persisted_integrity(auth.ifc_state.current(auth.ifc_labels), auth) == "trusted"
     rig.finish()
 
 

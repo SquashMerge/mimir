@@ -11798,8 +11798,15 @@ def _incomplete_protected_result(
     *,
     tool_name: str,
     auth_context: "AuthContext | None",
-) -> "InformationFlowLabels":
+) -> "InformationFlowLabels | None":
     from .models import InformationFlowLabels, SourceLabel
+
+    # The selected policy declares whether this result can ingest content. Apply
+    # that contract before every incomplete-provenance fallback, including plugin
+    # refusals and exceptions, regardless of whether a resource can be resolved.
+    descriptor = get_tool_descriptor(tool_name)
+    if descriptor is not None and descriptor.result_origin == ResultOriginKind.NON_INGESTING:
+        return None
 
     resource = next(
         (
@@ -12450,8 +12457,8 @@ def classify_protected_result(
 
     from .models import InformationFlowLabels, SourceLabel
 
-    # Plugin responses are provider-controlled even for sink-only tools and
-    # claimed NON_INGESTING results; they never inherit core refusal exemptions.
+    # Plugin responses are provider-controlled unless the selected policy
+    # declares them non-ingesting; they never inherit core refusal exemptions.
     selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
     if registered is None and not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
@@ -12880,9 +12887,6 @@ def classify_protected_result(
                 labels = labels.with_source(source)
             return labels
 
-        descriptor = get_tool_descriptor(tool_name)
-        if descriptor and descriptor.result_origin & ResultOriginKind.NON_INGESTING:
-            return None
         # An ingesting native tool without a confidentiality domain still
         # introduces model-visible content. Unknown provenance must taint the
         # turn rather than silently laundering integrity through the tool.

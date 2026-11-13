@@ -176,6 +176,117 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
     assert not os.path.lexists(lease.path)
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_trusted_pr_checkout_and_cleanup_do_not_taint_or_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool,
+) -> None:
+    from mimir import trust_approval
+    from mimir.access_control import SinkCategory, SinkGate, publish_protected_result
+    from mimir.models import SourceLabel
+    from mimir.plugins.core import policy_scope
+
+    selected = load_plugins(enable="cultivate").policy
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=False, policy=selected)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    trusted_source = SourceLabel(
+        principal=auth.canonical_principal, domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({auth.canonical_principal}),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    )
+    prompts = []
+    monkeypatch.setattr(trust_approval, "register_chat_request", lambda *args: prompts.append(args))
+    turn = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware(selected)
+    calls = []
+
+    def handler(request):
+        nonlocal lease
+        operation = request.tool_call["name"]
+        calls.append(operation)
+        if operation == "repo_checkout":
+            # The local Git transport fixture supplies the trusted server scope;
+            # production classification and the live checkout lease stay real.
+            lease, _ = repository.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+                runner=lambda argv: subprocess.run(
+                    argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
+                ),
+            )
+            assert_lease_attested(auth, scope, lease)
+            publish_protected_result((trusted_source,))
+            content = {"status": "checked_out", "path": str(lease.path)}
+        elif operation == "repo_cleanup":
+            content = repository.repo_cleanup.func(
+                scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+            )
+        return ToolMessage(content=json.dumps(content), tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request):
+        return handler(request)
+
+    token = set_current_turn(turn)
+    try:
+        with policy_scope(selected):
+            for operation in ("repo_checkout", "repo_cleanup"):
+                request = _make_request(
+                    operation, operation, auth,
+                    {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+                )
+                result = (
+                    asyncio.run(middleware.awrap_tool_call(request, async_handler)) if async_mode
+                    else middleware.wrap_tool_call(request, handler)
+                )
+                assert result.status != "error", result.content
+                if operation == "repo_checkout":
+                    assert trusted_source in turn.ifc_labels.sources
+                assert not turn.ifc_labels.has_untrusted_active_ingest
+            forge_flow = SinkGate.check_sink_flow(
+                "pr_comment", scope.canonical_repo, turn.ifc_labels, auth, enforce=True,
+                sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+            )
+            assert forge_flow.allowed, forge_flow.reason
+    finally:
+        reset_current_turn(token)
+    assert calls == ["repo_checkout", "repo_cleanup"]
+    assert state.checkout_lease is None and not os.path.lexists(lease.path)
+    assert not auth.ifc_state.current().has_untrusted_active_ingest
+    assert prompts == []
+
+
+@pytest.mark.parametrize("tool_name", ["repo_cleanup", "repo_restore_file", "repo_stage"])
+@pytest.mark.parametrize("arguments", [
+    {}, {"repository": "owner/repo", "pull_request": 7},
+    {"path": "untrusted/path", "file_path": "untrusted/file", "paths": ["tracked.txt"]},
+    {"turn_id": "turn", "atom_id": "atom", "job_id": "job"},
+])
+@pytest.mark.parametrize("outcome", ["success", "refusal", "exception"])
+def test_non_ingesting_repository_result_adds_no_source(tool_name, arguments, outcome) -> None:
+    from mimir.access_control import OperationDecision, ToolAuthorization, classify_protected_result
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    selected = load_plugins(enable="cultivate").policy
+    authorization = ToolAuthorization(tool_name, OperationDecision.OPEN, True, policy=selected)
+    refusal = ToolPolicyRefusal("operation refused") if outcome == "refusal" else None
+    result = (
+        RuntimeError("operation failed") if outcome == "exception" else
+        ToolMessage(content=str(refusal) if refusal else "done", tool_call_id="result",
+                    status="error" if refusal else "success")
+    )
+    assert classify_protected_result(
+        tool_name, arguments, None, authorization, result=result,
+        policy_refusal=refusal, failed=outcome != "success",
+    ) is None
+
+
 def _rebased_divergent_lease(tmp_path: Path, *, production_clone: bool = False):
     origin, source, scope, state = _repo_scope_and_state(tmp_path)
     lease = state.checkout_lease
