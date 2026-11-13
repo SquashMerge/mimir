@@ -767,5 +767,8 @@
       "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
       "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
     }
+  },
+  "review-trusted-evidence-first": {
+    "review": {"SKILL.md": "ed4541fdefef762732daf0eda1a829117a0048998caea073302361c9bd69e6f1"}
   }
 }
