@@ -2838,6 +2838,25 @@ def test_maximal_model_tool_inventory_has_total_protected_result_partition(
     assert mapped | exempted == names
 
 
+@pytest.mark.parametrize("tool_name", ["undeclared_protected_tool", "http_request", "read_file"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_ingesting_protected_result_without_resource_fails_closed(tool_name, failed) -> None:
+    from mimir.plugins.core import core_policy_registry
+
+    authorization = access_control.ToolAuthorization(
+        tool_name, OperationDecision.OPEN, True, policy=core_policy_registry(),
+    )
+    labels = classify_protected_result(
+        tool_name, {}, None, authorization, failed=failed,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    source, = labels.sources
+    assert source.resource_id == f"<unresolved-resource:protected_tool:{tool_name}>"
+    assert source.source_kind == "protected_tool"
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+
+
 def test_inventory_assertion_rejects_tool_without_result_classification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
