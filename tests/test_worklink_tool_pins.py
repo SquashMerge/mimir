@@ -18,6 +18,21 @@ from mimir.scaffold_docker import render_dockerfile
 from mimir.plugins.discovery import PluginDiscoveryError
 
 
+def test_shipped_skill_example_matches_canonical_opencode_inventory() -> None:
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    skill = (root / "plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/SKILL.md").read_text()
+    example = yaml.safe_load(skill.split("```yaml\n", 1)[1].split("```", 1)[0])
+    entry = next(row for row in example["tool_pins"] if row["name"] == "opencode")
+    pin = next(pin for pin in default_tool_pins() if pin.name == "opencode")
+    assert entry["pin"] == pin.pin == "2.2.7"
+    assert entry["package"] == pin.package == "@opencode/cli"
+    assert entry["smoke"] == pin.smoke == "opencode --version"
+    assert "opencode-ai" not in skill
+    assert "1.19.4" not in skill
+
+
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
     assert pins["opencode"].pin == "2.2.7"

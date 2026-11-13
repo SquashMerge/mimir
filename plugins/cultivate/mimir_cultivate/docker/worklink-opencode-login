@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/mimir-worklink/venv/bin/python -m mimir_cultivate.worklink.daemon_login "$@"

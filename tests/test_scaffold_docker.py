@@ -158,7 +158,7 @@ def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path,
         assert completed.returncode == 17
     assert shim_user.read_text() == "mimir"
     assert output.read_text() == "hello:mimir"
-    assert 'exec s6-setuidgid mimir /usr/local/bin/start.sh' in (context / "mimir/run").read_text()
+    assert 'exec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir /usr/local/bin/start.sh' in (context / "mimir/run").read_text()
     fake_start = tmp_path / "start.sh"
     fake_start.write_text('#!/bin/sh\nprintf "%s" "$GREETING" > "$RESULT"\nexit 23\n')
     fake_start.chmod(0o755)
@@ -166,7 +166,7 @@ def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path,
     mimir_wrapper.write_text((context / "mimir/run").read_text().replace(
         "/usr/local/bin/start.sh", str(fake_start)))
     mimir_wrapper.chmod(0o755)
-    completed = subprocess.run([str(mimir_wrapper)], env={**os.environ,
+    completed = subprocess.run(["sh", str(mimir_wrapper)], env={**os.environ,
         "PATH": f"{shim}:{os.environ['PATH']}", "GREETING": "mimir-start",
         "RESULT": str(output), "SHIM_USER": str(shim_user)}, check=False)
     assert completed.returncode == 23
@@ -663,12 +663,10 @@ def test_render_dockerfile_installs_opencode_when_selected():
         assert "opencode2-feature-factory@${FACTORY_VERSION}" in base, mode
         assert "@devtheops/opencode-plugin-otel@2.1.0" in base, mode
         assert "MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js" in out, mode
-        assert "/home/mimir/.config/opencode/opencode.json" in out, mode
-        assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" in out, mode
+        assert "/home/mimir/.config/opencode/opencode.json" not in out, mode
+        assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" not in out, mode
         assert "printf '%s'" not in out, mode
-        assert out.index("RUN sh /opt/cultivate-docker/users.sh") < out.index(
-            "chown -R mimir:mimir /home/mimir/.config"
-        ), mode
+        assert "sh /opt/cultivate-docker/service.sh" in out, mode
 
 
 def test_render_dockerfile_does_not_install_opencode_without_provider():
@@ -737,12 +735,9 @@ def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch
     assert ("ARG MIMIR_ENABLE_OPENCODE=0" in dockerfile) is bool(plugins)
     start = render_start_sh(mode=mode)
     assert "MIMIR_CODING_ENABLED" not in start
-    guard = next(line for line in start.splitlines() if line.startswith("if python3"))
-    result = subprocess.run(
-        ["sh", "-c", guard + " printf bootstrapped; fi"],
-        capture_output=True, text=True, check=True,
-    )
-    assert result.stdout == ("bootstrapped" if selected else "")
+    assert "resolve_activation(dict(os.environ))" in start
+    assert "/usr/local/libexec/worklink-daemon-gate" in start
+    assert "opencode-bootstrap" not in start
 
 
 @pytest.mark.parametrize("mode", ["workspace", "pypi"])
@@ -779,9 +774,12 @@ def test_selected_cultivate_scaffold_executes_gated_pinned_install(tmp_path, mon
     npm.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$NPM_LOG"\n')
     npm.chmod(0o755)
     log = tmp_path / "npm.log"
+    local_fragment = tmp_path / "base.sh"
+    local_fragment.write_text(fragment.read_text().replace("/opt/cultivate-docker", str(tmp_path / "cultivate-docker"))
+                              .replace("-o root -g root ", ""))
     for enabled in ("0", "1"):
         result = subprocess.run(
-            ["sh", str(fragment)],
+            ["sh", str(local_fragment)],
             env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
                  "NODE_VERSION": "22", "FACTORY_VERSION": FACTORY_VERSION,
                  "MIMIR_ENABLE_OPENCODE": enabled, "NPM_LOG": str(log)},
@@ -897,13 +895,13 @@ def test_scaffold_opencode_config_is_idempotent(tmp_path: Path, monkeypatch):
     assert ".config/opencode/opencode.json (no changes)" in second_result.files_skipped
 
 
-def test_start_scripts_bootstrap_the_global_config_when_opencode_is_enabled():
+def test_start_scripts_gate_workloads_without_agent_config_bootstrap():
     workspace = render_start_sh(mode="workspace")
     pypi = render_start_sh(mode="pypi")
-    assert 'os.environ.get("MIMIR_PLUGINS", "")' in workspace
-    assert 'uv run mimir opencode-bootstrap --home "$HOME"' in workspace
-    assert 'os.environ.get("MIMIR_PLUGINS", "")' in pypi
-    assert 'mimir opencode-bootstrap --home "$HOME"' in pypi
+    for text in (workspace, pypi):
+        assert 'resolve_activation(dict(os.environ))' in text
+        assert '/usr/local/libexec/worklink-daemon-gate' in text
+        assert 'opencode-bootstrap' not in text
 
 
 # ── scaffold() end-to-end ──────────────────────────────────────────

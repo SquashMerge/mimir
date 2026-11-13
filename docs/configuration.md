@@ -187,7 +187,7 @@ unless your collector and retention policy are approved for that data.
 | `MIMIR_MODEL_MAX_TOKENS` | int | `0` | Per-call **output** token cap for non-`claude-code` providers. `0` = provider default. Raise for thinking-via-Anthropic-compat models whose reasoning counts against output. |
 | `MIMIR_MODEL_REASONING_EFFORT` | str | `""` | Reasoning effort forwarded to supported model providers. Codex-Plus accepts `none`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; unset/`""` uses the model default. Other providers retain their provider-specific values and behavior. |
 | `MIMIR_WORKLINK_REASONING_EFFORT` | str | `""` | Optional override of `MIMIR_MODEL_REASONING_EFFORT` for Worklink OpenCode leaf builds only. Exported env wins over `<home>/.env`; unset or empty falls back to the agent effort. `none` omits `--variant`, as does an unset effort. OpenAI models accept Codex-Plus effort values; other providers use their own variant names. Feature-factory runs use their per-agent variants instead. |
-| `OPENCODE_CONFIG` | path | `$XDG_CONFIG_HOME/opencode/opencode.jsonc` or `~/.config/opencode/opencode.jsonc` | OpenCode's native operator-owned JSON/JSONC. Its `model`, `provider`, plugin, proxy, and `{env:NAME}` settings are used unchanged by both `spawn_open_code` and the Worklink backend. If `model` is absent, the live `MIMIR_MODEL_SPEC` is translated to `provider/model`; an explicit spawn `model` wins over both. |
+| `OPENCODE_CONFIG` | path | `/var/lib/mimir-worklink/daemon/config/opencode/opencode.json` | Service-owned private daemon config; agent/project configs are not projected. Worklink translates `MIMIR_MODEL_SPEC` to a session model; an explicit spawn model overrides it. |
 | `MIMIR_EFFORT` | str | `high` | Effort level recorded on the config. |
 | `MIMIR_EMBED_MODEL` | str | `BAAI/bge-small-en-v1.5` | Embedding model id. |
 | `MIMIR_CONTEXT_1M` | bool | `true` | Opt into Anthropic's 1M-context beta header for Claude 4.x. Disable for accounts/models without the beta. |
@@ -937,7 +937,7 @@ These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
 | `MIMIR_GIT_URL` | str | `https://github.com/SquashMerge/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
 | `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
-| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Root Dockerfile build arg: `1` installs pinned OpenCode and bootstraps its config. Selected Cultivate scaffold images use the same build argument and pass it to runtime bootstrap; this is not the runtime plugin selection (`MIMIR_PLUGINS`). |
+| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Image build arg: `1` installs pinned OpenCode and writes the root-owned installed marker. Runtime activation also requires selected trusted Cultivate; environment variables cannot override the built bit. Private daemon config is generated at service startup, never seeded from agent auth. |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
 | `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
 
@@ -951,11 +951,25 @@ or absent provider supplies no coding tools. For image builds, select Cultivate
 at build time with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
 `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` as described in
 [plugins](plugins.md#docker-image-assembly-and-services).
-`MIMIR_ENABLE_OPENCODE` is a build argument for the pinned CLI/bootstrap, not
+`MIMIR_ENABLE_OPENCODE` is a build argument for the pinned daemon installation, not
 a runtime coding switch. Compose reads its project `.env` for build argument
 interpolation, not `compose.env`; place runtime `MIMIR_PLUGINS` in the process
 environment. Regenerate scaffolds and rebuild images after changing installed
-plugins. `--opencode` only optionally bakes the home's config into the image.
+plugins. Selected Cultivate images never bake agent OpenCode config; the daemon
+generates its own private config. Core-only generic scaffolds retain their
+optional config-baking compatibility flag.
+
+Activation requires both runtime-selected trusted Cultivate and image marker
+`/opt/cultivate-docker/opencode-enabled` equal to `1`. Missing/`0` bypasses native
+login/workload requirements and reports `daemon_enabled:false`; invalid marker
+or an enabled image with a missing binary fails closed. Core/unselected paths
+do not import Cultivate or read daemon state. Installed-bit changes require
+rebuild and recreation. Bot token/identity/telemetry changes require
+`docker compose up -d --force-recreate <actual-agent-service>` using the project's
+normal env/interpolation options. Host env-file edits alone are not watched;
+Compose restart/s6 restart use the already-effective container environment.
+Agent effective values differing from the daemon launch snapshot report
+`bot_token_stale` without values, hashes or prefixes.
 
 Before an operator chooses to enable coding, provision all prerequisites:
 

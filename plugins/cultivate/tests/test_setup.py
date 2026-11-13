@@ -705,6 +705,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
 
     def run(argv, *, cwd):
         calls.append(argv)
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return json.dumps({'ok': True, 'daemon_enabled': True})
         if argv[-3:] == ["ps", "-q", "agent"]:
             return "b" * 64
         if argv[-3:] == ["mimir", "worklink", "status"]:
@@ -812,9 +814,11 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert compose["services"]["agent"]["environment"]["XDG_CACHE_HOME"] == "/home/mimir/.cache"
     assert "cache:/home/mimir/.cache" in compose["services"]["agent"]["volumes"]
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
-    assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink"}
+    assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon"}
+    assert "worklink-daemon:/var/lib/mimir-worklink/daemon" in compose["services"]["agent"]["volumes"]
     assert any('MIMIR_VERSION=' + VERSION in part for argv in calls for part in argv)
-    assert sum("docker" == argv[0] and "exec" in argv for argv in calls) == 2  # idle probes on the rerun
+    assert sum("docker" == argv[0] and "exec" in argv and argv[-1] != installer._OPENCODE_DAEMON_PROBE
+               for argv in calls) == 2  # idle probes on the rerun
     assert sum("-f" in argv and "compose.provision.yml" in argv for argv in calls) == 2
     assert all(argv[argv.index('--user') + 1] == '1001:1001' for argv in calls
                if 'compose.provision.yml' in argv)
@@ -914,6 +918,8 @@ def setup_environment(tmp_path, monkeypatch):
     def run(argv, *, cwd):
         assert cwd == deploy
         calls.append(argv)
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return json.dumps(state.get('daemon_health', {'ok': True, 'daemon_enabled': True}))
         if argv[-1] == installer._CODEX_LOGIN_PROBE:
             return 'ok' if installer._codex_auth_valid(deploy / 'codex' / 'auth.json') else 'missing'
         if argv[-3:] == ['ps', '-q', 'agent']:
@@ -943,6 +949,30 @@ def setup_environment(tmp_path, monkeypatch):
                         verify=lambda *a, **kw: state['verified'].append(a + ((kw,) if kw else ())))
 
     return deploy, args, state, calls, invoke
+
+
+def test_setup_native_login_refusal_keeps_daemon_available(setup_environment, capsys):
+    deploy, args, state, calls, invoke = setup_environment
+    state['daemon_health'] = {'ok': False, 'daemon_enabled': True}
+    with pytest.raises(installer.SetupError, match='Native login: docker compose exec --user worklink agent'):
+        invoke()
+    assert state['running'], 'container/daemon must remain available for native login'
+    assert not state['verified']
+    assert calls.index(['docker', 'compose', 'up', '-d', 'agent']) < next(
+        index for index, argv in enumerate(calls) if argv[-1] == installer._OPENCODE_DAEMON_PROBE)
+    assert 'worklink-opencode-login' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_setup_reports_effective_daemon_telemetry_and_login(setup_environment, capsys, enabled):
+    deploy, args, state, calls, invoke = setup_environment
+    state['daemon_health'] = {'ok': True, 'daemon_enabled': enabled,
+                              'refresh_unverified': enabled, 'sensitive_telemetry_disabled': enabled}
+    invoke()
+    output = capsys.readouterr().out
+    assert ('worklink-opencode-login' in output) is enabled
+    assert ('Native login refresh is unverified' in output) is enabled
+    assert ('telemetry is disabled because sensitive OTLP' in output) is enabled
 
 
 @pytest.fixture
@@ -3647,6 +3677,8 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
             kwargs["stdout"].write(b"owner-key\n")
             return subprocess.CompletedProcess(argv, 0)
         docker_calls.append(argv)
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({'ok': True, 'daemon_enabled': True}), stderr='')
         if "compose.provision.yml" in argv:
             home.mkdir(exist_ok=True)
             manifest = deploy / "manifest.json"
@@ -3744,6 +3776,8 @@ def test_digestless_deployment_adds_tracker_after_failed_provision_then_reruns_w
     push = {"ok": True}
 
     def subprocess_run(argv, **kwargs):
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({'ok': True, 'daemon_enabled': True}), stderr='')
         if argv[0] == 'chainlink':
             if argv[1:] == ['init', '-q']:
                 (home / '.chainlink').mkdir()

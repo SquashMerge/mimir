@@ -467,7 +467,9 @@ RUN set -eu; \
 RUN set -eu; \
     if [ "$(cat /opt/cultivate-docker/selected)" != 1 ]; then \
         rm -rf /etc/s6-overlay/s6-rc.d/worklink-execd \
-               /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-execd; \
+                /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-execd \
+                /etc/s6-overlay/s6-rc.d/worklink-opencode \
+                /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-opencode; \
     fi
 # Source builds must use the checkout's assembler: the published core-only
 # wheel can predate plugin support. BuildKit leaves this COPY unreachable for

@@ -56,9 +56,12 @@ inputs = (("mimir_agent", Path(sys.argv[2]), agent_hash),
           ("mimir_cultivate", Path(sys.argv[3]), cultivate_hash))
 s6 = ("mimir/type", "mimir/run", "watchdog/type", "watchdog/run",
       "worklink-execd/type", "worklink-execd/run", "worklink-execd/dependencies.d/base",
-      "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd")
+      "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd",
+      "worklink-opencode/type", "worklink-opencode/run", "worklink-opencode/dependencies.d/base",
+      "user/contents.d/worklink-opencode")
 scripts = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh",
-           "service.sh", "verify_wheels.py")
+           "service.sh", "verify_wheels.py", "worklink-opencode-service",
+           "worklink-daemon-gate", "worklink-opencode-login")
 if not version or destination.exists() and any(destination.iterdir()):
     raise SystemExit("invalid Docker context destination or version")
 opened = {}
@@ -84,6 +87,7 @@ try:
         output = destination / target
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(opened[package].read(member))
+        output.chmod((opened[package].getinfo(member).external_attr >> 16) & 0o777)
     wheels = destination / "plugins/cultivate/mimir_cultivate/docker/wheels"
     wheels.mkdir()
     for _, path, _ in inputs:
@@ -713,7 +717,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                             "MIMIR_WORKLINK_AGENT_ID": "cultivate-worklink"})
         environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
-                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
+                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink",
+                   "worklink-daemon:/var/lib/mimir-worklink/daemon"]
         if codex:
             volumes.append("./codex:/home/mimir/.codex")
             environment["CODEX_HOME"] = "/home/mimir/.codex"
@@ -727,7 +732,7 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                         (" && chown -R 1001:1001 /home/mimir/.codex && chmod 0700 /home/mimir/.codex" if codex else "")],
             "volumes": volumes,
         }
-        doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink")}
+        doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon")}
         return yaml.safe_dump(doc, sort_keys=False)
     except (KeyError, TypeError, AttributeError, yaml.YAMLError):
         raise SetupError("Incompatible scaffold Compose template; expected agent build and environment mapping.") from None
@@ -1374,11 +1379,17 @@ print(json.dumps(result))
 """
 
 
-def _verify_opencode_daemon(deploy: Path) -> None:
+def _verify_opencode_daemon(deploy: Path, *, run=None) -> None:
     try:
-        state = json.loads(_agent_exec(deploy, "python", "-c", _OPENCODE_DAEMON_PROBE))
+        output = (_agent_exec(deploy, "python", "-c", _OPENCODE_DAEMON_PROBE) if run is None else
+                  run(["docker", "compose", "exec", "-T", "--user", "mimir", "agent",
+                       "python", "-c", _OPENCODE_DAEMON_PROBE], cwd=deploy))
+        state = json.loads(output)
     except (ValueError, TypeError):
         state = {}
+    if isinstance(state, dict) and state.get("daemon_enabled") is True:
+        print("Worklink native Codex login (independent of the agent): "
+              "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
     if not isinstance(state, dict) or state.get("ok") is not True:
         raise SetupError("OpenCode daemon verification failed; inspect installation, readiness, native login and stale bot-token health. "
                          "Native login: docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
@@ -1917,13 +1928,21 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     if not no_start:
         if codex:
             _require_codex_login(deploy, run)
+        # s6 starts the daemon independently; the Mimir workload remains gated
+        # until the operator provisions its separate native login.
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
+        _verify_opencode_daemon(deploy, run=run)
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
         print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "
               + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
     if no_start:
         print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
+        from mimir.worklink_daemon_activation import planned_activation
+
+        if planned_activation(trusted_cultivate=True, opencode_installed=True).enabled:
+            print("Then provision the separate Worklink native Codex login: "
+                  "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
         if codex:
             print("First log in for this deployment: " + _codex_login_command(deploy))
         print("Then re-run mimir cultivate setup with the same deployment and settings, without --no-start, "

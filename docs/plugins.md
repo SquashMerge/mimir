@@ -112,9 +112,41 @@ different UID. Login before rerunning setup to start the agent; without a valid
 `auth.json`, setup refuses to start it and repeats the command. `--no-start`
 still builds and provisions before login. Do not copy or mount the host's `~/.codex`: refresh
 tokens are single-use, and sharing one login across deployments can revoke
-the entire token family. Log in separately for **each** deployment. OpenCode
-reconciles its OAuth store from this deployment's Codex login and projects
-OAuth into coding workers without passing an OpenAI API key.
+the entire token family. Log in separately for **each** deployment. This is the
+agent's login only: it is never copied into Worklink.
+
+Worklink uses a separate OpenCode 2.2.7 daemon, supervised by the
+`worklink-opencode` s6 longrun as `worklink` (uid 1002). Setup starts the container
+and waits at most 60 seconds for local daemon readiness. The Mimir workload is
+gated, but the daemon remains available even when native login is missing. From
+the deployment directory provision its **independent** native Codex login:
+
+```sh
+docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login
+```
+
+The private wrapper executes the pinned command
+`opencode auth login --server http://127.0.0.1:4096 --method chatgpt-headless openai`
+and loads API authentication privately, never from printed arguments. Substitute
+your actual Compose service name for `agent` in hand-maintained deployments.
+Rerun setup after login. Direct Compose startup enforces the same workload gate;
+it is not merely a healthcheck. `--no-start` builds/provisions and prints
+instructions without starting or probing the daemon or workload.
+
+The daemon's private HOME/config/data/state/cache and native credential SQLite
+DB live under `/var/lib/mimir-worklink/daemon`, retained in the `worklink-daemon`
+volume. Do not remove that volume during upgrades. Local health accepts
+`locally_unexpired` or `refreshable_unverified`; the latter warns that refresh
+and provider validity have not been checked. Missing, inactive, malformed,
+zero-expiry or expired-without-refresh credentials refuse workloads. No health
+probe initiates OAuth or checks a subscription with the provider.
+
+Daemon telemetry is metrics-only by default when tracing is enabled: logs and
+all three trace types are disabled. Content capture explicitly enables logs,
+traces, prompts and model context. Any sensitive OTLP configuration (including
+headers) disables daemon telemetry, with a setup/health explanation; no headers
+are copied to daemon/build environment or config. Agent Python telemetry is
+unchanged. See [Worklink daemon operation](internal/WORKLINK.md#opencode-2-daemon-operation).
 
 Setup also asks **Where should operator alerts go? [web/discord/slack/none]**.
 `web` delivers to the owner's authenticated `web-<owner>` chat and persists
@@ -520,7 +552,7 @@ The repository-root production `Dockerfile` has s6 and the core `mimir` and
 `watchdog` services. With `MIMIR_PLUGIN_SELECTION=cultivate` (or `all`) and
 `CHAINLINK_ARTIFACT_STAGE=chainlink-build` at build time it also assembles the
 trusted first-party fragment: pinned OpenCode and factory adapters, UID 1002 Worklink user, data directories,
-`opencode-bootstrap` and the exact `worklink-execd` s6 service (not a generic
+the exact `worklink-execd` and `worklink-opencode` s6 services (not a generic
 prefixed plugin service). In explicit source mode both venvs run Cultivate built
 from the verified source commit: the root executor venv overlays core and
 `plugins/cultivate` from `MIMIR_EXECUTOR_COMMIT` with `--no-deps` (so the

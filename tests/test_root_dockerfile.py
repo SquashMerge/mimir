@@ -110,6 +110,9 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
          "/etc/s6-overlay/s6-rc.d/mimir/run"),
     )
     for name, original, expected in zip(names, baseline, operations, strict=True):
+        if name == "bootstrap.sh":
+            assert "opencode-bootstrap" not in (source / name).read_text()
+            continue  # Native service-owned configuration replaces image-time agent seeding.
         original_text = normal(original).replace("mimir.worklink.worker_exec", "mimir_cultivate.worklink.worker_exec")
         script_text = normal((source / name).read_text())
         for text in (original_text, script_text):
@@ -143,8 +146,12 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
         return commands
 
     for name, original in zip(names, baseline, strict=True):
+        if name == "bootstrap.sh":
+            continue  # Replaced by independent native daemon preparation.
         expected_steps = steps(original)
         script = (source / name).read_text()
+        if name == "base.sh":
+            script = "apt-get update" + script.split("apt-get update", 1)[1]
         if name == "executor.sh":
             script = "git check-ref-format" + script.split("git check-ref-format", 1)[1]
         actual_steps = steps(script)
@@ -177,7 +184,11 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
                 "/etc/s6-overlay/s6-rc.d/watchdog/run /etc/s6-overlay/s6-rc.d/worklink-execd/run"
             )
             expected_steps += [
-                "chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/worklink-execd/run",
+                "install -o root -g root -m 0755 /opt/cultivate-docker/worklink-opencode-service /usr/local/libexec/worklink-opencode-service",
+                "install -o root -g root -m 0755 /opt/cultivate-docker/worklink-daemon-gate /usr/local/libexec/worklink-daemon-gate",
+                "install -o root -g root -m 0755 /opt/cultivate-docker/worklink-opencode-login /usr/local/bin/worklink-opencode-login",
+                "test -f /opt/cultivate-docker/opencode-enabled",
+                "chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/worklink-execd/run /etc/s6-overlay/s6-rc.d/worklink-opencode/run",
                 "chmod +x /etc/s6-overlay/s6-rc.d/watchdog/run",
             ]
         assert actual_steps == expected_steps, name
@@ -1013,8 +1024,8 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     assert "MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js" in text
     assert "prime" not in text.lower()
     assert 'if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then' in text
-    assert "mimir opencode-bootstrap --home /home/mimir" in text
-    assert "OpenCode reads this XDG-global config" in text
+    assert "mimir opencode-bootstrap --home /home/mimir" not in text
+    assert "/opt/cultivate-docker/opencode-enabled" in text
 
 
 def test_worklink_service_run_script_is_made_executable() -> None:
