@@ -776,5 +776,8 @@
       "tests/conftest.py": "5df4b16fedf0d178373d2c2196d579d9571ecc0d7c5f1c394360b5b45a937c1a",
       "tests/test_worklink_tool_pins_poller.py": "1ce74f66db36488f50afcb40ced0b7c45ff44c85a8ca7d5ad720145cd19a3603"
     }
+  },
+  "review-trusted-evidence-first": {
+    "review": {"SKILL.md": "b6799f8240d240c960e53279994a1aba5bd282993118d1facc912f8966293f37"}
   }
 }

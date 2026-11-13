@@ -43,7 +43,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v13-control-output-size"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v14-exited-worker-cancel"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -85,6 +85,10 @@ _FACTORY_EDIT_FIELDS = frozenset({
 })
 _jobs: dict[str, subprocess.Popen[bytes] | _FactoryProcess] = {}
 _launching: set[str] = set()
+# Retain only identities, for this executor's lifetime. Evicting them would make
+# an already-reaped worker indistinguishable from a never-issued identifier.
+# Exit status still travels over the original launch connection.
+_exited: set[str] = set()
 _jobs_lock = threading.Lock()
 _OUTPUT_LIMIT_POLL_S = 0.01
 _FACTORY_STOP_TIMEOUT_S = 5.0
@@ -909,8 +913,10 @@ def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5
 def _cancel(identifier: str) -> None:
     with _jobs_lock:
         proc = _jobs.get(identifier)
-    if proc is None:
-        raise RuntimeError("unknown worker id")
+        if proc is None:
+            if identifier in _exited:
+                return
+            raise RuntimeError("unknown worker id")
     _terminate_process_group(proc)
 
 
@@ -1147,6 +1153,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     with _jobs_lock:
         if identifier in _jobs or identifier in _launching:
             raise RuntimeError("worker id is already active")
+        if identifier in _exited:
+            raise RuntimeError("worker id has already exited")
         _launching.add(identifier)
     home = Path()
     proc: subprocess.Popen[bytes] | _FactoryProcess | None = None
@@ -1229,6 +1237,9 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             stderr_limit,
         )
         with _jobs_lock:
+            # Publish the tombstone atomically with removal, before home cleanup
+            # or terminal delivery can delay controller-side collection.
+            _exited.add(identifier)
             _jobs.pop(identifier, None)
         _cleanup_home(home)
         home = Path()

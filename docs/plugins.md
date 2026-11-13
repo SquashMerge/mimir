@@ -309,6 +309,37 @@ selected plugin owns. Startup does not fail.
 Your `worklink.yaml`, `repositories.yaml` and existing Worklink state are read
 unchanged once Cultivate is selected.
 
+#### Worklink operations
+
+Use `mimir worklink status <issue-id> --home <agent-home>` to inspect a leaf's
+run and active dispatch incident. An active incident shows `failure_kind`,
+`signature`, `occurrence_id` and `failed_at`.
+
+To release a dispatch-failure hold without executing the job:
+
+```sh
+mimir worklink clear-incident <issue-id> --home <agent-home> --reason "Infrastructure fault repaired"
+# Optionally pin the exact incident inspected in status (either or both flags):
+mimir worklink clear-incident <issue-id> --home <agent-home> --reason "Infrastructure fault repaired" --signature <signature> --occurrence <occurrence_id>
+```
+
+The command refuses absent/inactive incidents, mismatched pins, active runs or
+claims, unreadable/invalid state, and an empty reason. It serializes the ledger
+update, preserves the incident's other fields (including prior-attempt refs),
+records the operator, timestamp and a scrubbed reason bounded to 1000 characters,
+emits `worklink_incident_cleared`, and comments on the Chainlink issue. An audit
+delivery failure reports that the incident was cleared and exits nonzero.
+Labels, claims, worktrees and `refs/worklink/<id>/<n>` are untouched. If the issue
+is still `worklink:ready`, the next autonomous scan can dispatch it under normal
+admission rules, with its previous attempt available to the retry.
+
+For retained factory records, `mimir worklink archive-factory-run <issue-id>
+--home <agent-home>` archives factory control-plane state. For a quiescent legacy
+factory store, `mimir worklink clear-factory-runtime <exact-attempt-directory>
+--home <agent-home> --confirm-quiescent` performs operator-confirmed runtime
+cleanup; verify all driver, specialist and external store users have stopped
+before using this destructive command.
+
 Cultivate supplies Worklink, Forge/repository/CI tools, OpenCode execution,
 coding defaults, the Factory Runs and PR-board pages and the `squashmerge`
 default skin. The Coding status prompt block appears only for operator turns

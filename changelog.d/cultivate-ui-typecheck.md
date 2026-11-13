@@ -1,0 +1,1 @@
+- The frontend type-check (`npm run typecheck`, and `tsc` in `npm run build`) now also covers the Cultivate UI sources in `plugins/cultivate/frontend/src`, which were previously not type-checked anywhere.

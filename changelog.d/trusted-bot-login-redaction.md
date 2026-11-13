@@ -1,0 +1,1 @@
+- Reviews of PRs from operator-trusted bots (`MIMIR_GITHUB_TRUSTED_BOT_LOGINS`, e.g. `dependabot[bot]`) are no longer refused with `no_author_trust`: poller payload redaction treated the forwarded allowlist as a secret and replaced the bot's author login with `[REDACTED]`, so PR authorization saw an author mismatch.
