@@ -56,6 +56,9 @@ class ComputeResult:
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     children_reaped: bool = False
+    output_truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
 
 class ComputeLaunchError(RuntimeError):

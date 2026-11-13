@@ -75,7 +75,7 @@ async def test_gate_child_denies_otlp_carriers_after_spec_and_ambient_merge(
 
     compute = ChildCompute()
     if route == "factory":
-        def factory_child(checkout, argv, *, env, timeout, output_limit):
+        def factory_child(checkout, argv, *, env, timeout, output_limit, allow_output_truncation):
             compute.gate_env = dict(env)
             return subprocess.run(argv, cwd=checkout, env=env, capture_output=True)
         monkeypatch.setattr(worker_client, "run_factory_control", factory_child)
@@ -583,6 +583,60 @@ def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
     (repo / "test_gate_sample.py").write_text(test_source, encoding="utf-8")
     return repo
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux factory supervisor")
+@pytest.mark.parametrize("exit_code,with_report", [(0, True), (1, True), (0, False), (3, False)])
+@pytest.mark.asyncio
+async def test_factory_gate_large_output_preserves_verdict(tmp_path, monkeypatch, exit_code, with_report):
+    from mimir_cultivate.worklink import worker_client
+    from mimir_cultivate.worklink.backends.base import WorkSpec
+    from tests.worklink_control_helpers import install_local_control_executor
+
+    repo = _init_gate_repo(tmp_path, "def test_sample(): pass\n")
+    calls = install_local_control_executor(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (repo, 1482, 1))
+    size = 20_000_123
+    # Emit both streams in repeated chunks, then write the report: fatal overflow
+    # must fail this test even if it happens before a report can be produced.
+    script = repo / "noisy_gate.py"
+    script.write_text(
+        "import os, pathlib, shlex\n"
+        f"size = {size}\n"
+        "for fd in (1, 2):\n"
+        " os.write(fd, b'HEAD\\n')\n"
+        " remaining = size - 10\n"
+        " while remaining:\n"
+        "  chunk = b'x' * min(remaining, 65536)\n"
+        "  remaining -= os.write(fd, chunk)\n"
+        " os.write(fd, b'\\nTAIL')\n"
+        + (
+            "options = shlex.split(os.environ['PYTEST_ADDOPTS'])\n"
+            "report = pathlib.Path(next(x.split('=', 1)[1] for x in options if x.startswith('--junitxml=')))\n"
+            f"report.write_text('<testsuite tests=\"7\" failures=\"{int(exit_code != 0)}\" errors=\"0\" skipped=\"0\"/>')\n"
+            if with_report else ""
+        )
+        + f"raise SystemExit({exit_code})\n"
+    )
+    command = shlex.join([sys.executable, str(script), "pytest"])
+    spec = WorkSpec(1482, 1, "repo", "main", "issue/1482-a1", "", None, command, "feature_factory", 30, local_checkout=repo)
+    result = await observe_evidence(
+        issue=1482, attempt=1, backend="feature_factory", branch=spec.branch,
+        checkout=repo, started_at=datetime.now(UTC), base_ref="main", backend_status="completed",
+        test_command=command, compute=object(), work_spec=spec, gate_rerun_max_failures=0,
+    )
+    tests = result.evidence.tests
+    assert result.review_ready is (exit_code == 0)
+    assert result.status == ("completed" if exit_code == 0 else "failed")
+    assert tests.exit_code == exit_code
+    assert tests.output_truncated is True
+    assert (tests.stdout_bytes, tests.stderr_bytes) == (size, size)
+    assert tests.report_error == (None if with_report else "junit_missing")
+    if with_report:
+        assert tests.counts == ev.TestCounts(7, 7 - int(exit_code != 0), int(exit_code != 0), 0, 0)
+    else:
+        assert tests.counts is None
+    assert calls[0]["output_overflow"] is True
 
 
 class _AuthorizedGateCompute:

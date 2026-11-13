@@ -11448,8 +11448,10 @@ def factory_completion_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return sandbox
 
 
+@pytest.mark.parametrize("truncated", [False, True])
 def test_factory_completion_with_real_evidence_and_wrapped_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_completion_sandbox: Path,
+    truncated: bool,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
     import mimir_cultivate.worklink.worker_client as worker_client
@@ -11458,15 +11460,20 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(
     completion_runner = _completion_runner(sandbox, case="success")
     gate_calls = []
 
-    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024):
+    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024, allow_output_truncation=False):
         if argv[:1] == ["git"]:
             assert checkout == sandbox.parents[1]
             result = controller(argv)
             return cp(argv, result.returncode, result.stdout.encode(), result.stderr.encode())
         assert checkout == sandbox
         assert argv == ("/bin/sh", "-c", f"cd {sandbox} && make test")
+        assert allow_output_truncation is True
         gate_calls.append(("make test", checkout, True))
-        return cp(argv, stdout=b"all tests passed\n", stderr=b"")
+        result = cp(argv, stdout=b"all tests passed\n", stderr=b"")
+        result.output_truncated = truncated
+        result.stdout_bytes = 20_000_123 if truncated else len(result.stdout)
+        result.stderr_bytes = 20_000_456 if truncated else 0
+        return result
 
     monkeypatch.setattr(worker_client, "run_factory_control", worker_gate)
 
@@ -11499,7 +11506,37 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(
     assert evidence["diff_observed"] is True
     assert evidence["tests"]["observed"] is True
     assert evidence["tests"]["exit_code"] == 0
+    assert evidence["tests"]["output_truncated"] is truncated
+    assert orchestrator._gate_output_metadata(evidence_path) == (
+        {"output_truncated": True, "stdout_bytes": 20_000_123, "stderr_bytes": 20_000_456} if truncated else {}
+    )
     assert evidence["head_sha"] == "a" * 40
+
+    async def verified(**kwargs):
+        return evidence_path, pr_url
+
+    events = []
+    transitions = []
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", verified)
+    monkeypatch.setattr(orchestrator, "_enforce_factory_pr_publication", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **fields: events.append((name, fields)))
+    claims = SimpleNamespace(transition_issue=lambda *args, **kwargs: transitions.append(kwargs))
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=claims, backend=object(), compute=object(), factory_record=_completion_record(sandbox),
+            test_cmd="make test", runner=controller, started_at=datetime.now(UTC),
+        )
+    )
+    assert result.status == "review_ready"
+    assert transitions[0]["status"] == "review"
+    transition = next(fields for name, fields in events if name == "worklink_transition")
+    assert transition["review_ready"] is True
+    if truncated:
+        assert transition["output_truncated"] is True
+        assert transition["stdout_bytes"] == 20_000_123
+        assert transition["stderr_bytes"] == 20_000_456
 
 
 @pytest.mark.parametrize("args", ["make test", ["git", "status"]])

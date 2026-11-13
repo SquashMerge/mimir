@@ -3381,6 +3381,7 @@ class WorklinkRunner:
                 review_ready=False,
                 pr_url=published_url,
                 reason=reason,
+                **_gate_output_metadata(self.home / "state" / "worklink" / "evidence" / f"{issue_id}-{claim_record.attempt}.json"),
                 **(
                     {
                         "preserved_ref": preserved_ref,
@@ -4699,6 +4700,7 @@ class WorklinkRunner:
             status=result.status,
             review_ready=result.review_ready,
             pr_url=result.pr_url,
+            **_gate_output_metadata(evidence_path),
         )
         return result
 
@@ -4711,6 +4713,18 @@ async def _finish_factory_wait_task(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         return None
+
+
+def _gate_output_metadata(evidence_path: Path) -> dict[str, object]:
+    """Include diagnostic capture metadata in the published epic transition."""
+    try:
+        payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        tests = payload.get("tests") if isinstance(payload, dict) else None
+        if isinstance(tests, dict) and tests.get("output_truncated") is True:
+            return {key: tests[key] for key in ("output_truncated", "stdout_bytes", "stderr_bytes")}
+    except (OSError, ValueError, KeyError):
+        pass
+    return {}
 
 
 def _factory_controller_error(error: BaseException | str) -> str:
