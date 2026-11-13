@@ -1,4 +1,4 @@
-"""OpenCode configuration, worker projection, and proposal artifacts."""
+"""OpenCode daemon model selection, redaction, and proposal artifacts."""
 
 from __future__ import annotations
 
@@ -29,14 +29,12 @@ from mimir.contained_snapshot import (
     SnapshotUnsafeEntry,
 )
 from mimir import event_logger
-from mimir.codex_auth import auth_file_path, load_codex_auth
 from mimir.tools.registry import (
     _STATE, _spawn_acquire_rate_slot, _spawn_current_depth, _spawn_guard_init,
     _spawn_release_rate_slot,
 )
 
 from . import contained_execution
-from .worklink.worker_client import WorkerProjection
 
 
 _REDACTION = b"<redacted>"
@@ -172,7 +170,6 @@ _CONFIG_REASON_CODES = frozenset({
 _AUTH_REASON_CODES = frozenset({
     "auth_invalid", "auth_malformed", "auth_missing", "auth_oversize", "auth_unreadable",
 })
-_MAX_DOCUMENT_BYTES = 1024 * 1024
 
 
 class OpenCodeConfigError(ValueError):
@@ -204,13 +201,6 @@ class OpenCodeInvocation:
     provider_config: object = field(default_factory=dict, repr=False, compare=False)
     auth_entry: object | None = field(default=None, repr=False, compare=False)
     scrubber: SensitiveMaterialScrubber = field(repr=False, compare=False, default_factory=SensitiveMaterialScrubber)
-
-
-@dataclass(frozen=True)
-class OpenCodeWorkerDocuments:
-    config_document: bytes = field(repr=False)
-    auth_document: bytes | None = field(repr=False)
-    scrubber: SensitiveMaterialScrubber = field(repr=False, compare=False)
 
 
 def _home(env: Mapping[str, str]) -> Path:
@@ -258,108 +248,40 @@ def _provider_from_model(model: str) -> str:
     return provider
 
 
-def resolve_opencode_invocation(
-    explicit_model: str | None = None, *, env: Mapping[str, str] | None = None,
-    config_path: Path | str | None = None,
-) -> OpenCodeInvocation:
-    values = os.environ if env is None else env
-    path = opencode_config_path(values, override=config_path)
-    auth_path = opencode_auth_path(values)
-    scrubber = SensitiveMaterialScrubber(home=_home(values), source_paths=(path, auth_path))
-    explicitly_configured = config_path is not None or bool(values.get("OPENCODE_CONFIG", "").strip())
-    if not path.exists():
-        if explicitly_configured:
-            raise OpenCodeConfigError("config_missing")
-        native: dict[str, object] = {}
-    else:
-        native, config_source = _read_object(path, kind="config")
-        scrubber.add_document(config_source)
+def resolve_daemon_model(env: Mapping[str, str], explicit_model: str | None = None) -> dict[str, str]:
+    """Resolve the session model without opening provider or agent auth files."""
+    from mimir._reasoning_effort import validate_effort
 
-    configured_model = native.get("model")
-    if configured_model is not None and (
-        not isinstance(configured_model, str) or not configured_model.strip()
-    ):
-        raise OpenCodeConfigError("config_provider_selection")
-    if explicit_model and explicit_model.strip():
-        model = explicit_model.strip()
-        source = "explicit"
-    elif isinstance(configured_model, str):
-        model = configured_model.strip()
-        source = "opencode_config"
-    else:
-        model = opencode_model_from_agent_spec(values.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC))
-        source = "agent_model"
-
+    selected = (explicit_model or opencode_model_from_agent_spec(env.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC))).strip()
+    model, separator, variant = selected.partition("#")
     provider = _provider_from_model(model)
-    codex = provider == "openai" and values.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC).strip().startswith("codex-plus:")
-    if codex:
-        reconcile_codex_auth(values, scrubber=scrubber)
-    provider_config, env_references = _selected_provider_config(native, provider)
-    auth_type, remove_env, auth_entry = _inspect_auth(
-        provider, values, auth_path=auth_path, env_references=env_references, scrubber=scrubber,
-        codex=codex,
-    )
-    return OpenCodeInvocation(
-        model=model, provider=provider, model_source=source, config_path=path,
-        auth_path=auth_path, auth_type=auth_type, remove_env=remove_env,
-        pass_env=tuple(sorted(env_references)), provider_config=provider_config,
-        auth_entry=auth_entry, scrubber=scrubber,
-    )
+    if any(not char.isprintable() or char.isspace() for char in selected):
+        raise OpenCodeConfigError("config_provider_selection")
+    effort = env.get("MIMIR_WORKLINK_REASONING_EFFORT") or env.get("MIMIR_MODEL_REASONING_EFFORT", "")
+    if not separator and effort:
+        try:
+            variant = validate_effort("codex-plus", effort) if provider == "openai" else effort
+        except ValueError as exc:
+            name = "MIMIR_WORKLINK_REASONING_EFFORT" if env.get("MIMIR_WORKLINK_REASONING_EFFORT") else "MIMIR_MODEL_REASONING_EFFORT"
+            raise ValueError(f"{name}: {exc}") from exc
+    if separator and not variant:
+        raise OpenCodeConfigError("config_provider_selection")
+    reference = {"providerID": provider, "id": model.split("/", 1)[1]}
+    if variant and variant != "none":
+        reference["variant"] = variant
+    if any(not value or len(value.encode()) > 1024 for value in reference.values()):
+        raise OpenCodeConfigError("config_provider_selection")
+    return reference
 
 
-def _inspect_auth(
-    provider: str, env: Mapping[str, str], *, auth_path: Path,
-    env_references: set[str], scrubber: SensitiveMaterialScrubber, codex: bool = False,
-) -> tuple[str | None, tuple[str, ...], object | None]:
-    if auth_path.exists():
-        entries, auth_source = _read_object(auth_path, kind="auth")
-        scrubber.add_document(auth_source)
-        _add_sensitive_scalars(scrubber, entries, skip_keys=frozenset({"type"}))
-    else:
-        entries = {}
-    entry = entries.get(provider)
-    ambient_name = f"{provider.upper().replace('-', '_')}_API_KEY"
-    ambient_present = bool(env.get(ambient_name, "").strip())
+def redact_daemon_output(text: str) -> str:
+    from mimir.otel_credentials import is_sensitive_otlp_env
+    from mimir.redaction import redact_text
 
-    if entry is None:
-        if codex:
-            raise OpenCodeAuthError("auth_missing")
-        if ambient_present:
-            credential = env[ambient_name].strip()
-            scrubber.add_scalar(credential)
-            return "api", (ambient_name,), {"type": "api", "key": credential}
-        if env_references:
-            return None, (), None
-        raise OpenCodeAuthError("auth_missing")
-    if not isinstance(entry, dict):
-        raise OpenCodeAuthError("auth_invalid")
-    auth_type = entry.get("type")
-    if not isinstance(auth_type, str) or not auth_type.strip():
-        raise OpenCodeAuthError("auth_invalid")
-    auth_type = auth_type.strip()
-    if codex and auth_type != "oauth":
-        raise OpenCodeAuthError("auth_invalid")
-    if codex and not all(
-        isinstance(entry.get(key), str) and bool(entry[key].strip())
-        for key in ("access", "refresh")
-    ):
-        raise OpenCodeAuthError("auth_invalid")
-    required = {
-        "oauth": ("access", "refresh"), "api": ("key",), "wellknown": ("key", "token"),
-    }.get(auth_type)
-    if required is None:
-        usable = any(
-            key != "type" and isinstance(value, str) and value.strip()
-            for key, value in entry.items()
-        )
-    else:
-        usable = any(isinstance(entry.get(key), str) and bool(entry[key].strip()) for key in required)
-    if not usable:
-        raise OpenCodeAuthError("auth_invalid")
-    copied = json.loads(json.dumps(entry))
-    _add_sensitive_scalars(scrubber, copied, skip_keys=frozenset({"type"}))
-    remove = (ambient_name,) if auth_type == "oauth" else ()
-    return auth_type, remove, copied
+    for name, value in os.environ.items():
+        if value and is_sensitive_otlp_env(name, value):
+            text = text.replace(value, "<redacted>")
+    return redact_text(text)
 
 
 def _jwt_exp(token: str) -> int:
@@ -370,332 +292,6 @@ def _jwt_exp(token: str) -> int:
         return exp if isinstance(exp, int) and not isinstance(exp, bool) else 0
     except (IndexError, ValueError, KeyError, TypeError):
         return 0
-
-
-def _atomic_auth_write(path: Path, document: dict[str, object]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=".auth-", delete=False) as output:
-            temporary = output.name
-            os.fchmod(output.fileno(), 0o600)
-            json.dump(document, output)
-            output.write("\n")
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None and os.path.exists(temporary):
-            os.unlink(temporary)
-
-
-def reconcile_codex_auth(
-    env: Mapping[str, str] | None = None, *, scrubber: SensitiveMaterialScrubber | None = None,
-    refreshed_path: Path | None = None,
-    refreshed_document: bytes | None = None,
-) -> None:
-    """Keep Codex and OpenCode on one refresh-token family (newer JWT exp wins)."""
-    if refreshed_path is not None and refreshed_document is not None:
-        raise ValueError("choose one refreshed auth source")
-    values = os.environ if env is None else env
-    home = _home(values)
-    codex_home = Path(values.get("CODEX_HOME") or home / ".codex").expanduser()
-    codex_path = auth_file_path(codex_home)
-    opencode_path = opencode_auth_path(values)
-    if scrubber is not None:
-        scrubber.add_path(codex_path)
-        scrubber.add_path(opencode_path)
-    try:
-        auth = load_codex_auth(codex_path)
-        if auth is None:
-            raise OpenCodeAuthError("auth_missing")
-        if auth.auth_mode != "chatgpt" or not isinstance(auth.refresh_token, str) or not auth.refresh_token:
-            raise OpenCodeAuthError("auth_invalid")
-        if _jwt_exp(auth.access_token) <= 0:
-            raise OpenCodeAuthError("auth_invalid")
-        codex_document, codex_source = _read_object(codex_path, kind="auth")
-        if scrubber is not None:
-            scrubber.add_document(codex_source)
-            _add_sensitive_scalars(scrubber, codex_document)
-        entries = _read_object(opencode_path, kind="auth")[0] if opencode_path.exists() else {}
-        refreshed = (
-            _parse_object(refreshed_document, kind="auth").get("openai")
-            if refreshed_document is not None else
-            _read_object(refreshed_path, kind="auth")[0].get("openai")
-            if refreshed_path is not None and refreshed_path.exists() else None
-        )
-        if isinstance(refreshed, dict) and refreshed.get("type") == "oauth" and (
-            isinstance(refreshed.get("access"), str) and isinstance(refreshed.get("refresh"), str)
-            and refreshed["refresh"] and _jwt_exp(refreshed["access"]) > max(
-                _jwt_exp(auth.access_token),
-                _jwt_exp(entries.get("openai", {}).get("access", ""))
-                if isinstance(entries.get("openai"), dict) else 0,
-            )
-        ):
-            entries["openai"] = refreshed
-            _atomic_auth_write(opencode_path, entries)
-        if scrubber is not None:
-            _add_sensitive_scalars(scrubber, entries)
-        openai = entries.get("openai")
-        if openai is not None and not isinstance(openai, dict):
-            raise OpenCodeAuthError("auth_invalid")
-        if isinstance(openai, dict) and openai.get("type") == "oauth":
-            if openai.get("refresh") == auth.refresh_token:
-                return
-            if (isinstance(openai.get("access"), str) and isinstance(openai.get("refresh"), str)
-                    and openai["refresh"] and _jwt_exp(openai["access"]) > _jwt_exp(auth.access_token)):
-                tokens = codex_document.get("tokens")
-                if not isinstance(tokens, dict):
-                    raise OpenCodeAuthError("auth_invalid")
-                tokens["access_token"] = openai["access"]
-                tokens["refresh_token"] = openai["refresh"]
-                codex_document["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                _atomic_auth_write(codex_path, codex_document)
-                return
-        entries["openai"] = {
-            "type": "oauth", "access": auth.access_token, "refresh": auth.refresh_token,
-            "expires": _jwt_exp(auth.access_token) * 1000,
-        }
-        _atomic_auth_write(opencode_path, entries)
-    except OpenCodeAuthError as exc:
-        raise OpenCodeAuthError(exc.reason_code) from None
-    except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
-        raise OpenCodeAuthError("auth_invalid") from None
-
-
-def _read_object(path: Path, *, kind: str) -> tuple[dict[str, object], bytes]:
-    unreadable_code = "config_unreadable" if kind == "config" else "auth_unreadable"
-    error_type = OpenCodeConfigError if kind == "config" else OpenCodeAuthError
-    try:
-        with path.open("rb") as source:
-            document = source.read(_MAX_DOCUMENT_BYTES + 1)
-    except OSError as exc:
-        raise error_type(unreadable_code) from exc
-    return _parse_object(document, kind=kind), document
-
-
-def _parse_object(document: bytes, *, kind: str) -> dict[str, object]:
-    oversize_code = "config_oversize" if kind == "config" else "auth_oversize"
-    malformed_code = "config_malformed" if kind == "config" else "auth_malformed"
-    error_type = OpenCodeConfigError if kind == "config" else OpenCodeAuthError
-    if len(document) > _MAX_DOCUMENT_BYTES:
-        raise error_type(oversize_code)
-    try:
-        parsed = json.loads(_strip_jsonc(document.decode("utf-8")))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise error_type(malformed_code) from exc
-    if not isinstance(parsed, dict):
-        raise error_type(malformed_code)
-    return parsed
-
-
-_ENV_REFERENCE = re.compile(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
-_ENV_REFERENCE_FULL = re.compile(r"\{env:([A-Za-z_][A-Za-z0-9_]{0,127})\}")
-_SECRET_KEYS = frozenset({
-    "apikey", "key", "token", "accesstoken", "refreshtoken", "secret",
-    "password", "authorization", "credential", "credentials", "clientsecret",
-})
-
-
-def opencode_worker_documents(
-    invocation: OpenCodeInvocation, env: Mapping[str, str] | None = None,
-) -> OpenCodeWorkerDocuments:
-    if _is_github_provider(invocation.provider):
-        raise OpenCodeConfigError("config_provider_selection")
-    values = os.environ if env is None else env
-    references: set[str] = set()
-    _validate_provider_config(invocation.provider_config, invocation.provider, references)
-    provider_config = _materialize_env_references(invocation.provider_config, values, invocation.scrubber)
-    config = {
-        "model": invocation.model,
-        "provider": {invocation.provider: provider_config},
-        "permission": {"external_directory": "deny"},
-    }
-    config_document = _encode_projection(config, auth=False)
-    auth_document: bytes | None = None
-    if invocation.auth_entry is not None:
-        if invocation.auth_type not in {"api", "oauth", "wellknown"}:
-            raise OpenCodeAuthError("auth_invalid")
-        auth_document = _encode_projection({invocation.provider: invocation.auth_entry}, auth=True)
-    invocation.scrubber.add_document(config_document)
-    if auth_document is not None:
-        invocation.scrubber.add_document(auth_document)
-    return OpenCodeWorkerDocuments(config_document, auth_document, invocation.scrubber)
-
-
-def _encode_projection(value: object, *, auth: bool) -> bytes:
-    document = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if len(document) > _MAX_DOCUMENT_BYTES:
-        if auth:
-            raise OpenCodeAuthError("auth_oversize")
-        raise OpenCodeConfigError("config_oversize")
-    return document
-
-
-def _materialize_env_references(
-    value: object, env: Mapping[str, str], scrubber: SensitiveMaterialScrubber,
-) -> object:
-    if isinstance(value, str):
-        match = _ENV_REFERENCE_FULL.fullmatch(value)
-        if match is None:
-            return value
-        material = env.get(match.group(1), "")
-        if not material:
-            raise OpenCodeAuthError("auth_missing")
-        scrubber.add_scalar(material)
-        return material
-    if isinstance(value, dict):
-        return {key: _materialize_env_references(nested, env, scrubber) for key, nested in value.items()}
-    if isinstance(value, list):
-        return [_materialize_env_references(nested, env, scrubber) for nested in value]
-    return value
-
-
-def _selected_provider_config(native: Mapping[str, object], provider: str) -> tuple[object, set[str]]:
-    providers = native.get("provider")
-    selected = providers.get(provider, {}) if isinstance(providers, dict) else {}
-    if not isinstance(selected, dict):
-        raise OpenCodeConfigError("config_provider_selection")
-    copied = json.loads(json.dumps(selected))
-    return copied, _native_env_references(copied)
-
-
-def _native_env_references(value: object) -> set[str]:
-    if isinstance(value, str):
-        return set(_ENV_REFERENCE.findall(value))
-    if isinstance(value, dict):
-        found: set[str] = set()
-        for nested in value.values():
-            found.update(_native_env_references(nested))
-        return found
-    if isinstance(value, list):
-        found = set()
-        for nested in value:
-            found.update(_native_env_references(nested))
-        return found
-    return set()
-
-
-def _validate_provider_config(
-    value: object, provider: str, references: set[str], *, key: str | None = None,
-) -> None:
-    normalized = re.sub(r"[^a-z0-9]", "", key.lower()) if key else ""
-    if normalized in _SECRET_KEYS:
-        if isinstance(value, str) and not value:
-            return
-        if isinstance(value, (dict, list)) and not value:
-            return
-        full = _ENV_REFERENCE_FULL.fullmatch(value) if isinstance(value, str) else None
-        if full is not None:
-            references.add(full.group(1))
-            return
-        raise OpenCodeConfigError("config_unsafe_inline_secret")
-    if isinstance(value, dict):
-        for nested_key, nested in value.items():
-            if _is_github_provider(nested_key):
-                raise OpenCodeConfigError("config_unsafe_inline_secret")
-            _validate_provider_config(nested, provider, references, key=nested_key)
-        return
-    if isinstance(value, list):
-        for nested in value:
-            _validate_provider_config(nested, provider, references, key=key)
-        return
-    if isinstance(value, str):
-        full = _ENV_REFERENCE_FULL.fullmatch(value)
-        if "{env:" in value and full is None:
-            raise OpenCodeConfigError("config_unsafe_inline_secret")
-        if full is not None:
-            references.add(full.group(1))
-
-
-def _add_sensitive_scalars(
-    scrubber: SensitiveMaterialScrubber, value: object,
-    *, skip_keys: frozenset[str] = frozenset(),
-) -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key not in skip_keys:
-                _add_sensitive_scalars(scrubber, nested, skip_keys=skip_keys)
-    elif isinstance(value, list):
-        for nested in value:
-            _add_sensitive_scalars(scrubber, nested, skip_keys=skip_keys)
-    elif isinstance(value, str) and value:
-        scrubber.add_scalar(value)
-
-
-def _is_github_provider(provider: str) -> bool:
-    normalized = provider.strip().lower()
-    return normalized == "github" or normalized.startswith("github-")
-
-
-def _strip_jsonc(source: str) -> str:
-    output: list[str] = []
-    index = 0
-    in_string = False
-    escaped = False
-    while index < len(source):
-        char = source[index]
-        next_char = source[index + 1] if index + 1 < len(source) else ""
-        if in_string:
-            output.append(char)
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            index += 1
-            continue
-        if char == '"':
-            in_string = True
-            output.append(char)
-            index += 1
-            continue
-        if char == "/" and next_char == "/":
-            index += 2
-            while index < len(source) and source[index] not in "\r\n":
-                index += 1
-            continue
-        if char == "/" and next_char == "*":
-            index += 2
-            while index + 1 < len(source) and source[index:index + 2] != "*/":
-                index += 1
-            index += 2
-            continue
-        output.append(char)
-        index += 1
-
-    cleaned = "".join(output)
-    output = []
-    in_string = False
-    escaped = False
-    index = 0
-    while index < len(cleaned):
-        char = cleaned[index]
-        if in_string:
-            output.append(char)
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            index += 1
-            continue
-        if char == '"':
-            in_string = True
-            output.append(char)
-            index += 1
-            continue
-        if char == ",":
-            lookahead = index + 1
-            while lookahead < len(cleaned) and cleaned[lookahead].isspace():
-                lookahead += 1
-            if lookahead < len(cleaned) and cleaned[lookahead] in "}]":
-                index += 1
-                continue
-        output.append(char)
-        index += 1
-    return "".join(output)
 
 
 MAX_PROPOSAL_PATHS = 1_000
@@ -1042,6 +638,10 @@ async def _spawn_open_code_impl(
         home=home, checkout=seed, artifact_root=artifact_root,
         source_paths=(config_path, auth_path),
     )
+    from mimir.otel_credentials import is_sensitive_otlp_env
+    for key, value in os.environ.items():
+        if value and (is_sensitive_otlp_env(key, value) or key in {"GH_TOKEN", "GITHUB_TOKEN"}):
+            scrubber.add_scalar(value)
     selected_artifact_root = Path(
         artifact_root or cfg.get("artifact_root") or (home / ".factory" / "runs")
     ).expanduser()
@@ -1072,6 +672,7 @@ async def _spawn_open_code_impl(
             "reason_code": terminal.reason_code, "exit_code": None,
             "stdout": "", "result": "", "stderr": "Artifact storage unavailable",
             "artifact_dir": None, "name": name, "proposal": None,
+            "opencode_session_id": None,
         }, indent=2)
 
     stdout = b""
@@ -1081,11 +682,26 @@ async def _spawn_open_code_impl(
     execution = None
     terminal = None
     seed_tree = None
+    retain_checkout = False
+    session_id = None
+    launch_generation = None
+
+    def admitted(handle) -> None:
+        nonlocal session_id, launch_generation
+        session_id = handle.opencode_session_id
+        launch_generation = handle.launch_generation
+
+    def quiescent() -> None:
+        nonlocal retain_checkout
+        retain_checkout = False
+
     try:
         try:
-            invocation = resolve_opencode_invocation(model, config_path=cfg.get("opencode_config_path"))
-            documents = opencode_worker_documents(invocation)
-            scrubber = documents.scrubber
+            reference = resolve_daemon_model(dict(os.environ), model)
+            invocation = OpenCodeInvocation(
+                model=f"{reference['providerID']}/{reference['id']}", provider=reference['providerID'],
+                model_source="explicit" if model else "agent_model", config_path=config_path,
+                auth_path=auth_path, auth_type=None, scrubber=scrubber)
             scrubber.add_path(seed)
             scrubber.add_path(artifact_base)
         except OpenCodeAuthError as exc:
@@ -1110,22 +726,11 @@ async def _spawn_open_code_impl(
 
         if terminal is None and invocation is not None:
             try:
-                spawn_arguments = shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
-                argv = ["opencode", "run", "--dir", ".", *spawn_arguments]
-                argv += ["-m", invocation.model]
-                if agent:
-                    argv += ["--agent", agent]
-                argv += ["--", prompt]
-                selectors = {
-                    "MIMIR_SPAWN_DEPTH": str(current_depth + 1),
-                    "OPENCODE_MODEL": invocation.model,
-                    "OPENCODE_PROVIDER": invocation.provider,
-                }
-                if agent:
-                    selectors["OPENCODE_AGENT"] = agent
-                worker_env = contained_execution.opencode_worker_environment(
-                    contained_execution.base_worker_environment(run_id), selectors,
-                )
+                from .worklink.backends.base import SessionRequest
+                if os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", "").strip():
+                    raise ValueError("daemon sessions do not accept CLI arguments")
+                request = SessionRequest("spawn", reference, prompt,
+                                         spawn_depth=current_depth + 1, agent=agent)
             except ValueError:
                 terminal = classify_spawn_terminal_state(configuration_reason="config_provider_selection")
 
@@ -1135,7 +740,7 @@ async def _spawn_open_code_impl(
                     value, agent_home=home,
                     source_paths=(invocation.config_path, invocation.auth_path),
                 ) is not None
-                for value in (*argv, *worker_env.values())
+                for value in reference.values()
             )
             if sensitive_execution_value:
                 terminal = classify_spawn_terminal_state(configuration_reason="config_provider_selection")
@@ -1144,11 +749,7 @@ async def _spawn_open_code_impl(
             try:
                 checkout = checkout_factory(
                     seed, default_cwd=default_cwd,
-                    known_sensitive=tuple(
-                        document for document in (
-                            documents.config_document, documents.auth_document,
-                        ) if document is not None
-                    ),
+                    known_sensitive=(),
                 )
                 seed_tree = checkout.base_tree
             except SnapshotCredentialsRefused:
@@ -1165,29 +766,31 @@ async def _spawn_open_code_impl(
                 terminal = classify_spawn_terminal_state(provisioning_reason="provisioning_unavailable")
 
         if terminal is None and invocation is not None and checkout is not None:
-            projections = [WorkerProjection(
-                path=".config/opencode/opencode.json",
-                document=documents.config_document,
-            )]
-            if documents.auth_document is not None:
-                projections.append(WorkerProjection(
-                    path=".local/share/opencode/auth.json",
-                    document=documents.auth_document,
-                ))
             assert guard.sem is not None
             try:
                 async with guard.sem:
+                    retain_checkout = True
                     execution = await contained_runner(
-                        argv, checkout.capability, worker_env, tuple(projections),
-                        identifier=execution_identifier or run_id,
-                        timeout_s=timeout_s,
+                        checkout.capability, request, timeout_s=timeout_s,
                         stdout_limit=1024 * 1024,
-                        stderr_limit=1024 * 1024,
-                        scrubber=scrubber,
+                        on_session=admitted, on_quiescence=quiescent,
                     )
-                stdout = execution.stdout
-                stderr = execution.stderr
-            except (OSError, RuntimeError, ValueError):
+                    session_id = execution.handle.opencode_session_id if execution.handle else None
+                    retain_checkout = False
+                stdout = redact_daemon_output(execution.stdout).encode()
+                stderr = redact_daemon_output(execution.stderr).encode()
+            except ValueError:
+                retain_checkout = False
+                terminal = classify_spawn_terminal_state(containment_available=False)
+            except (OSError, RuntimeError) as exc:
+                from .worklink.backends.base import SessionAdmissionError
+                if isinstance(exc, SessionAdmissionError):
+                    retain_checkout = exc.uncertain and not exc.quiescent
+                    launch_generation = exc.launch_generation
+                    if exc.handle is not None:
+                        session_id = exc.handle.opencode_session_id
+                if isinstance(exc, contained_execution.SessionCleanupError):
+                    session_id = exc.handle.opencode_session_id
                 terminal = classify_spawn_terminal_state(containment_available=False)
 
         if terminal is None and execution is not None and checkout is not None:
@@ -1196,12 +799,7 @@ async def _spawn_open_code_impl(
                 proposal_result = build_opencode_proposal(
                     checkout.path, scrubber=scrubber, base_tree=seed_tree,
                 )
-            auth_required = False
-            if execution.exit_code not in (None, 0):
-                blob = scrubber.scrub_text(stderr + b"\n" + stdout).lower()
-                auth_required = any(marker in blob for marker in (
-                    "unauthorized", "not logged in", "credential", "auth", "401",
-                ))
+            auth_required = execution.session_error is not None and execution.session_error.type == "provider.auth"
             terminal = classify_spawn_terminal_state(
                 timed_out=execution.timed_out,
                 output_overflow=execution.output_overflow,
@@ -1209,15 +807,38 @@ async def _spawn_open_code_impl(
                 worker_authentication_required=auth_required,
                 proposal_result=proposal_result,
             )
-    except BaseException:
+    except BaseException as exc:
+        from .worklink.backends.base import SessionAdmissionCancelled
+        if isinstance(exc, SessionAdmissionCancelled):
+            retain_checkout = exc.uncertain
+            launch_generation = exc.launch_generation
+        if isinstance(exc, contained_execution.SessionCancelledError):
+            session_id = exc.handle.opencode_session_id
+            retain_checkout = not exc.verified
+        if session_id is not None or retain_checkout:
+            descriptor = os.open("manifest.json", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                                 dir_fd=artifact_directory_fd)
+            try:
+                with os.fdopen(descriptor, "w", closefd=False) as stream:
+                    json.dump({"schema_version": 2, "run_id": run_id, "launcher": "mimir.spawn_open_code",
+                               "status": "interrupted", "reason_code": "cancelled",
+                               "opencode_session_id": session_id,
+                               "launch_generation": launch_generation,
+                               "admission_state": "uncertain" if session_id is None else "admitted",
+                               "cancellation_state": "unverified" if retain_checkout else "verified"}, stream)
+            finally:
+                os.close(descriptor)
         os.close(artifact_directory_fd)
         artifact_directory_fd = -1
-        if execution is None:
+        if execution is None and session_id is None and not retain_checkout:
             await _spawn_release_rate_slot(guard, rate_token)
         raise
     finally:
         if checkout is not None:
             try:
+                if retain_checkout:
+                    checkout.close(retain=True)
+                    raise RuntimeError("session quiescence unverified; checkout retained")
                 checkout.close()
             except (OSError, RuntimeError):
                 event = cleanup_failure_event(run_id)
@@ -1227,7 +848,7 @@ async def _spawn_open_code_impl(
                 log.warning("spawn_open_code cleanup failed")
 
     assert terminal is not None
-    if execution is None:
+    if execution is None and session_id is None and not retain_checkout:
         await _spawn_release_rate_slot(guard, rate_token)
     manifest = {
         "schema_version": 2, "run_id": run_id, "launcher": "mimir.spawn_open_code",
@@ -1238,8 +859,11 @@ async def _spawn_open_code_impl(
         "exit_code": terminal.exit_code, "seed_tree": seed_tree,
         "timed_out": bool(execution and execution.timed_out),
         "output_overflow": bool(execution and execution.output_overflow),
-        "stdout_dropped_bytes": execution.stdout_dropped_bytes if execution else 0,
-        "stderr_dropped_bytes": execution.stderr_dropped_bytes if execution else 0,
+        "stdout_dropped_bytes": 0,
+        "stderr_dropped_bytes": 0,
+        "opencode_session_id": session_id,
+        "launch_generation": launch_generation,
+        "admission_state": "uncertain" if retain_checkout and session_id is None else "admitted" if session_id else "refused",
     }
     artifact_handle = run_id
     try:
@@ -1323,6 +947,7 @@ async def _spawn_open_code_impl(
         "stdout": safe_stdout, "result": safe_stdout, "stderr": safe_stderr,
         "artifact_dir": artifact_handle, "name": name,
         "proposal": terminal.proposal.as_dict() if terminal.proposal else None,
+        "opencode_session_id": manifest["opencode_session_id"],
     }, indent=2)
 
 
@@ -1338,11 +963,11 @@ async def spawn_open_code(
 ) -> str:
     """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
     from .contained_checkout import create_opencode_checkout
-    from .contained_execution import execute_contained
+    from .contained_execution import execute_contained_session
 
     return await _spawn_open_code_impl(
         prompt, cwd, timeout_s, name, model, agent, artifact_root,
-        contained_runner=execute_contained,
+        contained_runner=execute_contained_session,
         checkout_factory=create_opencode_checkout,
         execution_identifier=str(uuid.uuid4()),
     )

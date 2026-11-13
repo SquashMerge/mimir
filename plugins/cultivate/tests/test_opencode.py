@@ -13,6 +13,30 @@ from mimir_cultivate import opencode, repository
 from tests.opencode_fixtures import seed_codex_subscription
 
 
+def test_converted_consumers_have_no_legacy_execution_or_auth_fallback():
+    import ast
+    import inspect
+    import textwrap
+    from mimir_cultivate import setup
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+
+    forbidden = {"resolve_opencode_invocation", "resolve_worklink_opencode_invocation",
+                 "opencode_worker_documents", "reconcile_codex_auth", "resolve_opencode_binary",
+                 "opencode_worker_environment", "_verify_opencode_binary", "_verify_opencode_model"}
+    for consumer in (OpenCodeBackend.work_spec, opencode._spawn_open_code_impl, setup._verify):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(consumer)))
+        calls = {node.func.id for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        assert not calls & forbidden
+        constants = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        assert "OPENCODE_PERMISSION" not in constants
+    wrapper = inspect.getsource(opencode.spawn_open_code.coroutine)
+    assert "contained_runner=execute_contained_session" in wrapper
+    assert "resolve_daemon_model" in setup._OPENCODE_DAEMON_PROBE
+    assert "wait_for_daemon" in setup._OPENCODE_DAEMON_PROBE
+    assert "resolve_opencode_invocation" not in setup._OPENCODE_DAEMON_PROBE
+
+
 def test_selected_spawn_factory_is_provider_owned() -> None:
     from mimir_cultivate.policy import _factory
 
@@ -27,7 +51,7 @@ def _auth(home: Path, provider: str, entry: dict[str, str]) -> None:
     path.write_text(json.dumps({provider: entry}), encoding="utf-8")
 
 
-def test_selected_provider_projects_only_selected_config_and_oauth(tmp_path: Path) -> None:
+def test_daemon_selection_never_projects_controller_config_or_oauth(tmp_path: Path) -> None:
     path = tmp_path / "opencode.jsonc"
     path.write_text(
         '{"model":"openai/gpt-test","provider":{"openai":'
@@ -42,23 +66,17 @@ def test_selected_provider_projects_only_selected_config_and_oauth(tmp_path: Pat
         "MIMIR_MODEL_SPEC": "openai:gpt-test",
         "OPENAI_TOKEN": "private-token", "OPENAI_API_KEY": "ambient-token",
     }
-    selected = opencode.resolve_opencode_invocation(env=env)
-    assert (selected.model, selected.provider, selected.model_source) == (
-        "openai/gpt-test", "openai", "opencode_config",
-    )
-    assert selected.remove_env == ("OPENAI_API_KEY",)
-    assert selected.pass_env == ("OPENAI_TOKEN",)
-    documents = opencode.opencode_worker_documents(selected, env)
-    assert json.loads(documents.config_document)["permission"] == {"external_directory": "deny"}
-    assert b"other-secret" not in documents.config_document
-    assert b"other-secret" not in documents.auth_document
-    assert isinstance(documents.scrubber, opencode.SensitiveMaterialScrubber)
+    before = path.read_bytes()
+    selected = opencode.resolve_daemon_model(env)
+    assert selected == {"providerID": "openai", "id": "gpt-test"}
+    assert path.read_bytes() == before
     assert "private-refresh" not in repr(selected)
-    assert "private-token" not in documents.scrubber.scrub_text("private-token")
+    assert "private-token" not in repr(selected)
+    assert not hasattr(opencode, "opencode_worker_documents")
 
 
 @pytest.mark.parametrize("with_bundle", [False, True])
-def test_unset_spec_requires_native_codex_oauth(
+def test_unset_spec_does_not_seed_or_reconcile_agent_codex_oauth(
     tmp_path: Path, with_bundle: bool,
 ) -> None:
     # Even an ambient key and refresh-only OpenCode entry cannot substitute
@@ -66,26 +84,17 @@ def test_unset_spec_requires_native_codex_oauth(
     _auth(tmp_path, "openai", {"type": "oauth", "refresh": "subscription-refresh"})
     env = {"HOME": str(tmp_path), "OPENAI_API_KEY": "ambient-token"}
     assert "MIMIR_MODEL_SPEC" not in env
-    if not with_bundle:
-        with pytest.raises(opencode.OpenCodeAuthError) as raised:
-            opencode.resolve_opencode_invocation(env=env)
-        assert raised.value.reason_code == "auth_missing"
-        return
-
-    seed_codex_subscription(tmp_path, refresh="native-refresh")
-    selected = opencode.resolve_opencode_invocation(env=env)
-    assert selected.provider == "openai"
-    assert selected.auth_type == "oauth"
-    assert selected.remove_env == ("OPENAI_API_KEY",)
-    assert "OPENAI_API_KEY" not in selected.pass_env
-    documents = opencode.opencode_worker_documents(selected, env)
-    native = json.loads((tmp_path / ".codex" / "auth.json").read_text())
-    projected = json.loads(documents.auth_document)["openai"]
-    assert projected["type"] == "oauth"
-    assert projected["access"] == native["tokens"]["access_token"]
-    assert projected["refresh"] == native["tokens"]["refresh_token"]
-    assert "plugin" not in json.loads(documents.config_document)
-    assert b"ambient-token" not in documents.auth_document
+    if with_bundle:
+        seed_codex_subscription(tmp_path, refresh="native-refresh")
+    native = tmp_path / ".codex/auth.json"
+    before = native.read_bytes() if with_bundle else None
+    legacy_auth = tmp_path / ".local/share/opencode/auth.json"
+    legacy_before = legacy_auth.read_bytes()
+    selected = opencode.resolve_daemon_model(env)
+    assert selected["providerID"] == "openai"
+    assert "ambient-token" not in repr(selected)
+    assert (native.read_bytes() if native.exists() else None) == before
+    assert legacy_auth.read_bytes() == legacy_before
 
 
 @pytest.mark.parametrize("provider_config", [
@@ -102,20 +111,20 @@ def test_unsafe_provider_config_fails_closed(
         "model": "proxy/model", "provider": {"proxy": provider_config},
     }), encoding="utf-8")
     env = {"HOME": str(tmp_path), "OPENCODE_CONFIG": str(path), "PROXY_API_KEY": "ambient"}
-    selected = opencode.resolve_opencode_invocation(env=env)
-    with pytest.raises(opencode.OpenCodeConfigError) as raised:
-        opencode.opencode_worker_documents(selected, env)
-    assert raised.value.reason_code == "config_unsafe_inline_secret"
+    from mimir_cultivate.worklink.daemon_sessions import session_environment
+    before = path.read_bytes()
+    with pytest.raises((ValueError, RuntimeError)):
+        session_environment({"OPENCODE_CONFIG": str(path), "PROXY_API_KEY": "ambient"},
+                            home=tmp_path, git_settings=(), credentials={})
+    assert path.read_bytes() == before
 
 
 def test_github_provider_has_no_worker_projection(tmp_path: Path) -> None:
     _auth(tmp_path, "github-copilot", {"type": "api", "key": "private"})
-    selected = opencode.resolve_opencode_invocation(
-        env={"HOME": str(tmp_path), "MIMIR_MODEL_SPEC": "github-copilot:model"},
-    )
-    with pytest.raises(opencode.OpenCodeConfigError) as raised:
-        opencode.opencode_worker_documents(selected)
-    assert raised.value.reason_code == "config_provider_selection"
+    selected = opencode.resolve_daemon_model({"HOME": str(tmp_path), "MIMIR_MODEL_SPEC": "github-copilot:model"})
+    assert selected == {"providerID": "github-copilot", "id": "model"}
+    assert "private" not in repr(selected)
+    assert not hasattr(opencode, "opencode_worker_documents")
 
 
 def _git(repo: Path, *args: str) -> None:

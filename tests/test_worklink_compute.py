@@ -14,6 +14,70 @@ pytest.importorskip("mimir_cultivate", reason="Worklink compute belongs to Culti
 from mimir_cultivate.worklink import compute, run_state
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,exit_code", [("succeeded", 0), ("failed", 1), ("interrupted", 1), ("incomplete", 1)])
+async def test_daemon_compute_uses_authoritative_session_outcome(state, exit_code):
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    outcome = SessionOutcome("ses_owned", state, stdout="bounded output")
+    client = SimpleNamespace(session_observe=AsyncMock(return_value=outcome),
+                             session_cancel=AsyncMock(), session_release=AsyncMock())
+    backend = compute.OpenCodeDaemonComputeBackend(client=client)
+    result = await backend.wait(handle, 1)
+    assert result.exit_code == exit_code
+    assert result.session_outcome == outcome
+    assert result.stdout == "bounded output"
+    assert handle.shim_pid is None
+    assert backend.capabilities().persistent_after_disconnect
+    await backend.cancel(handle)
+    await backend.cleanup(handle)
+    client.session_cancel.assert_awaited_once_with(handle)
+    client.session_release.assert_awaited_once_with(handle)
+
+
+@pytest.mark.asyncio
+async def test_daemon_compute_overflow_cancels_owned_session():
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    client = SimpleNamespace(session_observe=AsyncMock(return_value=SessionOutcome("ses_owned", "started", output_overflow=True)),
+                             session_cancel=AsyncMock())
+    result = await compute.OpenCodeDaemonComputeBackend(client=client).wait(handle, 1)
+    assert result.output_overflow
+    assert result.exit_code != 0
+    client.session_cancel.assert_awaited_once_with(handle)
+
+
+@pytest.mark.asyncio
+async def test_daemon_compute_reconnects_without_readmission():
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome, SessionTransportLostError
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    client = SimpleNamespace(session_observe=AsyncMock(side_effect=[
+        SessionTransportLostError("lost"), SessionOutcome("ses_owned", "succeeded"),
+    ]), session_create=AsyncMock())
+    result = await compute.OpenCodeDaemonComputeBackend(client=client).wait(handle, 2)
+    assert result.exit_code == 0
+    assert client.session_observe.await_count == 2
+    client.session_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_daemon_wait_does_not_refresh_expired_launch_budget():
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    client = SimpleNamespace(session_observe=AsyncMock(), session_cancel=AsyncMock(side_effect=RuntimeError("unverified")))
+    backend = compute.OpenCodeDaemonComputeBackend(client=client)
+    backend._deadlines[handle.identifier] = asyncio.get_running_loop().time() - 1
+    result = await backend.wait(handle, 60)
+    assert result.timed_out and result.session_error.type == "timeout"
+    assert result.session_outcome.cancellation_state == "unverified"
+    client.session_observe.assert_not_awaited()
+    client.session_cancel.assert_awaited_once_with(handle)
+
+
 def test_authorized_checkout_binds_configured_worker_uid(monkeypatch, tmp_path) -> None:
     from mimir_cultivate.worklink import identities
     from mimir_cultivate.worklink.checkout import _mint_checkout_authorization

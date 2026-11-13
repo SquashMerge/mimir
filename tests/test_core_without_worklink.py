@@ -37,6 +37,12 @@ def test_core_only_scaffold_sets_up_no_worklink_identity_or_paths(tmp_path, monk
     scaffold(tmp_path, mode=mode)
     text = _scaffold_text(tmp_path).lower()
     assert not (tmp_path / ".mimir-scaffold" / "cultivate-docker").exists()
+    # The metadata-only core activation guard is inert when unselected. It must
+    # not be mistaken for a worker identity/path provisioning instruction.
+    guards = [line for line in text.splitlines() if "resolve_activation(dict(os.environ))" in line]
+    assert len(guards) == 1
+    assert "from mimir.worklink_daemon_activation import resolve_activation" in guards[0]
+    text = text.replace(guards[0], "")
     found = [marker for marker in _WORKLINK_MARKERS if marker in text]
     assert not found, found
 

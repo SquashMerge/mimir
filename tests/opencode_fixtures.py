@@ -28,6 +28,21 @@ def seed_opencode_binary(root: Path) -> Path:
     return binary
 
 
+def seed_factory_install(root: Path, version: str = "0.14.0") -> Path:
+    """Synthetic manifests only; never execute a downloaded or ambient factory."""
+    modules = root / "lib/node_modules"
+    factory = modules / "feature-factory"
+    adapter = modules / "opencode2-feature-factory"
+    (factory / "bin").mkdir(parents=True)
+    adapter.mkdir(parents=True)
+    entrypoint = factory / "bin/factory.js"
+    entrypoint.write_text("")
+    (factory / "package.json").write_text(json.dumps({"name": "feature-factory", "version": version}))
+    (adapter / "package.json").write_text(json.dumps({"name": "opencode2-feature-factory", "version": version,
+                                                    "dependencies": {"feature-factory": version}}))
+    return entrypoint
+
+
 def seed_codex_subscription(home: Path, refresh: str = "subscription") -> None:
     """Create a usable native OAuth bundle without plugins or literal tokens."""
     segment = base64.urlsafe_b64encode(json.dumps({"exp": 300}).encode()).decode().rstrip("=")

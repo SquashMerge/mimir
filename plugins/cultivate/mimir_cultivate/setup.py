@@ -56,9 +56,12 @@ inputs = (("mimir_agent", Path(sys.argv[2]), agent_hash),
           ("mimir_cultivate", Path(sys.argv[3]), cultivate_hash))
 s6 = ("mimir/type", "mimir/run", "watchdog/type", "watchdog/run",
       "worklink-execd/type", "worklink-execd/run", "worklink-execd/dependencies.d/base",
-      "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd")
+      "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd",
+      "worklink-opencode/type", "worklink-opencode/run", "worklink-opencode/dependencies.d/base",
+      "user/contents.d/worklink-opencode")
 scripts = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh",
-           "service.sh", "verify_wheels.py")
+           "service.sh", "verify_wheels.py", "worklink-opencode-service",
+           "worklink-daemon-gate", "worklink-opencode-login")
 if not version or destination.exists() and any(destination.iterdir()):
     raise SystemExit("invalid Docker context destination or version")
 opened = {}
@@ -84,6 +87,7 @@ try:
         output = destination / target
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(opened[package].read(member))
+        output.chmod((opened[package].getinfo(member).external_attr >> 16) & 0o777)
     wheels = destination / "plugins/cultivate/mimir_cultivate/docker/wheels"
     wheels.mkdir()
     for _, path, _ in inputs:
@@ -713,7 +717,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                             "MIMIR_WORKLINK_AGENT_ID": "cultivate-worklink"})
         environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
-                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
+                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink",
+                   "worklink-daemon:/var/lib/mimir-worklink/daemon"]
         if codex:
             volumes.append("./codex:/home/mimir/.codex")
             environment["CODEX_HOME"] = "/home/mimir/.codex"
@@ -727,7 +732,7 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                         (" && chown -R 1001:1001 /home/mimir/.codex && chmod 0700 /home/mimir/.codex" if codex else "")],
             "volumes": volumes,
         }
-        doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink")}
+        doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon")}
         return yaml.safe_dump(doc, sort_keys=False)
     except (KeyError, TypeError, AttributeError, yaml.YAMLError):
         raise SetupError("Incompatible scaffold Compose template; expected agent build and environment mapping.") from None
@@ -1233,58 +1238,6 @@ def _agent_exec(deploy: Path, *argv: str) -> str:
     return _run(["docker", "compose", "exec", "-T", "-u", "mimir", "agent", *argv], cwd=deploy)
 
 
-# The worklink uid cannot traverse the controller's private venv. Resolve there
-# as mimir, then run a stdlib-only probe with the system interpreter as worklink.
-_OPENCODE_RESOLVE_PROBE = """\
-try:
- from mimir_cultivate.worklink.backends.opencode import resolve_opencode_binary
- print(resolve_opencode_binary())
-except (ImportError, OSError, ValueError):
- print('opencode_missing')
-"""
-_OPENCODE_WORKER_PROBE = """\
-import subprocess
-import sys
-import tempfile
-try:
- with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
-  env = {
-   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
-   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
-   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
-   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
-  }
-  result = subprocess.run([sys.argv[1], '--version'], env=env, cwd='/tmp',
-   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-  print('ok' if result.returncode == 0 else 'opencode_missing')
-except (OSError, subprocess.TimeoutExpired, ValueError):
- print('opencode_missing')
-"""
-_OPENCODE_MODEL_PROBE = """\
-import subprocess
-import sys
-import tempfile
-try:
- with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
-  env = {
-   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
-   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
-   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
-   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
-  }
-  # The catalog command requires a configured provider. This is an inert
-  # placeholder, never the operator's API key and never used for a completion.
-  env[sys.argv[2].upper() + '_API_KEY'] = 'model-catalog-probe'
-  result = subprocess.run([sys.argv[1], 'models', sys.argv[2]], env=env, cwd='/tmp',
-   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-  print('ok' if result.returncode == 0 and sys.argv[3] in result.stdout.splitlines()
-        else 'opencode_model_unknown')
-except (OSError, subprocess.TimeoutExpired, ValueError):
- print('opencode_model_unknown')
-"""
-
 _TOOLCHAIN_WORKER_PROBE = """\
 import json
 from pathlib import Path
@@ -1359,7 +1312,7 @@ with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
 
 def toolchain_probe_environment(config) -> dict[str, str]:
     """Use the gate builder and persisted settings, never probe-only tool vars."""
-    from .worklink.backends.opencode import _permission_override, validate_test_env
+    from .worklink.backends.opencode import validate_test_env
     from .worklink.compute import WorkSpec, _enabled_child_env
 
     settings = config.backend_settings.get('opencode', {})
@@ -1367,8 +1320,7 @@ def toolchain_probe_environment(config) -> dict[str, str]:
     validate_test_env(test_env)
     spec = WorkSpec(issue_id=0, attempt=1, repo_url='', base_ref='', branch='',
                     prompt='', rules=None, test_command='', backend='opencode', timeout_s=30,
-                    env={'OPENCODE_PERMISSION': _permission_override(settings.get('bash_allowlist', [])),
-                         **test_env}, backend_config={'pass_env': tuple(test_env)})
+                    env=dict(test_env), backend_config={'pass_env': tuple(test_env)})
     return _enabled_child_env(spec, 'setup-toolchain-probe')
 
 
@@ -1405,28 +1357,46 @@ def _verify_system_packages(deploy: Path, packages: list[str]) -> None:
             raise SetupError(f"System package verification failed (system_package_missing: {name}); rebuild the agent image and check its package installation.")
 
 
-def _verify_opencode_binary(deploy: Path) -> str:
-    binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
-    check = "opencode_missing"
-    if binary.startswith("/") and "\n" not in binary and "\x00" not in binary:
-        check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
-                      "agent", "/usr/local/bin/python", "-c", _OPENCODE_WORKER_PROBE, binary], cwd=deploy)
-    if check != "ok":
-        raise SetupError("OpenCode leaf executable verification failed (opencode_missing); rebuild the agent image and check its OpenCode installation.")
-    return binary
+_OPENCODE_DAEMON_PROBE = """\
+import json
+import os
+from mimir.worklink_daemon_activation import ActivationError, resolve_activation
+try:
+ activation = resolve_activation(dict(os.environ))
+ if not activation.enabled:
+  result = {'ok': True, 'daemon_enabled': False}
+ else:
+  from mimir_cultivate.opencode import resolve_daemon_model
+  from mimir_cultivate.worklink.daemon_gate import wait_for_daemon
+  resolve_daemon_model(dict(os.environ))
+  health = wait_for_daemon(dict(os.environ))
+  result = {'ok': health.get('ok') is True, 'daemon_enabled': True,
+            'refresh_unverified': health.get('login_state') == 'refreshable_unverified',
+            'sensitive_telemetry_disabled': health.get('telemetry_state') == 'disabled_sensitive_otlp'}
+except (ActivationError, ValueError, OSError):
+ result = {'ok': False, 'daemon_enabled': True}
+print(json.dumps(result))
+"""
 
 
-def _verify_opencode_model(deploy: Path, binary: str, model: str) -> None:
-    # Only the provider/model crosses into the isolated worker probe, never the
-    # configured credential or the controller's private OpenCode config.
-    if not re.fullmatch(r"(openai|anthropic)/[A-Za-z0-9_.-]+", model):
-        raise SetupError("OpenCode model verification failed (opencode_model_unknown); check the configured provider/model.")
-    provider = model.split("/", 1)[0]
-    check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
-                  "agent", "/usr/local/bin/python", "-c", _OPENCODE_MODEL_PROBE,
-                  binary, provider, model], cwd=deploy)
-    if check != "ok":
-        raise SetupError(f"OpenCode model verification failed (opencode_model_unknown): {model}; update the agent image or choose a listed model.")
+def _verify_opencode_daemon(deploy: Path, *, run=None) -> None:
+    try:
+        output = (_agent_exec(deploy, "python", "-c", _OPENCODE_DAEMON_PROBE) if run is None else
+                  run(["docker", "compose", "exec", "-T", "--user", "mimir", "agent",
+                       "python", "-c", _OPENCODE_DAEMON_PROBE], cwd=deploy))
+        state = json.loads(output)
+    except (ValueError, TypeError):
+        state = {}
+    if isinstance(state, dict) and state.get("daemon_enabled") is True:
+        print("Worklink native Codex login (independent of the agent): "
+              "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        raise SetupError("OpenCode daemon verification failed; inspect installation, readiness, native login and stale bot-token health. "
+                         "Native login: docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
+    if state.get("refresh_unverified") is True:
+        print("Native login refresh is unverified; local health does not prove provider validity.")
+    if state.get("sensitive_telemetry_disabled") is True:
+        print("Worklink telemetry is disabled because sensitive OTLP configuration is present.")
 
 
 def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
@@ -1457,7 +1427,8 @@ def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
 
 def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str,
              system_packages: list[str] | None = None, alert_adapter: str = "none",
-             *, trackers: tuple[str, ...] = ()) -> None:
+              *, trackers: tuple[str, ...] = ()) -> None:
+    _verify_opencode_daemon(deploy)
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -1519,24 +1490,6 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, versi
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
     _verify_toolchain(deploy, kind, version)
     _verify_system_packages(deploy, system_packages or [])
-    binary = _verify_opencode_binary(deploy)
-    # Run in the agent container with its actual HOME, config and compose env.
-    # Only a stable reason code crosses the Docker boundary, never the bundle.
-    auth_check = _agent_exec(deploy, "python", "-c",
-        "from mimir_cultivate.opencode import resolve_opencode_invocation, OpenCodeAuthError, OpenCodeConfigError\n"
-        "try:\n resolve_opencode_invocation()\n print('ok')\n"
-        "except (OpenCodeAuthError, OpenCodeConfigError) as exc:\n print(exc.reason_code)")
-    if auth_check != "ok":
-        raise SetupError(
-            "OpenCode credential resolution failed (" + (
-                auth_check if auth_check in {"auth_missing", "auth_invalid", "auth_malformed", "auth_unreadable"}
-                else "unavailable"
-            ) + "); check the agent container's model API key or Codex OAuth login and OpenCode config."
-        )
-    model = _agent_exec(deploy, "python", "-c",
-        "from mimir_cultivate.opencode import resolve_opencode_invocation; "
-        "print(resolve_opencode_invocation().model)")
-    _verify_opencode_model(deploy, binary, model)
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}
@@ -1975,13 +1928,21 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     if not no_start:
         if codex:
             _require_codex_login(deploy, run)
+        # s6 starts the daemon independently; the Mimir workload remains gated
+        # until the operator provisions its separate native login.
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
+        _verify_opencode_daemon(deploy, run=run)
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
         print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "
               + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
     if no_start:
         print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
+        from mimir.worklink_daemon_activation import planned_activation
+
+        if planned_activation(trusted_cultivate=True, opencode_installed=True).enabled:
+            print("Then provision the separate Worklink native Codex login: "
+                  "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
         if codex:
             print("First log in for this deployment: " + _codex_login_command(deploy))
         print("Then re-run mimir cultivate setup with the same deployment and settings, without --no-start, "

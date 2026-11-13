@@ -173,7 +173,8 @@ def test_reset_clears_loop_bound_state() -> None:
 
 def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from mimir_cultivate import contained_checkout, contained_execution
-    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.worklink.compute import ComputeResult
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome
 
     home = tmp_path / "home"
     seed = tmp_path / "seed"
@@ -199,7 +200,7 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         check=True,
     )
     set_spawn_config({"default_cwd": tmp_path, "artifact_root": home / "artifacts"})
-    calls = {"factory": 0, "envs": []}
+    calls = {"factory": 0, "requests": [], "checkouts": []}
 
     class Checkout:
         def __init__(self, path):
@@ -209,19 +210,28 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 ["git", "-C", str(path), "rev-parse", "HEAD^{tree}"],
                 check=True, capture_output=True, text=True,
             ).stdout.strip()
-        def close(self):
-            pass
+        def close(self, *, retain=False):
+            self.retained = retain
+            self.closed = True
 
     def factory(source, **kwargs):
         calls["factory"] += 1
-        return Checkout(source)
+        checkout = Checkout(source)
+        calls["checkouts"].append(checkout)
+        return checkout
 
-    async def runner(argv, directory, worker_env, projections=(), **kwargs):
-        calls["envs"].append(dict(worker_env))
-        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+    async def runner(directory, request, **kwargs):
+        calls["requests"].append(request)
+        assert kwargs["timeout_s"] == 1800
+        assert kwargs["stdout_limit"] == 1024 * 1024
+        assert callable(kwargs["on_session"])
+        assert callable(kwargs["on_quiescence"])
+        handle = LaunchHandle("opencode_daemon", "ses_depth", opencode_session_id="ses_depth", launch_generation="generation")
+        return ComputeResult(0, "", "", handle=handle,
+                             session_outcome=SessionOutcome(handle.identifier, "succeeded"))
 
     monkeypatch.setattr(contained_checkout, "create_opencode_checkout", factory)
-    monkeypatch.setattr(contained_execution, "execute_contained", runner)
+    monkeypatch.setattr(contained_execution, "execute_contained_session", runner)
     return seed, calls, contained_execution
 
 
@@ -233,20 +243,25 @@ async def test_tool_depth_refusal_and_below_cap_propagation(tmp_path, monkeypatc
     monkeypatch.setenv(_SPAWN_DEPTH_ENV, "2")
     refused = await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(seed)})
     assert "depth cap" in refused
-    assert not calls["envs"]
+    assert not calls["requests"]
+    assert calls["factory"] == 0
 
     _spawn_reset_for_tests()
     monkeypatch.setenv(_SPAWN_DEPTH_ENV, "1")
     payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(seed)}))
     assert payload["status"] == "succeeded"
-    assert calls["envs"][-1][_SPAWN_DEPTH_ENV] == "2"
+    assert calls["requests"][-1].spawn_depth == 2
+    assert calls["requests"][-1].kind == "spawn"
+    assert calls["requests"][-1].shell_allowlist == ()
+    assert calls["checkouts"][-1].closed and not calls["checkouts"][-1].retained
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 @pytest.mark.skipif(spawn_open_code is None, reason="requires installed Cultivate")
 async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monkeypatch):
-    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.worklink.compute import ComputeResult
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome
     seed, calls, contained_execution = _surface_setup(tmp_path, monkeypatch)
     monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
     entered = asyncio.Event()
@@ -267,7 +282,7 @@ async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monke
 
     monkeypatch.setattr(guard.sem, "acquire", observed_acquire)
 
-    async def runner(argv, directory, worker_env, projections=(), **kwargs):
+    async def runner(directory, request, **kwargs):
         nonlocal active, maximum
         active += 1
         maximum = max(maximum, active)
@@ -276,9 +291,11 @@ async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monke
         entered.set()
         await release.wait()
         active -= 1
-        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+        handle = LaunchHandle("opencode_daemon", "ses_" + request.text, opencode_session_id="ses_" + request.text,
+                              launch_generation="generation")
+        return ComputeResult(0, "", "", handle=handle, session_outcome=SessionOutcome(handle.identifier, "succeeded"))
 
-    monkeypatch.setattr(contained_execution, "execute_contained", runner)
+    monkeypatch.setattr(contained_execution, "execute_contained_session", runner)
     first = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "one", "cwd": str(seed)}))
     await entered.wait()
     second = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "two", "cwd": str(seed)}))
@@ -290,3 +307,21 @@ async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monke
         release.set()
         await asyncio.gather(first, second)
     assert maximum == 1
+    assert all(checkout.closed and not checkout.retained for checkout in calls["checkouts"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(spawn_open_code is None, reason="requires installed Cultivate")
+async def test_tool_retains_checkout_and_rate_reservation_after_unknown_cleanup(tmp_path, monkeypatch):
+    from mimir_cultivate.contained_execution import SessionCleanupError
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+    seed, calls, execution = _surface_setup(tmp_path, monkeypatch)
+    async def unknown(directory, request, **kwargs):
+        raise SessionCleanupError(LaunchHandle("opencode_daemon", "ses_unknown",
+            opencode_session_id="ses_unknown", launch_generation="generation"))
+    monkeypatch.setattr(execution, "execute_contained_session", unknown)
+    result = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(seed)}))
+    assert result["status"] == "containment_unavailable"
+    assert result["opencode_session_id"] == "ses_unknown"
+    assert calls["checkouts"][-1].closed and calls["checkouts"][-1].retained
+    assert len(_spawn_guard_init().recent) == 1

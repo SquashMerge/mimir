@@ -125,6 +125,8 @@ class WorklinkEvidence:
     # PR head observed after publication; may advance beyond the verified head_sha.
     observed_pr_head_sha: str | None = None
     test_env: dict[str, str] = field(default_factory=dict)
+    opencode_session_id: str | None = None
+    mcp_servers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -680,6 +682,12 @@ async def _observe_evidence_from_ref(
         ):
             raise ComputeLaunchError("Cultivate factory evidence gate requires the recorded worker sandbox")
     if backend != "feature_factory" and worker_uid_drop and test_command and not skip_test_reason:
+        if getattr(compute, "name", None) == "opencode_daemon":
+            from .compute import LocalSubprocessComputeBackend
+            from .identities import get_identities
+            if work_spec is None or work_spec.session_request is None or work_spec.session_request.kind != "leaf":
+                raise ComputeLaunchError("daemon evidence gate requires the leaf session work spec")
+            compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
         authorization = getattr(compute, "_authorized_checkout", None)
         worker_bound = (
             getattr(compute, "name", None) != "local_subprocess"
@@ -966,6 +974,7 @@ async def _run_compute_gate(
     # the worker-side timeout must agree with that supervisor too.
     gate_spec = replace(
         work_spec,
+        session_request=None,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
         timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,
@@ -989,6 +998,10 @@ async def _run_compute_gate(
             ),
         )
     gate_spec = replace(gate_spec, env=filter_otlp_env(gate_spec.env))
+    if getattr(compute, "name", None) == "opencode_daemon":
+        from .compute import LocalSubprocessComputeBackend
+        from .identities import get_identities
+        compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
     if work_spec.backend == "feature_factory":
         from .compute import _local_child_env
         from .worker_client import run_factory_control

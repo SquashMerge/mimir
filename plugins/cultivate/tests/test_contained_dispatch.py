@@ -14,6 +14,24 @@ from mimir_cultivate import registration
 from mimir_cultivate.worklink import retained_scope, worker_client
 
 
+async def test_contained_session_uses_shared_outcome_and_verified_release():
+    from unittest.mock import AsyncMock
+    from mimir_cultivate.contained_execution import execute_contained_session
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome, SessionRequest
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    client = SimpleNamespace(session_create=AsyncMock(return_value=handle),
+                             session_observe=AsyncMock(return_value=SessionOutcome("ses_owned", "succeeded")),
+                             session_release=AsyncMock())
+    directory = SimpleNamespace(_contained_worker_client=client)
+    request = SessionRequest("spawn", {"providerID": "openai", "id": "synthetic"}, "build")
+    result = await execute_contained_session(directory, request, timeout_s=5)
+    assert result.exit_code == 0
+    assert result.session_outcome.opencode_session_id == "ses_owned"
+    client.session_create.assert_awaited_once_with(request, timeout_s=5, pass_env={})
+    client.session_release.assert_awaited_once_with(handle)
+
+
 def _backend(monkeypatch: pytest.MonkeyPatch, checkout: Path):
     backend = RetainedCheckoutFilesystemBackend(checkout)
     scope = SimpleNamespace(sandbox=str(checkout), run_id="run-1")

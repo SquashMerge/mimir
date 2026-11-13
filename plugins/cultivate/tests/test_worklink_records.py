@@ -60,7 +60,7 @@ def test_factory_record_round_trips_v2_and_reads_v1(tmp_path: Path) -> None:
     assert path.is_file()
 
 
-def test_factory_record_keeps_pre_prompt_change_v2_schema(tmp_path: Path) -> None:
+def test_factory_record_adds_session_and_mcp_without_changing_version(tmp_path: Path) -> None:
     record = _factory_record(tmp_path)
     payload = record.to_json()
     # Pin the existing strict reader's accepted keys independently of the writer.
@@ -69,11 +69,29 @@ def test_factory_record_keeps_pre_prompt_change_v2_schema(tmp_path: Path) -> Non
         "version", "run_id", "issue_id", "attempt", "repository", "base_ref",
         "branch", "launcher", "sandbox", "session", "handle", "status",
         "observed_at", "controller_phase", "controller_error", "transcript",
-        "children_reaped",
+        "children_reaped", "opencode_session_id", "mcp_servers",
     }
     assert FactoryRunRecord.from_json(payload) == record
+    assert payload["opencode_session_id"] is None
+    assert payload["mcp_servers"] == []
+    historical = {key: value for key, value in payload.items()
+                  if key not in {"opencode_session_id", "mcp_servers"}}
+    assert FactoryRunRecord.from_json(historical) == record
     with pytest.raises(FactoryRecordError, match="fields are invalid"):
         FactoryRunRecord.from_json({**payload, "issue_title": "Display only"})
+
+
+def test_factory_session_and_mcp_record_roundtrip(tmp_path: Path) -> None:
+    record = replace(_factory_record(tmp_path),
+                     handle=LaunchHandle("opencode_daemon", "ses_owned",
+                                         opencode_session_id="ses_owned", launch_generation="generation"),
+                     session="ses_owned", opencode_session_id="ses_owned",
+                     mcp_servers=("alpha", "beta", "alpha"))
+    save_factory_record(tmp_path, record)
+    assert load_factory_record(tmp_path, record.run_id) == record
+    assert record.to_json()["mcp_servers"] == ["alpha", "beta", "alpha"]
+    with pytest.raises(FactoryRecordError, match="session handle mismatch"):
+        replace(record, opencode_session_id="ses_foreign")
 
 
 def test_factory_record_refuses_symlinked_store(tmp_path: Path) -> None:
@@ -82,6 +100,37 @@ def test_factory_record_refuses_symlinked_store(tmp_path: Path) -> None:
     (home / "state" / "worklink").symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(FactoryRecordError, match="not contained"):
         save_factory_record(home, _factory_record(tmp_path))
+
+
+def test_session_handle_roundtrip_and_historical_defaults(tmp_path: Path) -> None:
+    record = _factory_record(tmp_path)
+    historical = record.to_json()
+    historical["handle"].pop("opencode_session_id")
+    historical["handle"].pop("launch_generation")
+    assert FactoryRunRecord.from_json(historical) == record
+    session = replace(record, handle=LaunchHandle(
+        "opencode_daemon", "ses_owned", opencode_session_id="ses_owned",
+        launch_generation="generation-1",
+    ))
+    assert FactoryRunRecord.from_json(session.to_json()) == session
+    payload = session.to_json()
+    payload["handle"]["unknown"] = True
+    with pytest.raises(FactoryRecordError, match="handle is invalid"):
+        FactoryRunRecord.from_json(payload)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("identifier", "ses_foreign"), ("launch_generation", None),
+    ("shim_pid", 123), ("process_start_ticks", True),
+])
+def test_session_handle_rejects_invalid_binding(tmp_path: Path, field, value) -> None:
+    record = replace(_factory_record(tmp_path), handle=LaunchHandle(
+        "opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="gen",
+    ))
+    payload = record.to_json()
+    payload["handle"][field] = value
+    with pytest.raises(FactoryRecordError):
+        FactoryRunRecord.from_json(payload)
 
 
 def test_populated_factory_record_recovers_legacy_status_and_handle(tmp_path: Path) -> None:

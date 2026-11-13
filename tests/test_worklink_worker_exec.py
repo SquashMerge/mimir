@@ -50,6 +50,559 @@ def _authorization(path: Path) -> CheckoutAuthorization:
     return _mint_checkout_authorization(path, 41, 2, fd)
 
 
+@pytest.mark.asyncio
+async def test_session_rpc_carries_checkout_fd_and_bound_handle(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+
+    checkout = _issued(tmp_path)
+    packets = []
+
+    class Channel:
+        def sendmsg(self, buffers, ancillary):
+            request = json.loads(buffers[0])
+            packets.append(request)
+            fd = ancillary[0][2][0]
+            assert os.fstat(fd).st_ino == checkout.stat().st_ino
+
+        def recv(self, size):
+            return b'{"opencode_session_id":"ses_owned","execution_state":"started","cancellation_state":"none","error_detail":null}'
+
+        def close(self):
+            pass
+
+    with _authorization(checkout) as authorization:
+        client = WorkerClient(authorization)
+        monkeypatch.setattr(client, "_connect", lambda *args: Channel())
+        handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+        outcome = await client.session_observe(handle)
+    assert outcome.execution_state == "started"
+    assert packets == [{
+        "version": 1, "op": "session_observe", "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+        "issue": 41, "attempt": 2, "device": checkout.stat().st_dev, "inode": checkout.stat().st_ino,
+        "path": str(checkout), "generation": "generation", "opencode_session_id": "ses_owned",
+        "stdout_limit": 64 * 1024 * 1024,
+    }]
+
+
+def test_session_executor_clean_exec_uses_only_launch_snapshot(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import daemon_service
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    generation = str(uuid.uuid4())
+    token = "fixture-" + "launch-token"
+    monkeypatch.setenv("OPENAI_API_KEY", "fixture-" + "provider-secret")
+    monkeypatch.setenv("GH_TOKEN", "fixture-" + "ambient-token")
+    monkeypatch.setattr(worker_exec, "_validate_checkout", Mock())
+    normalize = Mock()
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", normalize)
+    monkeypatch.setattr(daemon_service, "read_json", lambda *args, **kwargs: {
+        "version": 1, "launch_generation": generation, "bot_token": token, "publishing_identity": None,
+    })
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout=b'{"opencode_session_id":"ses_owned"}'))
+    monkeypatch.setattr(worker_exec.subprocess, "run", run)
+    connection = Mock()
+    request = {"version": 1, "executor_identity": EXECUTOR_PROTOCOL_IDENTITY, "op": "session_create",
+               "issue": 41, "attempt": 2, "device": checkout.stat().st_dev, "inode": checkout.stat().st_ino,
+               "path": str(checkout), "generation": generation, "request": {}, "timeout_s": 60,
+               "pass_env": {}, "git_settings": []}
+    try:
+        worker_exec._handle_session(connection, request, [fd])
+    finally:
+        os.close(fd)
+    assert run.call_args.args[0] == [daemon_service.UID_HELPER, "worklink", daemon_service.PYTHON,
+                                     "-I", "-m", "mimir_cultivate.worklink.daemon_sessions"]
+    assert run.call_args.kwargs["env"] == {
+        "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "GH_TOKEN": token, "GITHUB_TOKEN": token,
+    }
+    assert json.loads(run.call_args.kwargs["input"]) == request
+    assert run.call_args.kwargs["cwd"] == "/"
+    assert "preexec_fn" not in run.call_args.kwargs
+    assert run.call_args.kwargs["stderr"] is subprocess.DEVNULL
+    normalize.assert_called_once_with(fd, owner_uid=identities.get_identities().worklink_uid,
+                                      group_gid=identities.get_identities().worklink_gid)
+
+
+@pytest.mark.parametrize("operation", ["session_create", "session_observe", "session_cancel", "session_release"])
+def test_session_executor_rejects_open_contract(operation):
+    with pytest.raises(RuntimeError, match="exact contract"):
+        worker_exec._handle_session(Mock(), {"op": operation, "url": "http://foreign"}, [])
+
+
+@pytest.fixture
+async def session_boundary(tmp_path, monkeypatch):
+    """Real executor, native-helper shim, controller, HTTP and capability FDs.
+
+    Both fixture accounts map to this unprivileged test account. Only native
+    identity/peer setup is substituted: checkout validation, normalization,
+    private records, HTTP, output sinks and execution are production code.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from mimir_cultivate.worklink import daemon_service
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+
+    uid, gid = os.geteuid(), os.getegid()
+    ids = identities.WorklinkIdentities(uid, uid, gid)
+    monkeypatch.setattr(worker_exec, "get_identities", lambda: ids)
+    monkeypatch.setattr(identities, "get_identities", lambda: ids)
+    checkout = _issued(tmp_path)
+    checkout.parent.chmod(0o700)
+    checkout.chmod(0o2770)
+    (checkout / "marker").write_text("ordinary command on issued checkout")
+    (checkout / "marker").chmod(0o600)
+    monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", tmp_path / "checkouts")
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+    def native_identity(fd):
+        os.setsid()
+        os.fchdir(fd)
+    monkeypatch.setattr(worker_exec, "_drop_worker", native_identity)
+    root, run = tmp_path / "daemon", tmp_path / "run"
+    for path in (root, root / "sessions", run, run / "agent"):
+        path.mkdir(mode=0o700)
+    generation = str(uuid.uuid4())
+    paths = daemon_service.RuntimePaths(daemon=root, run=run)
+    for path, value in ((paths.snapshot, {"version": 1, "launch_generation": generation,
+                                        "bot_token": None, "publishing_identity": None}),
+                        (root / "launch.json", {"version": 1, "launch_generation": generation, "telemetry_state": "off"})):
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+    monkeypatch.setattr(daemon_service, "RuntimePaths", lambda: paths)
+    async with FakeOpenCodeDaemon() as daemon:
+        paths.api.write_text(json.dumps({"version": 1, "url": daemon.base_url,
+                                         "username": daemon.username, "password": daemon.password}))
+        paths.api.chmod(0o600)
+        shim = tmp_path / "native-helper"
+        shim.write_text(f'''#!{sys.executable}
+import os
+from pathlib import Path
+from mimir_cultivate.worklink import daemon_config, daemon_health, daemon_service, daemon_sessions, identities
+paths = daemon_service.RuntimePaths(daemon=Path({str(root)!r}), run=Path({str(run)!r}))
+daemon_service.RuntimePaths = lambda: paths
+daemon_config.DAEMON_ROOT = {str(root)!r}
+daemon_health.DAEMON_URL = {daemon.base_url!r}
+ids = identities.WorklinkIdentities(os.geteuid(), os.geteuid(), os.getegid())
+identities.get_identities = lambda: ids
+def fixture_identity(value):
+    assert os.geteuid() == value.worklink_uid and os.getegid() == value.worklink_gid
+identities.assert_worklink_identity = fixture_identity
+raise SystemExit(daemon_sessions.main())
+''')
+        shim.chmod(0o700)
+        monkeypatch.setattr(daemon_service, "UID_HELPER", str(shim))
+        monkeypatch.setattr(daemon_service, "PYTHON", sys.executable)
+        pending = []
+        with ThreadPoolExecutor(max_workers=4) as pool, _authorization(checkout) as authorization:
+            client = WorkerClient(authorization)
+            def native_peer(*args):
+                local, remote = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                local.settimeout(35)
+                pending.append(pool.submit(worker_exec.handle_connection, remote))
+                return local
+            monkeypatch.setattr(client, "_connect", native_peer)
+            yield SimpleNamespace(client=client, checkout=checkout, generation=generation, daemon=daemon,
+                                  records=root / "sessions", identities=ids, connect=native_peer)
+            for future in pending:
+                await asyncio.to_thread(future.result, 35)
+
+
+async def _boundary_create(boundary):
+    from dataclasses import asdict
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionRequest
+
+    response = await boundary.client._session_rpc("session_create", {
+        "generation": boundary.generation, "request": asdict(SessionRequest(
+            "leaf", {"providerID": "openai", "id": "synthetic"}, "fixture prompt", ("git *", "pytest *"))),
+        "timeout_s": 60, "pass_env": {}, "git_settings": [],
+    })
+    sid = response["opencode_session_id"]
+    return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation=boundary.generation)
+
+
+async def test_epic_nested_checkout_crosses_real_executor_and_controller(session_boundary, tmp_path, monkeypatch, request):
+    import tempfile
+    from mimir_cultivate.worklink import daemon_health
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+
+    boundary = session_boundary
+    errors = []
+    operation = worker_exec._handle_session
+    def observed(*args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except Exception as exc:
+            errors.append(str(exc))
+            raise
+    monkeypatch.setattr(worker_exec, "_handle_session", observed)
+    temporary = tempfile.TemporaryDirectory(prefix="epic-executor-", dir="/tmp")
+    request.addfinalizer(temporary.cleanup)
+    root = Path(temporary.name) / "factory-checkouts"
+    outer = root / "repo/41-2/checkout"
+    sandbox = outer / ".factory-sandboxes/chainlink-41"
+    sandbox.mkdir(parents=True)
+    root.chmod(0o750)
+    (root / "repo").chmod(0o750)
+    outer.chmod(0o2770)
+    outer.parent.chmod(0o2700)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True, "launch_generation": boundary.generation})
+    client = WorkerClient.for_path_checkout(sandbox, issue_id=41, attempt=2, run_uid=boundary.identities.worklink_uid)
+    monkeypatch.setattr(client, "_connect", boundary.connect)
+    spec = FeatureFactoryBackend().work_spec(WorkOrder(41, sandbox, "ignored", None, 30,
+        {"MIMIR_MODEL_SPEC": "codex-plus:gpt-test#high", "MIMIR_WORK_ITEM_JSON":
+         json.dumps({"run_id": "chainlink-41", "title": "epic", "body": "build"})}),
+        attempt=2, repo_url="repo", base_ref="main", branch="feature/chainlink-41", test_command="pytest")
+    backend = OpenCodeDaemonComputeBackend(client=client)
+    try:
+        handle = await backend.launch(spec)
+    except RuntimeError as exc:
+        pytest.fail(f"synthetic executor refused epic: {errors[:3]} ({exc})")
+    create = next(body for method, path, _, body in boundary.daemon.requests if method == "POST" and path == "/api/session")
+    assert create["location"] == {"directory": str(sandbox)}
+    assert create["model"] == {"providerID": "openai", "id": "gpt-test", "variant": "high"}
+    assert create["permissions"] == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        *[{"action": "read", "resource": name, "effect": "deny"} for name in (".env", "**/.env", "**/.env.*")]]
+    assert next(body for _, path, _, body in boundary.daemon.requests if path.endswith("/command")) == {
+        "name": "feature", "text": "--autonomous --max-retries 5 chainlink-41"}
+    boundary.daemon.finish(handle.identifier)
+    result = await backend.wait(handle, 30)
+    assert result.session_outcome.execution_state == "succeeded"
+    assert result.handle.opencode_session_id == handle.identifier
+    await backend.cancel(handle)
+    await backend.cleanup(handle)
+    _assert_session_retired(SimpleNamespace(checkout=sandbox, records=boundary.records,
+                                          generation=boundary.generation), handle)
+    assert stat.S_IMODE(outer.parent.stat().st_mode) == 0o2750
+
+
+@pytest.mark.parametrize("relative", ["checkout", "checkout/.factory-sandboxes/chainlink-42",
+                                      "checkout/.factory-sandboxes/41"])
+async def test_epic_rpc_refuses_nonmatching_sandbox_before_api(session_boundary, tmp_path, monkeypatch, relative):
+    from dataclasses import asdict
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+
+    root = tmp_path / "factory-checkouts"
+    path = root / "repo/41-2" / relative
+    path.mkdir(parents=True)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    client = WorkerClient.for_path_checkout(path, issue_id=41, attempt=2, run_uid=session_boundary.identities.worklink_uid)
+    monkeypatch.setattr(client, "_connect", session_boundary.connect)
+    with pytest.raises(RuntimeError, match="session executor"):
+        await client._session_rpc("session_create", {"generation": session_boundary.generation,
+            "request": asdict(SessionRequest("epic", {"providerID": "openai", "id": "test"},
+                                             "--autonomous --max-retries 5 chainlink-41")),
+            "timeout_s": 30, "pass_env": {}, "git_settings": []})
+    assert not any(path == "/api/session" for _, path, _, _ in session_boundary.daemon.requests)
+
+
+def _assert_session_retired(boundary, handle):
+    witnesses = list(boundary.records.glob(f"*.{handle.opencode_session_id}.retired.json"))
+    assert len(witnesses) == 1
+    witness = witnesses[0]
+    record = json.loads(witness.read_text())
+    assert record["opencode_session_id"] == handle.opencode_session_id
+    assert record["launch_generation"] == handle.launch_generation
+    assert record["cancellation_state"] == "verified" and record["stop_requested"]
+    assert record["checkout_path"] == str(boundary.checkout)
+    assert stat.S_IMODE(witness.stat().st_mode) == 0o600
+    assert all(path.name.endswith(".retired.json") for path in boundary.records.glob("*.json"))
+
+
+async def _ordinary_boundary_command(boundary):
+    from mimir.output_capture import open_output_pair
+
+    stdout, stderr = open_output_pair(None, 1024, None, 1024)
+    try:
+        proc = await boundary.client.launch(local_checkout=boundary.checkout,
+            argv=["/bin/sh", "-c", "cat marker"], env={"PATH": "/usr/bin:/bin"},
+            identifier=str(uuid.uuid4()), timeout_s=5, stdout_sink=stdout, stderr_sink=stderr)
+        assert await proc.wait() == 0
+        assert stdout.read_bounded()[0] == b"ordinary command on issued checkout"
+    finally:
+        stdout.close()
+        stderr.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", [None, "issue", "inode", "mode", "outside"])
+async def test_path_addressed_leaf_session_uses_existing_checkout_guard(session_boundary, tmp_path, monkeypatch, mutation):
+    boundary = session_boundary
+    root = tmp_path / "leaf-root"
+    checkout = root / "repository" / "2125-1"
+    checkout.mkdir(parents=True)
+    checkout.chmod(0o2770)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    client = WorkerClient.for_path_checkout(checkout, issue_id=2125, attempt=1,
+                                           run_uid=boundary.identities.worklink_uid)
+    monkeypatch.setattr(client, "_connect", boundary.connect)
+    leaf = SimpleNamespace(**{**vars(boundary), "client": client, "checkout": checkout})
+    handle = await _boundary_create(leaf)
+    assert stat.S_IMODE(checkout.stat().st_mode) == 0o2770
+    assert checkout.stat().st_uid == boundary.identities.mimir_uid
+    if mutation == "issue":
+        client.issue_id = 2126
+    elif mutation == "mode":
+        checkout.chmod(0o2777)
+    elif mutation == "outside":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        client.path_checkout = outside
+    if mutation:
+        if mutation == "inode":
+            with pytest.raises(RuntimeError):
+                await client._session_rpc("session_observe", {
+                    "generation": boundary.generation, "opencode_session_id": handle.identifier,
+                    "inode": checkout.stat().st_ino + 1})
+        else:
+            with pytest.raises(RuntimeError):
+                await client.session_observe(handle)
+    else:
+        boundary.daemon.finish(handle.identifier)
+        assert (await client.session_observe(handle)).execution_state == "succeeded"
+    client.issue_id, client.path_checkout = 2125, checkout
+    checkout.chmod(0o2770)
+    await client.session_cancel(handle)
+    await client.session_release(handle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified", [True, False])
+async def test_operator_stop_preserves_correlation_until_waiter_finalizes(session_boundary, tmp_path, monkeypatch, verified):
+    from mimir_cultivate.worklink.control import stop_worklink
+    from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+    from tests.worklink_daemon_fixtures import SyntheticFault
+
+    boundary = session_boundary
+    handle = await _boundary_create(boundary)
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    state = WorklinkRunState(41, 2, "opencode", "opencode_daemon", "opencode_daemon", handle.identifier,
+                            "issue/41-a2", "main", "main", str(tmp_path), "offline", "uv run pytest",
+                            "2026-11-12T00:00:00+00:00", checkout=str(boundary.checkout),
+                            opencode_session_id=handle.identifier, launch_generation=boundary.generation)
+    save_run_state(home, state)
+    monkeypatch.setattr(WorkerClient, "for_path_checkout", classmethod(lambda cls, *args, **kwargs: boundary.client))
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    observed, resume = asyncio.Event(), asyncio.Event()
+    original_observe = boundary.client.session_observe
+    async def pause_after_first_observation(owned, **kwargs):
+        outcome = await original_observe(owned, **kwargs)
+        if not observed.is_set():
+            observed.set()
+            await resume.wait()
+        return outcome
+    monkeypatch.setattr(boundary.client, "session_observe", pause_after_first_observation)
+    waiter = asyncio.create_task(OpenCodeDaemonComputeBackend(client=boundary.client).wait(handle, 30))
+    try:
+        await asyncio.wait_for(observed.wait(), 10)
+        if not verified:
+            route = f"/api/experimental/session/{handle.identifier}/log"
+            boundary.daemon.faults[("GET", route)].append(SyntheticFault(status=401))
+        result = await asyncio.to_thread(stop_worklink, home, 41,
+                                        runner=lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+        assert result.stopped is verified
+        retained = load_run_state(home, 41)
+        assert retained is not None and retained.opencode_session_id == handle.identifier
+        assert not result.state_cleared and not result.claim_released
+        assert list(boundary.records.glob("*.json"))
+        assert boundary.daemon.sessions[handle.identifier].active is not verified
+        if not verified:
+            await boundary.client.session_cancel(handle)
+        resume.set()
+        outcome = await asyncio.wait_for(waiter, 10)
+        assert outcome.exit_code != 0 and not outcome.timed_out
+        assert outcome.session_outcome.execution_state == "interrupted"
+        assert outcome.handle.opencode_session_id == handle.identifier
+    finally:
+        resume.set()
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+    await boundary.client.session_release(handle)
+    _assert_session_retired(boundary, handle)
+
+
+@pytest.mark.asyncio
+async def test_real_session_boundary_and_generic_command_survive_transfer_and_release(session_boundary):
+    boundary = session_boundary
+    await _ordinary_boundary_command(boundary)
+    handle = await _boundary_create(boundary)
+    assert stat.S_IMODE(boundary.checkout.parent.stat().st_mode) == 0o710
+    assert boundary.checkout.stat().st_uid == boundary.identities.worklink_uid
+    assert stat.S_IMODE((boundary.checkout / "marker").stat().st_mode) == 0o660
+    await _ordinary_boundary_command(boundary)
+    boundary.daemon.sessions[handle.identifier].messages.append({
+        "id": "msg_output", "type": "assistant", "time": {"created": 2}, "agent": "build",
+        "model": {"providerID": "openai", "id": "synthetic"},
+        "content": [{"type": "text", "text": "fixture output"}],
+    })
+    boundary.daemon.finish(handle.identifier)
+    outcome = await boundary.client.session_observe(handle)
+    assert outcome.execution_state == "succeeded" and outcome.stdout == "fixture output"
+    await boundary.client.session_cancel(handle)
+    await boundary.client.session_release(handle)
+    _assert_session_retired(boundary, handle)
+    assert list(boundary.records.glob("*.home")) == []
+    requests = len(boundary.daemon.requests)
+    await boundary.client.session_cancel(handle)
+    await boundary.client.session_release(handle)
+    assert len(boundary.daemon.requests) == requests
+    await _ordinary_boundary_command(boundary)
+
+
+@pytest.mark.asyncio
+async def test_retired_executor_handle_cannot_release_current_repair(session_boundary):
+    boundary = session_boundary
+    initial = await _boundary_create(boundary)
+    boundary.daemon.finish(initial.identifier)
+    await boundary.client.session_release(initial)
+    _assert_session_retired(boundary, initial)
+    repair = await _boundary_create(boundary)
+    homes = list(boundary.records.glob("*.home"))
+    assert len(homes) == 1
+    requests = len(boundary.daemon.requests)
+    await boundary.client.session_cancel(initial)
+    await boundary.client.session_release(initial)
+    assert len(boundary.daemon.requests) == requests
+    assert homes[0].exists()
+    assert boundary.daemon.sessions[repair.identifier].active
+    assert (await boundary.client.session_observe(repair)).execution_state == "started"
+    await boundary.client.session_cancel(repair)
+    await boundary.client.session_release(repair)
+    _assert_session_retired(boundary, repair)
+    assert list(boundary.records.glob("*.home")) == []
+    assert sum(route.endswith("/prompt") for _, route, _, _ in boundary.daemon.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("attempt", 3), ("device", 999999), ("inode", 1),
+                                        ("path", "/unissued/checkout"), ("generation", "foreign"),
+                                        ("opencode_session_id", "ses_foreign")])
+async def test_real_session_boundary_rejects_wrong_bindings(session_boundary, field, value):
+    handle = await _boundary_create(session_boundary)
+    with pytest.raises(RuntimeError):
+        await session_boundary.client._session_rpc("session_observe", {
+            "generation": handle.launch_generation, "opencode_session_id": handle.identifier, field: value,
+        })
+    assert list(session_boundary.records.glob("*.json"))
+    await session_boundary.client.session_cancel(handle)
+    await session_boundary.client.session_release(handle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("attempt", 3), ("device", 999999), ("inode", 1), ("generation", "foreign")])
+async def test_real_create_refuses_invalid_binding_before_admission(session_boundary, field, value):
+    from dataclasses import asdict
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+
+    boundary = session_boundary
+    with pytest.raises(RuntimeError):
+        await boundary.client._session_rpc("session_create", {
+            "generation": boundary.generation, "request": asdict(SessionRequest(
+                "leaf", {"providerID": "openai", "id": "synthetic"}, "fixture", ("git *",))),
+            "timeout_s": 60, "pass_env": {}, "git_settings": [], field: value,
+        })
+    assert boundary.daemon.sessions == {}
+    assert stat.S_IMODE(boundary.checkout.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ["owner", "checkout_mode", "boundary_mode"])
+async def test_transferred_checkout_still_rejects_wrong_owner_and_modes(session_boundary, monkeypatch, defect):
+    boundary = session_boundary
+    handle = await _boundary_create(boundary)
+    if defect == "owner":
+        monkeypatch.setattr(worker_exec, "get_identities", lambda: identities.WorklinkIdentities(
+            boundary.identities.mimir_uid, boundary.identities.worklink_uid + 1, boundary.identities.worklink_gid))
+    elif defect == "checkout_mode":
+        boundary.checkout.chmod(0o755)
+    else:
+        boundary.checkout.parent.chmod(0o770)
+    with pytest.raises(RuntimeError):
+        await _ordinary_boundary_command(boundary)
+    # Restore native fixture state before verifying release through the same RPC.
+    monkeypatch.setattr(worker_exec, "get_identities", lambda: boundary.identities)
+    boundary.checkout.chmod(0o2770)
+    boundary.checkout.parent.chmod(0o710)
+    await boundary.client.session_release(handle)
+
+
+@pytest.mark.asyncio
+async def test_real_session_boundary_racing_cancel_and_unverified_retention(session_boundary):
+    from tests.worklink_daemon_fixtures import SyntheticFault
+
+    boundary = session_boundary
+    boundary.daemon.auto_deliver = False
+    boundary.daemon.delete_race = True
+    handle = await _boundary_create(boundary)
+    await boundary.client.session_cancel(handle)
+    assert not boundary.daemon.sessions[handle.identifier].active
+    assert boundary.daemon.sessions[handle.identifier].inbox == []
+    await boundary.client.session_release(handle)
+    boundary.daemon.auto_deliver = True
+    handle = await _boundary_create(boundary)
+    route = f"/api/experimental/session/{handle.identifier}/log"
+    for _ in range(2):
+        boundary.daemon.faults[("GET", route)].append(SyntheticFault(status=401))
+    with pytest.raises(RuntimeError, match="unverified"):
+        await boundary.client.session_cancel(handle)
+    with pytest.raises(RuntimeError):
+        await boundary.client.session_release(handle)
+    assert list(boundary.records.glob("*.json")) and list(boundary.records.glob("*.home"))
+    assert boundary.daemon.sessions[handle.identifier].active
+    await boundary.client.session_release(handle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stdout_limit", [None, 2])
+async def test_output_fd_overflow_is_not_silent_success(tmp_path, monkeypatch, stdout_limit):
+    from mimir_cultivate.worklink import compute
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+
+    monkeypatch.setattr(compute, "_worklink_output_limits", lambda: (2 if stdout_limit is None else 1024 * 1024, 2))
+    packets = []
+    class Channel:
+        def sendmsg(self, buffers, ancillary):
+            request = json.loads(buffers[0])
+            packets.append(request["op"])
+            if request["op"] == "session_observe":
+                assert request["stdout_limit"] == 2
+                os.write(ancillary[0][2][1], "éx".encode())
+        def recv(self, size):
+            if packets[-1] == "session_cancel":
+                return b'{"cancellation_state":"verified"}'
+            return b'{"opencode_session_id":"ses_owned","execution_state":"succeeded","cancellation_state":"none","error_detail":null}'
+        def close(self):
+            pass
+    with _authorization(_issued(tmp_path)) as authorization:
+        client = WorkerClient(authorization)
+        monkeypatch.setattr(client, "_connect", lambda *args: Channel())
+        handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+        result = await compute.OpenCodeDaemonComputeBackend(client=client, stdout_limit=stdout_limit).wait(handle, 5)
+    assert result.output_overflow and result.exit_code != 0
+    assert result.stdout == "é"
+    assert packets == ["session_observe", "session_cancel"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [True, 0, -1, 67108865, 1.5, "1024"])
+async def test_session_observation_rejects_invalid_output_limit(tmp_path, monkeypatch, limit):
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+
+    with _authorization(_issued(tmp_path)) as authorization:
+        client = WorkerClient(authorization)
+        def unexpected_connect(*args):
+            pytest.fail("invalid output bound reached executor")
+        monkeypatch.setattr(client, "_connect", unexpected_connect)
+        handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+        with pytest.raises(ValueError, match="stdout limit"):
+            await client.session_observe(handle, stdout_limit=limit)
+
+
 def test_checkout_authorization_cannot_be_constructed_by_a_client(tmp_path: Path) -> None:
     path = _issued(tmp_path)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
@@ -61,15 +614,10 @@ def test_checkout_authorization_cannot_be_constructed_by_a_client(tmp_path: Path
 
 
 def test_worker_projection_has_fixed_destination_json_and_size_contract() -> None:
-    projection = WorkerProjection(".config/opencode/opencode.json", b'{"model":"x"}')
-    assert json.loads(projection.document) == {"model": "x"}
-    WorkerProjection(".local/share/opencode/auth.json", b"{}")
-    with pytest.raises(ValueError, match="destination"):
-        WorkerProjection("arbitrary.json", b"{}")
-    with pytest.raises(json.JSONDecodeError):
-        WorkerProjection(".config/opencode/opencode.json", b"invalid")
-    with pytest.raises(ValueError, match="size"):
-        WorkerProjection(".config/opencode/opencode.json", b" " * (MAX_PROJECTION_BYTES + 1))
+    for path in (".config/opencode/opencode.json", ".local/share/opencode/auth.json", "arbitrary.json"):
+        for document in (b"{}", b"invalid", b" " * (MAX_PROJECTION_BYTES + 1)):
+            with pytest.raises(ValueError, match="destination"):
+                WorkerProjection(path, document)
 
 
 def test_worker_clients_resolve_the_default_socket_at_call_time(
@@ -214,12 +762,9 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     )
     process = await client.launch(
         local_checkout=checkout,
-        argv=["opencode", "run", "--dir", "."],
-        env={"OPENCODE_PERMISSION": "{}"},
-        projections=[
-            WorkerProjection(".config/opencode/opencode.json", b'{"model":"provider/model"}'),
-            WorkerProjection(".local/share/opencode/auth.json", b'{"provider":{"token":"x"}}'),
-        ],
+        argv=["python3", "-c", "pass"],
+        env={},
+        projections=[],
         identifier=str(uuid.uuid4()),
         timeout_s=30,
     )
@@ -231,10 +776,7 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     assert request["run_uid"] == (synthetic_worklink_identities.worklink_uid if factory else 1002)
     assert set(request) == worker_exec._PATH_LAUNCH_FIELDS
     assert fd_counts == [2]
-    assert [item["path"] for item in request["projections"]] == [
-        ".config/opencode/opencode.json",
-        ".local/share/opencode/auth.json",
-    ]
+    assert request["projections"] == []
 
 
 @pytest.mark.asyncio
@@ -512,7 +1054,7 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
             os.close(fd)
 
     issued.chmod(0o2770)
-    issued.parent.chmod(0o710)
+    issued.parent.chmod(0o750)
     fd = os.open(issued, os.O_RDONLY | os.O_DIRECTORY)
     monkeypatch.setattr(worker_exec.os, "readlink", lambda _name: str(issued))
     try:
@@ -554,7 +1096,7 @@ def test_path_checkout_accepts_group_checkout_without_0700_boundary(
         os.close(fd)
 
 
-def test_project_home_completes_partial_writes_and_applies_modes(tmp_path: Path, monkeypatch) -> None:
+def test_retired_home_projection_is_refused_before_any_write(tmp_path: Path, monkeypatch) -> None:
     document = json.dumps({"payload": "x" * 10000})
     real_write = os.write
     writes: list[int] = []
@@ -567,15 +1109,12 @@ def test_project_home_completes_partial_writes_and_applies_modes(tmp_path: Path,
 
     monkeypatch.setattr(worker_exec.os, "write", partial)
     monkeypatch.setattr(worker_exec.os, "chown", lambda *args, **kwargs: None)
-    worker_exec._project_home(
-        tmp_path,
-        [{"path": ".config/opencode/opencode.json", "document": document}],
-    )
+    with pytest.raises(RuntimeError, match="projection"):
+        worker_exec._project_home(
+            tmp_path, [{"path": ".config/opencode/opencode.json", "document": document}])
     target = tmp_path / ".config/opencode/opencode.json"
-    assert target.read_text() == document
-    assert len(writes) > 2
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    assert not target.exists()
+    assert writes == []
 
 
 def test_repo_test_uv_cache_seed_copies_cache_and_tolerates_missing_source(
@@ -2326,7 +2865,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
         monkeypatch.setattr(os, name, lambda *a, **kw: None)
     monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: None)
 
-    monkeypatch.setattr(worker_exec, "_prepare_factory_runtime", lambda home: events.append("runtime"))
+    assert not hasattr(worker_exec, "_prepare_factory_runtime")
 
     payload = ["factory-payload", "--dir", "a directory", "--", "$(not-a-shell)"]
     factory_request["argv"] = payload.copy()
@@ -2350,8 +2889,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
         assert events == [
             ("gid", (observed.worklink_gid,) * 3),
             ("uid", (observed.worklink_uid,) * 3),
-            "runtime",
-        ], "supervisor execution happened before identity drop/runtime setup"
+        ], "supervisor execution happened before identity drop"
         # supervise() owns prctl-before-payload; its independent tests live in
         # test_worklink_factory_supervisor, not this mocked exec boundary.
         events.append("supervisor-exec")

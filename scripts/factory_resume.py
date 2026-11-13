@@ -3,24 +3,19 @@
 
 This script deliberately does **not** call ``factory resume``.
 
-mimir's recovery path does the whole transition as one operation: it accepts
-live ``running`` or published ``needs-human`` status and requires the retained process
-to be verifiably dead, steals or claims the session lock as needed, resumes,
-checks the returned status is owned and running, validates the recovery binding,
-launches a driver, saves the new handle and enters supervision. A live ``running``
-run with a verified-dead driver is parked before resume. Do not unpark manually:
-let the controller validate ownership and carry out the whole recovery sequence.
+mimir validates the retained checkout and exact daemon session binding. A running
+host is reattached without another feature command. A published ``needs-human``
+run first requires verified cancellation of the old host; a fresh session then
+uses the plugin's real context and ordered factory claim/resume protocol.
 
 Two details follow from reading that path rather than guessing at it:
 
-**The session is not the operator's to choose.** Recovery steals the lock using
-the *recorded* session and then resumes with it. A new session id produces a lock
-whose owner does not match what resume expects.
+**The session is not the operator's to choose.** It is the actual ID returned by
+OpenCode, never an operator label or an environment override.
 
-**A stale lock is not the operator's to steal.** Recovery already steals when
-``lock`` is ``stale`` or ``dead_lock`` is set, in the same sequence that then
-verifies ownership. A manual steal beforehand only moves the lock out from under
-those checks.
+**A stale lock is not the operator's to steal.** A manual steal moves ownership
+out from under the controller's exact-session checks. Historical process records
+remain inspectable, but require operator migration rather than daemon-ID guessing.
 
 So the useful work here is the preflight: report exactly which of mimir's own
 recovery preconditions hold, and refuse with the specific one that does not,
@@ -42,6 +37,8 @@ from mimir_cultivate.worklink.factory_state import (  # noqa: E402
     factory_process_is_verified_dead,
     load_factory_record,
 )
+from mimir_cultivate.worklink.backends.feature_factory import FactoryContractError, parse_factory_status, resolve_factory_entrypoint  # noqa: E402
+from mimir_cultivate.opencode import redact_daemon_output  # noqa: E402
 
 PARKED = "needs-human"
 
@@ -58,13 +55,17 @@ def _run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[s
 
 
 def factory_status(launcher: Path, run_id: str, sandbox: Path) -> dict:
+    launcher = resolve_factory_entrypoint(launcher)
     result = _run(["node", str(launcher), "status", run_id, "--repo", str(sandbox), "--json"])
     if result.returncode != 0:
-        raise ResumeError(f"factory status failed: {(result.stderr or result.stdout).strip()[:300]}")
+        raise ResumeError(f"factory status failed: {redact_daemon_output((result.stderr or result.stdout).strip())[:300]}")
     try:
-        return json.loads(result.stdout)
-    except ValueError as exc:
-        raise ResumeError(f"factory status returned unparseable JSON: {exc}") from exc
+        status = parse_factory_status(result.stdout)
+        if not status.valid or status.run_id != run_id or status.sandbox_path != str(sandbox):
+            raise ResumeError("factory status identity could not be qualified")
+        return status.to_json()
+    except (FactoryContractError, ValueError) as exc:
+        raise ResumeError("factory status response could not be qualified") from exc
 
 
 def preflight(record, status: dict, sandbox: Path) -> list[str]:
@@ -82,19 +83,29 @@ def preflight(record, status: dict, sandbox: Path) -> list[str]:
             f"factory status is {reported!r}; recovery resumes only 'running' or 'needs-human'"
         )
 
-    if not record.session:
+    initialized_only = (record.handle is None and record.opencode_session_id is None
+                        and record.children_reaped and record.run_id == f"chainlink-{record.issue_id}" and reported == PARKED)
+    if not record.session and not initialized_only:
         problems.append("retained session is missing; recovery resumes with the recorded session")
 
     if status.get("lock_session") not in {None, record.session}:
         problems.append("factory recovery lock owner changed; refusing a foreign session")
 
-    if factory_process_is_alive(record):
+    daemon = record.handle is not None and record.handle.substrate == "opencode_daemon"
+    if daemon and (record.opencode_session_id != record.handle.opencode_session_id
+                   or record.session != record.opencode_session_id):
+        problems.append("retained daemon session identity does not match its handle and lock")
+    elif not daemon and factory_process_is_alive(record):
         problems.append("the retained factory process is still alive; recovery refuses a live run")
-    elif not factory_process_is_verified_dead(record):
+    elif not daemon and not factory_process_is_verified_dead(record):
         problems.append(
             "the retained process cannot be verified dead (no recorded birth marker, or it is a "
             "zombie); recovery requires verified death to rule out pid reuse"
         )
+    if not daemon and not record.children_reaped:
+        problems.append("historical factory descendants are not verified quiescent; operator recovery is required")
+    if not daemon and (reported != PARKED or record.run_id != f"chainlink-{record.issue_id}"):
+        problems.append("historical host requires a verified park and canonical run before fresh daemon recovery")
 
     if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
         problems.append(f"sandbox is unavailable as an absolute real directory: {sandbox}")
@@ -134,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     record = load_factory_record(args.home, args.run_id)
     if record is None:
         raise ResumeError(f"no retained record for {args.run_id} under {args.home}")
+    args.launcher = resolve_factory_entrypoint(args.launcher)
 
     status = factory_status(args.launcher, args.run_id, sandbox)
     print(

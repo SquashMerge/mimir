@@ -705,6 +705,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
 
     def run(argv, *, cwd):
         calls.append(argv)
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return json.dumps({'ok': True, 'daemon_enabled': True})
         if argv[-3:] == ["ps", "-q", "agent"]:
             return "b" * 64
         if argv[-3:] == ["mimir", "worklink", "status"]:
@@ -812,9 +814,11 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert compose["services"]["agent"]["environment"]["XDG_CACHE_HOME"] == "/home/mimir/.cache"
     assert "cache:/home/mimir/.cache" in compose["services"]["agent"]["volumes"]
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
-    assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink"}
+    assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon"}
+    assert "worklink-daemon:/var/lib/mimir-worklink/daemon" in compose["services"]["agent"]["volumes"]
     assert any('MIMIR_VERSION=' + VERSION in part for argv in calls for part in argv)
-    assert sum("docker" == argv[0] and "exec" in argv for argv in calls) == 2  # idle probes on the rerun
+    assert sum("docker" == argv[0] and "exec" in argv and argv[-1] != installer._OPENCODE_DAEMON_PROBE
+               for argv in calls) == 2  # idle probes on the rerun
     assert sum("-f" in argv and "compose.provision.yml" in argv for argv in calls) == 2
     assert all(argv[argv.index('--user') + 1] == '1001:1001' for argv in calls
                if 'compose.provision.yml' in argv)
@@ -914,6 +918,8 @@ def setup_environment(tmp_path, monkeypatch):
     def run(argv, *, cwd):
         assert cwd == deploy
         calls.append(argv)
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return json.dumps(state.get('daemon_health', {'ok': True, 'daemon_enabled': True}))
         if argv[-1] == installer._CODEX_LOGIN_PROBE:
             return 'ok' if installer._codex_auth_valid(deploy / 'codex' / 'auth.json') else 'missing'
         if argv[-3:] == ['ps', '-q', 'agent']:
@@ -943,6 +949,30 @@ def setup_environment(tmp_path, monkeypatch):
                         verify=lambda *a, **kw: state['verified'].append(a + ((kw,) if kw else ())))
 
     return deploy, args, state, calls, invoke
+
+
+def test_setup_native_login_refusal_keeps_daemon_available(setup_environment, capsys):
+    deploy, args, state, calls, invoke = setup_environment
+    state['daemon_health'] = {'ok': False, 'daemon_enabled': True}
+    with pytest.raises(installer.SetupError, match='Native login: docker compose exec --user worklink agent'):
+        invoke()
+    assert state['running'], 'container/daemon must remain available for native login'
+    assert not state['verified']
+    assert calls.index(['docker', 'compose', 'up', '-d', 'agent']) < next(
+        index for index, argv in enumerate(calls) if argv[-1] == installer._OPENCODE_DAEMON_PROBE)
+    assert 'worklink-opencode-login' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_setup_reports_effective_daemon_telemetry_and_login(setup_environment, capsys, enabled):
+    deploy, args, state, calls, invoke = setup_environment
+    state['daemon_health'] = {'ok': True, 'daemon_enabled': enabled,
+                              'refresh_unverified': enabled, 'sensitive_telemetry_disabled': enabled}
+    invoke()
+    output = capsys.readouterr().out
+    assert ('worklink-opencode-login' in output) is enabled
+    assert ('Native login refresh is unverified' in output) is enabled
+    assert ('telemetry is disabled because sensitive OTLP' in output) is enabled
 
 
 @pytest.fixture
@@ -1642,22 +1672,19 @@ def test_subscription_fresh_setup_requires_login_before_start(setup_environment,
     values = dict(line.split('=', 1) for line in (deploy / 'compose.env').read_text().splitlines())
     values.update(agent['environment'])
     values.update({'HOME': str(home), 'CODEX_HOME': str(deploy / 'codex')})
-    selected = opencode.resolve_opencode_invocation(env=values)
-    assert selected.auth_type == 'oauth' and selected.auth_path == opencode.opencode_auth_path(values)
-    assert selected.model == 'openai/gpt-5.6-luna'
-    assert json.loads(opencode.opencode_worker_documents(selected, values).auth_document)['openai']['type'] == 'oauth'
-    assert 'OPENAI_API_KEY' not in values and 'OPENAI_API_KEY' not in selected.pass_env
+    assert opencode.resolve_daemon_model(values) == {'providerID': 'openai', 'id': 'gpt-5.6-luna'}
+    assert 'OPENAI_API_KEY' not in values
     from mimir_cultivate.worklink import compute
     from mimir_cultivate.worklink.backends import opencode as backend_module
     from mimir_cultivate.worklink.backends.base import WorkOrder
-    monkeypatch.setattr(backend_module, '_coding_enabled', lambda: True)
-    monkeypatch.setattr(backend_module, 'resolve_opencode_binary', lambda _: '/usr/bin/opencode')
     order = WorkOrder(2075, tmp_path, 'prompt', None, 30, {**values, 'MIMIR_HOME': str(home)})
     work = backend_module.OpenCodeBackend().work_spec(
         order, attempt=1, repo_url='repo', base_ref='main', branch='issue/2075', test_command='true')
     worker = compute._enabled_child_env(work, 'test-worker')
     assert 'OPENAI_API_KEY' not in work.env and 'OPENAI_API_KEY' not in worker
-    assert 'OPENAI_API_KEY' not in json.dumps(work.backend_config['worker_projections'], default=str)
+    assert 'worker_projections' not in work.backend_config
+    assert work.session_request.model == {'providerID': 'openai', 'id': 'gpt-5.6-luna'}
+    assert 'OPENCODE_PERMISSION' not in work.env
 
 
 def test_subscription_upgrade_drops_stale_openai_key(upgrade_setup, monkeypatch):
@@ -1970,6 +1997,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     def run(argv, *, cwd):
         exec_calls.append(argv)
         assert cwd == tmp_path
+        if installer._OPENCODE_DAEMON_PROBE in argv:
+            return json.dumps({'ok': all(pending[name] == 'ok' for name in ('binary', 'auth', 'model')),
+                               'daemon_enabled': True})
         if installer._TOOLCHAIN_ENV_PROBE in argv:
             return json.dumps(installer.toolchain_probe_environment(SimpleNamespace(backend_settings={})))
         if installer._TOOLCHAIN_WORKER_PROBE in argv:
@@ -1977,21 +2007,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
                                  "-w", "/tmp", "agent", "/usr/local/bin/python"]
             assert argv[-2:] == ['rust', '1.99.1']
             return pending['toolchain']
-        if installer._OPENCODE_WORKER_PROBE in argv:
-            assert argv[:10] == ["docker", "compose", "exec", "-T", "-u", "worklink",
-                                "-w", "/tmp", "agent", "/usr/local/bin/python"]
-            return pending["binary"]
-        if installer._OPENCODE_MODEL_PROBE in argv:
-            assert argv[4:9] == ["-u", "worklink", "-w", "/tmp", "agent"]
-            assert argv[-3:] == ["/opt/mimir-opencode/bin/opencode", "openai", "openai/gpt-6.1-sol"]
-            return pending["model"]
         assert argv[:7] == ["docker", "compose", "exec", "-T", "-u", "mimir", "agent"]
         if "plugins" in argv:
             return json.dumps([{"name": "cultivate", "enabled": True}])
-        if "print(resolve_opencode_invocation().model)" in argv[-1]:
-            return "openai/gpt-6.1-sol"
-        if "resolve_opencode_invocation" in argv[-1]:
-            return pending["auth"]
         if "verify_executor_identity" in argv[-1]:
             # Execute the actual docker python -c payload: exceptions must be
             # converted to stdout reason codes rather than a nonzero exit.
@@ -1999,9 +2017,6 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
             with redirect_stdout(output):
                 exec(compile(argv[-1], "<executor-verification>", "exec"), {})
             return output.getvalue().strip()
-        if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
-            assert argv[7:9] == ["/home/mimir/venv/bin/python", "-c"]
-            return "/opt/mimir-opencode/bin/opencode"
         if "base_identity_mismatch" in argv[-1]:
             return subprocess.run([sys.executable, '-c', argv[-1]], check=True, capture_output=True, text=True,
                 env=dict(os.environ, WORKLINK_REPO=str(base))).stdout.strip()
@@ -2013,12 +2028,11 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         installer._verify(tmp_path, 8123, "org/repo", "owner-key", 'rust', '1.99.1', **kwargs)
 
     verify()
-    assert len(exec_calls) == 11
+    assert len(exec_calls) == 7
     assert [argv[7:9] for argv in exec_calls] == [
-        ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
-        ["python", "-c"], ["/home/mimir/venv/bin/python", "-c"],
-        ["/tmp", "agent"], ["/home/mimir/venv/bin/python", "-c"],
-        ["/tmp", "agent"], ["python", "-c"], ["python", "-c"], ["/tmp", "agent"]]
+        ["python", "-c"], ["mimir", "plugins"], ["python", "-c"],
+        ["python", "-c"], ["python", "-c"],
+        ["/home/mimir/venv/bin/python", "-c"], ["/tmp", "agent"]]
     assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'wrong@example.com'], check=True)
     reads.clear()
@@ -2053,19 +2067,19 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         verify()
     pending['toolchain'] = 'ok'
     pending["binary"] = "opencode_missing"
-    with pytest.raises(installer.SetupError, match="opencode_missing"):
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed"):
         verify()
     pending["binary"] = "ok"
     pending["auth"] = "auth_missing"
-    with pytest.raises(installer.SetupError, match="OpenCode credential resolution failed.*auth_missing"):
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed"):
         verify()
     pending["auth"] = "private-key-material"
-    with pytest.raises(installer.SetupError, match="unavailable") as raised:
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed") as raised:
         verify()
     assert "private-key-material" not in str(raised.value)
     pending["auth"] = "ok"
     pending["model"] = "opencode_model_unknown"
-    with pytest.raises(installer.SetupError, match="opencode_model_unknown.*openai/gpt-6.1-sol"):
+    with pytest.raises(installer.SetupError, match="OpenCode daemon verification failed"):
         verify()
     pending["model"] = "ok"
     pending["alerts"] = [{"repository": "org/repo"}]
@@ -2090,186 +2104,86 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         verify()
 
 
-@pytest.mark.parametrize("runtime_injected", [False, True])
-@pytest.mark.parametrize("outcome", ["ok", "nonzero", "missing", "timeout"])
-def test_setup_binary_probe_executes_with_worker_path(
-    tmp_path, monkeypatch, outcome, runtime_injected
-):
-    import subprocess
-    import sys
+@pytest.mark.parametrize('state', ['disabled', 'ready', 'refreshable', 'missing_login', 'stale', 'unavailable', 'invalid'])
+def test_setup_daemon_probe_uses_actual_activation_and_gate(tmp_path, monkeypatch, state):
+    from contextlib import redirect_stdout
+    import io
+    from mimir import worklink_daemon_activation as activation
+    from mimir_cultivate.worklink import daemon_gate, daemon_health
+    from mimir_cultivate.worklink.daemon_service import RuntimePaths
+    from mimir_cultivate.worklink.identities import WorklinkIdentities
+    import time
+    import uuid
 
-    from mimir_cultivate.contained_execution import (
-        base_worker_environment,
-        opencode_worker_environment,
-    )
-
-    binary = tmp_path / "opencode"
-    marker = tmp_path / "probe-environment.json"
-    launch_marker = tmp_path / "probe-launch-environment.json"
-    binary.write_text(
-        f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
-        # Model runtime-added state on every platform, without adding it to the
-        # environment supplied by the probe itself.
-        + ("os.environ['TEST_RUNTIME_ADDED'] = 'runtime-only'\n" if runtime_injected else "")
-        + "assert sys.argv[1:] == ['--version']\n"
-        "home = pathlib.Path(os.environ['HOME'])\n"
-        "assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700\n"
-        "assert os.environ['PATH'] == '/usr/local/bin:/usr/bin:/bin'\n"
-        "for key, suffix in [('XDG_CONFIG_HOME', '.config'), ('XDG_DATA_HOME', '.local/share'), ('XDG_CACHE_HOME', '.cache')]:\n"
-        " assert os.environ[key] == str(home / suffix)\n"
-        " (home / suffix).mkdir(parents=True, exist_ok=True)\n"
-        f"pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))\n"
-        f"sys.exit({1 if outcome == 'nonzero' else 0})\n"
-    )
-    binary.chmod(0o755)
-    if outcome == "missing":
-        binary.unlink()
-    real_run = subprocess.run
-    captured = []
-
-    def run(argv, *, cwd):
-        captured.append(argv)
-        if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
-            assert argv[:9] == ['docker', 'compose', 'exec', '-T', '-u', 'mimir',
-                                'agent', '/home/mimir/venv/bin/python', '-c']
-            return str(binary)
-        assert argv[4:8] == ['-u', 'worklink', '-w', '/tmp']
-        assert argv[9] == '/usr/local/bin/python'
-        assert argv[-2:] == [installer._OPENCODE_WORKER_PROBE, str(binary)]
-        # Record the exact environment passed at the real subprocess boundary,
-        # before the child runtime can inject platform-specific variables.
-        # The clean interpreter still executes the unmodified production probe.
-        recorder = (
-            "import json, pathlib, subprocess\n"
-            "real_run = subprocess.run\n"
-            "def record_launch(*args, **kwargs):\n"
-            f" pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs['env']))\n"
-            + (" raise subprocess.TimeoutExpired(args[0], 15)\n" if outcome == 'timeout'
-               else " return real_run(*args, **kwargs)\n")
-            + "subprocess.run = record_launch\n"
-        )
-        code = recorder + argv[-2]
-        result = real_run([sys.executable, '-I', '-S', '-c', code, str(binary)],
-                          capture_output=True, text=True, check=True)
-        return result.stdout.strip()
-
-    monkeypatch.setattr(installer, '_run', run)
-    if outcome == 'ok':
-        installer._verify_opencode_binary(tmp_path)
-    else:
-        with pytest.raises(installer.SetupError, match='opencode_missing'):
-            installer._verify_opencode_binary(tmp_path)
-    assert len(captured) == 2
-    assert launch_marker.exists(), 'every outcome must reach the subprocess boundary'
-    launch_env = json.loads(launch_marker.read_text())
-    # Exact equality rejects every extra launch variable, including names the
-    # platform might subsequently inject into the child interpreter.
-    base = base_worker_environment('setup-probe-parity')
-    runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
-    expected = opencode_worker_environment(base, {})
-    expected = {key: value.replace(runtime_home, launch_env['HOME'])
-                for key, value in expected.items()}
-    expected['HOME'] = launch_env['HOME']  # assigned by the real executor too
-    assert launch_env == expected
-    assert not Path(launch_env['HOME']).exists(), 'probe must clean up after every outcome'
-    if outcome in {'ok', 'nonzero'}:
-        assert marker.exists(), 'positive control must execute the CLI body'
-        observed_env = json.loads(marker.read_text())
-        for key, value in expected.items():
-            assert observed_env[key] == value
-        if runtime_injected:
-            assert observed_env['TEST_RUNTIME_ADDED'] == 'runtime-only'
-            assert 'TEST_RUNTIME_ADDED' not in launch_env
-    else:
-        assert not marker.exists(), 'failed launches must not execute the CLI body'
-
-
-@pytest.mark.parametrize('runtime_injected', [False, True])
-@pytest.mark.parametrize('outcome', ['listed', 'unknown', 'nonzero', 'missing', 'timeout'])
-@pytest.mark.parametrize('provider, model', [
-    ('openai', 'openai/gpt-6.1-sol'), ('anthropic', 'anthropic/claude-haiku-5-5'),
-])
-def test_setup_model_probe_uses_isolated_worker_cli(
-    tmp_path, monkeypatch, provider, model, outcome, runtime_injected
-):
-    from mimir_cultivate.contained_execution import (
-        base_worker_environment,
-        opencode_worker_environment,
-    )
-
+    paths = RuntimePaths(tmp_path / 'daemon', tmp_path / 'run')
+    paths.status.parent.mkdir(parents=True)
+    paths.status.parent.chmod(0o755)
+    paths.snapshot.parent.mkdir(parents=True, mode=0o700)
+    paths.snapshot.parent.chmod(0o700)
+    marker = tmp_path / 'installed'
+    marker.write_text('0\n' if state == 'disabled' else 'bad' if state == 'invalid' else '1\n')
+    marker.chmod(0o644)
     binary = tmp_path / 'opencode'
-    marker = tmp_path / 'model-probe.json'
-    launch_marker = tmp_path / 'model-launch-environment.json'
-    binary.write_text(
-        f'#!{sys.executable}\nimport json, os, pathlib, sys\n'
-        + ("os.environ['TEST_RUNTIME_ADDED'] = 'runtime-only'\n" if runtime_injected else '')
-        + f"assert sys.argv[1:] == ['models', {provider!r}]\n"
-        "home = pathlib.Path(os.environ['HOME'])\n"
-        "assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700\n"
-        f'pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))\n'
-        # A prefix-only match must not satisfy the exact model check.
-        f"print({model + '-fast'!r})\n"
-        + (f"print({model!r})\n" if outcome != 'unknown' else '')
-        + f"sys.exit({1 if outcome == 'nonzero' else 0})\n"
-    )
+    binary.write_text('#!/bin/sh\nexit 0\n')
     binary.chmod(0o755)
-    if outcome == 'missing':
+    if state == 'unavailable':
         binary.unlink()
-    real_run = subprocess.run
-    captured = []
-    monkeypatch.setenv('OPENAI_API_KEY', 'private-openai-key')
-    monkeypatch.setenv('ANTHROPIC_API_KEY', 'private-anthropic-key')
-
+    fstat = os.fstat
+    marker_inode = marker.stat().st_ino
+    def marker_owner(fd):
+        info = fstat(fd)
+        return SimpleNamespace(st_uid=0, st_size=info.st_size, st_mode=info.st_mode) if info.st_ino == marker_inode else info
+    monkeypatch.setattr(activation.os, 'fstat', marker_owner)
+    monkeypatch.setattr(activation, 'DAEMON_PATH', str(tmp_path))
+    resolve = activation.resolve_activation
+    monkeypatch.setattr(activation, 'resolve_activation', lambda values: resolve(values, marker=marker))
+    monkeypatch.setattr(daemon_health, 'resolve_activation', activation.resolve_activation)
+    ids = WorklinkIdentities(os.getuid(), os.getuid(), os.getgid())
+    monkeypatch.setattr(daemon_health, 'get_identities', lambda: ids)
+    generation = str(uuid.uuid4())
+    token = 'fixture-' + 'bot-token'
+    paths.snapshot.write_text(json.dumps({'version': 1, 'launch_generation': generation,
+                                        'bot_token': token, 'publishing_identity': None}))
+    paths.snapshot.chmod(0o600)
+    paths.status.write_text(json.dumps({'version': 1, 'launch_generation': generation,
+        'checked_at_ms': int(time.time() * 1000), 'daemon_state': 'ready', 'daemon_version': '2.2.7',
+        'login_state': 'missing' if state == 'missing_login' else 'refreshable_unverified' if state == 'refreshable' else 'locally_unexpired',
+        'login_expires_at_ms': None, 'telemetry_state': 'off'}))
+    paths.status.chmod(0o644)
+    monkeypatch.setenv('MIMIR_PLUGINS', 'cultivate')
+    monkeypatch.setenv('MIMIR_MODEL_SPEC', 'codex-plus:fixture-model')
+    monkeypatch.delenv('GH_TOKEN', raising=False)
+    monkeypatch.delenv('MIMIR_FACTORY_PUBLISHING_IDENTITY', raising=False)
+    monkeypatch.setenv('GITHUB_TOKEN', token if state != 'stale' else 'fixture-' + 'changed-token')
+    wait = daemon_gate.wait_for_daemon
+    monkeypatch.setattr(daemon_gate, 'wait_for_daemon', lambda values: wait(values, paths=paths, timeout=0))
+    calls = []
     def run(argv, *, cwd):
-        captured.append(argv)
-        assert cwd == tmp_path
-        assert argv[:10] == ['docker', 'compose', 'exec', '-T', '-u', 'worklink',
-                             '-w', '/tmp', 'agent', '/usr/local/bin/python']
-        assert argv[-4:] == [installer._OPENCODE_MODEL_PROBE, str(binary), provider, model]
-        # Capture the exact launch mapping before the child runtime can add
-        # platform variables. Execute the unmodified stdlib-only setup payload.
-        recorder = (
-            'import json, pathlib, subprocess\n'
-            'real_run = subprocess.run\n'
-            'def record_launch(*args, **kwargs):\n'
-            f' pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs["env"]))\n'
-            + (' raise subprocess.TimeoutExpired(args[0], 30)\n' if outcome == 'timeout'
-               else ' return real_run(*args, **kwargs)\n')
-            + 'subprocess.run = record_launch\n'
-        )
-        result = real_run([sys.executable, '-I', '-S', '-c', recorder + argv[-4], *argv[-3:]],
-                          capture_output=True, text=True, check=True)
-        return result.stdout.strip()
-
+        calls.append(argv)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(compile(argv[-1], '<setup-daemon-probe>', 'exec'), {})
+        return output.getvalue().strip()
     monkeypatch.setattr(installer, '_run', run)
-    if outcome == 'listed':
-        installer._verify_opencode_model(tmp_path, str(binary), model)
+    if state in {'disabled', 'ready', 'refreshable'}:
+        installer._verify_opencode_daemon(tmp_path)
     else:
-        with pytest.raises(installer.SetupError, match=f'opencode_model_unknown.*{re.escape(model)}'):
-            installer._verify_opencode_model(tmp_path, str(binary), model)
-    assert len(captured) == 1
-    assert launch_marker.exists(), 'every outcome must reach the subprocess boundary'
-    launch_env = json.loads(launch_marker.read_text())
-    base = base_worker_environment('setup-model-probe-parity')
-    runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
-    expected = opencode_worker_environment(base, {})
-    expected = {key: value.replace(runtime_home, launch_env['HOME'])
-                for key, value in expected.items()}
-    expected['HOME'] = launch_env['HOME']
-    # The inert catalog key is the ONLY permitted difference from the worker.
-    expected[provider.upper() + '_API_KEY'] = 'model-catalog-probe'
-    assert launch_env == expected
-    assert not Path(launch_env['HOME']).exists(), 'probe must clean up after every outcome'
-    if outcome in {'listed', 'unknown', 'nonzero'}:
-        assert marker.exists(), 'positive control must execute the CLI body'
-        observed_env = json.loads(marker.read_text())
-        for key, value in expected.items():
-            assert observed_env[key] == value
-        if runtime_injected:
-            assert observed_env['TEST_RUNTIME_ADDED'] == 'runtime-only'
-            assert 'TEST_RUNTIME_ADDED' not in launch_env
-    else:
-        assert not marker.exists(), 'failed launches must not execute the CLI body'
+        with pytest.raises(installer.SetupError, match='daemon verification failed') as raised:
+            installer._verify_opencode_daemon(tmp_path)
+        assert token not in str(raised.value)
+    assert calls == [['docker', 'compose', 'exec', '-T', '-u', 'mimir', 'agent',
+                      'python', '-c', installer._OPENCODE_DAEMON_PROBE]]
+
+
+@pytest.mark.parametrize('spec, expected', [
+    ('codex-plus:gpt-test#high', {'providerID': 'openai', 'id': 'gpt-test', 'variant': 'high'}),
+    ('anthropic:claude-test', {'providerID': 'anthropic', 'id': 'claude-test'}),
+    ('proxy:arbitrary/model', {'providerID': 'proxy', 'id': 'arbitrary/model'}),
+])
+def test_setup_reuses_daemon_model_validator_without_cli_catalog(monkeypatch, spec, expected):
+    from mimir_cultivate.opencode import resolve_daemon_model
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **kw: pytest.fail('model validation must not run a CLI'))
+    assert resolve_daemon_model({'MIMIR_MODEL_SPEC': spec}) == expected
 
 
 def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):
@@ -2287,38 +2201,30 @@ def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
-        output = '/opt/mimir-opencode/bin/opencode' if argv[1] == 'mimir' else 'ok'
+        output = json.dumps({'ok': True, 'daemon_enabled': True})
         return SimpleNamespace(returncode=0, stdout=output, stderr='')
 
     monkeypatch.setattr(subprocess, 'run', run)
     monkeypatch.setattr(installer, '_run', installer._run)
     exec(compile(payloads[0], '<real-image-setup-probe>', 'exec'), {})
     assert [argv for argv, _ in calls] == [
-        ['/command/s6-setuidgid', 'mimir', '/home/mimir/venv/bin/python', '-c',
-         installer._OPENCODE_RESOLVE_PROBE],
-        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
-         installer._OPENCODE_WORKER_PROBE, '/opt/mimir-opencode/bin/opencode'],
-        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
-         installer._OPENCODE_MODEL_PROBE, '/opt/mimir-opencode/bin/opencode', 'openai', 'openai/gpt-6.1-sol'],
-        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
-         installer._OPENCODE_MODEL_PROBE, '/opt/mimir-opencode/bin/opencode', 'openai', 'openai/gpt-6-luna'],
-        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
-         installer._OPENCODE_MODEL_PROBE, '/opt/mimir-opencode/bin/opencode', 'anthropic', 'anthropic/claude-haiku-5-5'],
+        ['/command/s6-setuidgid', 'mimir', 'python', '-c', installer._OPENCODE_DAEMON_PROBE],
     ]
     assert all(kwargs == dict(cwd='/tmp', capture_output=True, text=True, timeout=30)
                for _, kwargs in calls)
 
 
-def test_setup_binary_resolution_failure_does_not_launch_worker(tmp_path, monkeypatch):
+@pytest.mark.parametrize('projection', ['not-json', '[]', '{}', '{"ok":false,"daemon_enabled":true}'])
+def test_setup_daemon_projection_failure_does_not_launch_worker(tmp_path, monkeypatch, projection):
     calls = []
     def run(argv, *, cwd):
         calls.append(argv)
-        return 'opencode_missing'
+        return projection
     monkeypatch.setattr(installer, '_run', run)
-    with pytest.raises(installer.SetupError, match='opencode_missing'):
-        installer._verify_opencode_binary(tmp_path)
+    with pytest.raises(installer.SetupError, match='daemon verification failed'):
+        installer._verify_opencode_daemon(tmp_path)
     assert len(calls) == 1
-    assert calls[0][-1] == installer._OPENCODE_RESOLVE_PROBE
+    assert calls[0][-1] == installer._OPENCODE_DAEMON_PROBE
 
 
 @pytest.mark.parametrize('kind, version, tools', [
@@ -2407,14 +2313,7 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
     from mimir_cultivate.worklink.backends import opencode as backend_module
     from mimir_cultivate.worklink.backends.base import WorkOrder
     from mimir_cultivate.worklink.backends.registry import BackendRegistry
-    invocation = SimpleNamespace(model='proof/model', provider='proof', model_source='test',
-                                 config_path=tmp_path / 'absent', pass_env=(), remove_env=())
-    monkeypatch.setattr(backend_module, '_coding_enabled', lambda: True)
-    monkeypatch.setattr(backend_module, 'resolve_opencode_binary', lambda _: '/usr/local/bin/opencode')
-    monkeypatch.setattr(backend_module, 'resolve_worklink_opencode_invocation', lambda _: SimpleNamespace(
-        invocation=invocation, env={}, configured_model='proof/model', model_diverged=False))
-    monkeypatch.setattr(backend_module, 'opencode_worker_documents', lambda *_: SimpleNamespace(
-        config_document=b'{}', auth_document=None))
+    monkeypatch.setenv('MIMIR_MODEL_SPEC', 'codex-plus:proof-model')
     spec = BackendRegistry(config).get('opencode').work_spec(
         WorkOrder(1, tmp_path, '', None, 30, {}), attempt=1,
         repo_url='', base_ref='', branch='', test_command='./tools/verify')
@@ -3778,6 +3677,8 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
             kwargs["stdout"].write(b"owner-key\n")
             return subprocess.CompletedProcess(argv, 0)
         docker_calls.append(argv)
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({'ok': True, 'daemon_enabled': True}), stderr='')
         if "compose.provision.yml" in argv:
             home.mkdir(exist_ok=True)
             manifest = deploy / "manifest.json"
@@ -3875,6 +3776,8 @@ def test_digestless_deployment_adds_tracker_after_failed_provision_then_reruns_w
     push = {"ok": True}
 
     def subprocess_run(argv, **kwargs):
+        if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({'ok': True, 'daemon_enabled': True}), stderr='')
         if argv[0] == 'chainlink':
             if argv[1:] == ['init', '-q']:
                 (home / '.chainlink').mkdir()

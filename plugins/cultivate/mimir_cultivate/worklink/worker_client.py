@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import socket
 import struct
 import subprocess
-from typing import Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 import uuid
 
 from mimir.output_capture import OutputSink, open_output_pair
@@ -20,6 +20,7 @@ from mimir.otel_credentials import filter_otlp_env
 from mimir_cultivate import install_identity
 from . import identities
 from .compute import LaunchHandle
+from .backends.base import SessionOutcome, SessionRequest, SessionTransportLostError
 
 DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
@@ -35,10 +36,7 @@ STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
 )
-_PROJECTION_PATHS = frozenset({
-    ".config/opencode/opencode.json",
-    ".local/share/opencode/auth.json",
-})
+_PROJECTION_PATHS: frozenset[str] = frozenset()
 
 
 def worklink_checkout_root() -> Path:
@@ -84,16 +82,38 @@ def factory_checkout_for_path(path: Path) -> tuple[Path, int, int] | None:
 def run_factory_control(
     checkout: Path, argv: Sequence[str], *, env: Mapping[str, str],
     timeout: float = 30, output_limit: int = 1024 * 1024,
+    initialize: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run retained-tree operations as its owner, without refreshing runtime auth."""
     binding = factory_checkout_for_path(checkout)
     if binding is None:
         raise ValueError("factory control requires an inner checkout")
     root, issue, attempt = binding
+    if initialize:
+        from .backends.feature_factory import resolve_factory_entrypoint
+        try:
+            node = list(argv).index("node")
+            entrypoint = argv[node + 1]
+            operation, run_id = argv[node + 2:node + 4]
+            repo = argv[list(argv).index("--repo") + 1]
+        except (ValueError, IndexError):
+            raise ValueError("initial factory control requires a bound init command") from None
+        if operation != "init" or run_id != f"chainlink-{issue}" or repo != str(root):
+            raise ValueError("initial factory control is outside its issued attempt")
+        flags = list(argv[node + 4:])
+        allowed = {"--repo", "--pr-base", "--mode", "--max-retries", "--publishing-identity"}
+        if (len(flags) % 2 or len(set(flags[::2])) != len(flags[::2])
+                or any(flag not in allowed for flag in flags[::2])):
+            raise ValueError("initial factory control flags are invalid")
+        if node != 0 and (node != 4 or not Path(argv[0]).is_absolute() or argv[1] != "-I"
+                or Path(argv[2]).resolve() != Path(__file__).with_name("factory_control_output.py").resolve()
+                or argv[3] != "other"):
+            raise ValueError("initial factory control requires the trusted output projector")
+        resolve_factory_entrypoint(entrypoint)
 
     async def run() -> subprocess.CompletedProcess[bytes]:
         client = WorkerClient.for_factory_checkout(root, issue_id=issue, attempt=attempt)
-        client._launch_op = "launch_factory_control"
+        client._launch_op = "launch_factory" if initialize else "launch_factory_control"
         client._socket_timeout_s = timeout + CANCEL_SOCKET_TIMEOUT_S
         stdout, stderr = open_output_pair(None, output_limit, None, output_limit)
         try:
@@ -105,7 +125,9 @@ def run_factory_control(
             )
             code = await process.wait()
             if process.timed_out:
-                raise subprocess.TimeoutExpired(argv, timeout)
+                error = subprocess.TimeoutExpired(argv, timeout)
+                error.quiescent = True
+                raise error
             if process.output_overflow:
                 command = _factory_control_name(argv)
                 observed = max(process.stdout_bytes, process.stderr_bytes)
@@ -118,7 +140,9 @@ def run_factory_control(
                                    stream=stream, observed_bytes=observed, limit_bytes=output_limit)
                 except RuntimeError:
                     pass  # An unavailable event sink must not replace the diagnosis.
-                raise RuntimeError(reason)
+                error = RuntimeError(reason)
+                error.quiescent = True
+                raise error
             return subprocess.CompletedProcess(
                 argv, code, stdout.read_bounded()[0], stderr.read_bounded()[0],
             )
@@ -216,6 +240,165 @@ class WorkerProcess:
 
 
 class WorkerClient:
+    async def _session_rpc(self, operation: str, payload: Mapping[str, object]) -> dict[str, Any]:
+        if operation not in {"session_create", "session_observe", "session_cancel", "session_release"}:
+            raise ValueError("invalid session operation")
+        if self.checkout is None and self.path_checkout is None:
+            raise ValueError("session operation requires an issued checkout capability")
+        if self.checkout is not None:
+            self.checkout.verify(self.checkout.path)
+            path = self.checkout.path
+            issue, attempt = self.checkout.issue_id, self.checkout.attempt
+            device, inode = self.checkout.device, self.checkout.inode
+        else:
+            path = self.path_checkout
+            issue, attempt = self.issue_id, self.attempt
+            info = path.stat()
+            device, inode = info.st_dev, info.st_ino
+        request = {
+            "version": 1, "op": operation, "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            "issue": issue, "attempt": attempt, "device": device, "inode": inode,
+            "path": str(path), **payload,
+        }
+        output = None
+        if operation == "session_observe":
+            from mimir.output_capture import open_output_sink
+            from .compute import _worklink_output_limits
+
+            limit = payload.get("stdout_limit")
+            if limit is None:
+                limit, _ = _worklink_output_limits()
+            if type(limit) is not int or not 0 < limit <= 64 * 1024 * 1024:
+                raise ValueError("session stdout limit must be between 1 and 67108864 bytes")
+            output = open_output_sink(None, limit)
+            request["stdout_limit"] = limit
+        try:
+            raw = json.dumps(request, allow_nan=False).encode()
+        except Exception:
+            if output is not None:
+                output.close()
+            raise
+        if len(raw) > MAX_REQUEST_BYTES:
+            if output is not None:
+                output.close()
+            raise ValueError("session request exceeds size limit")
+        fd = self.checkout.duplicate_fd() if self.checkout is not None else -1
+        sock = None
+        try:
+            sock = await asyncio.to_thread(self._connect, 35)
+            rights = ([fd] if fd >= 0 else []) + ([output.fd] if output is not None else [])
+            ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", rights))] if rights else []
+            sock.sendmsg([raw], ancillary)
+            response = json.loads(await asyncio.to_thread(sock.recv, MAX_REQUEST_BYTES + 1))
+            if not isinstance(response, dict) or "error" in response:
+                raise RuntimeError("session executor operation failed")
+            if output is not None:
+                captured, dropped = output.read_bounded()
+                response["stdout"] = captured.decode("utf-8", "ignore")
+                response["output_overflow"] = bool(response.get("output_overflow") or dropped or output.did_overflow)
+            return response
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if sock is not None:
+                sock.close()
+            if output is not None:
+                output.close()
+
+    async def session_create(self, request: SessionRequest, *, timeout_s: int, pass_env: Mapping[str, str] | None = None,
+                             git_settings: Sequence[tuple[str, str]] = ()) -> LaunchHandle:
+        from dataclasses import asdict
+        from .daemon_health import daemon_health
+        from .backends.base import SessionAdmissionError
+
+        health = daemon_health(dict(os.environ))
+        if health.get("ok") is not True:
+            raise SessionAdmissionError(uncertain=False)
+        generation = health["launch_generation"]
+        try:
+            response = await self._session_rpc("session_create", {
+                "generation": generation, "request": asdict(request), "timeout_s": timeout_s,
+                "pass_env": dict(pass_env or {}), "git_settings": list(git_settings),
+            })
+        except (OSError, RuntimeError, ValueError):
+            recovered = await self.session_recover_admission(str(generation))
+            if recovered is None:
+                raise SessionAdmissionError(uncertain=False, generation=str(generation)) from None
+            return recovered
+        if response.get("admission_state") == "conflict":
+            raise SessionAdmissionError(uncertain=True, generation=str(generation),
+                                        handle=self._admission_handle(response, str(generation)))
+        return self._admission_handle(response, str(generation))
+
+    @staticmethod
+    def _admission_handle(response: Mapping[str, Any], generation: str) -> LaunchHandle:
+        from .backends.base import SessionAdmissionError
+        sid = response.get("opencode_session_id")
+        if not isinstance(sid, str) or not re.fullmatch(r"ses_[A-Za-z0-9_-]{1,128}", sid):
+            raise SessionAdmissionError(uncertain=True, generation=generation)
+        return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid,
+                            launch_generation=generation)
+
+    async def session_recover_admission(self, generation: str) -> LaunchHandle | None:
+        """Read the owned attempt record; never repeat create or input admission."""
+        from .backends.base import SessionAdmissionError
+        try:
+            async with asyncio.timeout(35):
+                while True:
+                    try:
+                        response = await self._session_rpc("session_observe", {
+                            "generation": generation, "opencode_session_id": None})
+                    except (OSError, RuntimeError, ValueError):
+                        await asyncio.sleep(0.1)
+                        continue
+                    stage = response.get("admission_state")
+                    if stage == "absent":
+                        return None
+                    if stage == "retained":
+                        return self._admission_handle(response, generation)
+                    if stage != "busy":
+                        raise SessionAdmissionError(uncertain=True, generation=generation)
+                    await asyncio.sleep(0.1)
+        except TimeoutError:
+            raise SessionAdmissionError(uncertain=True, generation=generation) from None
+
+    async def _session_handle_rpc(self, operation: str, handle: LaunchHandle, *,
+                                  stdout_limit: int | None = None) -> dict[str, Any]:
+        if (handle.substrate != "opencode_daemon" or handle.identifier != handle.opencode_session_id
+                or not handle.launch_generation):
+            raise ValueError("invalid daemon session handle")
+        payload: dict[str, object] = {
+            "generation": handle.launch_generation, "opencode_session_id": handle.opencode_session_id,
+        }
+        if stdout_limit is not None:
+            if operation != "session_observe":
+                raise ValueError("only session observation accepts an output limit")
+            payload["stdout_limit"] = stdout_limit
+        return await self._session_rpc(operation, payload)
+
+    async def session_observe(self, handle: LaunchHandle, *, stdout_limit: int | None = None) -> SessionOutcome:
+        from .backends.base import SessionError, SessionOutcome
+
+        response = await self._session_handle_rpc("session_observe", handle, stdout_limit=stdout_limit)
+        if response.get("transport_lost") is True:
+            raise SessionTransportLostError("session observation transport lost")
+        if response.get("opencode_session_id") != handle.identifier:
+            raise RuntimeError("session executor identity mismatch")
+        error = response.get("error_detail")
+        return SessionOutcome(response["opencode_session_id"], response["execution_state"],
+                              response["cancellation_state"], SessionError(**error) if error else None,
+                              response.get("stdout", ""), response.get("output_overflow", False))
+
+    async def session_cancel(self, handle: LaunchHandle) -> None:
+        response = await self._session_handle_rpc("session_cancel", handle)
+        if response.get("cancellation_state") != "verified":
+            raise RuntimeError("session cancellation unverified; retain checkout")
+
+    async def session_release(self, handle: LaunchHandle) -> None:
+        response = await self._session_handle_rpc("session_release", handle)
+        if response != {"released": True}:
+            raise RuntimeError("session release unverified; retain checkout")
+
     def __init__(
         self,
         checkout: CheckoutCapability | None,
@@ -536,6 +719,8 @@ class WorkerClient:
                 "substrate": handle.substrate, "identifier": handle.identifier,
                 "process_start_ticks": handle.process_start_ticks,
                 "shim_pid": handle.shim_pid,
+                "opencode_session_id": handle.opencode_session_id,
+                "launch_generation": handle.launch_generation,
             },
         }
         sock = await asyncio.to_thread(self._connect, CANCEL_SOCKET_TIMEOUT_S)

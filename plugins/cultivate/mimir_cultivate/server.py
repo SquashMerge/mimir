@@ -56,7 +56,10 @@ async def capture_controller_source_commit(app: Any) -> None:
 
 
 async def executor_health(app: Any) -> dict[str, object]:
-    from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
+    from .worklink.worker_client import (
+        DEFAULT_EXECUTOR_SOCKET, STALE_EXECUTOR_DIAGNOSTIC,
+        StaleWorkerExecutorError, verify_executor_identity,
+    )
 
     if not app.get("check_worker_executor_health"):
         return {}
@@ -65,15 +68,17 @@ async def executor_health(app: Any) -> dict[str, object]:
     if DEFAULT_EXECUTOR_SOCKET.exists():
         try:
             executor_identity = await verify_executor_identity()
-        except (OSError, RuntimeError, ValueError) as exc:
-            result.update(ok=False, error=str(exc))
+        except StaleWorkerExecutorError:
+            result.update(ok=False, error=STALE_EXECUTOR_DIAGNOSTIC)
+        except (OSError, RuntimeError, ValueError):
+            result.update(ok=False, error="Worklink executor identity unavailable")
     controller_identity = app.get("worklink_controller_identity")
     if isinstance(controller_identity, dict) and controller_identity.get("mode") == "pypi":
         try:
             if await asyncio.to_thread(install_identity.controller_identity) != controller_identity:
                 raise install_identity.InstallIdentityError("controller install identity changed since boot")
-        except install_identity.InstallIdentityError as exc:
-            result.update(ok=False, error=str(exc))
+        except install_identity.InstallIdentityError:
+            result.update(ok=False, error="Worklink controller install identity changed since boot")
     if not isinstance(controller_identity, dict) or not isinstance(executor_identity, dict):
         result.update(ok=False, error=result.get("error", "Worklink install identity unavailable"))
     elif controller_identity != executor_identity:
@@ -96,6 +101,13 @@ async def executor_health(app: Any) -> dict[str, object]:
         worklink_executor_distributions=executor_identity.get("distributions") if isinstance(executor_identity, dict) and executor_identity.get("mode") == "pypi" else None,
         worklink_install_status="matched" if result.get("ok", True) else "mismatched",
     )
+    from .worklink.daemon_health import daemon_health
+
+    health = await asyncio.to_thread(daemon_health, dict(os.environ))
+    daemon_ok = health.pop("ok", True)
+    result.update(health)
+    if not daemon_ok:
+        result["ok"] = False
     return result
 
 
@@ -197,7 +209,10 @@ def reattach_inflight_worklink_runs(
             emit("worklink_reattach_dispatch_failed", **failure)
         factory_records = [
             record for record in listing.records
-            if factory_process_is_verified_dead(record)
+            if (factory_process_is_verified_dead(record) or (
+                record.handle is not None and record.handle.substrate == "opencode_daemon"
+                and record.opencode_session_id == record.handle.opencode_session_id
+                and record.opencode_session_id is not None))
             and record.controller_phase not in {"failed", "parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)
         ]
@@ -214,7 +229,7 @@ def reattach_inflight_worklink_runs(
     state_dir = home / "state" / "worklink" / "runs"
     dispatched: list[int] = []
     for state in states:
-        if state.compute_name == "local_subprocess":
+        if state.compute_name == "local_subprocess" and state.opencode_session_id is None:
             continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
         log_path = state_dir / f"reattach-{state.issue_id}.log"

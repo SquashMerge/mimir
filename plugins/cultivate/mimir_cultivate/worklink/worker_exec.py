@@ -216,25 +216,10 @@ def _drop_worker(checkout_fd: int) -> None:
 #: other symptom. It sits BESIDE the checkout rather than inside it, because a
 #: data dir within the snapshotted tree makes every ``git add --all`` index the
 #: previous snapshot's objects (chainlink #1610 attempt 6, #1933).
-FACTORY_RUNTIME_DATA = Path("../.factory-runtime/data/opencode")
-
-
-def _prepare_factory_runtime(home: Path) -> None:
-    """Refresh auth without discarding attempt-scoped OpenCode session state."""
-    data = FACTORY_RUNTIME_DATA
-    data.mkdir(parents=True, exist_ok=True)
-    auth = home / ".local/share/opencode/auth.json"
-    if auth.is_file():
-        shutil.copyfile(auth, data / "auth.json")
-        (data / "auth.json").chmod(0o600)
-    else:
-        (data / "auth.json").unlink(missing_ok=True)
 
 
 def _drop_factory(checkout_fd: int, home: Path) -> None:
     _drop_worker(checkout_fd)
-    # The checkout is attacker-writable. No runtime writes may precede uid drop.
-    _prepare_factory_runtime(home)
 
 
 def _status_fields() -> dict[str, str]:
@@ -321,10 +306,15 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
         not stat.S_ISDIR(boundary.st_mode)
         or boundary.st_uid != get_identities().mimir_uid
         or boundary.st_gid != get_identities().worklink_gid
-        or stat.S_IMODE(boundary.st_mode) != 0o700
+        or stat.S_IMODE(boundary.st_mode) not in {0o700, 0o710}
     ):
         raise RuntimeError("issued checkout isolation boundary is invalid")
-    if observed.st_uid != get_identities().mimir_uid or observed.st_gid != get_identities().worklink_gid:
+    owner_uid = (
+        get_identities().worklink_uid
+        if stat.S_IMODE(boundary.st_mode) == 0o710
+        else get_identities().mimir_uid
+    )
+    if observed.st_uid != owner_uid or observed.st_gid != get_identities().worklink_gid:
         raise RuntimeError("issued checkout ownership is invalid")
     if stat.S_IMODE(observed.st_mode) != 0o2770:
         raise RuntimeError("issued checkout mode is invalid")
@@ -788,41 +778,10 @@ def _leaf_git_environment(environment: dict[str, str], checkout: Path) -> None:
 def _project_home(home: Path, projections: object) -> None:
     if not isinstance(projections, list) or len(projections) > 2:
         raise RuntimeError("at most two worker projections are allowed")
-    seen: set[str] = set()
     for projection in projections:
         if not isinstance(projection, dict) or set(projection) != {"path", "document"}:
             raise RuntimeError("invalid projection document")
-        path = projection["path"]
-        document = projection["document"]
-        if not isinstance(path, str) or path not in _PROJECTION_PATHS or path in seen:
-            raise RuntimeError("invalid projection destination")
-        if not isinstance(document, str):
-            raise RuntimeError("invalid projection document")
-        encoded = document.encode()
-        if len(encoded) > MAX_PROJECTION_BYTES:
-            raise RuntimeError("invalid projection document")
-        parsed = json.loads(document)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("invalid projection document")
-        seen.add(path)
-        relative = PurePosixPath(path)
-        parent = home.joinpath(*relative.parts[:-1])
-        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        target = parent / relative.name
-        fd = os.open(
-            target,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise RuntimeError("incomplete projection write")
-                view = view[written:]
-        finally:
-            os.close(fd)
+        raise RuntimeError("invalid projection destination: worker auth/config projection is retired")
     for root, directories, files in os.walk(home):
         for name in directories:
             os.chown(Path(root) / name, get_identities().worklink_uid, get_identities().worklink_gid, follow_symlinks=False)
@@ -1022,7 +981,9 @@ def _handle_cancel_factory_handle(
         raise RuntimeError("factory cancel request must carry the exact contract and no FDs")
     _validate_executor_identity(request)
     handle = request["handle"]
-    if not isinstance(handle, dict) or set(handle) != _FACTORY_HANDLE_FIELDS:
+    if not isinstance(handle, dict) or not (
+        _FACTORY_HANDLE_FIELDS <= set(handle) <= _FACTORY_HANDLE_FIELDS | {"opencode_session_id", "launch_generation"}
+    ) or handle.get("opencode_session_id") is not None or handle.get("launch_generation") is not None:
         raise RuntimeError("invalid factory handle")
     identifier = handle["identifier"]
     if not isinstance(identifier, str):
@@ -1317,6 +1278,108 @@ def _handle_launch_factory(connection: socket.socket, request: dict[str, Any], f
     _handle_launch(connection, request, fds)
 
 
+def _open_epic_session_checkout(request: dict[str, Any], *, for_launch: bool) -> int:
+    """Open a run sandbox beneath the attempt's existing private boundary."""
+    path = Path(request["path"])
+    issue = _positive_integer(request, "issue")
+    if path.parent.name != ".factory-sandboxes" or path.name not in {str(issue), f"chainlink-{issue}"}:
+        raise RuntimeError("epic session sandbox identity is invalid")
+    outer = path.parent.parent
+    outer_fd = _open_factory_checkout({**request, "path": str(outer)}, for_launch=for_launch)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(".factory-sandboxes", flags, dir_fd=outer_fd)
+        try:
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(outer_fd)
+    info = os.fstat(fd)
+    if info.st_uid != get_identities().worklink_uid or not stat.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise RuntimeError("epic session sandbox ownership is invalid")
+    return fd
+
+
+def _handle_session(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
+    from .daemon_config import PublishingCredentials, parse_launch_snapshot
+    from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
+
+    common = {"version", "op", "executor_identity", "issue", "attempt", "device", "inode", "path", "generation"}
+    create = request["op"] == "session_create"
+    expected = common | ({"request", "timeout_s", "pass_env", "git_settings"} if create else {"opencode_session_id"})
+    observe = request["op"] == "session_observe"
+    if observe:
+        expected |= {"stdout_limit"}
+    count = 2 if observe else 1
+    if set(request) != expected or len(fds) not in {count, count - 1}:
+        raise RuntimeError("session operation requires the exact contract and checkout FD")
+    _validate_executor_identity(request)
+    path_addressed = len(fds) == count - 1
+    if create and request.get("request", {}).get("kind") == "epic":
+        epic_path = Path(request["path"])
+        if epic_path.parent.name != ".factory-sandboxes" or epic_path.name != f"chainlink-{_positive_integer(request, 'issue')}":
+            raise RuntimeError("epic creation requires its exact nested sandbox")
+    if create and "MIMIR_WORK_ITEM_JSON" in request.get("pass_env", {}):
+        item = json.loads(request["pass_env"]["MIMIR_WORK_ITEM_JSON"])
+        if (request.get("request", {}).get("kind") != "epic" or not isinstance(item, dict)
+                or item.get("run_id") != f"chainlink-{_positive_integer(request, 'issue')}"):
+            raise RuntimeError("factory work item is outside the admitted epic")
+    if path_addressed:
+        validated = {**request, "run_uid": get_identities().worklink_uid}
+        if Path(request["path"]).parent.name == ".factory-sandboxes":
+            directory_fd = _open_epic_session_checkout(validated, for_launch=create)
+        elif Path(request["path"]).name == "checkout":
+            directory_fd = _open_factory_checkout(validated, for_launch=create)
+        else:
+            directory_fd = _open_path_checkout(validated)
+        fds.insert(0, directory_fd)
+        observed = os.fstat(fds[0])
+        if (observed.st_dev, observed.st_ino) != (request["device"], request["inode"]):
+            raise RuntimeError("session checkout identity mismatch")
+    else:
+        _validate_checkout(fds[0], request)
+    checkout = Path(os.readlink(f"/proc/self/fd/{fds[0]}"))
+    if str(checkout) != request["path"] or checkout.resolve() != checkout:
+        raise RuntimeError("session checkout path does not match capability")
+    paths = RuntimePaths()
+    identities = get_identities()
+    snapshot = parse_launch_snapshot(read_json(paths.snapshot, uid=identities.mimir_uid, mode=0o600))
+    if create and snapshot.launch_generation != request["generation"]:
+        raise RuntimeError("session launch generation is stale")
+    environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+    environment.update(PublishingCredentials(snapshot.bot_token, snapshot.publishing_identity).environment())
+    if create:
+        # Only the launch snapshot, never ambient aliases or caller pass_env,
+        # supplies the daemon generation's publishing identity.
+        if not path_addressed:
+            boundary_fd = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[0])
+            try:
+                fcntl.flock(boundary_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if stat.S_IMODE(os.fstat(boundary_fd).st_mode) == 0o700:
+                    _normalize_checkout_fd(fds[0], owner_uid=identities.worklink_uid, group_gid=identities.worklink_gid)
+                    os.fchmod(boundary_fd, 0o710)
+            finally:
+                os.close(boundary_fd)
+    if observe:
+        if not stat.S_ISREG(os.fstat(fds[1]).st_mode) or _positive_integer(request, "stdout_limit") > 64 * 1024 * 1024:
+            raise RuntimeError("invalid session output capability")
+        environment["WORKLINK_SESSION_OUTPUT_FD"] = str(fds[1])
+    process = subprocess.run(
+        [UID_HELPER, "worklink", PYTHON, "-I", "-m", "mimir_cultivate.worklink.daemon_sessions"],
+        input=json.dumps(request).encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=environment, cwd="/", timeout=32, check=False,
+        pass_fds=(fds[1],) if observe else (),
+    )
+    if process.returncode != 0 or len(process.stdout) > MAX_REQUEST_BYTES:
+        raise RuntimeError("session operation failed; retain controller and checkout")
+    response = json.loads(process.stdout)
+    if not isinstance(response, dict):
+        raise RuntimeError("invalid session helper response")
+    _send(connection, response)
+
+
 def handle_connection(connection: socket.socket) -> None:
     fds: list[int] = []
     identifier: str | None = None
@@ -1333,7 +1396,9 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker request")
         raw_identifier = request.get("id")
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
-        if request.get("op") in {"launch", "launch_path"}:
+        if request.get("op") in {"session_create", "session_observe", "session_cancel", "session_release"}:
+            _handle_session(connection, request, fds)
+        elif request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)
         elif request.get("op") in {"launch_factory", "launch_factory_control"}:
             _handle_launch_factory(connection, request, fds)

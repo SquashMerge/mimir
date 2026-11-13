@@ -147,7 +147,7 @@ ENV NODE_VERSION=22
 ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
 ENV PATH="/opt/mimir-opencode/bin:${PATH}"
 ARG MIMIR_ENABLE_OPENCODE=0
-ARG FACTORY_VERSION=0.12.1
+ARG FACTORY_VERSION=0.14.0
 RUN NODE_VERSION="$NODE_VERSION" MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" FACTORY_VERSION="$FACTORY_VERSION" \
     sh /opt/cultivate-docker/base.sh
 
@@ -467,7 +467,9 @@ RUN set -eu; \
 RUN set -eu; \
     if [ "$(cat /opt/cultivate-docker/selected)" != 1 ]; then \
         rm -rf /etc/s6-overlay/s6-rc.d/worklink-execd \
-               /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-execd; \
+                /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-execd \
+                /etc/s6-overlay/s6-rc.d/worklink-opencode \
+                /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-opencode; \
     fi
 # Source builds must use the checkout's assembler: the published core-only
 # wheel can predate plugin support. BuildKit leaves this COPY unreachable for

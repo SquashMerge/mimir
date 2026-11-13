@@ -715,16 +715,6 @@ class LeafValidationError(WorklinkError):
 def _read_factory_publishing_identity(
     repo: Path, environ: Mapping[str, object] = os.environ
 ) -> tuple[str, str]:
-    if _FACTORY_PUBLISHING_IDENTITY_ENV in environ:
-        identity = environ[_FACTORY_PUBLISHING_IDENTITY_ENV]
-        if not isinstance(identity, str):
-            raise WorklinkError(
-                f"{_FACTORY_PUBLISHING_IDENTITY_ENV} must be a string when set"
-            )
-        if not identity.strip():
-            raise WorklinkError(f"{_FACTORY_PUBLISHING_IDENTITY_ENV} is set but blank")
-        return identity.strip(), f"environment variable {_FACTORY_PUBLISHING_IDENTITY_ENV}"
-
     declaration = repo / ".factory.json"
     try:
         payload = json.loads(declaration.read_text(encoding="utf-8"))
@@ -734,10 +724,14 @@ def _read_factory_publishing_identity(
         raise WorklinkError("factory publishing identity declaration is invalid") from exc
     if not isinstance(payload, Mapping):
         raise WorklinkError("factory publishing identity declaration is invalid")
-    identity = payload.get("publishing_identity")
-    if not isinstance(identity, str) or not identity.strip():
-        raise WorklinkError("factory publishing identity is missing")
-    return identity.strip(), ".factory.json"
+    from .daemon_config import DaemonConfigError, resolve_epic_credentials
+
+    try:
+        credentials = resolve_epic_credentials(environ, repository_config=payload)
+    except DaemonConfigError as exc:
+        raise WorklinkError(str(exc)) from exc
+    assert credentials.publishing_identity is not None
+    return credentials.publishing_identity, f"environment variable {_FACTORY_PUBLISHING_IDENTITY_ENV}"
 
 
 def _read_checkout_git_identity(checkout: Path, runner: Runner) -> tuple[str, str]:
@@ -917,20 +911,20 @@ def _validate_epic_work_item(payload: str, issue_id: int) -> str:
 def _require_factory_launch_binding(
     spec: WorkSpec, run_id: str, publishing_identity: str
 ) -> None:
-    argv = spec.local_argv
+    request = spec.session_request
     if (
         spec.backend_config.get("run_id") != run_id
-        or argv is None
-        or not argv
-        or not argv[-1].split()
-        or argv[-1].split()[-1] != run_id
+        or request is None or request.kind != "epic"
+        or not request.text.split()
+        or request.text.split()[-1] != run_id
+        or spec.local_argv is not None
     ):
         raise WorklinkError("factory launch request run_id does not match the supervised run_id")
     # Fail closed on a launch that would publish as some other account. Losing the
     # variable between here and the child is silent otherwise: the driver falls back
     # to the sandbox's .factory.json and parks at Gate 1 naming the FILE's identity,
     # which reads as a misconfiguration rather than a dropped variable.
-    if spec.env.get(FACTORY_PUBLISHING_IDENTITY_ENV) != publishing_identity:
+    if spec.backend_config.get("publishing_identity") != publishing_identity:
         raise WorklinkError(
             "factory launch environment does not carry the resolved publishing identity"
         )
@@ -1146,11 +1140,14 @@ class WorklinkRunner:
             else registry.select(labels=issue.labels, repo=repo_slug)
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+        if isinstance(backend, OpenCodeBackend):
+            from .compute import OpenCodeDaemonComputeBackend
+            compute = OpenCodeDaemonComputeBackend()
         selected_name = backend.name
         worker_uid_drop = (
             _cultivate_selected()
             and isinstance(backend, OpenCodeBackend)
-            and compute.name == "local_subprocess"
+            and compute.name == "opencode_daemon"
         )
         test_cmd = (
             repository_config.quick_gate_command if gate_mode == "ci" else
@@ -1334,6 +1331,8 @@ class WorklinkRunner:
         preserve_reason: str | None = None
         executor_report_dir: Path | None = None
         spec = None
+        retain_session = False
+        session_handle = None
         try:
             lease = _create_backend_checkout(
                 self.repo,
@@ -1347,14 +1346,9 @@ class WorklinkRunner:
                 worker_eligible=worker_uid_drop,
             )
             if worker_uid_drop:
-                if not isinstance(compute, LocalSubprocessComputeBackend):
-                    raise WorklinkError("worker uid drop requires local subprocess compute")
                 # Leaf builds run as the worklink uid through the root executor,
                 # in a path-addressed checkout the worker can traverse (base's
                 # model): coding CLIs and git need to stat their own tree.
-                compute = LocalSubprocessComputeBackend.for_path_checkout(
-                    get_identities().worklink_uid
-                )
                 checkout_fd = os.open(
                     lease.path,
                     os.O_RDONLY
@@ -1421,6 +1415,8 @@ class WorklinkRunner:
                 branch=lease.branch,
                 test_command=test_cmd or "",
             )
+            if publication is not None:
+                spec = replace(spec, factory_credential_settings=getattr(publication, "credential_settings", ()))
             executor_report_dir = _make_executor_report_dir(
                 issue.issue_id, record.attempt, worker_uid_drop=worker_uid_drop
             )
@@ -1450,12 +1446,22 @@ class WorklinkRunner:
                     configured_model=spec.backend_config.get("configured_model"),
                 )
             async def invoke_backend() -> ComputeResult:
-                nonlocal spec
+                nonlocal spec, retain_session, session_handle
                 handle = None
                 try:
-                    if isinstance(backend, OpenCodeBackend) and spec.backend_config.get("codex"):
-                        spec = backend.refresh_codex_projections(spec, order.env)
-                    handle = await compute.launch(spec)
+                    try:
+                        handle = await compute.launch(spec)
+                    except BaseException as exc:
+                        from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
+                        if isinstance(exc, (SessionAdmissionCancelled, SessionAdmissionError)):
+                            recovery = exc.handle
+                            if recovery is None and exc.uncertain:
+                                recovery = LaunchHandle("opencode_daemon", "admission", launch_generation=exc.launch_generation)
+                            remember_session(recovery, not exc.quiescent and (exc.uncertain or exc.handle is not None))
+                        raise
+                    retain_session = handle.substrate == "opencode_daemon"
+                    if retain_session:
+                        session_handle = handle
                     # Atomically replace the provisional controller record with
                     # the real cancellable worker handle immediately after spawn.
                     try:
@@ -1495,21 +1501,26 @@ class WorklinkRunner:
                     )
                 finally:
                     if handle is not None:
+                        if retain_session:
+                            try:
+                                await compute.cancel(handle)
+                            except RuntimeError:
+                                terminal_release.retain_for_recovery = True
+                                raise
                         await compute.cleanup(handle)
+                        retain_session = False
 
-            if isinstance(backend, OpenCodeBackend):
-                compute_result = await backend.invoke_with_startup_retry(
-                    invoke_backend,
-                    issue_id=issue.issue_id,
-                    checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner, publication=publication),
-                    event_logger=_log_event,
-                    codex=bool(spec.backend_config.get("codex")),
-                    env=filter_otlp_env({**os.environ, **order.env}),
-                    refreshed_path=(lease.path.parent / ".factory-runtime/data/opencode/auth.json"
-                                    if worker_uid_drop else None),
-                )
-            else:
-                compute_result = await invoke_backend()
+            def remember_session(handle: LaunchHandle | None, retained: bool) -> None:
+                nonlocal session_handle, retain_session
+                session_handle, retain_session = handle, retained
+                if handle is not None:
+                    _persist_run_state(
+                        self.home, issue=issue, attempt=record.attempt, backend_name=selected_name,
+                        compute=compute, handle=handle, lease=lease, repo=self.repo,
+                        repo_url=repo_url, test_command=test_cmd, started_at=started,
+                        test_env=spec.backend_config.get("test_env", {}))
+
+            compute_result = await invoke_backend()
             # Gates (including reruns) can outlast the claim TTL independently
             # of the backend. Keep the claim alive through publication as well.
             result = await _heartbeat_while(
@@ -1534,6 +1545,7 @@ class WorklinkRunner:
                     terminal_release=terminal_release,
                     autonomous=autonomous,
                     gate_mode=gate_mode,
+                    on_session_state=remember_session,
                 ),
                 claims=claims,
                 record=record,
@@ -1569,6 +1581,15 @@ class WorklinkRunner:
                 raise
             transition_applied = False
             transition_error = None
+            from .compute import ComputeCleanupError
+            if isinstance(exc, ComputeCleanupError):
+                retain_session = True
+                session_handle = exc.handle
+            exception_evidence = None
+            if isinstance(backend, OpenCodeBackend):
+                exception_evidence = _write_session_failure(
+                    self.home, issue.issue_id, record.attempt, selected_name,
+                    lease.branch if lease else "", str(lease.path) if lease else "", session_handle, exc)
             preserve_reason = str(exc)
             terminal_release.retain_for_recovery = True
             try:
@@ -1596,7 +1617,7 @@ class WorklinkRunner:
                 )
                 transition_applied = True
                 terminal_release.label_transition_applied = True
-                terminal_release.retain_for_recovery = False
+                terminal_release.retain_for_recovery = retain_session
                 terminal_release()
             except Exception as transition_exc:
                 if (
@@ -1624,6 +1645,7 @@ class WorklinkRunner:
                 reason=str(exc),
                 checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,
+                evidence_path=exception_evidence,
                 incident_recorded=autonomous,
             )
         except BaseException as exc:
@@ -1631,6 +1653,10 @@ class WorklinkRunner:
             # when the finally block below requests release after teardown.
             terminal_release.retain_for_recovery = True
             preserve_reason = f"interrupted: {type(exc).__name__}: {exc}"
+            if isinstance(backend, OpenCodeBackend):
+                _write_session_failure(self.home, issue.issue_id, record.attempt, selected_name,
+                                       lease.branch if lease else "", str(lease.path) if lease else "",
+                                       session_handle, exc, status="interrupted")
             try:
                 incident = incident_owner.record(
                     producer="leaf_interruption",
@@ -1661,7 +1687,7 @@ class WorklinkRunner:
         finally:
             try:
                 try:
-                    if lease is not None and lease.isolated_checkout and not attempt_published:
+                    if lease is not None and lease.isolated_checkout and not attempt_published and not retain_session:
                         # Before capabilities close: the publication handle is the
                         # controller's only safe view of the worker's checkout.
                         await asyncio.to_thread(
@@ -1669,7 +1695,7 @@ class WorklinkRunner:
                             claims, lease, publication, preserve_reason, runner,
                             config.defaults.preserved_attempts_keep,
                         )
-                    if executor_report_dir is not None:
+                    if executor_report_dir is not None and not retain_session:
                         # Worker cleanup needs the still-live checkout. Even a
                         # cancellation here must close capabilities below.
                         await _remove_executor_basetemp_best_effort(
@@ -1791,6 +1817,7 @@ class WorklinkRunner:
         terminal_release: _TerminalClaimRelease,
         autonomous: bool = False,
         gate_mode: str = "local",
+        on_session_state: Callable[[LaunchHandle | None, bool], None] | None = None,
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -1803,6 +1830,7 @@ class WorklinkRunner:
             autonomous
         )
         selected_name = backend.name
+        current_session_handle = compute_result.handle
         if compute_result.exit_code != 0 and operator_stop_requested(self.home, issue.issue_id, attempt):
             reason = "stopped by operator"
             evidence = WorklinkEvidence(
@@ -1813,6 +1841,7 @@ class WorklinkRunner:
                 diff_stat="", commands=[], tests=None, pr_url=None,
                 status="stopped", base_ref=lease.local_base or lease.base_ref,
                 diff_observed=False, failure_reason=reason,
+                opencode_session_id=compute_result.handle.opencode_session_id if compute_result.handle else None,
             )
             evidence_path = _write_evidence(self.home, evidence)
             stop = ShutdownAbortRecord(
@@ -1892,6 +1921,7 @@ class WorklinkRunner:
                 test_command=test_cmd,
                 started_at=started,
                 test_env=spec.backend_config.get("test_env", {}),
+                session_handle=current_session_handle,
             )
 
         # After the #832 substrate cleanup local_subprocess is the only Worklink
@@ -1930,6 +1960,8 @@ class WorklinkRunner:
                 compute=compute,
                 on_gate_launch=persist_gate_handle,
             )
+            observed = replace(observed, evidence=replace(
+                observed.evidence, opencode_session_id=raw.opencode_session_id))
             if snapshot is None:
                 return observed
             after = _gate_checkout_snapshot(
@@ -2086,6 +2118,8 @@ class WorklinkRunner:
                         branch=lease.branch, base_ref=lease.base_ref, local_base=lease.local_base or lease.base_ref,
                         repo=str(self.repo), repo_url=spec.repo_url or "", test_command=test_cmd,
                         started_at=started.isoformat(), checkout=str(lease.path), phase="ci_wait",
+                        opencode_session_id=current_session_handle.opencode_session_id if current_session_handle else None,
+                        launch_generation=current_session_handle.launch_generation if current_session_handle else None,
                     ))
                     ci_result = await wait_for_ci(
                         runner, repo_slug, pr_url, sha,
@@ -2131,13 +2165,23 @@ class WorklinkRunner:
                         repair_order, attempt=attempt, repo_url=spec.repo_url,
                         base_ref=spec.base_ref, branch=lease.branch, test_command=test_cmd or "",
                     )
-                    repair_spec = replace(repair_spec, backend_config={
+                    repair_spec = replace(repair_spec, factory_credential_settings=spec.factory_credential_settings, backend_config={
                         **repair_spec.backend_config, "test_env": spec.backend_config.get("test_env", {}),
                     })
-                    if isinstance(backend, OpenCodeBackend) and repair_spec.backend_config.get("codex"):
-                        repair_spec = backend.refresh_codex_projections(repair_spec, repair_order.env)
-                    handle = await compute.launch(repair_spec)
+                    handle = None
                     try:
+                        try:
+                            handle = await compute.launch(repair_spec)
+                        except BaseException as exc:
+                            from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
+                            if isinstance(exc, (SessionAdmissionCancelled, SessionAdmissionError)):
+                                if on_session_state is not None:
+                                    recovery = exc.handle or (LaunchHandle("opencode_daemon", "admission", launch_generation=exc.launch_generation) if exc.uncertain else None)
+                                    on_session_state(recovery, not exc.quiescent and (exc.uncertain or exc.handle is not None))
+                            raise
+                        if on_session_state is not None:
+                            on_session_state(handle, handle.substrate == "opencode_daemon")
+                        current_session_handle = handle
                         _persist_run_state(
                             self.home, issue=issue, attempt=attempt, backend_name=selected_name,
                             compute=compute, handle=handle, lease=lease, repo=self.repo,
@@ -2146,8 +2190,15 @@ class WorklinkRunner:
                         )
                         repair_result = await compute.wait(handle, repair_spec.timeout_s)
                     finally:
-                        await compute.cleanup(handle)
+                        if handle is not None:
+                            if handle.substrate == "opencode_daemon":
+                                await compute.cancel(handle)
+                            await compute.cleanup(handle)
+                            if on_session_state is not None:
+                                on_session_state(handle, False)
                     raw = await backend.interpret(repair_order, repair_result)
+                    validation = replace(validation, evidence=replace(
+                        validation.evidence, opencode_session_id=raw.opencode_session_id))
                     if operator_stop_requested(self.home, issue.issue_id, attempt):
                         ci_reason = "stopped by operator"
                         break
@@ -2198,6 +2249,7 @@ class WorklinkRunner:
             if ci_result is not None:
                 validation = replace(validation, evidence=replace(
                     validation.evidence, pr_url=pr_url, head_sha=sha,
+                    opencode_session_id=current_session_handle.opencode_session_id if current_session_handle else None,
                     ci_repair_rounds=ci_rounds,
                     ci_checks=tuple((redact_text(name)[:150], redact_text(state)[:60])
                         for name, state in ci_result.checks[:100]),
@@ -2292,7 +2344,12 @@ class WorklinkRunner:
         if transition_status == "failed":
             try:
                 quota_failure = selected_name == "opencode" and raw.backend_status == "quota_exhausted"
-                reset_at, reset_source = _worklink_quota_reset(self.home, raw.error or "") if quota_failure else (None, "")
+                if quota_failure and raw.retry_after_ms is not None:
+                    from datetime import timedelta
+                    reset_at = datetime.now(UTC) + timedelta(milliseconds=raw.retry_after_ms)
+                    reset_source = "provider.retryAfterMs"
+                else:
+                    reset_at, reset_source = _worklink_quota_reset(self.home, raw.error or "") if quota_failure else (None, "")
                 incident = incident_owner.record(
                     producer="leaf_result",
                     home=self.home,
@@ -2439,17 +2496,12 @@ class WorklinkRunner:
     async def reattach(
         self, issue_id: int, *, autonomous: bool = False
     ) -> WorklinkRunResult:
-        """Resume an in-flight run after a controller restart (#561).
+        """Observe an owned durable session without admitting another input.
 
-        After the #832 substrate cleanup local_subprocess is the only Worklink
-        compute substrate; its runs die with the controller, so no run state is
-        ever persisted and ``reattach`` always returns ``failed`` with reason
-        ``reattach: no run state``. The startup reconcile honors the same
-        return — it has nothing to re-dispatch and the TTL reaper remains the
-        recovery net. Kept as a no-op entry point so the CLI flag and the
-        server-side reconcile API stay stable for older deployments that may
-        still hold a ``<home>/state/worklink/runs/<id>.json`` from a prior
-        docker-sibling / ecs-runtask run."""
+        Failed daemon runs retain their recovery state until cancellation is
+        verified, even if failure routing has already removed in-progress.
+        Historical process substrates retain their existing recovery policy.
+        """
         incident_owner = self._begin_incident_invocation(autonomous)
         state = load_run_state(self.home, issue_id)
         if state is None:
@@ -2473,6 +2525,37 @@ class WorklinkRunner:
         )
         terminal_release.retain_for_recovery = True
 
+        session_handle = _state_session_handle(state)
+
+        async def reconcile_current_session() -> WorklinkRunResult | None:
+            nonlocal session_handle, state
+            from .compute import OpenCodeDaemonComputeBackend
+            from .worker_client import WorkerClient
+
+            try:
+                session_compute = OpenCodeDaemonComputeBackend(client=WorkerClient.for_path_checkout(
+                    Path(state.checkout), issue_id=state.issue_id, attempt=state.attempt,
+                    run_uid=get_identities().worklink_uid))
+                if session_handle is None:
+                    session_handle = await session_compute.recover_admission(state.launch_generation)
+                    if session_handle is None:
+                        return None
+                    state = replace(state, handle_identifier=session_handle.identifier,
+                                    opencode_session_id=session_handle.opencode_session_id, phase="spawned")
+                    save_run_state(self.home, state)
+                await session_compute.cancel(session_handle)
+                await session_compute.cleanup(session_handle)
+            except BaseException as exc:
+                interrupted = not isinstance(exc, Exception)
+                evidence = _write_session_failure(
+                    self.home, issue_id, state.attempt, state.backend, state.branch,
+                    state.checkout, session_handle, exc, status="interrupted" if interrupted else "failed")
+                if interrupted:
+                    raise
+                return WorklinkRunResult(issue_id, state.attempt, "failed", evidence_path=evidence,
+                                         reason="session quiescence unverified; recovery retained")
+            return None
+
         def fence_failure(reason: BaseException | str, *, exit_status: int | None = 1) -> None:
             try:
                 incident_owner.record(
@@ -2489,6 +2572,32 @@ class WorklinkRunner:
             except OSError as write_exc:
                 incident_owner.bind(write_exc)
                 raise
+        if state.phase == "ci_wait" and session_handle is not None:
+            if process_is_alive(state):
+                from .control import _mark_operator_stop
+
+                _mark_operator_stop(self.home, issue_id, state.attempt)
+                reason = "CI waiter is still live; stop requested; session recovery retained"
+                evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                                  state.branch, state.checkout, session_handle, RuntimeError(reason))
+                return WorklinkRunResult(issue_id, state.attempt, "failed", reason=reason, evidence_path=evidence)
+            recovery_failure = await reconcile_current_session()
+            if recovery_failure is not None:
+                return recovery_failure
+            reason = "CI wait interrupted by controller restart; session cancellation verified"
+            evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                              state.branch, state.checkout, session_handle, RuntimeError(reason))
+            if evidence is None:
+                return WorklinkRunResult(issue_id, state.attempt, "failed",
+                                         reason="terminal evidence unavailable; session recovery retained")
+            fence_failure(reason)
+            claims.transition_issue(issue_id, status="failed", review_ready=False,
+                                    attempt=state.attempt, reason=reason)
+            terminal_release.label_transition_applied = True
+            terminal_release.retain_for_recovery = False
+            terminal_release()
+            return WorklinkRunResult(issue_id, state.attempt, "failed", reason=reason, evidence_path=evidence)
+
         if state.shim_pid is not None:
             handle = LaunchHandle(
                 state.handle_substrate,
@@ -2497,6 +2606,7 @@ class WorklinkRunner:
                 state.shim_pid,
             )
             reason = "reattach: worker interrupted by controller restart"
+            cleanup_verified = True
             try:
                 if not process_is_alive(state):
                     reason = "reattach: worker shim identity is stale"
@@ -2504,6 +2614,22 @@ class WorklinkRunner:
                     await LocalSubprocessComputeBackend().cancel(handle)
             except (KeyError, RuntimeError, OSError, ValueError) as exc:
                 reason = f"reattach: worker cleanup failed: {exc}"
+                cleanup_verified = False
+            except BaseException as exc:
+                _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                       state.branch, state.checkout, _state_session_handle(state), exc,
+                                       status="interrupted")
+                raise
+            if cleanup_verified and session_handle is not None:
+                recovery_failure = await reconcile_current_session()
+                if recovery_failure is not None:
+                    return recovery_failure
+            evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                              state.branch, state.checkout, _state_session_handle(state),
+                                              RuntimeError(reason))
+            if session_handle is not None and evidence is None:
+                return WorklinkRunResult(issue_id, state.attempt, "failed",
+                                         reason="terminal evidence unavailable; session recovery retained")
             fence_failure(reason)
             claims.transition_issue(
                 issue_id,
@@ -2513,7 +2639,7 @@ class WorklinkRunner:
                 reason=reason,
             )
             terminal_release.label_transition_applied = True
-            terminal_release.retain_for_recovery = False
+            terminal_release.retain_for_recovery = state.opencode_session_id is not None and not cleanup_verified
             terminal_release()
             _log_event(
                 "worklink_reattach_cleanup",
@@ -2528,10 +2654,26 @@ class WorklinkRunner:
                 checkout=Path(state.checkout) if state.checkout else None,
                 branch=state.branch,
                 reason=reason,
+                evidence_path=evidence,
                 incident_recorded=autonomous,
             )
 
         review_ready = claims.review_ready_evidence(issue_id)
+        if review_ready is not None and (session_handle is not None or state.handle_substrate == "opencode_daemon"):
+            recovery_failure = await reconcile_current_session()
+            if recovery_failure is not None:
+                return recovery_failure
+            if session_handle is not None and review_ready.payload.get("opencode_session_id") != session_handle.opencode_session_id:
+                reason = "completed evidence belongs to an earlier session; current session cancellation verified"
+                fence_failure(reason)
+                evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                                  state.branch, state.checkout, session_handle, RuntimeError(reason))
+                claims.transition_issue(issue_id, status="failed", review_ready=False,
+                                        attempt=state.attempt, reason=reason)
+                terminal_release.label_transition_applied = True
+                terminal_release.retain_for_recovery = False
+                terminal_release()
+                return WorklinkRunResult(issue_id, state.attempt, "failed", evidence_path=evidence, reason=reason)
         if review_ready is not None:
             try:
                 pr_url = str(review_ready.payload["pr_url"])
@@ -2592,12 +2734,10 @@ class WorklinkRunner:
                 )
             finally:
                 terminal_release()
-        # Only resume a leaf still in-progress. If the reaper already recovered it
-        # (or a prior run transitioned it) the work is no longer ours to finish —
-        # drop the stale state and stop. ``_issue_has_label`` fails open (assume
-        # in-progress) when labels can't be read, so a transient read error
-        # doesn't strand the worker.
-        if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
+        # Missing in-progress is sufficient only for historical process state.
+        # An owned daemon record may still have active or queued input; reconcile
+        # it below before releasing its claim or recovery pointer.
+        if not claims._issue_has_label(issue_id, "worklink:in-progress") and state.handle_substrate != "opencode_daemon":  # noqa: SLF001
             _log_event("worklink_reattach_skipped", issue_id=issue_id, reason="not_in_progress")
             fence_failure("reattach: leaf no longer in-progress")
             terminal_release.retain_for_recovery = False
@@ -2617,8 +2757,9 @@ class WorklinkRunner:
         except (KeyError, ValueError) as exc:
             _log_event("worklink_reattach_failed", issue_id=issue_id, reason=str(exc))
             fence_failure(f"reattach: {exc}")
-            clear_run_state(self.home, issue_id)
-            terminal_release.retain_for_recovery = False
+            if state.handle_substrate != "opencode_daemon":
+                clear_run_state(self.home, issue_id)
+                terminal_release.retain_for_recovery = False
             terminal_release()
             return WorklinkRunResult(
                 issue_id,
@@ -2646,7 +2787,43 @@ class WorklinkRunner:
             state.handle_identifier,
             state.process_start_ticks,
             state.shim_pid,
+            state.opencode_session_id,
+            state.launch_generation,
         )
+        if state.handle_substrate == "opencode_daemon":
+            from .compute import OpenCodeDaemonComputeBackend
+            from .worker_client import WorkerClient
+            compute = OpenCodeDaemonComputeBackend(client=WorkerClient.for_path_checkout(
+                Path(state.checkout), issue_id=state.issue_id, attempt=state.attempt,
+                run_uid=get_identities().worklink_uid))
+            if state.phase == "admission_uncertain":
+                try:
+                    recovered = await compute.recover_admission(state.launch_generation)
+                except BaseException as exc:
+                    evidence = _write_session_failure(
+                        self.home, issue_id, state.attempt, state.backend, state.branch, state.checkout,
+                        session_handle, exc, status="failed" if isinstance(exc, Exception) else "interrupted")
+                    if not isinstance(exc, Exception):
+                        raise
+                    return WorklinkRunResult(issue_id, state.attempt, "failed", evidence_path=evidence,
+                                             reason="session admission recovery unverified")
+                if recovered is not None:
+                    handle = recovered
+                    session_handle = recovered
+                    state = replace(state, handle_identifier=handle.identifier,
+                                    opencode_session_id=handle.opencode_session_id, phase="spawned")
+                    save_run_state(self.home, state)
+                else:
+                    terminal_release.retain_for_recovery = False
+                    terminal_release()
+                    return WorklinkRunResult(issue_id, state.attempt, "failed", reason="session admission refused before creation")
+            if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
+                recovery_failure = await reconcile_current_session()
+                if recovery_failure is not None:
+                    return recovery_failure
+                terminal_release.retain_for_recovery = False
+                terminal_release()
+                return WorklinkRunResult(issue_id, state.attempt, "failed", reason="retained session cancellation verified")
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
         test_cmd = state.test_command
         _log_event(
@@ -2658,8 +2835,14 @@ class WorklinkRunner:
         )
 
         lease: CheckoutLease | None = None
+        publication = None
+        retain_session = state.handle_substrate == "opencode_daemon"
         try:
-            lease = _create_observation_worktree(
+            lease = CheckoutLease(
+                issue_id=issue_id, attempt=state.attempt, repo=self.repo, path=Path(state.checkout),
+                branch=state.branch, base_ref=state.base_ref, local_base=state.local_base,
+                isolated_checkout=True, worker_authorized=True,
+            ) if state.handle_substrate == "opencode_daemon" else _create_observation_worktree(
                 self.repo,
                 issue_id=issue_id,
                 attempt=state.attempt,
@@ -2668,6 +2851,14 @@ class WorklinkRunner:
                 branch=state.branch,
                 runner=_list_runner(runner),
             )
+            if state.handle_substrate == "opencode_daemon":
+                checkout_fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    publication = ControllerGitPublication.capture(
+                        checkout_fd, self.repo, lease.branch,
+                        self.home / "state" / "worklink" / "publication")
+                finally:
+                    os.close(checkout_fd)
             started = _parse_chainlink_datetime(state.started_at) or datetime.now(UTC)
             prompt = render_work_order(
                 issue,
@@ -2703,6 +2894,16 @@ class WorklinkRunner:
                 agent_id=self.agent_id,
                 claimed_at=started,
             )
+            def remember_session(current: LaunchHandle | None, retained: bool) -> None:
+                nonlocal handle, retain_session
+                if current is not None:
+                    handle = current
+                    _persist_run_state(
+                        self.home, issue=issue, attempt=state.attempt, backend_name=state.backend,
+                        compute=compute, handle=current, lease=lease, repo=self.repo,
+                        repo_url=state.repo_url, test_command=test_cmd, started_at=started,
+                        test_env=state.test_env)
+                retain_session = retained
             try:
                 compute_result = await _heartbeat_while(
                     compute.wait(handle, config.defaults.timeout_s),
@@ -2710,7 +2911,10 @@ class WorklinkRunner:
                     record=claim_record,
                 )
             finally:
+                if retain_session:
+                    await compute.cancel(handle)
                 await compute.cleanup(handle)
+                retain_session = False
             if _reattach_worker_lost(compute_result):
                 # Broker/substrate can no longer produce the result (e.g. it also
                 # restarted): the compute is wasted. Fall back to redispatch
@@ -2756,8 +2960,10 @@ class WorklinkRunner:
                     test_cmd=test_cmd,
                     root_dirty_before=(),
                     runner=runner,
+                    publication=publication,
                     terminal_release=terminal_release,
                     autonomous=autonomous,
+                    on_session_state=remember_session,
                 ),
                 claims=claims,
                 record=claim_record,
@@ -2767,6 +2973,8 @@ class WorklinkRunner:
                 incident_owner.bind(exc)
                 raise
             fence_failure(f"reattach failed: {exc}")
+            evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                              state.branch, state.checkout, handle, exc)
             try:
                 claims.transition_issue(
                     issue_id,
@@ -2779,7 +2987,7 @@ class WorklinkRunner:
                 pass
             else:
                 terminal_release.label_transition_applied = True
-                terminal_release.retain_for_recovery = False
+                terminal_release.retain_for_recovery = retain_session
                 terminal_release()
             _log_event(
                 "worklink_reattach_failed", issue_id=issue_id, attempt=state.attempt, error=str(exc)
@@ -2789,9 +2997,12 @@ class WorklinkRunner:
                 state.attempt,
                 "failed",
                 reason=f"reattach failed: {exc}",
+                evidence_path=evidence,
                 incident_recorded=autonomous,
             )
         except BaseException as exc:
+            _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                   state.branch, state.checkout, handle, exc, status="interrupted")
             try:
                 incident = incident_owner.record(
                     producer="reattach_interruption",
@@ -2815,7 +3026,9 @@ class WorklinkRunner:
             raise
         finally:
             try:
-                if lease is not None:
+                if publication is not None:
+                    publication.close()
+                if lease is not None and state.handle_substrate != "opencode_daemon":
                     try:
                         _remove_observation_worktree(self.repo, lease, runner=_list_runner(runner))
                     except Exception as exc:  # noqa: BLE001 - teardown must continue
@@ -2877,6 +3090,8 @@ class WorklinkRunner:
     ) -> WorklinkRunResult:
         from .autonomy import factory_max_concurrent
 
+        if self._incident_owner is None:
+            self._begin_incident_invocation(autonomous)
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue_reader = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner)
         issue = issue_reader.read(issue_id)
@@ -2898,10 +3113,13 @@ class WorklinkRunner:
         if repo_slug is None:
             raise WorklinkError("factory repository must have a canonical GitHub origin")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
-        if compute.name != "local_subprocess":
-            raise WorklinkError("factory runs require local_subprocess supervision")
         if isinstance(compute, LocalSubprocessComputeBackend):
             runner = _factory_git_runner(runner)
+            from .compute import OpenCodeDaemonComputeBackend
+
+            compute = OpenCodeDaemonComputeBackend()
+        if compute.name not in {"opencode_daemon", "local_subprocess"}:
+            raise WorklinkError("factory runs require daemon session supervision")
         if autonomous:
             allowed, reason = config.autonomous_compute_allowed(
                 compute.name, compute.capabilities()
@@ -3062,16 +3280,24 @@ class WorklinkRunner:
                 if not live.is_terminal:
                     if live.status not in {"running", "needs-human"}:
                         raise WorklinkError("factory recovery status is not resumable")
-                    if factory_process_is_alive(candidate):
+                    daemon_host = (candidate.opencode_session_id is not None and candidate.handle is not None and candidate.handle.substrate == "opencode_daemon"
+                                   and candidate.opencode_session_id == candidate.handle.opencode_session_id)
+                    if not daemon_host and factory_process_is_alive(candidate):
                         raise WorklinkError("factory recovery refuses a live retained process")
-                    if not factory_process_is_verified_dead(candidate):
+                    if not daemon_host and not factory_process_is_verified_dead(candidate):
                         raise WorklinkError("factory recovery cannot verify the retained process is dead")
+                    if not daemon_host and not (live.is_parked and candidate.children_reaped
+                                                and candidate.run_id == epic_run_id(candidate.issue_id)):
+                        raise WorklinkError("legacy factory host requires operator parking and fresh daemon recovery")
                     if live.status == "needs-human" and live.park_snapshot is None:
                         raise WorklinkError("factory recovery requires a published park snapshot")
                 # Do not adopt lock identity or clear controller diagnostics during
                 # the pre-claim refresh; subsequent recovery can still refuse.
                 candidate = replace(
-                    candidate, status=live, observed_at=datetime.now(UTC).isoformat(),
+                    candidate, status=live, observed_at=(
+                        candidate.observed_at if live.is_parked and candidate.status is not None
+                        and candidate.status.is_parked and candidate.status.park_snapshot == live.park_snapshot
+                        else None if live.is_parked else datetime.now(UTC).isoformat()),
                 )
                 # Terminal observations remain in-memory until the claim succeeds.
                 # Otherwise a denied claim could make the autonomy sweep treat a
@@ -3182,6 +3408,7 @@ class WorklinkRunner:
         _request_tracker_transition(self.home, issue, "build_started")
         lease: CheckoutLease | None = None
         release_permitted = True
+        factory_launch_uncertain = False
         try:
             if retained is not None:
                 result = await self._recover_factory_070(
@@ -3209,7 +3436,7 @@ class WorklinkRunner:
                     base_fetch=config.defaults.base_fetch,
                     event_logger=_log_event,
                     runner=_list_runner(runner),
-                    worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
+                    worker_eligible=True,
                 )
                 _record_dispatch_spec_best_effort(self.home, issue, claim_record.attempt)
                 await asyncio.to_thread(
@@ -3219,21 +3446,48 @@ class WorklinkRunner:
                         "issue", "comment", str(target), text,
                     ),
                 )
+                epic_environment = dict(os.environ)
                 order, publishing_identity = self._factory_launch_order(
                     issue=issue, checkout=lease.path,
                     work_item_json=work_item_json, runner=runner,
                     attempt=claim_record.attempt,
+                    environ=epic_environment,
                 )
-                spec = selected.work_spec(
-                    order,
-                    attempt=claim_record.attempt,
-                    repo_url=repo_url,
-                    base_ref=lease.base_ref,
-                    branch=f"feature/{run_id}",
-                    test_command=test_cmd,
-                )
+                from .daemon_health import daemon_health
+                if daemon_health(epic_environment).get("ok") is not True:
+                    raise WorklinkError("OpenCode daemon admission unavailable before factory initialization")
+                from .backends.feature_factory import _factory_max_retries
+                retry_budget = _factory_max_retries()
+                spec = selected.work_spec(order, attempt=claim_record.attempt, repo_url=repo_url,
+                    base_ref=lease.base_ref, branch=f"feature/{run_id}", test_command=test_cmd,
+                    max_retries=retry_budget)
                 _require_factory_launch_binding(spec, run_id, publishing_identity)
-                spec = replace(spec, factory_credential_settings=_git_credential_settings(self.repo))
+                spec = replace(spec, factory_credential_settings=(*_git_credential_settings(self.repo),
+                    ("user.name", order.env["GIT_AUTHOR_NAME"]), ("user.email", order.env["GIT_AUTHOR_EMAIL"])))
+                from .daemon_sessions import session_environment
+                session_environment(dict(spec.env), home=Path("/var/lib/mimir-worklink/session-validation"),
+                    git_settings=spec.factory_credential_settings, credentials={})
+                pending = FactoryRunRecord(run_id=run_id, issue_id=issue_id, attempt=claim_record.attempt,
+                    repository=repo_slug, base_ref=lease.base_ref, branch=f"feature/{run_id}",
+                    launcher=str(launcher), sandbox=str(lease.path / ".factory-sandboxes" / run_id),
+                    session=None, handle=None, status=None, observed_at=None, controller_phase="running")
+                save_factory_record(self.home, pending)
+                factory_launch_uncertain = True
+                initialized = await _await_factory_control(
+                    selected.initialize, run_id, operator_checkout=lease.path,
+                    base_ref=lease.base_ref, publishing_identity=publishing_identity,
+                    git_settings=spec.factory_credential_settings,
+                    timeout_s=_factory_startup_status_timeout_s(),
+                    credentials={key: order.env[key] for key in ("GH_TOKEN", "GITHUB_TOKEN")},
+                    max_retries=retry_budget,
+                )
+                factory_launch_uncertain = False
+                pending = replace(pending, children_reaped=True)
+                save_factory_record(self.home, pending)
+                _require_factory_status(initialized, pending)
+                if initialized.status != "running" or initialized.lock != "absent" or initialized.lock_session is not None:
+                    raise WorklinkError("factory initialization did not return an unowned running sandbox")
+                spec = replace(spec, local_checkout=Path(initialized.sandbox_path))
                 factory_record = FactoryRunRecord(
                     run_id=run_id,
                     issue_id=issue_id,
@@ -3245,22 +3499,47 @@ class WorklinkRunner:
                     sandbox=str(lease.path / ".factory-sandboxes" / run_id),
                     session=None,
                     handle=None,
-                    status=None,
-                    observed_at=None,
+                    status=initialized,
+                    mcp_servers=initialized.mcp_servers,
+                    observed_at=datetime.now(UTC).isoformat(),
                     controller_phase="running",
                     transcript=None,
                 )
-                _create_factory_sandbox(factory_record, lease)
-                _prepare_factory_sandbox_permissions(
-                    lease.path / ".factory-sandboxes",
-                    worker_uid_drop=isinstance(compute, LocalSubprocessComputeBackend),
-                )
-                handle = await compute.launch(spec)
-                factory_record = replace(factory_record, handle=handle)
+                save_factory_record(self.home, factory_record)
+                try:
+                    handle = await compute.launch(spec)
+                except BaseException as exc:
+                    admitted = getattr(exc, "handle", None)
+                    factory_launch_uncertain = bool(getattr(exc, "uncertain", False) and not getattr(exc, "quiescent", False))
+                    if admitted is not None:
+                        factory_record = replace(factory_record, handle=admitted,
+                            session=admitted.opencode_session_id, opencode_session_id=admitted.opencode_session_id,
+                            children_reaped=bool(getattr(exc, "quiescent", False)))
+                        try:
+                            save_factory_record(self.home, factory_record)
+                        except OSError as write_error:
+                            write_error.handle = admitted
+                            write_error.quiescent = bool(getattr(exc, "quiescent", False))
+                            write_error.uncertain = not write_error.quiescent
+                            raise
+                    elif getattr(exc, "quiescent", False):
+                        factory_record = replace(factory_record, children_reaped=True)
+                        save_factory_record(self.home, factory_record)
+                    _write_factory_host_evidence(self.home, factory_record, "backend_error", _factory_controller_error(exc))
+                    raise
+                factory_record = replace(factory_record, handle=handle,
+                    session=handle.opencode_session_id, opencode_session_id=handle.opencode_session_id)
                 try:
                     save_factory_record(self.home, factory_record)
-                except BaseException:
-                    await _cancel_and_cleanup_factory_handle(compute, handle)
+                except BaseException as exc:
+                    try:
+                        await _cancel_and_cleanup_factory_handle(compute, handle)
+                    except BaseException as cleanup_error:
+                        cleanup_error.handle = handle
+                        cleanup_error.uncertain = True
+                        raise
+                    exc.handle = handle
+                    exc.quiescent = True
                     raise
                 if autonomous:
                     _record_factory_milestone(
@@ -3283,6 +3562,9 @@ class WorklinkRunner:
             # A bound exception may represent a failed ledger write, not a
             # durable incident. Retain the reservation before any early exit.
             release_permitted = False
+            factory_launch_uncertain |= bool(getattr(exc, "uncertain", False) and not getattr(exc, "quiescent", False))
+            if getattr(exc, "quiescent", False):
+                factory_launch_uncertain = False
             incident_owner = self._incident_owner
             assert incident_owner is not None
             if _exception_incident_handled(exc) or incident_owner.owns_terminal_failure:
@@ -3294,16 +3576,30 @@ class WorklinkRunner:
                 current = records[0] if records else None
             except Exception:
                 current = None
+            admitted = getattr(exc, "handle", None)
+            if current is not None and admitted is not None and admitted.opencode_session_id is not None:
+                current = replace(current, handle=admitted, session=admitted.opencode_session_id,
+                    opencode_session_id=admitted.opencode_session_id, children_reaped=bool(getattr(exc, "quiescent", False)))
+            if (current is not None and current.handle is None and current.opencode_session_id is None
+                    and getattr(exc, "quiescent", False)):
+                current = replace(current, children_reaped=True)
+                save_factory_record(self.home, current)
+            if current is None:
+                _write_session_failure(self.home, issue_id, claim_record.attempt, "feature_factory",
+                    f"feature/{run_id}", str(lease.path) if lease is not None else "", None, exc,
+                    status="backend_error")
+            else:
+                _write_factory_host_evidence(self.home, current,
+                    "backend_error" if current.opencode_session_id is None else "failed", _factory_controller_error(exc))
             published_url = (
                 current.status.pr_url if current is not None and current.status is not None
                 else None
             )
             published = published_url is not None
-            preserved_ref, preservation_error = _preserve_failed_factory_run(
-                home=self.home,
-                trusted_repo=self.repo,
-                record=current,
-            )
+            host_unverified = factory_launch_uncertain or bool(current is not None and current.handle is not None
+                and current.handle.substrate == "opencode_daemon" and not current.children_reaped)
+            preserved_ref, preservation_error = (None, None) if host_unverified else _preserve_failed_factory_run(
+                home=self.home, trusted_repo=self.repo, record=current)
             reason = original_reason
             if published:
                 # The child may already have opened its PR before a later status,
@@ -3319,7 +3615,7 @@ class WorklinkRunner:
                 reason += f"; completed work preserved at {preserved_ref}"
             elif preservation_error is not None:
                 reason += f"; completed work preservation failed: {preservation_error}"
-            if not published and current is not None:
+            if not published and current is not None and not host_unverified:
                 # #2114: the unpublished epic attempt is kept locally as reference
                 # for the next attempt, never pushed. A pushed feature branch
                 # (above) holds only merged slices, not the sandbox's other or
@@ -3411,6 +3707,16 @@ class WorklinkRunner:
             try:
                 records = load_factory_records_for_issue(self.home, issue_id)
                 current = records[0] if records else retained
+                admitted = getattr(exc, "handle", None)
+                if current is not None and admitted is not None and admitted.opencode_session_id is not None:
+                    current = replace(current, handle=admitted, session=admitted.opencode_session_id,
+                        opencode_session_id=admitted.opencode_session_id, children_reaped=bool(getattr(exc, "quiescent", False)))
+                    _write_factory_host_evidence(self.home, current, "failed", _factory_controller_error(exc))
+                if (current is not None and current.handle is None and current.opencode_session_id is None
+                        and getattr(exc, "quiescent", False)):
+                    current = replace(current, children_reaped=True, controller_phase="failed",
+                                      controller_error=_factory_controller_error(exc))
+                    save_factory_record(self.home, current)
                 incident = incident_owner.record(
                     producer="factory_interruption",
                     home=self.home,
@@ -3436,6 +3742,16 @@ class WorklinkRunner:
                 )
             raise
         finally:
+            try:
+                retained_records = load_factory_records_for_issue(self.home, issue_id)
+            except (OSError, FactoryRecordError):
+                retained_records = []
+                release_permitted = False
+            if factory_launch_uncertain or any(
+                entry.handle is not None and entry.handle.substrate == "opencode_daemon"
+                and not entry.children_reaped for entry in retained_records
+            ):
+                release_permitted = False
             released = (
                 _release_issue_and_clear_run_state(
                     claims,
@@ -3463,20 +3779,20 @@ class WorklinkRunner:
     def _factory_launch_order(
         self, *, issue: IssueContext, checkout: Path, work_item_json: str, runner: Runner,
         attempt: int | None = None,
+        environ: Mapping[str, str] | None = None,
     ) -> tuple[WorkOrder, str]:
         """Build the order for a fresh ``/feature`` driver.
 
-        The initial launch and fresh-session recovery both start a new driver
-        that runs intake and later publishes, so both launch from the operator
-        checkout (never the retained sandbox, where intake's absent-feature-ref
-        guard fails) with the work item, Git identity and a verified publishing
-        identity and credential.
+        Capture original agent credentials and trusted Git identity before any
+        initialization/lock effect. Initialization creates the nested sandbox;
+        both initial admission and fresh recovery place the driver there.
         """
+        source = dict(os.environ) if environ is None else dict(environ)
         git_name, git_email = _read_checkout_git_identity(checkout, runner)
         publishing_identity, publishing_identity_source = (
-            _read_factory_publishing_identity(self.repo)
+            _read_factory_publishing_identity(self.repo, source)
         )
-        github_token, github_env = _resolve_factory_github_credential(os.environ)
+        github_token, github_env = _resolve_factory_github_credential(source)
         try:
             GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
         except GitHubIdentityVerificationError as exc:
@@ -3495,22 +3811,15 @@ class WorklinkRunner:
             env={
                 "MIMIR_HOME": str(self.home),
                 "MIMIR_WORK_ITEM_JSON": work_item_json,
+                **{key: source[key] for key in ("MIMIR_MODEL_SPEC", "MIMIR_MODEL_REASONING_EFFORT",
+                                               "MIMIR_WORKLINK_REASONING_EFFORT") if key in source},
                 **github_env,
                 "GIT_AUTHOR_NAME": git_name,
                 "GIT_AUTHOR_EMAIL": git_email,
                 "GIT_COMMITTER_NAME": git_name,
                 "GIT_COMMITTER_EMAIL": git_email,
-                # The factory child does the publishing, and 0.8.0+ compares this
-                # declared identity against ``gh api /user`` at Gate 1.
-                #
-                # Two DIFFERENT names are in play: the operator selects the identity
-                # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
-                # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
-                # controller already resolved and verified above, under the child's
-                # name -- inheritance alone would carry nothing in the local case,
-                # where the identity comes from .factory.json and no variable is
-                # exported at all. This also keeps the controller authoritative over
-                # whatever .factory.json the sandbox happens to hold.
+                # The canonical identity is verified here; native session
+                # credentials subsequently come only from the launch generation.
                 FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
             },
             transcript_root=self.home / "state" / "worklink" / "transcripts",
@@ -3547,258 +3856,130 @@ class WorklinkRunner:
         )
         pre = backend.status(retained.run_id, sandbox=sandbox, launcher=retained.launcher)
         _require_factory_status(pre, retained)
-        historical_result = _opaque_json_bytes(pre.terminal_result)
         if retained.controller_phase == "terminal" and not pre.is_terminal:
             raise WorklinkError("factory recovery terminal lifecycle regressed")
+        from .compute import OpenCodeDaemonComputeBackend
+
+        handle = retained.handle
+        daemon_host = retained.opencode_session_id is not None and handle is not None and handle.substrate == "opencode_daemon" and retained.opencode_session_id == handle.opencode_session_id
+        legacy_quiescent = (not daemon_host and retained.children_reaped and factory_process_is_verified_dead(retained))
+        if not daemon_host and not (legacy_quiescent and (pre.is_terminal or (
+                pre.is_parked and retained.run_id == epic_run_id(retained.issue_id)))):
+            raise WorklinkError("legacy factory host requires operator parking and fresh daemon recovery")
+        if isinstance(compute, OpenCodeDaemonComputeBackend):
+            compute.bind_retained_checkout(sandbox, issue_id=retained.issue_id, attempt=retained.attempt)
         if pre.lock_session not in {None, retained.session}:
-            raise WorklinkError("factory recovery lock owner changed")
+            raise WorklinkError("factory recovery lock session does not match the OpenCode host")
         if pre.lock == "absent" and pre.lock_session is not None:
             raise WorklinkError("factory recovery absent lock has an owner")
-        if pre.lock == "stale" and pre.lock_session != retained.session:
-            raise WorklinkError("factory recovery lock owner does not match retained session")
-        if pre.lock == "fresh" and pre.lock_session != retained.session:
-            raise WorklinkError("factory recovery found a fresh foreign lock owner")
         if pre.is_terminal:
-            if retained.handle is not None:
-                if factory_process_is_alive(retained):
-                    await _cancel_and_cleanup_factory_handle(compute, retained.handle)
-                elif not factory_process_is_verified_dead(retained):
-                    raise WorklinkError("factory terminal process identity cannot be verified")
-            retained = retained.observed(pre, datetime.now(UTC).isoformat())
+            if daemon_host:
+                await _cancel_and_cleanup_factory_handle(compute, handle)
+            retained = replace(retained.observed(pre, datetime.now(UTC).isoformat()), children_reaped=True)
             save_factory_record(self.home, retained)
-            return await self._finish_factory_070(
-                issue=issue,
-                claim_record=claim_record,
-                claims=claims,
-                backend=backend,
-                compute=compute,
-                factory_record=retained,
-                test_cmd=test_cmd,
-                runner=runner,
-                started_at=datetime.now(UTC),
-            )
-        if pre.status not in {"running", "needs-human"}:
+            return await self._finish_factory_070(issue=issue, claim_record=claim_record, claims=claims,
+                backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
+                runner=runner, started_at=datetime.now(UTC))
+        if daemon_host and pre.status == "running":
+            return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
+                backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
+                runner=runner, started_at=datetime.now(UTC), initial_status=pre, autonomous=autonomous)
+        if not pre.is_parked:
             raise WorklinkError("factory recovery status is not resumable")
-        if factory_process_is_alive(retained):
-            raise WorklinkError("factory recovery refuses a live retained process")
-        if not factory_process_is_verified_dead(retained):
-            raise WorklinkError("factory recovery cannot verify the retained process is dead")
-        # The sandbox lives at <operator checkout>/.factory-sandboxes/<run id>.
-        operator_checkout = sandbox.parent.parent
-        # Resolve identity before touching the lock, so a refusal leaves the run as found.
-        # Legacy retained runs use the numeric id; bind the work item to the retained
-        # id _verify_factory_recovery_target accepted rather than the canonical render.
-        order, publishing_identity = self._factory_launch_order(
-            issue=issue, checkout=operator_checkout,
-            work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id),
-            runner=runner,
-        )
-        if pre.is_parked and pre.park_snapshot is not None:
-            # This park predates the dispatch claim. Never re-date it to now or
-            # credit the resume claim before resume has done any work. A durable
-            # parked observation may be missing only its controller phase/archive;
-            # without that original observation time we cannot certify a credit.
-            if (retained.status is not None and retained.status.is_parked
-                    and retained.status.park_snapshot == pre.park_snapshot
-                    and retained.observed_at is not None):
-                parked = replace(retained, controller_phase="parked")
-                history = claim_records_from_comments(
-                    claims._issue_comments(issue.issue_id, strict=True),
-                )
-                prior = {
-                    (entry.agent_id, entry.claimed_at, entry.generation): entry
-                    for entry in history
-                    if entry.issue_id == retained.issue_id
-                    and entry.attempt == retained.attempt
-                    and entry.claimed_at < claim_record.claimed_at
-                    and entry.attempt < claim_record.attempt
-                }
-                if len(prior) == 1:
-                    save_factory_record(self.home, parked)
-                    self._archive_factory_park(next(iter(prior.values())), parked)
-                    retained = parked
-        session = retained.session
-        if pre.lock == "stale" or pre.dead_lock:
-            backend.lock(
-                retained.run_id,
-                "steal",
-                session=session,
-                sandbox=sandbox,
-                launcher=retained.launcher,
-            )
-            locked = backend.status(
-                retained.run_id, sandbox=sandbox, launcher=retained.launcher
-            )
-        elif pre.lock == "absent":
-            backend.lock(
-                retained.run_id,
-                "claim",
-                session=session,
-                sandbox=sandbox,
-                launcher=retained.launcher,
-            )
-            locked = backend.status(
-                retained.run_id, sandbox=sandbox, launcher=retained.launcher
-            )
-        else:
-            locked = pre
-        _require_factory_status(locked, retained)
-        if (
-            locked.lock != "fresh"
-            or locked.dead_lock
-            or locked.lock_session != session
-            or _opaque_json_bytes(locked.terminal_result) != historical_result
-        ):
-            raise WorklinkError("factory recovery lock reconciliation failed")
-        if pre.status == "running":
-            park_failure = "factory recovery could not verify the running factory was parked"
-            try:
-                backend.terminal(
-                    retained.run_id, "needs-human",
-                    reason=(
-                        "controller recovery: retained driver verified dead while factory status "
-                        "was running; parked for fresh-session resume"
-                    ),
-                    sandbox=sandbox, launcher=retained.launcher,
-                )
-                parked_status = backend.status(
-                    retained.run_id, sandbox=sandbox, launcher=retained.launcher,
-                )
-                _require_factory_status(parked_status, retained)
-                if (
-                    parked_status.status != "needs-human"
-                    or parked_status.next != pre.next
-                    or parked_status.lock_session != locked.lock_session
-                ):
-                    raise WorklinkError(park_failure)
-            except Exception:
-                parked = replace(
-                    retained.observed(locked, datetime.now(UTC).isoformat()),
-                    controller_phase="parked",
-                    controller_error=_factory_controller_error(park_failure),
-                )
-                save_factory_record(self.home, parked)
-                claims.transition_issue(
-                    issue.issue_id, status="blocked", review_ready=False,
-                    attempt=claim_record.budget_attempt or claim_record.attempt,
-                    reason=f"{park_failure}; retained sandbox: {retained.sandbox}",
-                )
-                return WorklinkRunResult(
-                    issue.issue_id, retained.attempt, "needs-human",
-                    checkout=sandbox, branch=retained.branch, reason=park_failure,
-                )
-            retained = retained.observed(parked_status, datetime.now(UTC).isoformat())
-            save_factory_record(self.home, retained)
-            historical_result = _opaque_json_bytes(parked_status.terminal_result)
-        resumed = backend.resume(
-            retained.run_id,
-            session=session,
-            sandbox=sandbox,
-            launcher=retained.launcher,
-        )
-        _require_factory_status(resumed, retained)
-        if (
-            resumed.status != "running"
-            or resumed.lock != "fresh"
-            or resumed.dead_lock
-            or resumed.lock_session != session
-            or _opaque_json_bytes(resumed.terminal_result) != historical_result
-        ):
-            raise WorklinkError("factory resume did not return an owned running status")
-        resumed.require_recovery_next()
-        release_failure = "factory recovery could not verify the retained lock was released"
-        try:
-            backend.lock(
-                retained.run_id, "release", session=session,
-                sandbox=sandbox, launcher=retained.launcher,
-            )
-            released = backend.status(
-                retained.run_id, sandbox=sandbox, launcher=retained.launcher,
-            )
-            _require_factory_status(released, retained)
-            if (
-                released.status != "running"
-                or released.lock != "absent"
-                or released.lock_session is not None
-                or _opaque_json_bytes(released.terminal_result) != historical_result
-            ):
-                raise WorklinkError(release_failure)
-            released.require_recovery_next()
-        except Exception:
-            parked = replace(
-                retained.observed(resumed, datetime.now(UTC).isoformat()),
-                controller_phase="parked",
-                controller_error=_factory_controller_error(release_failure),
-            )
-            save_factory_record(self.home, parked)
-            claims.transition_issue(
-                issue.issue_id, status="blocked", review_ready=False,
-                attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=f"{release_failure}; retained sandbox: {retained.sandbox}",
-            )
-            return WorklinkRunResult(
-                issue.issue_id, retained.attempt, "needs-human",
-                checkout=sandbox, branch=retained.branch, reason=release_failure,
-            )
-        _verify_factory_recovery_binding(
-            runner=self,
-            issue=issue,
-            claim_record=claim_record,
-            claims=claims,
-            retained=retained,
-            launcher=launcher,
-            repo_slug=repo_slug,
-            base=base,
-            command_runner=runner,
-        )
-        recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
-        if (
-            _factory_checkout_repository(sandbox, runner) or ""
-        ).lower() != retained.repository.lower():
-            raise WorklinkError("factory recovery sandbox repository changed before launch")
-        spec = backend.work_spec(
-            order,
-            attempt=retained.attempt,
-            repo_url=recovery_repo_url,
-            base_ref=retained.base_ref,
-            branch=retained.branch,
-            test_command=test_cmd,
-            run_id=retained.run_id,
-        )
+        if retained.run_id != epic_run_id(retained.issue_id):
+            raise WorklinkError("fresh daemon recovery requires a canonical factory run id")
+        if pre.park_snapshot is None:
+            raise WorklinkError("factory recovery requires a published park snapshot")
+        pre.require_recovery_next()
+        prior_park_time = (retained.observed_at if retained.status is not None and retained.status.is_parked
+                           and retained.status.park_snapshot == pre.park_snapshot else None)
+        epic_environment = dict(os.environ)
+        order, publishing_identity = self._factory_launch_order(issue=issue, checkout=sandbox,
+            work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id), runner=runner,
+            environ=epic_environment)
+        from .daemon_health import daemon_health
+        if daemon_health(epic_environment).get("ok") is not True:
+            raise WorklinkError("OpenCode daemon admission unavailable before fresh factory recovery")
+        spec = backend.work_spec(order, attempt=retained.attempt, repo_url=_repo_remote_url(sandbox, runner=runner),
+                                 base_ref=retained.base_ref, branch=retained.branch, test_command=test_cmd,
+                                 run_id=retained.run_id)
         _require_factory_launch_binding(spec, retained.run_id, publishing_identity)
-        spec = replace(spec, factory_credential_settings=_git_credential_settings(self.repo))
-        handle = await compute.launch(spec)
-        relaunched = replace(
-            retained.observed(released, datetime.now(UTC).isoformat()),
-            handle=handle,
-            controller_phase="running",
-            transcript=None,
-            children_reaped=False,
-        )
+        spec = replace(spec, factory_credential_settings=(*_git_credential_settings(self.repo),
+            ("user.name", order.env["GIT_AUTHOR_NAME"]), ("user.email", order.env["GIT_AUTHOR_EMAIL"])))
+        from .daemon_sessions import session_environment
+        session_environment(dict(spec.env), home=Path("/var/lib/mimir-worklink/session-validation"),
+                            git_settings=spec.factory_credential_settings, credentials={})
+        if (retained.status is not None and retained.status.is_parked
+                and retained.status.park_snapshot == pre.park_snapshot and retained.observed_at is not None):
+            history = claim_records_from_comments(claims._issue_comments(issue.issue_id, strict=True))
+            prior = {(entry.agent_id, entry.claimed_at, entry.generation): entry for entry in history
+                     if entry.issue_id == retained.issue_id and entry.attempt == retained.attempt
+                     and entry.claimed_at < claim_record.claimed_at and entry.attempt < claim_record.attempt}
+            intervening_claim = any(entry.issue_id == retained.issue_id and retained.attempt < entry.attempt < claim_record.attempt
+                                    for entry in history)
+            if len(prior) == 1 and not intervening_claim:
+                retained = replace(retained, controller_phase="parked")
+                save_factory_record(self.home, retained)
+                self._archive_factory_park(next(iter(prior.values())), retained)
+        if daemon_host:
+            await _cancel_and_cleanup_factory_handle(compute, handle)
+        if pre.lock_session is not None:
+            await _await_factory_control(backend.lock, retained.run_id, "release", session=retained.session,
+                                   sandbox=sandbox, launcher=retained.launcher)
+        released = await asyncio.to_thread(backend.status, retained.run_id, sandbox=sandbox, launcher=retained.launcher)
+        _require_factory_status(released, retained)
+        if (not released.is_parked or released.lock != "absent" or released.lock_session is not None
+                or released.next != pre.next
+                or _opaque_json_bytes(released.terminal_result) != _opaque_json_bytes(pre.terminal_result)):
+            raise WorklinkError("factory recovery could not verify the old host lock was released")
+        from .control import clear_legacy_factory_stop
+        clear_legacy_factory_stop(self.home, retained.issue_id, retained.attempt)
+        pending = replace(retained.observed(released, prior_park_time), handle=None,
+            session=None, opencode_session_id=None, children_reaped=False, controller_phase="running", transcript=None)
+        save_factory_record(self.home, pending)
+        try:
+            handle = await compute.launch(spec)
+        except BaseException as exc:
+            admitted = getattr(exc, "handle", None)
+            if admitted is not None:
+                pending = replace(pending, handle=admitted, session=admitted.opencode_session_id,
+                    opencode_session_id=admitted.opencode_session_id, children_reaped=bool(getattr(exc, "quiescent", False)))
+                try:
+                    save_factory_record(self.home, pending)
+                except OSError as write_error:
+                    write_error.handle = admitted
+                    write_error.quiescent = bool(getattr(exc, "quiescent", False))
+                    write_error.uncertain = not write_error.quiescent
+                    raise
+            elif getattr(exc, "quiescent", False):
+                pending = replace(pending, children_reaped=True, controller_phase="failed")
+                save_factory_record(self.home, pending)
+            _write_factory_host_evidence(self.home, pending, "backend_error", _factory_controller_error(exc))
+            raise
+        relaunched = replace(retained.observed(released, prior_park_time),
+            handle=handle, session=handle.opencode_session_id, opencode_session_id=handle.opencode_session_id,
+            controller_phase="running", transcript=None, children_reaped=False)
         try:
             save_factory_record(self.home, relaunched)
-        except BaseException:
-            await _cancel_and_cleanup_factory_handle(compute, handle)
+        except BaseException as exc:
+            try:
+                await _cancel_and_cleanup_factory_handle(compute, handle)
+            except BaseException as cleanup_error:
+                cleanup_error.handle = handle
+                cleanup_error.uncertain = True
+                raise
+            exc.handle = handle
+            exc.quiescent = True
             raise
+        # The real plugin context supplies the new ID and performs claim/resume;
+        # the controller only observes that protocol, never prompts a second time.
         if autonomous:
-            _record_factory_milestone(
-                self.home, kind="factory_start", issue=issue,
-                run_id=retained.run_id, attempt=retained.attempt,
-            )
-        return await self._supervise_factory_070(
-            issue=issue,
-            claim_record=claim_record,
-            claims=claims,
-            backend=backend,
-            compute=compute,
-            factory_record=relaunched,
-            test_cmd=test_cmd,
-            runner=runner,
-            started_at=datetime.now(UTC),
-            initial_status=released,
-            recovery_session=session,
-            autonomous=autonomous,
-        )
+            _record_factory_milestone(self.home, kind="factory_start", issue=issue,
+                                      run_id=retained.run_id, attempt=retained.attempt)
+        return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
+            backend=backend, compute=compute, factory_record=relaunched, test_cmd=test_cmd,
+            runner=runner, started_at=datetime.now(UTC), recovery_session=handle.opencode_session_id,
+            autonomous=autonomous)
 
     async def _supervise_factory_070(
         self,
@@ -3831,6 +4012,7 @@ class WorklinkRunner:
         # unusable setting twice and could disagree if the environment moved.
         startup_timeout = _factory_startup_status_timeout_s()
         startup_deadline = min(deadline, loop.time() + startup_timeout)
+        host_lock_pending = handle.opencode_session_id is not None
         stale_after = _epic_stale_heartbeat_s()
         # Silence during a model generation is not proof that the loop exited.
         # Keep the short stale diagnostic distinct from the conservative idle
@@ -3877,9 +4059,19 @@ class WorklinkRunner:
 
         def retain_result(result: ComputeResult | None, outcome: str) -> None:
             nonlocal factory_record
-            if factory_record.transcript is not None:
+            if factory_record.controller_phase == "stopped":
+                outcome = "interrupted"
+            elif factory_record.status is not None and (factory_record.status.is_terminal or factory_record.status.is_parked):
+                outcome = factory_record.status.status or "failed"
+            elif outcome in {"completed", "refused"}:
+                outcome = "failed"
+            if handle.opencode_session_id is not None and cancel_attempted and not factory_record.children_reaped:
+                outcome = "failed"
+            if factory_record.transcript is not None and outcome == "running":
                 return
-            path = transcript_path(
+            _write_factory_host_evidence(self.home, factory_record, outcome,
+                                        factory_record.controller_error or (result.launch_error if result is not None else None))
+            path = Path(factory_record.transcript) if factory_record.transcript is not None else transcript_path(
                 self.home / "state" / "worklink" / "transcripts",
                 issue.issue_id,
             )
@@ -3901,16 +4093,25 @@ class WorklinkRunner:
             )
             factory_record = replace(
                 factory_record, transcript=str(path),
-                children_reaped=(result is not None and result.children_reaped),
+                children_reaped=(factory_record.children_reaped or (result is not None and result.children_reaped)),
             )
             save_factory_record(self.home, factory_record)
 
         async def cancel_once() -> None:
-            nonlocal cancel_attempted
+            nonlocal cancel_attempted, factory_record
             if cancel_attempted:
                 return
             cancel_attempted = True
-            await compute.cancel(handle)
+            try:
+                await compute.cancel(handle)
+            except BaseException as exc:
+                factory_record = replace(factory_record, controller_error=_factory_controller_error(exc))
+                save_factory_record(self.home, factory_record)
+                _write_factory_host_evidence(self.home, factory_record, "failed", _factory_controller_error(exc))
+                raise
+            if handle.opencode_session_id is not None:
+                factory_record = replace(factory_record, children_reaped=True)
+                save_factory_record(self.home, factory_record)
 
         async def park_for_reason(
             current: FactoryStatus, reason: str, *, startup_failure: bool = False,
@@ -3920,6 +4121,29 @@ class WorklinkRunner:
             wait_result = await _finish_factory_wait_task(wait_task)
             if compute.job_alive(handle):
                 raise WorklinkError("factory driver survived cancellation before park")
+            # Cancellation can deliver a final factory transition. Qualify that
+            # observation before any writer acts on the earlier running state.
+            if handle.opencode_session_id is not None:
+                current = await asyncio.to_thread(
+                    backend.status, factory_record.run_id,
+                    sandbox=Path(factory_record.sandbox), launcher=factory_record.launcher,
+                )
+                _require_factory_status(current, factory_record)
+                if current.lock_session not in {None, factory_record.session}:
+                    raise WorklinkError("factory lock owner changed during cancellation before park")
+                factory_record = replace(
+                    factory_record.observed(current, datetime.now(UTC).isoformat()),
+                    controller_phase="terminal" if current.is_terminal else "parked" if current.is_parked else "running",
+                )
+                save_factory_record(self.home, factory_record)
+                if current.is_terminal or current.is_parked:
+                    retain_result(wait_result, current.status or "failed")
+                    failed = False
+                    return await self._finish_factory_070(
+                        issue=issue, claim_record=claim_record, claims=claims, backend=backend,
+                        compute=compute, factory_record=factory_record, test_cmd=test_cmd,
+                        runner=runner, started_at=started_at,
+                    )
             if startup_failure:
                 if not factory_process_is_verified_dead(factory_record):
                     raise WorklinkError(reason)
@@ -3934,16 +4158,10 @@ class WorklinkRunner:
                 _require_factory_status(current, factory_record)
                 if current.status != "running" or (current.lock == "fresh" and not current.dead_lock):
                     raise WorklinkError("factory startup deadline: run has a live lock or is not running")
-                if not (factory_record.session or current.lock_session):
-                    # An initial launch whose driver died before taking the lock has
-                    # no session anywhere, and recovery admits only a retained one.
-                    # Record a controller-owned session; recovery claims the absent
-                    # lock under it through the factory CLI before resuming.
-                    factory_record = replace(
-                        factory_record, session=f"worklink-repark-{os.urandom(8).hex()}",
-                    )
+                if not factory_record.session:
+                    raise WorklinkError("factory startup has no admitted host session")
             retain_result(wait_result, "needs-human")
-            await asyncio.to_thread(
+            await _await_factory_control(
                 backend.terminal,
                 factory_record.run_id,
                 "needs-human",
@@ -3954,7 +4172,9 @@ class WorklinkRunner:
 
             snapshot_failure = "factory status reports park_snapshot null"
             snapshot_attempted = False
-            verification_deadline = max(deadline, loop.time() + startup_timeout) if startup_failure else deadline
+            # Model work is over. Cancellation and terminal control may already
+            # have spent its deadline; publication still needs a bounded read.
+            verification_deadline = loop.time() + startup_timeout
             while True:
                 remaining = verification_deadline - loop.time()
                 if remaining <= 0:
@@ -3986,19 +4206,19 @@ class WorklinkRunner:
                     if not snapshot_attempted:
                         snapshot_attempted = True
                         try:
-                            await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    backend.snapshot, factory_record.run_id,
-                                    sandbox=Path(factory_record.sandbox),
-                                    launcher=factory_record.launcher,
-                                ),
-                                timeout=max(0.01, verification_deadline - loop.time()),
+                            await _await_factory_control(
+                                backend.snapshot, factory_record.run_id,
+                                sandbox=Path(factory_record.sandbox),
+                                launcher=factory_record.launcher,
                             )
                         except Exception as exc:
                             snapshot_failure = _factory_controller_error(exc)
                             break
                         # Read status again: a successful CLI exit alone is not a
                         # published snapshot until factory status reports it.
+                        # The bounded writer can outlast either deadline. Give
+                        # its acknowledgment a fresh, finite observation window.
+                        verification_deadline = loop.time() + startup_timeout
                         continue
                 except FactoryRunLockContended:
                     snapshot_failure = "factory run state stayed locked"
@@ -4039,6 +4259,8 @@ class WorklinkRunner:
             )
 
         async def repark_startup_failure(reason: str) -> WorklinkRunResult:
+            if handle.opencode_session_id is not None:
+                raise WorklinkError(reason)
             # The park helper cancels and drains the driver, verifies its birth
             # marker, then reads run state again before invoking the factory CLI.
             # With no manifest even then, the original failure remains the diagnosis,
@@ -4099,11 +4321,55 @@ class WorklinkRunner:
         error_polls = 0
         error_incident = False
 
+        def host_stop_requested() -> bool:
+            return handle.opencode_session_id is not None and operator_stop_requested(
+                self.home, issue.issue_id, factory_record.attempt,
+                opencode_session_id=handle.opencode_session_id,
+            )
+
+        async def finish_requested_stop() -> WorklinkRunResult | None:
+            nonlocal factory_record, failed
+            from .factory_state import load_factory_record
+            if not host_stop_requested():
+                return None
+            await cancel_once()
+            latest = load_factory_record(self.home, factory_record.run_id)
+            if latest is not None:
+                if latest.handle != handle:
+                    raise WorklinkError("factory host changed during explicit stop")
+                factory_record = latest
+            factory_record = replace(factory_record, children_reaped=True,
+                controller_error="operator requested stop",
+                controller_phase="terminal" if factory_record.status and factory_record.status.is_terminal
+                else "parked" if factory_record.status and factory_record.status.is_parked else "stopped")
+            save_factory_record(self.home, factory_record)
+            _write_factory_host_evidence(self.home, factory_record, "interrupted", "operator requested stop")
+            failed = False
+            return WorklinkRunResult(issue.issue_id, factory_record.attempt, "interrupted",
+                checkout=Path(factory_record.sandbox), branch=factory_record.branch,
+                reason="operator requested stop")
+
+        def successful_host_turn() -> bool:
+            return (handle.opencode_session_id is not None and wait_task.done()
+                and not wait_task.cancelled() and wait_task.exception() is None
+                and wait_task.result().session_outcome is not None
+                and wait_task.result().session_outcome.execution_state == "succeeded")
+
         async def missed_poll(exc: Exception) -> None:
-            nonlocal error_polls, error_incident, status
+            nonlocal error_polls, error_incident, status, wait_task
             # Only a verified ending may leave supervision. A control-plane
             # failure while the driver runs is a missed observation.
-            if not wait_task.done() and compute.job_alive(handle):
+            if host_stop_requested():
+                status = None
+                return  # The loop reconciles stop before any write or heartbeat.
+            turn_finished = successful_host_turn()
+            if turn_finished and _factory_lock_refusal(wait_task.result()):
+                raise WorklinkError("factory driver did not acquire the retained run lock: "
+                                    + _factory_controller_error(wait_task.result().stdout)[:300])
+            if (not wait_task.done() or turn_finished) and compute.job_alive(handle):
+                if turn_finished:
+                    retain_result(wait_task.result(), "running")
+                    wait_task = asyncio.create_task(compute.wait(handle, max(1, math.ceil(deadline - loop.time()))))
                 error_polls += 1
                 message = _factory_controller_error(exc)
                 if error_polls == 1:
@@ -4137,6 +4403,9 @@ class WorklinkRunner:
 
         try:
             while True:
+                stopped = await finish_requested_stop()
+                if stopped is not None:
+                    return stopped
                 if initial_observation_error is not None:
                     error = initial_observation_error
                     initial_observation_error = None
@@ -4157,7 +4426,7 @@ class WorklinkRunner:
                     return await park_for_reason(
                         last_status, reason
                     )
-                if recovery_session is not None and loop.time() >= startup_deadline:
+                if (recovery_session is not None or host_lock_pending) and loop.time() >= startup_deadline:
                     return await repark_startup_failure(
                         "factory driver did not acquire the run lock before startup deadline"
                     )
@@ -4229,24 +4498,51 @@ class WorklinkRunner:
                     if loop.time() >= startup_deadline:
                         return await repark_startup_failure("factory never initialised before startup deadline")
                 else:
+                    stopped = await finish_requested_stop()
+                    if stopped is not None:
+                        return stopped
                     try:
                         _require_factory_status(status, factory_record)
                     except Exception as exc:
                         await missed_poll(exc)
                         continue
                     handoff_claimed = False
+                    if (handle.opencode_session_id is not None and status.lock_session is not None
+                            and status.lock_session != handle.opencode_session_id):
+                        raise WorklinkError("factory lock session does not match the OpenCode host session")
+                    if handle.opencode_session_id is not None and status.lock == "absent" and status.lock_session is not None:
+                        raise WorklinkError("factory absent lock unexpectedly reports a host owner")
+                    if handle.opencode_session_id is not None:
+                        owned = status.lock == "fresh" and not status.dead_lock and status.lock_session == handle.opencode_session_id
+                        if status.is_terminal or status.is_parked or owned:
+                            host_lock_pending = False
+                        elif not host_lock_pending:
+                            host_lock_pending = True
+                            startup_deadline = min(deadline, loop.time() + startup_timeout)
                     if recovery_session is not None:
-                        if status.lock == "absent" and status.lock_session is None:
+                        if status.is_terminal:
+                            recovery_session = None
+                        elif (status.is_parked and status.lock_session in {None, recovery_session}):
                             if loop.time() >= startup_deadline:
                                 return await repark_startup_failure(
                                     "factory driver did not acquire the run lock before startup deadline"
                                 )
+                            _heartbeat_claim_best_effort(claims, claim_record)
+                            await asyncio.sleep(min(max(0.01, float(backend.poll_interval_s)),
+                                                    max(0, startup_deadline - loop.time())))
+                            status = None
+                            continue
                         elif (
+                            status.status == "running"
+                            and
                             status.lock == "fresh"
                             and not status.dead_lock
-                            and status.lock_session is not None
-                            and status.lock_session != recovery_session
+                            and status.lock_session == recovery_session
                         ):
+                            if (factory_record.status is not None
+                                    and _opaque_json_bytes(status.terminal_result)
+                                    != _opaque_json_bytes(factory_record.status.terminal_result)):
+                                raise WorklinkError("factory recovery historical result changed during handoff")
                             recovery_session = None
                             handoff_claimed = True
                         else:
@@ -4285,10 +4581,11 @@ class WorklinkRunner:
                     if (
                         observed
                         and status.lock == "fresh"
+                        and not status.dead_lock
                         and factory_record.session == status.lock_session
                     ):
                         try:
-                            await asyncio.to_thread(
+                            await _await_factory_control(
                                 backend.heartbeat,
                                 factory_record.run_id,
                                 session=factory_record.session,
@@ -4409,6 +4706,8 @@ class WorklinkRunner:
                                 str(incident["occurrence_id"]),
                             )
                     if status.is_terminal or status.is_parked:
+                        if handle.opencode_session_id is not None:
+                            await cancel_once()
                         if not wait_task.done():
                             await cancel_once()
                             wait_result = await _finish_factory_wait_task(wait_task)
@@ -4432,7 +4731,12 @@ class WorklinkRunner:
                         last_status = status
                     error_polls = 0
                     error_incident = False
-                if wait_task.done() or not compute.job_alive(handle):
+                if successful_host_turn() and not _factory_lock_refusal(wait_task.result()):
+                    # Only factory status above can complete the run. A model
+                    # turn ending successfully supplies no factory terminal proof.
+                    retain_result(wait_task.result(), "running")
+                    wait_task = asyncio.create_task(compute.wait(handle, max(1, math.ceil(deadline - loop.time()))))
+                elif wait_task.done() or not compute.job_alive(handle):
                     try:
                         result = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
                         wait_result = result
@@ -4441,9 +4745,18 @@ class WorklinkRunner:
                             "OpenCode process stopped without a drainable supervision result"
                         ) from exc
                     retain_result(result, "failed")
+                    stopped = await finish_requested_stop()
+                    if stopped is not None:
+                        return stopped
                     detail = result.stderr.strip() or result.stdout.strip()
+                    if result.session_error is not None:
+                        detail = _factory_controller_error(
+                            f"{result.session_error.type}: {result.session_error.message}")
+                    detail = _factory_controller_error(detail)
                     if _factory_lock_refusal(result):
                         reason = "factory driver did not acquire the retained run lock"
+                        if detail:
+                            reason += f": {detail[:300]}"
                         factory_record = replace(
                             factory_record,
                             controller_phase="parked",
@@ -4480,13 +4793,16 @@ class WorklinkRunner:
                         )
                     suffix = f": {detail[:300]}" if detail else ""
                     raise WorklinkError(
-                        f"OpenCode process exited while factory status was running{suffix}"
+                        f"OpenCode host stopped while factory status was running{suffix}"
                     )
                 if loop.time() >= park_deadline:
                     assert last_status is not None
                     return await park_for_reason(
                         last_status, _factory_budget_park_reason(last_status, factory_record)
                     )
+                stopped = await finish_requested_stop()
+                if stopped is not None:
+                    return stopped
                 _heartbeat_claim_best_effort(claims, claim_record)
                 poll_delay = max(0.01, float(backend.poll_interval_s))
                 if pre_manifest or recovery_session is not None:
@@ -4500,6 +4816,8 @@ class WorklinkRunner:
                 end_stale_episode("supervision_ended")
             finally:
                 try:
+                    if handle.opencode_session_id is not None:
+                        await cancel_once()
                     if failed and not wait_task.done():
                         try:
                             await cancel_once()
@@ -4512,7 +4830,19 @@ class WorklinkRunner:
                             wait_result = drained[0]
                         retain_result(wait_result, "refused" if failed else "completed")
                 finally:
-                    await compute.cleanup(handle)
+                    if handle.opencode_session_id is not None and not factory_record.children_reaped and not wait_task.done():
+                        # Stop only this controller's observation task. Native
+                        # input, checkout and correlation remain retained.
+                        wait_task.cancel()
+                        await asyncio.gather(wait_task, return_exceptions=True)
+                    if handle.opencode_session_id is None or factory_record.children_reaped:
+                        try:
+                            await compute.cleanup(handle)
+                        except BaseException as exc:
+                            factory_record = replace(factory_record, children_reaped=False)
+                            save_factory_record(self.home, factory_record)
+                            _write_factory_host_evidence(self.home, factory_record, "failed", _factory_controller_error(exc))
+                            raise
 
     def _archive_factory_park(self, claim: ClaimRecord, record: FactoryRunRecord) -> None:
         """Persist credit before fallible transitions or resume replace the evidence."""
@@ -4544,35 +4874,11 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if not (status.is_parked or status.is_terminal):
-            raise WorklinkError("factory OpenCode prune requires a parked or terminal status")
-        from .factory_store import prune_factory_store
-
-        # Cancellation cannot release the issue/interlock while the worker thread
-        # is still mutating the store. Shield and drain even repeated cancels.
-        maintenance = asyncio.create_task(asyncio.to_thread(prune_factory_store, factory_record))
-        cancelled = False
-        while True:
-            try:
-                await asyncio.shield(maintenance)
-                break
-            except asyncio.CancelledError:
-                cancelled = True
-                if maintenance.done():
-                    break
-            except Exception as exc:  # housekeeping must not fail a park/completion
-                try:
-                    _log_event(
-                        "worklink_factory_opencode_prune_failed",
-                        issue_id=issue.issue_id, attempt=factory_record.attempt,
-                        run_id=factory_record.run_id, reason=_factory_controller_error(exc),
-                    )
-                except Exception:
-                    pass  # Telemetry failure cannot make housekeeping fatal either.
-                break
-        if cancelled:
-            # Retrieve any exception to avoid an unobserved task error.
-            await asyncio.gather(maintenance, return_exceptions=True)
-            raise asyncio.CancelledError
+            raise WorklinkError("factory finalization requires a parked or terminal status")
+        if (factory_record.handle is not None and factory_record.handle.substrate == "opencode_daemon"
+                and not factory_record.children_reaped):
+            raise WorklinkError("factory finalization requires verified host quiescence")
+        _write_factory_host_evidence(self.home, factory_record, status.status or "failed")
         if status.is_parked:
             self._archive_factory_park(claim_record, factory_record)
             diagnosis = factory_record.controller_error or "factory run is parked"
@@ -4702,6 +5008,64 @@ class WorklinkRunner:
         )
         return result
 
+async def _await_factory_control(operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """A bounded node control must settle before its issue/interlock can be released."""
+    task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            if task.cancelled():
+                raise
+    if cancelled:
+        error = asyncio.CancelledError()
+        error.quiescent = True
+        raise error
+    return result
+
+
+def _write_factory_host_evidence(home: Path, record: FactoryRunRecord, status: str,
+                                 error: str | None = None) -> Path:
+    path = home / "state" / "worklink" / "evidence" / f"{record.issue_id}-{record.attempt}.json"
+    # Only the completion verifier sets review_ready after independent gate,
+    # checkout and forge verification. A manifest terminal alone is not proof.
+    try:
+        with path.open("rb") as stream:
+            prior = json.loads(stream.read(2 * 1024 * 1024))
+    except (OSError, ValueError):
+        prior = None
+    same_invocation = (isinstance(prior, dict)
+            and prior.get("issue") == record.issue_id and prior.get("attempt") == record.attempt
+            and prior.get("backend") == "feature_factory" and prior.get("checkout") == record.sandbox
+            and prior.get("branch") == record.branch
+            and prior.get("opencode_session_id") == record.opencode_session_id)
+    if same_invocation and prior.get("review_ready") is True and prior.get("status") == "completed":
+        return path
+    if same_invocation and prior.get("diff_observed") is True:
+        # A verifier failure already contains observed diff/test/forge facts.
+        # Add a cleanup diagnosis without discarding those observations or
+        # converting a rejected completion back into manifest-only success.
+        if error is not None:
+            from mimir_cultivate.opencode import redact_daemon_output
+            prior["failure_reason"] = redact_daemon_output(error)
+        prior["finished_at"] = datetime.now(UTC).isoformat()
+        prior["review_ready"] = False
+        atomic_write_json(path, prior)
+        return path
+    now = datetime.now(UTC).isoformat()
+    return _write_evidence(home, WorklinkEvidence(
+        issue=record.issue_id, attempt=record.attempt, backend="feature_factory",
+        branch=record.branch, checkout=record.sandbox, started_at=record.observed_at or now,
+        finished_at=now, files_changed=[], diff_stat="", commands=[], tests=None,
+        pr_url=record.status.pr_url if record.status else None, status=status,
+        base_ref=record.base_ref, diff_observed=False, failure_reason=error,
+        transcript=record.transcript, opencode_session_id=record.opencode_session_id,
+        mcp_servers=record.mcp_servers))
+
+
 async def _finish_factory_wait_task(
     task: asyncio.Task[ComputeResult],
 ) -> ComputeResult | None:
@@ -4714,7 +5078,9 @@ async def _finish_factory_wait_task(
 
 
 def _factory_controller_error(error: BaseException | str) -> str:
-    encoded = redact_text(str(error)).encode("utf-8")
+    from mimir_cultivate.opencode import redact_daemon_output
+
+    encoded = redact_daemon_output(str(error)).encode("utf-8")
     if len(encoded) <= _FACTORY_CONTROLLER_ERROR_MAX_BYTES:
         return encoded.decode("utf-8")
     marker = b"[controller error truncated; see transcript]"
@@ -4779,10 +5145,8 @@ def _preserve_failed_factory_run(
 
 
 async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle) -> None:
-    try:
-        await compute.cancel(handle)
-    finally:
-        await compute.cleanup(handle)
+    await compute.cancel(handle)
+    await compute.cleanup(handle)
 
 
 def _opaque_json_bytes(value: dict[str, Any] | None) -> bytes:
@@ -4849,7 +5213,8 @@ def _verify_factory_recovery_target(
         raise WorklinkError("retained factory base does not match recovery request")
     if retained.launcher != str(launcher):
         raise WorklinkError("retained factory launcher does not match recovery request")
-    if not retained.session:
+    if not retained.session and not (retained.handle is None and retained.opencode_session_id is None
+                                     and retained.children_reaped and retained.run_id == epic_run_id(retained.issue_id)):
         raise WorklinkError("retained factory session is missing")
     sandbox = Path(retained.sandbox)
     from .worker_client import worklink_checkout_root, factory_checkout_for_path
@@ -5119,6 +5484,9 @@ async def _verify_factory_completion(
         status="failed",
         base_ref=record.base_ref,
         diff_observed=False,
+        opencode_session_id=record.opencode_session_id,
+        mcp_servers=record.mcp_servers,
+        transcript=record.transcript,
     )
     try:
         if status is None:
@@ -5126,6 +5494,8 @@ async def _verify_factory_completion(
         if status.status != "completed" or not status.is_terminal:
             raise WorklinkError("factory completion status is not authoritative")
         _require_factory_status(status, record, require_pr_base=True)
+        if record.opencode_session_id is not None and status.lock_session not in {None, record.opencode_session_id}:
+            raise WorklinkError("factory completion lock belongs to another OpenCode host")
         if status.slices is None or not any(row["status"] == "merged" for row in status.slices):
             raise WorklinkError("factory completion has no merged slice")
         if status.pr_draft:
@@ -5178,7 +5548,8 @@ async def _verify_factory_completion(
                 local_checkout=sandbox,
             ),
         )
-        evidence = validation.evidence
+        evidence = replace(validation.evidence, opencode_session_id=record.opencode_session_id,
+                           mcp_servers=record.mcp_servers, transcript=record.transcript or validation.evidence.transcript)
         _log_gate_flaky_tests(evidence)
         if evidence.issue != issue.issue_id:
             raise WorklinkError("factory evidence issue mismatch")
@@ -5325,7 +5696,7 @@ async def _verify_factory_completion(
         )
         if final_head != after_head:
             raise WorklinkError("factory checkout HEAD moved during publication verification")
-        evidence_path = _write_evidence(home, evidence)
+        evidence_path = _write_evidence(home, evidence, review_ready=True)
         return evidence_path, status.pr_url
     except Exception as exc:
         _write_evidence(
@@ -5952,6 +6323,33 @@ def _run_worklink_epic_under_lease(
     return result
 
 
+def _state_session_handle(state: WorklinkRunState) -> LaunchHandle | None:
+    if state.opencode_session_id is None:
+        return None
+    return LaunchHandle("opencode_daemon", state.opencode_session_id,
+                        opencode_session_id=state.opencode_session_id,
+                        launch_generation=state.launch_generation)
+
+
+def _write_session_failure(
+    home: Path, issue_id: int, attempt: int, backend: str, branch: str, checkout: str,
+    handle: LaunchHandle | None, error: BaseException, *, status: str = "failed",
+) -> Path | None:
+    from mimir_cultivate.opencode import redact_daemon_output
+
+    now = datetime.now(UTC).isoformat()
+    try:
+        return _write_evidence(home, WorklinkEvidence(
+            issue=issue_id, attempt=attempt, backend=backend, branch=branch, checkout=checkout,
+            started_at=now, finished_at=now, files_changed=[], diff_stat="", commands=[],
+            tests=None, pr_url=None, status=status, diff_observed=False,
+            failure_reason=redact_daemon_output(str(error))[:2048],
+            opencode_session_id=handle.opencode_session_id if handle else None))
+    except OSError:
+        _log_event("worklink_evidence_write_failed", issue_id=issue_id, attempt=attempt)
+        return None
+
+
 def _persist_run_state(
     home: Path,
     *,
@@ -5966,6 +6364,7 @@ def _persist_run_state(
     test_command: str | None,
     started_at: datetime,
     test_env: Mapping[str, str] | None = None,
+    session_handle: LaunchHandle | None = None,
 ) -> None:
     """Record the worker handle so a fresh controller can reattach (#561).
 
@@ -5977,8 +6376,10 @@ def _persist_run_state(
             issue_id=issue.issue_id,
             attempt=attempt,
             backend=backend_name,
-            compute_name=compute.name,
+            compute_name=handle.substrate if compute.name == "opencode_daemon" else compute.name,
             handle_substrate=handle.substrate,
+            opencode_session_id=(session_handle or handle).opencode_session_id,
+            launch_generation=(session_handle or handle).launch_generation,
             handle_identifier=handle.identifier,
             branch=lease.branch,
             base_ref=lease.base_ref,
@@ -5990,7 +6391,7 @@ def _persist_run_state(
             checkout=str(lease.path),
             process_start_ticks=handle.process_start_ticks,
             shim_pid=handle.shim_pid,
-            phase="spawned",
+            phase="admission_uncertain" if handle.substrate == "opencode_daemon" and handle.opencode_session_id is None else "spawned",
             test_env=dict(test_env or {}),
         ),
     )
@@ -7094,9 +7495,25 @@ def _publication_failed_validation(
 
 
 def _evidence_json(evidence: WorklinkEvidence) -> dict[str, Any]:
+    from .factory_control_output import parse_mcp_servers
+    from .backends.opencode import redact_daemon_output
+
     data = asdict(evidence)
     data["commands"] = [asdict(command) for command in evidence.commands]
     data["tests"] = asdict(evidence.tests) if evidence.tests else None
+    data["mcp_servers"] = list(parse_mcp_servers(evidence.mcp_servers))
+    def scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            return redact_daemon_output(value)
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(scrub(item) for item in value)
+        return value
+    data = scrub(data)
+    data["mcp_servers"] = list(parse_mcp_servers(data["mcp_servers"]))
     return data
 
 

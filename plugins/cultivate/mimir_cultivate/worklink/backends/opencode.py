@@ -1,4 +1,4 @@
-"""OpenCode CLI Worklink backend (chainlink #830)."""
+"""OpenCode daemon leaf backend and retained factory process helpers."""
 
 from __future__ import annotations
 
@@ -18,11 +18,9 @@ from mimir._reasoning_effort import validate_effort
 from mimir.config import model_spec_at_call_time
 from mimir_cultivate.opencode import (
     OpenCodeConfigError,
-    OpenCodeInvocation,
     opencode_model_from_agent_spec,
-    opencode_worker_documents,
-    reconcile_codex_auth,
-    resolve_opencode_invocation,
+    resolve_daemon_model,
+    redact_daemon_output,
 )
 from mimir.redaction import redact_text
 from mimir.otel_credentials import filter_otlp_env
@@ -34,6 +32,7 @@ from .base import (
     WorkOrder,
     blocked_reason_from_output,
     last_nonempty_line,
+    SessionRequest,
 )
 
 
@@ -104,65 +103,8 @@ Clock = Callable[[], float]
 
 
 @dataclass(frozen=True)
-class WorkerProjection:
-    path: str
-    document: bytes
-
-    def __post_init__(self) -> None:
-        if self.path not in {
-            ".config/opencode/opencode.json",
-            ".local/share/opencode/auth.json",
-        }:
-            raise ValueError("worker projection destination is not permitted")
-        if len(self.document) > 1024 * 1024:
-            raise ValueError("worker projection exceeds size limit")
-        if not isinstance(json.loads(self.document), dict):
-            raise ValueError("worker projection must be a JSON object")
-
-
-@dataclass(frozen=True)
-class WorklinkOpenCodeResolution:
-    invocation: OpenCodeInvocation
-    configured_model: str
-    model_diverged: bool
-    env: Mapping[str, str] = field(repr=False)
-
-
-def resolve_worklink_opencode_invocation(
-    env: Mapping[str, str],
-) -> WorklinkOpenCodeResolution:
-    """Resolve an OpenCode invocation consistently for every Worklink path."""
-    model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
-    dotenv_model_spec = model_spec_at_call_time(model_home)
-    configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
-    resolution_env = filter_otlp_env({**os.environ, **env})
-    resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
-    invocation = resolve_opencode_invocation(env=resolution_env)
-    configured_model = opencode_model_from_agent_spec(configured_model_spec)
-    model_diverged = invocation.model != configured_model
-    if model_diverged:
-        log.warning(
-            "Worklink OpenCode model %s differs from configured agent model %s",
-            invocation.model,
-            configured_model,
-        )
-    return WorklinkOpenCodeResolution(
-        invocation=invocation,
-        configured_model=configured_model,
-        model_diverged=model_diverged,
-        env=resolution_env,
-    )
-
-
-@dataclass(frozen=True)
 class OpenCodeBackend:
-    """Adapter for ``opencode run`` Worklink jobs.
-
-    The provider-agnostic coding substrate from the #830 pivot: opencode
-    routes to whichever model provider its own config selects, so per-leaf
-    worklink no longer cares which subscription executes the build. Runs
-    non-interactively in the leaf checkout via ``opencode run --dir``.
-    """
+    """Render a single daemon input and interpret its authoritative outcome."""
 
     bin: str = "opencode"
     extra_args: Sequence[str] = field(default_factory=tuple)
@@ -174,19 +116,15 @@ class OpenCodeBackend:
     def __post_init__(self) -> None:
         validate_extra_args(self.extra_args)
         validate_test_env(self.test_env)
+        if (not self.bash_allowlist or len(self.bash_allowlist) > 128
+                or any(not isinstance(rule, str) or not rule or rule.strip() == "*"
+                       or len(rule.encode()) > 1024 or any(char in rule for char in "\x00\r\n")
+                       for rule in self.bash_allowlist)):
+            raise ValueError("worklink opencode bash_allowlist requires explicit nonempty shell patterns")
 
     def refresh_codex_projections(self, spec: WorkSpec, env: Mapping[str, str]) -> WorkSpec:
-        """Use the just-reconciled token, not a pre-launch work-spec snapshot."""
-        if not spec.backend_config.get("codex") or "worker_projections" not in spec.backend_config:
-            return spec
-        invocation = resolve_worklink_opencode_invocation(env).invocation
-        if invocation.model != spec.backend_config["model"]:
-            raise OpenCodeConfigError("config_provider_selection")
-        documents = opencode_worker_documents(invocation, filter_otlp_env({**os.environ, **env}))
-        projections = [WorkerProjection(".config/opencode/opencode.json", documents.config_document)]
-        if documents.auth_document is not None:
-            projections.append(WorkerProjection(".local/share/opencode/auth.json", documents.auth_document))
-        return replace(spec, env=filter_otlp_env(spec.env), backend_config={**spec.backend_config, "worker_projections": projections})
+        """Compatibility hook: daemon login is independent and never projected."""
+        return replace(spec, env=filter_otlp_env(spec.env))
 
     def capabilities(self) -> Caps:
         return Caps(
@@ -207,79 +145,26 @@ class OpenCodeBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
-        binary = resolve_opencode_binary(self.bin)
         prompt = _prompt_for_order(order)
-        args = list(self.extra_args)
-        env = dict(order.env)
-        resolution = resolve_worklink_opencode_invocation(env)
-        invocation = resolution.invocation
-        resolution_env = resolution.env
-        args.extend(("-m", invocation.model))
-        override = resolution_env.get("MIMIR_WORKLINK_REASONING_EFFORT", "")
-        agent_effort = resolution_env.get("MIMIR_MODEL_REASONING_EFFORT", "")
-        effort_name = "MIMIR_WORKLINK_REASONING_EFFORT" if override else "MIMIR_MODEL_REASONING_EFFORT"
-        raw_effort = override or agent_effort
-        try:
-            effort = (
-                validate_effort("codex-plus", raw_effort)
-                if invocation.provider == "openai" else raw_effort
-            )
-        except ValueError as exc:
-            raise ValueError(f"{effort_name}: {exc}") from exc
-        variant = effort if effort and effort != "none" else None
-        variant_source = (
-            "worklink_override" if override else "agent"
-        ) if variant else "none"
-        if variant:
-            args.extend(("--variant", variant))
-        if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
-            env["OPENCODE_CONFIG"] = str(invocation.config_path)
-        for key in invocation.pass_env:
-            if key in os.environ:
-                env[key] = os.environ[key]
-        for key in invocation.remove_env:
-            # WorkSpec overrides an allowlisted parent environment; an empty
-            # value is required here because omission would inherit it again.
-            env[key] = ""
-        # Model selection is consumed above by the backend. Do not expose it to
-        # the executor or repository-controlled test processes it launches.
-        from mimir.tools._shell_env import scrub_model_selection_env
-
-        env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
+        model_home = order.env.get("MIMIR_HOME") or os.environ.get("MIMIR_HOME")
+        configured = model_spec_at_call_time(Path(model_home) if model_home else None)
+        values = {**os.environ, **order.env}
+        values.setdefault("MIMIR_MODEL_SPEC", configured)
+        reference = resolve_daemon_model(values)
+        allowlist = tuple(self.bash_allowlist)
+        model = f"{reference['providerID']}/{reference['id']}"
+        if self.extra_args:
+            raise ValueError("daemon leaf sessions do not accept CLI arguments")
         backend_config: dict[str, object] = {
-            "bin": binary,
-            "args": args,
-            "bash_allowlist": list(self.bash_allowlist),
-            "model": invocation.model,
-            "configured_model": resolution.configured_model,
-            "model_diverged": resolution.model_diverged,
-            "model_source": invocation.model_source,
-            "codex": invocation.provider == "openai" and resolution_env.get("MIMIR_MODEL_SPEC", "").startswith("codex-plus:"),
-            "variant": variant,
-            "variant_source": variant_source,
+            "bash_allowlist": list(allowlist),
+            "model": model,
+            "variant": reference.get("variant"),
+            "variant_source": ("none" if "variant" not in reference else
+                               "model_spec" if "#" in values["MIMIR_MODEL_SPEC"] else
+                               "worklink_override" if values.get("MIMIR_WORKLINK_REASONING_EFFORT") else "agent"),
             "test_env": dict(self.test_env),
+            "pass_env": tuple(self.test_env),
         }
-        enabled = _coding_enabled()
-        if enabled:
-            documents = opencode_worker_documents(invocation, resolution_env)
-            projections = [
-                WorkerProjection(
-                    ".config/opencode/opencode.json", documents.config_document
-                )
-            ]
-            if documents.auth_document is not None:
-                projections.append(
-                    WorkerProjection(
-                        ".local/share/opencode/auth.json", documents.auth_document
-                    )
-                )
-            env = {
-                "OPENCODE_PERMISSION": _permission_override(self.bash_allowlist),
-            }
-            backend_config["worker_projections"] = projections
-            backend_config["pass_env"] = tuple(self.test_env)
-        env.update(self.test_env)
-        scrub_model_selection_env(env)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -291,12 +176,10 @@ class OpenCodeBackend:
             test_command=test_command,
             backend=self.name,
             timeout_s=order.timeout_s,
-            env=filter_otlp_env(env),
+            env=dict(self.test_env),
             backend_config=backend_config,
             local_checkout=order.checkout,
-            local_argv=_local_argv(
-                binary, args, order.checkout, prompt, fd_anchored=enabled
-            ),
+            session_request=SessionRequest("leaf", reference, prompt, allowlist),
             output_root=order.transcript_root,
         )
 
@@ -316,51 +199,8 @@ class OpenCodeBackend:
         env: Mapping[str, str] | None = None,
         refreshed_path: Path | None = None,
     ) -> ComputeResult:
-        """Retry transient SQLite contention only before the run can mutate work."""
-        max_attempts = max(1, max_attempts)
-        initial_backoff_s = max(0.0, initial_backoff_s)
-        startup_window_s = max(0.0, startup_window_s)
-        initial_checkout = checkout_snapshot()
-        result: ComputeResult | None = None
-        for attempt in range(1, max_attempts + 1):
-            invoked_at = clock()
-            # A refreshed token must reach the other store even when the run
-            # fails, times out or is cancelled. Each retry is a new invocation.
-            if codex:
-                reconcile_codex_auth(env)
-            try:
-                result = await invoke()
-            finally:
-                if codex:
-                    reconcile_codex_auth(env, refreshed_path=refreshed_path)
-            elapsed_s = max(0.0, clock() - invoked_at)
-            retryable = (
-                _is_sqlite_contention(result)
-                and elapsed_s <= startup_window_s
-                and checkout_snapshot() == initial_checkout
-            )
-            if not retryable:
-                if attempt > 1 and result.exit_code == 0:
-                    _emit_startup_contention(
-                        event_logger, issue_id, attempt, max_attempts, "succeeded"
-                    )
-                return result
-
-            if attempt < max_attempts:
-                _emit_startup_contention(
-                    event_logger, issue_id, attempt, max_attempts, "retrying"
-                )
-                await sleeper(initial_backoff_s * (2 ** (attempt - 1)))
-
-        assert result is not None
-        _emit_startup_contention(
-            event_logger, issue_id, max_attempts, max_attempts, "exhausted"
-        )
-        detail = result.stderr.rstrip()
-        stderr = f"{detail}\n{STARTUP_CONTENTION_EXHAUSTED_REASON}" if detail else (
-            STARTUP_CONTENTION_EXHAUSTED_REASON
-        )
-        return replace(result, stderr=stderr)
+        """Compatibility hook: recovery observes the owned session, never re-admits."""
+        return await invoke()
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
@@ -372,42 +212,47 @@ class OpenCodeBackend:
                 command=list(result.command),
                 exit_code=None,
                 status="backend_error",
-                stdout=result.stdout,
-                stderr=result.stderr,
+                stdout=redact_daemon_output(result.stdout),
+                stderr=redact_daemon_output(result.stderr),
                 timed_out=False,
                 output_overflow=False,
                 stdout_path=result.stdout_path,
                 stderr_path=result.stderr_path,
             )
-            return RawResult(-1, transcript_file, "backend_error", result.launch_error)
+            return RawResult(-1, transcript_file, "backend_error", redact_daemon_output(result.launch_error),
+                             opencode_session_id=result.handle.opencode_session_id if result.handle else None)
 
-        blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
-        permission_refusal = _permission_refusal_reason(
-            result.stdout, result.stderr, self.bash_allowlist, result.exit_code
-        )
-        status = "output_overflow" if result.output_overflow else (
-            "blocked" if blocked_reason else (
-                "failed" if permission_refusal else (
-                    "timeout" if result.timed_out else _status_from_output(
-                        result.exit_code, result.stdout, result.stderr
-                    )
-                )
-            )
-        )
-        error = (
-            "backend output exceeded configured Worklink limit"
-            if result.output_overflow
-            else blocked_reason or permission_refusal or _error_from_status(
-                status, result.stdout, result.stderr, result.command
-            )
-        )
+        stdout, stderr = redact_daemon_output(result.stdout), redact_daemon_output(result.stderr)
+        outcome = result.session_outcome
+        typed_error = result.session_error or (outcome.error if outcome else None)
+        blocked_reason = None
+        retry_after = None
+        if result.output_overflow:
+            status, error = "output_overflow", "backend output exceeded configured Worklink limit"
+        elif result.timed_out:
+            status, error = "timeout", "Worklink session deadline exceeded"
+        elif outcome is None:
+            status, error = "backend_error", "OpenCode session outcome unavailable"
+        elif typed_error is not None:
+            status = ("backend_error" if outcome.execution_state == "incomplete" and typed_error.type == "backend_error"
+                      else session_error_status(typed_error.type))
+            error = ": ".join((redact_daemon_output(typed_error.type).encode()[:128].decode("utf-8", "ignore"),
+                               redact_daemon_output(typed_error.message).encode()[:2048].decode("utf-8", "ignore")))
+            retry = typed_error.retry_after_ms
+            if type(retry) is int and 0 < retry <= 8 * 86400 * 1000:
+                retry_after = retry
+        elif outcome.execution_state == "succeeded":
+            blocked_reason = blocked_reason_from_output(stdout, stderr)
+            status, error = ("blocked", blocked_reason) if blocked_reason else ("success", None)
+        else:
+            status, error = "backend_error", "OpenCode session has no verified successful completion"
         write_transcript(
             transcript_file,
             command=list(result.command),
             exit_code=result.exit_code,
             status=status,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=stdout,
+            stderr=stderr,
             timed_out=result.timed_out,
             output_overflow=result.output_overflow,
             stdout_path=result.stdout_path,
@@ -420,7 +265,24 @@ class OpenCodeBackend:
             error,
             blocked_reason,
             output_overflow=result.output_overflow,
+            opencode_session_id=outcome.opencode_session_id if outcome else (
+                result.handle.opencode_session_id if result.handle else None),
+            retry_after_ms=retry_after,
         )
+
+
+_QUOTA_TYPES = frozenset({
+    "provider.quota", "provider.rate-limit", "provider.budget-limit", "provider.chatgpt-limit",
+    "provider.free-limit", "provider.go-limit", "provider.model-budget-limit",
+})
+
+
+def session_error_status(error_type: str) -> str:
+    if error_type == "provider.auth":
+        return "auth_error"
+    if error_type in _QUOTA_TYPES:
+        return "quota_exhausted"
+    return "failed"
 
 
 def _coding_enabled() -> bool:
@@ -484,30 +346,6 @@ def validate_extra_args(args: Sequence[str]) -> None:
 
 def _prompt_for_order(order: WorkOrder) -> str:
     return order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
-
-
-def _local_argv(
-    bin_name: str,
-    args: Sequence[str],
-    checkout: Path,
-    prompt: str,
-    *,
-    fd_anchored: bool = False,
-) -> tuple[str, ...]:
-    # ``--`` so a prompt that begins with ``-`` is never parsed as a flag.
-    directory = "." if fd_anchored else str(checkout)
-    return (bin_name, "run", "--dir", directory, *args, "--", prompt)
-
-
-def _permission_override(bash_allowlist: Sequence[str]) -> str:
-    # OpenCode evaluates the last matching rule. Keep the deny first and append
-    # only explicit operator grants so unmatched commands cannot prompt or run.
-    bash = {"*": "deny"}
-    bash.update((pattern, "allow") for pattern in bash_allowlist)
-    return json.dumps({
-        "external_directory": {"/**": "deny"},
-        "bash": bash,
-    }, separators=(",", ":"))
 
 
 def _permission_refusal_reason(
@@ -580,7 +418,7 @@ def _default_transcript_root() -> Path:
 
 
 def _bounded_transcript_tail(value: str, limit: int) -> str:
-    scrubbed = redact_text(value)
+    scrubbed = redact_daemon_output(value)
     encoded = scrubbed.encode("utf-8")
     if len(encoded) <= limit:
         return scrubbed
