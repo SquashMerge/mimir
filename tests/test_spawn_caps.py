@@ -173,9 +173,11 @@ def test_reset_clears_loop_bound_state() -> None:
 
 def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from mimir_cultivate import contained_checkout, contained_execution
+    from mimir_cultivate.worklink import daemon_health
     from mimir_cultivate.worklink.compute import ComputeResult
     from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome
 
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     home = tmp_path / "home"
     seed = tmp_path / "seed"
     home.mkdir()

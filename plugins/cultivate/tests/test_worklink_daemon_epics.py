@@ -675,7 +675,7 @@ async def test_completed_observation_cleanup_failure_has_actual_session_evidence
 
 
 @pytest.mark.parametrize("ending", ["completed", "needs-human", "foreign"])
-async def test_budget_park_requalifies_factory_after_session_cancellation(tmp_path, monkeypatch, ending):
+async def test_budget_park_requalifies_factory_after_session_cancellation(tmp_path, monkeypatch, supervisor_clock, ending):
     from mimir_cultivate.worklink import orchestrator
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
@@ -687,9 +687,16 @@ async def test_budget_park_requalifies_factory_after_session_cancellation(tmp_pa
             await real_cancel(selected)
             cancelled = True
         monkeypatch.setattr(compute, "cancel", cancel)
-        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 0.06)
         winning = replace(record.status, status=ending if ending != "foreign" else "running",
             lock_session="ses_foreign" if ending == "foreign" else handle.identifier)
+        def status(*args, **kwargs):
+            if cancelled:
+                return winning
+            # Cross the 100-second supervisor budget's park boundary only once
+            # its owned host lock has been observed. HTTP and cleanup keep real
+            # clocks; their scheduling must not decide when the budget fires.
+            supervisor_clock.now = 60.0
+            return record.status
         async def verify(**kwargs):
             assert kwargs["record"].status == winning
             return tmp_path / "verified.json", "https://github.com/owner/repo/pull/1"
@@ -701,15 +708,17 @@ async def test_budget_park_requalifies_factory_after_session_cancellation(tmp_pa
             issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)),
             claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None, transition_issue=lambda *a, **kw: None),
-            backend=SimpleNamespace(status=lambda *a, **kw: winning if cancelled else record.status,
+            backend=SimpleNamespace(status=status,
                 heartbeat=lambda *a, **kw: None, terminal=terminal, poll_interval_s=0.001),
             compute=compute, factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None,
             started_at=datetime.now(UTC))
         if ending == "foreign":
             with pytest.raises(WorklinkError, match="owner changed during cancellation"):
-                await asyncio.wait_for(invocation, 3)
+                await asyncio.wait_for(invocation, 10)
         else:
-            result = await asyncio.wait_for(invocation, 3)
+            # Hang guard remains below the session's 30-second work deadline;
+            # crossing the budget is proved by the controlled clock above.
+            result = await asyncio.wait_for(invocation, 10)
             assert result.status == ("review_ready" if ending == "completed" else "needs-human")
             assert load_factory_record(tmp_path, record.run_id).status == winning
         assert cancelled

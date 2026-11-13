@@ -7,13 +7,12 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 import subprocess
-from types import SimpleNamespace
 
 import pytest
 
 from mimir_cultivate.repository import RepositoryInventory
 from mimir_cultivate.worklink import ci_gate, control, orchestrator
-from mimir_cultivate.worklink.backends.base import RawResult
+from mimir_cultivate.worklink.backends.base import LaunchHandle, RawResult
 from mimir_cultivate.worklink.backends.base import WorkOrder
 from mimir_cultivate.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir_cultivate.worklink.checkout import CheckoutLease
@@ -152,6 +151,7 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
         base_ref: str = "main"
         timeout_s: int = 5
         backend_config: dict | None = None
+        factory_credential_settings: tuple[tuple[str, str], ...] = ()
 
     class Backend:
         name = "opencode"
@@ -165,7 +165,7 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
 
     class Compute:
         async def launch(self, spec):
-            return SimpleNamespace(identifier="42")
+            return LaunchHandle("local_subprocess", "42")
 
         async def wait(self, handle, timeout):
             return ComputeResult(0, "", "")

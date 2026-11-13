@@ -697,13 +697,20 @@ async def _spawn_open_code_impl(
 
     try:
         try:
-            reference = resolve_daemon_model(dict(os.environ), model)
-            invocation = OpenCodeInvocation(
-                model=f"{reference['providerID']}/{reference['id']}", provider=reference['providerID'],
-                model_source="explicit" if model else "agent_model", config_path=config_path,
-                auth_path=auth_path, auth_type=None, scrubber=scrubber)
-            scrubber.add_path(seed)
-            scrubber.add_path(artifact_base)
+            from .worklink.daemon_gate import workload_refusal
+            from .worklink.daemon_health import daemon_health
+
+            reason = workload_refusal(daemon_health(dict(os.environ)))
+            if reason is not None:
+                terminal = SpawnTerminalResult("refused", None, reason, "spawn_open_code_configuration_refused")
+            else:
+                reference = resolve_daemon_model(dict(os.environ), model)
+                invocation = OpenCodeInvocation(
+                    model=f"{reference['providerID']}/{reference['id']}", provider=reference['providerID'],
+                    model_source="explicit" if model else "agent_model", config_path=config_path,
+                    auth_path=auth_path, auth_type=None, scrubber=scrubber)
+                scrubber.add_path(seed)
+                scrubber.add_path(artifact_base)
         except OpenCodeAuthError as exc:
             terminal = classify_spawn_terminal_state(authentication_reason=exc.reason_code)
         except OpenCodeConfigError as exc:

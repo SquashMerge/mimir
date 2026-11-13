@@ -170,6 +170,88 @@ def test_gate_main_refuses_missing_login(tmp_path, monkeypatch, capsys):
     assert env["GITHUB_TOKEN"] not in output.out + output.err
 
 
+@pytest.mark.parametrize(("state", "login", "reason"), [
+    ("down", "missing", "daemon_down"),
+    ("ready", "missing", "login_missing"),
+    ("ready", "expired_no_refresh", "login_expired"),
+])
+@pytest.mark.parametrize("workload", ["leaf", "factory", "spawn"])
+@pytest.mark.asyncio
+async def test_workloads_refuse_with_real_daemon_health(tmp_path, monkeypatch, state, login, reason, workload):
+    from functools import partial
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+    from mimir_cultivate import opencode
+    from mimir.tools.registry import _spawn_reset_for_tests, set_spawn_config
+
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login=login)
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    payload = json.loads(paths.status.read_text())
+    payload.update(daemon_state=state, daemon_version="2.2.7" if state == "ready" else None)
+    paths.status.write_text(json.dumps(payload))
+    monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
+    observed = health.daemon_health(dict(os.environ))
+    assert observed["daemon_enabled"] is True and observed["ok"] is False
+    assert observed["login_state"] == login
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unhealthy workload reached claim, checkout, initialization or launch")
+
+    if workload == "spawn":
+        _spawn_reset_for_tests()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        set_spawn_config({"default_cwd": tmp_path, "artifact_root": tmp_path / "artifacts"})
+        try:
+            result = json.loads(await opencode._spawn_open_code_impl(
+                "build", contained_runner=forbidden, checkout_factory=forbidden))
+            assert result["status"] == "refused" and result["reason_code"] == reason
+            assert result["opencode_session_id"] is None
+        finally:
+            _spawn_reset_for_tests()
+        return
+
+    description = """Acceptance criteria:
+- [ ] Build the fix.
+Review criteria:
+Verify the fix.
+Worklink notes:
+- Scope: fixture
+- Out of scope: deployment
+- Suggested test command: pytest
+"""
+    issue = orchestrator.IssueContext(2138, "Fix", description, {"worklink:ready", "worklink"})
+    if workload == "factory":
+        issue.labels.add("worklink:epic")
+    # Real backend/compute selection and admission policy; only tracker and Git
+    # metadata are fixtures. Any side effect after preflight fails the test.
+    monkeypatch.setattr(orchestrator.ChainlinkIssueReader, "read", lambda self, id: issue)
+    monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *a, **kw: "https://github.com/acme/widget.git")
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", forbidden)
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", forbidden)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", forbidden)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(OpenCodeBackend())
+    registry.register(FeatureFactoryBackend())
+    registry.select_compute = lambda **kw: LocalSubprocessComputeBackend()
+    worker = orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path, registry=registry)
+    result = (await worker.run_epic(2138) if workload == "factory"
+              else await worker.run(2138, backend_name="opencode"))
+    assert result.status == "refused" and result.reason == reason
+    assert result.attempt is None
+
+
+@pytest.mark.parametrize("payload", [{}, {"ok": False}, {"ok": "true"}, {"ok": 1}, {"daemon_enabled": False}])
+def test_workload_health_requires_explicit_readiness(payload):
+    assert gate.workload_refusal(payload) == "daemon_down"
+
+
+def test_workload_health_preserves_stale_token_reason():
+    assert gate.workload_refusal({"ok": False, "daemon_error": "bot_token_stale"}) == "bot_token_stale"
+
+
 @pytest.mark.parametrize("login", sorted(health.LOGIN_STATES))
 def test_gate_local_login_policy(tmp_path, monkeypatch, login):
     paths, ids, env = fixture_status(tmp_path, monkeypatch, login=login)

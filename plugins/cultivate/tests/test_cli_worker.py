@@ -107,18 +107,24 @@ def test_unselected_cli_does_not_import_cultivate() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_opencode_bootstrap_preserves_merge_and_home(
+def test_opencode_bootstrap_reports_service_owned_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     from mimir import scaffold_docker
 
-    calls: list[Path] = []
-    monkeypatch.setattr(scaffold_docker, "opencode_config_path", lambda home: home / "config")
-    monkeypatch.setattr(scaffold_docker, "ensure_opencode_config", lambda path: calls.append(path) or True)
+    # The daemon owns its private config and native login. --home is retained
+    # only for CLI compatibility and must not seed agent-owned config or auth.
+    def forbidden(*args):
+        pytest.fail("bootstrap accessed agent-owned OpenCode config")
+    monkeypatch.setattr(scaffold_docker, "opencode_config_path", forbidden)
+    monkeypatch.setattr(scaffold_docker, "ensure_opencode_config", forbidden)
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     main(["opencode-bootstrap", "--home", str(tmp_path)])
-    assert calls == [tmp_path / "config"]
-    assert capsys.readouterr().out == f"updated {tmp_path / 'config'}\n"
+    output = capsys.readouterr().out
+    assert "generated privately by the Worklink daemon service" in output
+    assert "docker compose exec --user worklink" in output
+    assert "/usr/local/bin/worklink-opencode-login" in output
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_operator_scripts_use_provider_records(tmp_path: Path) -> None:

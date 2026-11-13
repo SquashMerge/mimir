@@ -22,6 +22,7 @@ CONTAINER = f"mimir-worklink-identity-{os.getpid()}"
 async def prove_offline(directory: Path) -> dict[str, object]:
     """Exercise production session consumers, not native UID isolation or a provider."""
     from types import SimpleNamespace
+    from unittest.mock import patch
     import uuid
     from mimir_cultivate import contained_execution, opencode
     from mimir_cultivate.worklink.backends.base import LaunchHandle, WorkOrder
@@ -93,10 +94,13 @@ async def prove_offline(directory: Path) -> dict[str, object]:
         previous = _STATE["spawn_config"]
         try:
             set_spawn_config({"default_cwd": seed, "artifact_root": directory / "artifacts"})
-            spawned = json.loads(await opencode._spawn_open_code_impl(
-                "offline spawn", str(seed), 30, model="openai/fixture-model", agent="build",
-                contained_runner=contained_execution.execute_contained_session,
-                checkout_factory=lambda *args, **kwargs: Checkout()))
+            # Like Executor above, readiness belongs to this synthetic offline
+            # fixture. This proof does not establish native login validity.
+            with patch("mimir_cultivate.worklink.daemon_health.daemon_health", return_value={"ok": True}):
+                spawned = json.loads(await opencode._spawn_open_code_impl(
+                    "offline spawn", str(seed), 30, model="openai/fixture-model", agent="build",
+                    contained_runner=contained_execution.execute_contained_session,
+                    checkout_factory=lambda *args, **kwargs: Checkout()))
         finally:
             _STATE["spawn_config"] = previous
         assert spawned["status"] == "succeeded" and spawned["proposal"]
@@ -111,7 +115,7 @@ async def prove_offline(directory: Path) -> dict[str, object]:
             {"action": "shell", "resource": "*", "effect": "allow"}]
         assert creates[1]["agent"] == "build"
         return {"leaf_session": raw.opencode_session_id, "spawn_session": spawned["opencode_session_id"],
-                "creates": creates, "uid_isolation_proven": False}
+                "creates": creates, "uid_isolation_proven": False, "native_login_proven": False}
 
 
 def run(args: list[str], *, input_text: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
