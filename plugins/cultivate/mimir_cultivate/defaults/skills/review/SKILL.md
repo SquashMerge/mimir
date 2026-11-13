@@ -180,8 +180,13 @@ Name the specific question before you fetch, and fetch only what answers it.
 When you do fetch, do it **last**:
 1. Submit every review that doesn't need external evidence first. In a
    multi-PR turn, finish and submit each such review before any fetch.
-2. On a poller turn, don't fetch. Submit `COMMENTED` with the trusted findings,
-   and name the upstream question that remains for the operator.
+2. On a poller turn, don't fetch. Submit `REQUEST_CHANGES` with the trusted
+   findings, and name the upstream question that remains for the operator. Do
+   not use `COMMENTED` for this. A current-head `COMMENTED` review means "only
+   CI is outstanding", and the CI-completion follow-up approves it once checks
+   go green. That would approve the bump with the question still open. A
+   `REQUEST_CHANGES` review without the poller's CI-only marker is never
+   approved by that follow-up.
 3. On an interactive turn, fetch. If a trust prompt follows, submit the pending
    review once the operator replies `trust`.
 
@@ -208,11 +213,13 @@ Write a review that covers:
 Approval is allowed only when the reviewed head has at least one check and
 every check run and commit status is complete and passing (`success`, `neutral`,
 or `skipped`). The submission tools enforce this on the exact head. While CI
-is pending, submit `COMMENTED` with the code findings and withhold approval;
-request changes immediately for blocking findings. A `pr_checks_completed`
-event is a CI follow-up, not a fresh review: if the head is unchanged and CI
-green, approve without a full re-review; if red, request changes naming failed
-checks and the first failing test or log excerpt. Infrastructure reruns are
+is pending, and CI is the only thing outstanding, submit `COMMENTED` with the
+code findings and withhold approval. Request changes immediately for blocking
+findings, or for any open review question that green CI would not settle (see
+3a). A `pr_checks_completed` event is a CI follow-up, not a fresh review: if
+the head is unchanged and CI green, approve without a full re-review; if red,
+request changes naming the failed checks, plus the first failing test when
+`pr_checks` already shows it. Do not read CI logs to find one. Infrastructure reruns are
 limited to one per head by the poller; after that, post a comment for the
 operator rather than requesting another rerun.
 
