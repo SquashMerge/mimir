@@ -220,6 +220,84 @@ async def _boundary_create(boundary):
     return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation=boundary.generation)
 
 
+async def test_epic_nested_checkout_crosses_real_executor_and_controller(session_boundary, tmp_path, monkeypatch, request):
+    import tempfile
+    from mimir_cultivate.worklink import daemon_health
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+
+    boundary = session_boundary
+    errors = []
+    operation = worker_exec._handle_session
+    def observed(*args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except Exception as exc:
+            errors.append(str(exc))
+            raise
+    monkeypatch.setattr(worker_exec, "_handle_session", observed)
+    temporary = tempfile.TemporaryDirectory(prefix="epic-executor-", dir="/tmp")
+    request.addfinalizer(temporary.cleanup)
+    root = Path(temporary.name) / "factory-checkouts"
+    outer = root / "repo/41-2/checkout"
+    sandbox = outer / ".factory-sandboxes/chainlink-41"
+    sandbox.mkdir(parents=True)
+    root.chmod(0o750)
+    (root / "repo").chmod(0o750)
+    outer.chmod(0o2770)
+    outer.parent.chmod(0o2700)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True, "launch_generation": boundary.generation})
+    client = WorkerClient.for_path_checkout(sandbox, issue_id=41, attempt=2, run_uid=boundary.identities.worklink_uid)
+    monkeypatch.setattr(client, "_connect", boundary.connect)
+    spec = FeatureFactoryBackend().work_spec(WorkOrder(41, sandbox, "ignored", None, 30,
+        {"MIMIR_MODEL_SPEC": "codex-plus:gpt-test#high", "MIMIR_WORK_ITEM_JSON":
+         json.dumps({"run_id": "chainlink-41", "title": "epic", "body": "build"})}),
+        attempt=2, repo_url="repo", base_ref="main", branch="feature/chainlink-41", test_command="pytest")
+    backend = OpenCodeDaemonComputeBackend(client=client)
+    try:
+        handle = await backend.launch(spec)
+    except RuntimeError as exc:
+        pytest.fail(f"synthetic executor refused epic: {errors[:3]} ({exc})")
+    create = next(body for method, path, _, body in boundary.daemon.requests if method == "POST" and path == "/api/session")
+    assert create["location"] == {"directory": str(sandbox)}
+    assert create["model"] == {"providerID": "openai", "id": "gpt-test", "variant": "high"}
+    assert create["permissions"] == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        *[{"action": "read", "resource": name, "effect": "deny"} for name in (".env", "**/.env", "**/.env.*")]]
+    assert next(body for _, path, _, body in boundary.daemon.requests if path.endswith("/command")) == {
+        "name": "feature", "text": "--autonomous --max-retries 5 chainlink-41"}
+    boundary.daemon.finish(handle.identifier)
+    result = await backend.wait(handle, 30)
+    assert result.session_outcome.execution_state == "succeeded"
+    assert result.handle.opencode_session_id == handle.identifier
+    await backend.cancel(handle)
+    await backend.cleanup(handle)
+    _assert_session_retired(SimpleNamespace(checkout=sandbox, records=boundary.records,
+                                          generation=boundary.generation), handle)
+    assert stat.S_IMODE(outer.parent.stat().st_mode) == 0o2750
+
+
+@pytest.mark.parametrize("relative", ["checkout", "checkout/.factory-sandboxes/chainlink-42",
+                                      "checkout/.factory-sandboxes/41"])
+async def test_epic_rpc_refuses_nonmatching_sandbox_before_api(session_boundary, tmp_path, monkeypatch, relative):
+    from dataclasses import asdict
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+
+    root = tmp_path / "factory-checkouts"
+    path = root / "repo/41-2" / relative
+    path.mkdir(parents=True)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    client = WorkerClient.for_path_checkout(path, issue_id=41, attempt=2, run_uid=session_boundary.identities.worklink_uid)
+    monkeypatch.setattr(client, "_connect", session_boundary.connect)
+    with pytest.raises(RuntimeError, match="session executor"):
+        await client._session_rpc("session_create", {"generation": session_boundary.generation,
+            "request": asdict(SessionRequest("epic", {"providerID": "openai", "id": "test"},
+                                             "--autonomous --max-retries 5 chainlink-41")),
+            "timeout_s": 30, "pass_env": {}, "git_settings": []})
+    assert not any(path == "/api/session" for _, path, _, _ in session_boundary.daemon.requests)
+
+
 def _assert_session_retired(boundary, handle):
     witnesses = list(boundary.records.glob(f"*.{handle.opencode_session_id}.retired.json"))
     assert len(witnesses) == 1
@@ -535,15 +613,10 @@ def test_checkout_authorization_cannot_be_constructed_by_a_client(tmp_path: Path
 
 
 def test_worker_projection_has_fixed_destination_json_and_size_contract() -> None:
-    projection = WorkerProjection(".config/opencode/opencode.json", b'{"model":"x"}')
-    assert json.loads(projection.document) == {"model": "x"}
-    WorkerProjection(".local/share/opencode/auth.json", b"{}")
-    with pytest.raises(ValueError, match="destination"):
-        WorkerProjection("arbitrary.json", b"{}")
-    with pytest.raises(json.JSONDecodeError):
-        WorkerProjection(".config/opencode/opencode.json", b"invalid")
-    with pytest.raises(ValueError, match="size"):
-        WorkerProjection(".config/opencode/opencode.json", b" " * (MAX_PROJECTION_BYTES + 1))
+    for path in (".config/opencode/opencode.json", ".local/share/opencode/auth.json", "arbitrary.json"):
+        for document in (b"{}", b"invalid", b" " * (MAX_PROJECTION_BYTES + 1)):
+            with pytest.raises(ValueError, match="destination"):
+                WorkerProjection(path, document)
 
 
 def test_worker_clients_resolve_the_default_socket_at_call_time(
@@ -688,12 +761,9 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     )
     process = await client.launch(
         local_checkout=checkout,
-        argv=["opencode", "run", "--dir", "."],
-        env={"OPENCODE_PERMISSION": "{}"},
-        projections=[
-            WorkerProjection(".config/opencode/opencode.json", b'{"model":"provider/model"}'),
-            WorkerProjection(".local/share/opencode/auth.json", b'{"provider":{"token":"x"}}'),
-        ],
+        argv=["python3", "-c", "pass"],
+        env={},
+        projections=[],
         identifier=str(uuid.uuid4()),
         timeout_s=30,
     )
@@ -705,10 +775,7 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     assert request["run_uid"] == (synthetic_worklink_identities.worklink_uid if factory else 1002)
     assert set(request) == worker_exec._PATH_LAUNCH_FIELDS
     assert fd_counts == [2]
-    assert [item["path"] for item in request["projections"]] == [
-        ".config/opencode/opencode.json",
-        ".local/share/opencode/auth.json",
-    ]
+    assert request["projections"] == []
 
 
 @pytest.mark.asyncio
@@ -1028,7 +1095,7 @@ def test_path_checkout_accepts_group_checkout_without_0700_boundary(
         os.close(fd)
 
 
-def test_project_home_completes_partial_writes_and_applies_modes(tmp_path: Path, monkeypatch) -> None:
+def test_retired_home_projection_is_refused_before_any_write(tmp_path: Path, monkeypatch) -> None:
     document = json.dumps({"payload": "x" * 10000})
     real_write = os.write
     writes: list[int] = []
@@ -1041,15 +1108,12 @@ def test_project_home_completes_partial_writes_and_applies_modes(tmp_path: Path,
 
     monkeypatch.setattr(worker_exec.os, "write", partial)
     monkeypatch.setattr(worker_exec.os, "chown", lambda *args, **kwargs: None)
-    worker_exec._project_home(
-        tmp_path,
-        [{"path": ".config/opencode/opencode.json", "document": document}],
-    )
+    with pytest.raises(RuntimeError, match="projection"):
+        worker_exec._project_home(
+            tmp_path, [{"path": ".config/opencode/opencode.json", "document": document}])
     target = tmp_path / ".config/opencode/opencode.json"
-    assert target.read_text() == document
-    assert len(writes) > 2
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    assert not target.exists()
+    assert writes == []
 
 
 def test_repo_test_uv_cache_seed_copies_cache_and_tolerates_missing_source(
@@ -2769,7 +2833,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
         monkeypatch.setattr(os, name, lambda *a, **kw: None)
     monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: None)
 
-    monkeypatch.setattr(worker_exec, "_prepare_factory_runtime", lambda home: events.append("runtime"))
+    assert not hasattr(worker_exec, "_prepare_factory_runtime")
 
     payload = ["factory-payload", "--dir", "a directory", "--", "$(not-a-shell)"]
     factory_request["argv"] = payload.copy()
@@ -2793,8 +2857,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
         assert events == [
             ("gid", (observed.worklink_gid,) * 3),
             ("uid", (observed.worklink_uid,) * 3),
-            "runtime",
-        ], "supervisor execution happened before identity drop/runtime setup"
+        ], "supervisor execution happened before identity drop"
         # supervise() owns prctl-before-payload; its independent tests live in
         # test_worklink_factory_supervisor, not this mocked exec boundary.
         events.append("supervisor-exec")

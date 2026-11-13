@@ -209,7 +209,10 @@ def reattach_inflight_worklink_runs(
             emit("worklink_reattach_dispatch_failed", **failure)
         factory_records = [
             record for record in listing.records
-            if factory_process_is_verified_dead(record)
+            if (factory_process_is_verified_dead(record) or (
+                record.handle is not None and record.handle.substrate == "opencode_daemon"
+                and record.opencode_session_id == record.handle.opencode_session_id
+                and record.opencode_session_id is not None))
             and record.controller_phase not in {"failed", "parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)
         ]

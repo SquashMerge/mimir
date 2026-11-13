@@ -50,7 +50,8 @@ def _operator_stop_path(home: Path, issue_id: int) -> Path:
     return runs_dir(home).parent / "operator-stops" / f"{issue_id}.json"
 
 
-def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | None) -> bool:
+def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | None, *,
+                            opencode_session_id: str | None = None) -> bool:
     """Only the stopped issue's exact claim attempt may use this marker."""
     if home is None or attempt is None:
         return False
@@ -58,13 +59,28 @@ def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | Non
         data = json.loads(_operator_stop_path(home, issue_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
+    return bool(isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
+                and (opencode_session_id is None or data.get("opencode_session_id") == opencode_session_id))
 
 
-def _mark_operator_stop(home: Path, issue_id: int, attempt: int) -> None:
+def _mark_operator_stop(home: Path, issue_id: int, attempt: int, *, opencode_session_id: str | None = None) -> None:
     path = _operator_stop_path(home, issue_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, {"issue_id": issue_id, "attempt": attempt})
+    atomic_write_json(path, {"issue_id": issue_id, "attempt": attempt,
+                            **({"opencode_session_id": opencode_session_id} if opencode_session_id is not None else {})})
+
+
+def clear_legacy_factory_stop(home: Path, issue_id: int, attempt: int) -> None:
+    """After old-host quiescence, do not carry an unscoped legacy stop into a new host."""
+    with _claim_mutex(home):
+        path = _operator_stop_path(home, issue_id)
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        if (isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
+                and "opencode_session_id" not in data):
+            path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -364,6 +380,43 @@ def stop_worklink(
             uncertain = False
             for factory in factories:
                 problem = None
+                if factory.handle is not None and factory.handle.substrate == "opencode_daemon":
+                    from .compute import OpenCodeDaemonComputeBackend
+                    from .worker_client import WorkerClient
+                    from .identities import get_identities
+                    from .orchestrator import _require_factory_status, _write_factory_host_evidence
+                    from .backends.feature_factory import FeatureFactoryBackend
+                    from .factory_state import load_factory_record
+
+                    client = WorkerClient.for_path_checkout(Path(factory.sandbox), issue_id=issue_id,
+                        attempt=factory.attempt, run_uid=get_identities().worklink_uid)
+                    backend = FeatureFactoryBackend(entrypoint=factory.launcher)
+                    try:
+                        actual = factory.handle.opencode_session_id
+                        before = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
+                        _require_factory_status(before, factory)
+                        if factory.opencode_session_id != actual or factory.session != actual or before.lock_session not in {None, actual}:
+                            raise RuntimeError("factory host ownership changed")
+                        _mark_operator_stop(home, issue_id, factory.attempt, opencode_session_id=actual)
+                        asyncio.run(OpenCodeDaemonComputeBackend(client=client).cancel(factory.handle))
+                        after = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
+                        _require_factory_status(after, factory)
+                        latest = load_factory_record(home, factory.run_id)
+                        if after.lock_session not in {None, actual} or latest is None or latest.handle != factory.handle:
+                            raise RuntimeError("factory host ownership changed during stop")
+                    except (RuntimeError, OSError, ValueError):
+                        _write_factory_host_evidence(home, factory, "failed", "session cancellation or ownership unverified")
+                        uncertain = True
+                        problems.append(f"factory {factory.run_id}: session cancellation or ownership unverified; state and claim retained")
+                        continue
+                    stopped = replace(latest.observed(after, datetime.now(UTC).isoformat()),
+                        controller_phase="terminal" if after.is_terminal else "parked" if after.is_parked else "stopped",
+                        controller_error="operator requested stop",
+                        children_reaped=True)
+                    save_factory_record(home, stopped)
+                    _write_factory_host_evidence(home, stopped,
+                        "interrupted", "operator requested stop; factory status: " + str(after.status))
+                    continue
                 if factory_process_is_alive(factory) and factory.handle is not None:
                     try:
                         handle = factory.handle
@@ -371,6 +424,7 @@ def stop_worklink(
                             from .worker_client import WorkerClient
 
                             asyncio.run(WorkerClient(None).cancel_factory_handle(handle))
+                            factory = replace(factory, children_reaped=True)
                         else:
                             asyncio.run(LocalSubprocessComputeBackend().cancel(handle))
                     except (KeyError, RuntimeError, OSError, ValueError) as exc:

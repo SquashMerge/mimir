@@ -18,7 +18,7 @@ class ToolPin:
     risk: str | None = None
 
 
-OPENCODE_VERSION = "1.19.4"
+OPENCODE_VERSION = "2.2.7"
 
 
 DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
@@ -71,7 +71,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
         pin=OPENCODE_VERSION,
         smoke="opencode --version",
         source="npm",
-        package="opencode-ai",
+        package="@opencode/cli",
         install="root/scaffold Dockerfiles only when MIMIR_ENABLE_OPENCODE=1",
         risk="High: Worklink coding backend; changes can affect prompt execution, plugin loading, and auth flow.",
     ),
@@ -88,7 +88,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="feature-factory",
         category="coding-cli",
-        pin="0.12.1",
+        pin="0.14.0",
         smoke="test -f \"$MIMIR_FACTORY_ENTRYPOINT\"",
         source="npm",
         package="feature-factory",
@@ -96,44 +96,24 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
         risk="High: Feature factory state-machine CLI; changes can affect Worklink epic lifecycle and recovery.",
     ),
     ToolPin(
-        name="opencode-feature-factory",
+        name="opencode2-feature-factory",
         category="coding-plugin",
-        pin="0.12.1",
+        pin="0.14.0",
         smoke="opencode --version",
         source="npm",
-        package="opencode-feature-factory",
+        package="opencode2-feature-factory",
         install="root/scaffold Dockerfiles only when MIMIR_ENABLE_OPENCODE=1; registered as OpenCode plugin",
         risk="High: Feature factory plugin; changes can affect Worklink epic/leaf dispatch and review flow.",
     ),
     ToolPin(
-        name="opencode-project-memory",
+        name="opencode-plugin-otel",
         category="coding-plugin",
-        pin="0.1.0",
+        pin="2.1.0",
         smoke="opencode --version",
         source="npm",
-        package="opencode-project-memory",
-        install="root/scaffold Dockerfiles only when MIMIR_ENABLE_OPENCODE=1; registered as OpenCode plugin with memoryDir=.opencode/memory",
-        risk="Medium: Project memory plugin; changes can affect memory indexing and retrieval behavior.",
-    ),
-    ToolPin(
-        name="opencode-openai-codex-auth",
-        category="coding-plugin",
-        pin="4.4.0",
-        smoke="opencode --version",
-        source="npm",
-        package="opencode-openai-codex-auth",
-        install="root/scaffold Dockerfiles only when MIMIR_ENABLE_OPENCODE=1; provides Codex auth for OpenCode",
-        risk="Medium: Codex auth plugin; changes can affect authentication flow to OpenAI Codex.",
-    ),
-    ToolPin(
-        name="opencode-anthropic-auth",
-        category="coding-plugin",
-        pin="0.0.13",
-        smoke="opencode --version",
-        source="npm",
-        package="opencode-anthropic-auth",
-        install="root/scaffold Dockerfiles only when MIMIR_ENABLE_OPENCODE=1; provides Anthropic auth for OpenCode",
-        risk="Medium: Anthropic auth plugin; changes can affect authentication flow to Anthropic API.",
+        package="@devtheops/opencode-plugin-otel",
+        install="root/scaffold Dockerfiles only when MIMIR_ENABLE_OPENCODE=1; daemon inline telemetry policy",
+        risk="High: Telemetry content and credential isolation depend on exact plugin gates and options.",
     ),
 )
 

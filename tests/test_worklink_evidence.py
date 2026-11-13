@@ -41,6 +41,45 @@ _OTLP_CARRIERS = {
 
 
 @pytest.mark.asyncio
+async def test_factory_projection_record_and_completion_evidence_keep_mcp_and_session(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.factory_control_output import _status_projection
+    from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record, load_factory_record
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _verify_factory_completion
+
+    secret = "runtime-" + "factory-mcp-header-" + "canary"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", secret)
+    fixture = Path(__file__).parent / "fixtures/worklink/feature_factory_0_14_0/status.raw.stdout.json"
+    source = json.loads(fixture.read_bytes())
+    source.update(run_id="chainlink-2125", sandbox_path=str(tmp_path / "chainlink-2125"),
+                  status="running", mcp_servers=[*source["mcp_servers"], secret, "fixture-mcp"])
+    status = parse_factory_status(_status_projection(source))
+    record = FactoryRunRecord(
+        run_id=status.run_id, issue_id=2125, attempt=1, repository="owner/repo",
+        base_ref=status.pr_base or "main", branch=status.branch or "feature/test",
+        launcher="/opt/factory/bin/factory.js", sandbox=status.sandbox_path,
+        session=None, handle=None, status=None, observed_at=None, controller_phase="running",
+        opencode_session_id="ses_actual",
+    ).observed(status, datetime.now(UTC).isoformat())
+    save_factory_record(tmp_path, record)
+    recovered = load_factory_record(tmp_path, record.run_id)
+    assert recovered is not None
+    with pytest.raises(WorklinkError, match="not authoritative"):
+        await _verify_factory_completion(
+            home=tmp_path, issue=SimpleNamespace(issue_id=2125), record=recovered,
+            test_command="pytest", started_at=datetime.now(UTC),
+            runner=lambda *args, **kwargs: pytest.fail("nonterminal status cannot run completion commands"),
+        )
+    encoded = (tmp_path / "state/worklink/evidence/2125-1.json").read_text()
+    evidence = json.loads(encoded)
+    assert secret not in encoded
+    assert evidence["mcp_servers"] == ["fixture-mcp", "<redacted>", "fixture-mcp"]
+    assert evidence["opencode_session_id"] == "ses_actual"
+    assert evidence["status"] == "failed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["contained", "factory"])
 async def test_gate_child_denies_otlp_carriers_after_spec_and_ambient_merge(
     tmp_path, monkeypatch, route,
@@ -130,28 +169,17 @@ def test_opencode_resolver_filters_otlp_carriers_before_projection(monkeypatch, 
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/ordinary")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-    seen = {}
-    invocation = type("Invocation", (), {"model": "openai/model"})()
-
-    def resolve(*, env):
-        seen["resolver"] = dict(env)
-        return invocation
-
-    monkeypatch.setattr(opencode, "resolve_opencode_invocation", resolve)
-    monkeypatch.setattr(opencode, "opencode_model_from_agent_spec", lambda value: "openai/model")
     monkeypatch.setattr(opencode, "model_spec_at_call_time", lambda home: "codex-plus:model")
-    resolution = opencode.resolve_worklink_opencode_invocation({"MIMIR_HOME": str(tmp_path)})
-    assert resolution.invocation is invocation
     from mimir_cultivate.worklink.backends.base import WorkOrder
     spec = opencode.OpenCodeBackend().work_spec(
         WorkOrder(845, tmp_path, "build", None, 30, {"MIMIR_MODEL_SPEC": "codex-plus:model", **_OTLP_CARRIERS}),
         attempt=1, repo_url="repo", base_ref="main", branch="issue/845-a1", test_command="uv run pytest")
     refreshed = opencode.OpenCodeBackend().refresh_codex_projections(spec, {"MIMIR_HOME": str(tmp_path), **_OTLP_CARRIERS})
-    for observed in (seen["resolver"], resolution.env, refreshed.env):
+    for observed in (spec.env, refreshed.env):
         assert not _OTLP_CARRIERS.keys() & observed.keys()
         assert not any(value in repr(observed) for value in _OTLP_CARRIERS.values())
-    assert resolution.env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
-    assert resolution.env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" not in spec.env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in spec.env
     assert "worker_projections" not in refreshed.backend_config
 
     # The production gate environment must not recreate any leaf auth document.

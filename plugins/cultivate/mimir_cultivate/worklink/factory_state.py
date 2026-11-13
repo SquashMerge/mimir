@@ -45,6 +45,7 @@ class FactoryStatus:
     next_present: bool = False
     slices_total: int | None = None
     slices_counts: dict[str, int] | None = None
+    mcp_servers: tuple[str, ...] = ()
 
     TERMINAL_STATUSES: ClassVar[frozenset[str]] = frozenset({"completed", "blocked", "partial"})
 
@@ -62,7 +63,7 @@ class FactoryStatus:
         return self.next
 
     def to_json(self) -> dict[str, Any]:
-        payload = {name: list(value) if name in {"steps", "slices"} and value is not None else value
+        payload = {name: list(value) if name in {"steps", "slices", "mcp_servers"} and value is not None else value
                    for name, value in vars(self).items() if name not in {"next", "next_present"}}
         if self.slices_total is None:
             payload.pop("slices_total")
@@ -179,10 +180,11 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
                 raise FactoryContractError(f"factory status {name} must be a bounded object list")
             rows = tuple(_status_row(item, name) for item in rows)
         values[name] = rows
-    from .factory_control_output import parse_slice_summary
+    from .factory_control_output import parse_mcp_servers, parse_slice_summary
 
     try:
         values["slices_total"], values["slices_counts"] = parse_slice_summary(payload, values["slices"])
+        values["mcp_servers"] = parse_mcp_servers(payload.get("mcp_servers", []))
     except ValueError as exc:
         raise FactoryContractError(str(exc)) from exc
     gates = payload.get("gates")
@@ -282,12 +284,34 @@ class FactoryRunRecord:
     controller_phase: str
     controller_error: str | None = None
     transcript: str | None = None
-    # Set only after the executor's successful subreaper terminal acknowledgement.
-    # Driver PID death alone does not exclude detached specialists.
+    # Executor proof: process descendants reaped, or owned daemon input/execution
+    # reconciled quiescent. Neither PID death nor a model-turn result proves this.
     children_reaped: bool = False
     version: int = FACTORY_RECORD_VERSION
+    opencode_session_id: str | None = None
+    mcp_servers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        from .factory_control_output import parse_mcp_servers
+
+        try:
+            parse_mcp_servers(self.mcp_servers)
+        except (ValueError, UnicodeError) as exc:
+            raise FactoryRecordError("factory record mcp_servers is invalid") from exc
+        if self.opencode_session_id is not None and (
+            not isinstance(self.opencode_session_id, str)
+            or not self.opencode_session_id.startswith("ses_")
+            or len(self.opencode_session_id) <= 4
+            or len(self.opencode_session_id) > 128
+            or any(not char.isascii() or not (char.isalnum() or char in "_-")
+                   for char in self.opencode_session_id)
+        ):
+            raise FactoryRecordError("factory record OpenCode session is invalid")
+        if (self.handle is not None and self.opencode_session_id is not None
+                and self.handle.opencode_session_id != self.opencode_session_id):
+            raise FactoryRecordError("factory record session handle mismatch")
+        if self.opencode_session_id is not None and self.session is not None and self.session != self.opencode_session_id:
+            raise FactoryRecordError("factory record lock identity does not match the OpenCode host")
         if type(self.children_reaped) is not bool:
             raise FactoryRecordError("factory record children_reaped is invalid")
         if self.version != FACTORY_RECORD_VERSION:
@@ -347,6 +371,8 @@ class FactoryRunRecord:
             "controller_error": self.controller_error,
             "transcript": self.transcript,
             "children_reaped": self.children_reaped,
+            "opencode_session_id": self.opencode_session_id,
+            "mcp_servers": list(self.mcp_servers),
         }
 
     @classmethod
@@ -372,6 +398,13 @@ class FactoryRunRecord:
             "transcript",
         }
         data = dict(data)
+        opencode_session_id = data.pop("opencode_session_id", None)
+        from .factory_control_output import parse_mcp_servers
+
+        try:
+            mcp_servers = parse_mcp_servers(data.pop("mcp_servers", []))
+        except (ValueError, UnicodeError) as exc:
+            raise FactoryRecordError("factory record mcp_servers is invalid") from exc
         children_reaped = data.pop("children_reaped", False)
         if type(children_reaped) is not bool:
             raise FactoryRecordError("factory record children_reaped is invalid")
@@ -464,15 +497,20 @@ class FactoryRunRecord:
             controller_error=controller_error,
             transcript=transcript,
             children_reaped=children_reaped,
+            opencode_session_id=opencode_session_id,
+            mcp_servers=mcp_servers,
         )
 
-    def observed(self, status: FactoryStatus, observed_at: str) -> FactoryRunRecord:
+    def observed(self, status: FactoryStatus, observed_at: str | None) -> FactoryRunRecord:
+        if self.opencode_session_id is not None and status.lock_session not in {None, self.opencode_session_id}:
+            raise FactoryRecordError("factory lock session does not match the OpenCode host")
         return replace(
             self,
             status=status,
-            session=status.lock_session or self.session,
+            session=self.opencode_session_id or status.lock_session or self.session,
             observed_at=observed_at,
             controller_error=None,
+            mcp_servers=status.mcp_servers,
         )
 
 
@@ -908,7 +946,10 @@ def report_retained_factory_records(
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:
+    """Conservatively retain daemon activity until the executor proves quiescence."""
     handle = record.handle
+    if handle is not None and handle.substrate == "opencode_daemon":
+        return not record.children_reaped
     if handle is None or handle.substrate != "local_subprocess":
         return False
     pid = handle.shim_pid
@@ -937,6 +978,11 @@ def factory_process_is_verified_dead(
     clean a missing PID or zombie without one, but cannot infer PID reuse.
     """
     handle = record.handle
+    if handle is not None and handle.substrate == "opencode_daemon":
+        return bool(record.children_reaped and record.opencode_session_id == handle.opencode_session_id
+                    and record.session == handle.opencode_session_id)
+    if handle is None:
+        return bool(record.children_reaped and record.opencode_session_id is None)
     if (
         handle is None
         or handle.substrate != "local_subprocess"

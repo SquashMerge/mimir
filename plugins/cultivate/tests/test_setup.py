@@ -2283,14 +2283,7 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
     from mimir_cultivate.worklink.backends import opencode as backend_module
     from mimir_cultivate.worklink.backends.base import WorkOrder
     from mimir_cultivate.worklink.backends.registry import BackendRegistry
-    invocation = SimpleNamespace(model='proof/model', provider='proof', model_source='test',
-                                 config_path=tmp_path / 'absent', pass_env=(), remove_env=())
-    monkeypatch.setattr(backend_module, '_coding_enabled', lambda: True)
-    monkeypatch.setattr(backend_module, 'resolve_opencode_binary', lambda _: '/usr/local/bin/opencode')
-    monkeypatch.setattr(backend_module, 'resolve_worklink_opencode_invocation', lambda _: SimpleNamespace(
-        invocation=invocation, env={}, configured_model='proof/model', model_diverged=False))
-    monkeypatch.setattr(backend_module, 'opencode_worker_documents', lambda *_: SimpleNamespace(
-        config_document=b'{}', auth_document=None))
+    monkeypatch.setenv('MIMIR_MODEL_SPEC', 'codex-plus:proof-model')
     spec = BackendRegistry(config).get('opencode').work_spec(
         WorkOrder(1, tmp_path, '', None, 30, {}), attempt=1,
         repo_url='', base_ref='', branch='', test_command='./tools/verify')

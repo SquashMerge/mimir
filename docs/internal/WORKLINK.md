@@ -64,8 +64,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.12.1` through the lockstep
-`opencode-feature-factory@0.12.1` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.14.0` through the lockstep
+`opencode2-feature-factory@0.14.0` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -95,27 +95,24 @@ executor together by rebuilding the executor image before enabling this layout.
   starts or resumes the opencode feature-factory in the target repo. Until the
   flag is set, epics are only excluded from leaf dispatch and are never
   dispatched (no dispatch-then-refuse churn).
-- **Launch**: Worklink supervises exactly `opencode run --log-level DEBUG
-  --print-logs --dir <checkout> --command feature " --autonomous --max-retries
-  5 <issue>"`.
-  Cancellation is verified process-group cancellation through `mimir worklink
-  stop`; feature-factory has no cancel transition.
+- **Launch**: The daemon receives command `feature` with exactly
+  `--autonomous --max-retries 5 chainlink-<id>` in the verified epic sandbox.
+  Cancellation through `mimir worklink stop` verifies owned inbox/execution
+  quiescence; feature-factory has no cancel transition. The shared daemon is
+  never terminated or vacuumed for a run.
 - **Retry and staging**: `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts
   exactly ASCII `[0-9]+` in range `1..9007199254740991`, and falls back to `5`
   for absent or invalid values. feature-factory 0.7.5 stages the workflow inside
   the run directory; exact token `--auto` is never passed. Worklink's base
   selects the checkout start point and PR target; it is not factory `--base`,
   which is never passed.
-- **First-dispatch identity**: Before first factory dispatch only, after checkout
-  creation and before process launch, Worklink reads the effective checkout `git
-  config --get user.name` and `git config --get user.email`. Both must be
-  nonblank. The child receives `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
-  `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox
-  Git identity configuration.
-- **Publication credential**: Worklink reads the nonblank `publishing_identity`
-  from `MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise
-  from the trusted controller checkout's `.factory.json`. A set but blank or
-  non-string override fails instead of falling back. For GitHub
+- **First-dispatch identity**: Before initialization, Worklink requires nonblank
+  effective checkout `git config --get user.name` and `git config --get user.email`.
+  Only trusted captured Git settings enter the session environment.
+- **Publication credential**: Worklink requires canonical
+  `MIMIR_FACTORY_PUBLISHING_IDENTITY`. A legacy `.factory.json.publishing_identity`
+  key refuses admission even with a valid environment identity; removal requires
+  a reviewed repository edit. There is no repository fallback. For GitHub
   publication Worklink verifies the credential this process is already bound to,
   `GITHUB_TOKEN`, rather than selecting among candidates: `GH_TOKEN` is a
   child-only alias for `gh`, and verifying a second credential in a process that
@@ -126,7 +123,7 @@ executor together by rebuilding the executor image before enabling this layout.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.12.1 verification and
+  Worklink admits the launcher only after package/adapter 0.14.0 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume uses the retained session, while
   heartbeat uses the newly claimed session after recovery; lock actions use
@@ -615,7 +612,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.12.1 controls. |
+| `feature_factory` | daemon command `feature`, text `--autonomous --max-retries 5 chainlink-<id>` | Epic adapter with session-supervised OpenCode and absolute 0.14.0 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -1466,10 +1463,10 @@ even if another signal is absent.
 tool_pins:
   - name: opencode               # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
-    pin: "1.19.4"              # required: version, tag, or SHA currently expected
+    pin: "2.2.7"               # required: version, tag, or SHA currently expected
     smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
-    package: "opencode-ai"       # optional upstream package/repo identifier
+    package: "@opencode/cli"     # optional upstream package/repo identifier
   - name: codex
     category: coding-cli
     pin: "0.139.0"

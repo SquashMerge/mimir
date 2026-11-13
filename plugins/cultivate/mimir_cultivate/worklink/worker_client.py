@@ -36,10 +36,7 @@ STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
 )
-_PROJECTION_PATHS = frozenset({
-    ".config/opencode/opencode.json",
-    ".local/share/opencode/auth.json",
-})
+_PROJECTION_PATHS: frozenset[str] = frozenset()
 
 
 def worklink_checkout_root() -> Path:
@@ -85,16 +82,38 @@ def factory_checkout_for_path(path: Path) -> tuple[Path, int, int] | None:
 def run_factory_control(
     checkout: Path, argv: Sequence[str], *, env: Mapping[str, str],
     timeout: float = 30, output_limit: int = 1024 * 1024,
+    initialize: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run retained-tree operations as its owner, without refreshing runtime auth."""
     binding = factory_checkout_for_path(checkout)
     if binding is None:
         raise ValueError("factory control requires an inner checkout")
     root, issue, attempt = binding
+    if initialize:
+        from .backends.feature_factory import resolve_factory_entrypoint
+        try:
+            node = list(argv).index("node")
+            entrypoint = argv[node + 1]
+            operation, run_id = argv[node + 2:node + 4]
+            repo = argv[list(argv).index("--repo") + 1]
+        except (ValueError, IndexError):
+            raise ValueError("initial factory control requires a bound init command") from None
+        if operation != "init" or run_id != f"chainlink-{issue}" or repo != str(root):
+            raise ValueError("initial factory control is outside its issued attempt")
+        flags = list(argv[node + 4:])
+        allowed = {"--repo", "--pr-base", "--mode", "--max-retries", "--publishing-identity"}
+        if (len(flags) % 2 or len(set(flags[::2])) != len(flags[::2])
+                or any(flag not in allowed for flag in flags[::2])):
+            raise ValueError("initial factory control flags are invalid")
+        if node != 0 and (node != 4 or not Path(argv[0]).is_absolute() or argv[1] != "-I"
+                or Path(argv[2]).resolve() != Path(__file__).with_name("factory_control_output.py").resolve()
+                or argv[3] != "other"):
+            raise ValueError("initial factory control requires the trusted output projector")
+        resolve_factory_entrypoint(entrypoint)
 
     async def run() -> subprocess.CompletedProcess[bytes]:
         client = WorkerClient.for_factory_checkout(root, issue_id=issue, attempt=attempt)
-        client._launch_op = "launch_factory_control"
+        client._launch_op = "launch_factory" if initialize else "launch_factory_control"
         client._socket_timeout_s = timeout + CANCEL_SOCKET_TIMEOUT_S
         stdout, stderr = open_output_pair(None, output_limit, None, output_limit)
         try:
@@ -106,7 +125,9 @@ def run_factory_control(
             )
             code = await process.wait()
             if process.timed_out:
-                raise subprocess.TimeoutExpired(argv, timeout)
+                error = subprocess.TimeoutExpired(argv, timeout)
+                error.quiescent = True
+                raise error
             if process.output_overflow:
                 command = _factory_control_name(argv)
                 observed = max(process.stdout_bytes, process.stderr_bytes)
@@ -119,7 +140,9 @@ def run_factory_control(
                                    stream=stream, observed_bytes=observed, limit_bytes=output_limit)
                 except RuntimeError:
                     pass  # An unavailable event sink must not replace the diagnosis.
-                raise RuntimeError(reason)
+                error = RuntimeError(reason)
+                error.quiescent = True
+                raise error
             return subprocess.CompletedProcess(
                 argv, code, stdout.read_bounded()[0], stderr.read_bounded()[0],
             )
