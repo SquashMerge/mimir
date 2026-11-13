@@ -1405,7 +1405,6 @@ def test_selected_git_operations_require_live_owner_grant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, verdict: bool | None,
 ) -> None:
     from importlib.metadata import PackageNotFoundError, version
-    from mimir.tool_descriptors import ResultOriginKind
 
     try:
         version("mimir-cultivate")
@@ -1428,8 +1427,8 @@ def test_selected_git_operations_require_live_owner_grant(
     assert grant.lease_identity == (str(lease.path), lease.recovery_id)
     assert checkout_auth.ifc_state.has_untrusted_active_ingest()
     sources = follow_on.ifc_state.current(follow_on.ifc_labels).sources
-    if selected.tools[operation].descriptor.result_origin == ResultOriginKind.NON_INGESTING:
-        # Non-ingesting status adds no source even without author attestation.
+    if operation == "repo_stage" and verdict is True:
+        # The stage result is non-ingesting on the PR lease path.
         assert not sources
     else:
         (source,) = sources

@@ -2838,34 +2838,6 @@ def test_maximal_model_tool_inventory_has_total_protected_result_partition(
     assert mapped | exempted == names
 
 
-@pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "write_todos", "fetch_url"])
-@pytest.mark.parametrize("arguments", [
-    {}, {"path": "untrusted/path"}, {"file_path": "untrusted/file"},
-    {"turn_id": "turn"}, {"atom_id": "atom"}, {"job_id": "job"},
-])
-@pytest.mark.parametrize("outcome", ["success", "refusal", "exception"])
-def test_non_ingesting_protected_result_fallback_adds_no_source(
-    tool_name, arguments, outcome,
-) -> None:
-    from langchain_core.messages import ToolMessage
-    from mimir.plugins.core import core_policy_registry
-    from mimir.tools.refusals import ToolPolicyRefusal
-
-    authorization = access_control.ToolAuthorization(
-        tool_name, OperationDecision.OPEN, True, policy=core_policy_registry(),
-    )
-    refusal = ToolPolicyRefusal("operation refused") if outcome == "refusal" else None
-    result = (
-        RuntimeError("operation failed") if outcome == "exception" else
-        ToolMessage(content=str(refusal) if refusal else "done", tool_call_id="result",
-                    status="error" if refusal else "success")
-    )
-    assert classify_protected_result(
-        tool_name, arguments, None, authorization, result=result,
-        policy_refusal=refusal, failed=outcome != "success",
-    ) is None
-
-
 @pytest.mark.parametrize("tool_name", ["undeclared_protected_tool", "http_request", "read_file"])
 @pytest.mark.parametrize("failed", [False, True])
 def test_ingesting_protected_result_without_resource_fails_closed(tool_name, failed) -> None:

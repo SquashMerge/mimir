@@ -262,29 +262,120 @@ def test_trusted_pr_checkout_and_cleanup_do_not_taint_or_prompt(
     assert prompts == []
 
 
-@pytest.mark.parametrize("tool_name", ["repo_cleanup", "repo_restore_file", "repo_stage"])
-@pytest.mark.parametrize("arguments", [
-    {}, {"repository": "owner/repo", "pull_request": 7},
-    {"path": "untrusted/path", "file_path": "untrusted/file", "paths": ["tracked.txt"]},
-    {"turn_id": "turn", "atom_id": "atom", "job_id": "job"},
+@pytest.mark.parametrize("message", [False, True], ids=["raw", "tool_message"])
+@pytest.mark.parametrize("invalid", [
+    None, "extra_key", "missing_key", "removed_int", "scope_type", "wrong_scope_id",
+    "wrong_status", "other_owner", "would_block", "disallowed", "wrong_decision",
+    "wrong_repository", "wrong_pr", "missing_state", "failed", "refusal", "exception",
+    "error_message", "malformed_message", "untrusted_provenance", "untrusted_artifact",
 ])
-@pytest.mark.parametrize("outcome", ["success", "refusal", "exception"])
-def test_non_ingesting_repository_result_adds_no_source(tool_name, arguments, outcome) -> None:
-    from mimir.access_control import OperationDecision, ToolAuthorization, classify_protected_result
+def test_repo_cleanup_exempts_only_exact_server_success(tmp_path, monkeypatch, message, invalid) -> None:
+    from copy import copy
+    from mimir.access_control import (
+        OperationDecision, ProtectedResultProvenance, ToolAuthorization, classify_protected_result,
+    )
+    from mimir.models import SourceLabel
     from mimir.tools.refusals import ToolPolicyRefusal
 
     selected = load_plugins(enable="cultivate").policy
-    authorization = ToolAuthorization(tool_name, OperationDecision.OPEN, True, policy=selected)
-    refusal = ToolPolicyRefusal("operation refused") if outcome == "refusal" else None
-    result = (
-        RuntimeError("operation failed") if outcome == "exception" else
-        ToolMessage(content=str(refusal) if refusal else "done", tool_call_id="result",
-                    status="error" if refusal else "success")
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
     )
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=state.checkout_lease.lease_root, review_state=state,
+        runner=lambda argv: subprocess.run(
+            argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
+        ),
+    )
+    from mimir.plugins.core import policy_scope
+    with policy_scope(selected):
+        assert_lease_attested(auth, scope, state.checkout_lease)
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    authorization = ToolAuthorization(
+        "repo_cleanup", OperationDecision.RESOURCE_SCOPED, True,
+        policy=selected, repo_pr_action_scope=scope,
+    )
+    payload = {"status": "cleaned", "removed": True, "scope_id": scope.scope_id}
+    # A positive control with the same live state prevents earlier admission
+    # failures from masking shape/owner regressions.
     assert classify_protected_result(
-        tool_name, arguments, None, authorization, result=result,
-        policy_refusal=refusal, failed=outcome != "success",
+        "repo_cleanup", arguments, auth, authorization, result=payload,
     ) is None
+    failed = False
+    refusal = None
+    provenance = None
+    if invalid == "extra_key":
+        payload["content"] = "untrusted content"
+    elif invalid == "missing_key":
+        payload.pop("removed")
+    elif invalid == "removed_int":
+        payload["removed"] = 1
+    elif invalid == "scope_type":
+        payload["scope_id"] = 7
+    elif invalid == "wrong_scope_id":
+        payload["scope_id"] = "another_scope"
+    elif invalid == "wrong_status":
+        payload["status"] = "refused"
+    elif invalid == "other_owner":
+        selected = copy(selected)
+        selected._tools = dict(selected.tools)
+        selected._tools["repo_cleanup"] = replace(selected.tools["repo_cleanup"], owner="other_plugin")
+        authorization = replace(authorization, policy=selected)
+    elif invalid == "would_block":
+        authorization = replace(authorization, would_block=True)
+    elif invalid == "disallowed":
+        authorization = replace(authorization, allowed=False)
+    elif invalid == "wrong_decision":
+        authorization = replace(authorization, decision=OperationDecision.OPEN)
+    elif invalid == "wrong_repository":
+        arguments["repository"] = "other/repository"
+    elif invalid == "wrong_pr":
+        arguments["pull_request"] += 1
+    elif invalid == "missing_state":
+        auth = replace(auth, repo_review_state=None, repo_pr_scope_registry=None)
+    elif invalid == "failed":
+        failed = True
+    elif invalid == "refusal":
+        refusal = ToolPolicyRefusal("refused cleanup")
+    if message:
+        payload = ToolMessage(content=json.dumps(payload), tool_call_id="cleanup")
+    if invalid == "exception":
+        payload = RuntimeError("cleanup failed with untrusted content")
+        failed = True
+    elif invalid == "refusal":
+        payload = ToolMessage(content=str(refusal), tool_call_id="cleanup", status="error")
+    elif invalid == "error_message":
+        payload = ToolMessage(content=json.dumps({"status": "cleaned", "removed": True,
+                                                "scope_id": scope.scope_id}),
+                              tool_call_id="cleanup", status="error")
+    elif invalid == "malformed_message":
+        payload = ToolMessage(content="untrusted text", tool_call_id="cleanup")
+    elif invalid in {"untrusted_provenance", "untrusted_artifact"}:
+        provenance = ProtectedResultProvenance((SourceLabel(
+            principal=None, domain="web", resource_id="external", bridge_instance=None,
+            sensitivity="public", source_kind="protected_tool", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ),))
+        if invalid == "untrusted_artifact":
+            payload = ToolMessage(content=json.dumps({"status": "cleaned", "removed": True,
+                                                    "scope_id": scope.scope_id}),
+                                  tool_call_id="cleanup", artifact=provenance)
+            provenance = None
+    labels = classify_protected_result(
+        "repo_cleanup", arguments, auth, authorization, result=payload,
+        failed=failed, policy_refusal=refusal, provenance=provenance,
+    )
+    if invalid is None:
+        assert labels is None
+    else:
+        assert labels is not None and labels.has_untrusted_active_ingest
+        if invalid not in {"untrusted_provenance", "untrusted_artifact"}:
+            assert any(source.resource_id == "<unresolved-resource:protected_tool:repo_cleanup>"
+                       for source in labels.sources)
 
 
 def _rebased_divergent_lease(tmp_path: Path, *, production_clone: bool = False):

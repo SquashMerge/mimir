@@ -423,7 +423,7 @@ def test_outbound_extractor_is_used_to_block_private_payload(category, destinati
 @pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.parametrize("mode", ["sync", "async"])
 @pytest.mark.asyncio
-async def test_plugin_sink_result_policy_controls_following_live_write(origin, domain, result_kind, enforce, mode, tmp_path, monkeypatch):
+async def test_plugin_sink_result_still_taints_a_following_live_write(origin, domain, result_kind, enforce, mode, tmp_path, monkeypatch):
     from langchain.agents.middleware import ToolCallRequest
     from langchain_core.messages import ToolMessage
     from langchain_core.tools import StructuredTool
@@ -494,14 +494,12 @@ async def test_plugin_sink_result_policy_controls_following_live_write(origin, d
     assert executed == [True]
     assert result.status == ("error" if result_kind == "error" else "success")
     labels = auth.ifc_state.current(auth.ifc_labels)
-    ingesting = origin != ResultOriginKind.NON_INGESTING
-    assert labels.has_untrusted_active_ingest is ingesting
-    assert {source.domain for source in labels.sources} == ({domain or "unknown"} if ingesting else set())
+    assert labels.has_untrusted_active_ingest
+    assert {source.domain for source in labels.sources} == {domain or "unknown"}
     denial = ToolRegistry().authorize_tool(
         "write_file", auth, enforce=enforce, policy=policy, arguments=write_arguments,
     )
-    assert denial.allowed is (not ingesting)
-    assert denial.reason == ("write_blocked_by_untrusted_ingest" if ingesting else None)
+    assert not denial.allowed and denial.reason == "write_blocked_by_untrusted_ingest"
 
     def write_operation(file_path: str, content: str) -> str:
         """Write live state."""
@@ -522,8 +520,7 @@ async def test_plugin_sink_result_policy_controls_following_live_write(origin, d
         blocked = await middleware.awrap_tool_call(write_request, async_write_handler)
     else:
         blocked = middleware.wrap_tool_call(write_request, write_handler)
-    assert blocked.status == ("error" if ingesting else "success")
-    assert written == ([] if ingesting else [True])
+    assert blocked.status == "error" and written == []
 
 
 @pytest.mark.parametrize("metadata", [
@@ -654,7 +651,7 @@ def test_registrar_owner_override_cannot_reach_core_registration(method):
     "success", "error", "exception", "empty_provenance", "empty_artifact",
     "trusted_provenance", "trusted_artifact", "typed_refusal",
 ])
-def test_plugin_result_classifier_honors_non_ingesting_policy(flow, origin, domain, result_kind):
+def test_plugin_result_classifier_always_labels_provider_controlled_results(flow, origin, domain, result_kind):
     from langchain_core.messages import ToolMessage
     from mimir.access_control import (
         OperationDecision, ProtectedResultProvenance, ToolAuthorization, classify_protected_result,
@@ -695,9 +692,6 @@ def test_plugin_result_classifier_honors_non_ingesting_policy(flow, origin, doma
         "sample", {}, None, authorization, result=result, provenance=provenance,
         policy_refusal=refusal, failed=failed,
     )
-    if origin == ResultOriginKind.NON_INGESTING:
-        assert labels is None
-        return
     assert labels is not None and labels.has_untrusted_active_ingest
     assert len(labels.sources) == 1
     source = next(iter(labels.sources))
@@ -708,7 +702,7 @@ def test_plugin_result_classifier_honors_non_ingesting_policy(flow, origin, doma
 
 
 @pytest.mark.parametrize("exemption", ["empty_provenance", "non_ingesting", "typed_refusal"])
-def test_core_result_classifier_exemptions(exemption):
+def test_core_result_classifier_exemptions_remain_core_only(exemption):
     from langchain_core.messages import ToolMessage
     from mimir.access_control import (
         OperationDecision, ProtectedResultProvenance, ToolAuthorization, classify_protected_result,

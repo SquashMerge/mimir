@@ -347,7 +347,6 @@ async def test_selected_retained_tools_keep_one_live_lease_through_result_classi
     from langchain.agents.middleware import ToolCallRequest
     from langchain.tools import ToolRuntime
     from langgraph.runtime import Runtime
-    from mimir.tool_descriptors import ResultOriginKind
     from mimir.tools import budget_gate
     from mimir_cultivate import repository
     from mimir_cultivate.worklink import retained_scope, worker_client
@@ -436,13 +435,8 @@ async def test_selected_retained_tools_keep_one_live_lease_through_result_classi
             name, arguments, auth, authorizations[0], result=output,
             retained_receipt=receipt,
         )
-    if selected.tools[name].descriptor.result_origin == ResultOriginKind.NON_INGESTING:
-        # The consumed receipt cannot grant authority on replay, but a declared
-        # non-ingesting status must not invent an untrusted content source.
-        assert replay is None
-    else:
-        assert replay is not None
-        assert all(source.integrity == "untrusted" for source in replay.sources)
+    assert replay is not None
+    assert all(source.integrity == "untrusted" for source in replay.sources)
 
 
 @pytest.mark.asyncio

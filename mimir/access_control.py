@@ -11798,15 +11798,8 @@ def _incomplete_protected_result(
     *,
     tool_name: str,
     auth_context: "AuthContext | None",
-) -> "InformationFlowLabels | None":
+) -> "InformationFlowLabels":
     from .models import InformationFlowLabels, SourceLabel
-
-    # The selected policy declares whether this result can ingest content. Apply
-    # that contract before every incomplete-provenance fallback, including plugin
-    # refusals and exceptions, regardless of whether a resource can be resolved.
-    descriptor = get_tool_descriptor(tool_name)
-    if descriptor is not None and descriptor.result_origin == ResultOriginKind.NON_INGESTING:
-        return None
 
     resource = next(
         (
@@ -12339,6 +12332,60 @@ def _bound_tracker_status_result(
     )
 
 
+def _bound_repository_cleanup_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any, result: Any,
+    failed: bool,
+) -> bool:
+    """Recognize only Cultivate's exact post-revocation server status.
+
+    Cleanup removes its own live lease before classification, so this guard
+    binds the status to the authorized review state, not to a surviving lease.
+    """
+    from langchain_core.messages import ToolMessage
+
+    scope = authorization.repo_pr_action_scope
+    if not (
+        registered.owner == "cultivate" and tool_name == "repo_cleanup"
+        and registered.resource_scope == "repo_pr" and registered.flow == "sink"
+        and "repo_actions" in registered.memberships
+        and registered.descriptor is not None
+        and registered.descriptor.result_origin == ResultOriginKind.NON_INGESTING
+        and registered.descriptor.sink_destination == "bound_pull_request"
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        and not failed and scope is not None
+        and isinstance(arguments.get("repository"), str)
+        and type(arguments.get("pull_request")) is int
+        and arguments["repository"].lower() == scope.canonical_repo.lower()
+        and arguments["pull_request"] == scope.pr_number
+    ):
+        return False
+    state = getattr(auth_context, "repo_review_state", None)
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        state = registry.resolve(arguments["repository"], arguments["pull_request"]) if registry else None
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        state = (discovered.resolve_for_tool(tool_name, arguments["repository"], arguments["pull_request"])
+                 if discovered is not None else None)
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        return False
+    if isinstance(result, ToolMessage):
+        if result.status != "success" or not isinstance(result.content, str):
+            return False
+        try:
+            result = json.loads(result.content)
+        except ValueError:
+            return False
+    return (
+        type(result) is dict and set(result) == {"status", "removed", "scope_id"}
+        and type(result["status"]) is str and result["status"] == "cleaned"
+        and type(result["removed"]) is bool
+        and type(result["scope_id"]) is str and result["scope_id"] == scope.scope_id
+    )
+
+
 def _bound_unsupported_operation_result(
     tool_name: str, arguments: dict[str, Any], auth_context: Any,
     authorization: ToolAuthorization, registered: Any, result: Any,
@@ -12457,8 +12504,8 @@ def classify_protected_result(
 
     from .models import InformationFlowLabels, SourceLabel
 
-    # Plugin responses are provider-controlled unless the selected policy
-    # declares them non-ingesting; they never inherit core refusal exemptions.
+    # Plugin responses are provider-controlled even for sink-only tools and
+    # claimed NON_INGESTING results; they never inherit core refusal exemptions.
     selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
     if registered is None and not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
@@ -12468,6 +12515,25 @@ def classify_protected_result(
         )
     retained_verified = False
     if registered is not None and registered.owner != "core":
+        if tool_name == "repo_cleanup":
+            if _bound_repository_cleanup_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, result, failed or policy_refusal is not None,
+            ):
+                # Keep any published sources; an exact status is not authority
+                # to erase content labels (including an attached artifact).
+                artifact = getattr(result, "artifact", None)
+                sources = tuple(provenance.sources) if provenance is not None else ()
+                if isinstance(artifact, ProtectedResultProvenance):
+                    sources += tuple(artifact.sources)
+                labels = InformationFlowLabels()
+                for source in sources:
+                    labels = labels.with_source(source)
+                return labels if sources else None
+            return _incomplete_protected_result(
+                registered.result_domain or "unknown", arguments or {},
+                tool_name=tool_name, auth_context=auth_context,
+            )
         if tool_name == "issue_comment":
             issue_labels = _bound_issue_write_result(
                 tool_name, arguments or {}, auth_context, authorization,
@@ -12887,6 +12953,9 @@ def classify_protected_result(
                 labels = labels.with_source(source)
             return labels
 
+        descriptor = get_tool_descriptor(tool_name)
+        if descriptor and descriptor.result_origin & ResultOriginKind.NON_INGESTING:
+            return None
         # An ingesting native tool without a confidentiality domain still
         # introduces model-visible content. Unknown provenance must taint the
         # turn rather than silently laundering integrity through the tool.

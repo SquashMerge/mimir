@@ -622,8 +622,8 @@ def test_unsupported_operation_allows_remediation_writes(tmp_path, monkeypatch, 
     assert escalation_auth.allowed and not escalation_auth.would_block
     assert escalation_auth.repo_pr_action_scope is scope
     # The former channel route shadows this PR destination in a poller turn.
-    # It can execute outside enforcement. The would_block decision still denies
-    # authority, while its non-ingesting result declaration adds no source.
+    # It can execute outside enforcement, but its would_block decision must not
+    # exempt a result from the protected-source classifier.
     with policy_scope(auth._plugin_slot_policy):
         shadow = ToolRegistry().authorize_tool(
             "unsupported_operation", replace(auth, scoped_pr_grants=None),
@@ -638,7 +638,7 @@ def test_unsupported_operation_allows_remediation_writes(tmp_path, monkeypatch, 
             "unsupported_operation", {"repository": scope.canonical_repo,
                                       "pull_request": scope.pr_number}, auth, shadow, result=status,
         )
-    assert shadow_labels is None
+    assert shadow_labels is not None and shadow_labels.has_untrusted_active_ingest
     escalated = invoke(
         "unsupported_operation", description="Need unsupported test flags",
         attempted_operations=["repo_test lacks this flag"],
@@ -664,7 +664,7 @@ def test_unsupported_operation_allows_remediation_writes(tmp_path, monkeypatch, 
     "wrong_scope", "wrong_repository", "wrong_origin", "wrong_sink", "wrong_scope_kind",
 ])
 @pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
-def test_unsupported_result_label_follows_non_ingesting_declaration(tmp_path, monkeypatch, invalid, discovered):
+def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypatch, invalid, discovered):
     from mimir.access_control import (
         ProtectedResultProvenance, ToolAuthorization, classify_protected_result,
     )
@@ -740,10 +740,6 @@ def test_unsupported_result_label_follows_non_ingesting_declaration(tmp_path, mo
             "unsupported_operation", arguments, auth, authorization,
             result=result, provenance=provenance, failed=failed,
         )
-    if policy.tools["unsupported_operation"].descriptor.result_origin == ResultOriginKind.NON_INGESTING:
-        assert labels is None
-        assert not auth.ifc_state.has_untrusted_active_ingest()
-        return
     assert labels is not None
     assert labels.has_untrusted_active_ingest
     assert any(source.resource_id == "<unresolved-resource:protected_tool:unsupported_operation>"
