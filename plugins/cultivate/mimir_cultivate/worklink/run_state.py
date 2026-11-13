@@ -97,10 +97,12 @@ class WorklinkRunState:
                     or sid != identifier)) or not isinstance(generation, str) or not generation
                     or len(generation) > 128 or ticks is not None or shim_pid is not None):
                 raise ValueError("invalid daemon run identity")
-        elif phase == "ci_wait" and data["handle_substrate"] == "controller":
-            if sid is not None and (not isinstance(sid, str) or re.fullmatch(r"ses_[A-Za-z0-9_-]{1,128}", sid) is None
-                                    or not isinstance(generation, str) or not generation or len(generation) > 128):
-                raise ValueError("invalid CI session identity")
+        elif data["handle_substrate"] in {"controller", "local_subprocess"}:
+            if (sid is not None or generation is not None) and (
+                not isinstance(sid, str) or re.fullmatch(r"ses_[A-Za-z0-9_-]{1,128}", sid) is None
+                or not isinstance(generation, str) or not generation or len(generation) > 128
+            ):
+                raise ValueError("invalid gate session identity")
         elif sid is not None or generation is not None:
             raise ValueError("session identity is only valid for daemon runs")
         if phase == "spawned" and local_handle:

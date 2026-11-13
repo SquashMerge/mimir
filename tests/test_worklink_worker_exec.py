@@ -220,6 +220,19 @@ async def _boundary_create(boundary):
     return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation=boundary.generation)
 
 
+def _assert_session_retired(boundary, handle):
+    witnesses = list(boundary.records.glob(f"*.{handle.opencode_session_id}.retired.json"))
+    assert len(witnesses) == 1
+    witness = witnesses[0]
+    record = json.loads(witness.read_text())
+    assert record["opencode_session_id"] == handle.opencode_session_id
+    assert record["launch_generation"] == handle.launch_generation
+    assert record["cancellation_state"] == "verified" and record["stop_requested"]
+    assert record["checkout_path"] == str(boundary.checkout)
+    assert stat.S_IMODE(witness.stat().st_mode) == 0o600
+    assert all(path.name.endswith(".retired.json") for path in boundary.records.glob("*.json"))
+
+
 async def _ordinary_boundary_command(boundary):
     from mimir.output_capture import open_output_pair
 
@@ -331,7 +344,7 @@ async def test_operator_stop_preserves_correlation_until_waiter_finalizes(sessio
             waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
     await boundary.client.session_release(handle)
-    assert not list(boundary.records.glob("*.json"))
+    _assert_session_retired(boundary, handle)
 
 
 @pytest.mark.asyncio
@@ -353,9 +366,37 @@ async def test_real_session_boundary_and_generic_command_survive_transfer_and_re
     assert outcome.execution_state == "succeeded" and outcome.stdout == "fixture output"
     await boundary.client.session_cancel(handle)
     await boundary.client.session_release(handle)
-    assert list(boundary.records.glob("*.json")) == []
+    _assert_session_retired(boundary, handle)
     assert list(boundary.records.glob("*.home")) == []
+    requests = len(boundary.daemon.requests)
+    await boundary.client.session_cancel(handle)
+    await boundary.client.session_release(handle)
+    assert len(boundary.daemon.requests) == requests
     await _ordinary_boundary_command(boundary)
+
+
+@pytest.mark.asyncio
+async def test_retired_executor_handle_cannot_release_current_repair(session_boundary):
+    boundary = session_boundary
+    initial = await _boundary_create(boundary)
+    boundary.daemon.finish(initial.identifier)
+    await boundary.client.session_release(initial)
+    _assert_session_retired(boundary, initial)
+    repair = await _boundary_create(boundary)
+    homes = list(boundary.records.glob("*.home"))
+    assert len(homes) == 1
+    requests = len(boundary.daemon.requests)
+    await boundary.client.session_cancel(initial)
+    await boundary.client.session_release(initial)
+    assert len(boundary.daemon.requests) == requests
+    assert homes[0].exists()
+    assert boundary.daemon.sessions[repair.identifier].active
+    assert (await boundary.client.session_observe(repair)).execution_state == "started"
+    await boundary.client.session_cancel(repair)
+    await boundary.client.session_release(repair)
+    _assert_session_retired(boundary, repair)
+    assert list(boundary.records.glob("*.home")) == []
+    assert sum(route.endswith("/prompt") for _, route, _, _ in boundary.daemon.requests) == 2
 
 
 @pytest.mark.asyncio

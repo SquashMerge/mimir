@@ -1916,6 +1916,7 @@ class WorklinkRunner:
                 test_command=test_cmd,
                 started_at=started,
                 test_env=spec.backend_config.get("test_env", {}),
+                session_handle=current_session_handle,
             )
 
         # After the #832 substrate cleanup local_subprocess is the only Worklink
@@ -2191,6 +2192,8 @@ class WorklinkRunner:
                             if on_session_state is not None:
                                 on_session_state(handle, False)
                     raw = await backend.interpret(repair_order, repair_result)
+                    validation = replace(validation, evidence=replace(
+                        validation.evidence, opencode_session_id=raw.opencode_session_id))
                     if operator_stop_requested(self.home, issue.issue_id, attempt):
                         ci_reason = "stopped by operator"
                         break
@@ -2241,6 +2244,7 @@ class WorklinkRunner:
             if ci_result is not None:
                 validation = replace(validation, evidence=replace(
                     validation.evidence, pr_url=pr_url, head_sha=sha,
+                    opencode_session_id=current_session_handle.opencode_session_id if current_session_handle else None,
                     ci_repair_rounds=ci_rounds,
                     ci_checks=tuple((redact_text(name)[:150], redact_text(state)[:60])
                         for name, state in ci_result.checks[:100]),
@@ -2515,6 +2519,37 @@ class WorklinkRunner:
         )
         terminal_release.retain_for_recovery = True
 
+        session_handle = _state_session_handle(state)
+
+        async def reconcile_current_session() -> WorklinkRunResult | None:
+            nonlocal session_handle, state
+            from .compute import OpenCodeDaemonComputeBackend
+            from .worker_client import WorkerClient
+
+            try:
+                session_compute = OpenCodeDaemonComputeBackend(client=WorkerClient.for_path_checkout(
+                    Path(state.checkout), issue_id=state.issue_id, attempt=state.attempt,
+                    run_uid=get_identities().worklink_uid))
+                if session_handle is None:
+                    session_handle = await session_compute.recover_admission(state.launch_generation)
+                    if session_handle is None:
+                        return None
+                    state = replace(state, handle_identifier=session_handle.identifier,
+                                    opencode_session_id=session_handle.opencode_session_id, phase="spawned")
+                    save_run_state(self.home, state)
+                await session_compute.cancel(session_handle)
+                await session_compute.cleanup(session_handle)
+            except BaseException as exc:
+                interrupted = not isinstance(exc, Exception)
+                evidence = _write_session_failure(
+                    self.home, issue_id, state.attempt, state.backend, state.branch,
+                    state.checkout, session_handle, exc, status="interrupted" if interrupted else "failed")
+                if interrupted:
+                    raise
+                return WorklinkRunResult(issue_id, state.attempt, "failed", evidence_path=evidence,
+                                         reason="session quiescence unverified; recovery retained")
+            return None
+
         def fence_failure(reason: BaseException | str, *, exit_status: int | None = 1) -> None:
             try:
                 incident_owner.record(
@@ -2539,6 +2574,7 @@ class WorklinkRunner:
                 state.shim_pid,
             )
             reason = "reattach: worker interrupted by controller restart"
+            cleanup_verified = True
             try:
                 if not process_is_alive(state):
                     reason = "reattach: worker shim identity is stale"
@@ -2546,6 +2582,15 @@ class WorklinkRunner:
                     await LocalSubprocessComputeBackend().cancel(handle)
             except (KeyError, RuntimeError, OSError, ValueError) as exc:
                 reason = f"reattach: worker cleanup failed: {exc}"
+                cleanup_verified = False
+            except BaseException as exc:
+                _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                       state.branch, state.checkout, _state_session_handle(state), exc,
+                                       status="interrupted")
+                raise
+            evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                              state.branch, state.checkout, _state_session_handle(state),
+                                              RuntimeError(reason))
             fence_failure(reason)
             claims.transition_issue(
                 issue_id,
@@ -2555,7 +2600,7 @@ class WorklinkRunner:
                 reason=reason,
             )
             terminal_release.label_transition_applied = True
-            terminal_release.retain_for_recovery = False
+            terminal_release.retain_for_recovery = state.opencode_session_id is not None and not cleanup_verified
             terminal_release()
             _log_event(
                 "worklink_reattach_cleanup",
@@ -2570,10 +2615,26 @@ class WorklinkRunner:
                 checkout=Path(state.checkout) if state.checkout else None,
                 branch=state.branch,
                 reason=reason,
+                evidence_path=evidence,
                 incident_recorded=autonomous,
             )
 
         review_ready = claims.review_ready_evidence(issue_id)
+        if review_ready is not None and (session_handle is not None or state.handle_substrate == "opencode_daemon"):
+            recovery_failure = await reconcile_current_session()
+            if recovery_failure is not None:
+                return recovery_failure
+            if session_handle is not None and review_ready.payload.get("opencode_session_id") != session_handle.opencode_session_id:
+                reason = "completed evidence belongs to an earlier session; current session cancellation verified"
+                fence_failure(reason)
+                evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
+                                                  state.branch, state.checkout, session_handle, RuntimeError(reason))
+                claims.transition_issue(issue_id, status="failed", review_ready=False,
+                                        attempt=state.attempt, reason=reason)
+                terminal_release.label_transition_applied = True
+                terminal_release.retain_for_recovery = False
+                terminal_release()
+                return WorklinkRunResult(issue_id, state.attempt, "failed", evidence_path=evidence, reason=reason)
         if review_ready is not None:
             try:
                 pr_url = str(review_ready.payload["pr_url"])
@@ -2699,10 +2760,17 @@ class WorklinkRunner:
             if state.phase == "admission_uncertain":
                 try:
                     recovered = await compute.recover_admission(state.launch_generation)
-                except RuntimeError:
-                    return WorklinkRunResult(issue_id, state.attempt, "failed", reason="session admission recovery unverified")
+                except BaseException as exc:
+                    evidence = _write_session_failure(
+                        self.home, issue_id, state.attempt, state.backend, state.branch, state.checkout,
+                        session_handle, exc, status="failed" if isinstance(exc, Exception) else "interrupted")
+                    if not isinstance(exc, Exception):
+                        raise
+                    return WorklinkRunResult(issue_id, state.attempt, "failed", evidence_path=evidence,
+                                             reason="session admission recovery unverified")
                 if recovered is not None:
                     handle = recovered
+                    session_handle = recovered
                     state = replace(state, handle_identifier=handle.identifier,
                                     opencode_session_id=handle.opencode_session_id, phase="spawned")
                     save_run_state(self.home, state)
@@ -2711,14 +2779,9 @@ class WorklinkRunner:
                     terminal_release()
                     return WorklinkRunResult(issue_id, state.attempt, "failed", reason="session admission refused before creation")
             if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
-                try:
-                    await compute.cancel(handle)
-                    await compute.cleanup(handle)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    evidence = _write_session_failure(self.home, issue_id, state.attempt, state.backend,
-                                                      state.branch, state.checkout, handle, exc)
-                    return WorklinkRunResult(issue_id, state.attempt, "failed", evidence_path=evidence,
-                                             reason="session quiescence unverified; recovery retained")
+                recovery_failure = await reconcile_current_session()
+                if recovery_failure is not None:
+                    return recovery_failure
                 terminal_release.retain_for_recovery = False
                 terminal_release()
                 return WorklinkRunResult(issue_id, state.attempt, "failed", reason="retained session cancellation verified")
@@ -6063,6 +6126,14 @@ def _run_worklink_epic_under_lease(
     return result
 
 
+def _state_session_handle(state: WorklinkRunState) -> LaunchHandle | None:
+    if state.opencode_session_id is None:
+        return None
+    return LaunchHandle("opencode_daemon", state.opencode_session_id,
+                        opencode_session_id=state.opencode_session_id,
+                        launch_generation=state.launch_generation)
+
+
 def _write_session_failure(
     home: Path, issue_id: int, attempt: int, backend: str, branch: str, checkout: str,
     handle: LaunchHandle | None, error: BaseException, *, status: str = "failed",
@@ -6096,6 +6167,7 @@ def _persist_run_state(
     test_command: str | None,
     started_at: datetime,
     test_env: Mapping[str, str] | None = None,
+    session_handle: LaunchHandle | None = None,
 ) -> None:
     """Record the worker handle so a fresh controller can reattach (#561).
 
@@ -6109,8 +6181,8 @@ def _persist_run_state(
             backend=backend_name,
             compute_name=handle.substrate if compute.name == "opencode_daemon" else compute.name,
             handle_substrate=handle.substrate,
-            opencode_session_id=handle.opencode_session_id,
-            launch_generation=handle.launch_generation,
+            opencode_session_id=(session_handle or handle).opencode_session_id,
+            launch_generation=(session_handle or handle).launch_generation,
             handle_identifier=handle.identifier,
             branch=lease.branch,
             base_ref=lease.base_ref,

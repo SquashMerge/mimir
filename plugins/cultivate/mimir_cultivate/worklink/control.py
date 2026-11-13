@@ -457,6 +457,13 @@ def stop_worklink(
             _operator_stop_path(home, issue_id).unlink(missing_ok=True)
             return WorklinkStopResult(issue_id, False, reason=str(exc))
 
+        if state.opencode_session_id is not None:
+            # A local gate has its own process handle, but its build-session
+            # correlation must survive until the waiter or reattach writes the
+            # terminal evidence and routes the claim.
+            return WorklinkStopResult(issue_id, True,
+                reason="gate cancelled; controller finalization or reattach is required")
+
         clear_run_state(home, issue_id)
         state_cleared = load_run_state(home, issue_id) is None
         release = run([chainlink_bin, "locks", "release", str(issue_id)])

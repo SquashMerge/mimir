@@ -442,6 +442,212 @@ def _write_completed_evidence(
     return path
 
 
+@pytest.fixture
+async def daemon_recovery(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / ".worklink/repo/561-1"
+    checkout.mkdir(parents=True)
+    path = tmp_path / "controller.json"
+    labels, calls, operations = ["worklink:failed"], [], []
+    runner = _remote_runner(repo, calls, issue_id=561, labels=labels)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        async def create(text):
+            return await SessionController.create(
+                client, path, request=SessionRequest("leaf", {"providerID": "openai", "id": "gpt-test"}, text, ("git *",)),
+                issue_id=561, attempt=1, generation="generation", checkout=checkout,
+                environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+
+        class Boundary:
+            def recover(self, handle, operation):
+                operations.append((operation, handle.opencode_session_id, handle.launch_generation))
+                assert handle.identifier == handle.opencode_session_id
+                return SessionController.recover_owned(
+                    client, path, session_id=handle.opencode_session_id,
+                    generation=handle.launch_generation, checkout=checkout)
+
+            async def session_observe(self, handle):
+                return await self.recover(handle, "observe").observe()
+
+            async def session_cancel(self, handle):
+                if not await self.recover(handle, "cancel").cancel(timeout_s=2):
+                    raise RuntimeError("session cancellation unverified")
+
+            async def session_release(self, handle):
+                await self.recover(handle, "release").release()
+
+        boundary = Boundary()
+        monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *args, **kwargs: boundary)
+        registry = BackendRegistry(WorklinkConfig())
+        registry.register(OpenCodeBackend(bash_allowlist=("git *",)))
+        registry.register_compute(OpenCodeDaemonComputeBackend(client=boundary))
+
+        def save(controller):
+            sid = controller.record.opencode_session_id
+            state = WorklinkRunState(
+                issue_id=561, attempt=1, backend="opencode", compute_name="opencode_daemon",
+                handle_substrate="opencode_daemon", handle_identifier=sid, branch="issue/561-a1",
+                base_ref="main", local_base="main", repo=str(repo), repo_url="repo", test_command=None,
+                started_at="2026-06-18T16:00:00+00:00", checkout=str(checkout),
+                opencode_session_id=sid, launch_generation="generation")
+            save_run_state(tmp_path, state)
+            return state
+
+        yield SimpleNamespace(daemon=daemon, client=client, create=create, save=save, boundary=boundary,
+                              repo=repo, checkout=checkout, path=path, labels=labels, calls=calls,
+                              operations=operations, registry=registry,
+                              runner=WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry))
+
+
+@pytest.mark.asyncio
+async def test_completed_initial_evidence_cannot_release_active_repair(tmp_path, daemon_recovery):
+    fixture = daemon_recovery
+    initial = await fixture.create("initial build")
+    initial_id = initial.record.opencode_session_id
+    fixture.daemon.finish(initial_id, outcome="succeeded")
+    await initial.release()
+    repair = await fixture.create("repair CI")
+    state = fixture.save(repair)
+    evidence_path = _write_completed_evidence(tmp_path, issue_id=561)
+    evidence = json.loads(evidence_path.read_text())
+    evidence["opencode_session_id"] = initial_id
+    evidence_path.write_text(json.dumps(evidence))
+
+    fixture.daemon.interrupt_noop = True
+    result = await fixture.runner.reattach(561)
+    assert result.status == "failed" and not result.review_ready
+    assert result.reason == "session quiescence unverified; recovery retained"
+    assert load_run_state(tmp_path, 561) == state
+    assert fixture.checkout.exists() and fixture.path.exists()
+    assert ["chainlink", "locks", "release", "561"] not in fixture.calls
+    assert fixture.operations == [("cancel", state.opencode_session_id, "generation")]
+
+    fixture.daemon.interrupt_noop = False
+    result = await fixture.runner.reattach(561)
+    assert result.reason == "retained session cancellation verified"
+    assert load_run_state(tmp_path, 561) is None
+    assert ["chainlink", "locks", "release", "561"] in fixture.calls
+    assert all(sid == state.opencode_session_id and generation == "generation"
+               for _, sid, generation in fixture.operations)
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence_is_current", [False, True])
+async def test_completed_evidence_requires_current_session_and_verified_cleanup(tmp_path, daemon_recovery, evidence_is_current):
+    fixture = daemon_recovery
+    initial = await fixture.create("initial build")
+    initial_id = initial.record.opencode_session_id
+    fixture.daemon.finish(initial_id, outcome="succeeded")
+    await initial.release()
+    repair = await fixture.create("repair CI")
+    state = fixture.save(repair)
+    if evidence_is_current:
+        fixture.daemon.finish(state.opencode_session_id, outcome="succeeded")
+    evidence_path = _write_completed_evidence(tmp_path, issue_id=561)
+    evidence = json.loads(evidence_path.read_text())
+    evidence["opencode_session_id"] = state.opencode_session_id if evidence_is_current else initial_id
+    evidence_path.write_text(json.dumps(evidence))
+
+    result = await fixture.runner.reattach(561)
+    assert result.status == ("completed" if evidence_is_current else "failed")
+    assert load_run_state(tmp_path, 561) is None
+    assert ["chainlink", "locks", "release", "561"] in fixture.calls
+    assert fixture.operations == [(operation, state.opencode_session_id, "generation")
+                                  for operation in ("cancel", "release")]
+    assert json.loads(result.evidence_path.read_text())["opencode_session_id"] == state.opencode_session_id
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_retained_session_reconciliation_interruption_writes_current_identity(tmp_path, monkeypatch, daemon_recovery):
+    fixture = daemon_recovery
+    controller = await fixture.create("repair CI")
+    state = fixture.save(controller)
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+    original_cancel = fixture.boundary.session_cancel
+
+    async def paused_cancel(handle):
+        assert (handle.identifier, handle.launch_generation) == (state.opencode_session_id, "generation")
+        entered.set()
+        await proceed.wait()
+        await original_cancel(handle)
+
+    monkeypatch.setattr(fixture.boundary, "session_cancel", paused_cancel)
+    canary = "opaque-" + "retained-interruption"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", canary)
+    task = asyncio.create_task(fixture.runner.reattach(561))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel(canary + "x" * 3000)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    evidence = json.loads((tmp_path / "state/worklink/evidence/561-1.json").read_text())
+    assert evidence["status"] == "interrupted"
+    assert evidence["opencode_session_id"] == state.opencode_session_id
+    assert canary not in evidence["failure_reason"]
+    assert len(evidence["failure_reason"]) <= 2048
+    assert load_run_state(tmp_path, 561) == state
+    assert fixture.path.exists() and fixture.checkout.exists()
+    assert ["chainlink", "locks", "release", "561"] not in fixture.calls
+
+    monkeypatch.setattr(fixture.boundary, "session_cancel", original_cancel)
+    result = await fixture.runner.reattach(561)
+    assert result.reason == "retained session cancellation verified"
+    assert load_run_state(tmp_path, 561) is None
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_retirement_witness_is_scoped_to_session_and_generation(daemon_recovery):
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+
+    fixture = daemon_recovery
+    initial = await fixture.create("initial")
+    initial_id = initial.record.opencode_session_id
+    fixture.daemon.finish(initial_id, outcome="succeeded")
+    await initial.release()
+    repair = await fixture.create("repair")
+    repair_id = repair.record.opencode_session_id
+    requests_before = len(fixture.daemon.requests)
+    retired = SessionController.recover_owned(fixture.client, fixture.path, session_id=initial_id,
+                                              generation="generation", checkout=fixture.checkout)
+    assert await retired.cancel()
+    await retired.release()
+    assert len(fixture.daemon.requests) == requests_before
+    assert fixture.daemon.sessions[repair_id].active
+    assert fixture.path.exists()
+    assert SessionController.recover(fixture.client, fixture.path, generation="generation",
+                                     checkout=fixture.checkout).record.opencode_session_id == repair_id
+    with pytest.raises(ValueError, match="generation mismatch"):
+        SessionController.recover_owned(fixture.client, fixture.path, session_id=initial_id,
+                                        generation="foreign-generation", checkout=fixture.checkout)
+
+
+@pytest.mark.parametrize("sid, generation", [(None, "generation"), ("ses_current", None),
+                                            ("not-a-session", "generation")])
+def test_process_gate_state_rejects_invalid_session_correlation(sid, generation):
+    import uuid
+
+    state = WorklinkRunState(
+        issue_id=561, attempt=1, backend="opencode", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier=str(uuid.uuid4()), branch="issue/561-a1",
+        base_ref="main", local_base="main", repo="/repo", repo_url="repo", test_command="pytest",
+        started_at="2026-06-18T16:00:00+00:00", process_start_ticks=1, shim_pid=12345,
+        opencode_session_id=sid, launch_generation=generation)
+    with pytest.raises(ValueError, match="gate session identity"):
+        WorklinkRunState.from_json(state.to_json())
+
+
 @pytest.mark.parametrize("release_ok", [True, False])
 def test_reattach_completed_evidence_reconciles_without_worker_or_push(
     tmp_path: Path, monkeypatch, release_ok: bool,

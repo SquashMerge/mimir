@@ -24,11 +24,12 @@ class SessionBoundary:
         self.error = None
         self.text = "done"
         self.finish = True
+        self.issue_id = 2125
 
     async def session_create(self, request, *, timeout_s, pass_env=None, git_settings=()):
         self.controller = await SessionController.create(
             self.client, self.checkout_path / "controller.json", request=request,
-            issue_id=2125, attempt=1, generation="generation", checkout=self.checkout_path,
+            issue_id=self.issue_id, attempt=1, generation="generation", checkout=self.checkout_path,
             environment={"PATH": "/usr/bin:/bin", **(pass_env or {})}, timeout_s=timeout_s)
         sid = self.controller.record.opencode_session_id
         return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation="generation")
@@ -44,7 +45,7 @@ class SessionBoundary:
         return await self.controller.observe(stdout_limit=stdout_limit)
 
     async def session_cancel(self, handle):
-        if not await self.controller.cancel(timeout_s=1):
+        if not await self.controller.cancel():
             raise RuntimeError("unverified cancellation")
 
     async def session_release(self, handle):
@@ -232,6 +233,15 @@ class AdmissionBoundary(SessionBoundary):
         self.recoveries = 0
         self.creates = 0
         self.pause_after = 1
+        self.pause_wait = False
+        self.wait_entered = asyncio.Event()
+        self.wait_acknowledge = asyncio.Event()
+
+    async def session_observe(self, handle, **kwargs):
+        if self.pause_wait and self.creates == self.pause_after:
+            self.wait_entered.set()
+            await self.wait_acknowledge.wait()
+        return await super().session_observe(handle, **kwargs)
 
     async def session_create(self, request, **kwargs):
         from mimir_cultivate.worklink.worker_client import WorkerClient
@@ -331,7 +341,9 @@ async def test_controller_redacts_current_api_and_publishing_credentials(tmp_pat
 
 
 @pytest.mark.parametrize("phase, failure", [("initial", "cancel"), ("repair", "cancel"),
-                                            ("repair", "lost_ack"), ("repair", "exception")])
+                                            ("initial", "wait_cancel"), ("repair", "wait_cancel"),
+                                            ("repair", "lost_ack"), ("repair", "exception"),
+                                            ("repair", "stop"), ("initial", "gate_cancel"), ("repair", "gate_cancel")])
 async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path, monkeypatch, phase, failure):
     from types import SimpleNamespace
     from mimir_cultivate.worklink import orchestrator as orch
@@ -342,8 +354,11 @@ async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path
     from tests.test_worklink_orchestrator import _orchestrator_runner
 
     repo, checkout = tmp_path / "repo", tmp_path / "checkout"
-    checkout.mkdir()
-    _, runner = _orchestrator_runner(repo, checkout)
+    checkout.mkdir(mode=0o700)
+    calls, runner = _orchestrator_runner(repo, checkout)
+    stopped = False
+    observations = 0
+    monkeypatch.setattr(orch, "operator_stop_requested", lambda *args: stopped)
     monkeypatch.setattr(orch, "_cultivate_selected", lambda: False)
     monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:
                         CheckoutLease(441, 1, repo, checkout, "issue/441-a1", "main", isolated_checkout=True))
@@ -362,33 +377,65 @@ async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path
     monkeypatch.setattr(orch, "_with_head_sha", lambda validation, *args, **kwargs: validation)
 
     async def observe(**kwargs):
-        return EvidenceValidation("completed", True, (), WorklinkEvidence(
+        nonlocal observations
+        observations += 1
+        if failure == "gate_cancel" and (phase == "initial" or boundary.creates == 2):
+            from mimir_cultivate.worklink.evidence import _run_compute_gate
+            await _run_compute_gate(
+                "uv run pytest", checkout=checkout, work_spec=kwargs["work_spec"],
+                compute=kwargs["compute"], on_launch=kwargs["on_gate_launch"])
+        succeeded = kwargs["backend_status"] == "success"
+        return EvidenceValidation("completed" if succeeded else "failed", succeeded, (), WorklinkEvidence(
             issue=441, attempt=1, backend="opencode", branch="issue/441-a1", checkout=str(checkout),
             started_at="2026-11-12T00:00:00+00:00", finished_at="2026-11-12T00:00:01+00:00",
             files_changed=["changed.py"], diff_stat="changed", commands=[], tests=None,
-            pr_url=None, status="completed", head_sha="abc123"))
+            pr_url=None, status="completed" if succeeded else "failed", head_sha="abc123"))
 
     async def red_ci(*args, **kwargs):
-        return SimpleNamespace(outcome="red", reason="test failed", excerpt="bounded log")
+        return SimpleNamespace(outcome="red", reason="test failed", excerpt="bounded log", checks=())
 
     monkeypatch.setattr(orch, "observe_evidence", observe)
     monkeypatch.setattr(orch, "wait_for_ci", red_ci)
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         boundary = AdmissionBoundary(daemon, client, checkout, lost_ack=failure == "lost_ack")
+        boundary.issue_id = 441
+        boundary.pause_wait = failure == "wait_cancel"
         boundary.pause_after = 1 if phase == "initial" else 2
         compute = OpenCodeDaemonComputeBackend(client=boundary)
-        monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: compute)
+        monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend",
+                            lambda **kwargs: OpenCodeDaemonComputeBackend(**kwargs) if kwargs else compute)
         backend = OpenCodeBackend(bash_allowlist=("git *", "uv *"))
         original_interpret = backend.interpret
 
         async def interpret(self, order, result):
+            nonlocal stopped
             if boundary.creates == 2 and failure == "exception":
                 raise RuntimeError("ordinary finalization failure")
+            if boundary.creates == 2 and failure == "stop":
+                stopped = True
             return await original_interpret(order, result)
 
         monkeypatch.setattr(OpenCodeBackend, "interpret", interpret)
         registry = BackendRegistry(WorklinkConfig())
         registry.register(backend)
+        if failure == "gate_cancel":
+            import uuid
+            from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+
+            class ProcessGate:
+                async def _launch_contained(self, spec, argv):
+                    return LaunchHandle("local_subprocess", str(uuid.uuid4()), process_start_ticks=1, shim_pid=12345)
+
+                async def wait(self, handle, timeout_s):
+                    raise asyncio.CancelledError("local gate interrupted")
+
+                async def cancel(self, handle):
+                    pass
+
+                async def cleanup(self, handle):
+                    pass
+
+            monkeypatch.setattr(LocalSubprocessComputeBackend, "for_path_checkout", lambda *args: ProcessGate())
         task = asyncio.create_task(orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner,
                                                        registry=registry).run(441, backend_name="opencode"))
         admitted = asyncio.create_task(boundary.admitted.wait())
@@ -399,12 +446,23 @@ async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path
         if failure == "cancel":
             task.cancel()
         boundary.acknowledge.set()
-        if failure == "cancel":
-            with pytest.raises(asyncio.CancelledError):
+        if failure == "wait_cancel":
+            await asyncio.wait_for(boundary.wait_entered.wait(), 5)
+            task.cancel()
+        if failure in {"cancel", "wait_cancel", "gate_cancel"}:
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                pytest.fail(f"expected interruption, got {task.result()}; cancellation={boundary.controller.record.cancellation_state}")
         else:
             result = await task
-            assert result.status == "failed"
+            assert result.status == ("stopped" if failure == "stop" else "blocked" if failure == "lost_ack" else "failed")
+            if failure == "lost_ack":
+                assert boundary.recoveries == 1
+            if failure == "stop":
+                assert observations == 2, "stop must precede repair re-observation"
         evidence_files = list((tmp_path / "state/worklink/evidence").rglob("*.json"))
         assert evidence_files
         evidence = json.loads(evidence_files[-1].read_text())
@@ -412,4 +470,59 @@ async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path
         state = load_run_state(tmp_path, 441)
         if state is not None:
             assert state.opencode_session_id == sid
+        if failure in {"cancel", "wait_cancel", "gate_cancel"}:
+            from mimir_cultivate.worklink.worker_client import WorkerClient
+            assert state is not None
+            assert state.launch_generation == "generation"
+            assert ["chainlink", "locks", "release", "441"] not in calls
+
+            class RecoveredBoundary:
+                def recover(self, handle):
+                    assert (handle.opencode_session_id, handle.launch_generation) == (sid, "generation")
+                    return SessionController.recover_owned(client, checkout / "controller.json", session_id=sid,
+                                                           generation="generation", checkout=checkout)
+
+                async def session_cancel(self, handle):
+                    assert await self.recover(handle).cancel()
+
+                async def session_release(self, handle):
+                    await self.recover(handle).release()
+
+                async def session_observe(self, handle):
+                    return await self.recover(handle).observe()
+
+            monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *args, **kwargs: RecoveredBoundary())
+            if failure != "gate_cancel":
+                assert RecoveredBoundary().recover(LaunchHandle("opencode_daemon", sid, opencode_session_id=sid,
+                                                                launch_generation="generation")).record.cancellation_state == "verified"
+            if failure == "gate_cancel":
+                assert state.handle_substrate == "local_subprocess"
+                assert state.handle_identifier != sid
+                assert state.shim_pid == 12345
+                if phase == "repair":
+                    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+
+                    async def unverified_process_cancel(self, handle):
+                        assert handle.identifier == state.handle_identifier
+                        assert handle.opencode_session_id is None
+                        raise RuntimeError("process gate cleanup unverified")
+
+                    monkeypatch.setattr(orch, "process_is_alive", lambda state: True)
+                    monkeypatch.setattr(LocalSubprocessComputeBackend, "cancel", unverified_process_cancel)
+                    result = await orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(441)
+                    assert result.status == "failed"
+                    assert load_run_state(tmp_path, 441) == state
+                    assert ["chainlink", "locks", "release", "441"] not in calls
+                    assert json.loads(result.evidence_path.read_text())["opencode_session_id"] == sid
+                monkeypatch.setattr(orch, "process_is_alive", lambda state: False)
+            else:
+                monkeypatch.setattr(orch.ChainlinkClaims, "_issue_has_label",
+                                    lambda self, issue_id, label: label == "worklink:in-progress")
+                monkeypatch.setattr(orch.ControllerGitPublication, "capture",
+                                    lambda *args: SimpleNamespace(close=lambda: None))
+            result = await orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(441)
+            assert result.status == "failed"
+            assert load_run_state(tmp_path, 441) is None, (result.reason, json.loads(evidence_files[-1].read_text())["failure_reason"])
+            assert ["chainlink", "locks", "release", "441"] in calls
+            assert json.loads(evidence_files[-1].read_text())["opencode_session_id"] == sid
         assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == boundary.creates
