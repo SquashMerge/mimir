@@ -14,6 +14,7 @@ for file in \
     tests/test_scaffold_docker.py \
     tests/test_worklink_tool_pins.py \
     tests/test_core_without_worklink.py \
+    tests/test_plugin_skills_cli.py \
     tests/test_worklink_feature_factory.py \
     tests/test_factory_execution_config.py \
     tests/test_worklink_factory_docs.py \
