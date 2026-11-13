@@ -226,9 +226,9 @@ def test_shared_service_script_provisions_each_layout(tmp_path: Path, monkeypatc
     assert stat.S_IMODE((bindir / "worklink-opencode-login").stat().st_mode) == 0o755
 
 
-def test_sdist_wheel_source_free_context_preserves_daemon_resources(tmp_path: Path) -> None:
+@pytest.fixture
+def daemon_packages(tmp_path: Path):
     import hashlib
-    import tarfile
 
     from mimir.plugin_dockerfile import _S6_FILES, _CONTEXT_SCRIPTS, build_pypi_context
     from mimir_cultivate.setup import _BUILD_CONTEXT_HELPER
@@ -255,6 +255,14 @@ def test_sdist_wheel_source_free_context_preserves_daemon_resources(tmp_path: Pa
     subprocess.run([sys.executable, "-I", "-S", str(helper), str(saved), str(wheels["mimir-agent"]),
                     str(wheels["mimir-cultivate"]), version, hashes["mimir-agent"], hashes["mimir-cultivate"]],
                    check=True, capture_output=True, text=True)
+    sdists = {package: next(tmp_path.glob(package.replace("-", "_") + "-*.tar.gz"))
+              for package in wheels}
+    return resources, wheels, sdists, (context, saved)
+
+
+def _assert_daemon_resource_chain(resources, wheels, sdists, contexts) -> None:
+    import tarfile
+
     for package, member, source in resources:
         # Hatch normalizes write permissions for reproducible archives. Source
         # executability is authoritative; checkout group-write bits are not.
@@ -262,7 +270,7 @@ def test_sdist_wheel_source_free_context_preserves_daemon_resources(tmp_path: Pa
         if source.endswith("/run") or Path(source).name in {
                 "worklink-opencode-service", "worklink-daemon-gate", "worklink-opencode-login"}:
             assert expected_mode == 0o755, f"source executable mode: {source}"
-        with tarfile.open(next(tmp_path.glob(package.replace("-", "_") + "-*.tar.gz"))) as archive:
+        with tarfile.open(sdists[package]) as archive:
             path = next(name for name in archive.getnames() if name.endswith("/" + source.removeprefix("plugins/cultivate/")))
             assert archive.extractfile(path).read() == (ROOT / source).read_bytes()
             assert stat.S_IMODE(archive.getmember(path).mode) == expected_mode, f"sdist source mode: {source}"
@@ -270,6 +278,47 @@ def test_sdist_wheel_source_free_context_preserves_daemon_resources(tmp_path: Pa
             info = archive.getinfo(member)
             assert archive.read(member) == (ROOT / source).read_bytes()
             assert stat.S_IMODE(info.external_attr >> 16) == expected_mode, f"wheel source mode: {source}"
-            for destination in (context, saved):
+            for destination in contexts:
                 assert (destination / source).read_bytes() == archive.read(member)
                 assert stat.S_IMODE((destination / source).stat().st_mode) == expected_mode, f"context source mode: {destination.name}/{source}"
+
+
+def test_sdist_wheel_source_free_context_preserves_daemon_resources(daemon_packages) -> None:
+    _assert_daemon_resource_chain(*daemon_packages)
+
+
+def test_mutation_sdist_executable_bits_lost(daemon_packages, tmp_path: Path) -> None:
+    import tarfile
+
+    resources, wheels, sdists, contexts = daemon_packages
+    _assert_daemon_resource_chain(*daemon_packages)
+    damaged = tmp_path / "damaged.tar.gz"
+    target = "deploy/s6-overlay/s6-rc.d/mimir/run"
+    with tarfile.open(sdists["mimir-agent"]) as original, tarfile.open(damaged, "w:gz") as archive:
+        for info in original.getmembers():
+            data = original.extractfile(info) if info.isfile() else None
+            if info.name.endswith("/" + target):
+                info.mode = 0o644
+            try:
+                archive.addfile(info, data)
+            finally:
+                if data is not None:
+                    data.close()
+    with pytest.raises(AssertionError, match="sdist source mode: " + target):
+        _assert_daemon_resource_chain(resources, wheels, {**sdists, "mimir-agent": damaged}, contexts)
+    _assert_daemon_resource_chain(*daemon_packages)
+
+
+def test_mutation_wheel_executable_bits_lost(daemon_packages, tmp_path: Path) -> None:
+    resources, wheels, sdists, contexts = daemon_packages
+    _assert_daemon_resource_chain(*daemon_packages)
+    damaged = tmp_path / "damaged.whl"
+    target = "mimir_cultivate/docker/worklink-opencode-login"
+    with ZipFile(wheels["mimir-cultivate"]) as original, ZipFile(damaged, "w") as archive:
+        for info in original.infolist():
+            if info.filename == target:
+                info.external_attr = (stat.S_IFREG | 0o644) << 16
+            archive.writestr(info, original.read(info.filename))
+    with pytest.raises(AssertionError, match="wheel source mode: plugins/cultivate/" + target):
+        _assert_daemon_resource_chain(resources, {**wheels, "mimir-cultivate": damaged}, sdists, contexts)
+    _assert_daemon_resource_chain(*daemon_packages)
