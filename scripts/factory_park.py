@@ -342,6 +342,8 @@ def _quiesce_daemon_host(record: FactoryRunRecord, home: Path) -> FactoryRunReco
     try:
         asyncio.run(cancel_host())
     except (OSError, RuntimeError, ValueError) as exc:
+        from mimir_cultivate.worklink.orchestrator import _write_factory_host_evidence
+        _write_factory_host_evidence(home, record, "failed", "operator park: session quiescence unverified")
         raise ParkError("session quiescence unverified; checkout, record and claim retained") from exc
     current = load_factory_record(home, record.run_id)
     if current is None or current.handle != record.handle:
@@ -609,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
                 record = replace(record.observed(parse_factory_status(observed), datetime.now(UTC).isoformat()),
                                  controller_phase="parked")
                 save_factory_record(args.home, record)
+            from mimir_cultivate.worklink.orchestrator import _write_factory_host_evidence
+            _write_factory_host_evidence(args.home, record, "needs-human", "operator park reconciled")
             code, detail = release_parked_claim(args.chainlink_bin, record.issue_id, args.agent_id, args.home)
         if code != 0:
             print(f"PARKED, BUT THE CLAIM IS STILL HELD: {detail}", file=sys.stderr)
@@ -743,6 +747,8 @@ def _finish_operator_park(args, record: FactoryRunRecord, sandbox: Path, plane: 
     reconciled = replace(current.observed(parse_factory_status(after), datetime.now(UTC).isoformat()),
                          controller_phase="parked")
     save_factory_record(args.home, reconciled)
+    from mimir_cultivate.worklink.orchestrator import _write_factory_host_evidence
+    _write_factory_host_evidence(args.home, reconciled, "needs-human", "operator park reconciled")
     print("reconciled : controller_phase=parked, observed status=needs-human")
 
     print()

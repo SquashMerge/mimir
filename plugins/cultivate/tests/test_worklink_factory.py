@@ -458,6 +458,9 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         assert record.opencode_session_id == "ses_completion"
         if not reaped:
             assert result.status == "failed" and "quiescence unverified" in result.reason
+            payload = json.loads((tmp_path / "state/worklink/evidence/1949-1.json").read_text())
+            assert payload["opencode_session_id"] == record.opencode_session_id
+            assert payload["status"] == "failed" and payload["failure_reason"]
             assert not record.children_reaped
             assert sandbox.is_dir() and not cleanups
             assert requests == []

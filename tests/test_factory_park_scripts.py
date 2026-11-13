@@ -177,7 +177,8 @@ def _park_main(record, home: Path, monkeypatch, run, tmp_path: Path, *, extra=()
     if daemon:
         values.append(_status("running", sandbox_path=record.sandbox))
     values.extend([_status(sandbox_path=record.sandbox), _status(sandbox_path=record.sandbox)])
-    statuses = iter([{**value, **({"lock_session": record.session} if daemon else {})} for value in values])
+    statuses = iter([{**value, "mcp_servers": list(record.mcp_servers),
+                     **({"lock_session": record.session} if daemon else {})} for value in values])
     monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
     monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
     def publish(*args, **kwargs):
@@ -396,7 +397,8 @@ def _status(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verified", [True, False])
-async def test_operator_park_cancels_actual_daemon_host_before_factory_effects(tmp_path, monkeypatch, verified):
+@pytest.mark.parametrize("already_parked", [False, True])
+async def test_operator_park_cancels_actual_daemon_host_before_factory_effects(tmp_path, monkeypatch, verified, already_parked):
     import asyncio
     from mimir_cultivate.worklink import worker_client
     from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
@@ -404,7 +406,10 @@ async def test_operator_park_cancels_actual_daemon_host_before_factory_effects(t
     from mimir_cultivate.worklink.backends.base import SessionRequest
     from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
 
-    original = _record(tmp_path, phase="running", status="running")
+    original = _record(tmp_path, phase="parked" if already_parked else "running",
+                       status="needs-human" if already_parked else "running")
+    secret = "opaque-" + "operator-mcp-" + "header"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", secret)
     loop = asyncio.get_running_loop()
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         controller = await SessionController.create(client, tmp_path / "native-controller.json",
@@ -415,7 +420,8 @@ async def test_operator_park_cancels_actual_daemon_host_before_factory_effects(t
         sid = controller.record.opencode_session_id
         record = replace(original, handle=LaunchHandle("opencode_daemon", sid,
             opencode_session_id=sid, launch_generation="operator-generation"),
-            session=sid, opencode_session_id=sid, children_reaped=False)
+            session=sid, opencode_session_id=sid, children_reaped=False,
+            mcp_servers=("first", "fixture-mcp", secret, "fixture-mcp"))
         home = _home_with(record, tmp_path)
         assert resume.preflight(record, {**_status("running"), "lock_session": sid}, Path(record.sandbox)) == []
         order = []
@@ -436,17 +442,26 @@ async def test_operator_park_cancels_actual_daemon_host_before_factory_effects(t
         run = _park_stub(calls, _claim_history(1))
         def command(argv, **kwargs):
             if argv[:1] == ["node"]:
-                assert order[:3] == ["controller", "quiescent", "released"]
+                assert order[-2:] == ["quiescent", "released"]
             return run(argv, **kwargs)
         daemon.interrupt_noop = not verified
         try:
-            invocation = asyncio.to_thread(_park_main, record, home, monkeypatch, command, tmp_path)
+            if already_parked:
+                monkeypatch.setattr(park, "factory_status", lambda *a, **kw: {
+                    **_status(sandbox_path=record.sandbox), "lock_session": sid,
+                    "mcp_servers": list(record.mcp_servers)})
+                monkeypatch.setattr(park, "_run", command)
+                invocation = asyncio.to_thread(park.main, ["--run-id", record.run_id, "--sandbox", record.sandbox,
+                    "--home", str(home), "--launcher", record.launcher, "--reason", "budget",
+                    "--controller-pid", "none", "--agent-id", AGENT])
+            else:
+                invocation = asyncio.to_thread(_park_main, record, home, monkeypatch, command, tmp_path)
             if verified:
                 assert await invocation == 0
                 retained = load_factory_record(home, record.run_id)
                 assert retained.controller_phase == "parked" and retained.children_reaped
                 assert retained.opencode_session_id == retained.session == sid
-                assert any(argv[2:3] == ["terminal"] for argv in calls if argv[:1] == ["node"])
+                assert any(argv[2:3] == ["terminal"] for argv in calls if argv[:1] == ["node"]) is (not already_parked)
                 assert any(argv[1:3] == ["locks", "release"] for argv in calls)
             else:
                 with pytest.raises(park.ParkError, match="quiescence unverified"):
@@ -454,6 +469,12 @@ async def test_operator_park_cancels_actual_daemon_host_before_factory_effects(t
                 assert controller.path.exists()
                 assert not load_factory_record(home, record.run_id).children_reaped
                 assert not any(argv[:1] == ["node"] or argv[1:3] == ["locks", "release"] for argv in calls)
+            proof = json.loads((home / "state/worklink/evidence/1783-1.json").read_text())
+            assert proof["opencode_session_id"] == sid
+            assert proof["mcp_servers"] == ["first", "fixture-mcp", "<redacted>", "fixture-mcp"]
+            assert secret not in json.dumps(proof)
+            assert proof["status"] == ("needs-human" if verified else "failed")
+            assert proof["failure_reason"]
         finally:
             daemon.interrupt_noop = False
             await controller.release()

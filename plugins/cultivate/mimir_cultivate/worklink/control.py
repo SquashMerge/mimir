@@ -60,8 +60,7 @@ def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | Non
     except (OSError, ValueError):
         return False
     return bool(isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
-                and (opencode_session_id is None or data.get("opencode_session_id") is None
-                     or data.get("opencode_session_id") == opencode_session_id))
+                and (opencode_session_id is None or data.get("opencode_session_id") == opencode_session_id))
 
 
 def _mark_operator_stop(home: Path, issue_id: int, attempt: int, *, opencode_session_id: str | None = None) -> None:
@@ -406,16 +405,17 @@ def stop_worklink(
                         if after.lock_session not in {None, actual} or latest is None or latest.handle != factory.handle:
                             raise RuntimeError("factory host ownership changed during stop")
                     except (RuntimeError, OSError, ValueError):
+                        _write_factory_host_evidence(home, factory, "failed", "session cancellation or ownership unverified")
                         uncertain = True
                         problems.append(f"factory {factory.run_id}: session cancellation or ownership unverified; state and claim retained")
                         continue
                     stopped = replace(latest.observed(after, datetime.now(UTC).isoformat()),
                         controller_phase="terminal" if after.is_terminal else "parked" if after.is_parked else "stopped",
+                        controller_error="operator requested stop",
                         children_reaped=True)
                     save_factory_record(home, stopped)
-                    if after.status != "completed":
-                        _write_factory_host_evidence(home, stopped,
-                            after.status if after.is_terminal or after.is_parked else "interrupted", "operator requested stop")
+                    _write_factory_host_evidence(home, stopped,
+                        "interrupted", "operator requested stop; factory status: " + str(after.status))
                     continue
                 if factory_process_is_alive(factory) and factory.handle is not None:
                     try:

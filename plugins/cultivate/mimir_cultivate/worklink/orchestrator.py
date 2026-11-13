@@ -3576,7 +3576,7 @@ class WorklinkRunner:
                 _write_session_failure(self.home, issue_id, claim_record.attempt, "feature_factory",
                     f"feature/{run_id}", str(lease.path) if lease is not None else "", None, exc,
                     status="backend_error")
-            elif current.status is None or current.status.status != "completed":
+            else:
                 _write_factory_host_evidence(self.home, current,
                     "backend_error" if current.opencode_session_id is None else "failed", _factory_controller_error(exc))
             published_url = (
@@ -3912,7 +3912,7 @@ class WorklinkRunner:
         if daemon_host:
             await _cancel_and_cleanup_factory_handle(compute, handle)
         if pre.lock_session is not None:
-            await asyncio.to_thread(backend.lock, retained.run_id, "release", session=retained.session,
+            await _await_factory_control(backend.lock, retained.run_id, "release", session=retained.session,
                                    sandbox=sandbox, launcher=retained.launcher)
         released = await asyncio.to_thread(backend.status, retained.run_id, sandbox=sandbox, launcher=retained.launcher)
         _require_factory_status(released, retained)
@@ -4053,11 +4053,12 @@ class WorklinkRunner:
                 outcome = factory_record.status.status or "failed"
             elif outcome in {"completed", "refused"}:
                 outcome = "failed"
+            if handle.opencode_session_id is not None and cancel_attempted and not factory_record.children_reaped:
+                outcome = "failed"
             if factory_record.transcript is not None and outcome == "running":
                 return
-            if factory_record.status is None or factory_record.status.status != "completed":
-                _write_factory_host_evidence(self.home, factory_record, outcome,
-                                            result.launch_error if result is not None else None)
+            _write_factory_host_evidence(self.home, factory_record, outcome,
+                                        factory_record.controller_error or (result.launch_error if result is not None else None))
             path = Path(factory_record.transcript) if factory_record.transcript is not None else transcript_path(
                 self.home / "state" / "worklink" / "transcripts",
                 issue.issue_id,
@@ -4089,7 +4090,13 @@ class WorklinkRunner:
             if cancel_attempted:
                 return
             cancel_attempted = True
-            await compute.cancel(handle)
+            try:
+                await compute.cancel(handle)
+            except BaseException as exc:
+                factory_record = replace(factory_record, controller_error=_factory_controller_error(exc))
+                save_factory_record(self.home, factory_record)
+                _write_factory_host_evidence(self.home, factory_record, "failed", _factory_controller_error(exc))
+                raise
             if handle.opencode_session_id is not None:
                 factory_record = replace(factory_record, children_reaped=True)
                 save_factory_record(self.home, factory_record)
@@ -4102,6 +4109,29 @@ class WorklinkRunner:
             wait_result = await _finish_factory_wait_task(wait_task)
             if compute.job_alive(handle):
                 raise WorklinkError("factory driver survived cancellation before park")
+            # Cancellation can deliver a final factory transition. Qualify that
+            # observation before any writer acts on the earlier running state.
+            if handle.opencode_session_id is not None:
+                current = await asyncio.to_thread(
+                    backend.status, factory_record.run_id,
+                    sandbox=Path(factory_record.sandbox), launcher=factory_record.launcher,
+                )
+                _require_factory_status(current, factory_record)
+                if current.lock_session not in {None, factory_record.session}:
+                    raise WorklinkError("factory lock owner changed during cancellation before park")
+                factory_record = replace(
+                    factory_record.observed(current, datetime.now(UTC).isoformat()),
+                    controller_phase="terminal" if current.is_terminal else "parked" if current.is_parked else "running",
+                )
+                save_factory_record(self.home, factory_record)
+                if current.is_terminal or current.is_parked:
+                    retain_result(wait_result, current.status or "failed")
+                    failed = False
+                    return await self._finish_factory_070(
+                        issue=issue, claim_record=claim_record, claims=claims, backend=backend,
+                        compute=compute, factory_record=factory_record, test_cmd=test_cmd,
+                        runner=runner, started_at=started_at,
+                    )
             if startup_failure:
                 if not factory_process_is_verified_dead(factory_record):
                     raise WorklinkError(reason)
@@ -4119,7 +4149,7 @@ class WorklinkRunner:
                 if not factory_record.session:
                     raise WorklinkError("factory startup has no admitted host session")
             retain_result(wait_result, "needs-human")
-            await asyncio.to_thread(
+            await _await_factory_control(
                 backend.terminal,
                 factory_record.run_id,
                 "needs-human",
@@ -4162,13 +4192,10 @@ class WorklinkRunner:
                     if not snapshot_attempted:
                         snapshot_attempted = True
                         try:
-                            await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    backend.snapshot, factory_record.run_id,
-                                    sandbox=Path(factory_record.sandbox),
-                                    launcher=factory_record.launcher,
-                                ),
-                                timeout=max(0.01, verification_deadline - loop.time()),
+                            await _await_factory_control(
+                                backend.snapshot, factory_record.run_id,
+                                sandbox=Path(factory_record.sandbox),
+                                launcher=factory_record.launcher,
                             )
                         except Exception as exc:
                             snapshot_failure = _factory_controller_error(exc)
@@ -4277,14 +4304,51 @@ class WorklinkRunner:
         error_polls = 0
         error_incident = False
 
+        def host_stop_requested() -> bool:
+            return handle.opencode_session_id is not None and operator_stop_requested(
+                self.home, issue.issue_id, factory_record.attempt,
+                opencode_session_id=handle.opencode_session_id,
+            )
+
+        async def finish_requested_stop() -> WorklinkRunResult | None:
+            nonlocal factory_record, failed
+            from .factory_state import load_factory_record
+            if not host_stop_requested():
+                return None
+            await cancel_once()
+            latest = load_factory_record(self.home, factory_record.run_id)
+            if latest is not None:
+                if latest.handle != handle:
+                    raise WorklinkError("factory host changed during explicit stop")
+                factory_record = latest
+            factory_record = replace(factory_record, children_reaped=True,
+                controller_error="operator requested stop",
+                controller_phase="terminal" if factory_record.status and factory_record.status.is_terminal
+                else "parked" if factory_record.status and factory_record.status.is_parked else "stopped")
+            save_factory_record(self.home, factory_record)
+            _write_factory_host_evidence(self.home, factory_record, "interrupted", "operator requested stop")
+            failed = False
+            return WorklinkRunResult(issue.issue_id, factory_record.attempt, "interrupted",
+                checkout=Path(factory_record.sandbox), branch=factory_record.branch,
+                reason="operator requested stop")
+
+        def successful_host_turn() -> bool:
+            return (handle.opencode_session_id is not None and wait_task.done()
+                and not wait_task.cancelled() and wait_task.exception() is None
+                and wait_task.result().session_outcome is not None
+                and wait_task.result().session_outcome.execution_state == "succeeded")
+
         async def missed_poll(exc: Exception) -> None:
             nonlocal error_polls, error_incident, status, wait_task
             # Only a verified ending may leave supervision. A control-plane
             # failure while the driver runs is a missed observation.
-            turn_finished = (handle.opencode_session_id is not None and wait_task.done()
-                and not wait_task.cancelled() and wait_task.exception() is None
-                and wait_task.result().session_outcome is not None
-                and wait_task.result().session_outcome.execution_state == "succeeded")
+            if host_stop_requested():
+                status = None
+                return  # The loop reconciles stop before any write or heartbeat.
+            turn_finished = successful_host_turn()
+            if turn_finished and _factory_lock_refusal(wait_task.result()):
+                raise WorklinkError("factory driver did not acquire the retained run lock: "
+                                    + _factory_controller_error(wait_task.result().stdout)[:300])
             if (not wait_task.done() or turn_finished) and compute.job_alive(handle):
                 if turn_finished:
                     retain_result(wait_task.result(), "running")
@@ -4322,6 +4386,9 @@ class WorklinkRunner:
 
         try:
             while True:
+                stopped = await finish_requested_stop()
+                if stopped is not None:
+                    return stopped
                 if initial_observation_error is not None:
                     error = initial_observation_error
                     initial_observation_error = None
@@ -4414,6 +4481,9 @@ class WorklinkRunner:
                     if loop.time() >= startup_deadline:
                         return await repark_startup_failure("factory never initialised before startup deadline")
                 else:
+                    stopped = await finish_requested_stop()
+                    if stopped is not None:
+                        return stopped
                     try:
                         _require_factory_status(status, factory_record)
                     except Exception as exc:
@@ -4498,7 +4568,7 @@ class WorklinkRunner:
                         and factory_record.session == status.lock_session
                     ):
                         try:
-                            await asyncio.to_thread(
+                            await _await_factory_control(
                                 backend.heartbeat,
                                 factory_record.run_id,
                                 session=factory_record.session,
@@ -4644,10 +4714,7 @@ class WorklinkRunner:
                         last_status = status
                     error_polls = 0
                     error_incident = False
-                if (handle.opencode_session_id is not None and wait_task.done()
-                        and not wait_task.cancelled() and wait_task.exception() is None
-                        and wait_task.result().session_outcome is not None
-                        and wait_task.result().session_outcome.execution_state == "succeeded"):
+                if successful_host_turn() and not _factory_lock_refusal(wait_task.result()):
                     # Only factory status above can complete the run. A model
                     # turn ending successfully supplies no factory terminal proof.
                     retain_result(wait_task.result(), "running")
@@ -4661,17 +4728,9 @@ class WorklinkRunner:
                             "OpenCode process stopped without a drainable supervision result"
                         ) from exc
                     retain_result(result, "failed")
-                    if (handle.opencode_session_id is not None
-                            and operator_stop_requested(self.home, issue.issue_id, factory_record.attempt,
-                                                        opencode_session_id=handle.opencode_session_id)):
-                        await cancel_once()
-                        factory_record = replace(factory_record, controller_phase="stopped")
-                        save_factory_record(self.home, factory_record)
-                        _write_factory_host_evidence(self.home, factory_record, "interrupted", "operator requested stop")
-                        failed = False
-                        return WorklinkRunResult(issue.issue_id, factory_record.attempt, "interrupted",
-                            checkout=Path(factory_record.sandbox), branch=factory_record.branch,
-                            reason="operator requested stop")
+                    stopped = await finish_requested_stop()
+                    if stopped is not None:
+                        return stopped
                     detail = result.stderr.strip() or result.stdout.strip()
                     if result.session_error is not None:
                         detail = _factory_controller_error(
@@ -4679,6 +4738,8 @@ class WorklinkRunner:
                     detail = _factory_controller_error(detail)
                     if _factory_lock_refusal(result):
                         reason = "factory driver did not acquire the retained run lock"
+                        if detail:
+                            reason += f": {detail[:300]}"
                         factory_record = replace(
                             factory_record,
                             controller_phase="parked",
@@ -4722,6 +4783,9 @@ class WorklinkRunner:
                     return await park_for_reason(
                         last_status, _factory_budget_park_reason(last_status, factory_record)
                     )
+                stopped = await finish_requested_stop()
+                if stopped is not None:
+                    return stopped
                 _heartbeat_claim_best_effort(claims, claim_record)
                 poll_delay = max(0.01, float(backend.poll_interval_s))
                 if pre_manifest or recovery_session is not None:
@@ -4755,7 +4819,13 @@ class WorklinkRunner:
                         wait_task.cancel()
                         await asyncio.gather(wait_task, return_exceptions=True)
                     if handle.opencode_session_id is None or factory_record.children_reaped:
-                        await compute.cleanup(handle)
+                        try:
+                            await compute.cleanup(handle)
+                        except BaseException as exc:
+                            factory_record = replace(factory_record, children_reaped=False)
+                            save_factory_record(self.home, factory_record)
+                            _write_factory_host_evidence(self.home, factory_record, "failed", _factory_controller_error(exc))
+                            raise
 
     def _archive_factory_park(self, claim: ClaimRecord, record: FactoryRunRecord) -> None:
         """Persist credit before fallible transitions or resume replace the evidence."""
@@ -4942,6 +5012,32 @@ async def _await_factory_control(operation: Callable[..., Any], *args: Any, **kw
 
 def _write_factory_host_evidence(home: Path, record: FactoryRunRecord, status: str,
                                  error: str | None = None) -> Path:
+    path = home / "state" / "worklink" / "evidence" / f"{record.issue_id}-{record.attempt}.json"
+    # Only the completion verifier sets review_ready after independent gate,
+    # checkout and forge verification. A manifest terminal alone is not proof.
+    try:
+        with path.open("rb") as stream:
+            prior = json.loads(stream.read(2 * 1024 * 1024))
+    except (OSError, ValueError):
+        prior = None
+    same_invocation = (isinstance(prior, dict)
+            and prior.get("issue") == record.issue_id and prior.get("attempt") == record.attempt
+            and prior.get("backend") == "feature_factory" and prior.get("checkout") == record.sandbox
+            and prior.get("branch") == record.branch
+            and prior.get("opencode_session_id") == record.opencode_session_id)
+    if same_invocation and prior.get("review_ready") is True and prior.get("status") == "completed":
+        return path
+    if same_invocation and prior.get("diff_observed") is True:
+        # A verifier failure already contains observed diff/test/forge facts.
+        # Add a cleanup diagnosis without discarding those observations or
+        # converting a rejected completion back into manifest-only success.
+        if error is not None:
+            from mimir_cultivate.opencode import redact_daemon_output
+            prior["failure_reason"] = redact_daemon_output(error)
+        prior["finished_at"] = datetime.now(UTC).isoformat()
+        prior["review_ready"] = False
+        atomic_write_json(path, prior)
+        return path
     now = datetime.now(UTC).isoformat()
     return _write_evidence(home, WorklinkEvidence(
         issue=record.issue_id, attempt=record.attempt, backend="feature_factory",
@@ -5583,7 +5679,7 @@ async def _verify_factory_completion(
         )
         if final_head != after_head:
             raise WorklinkError("factory checkout HEAD moved during publication verification")
-        evidence_path = _write_evidence(home, evidence)
+        evidence_path = _write_evidence(home, evidence, review_ready=True)
         return evidence_path, status.pr_url
     except Exception as exc:
         _write_evidence(

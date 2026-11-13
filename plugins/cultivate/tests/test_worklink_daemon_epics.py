@@ -484,7 +484,8 @@ async def test_explicit_epic_stop_is_bound_to_the_actual_host(tmp_path, requeste
 
 
 @pytest.mark.parametrize("ending", ["running", "completed", "foreign", "unverified"])
-async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quiescence(tmp_path, monkeypatch, ending):
+@pytest.mark.parametrize("verified_evidence", [False, True])
+async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quiescence(tmp_path, monkeypatch, ending, verified_evidence):
     from mimir_cultivate.worklink import control, identities
     from mimir_cultivate.worklink.worker_client import WorkerClient
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
@@ -509,10 +510,13 @@ async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quies
         monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *a, **kw: Peer())
         daemon.interrupt_noop = ending == "unverified"
         proof = tmp_path / "state/worklink/evidence/2125-1.json"
-        proof.parent.mkdir(parents=True)
-        proof.write_text(json.dumps({"status": "completed", "head_sha": "verified-head",
-                                     "opencode_session_id": handle.identifier}))
-        prior = proof.read_bytes()
+        if verified_evidence:
+            proof.parent.mkdir(parents=True)
+            proof.write_text(json.dumps({"status": "completed", "head_sha": "verified-head",
+                "review_ready": True, "issue": record.issue_id, "attempt": record.attempt,
+                "backend": "feature_factory", "checkout": record.sandbox, "branch": record.branch,
+                "opencode_session_id": handle.identifier}))
+        prior = proof.read_bytes() if proof.exists() else None
         calls = []
         def command(argv):
             calls.append(list(argv))
@@ -528,11 +532,295 @@ async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quies
                 assert boundary.controller.path.exists()
             else:
                 assert result.stopped and result.claim_released and retained.children_reaped
-                if ending == "completed":
-                    assert retained.controller_phase == "terminal" and proof.read_bytes() == prior
+                assert retained.controller_phase == ("terminal" if ending == "completed" else "stopped")
+                if verified_evidence:
+                    assert proof.read_bytes() == prior
                 else:
-                    assert retained.controller_phase == "stopped"
                     assert json.loads(proof.read_text())["status"] == "interrupted"
+                    assert json.loads(proof.read_text())["opencode_session_id"] == handle.identifier
+                    assert json.loads(proof.read_text())["mcp_servers"] == ["fixture-mcp"]
         finally:
             daemon.interrupt_noop = False
+            await boundary.controller.release()
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "interrupted"])
+@pytest.mark.parametrize("missed_poll", [False, True])
+async def test_live_supervisor_observes_operator_stop_after_idle_turn(tmp_path, monkeypatch, outcome, missed_poll):
+    import threading
+    from mimir_cultivate.worklink import control, identities
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.outcome = outcome
+        loop = asyncio.get_running_loop()
+        finished, polling = asyncio.Event(), asyncio.Event()
+        release_poll = threading.Event()
+        stopping = False
+        released = False
+        real_wait = compute.wait
+        async def wait(*args, **kwargs):
+            result = await real_wait(*args, **kwargs)
+            finished.set()
+            return result
+        monkeypatch.setattr(compute, "wait", wait)
+        def status(*args, **kwargs):
+            if finished.is_set() and not stopping:
+                loop.call_soon_threadsafe(polling.set)
+                assert release_poll.wait(3), "operator stop did not finish"
+                if missed_poll:
+                    raise RuntimeError("synthetic missed poll after stop")
+            return record.status
+        def heartbeat(*args, **kwargs):
+            assert not released, "supervisor heartbeated a released claim"
+        monkeypatch.setattr(FeatureFactoryBackend, "status", status)
+        monkeypatch.setattr(identities, "get_identities", lambda: SimpleNamespace(worklink_uid=os.geteuid()))
+        class Peer:
+            async def session_cancel(self, requested):
+                assert requested == handle
+                future = asyncio.run_coroutine_threadsafe(boundary.controller.cancel(), loop)
+                assert await asyncio.wrap_future(future)
+        monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *a, **kw: Peer())
+        task = asyncio.create_task(WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(heartbeat_issue=heartbeat),
+            backend=SimpleNamespace(status=status, heartbeat=heartbeat, poll_interval_s=0.001),
+            compute=compute, factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None,
+            started_at=datetime.now(UTC)))
+        try:
+            await asyncio.wait_for(polling.wait(), 3)
+            stopping = True
+            stop = await asyncio.to_thread(control.stop_worklink, tmp_path, 2125,
+                runner=lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+            assert stop.stopped and stop.claim_released
+            released = True
+            release_poll.set()
+            result = await asyncio.wait_for(task, 3)
+            assert result.status == "interrupted"
+            saved = load_factory_record(tmp_path, record.run_id)
+            assert saved.controller_phase == "stopped" and saved.status.status == "running"
+            assert saved.opencode_session_id == handle.identifier
+            assert sum(route.endswith("/command") for _, route, _, _ in daemon.requests) == 1
+        finally:
+            release_poll.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("missed_poll", [False, True])
+async def test_successful_host_lock_refusal_precedes_rewait(tmp_path, missed_poll):
+    from mimir_cultivate.worklink.control import _mark_operator_stop
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        _mark_operator_stop(tmp_path, 2125, 1, opencode_session_id="ses_other_host")
+        daemon.sessions[handle.identifier].messages.append({
+            "id": "msg_refusal", "type": "assistant", "time": {"created": 2}, "agent": "build",
+            "model": {"providerID": "openai", "id": "synthetic"},
+            "content": [{"type": "text", "text": "Another live session holds the run lock; did not acquire the lock"}],
+        })
+        def status(*args, **kwargs):
+            if missed_poll:
+                raise RuntimeError("synthetic unavailable status")
+            return replace(record.status, lock="absent", lock_session=None)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None, transition_issue=lambda *a, **kw: None),
+            backend=SimpleNamespace(status=status, poll_interval_s=0.001), compute=compute,
+            factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None, started_at=datetime.now(UTC))
+        if missed_poll:
+            with pytest.raises(WorklinkError, match="did not acquire the retained run lock.*Another live session"):
+                await asyncio.wait_for(invocation, 3)
+        else:
+            result = await asyncio.wait_for(invocation, 3)
+            assert result.status == "needs-human" and "Another live session holds" in result.reason
+        assert sum(route.endswith("/command") for _, route, _, _ in daemon.requests) == 1
+        assert load_factory_record(tmp_path, record.run_id).opencode_session_id == handle.identifier
+
+
+@pytest.mark.parametrize("failure", ["cancel", "release"])
+async def test_completed_observation_cleanup_failure_has_actual_session_evidence(tmp_path, monkeypatch, failure):
+    from mimir_cultivate.opencode import redact_daemon_output
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        names = ("first", "fixture-mcp", "fixture-mcp", "token=" + "ghp_" + "A" * 36)
+        status = replace(record.status, status="completed", mcp_servers=names)
+        record = replace(record, mcp_servers=names)
+        save_factory_record(tmp_path, record)
+        proof = tmp_path / "state/worklink/evidence/2125-1.json"
+        assert not proof.exists()
+        if failure == "cancel":
+            boundary.cancel_verified = False
+        else:
+            async def fail_release(handle):
+                raise RuntimeError("synthetic release failure")
+            monkeypatch.setattr(boundary, "session_release", fail_release)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)), claims=object(),
+            backend=SimpleNamespace(status=lambda *a, **kw: status, heartbeat=lambda *a, **kw: None, poll_interval_s=0.001),
+            compute=compute, factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None,
+            started_at=datetime.now(UTC))
+        with pytest.raises(ComputeCleanupError):
+            await invocation
+        payload = json.loads(proof.read_text())
+        assert payload["status"] == "failed" and payload["failure_reason"]
+        assert payload["opencode_session_id"] == handle.identifier
+        assert payload["mcp_servers"] == [redact_daemon_output(name) for name in names]
+        assert not load_factory_record(tmp_path, record.run_id).children_reaped
+        assert boundary.controller.path.exists() and Path(record.sandbox).is_dir()
+        await boundary.controller.release()
+
+
+@pytest.mark.parametrize("ending", ["completed", "needs-human", "foreign"])
+async def test_budget_park_requalifies_factory_after_session_cancellation(tmp_path, monkeypatch, ending):
+    from mimir_cultivate.worklink import orchestrator
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        cancelled = False
+        real_cancel = compute.cancel
+        async def cancel(selected):
+            nonlocal cancelled
+            await real_cancel(selected)
+            cancelled = True
+        monkeypatch.setattr(compute, "cancel", cancel)
+        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 0.06)
+        winning = replace(record.status, status=ending if ending != "foreign" else "running",
+            lock_session="ses_foreign" if ending == "foreign" else handle.identifier)
+        async def verify(**kwargs):
+            assert kwargs["record"].status == winning
+            return tmp_path / "verified.json", "https://github.com/owner/repo/pull/1"
+        monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
+        monkeypatch.setattr(orchestrator, "_enforce_factory_pr_publication", lambda *a, **kw: None)
+        def terminal(*args, **kwargs):
+            pytest.fail("a post-cancellation outcome or foreign lock must not be terminalized")
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None, transition_issue=lambda *a, **kw: None),
+            backend=SimpleNamespace(status=lambda *a, **kw: winning if cancelled else record.status,
+                heartbeat=lambda *a, **kw: None, terminal=terminal, poll_interval_s=0.001),
+            compute=compute, factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None,
+            started_at=datetime.now(UTC))
+        if ending == "foreign":
+            with pytest.raises(WorklinkError, match="owner changed during cancellation"):
+                await asyncio.wait_for(invocation, 3)
+        else:
+            result = await asyncio.wait_for(invocation, 3)
+            assert result.status == ("review_ready" if ending == "completed" else "needs-human")
+            assert load_factory_record(tmp_path, record.run_id).status == winning
+        assert cancelled
+        assert sum(route.endswith("/command") for _, route, _, _ in daemon.requests) == 1
+
+
+@pytest.mark.parametrize("writer", ["release", "terminal", "snapshot", "heartbeat"])
+@pytest.mark.parametrize("cancellation", ["repeated", "timeout"])
+async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(tmp_path, monkeypatch, writer, cancellation):
+    import threading
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.factory_state import factory_checkout_interlock, factory_issue_resource_lock
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        entered = asyncio.Event()
+        finish_writer = threading.Event()
+        settled = threading.Event()
+        loop = asyncio.get_running_loop()
+        effects = []
+        def write(name):
+            if name != writer:
+                return
+            loop.call_soon_threadsafe(entered.set)
+            assert finish_writer.wait(3), "test did not release bounded writer"
+            effects.append(name)
+            settled.set()
+        parked = False
+        class Factory(FeatureFactoryBackend):
+            def status(self, *args, **kwargs):
+                return replace(record.status, status="needs-human" if parked or writer == "release" else "running",
+                    park_snapshot=str(tmp_path / "snapshot") if writer == "release" else None)
+            def heartbeat(self, *args, **kwargs):
+                write("heartbeat")
+            def lock(self, *args, **kwargs):
+                assert args[1] == "release"
+                write("release")
+            def terminal(self, *args, **kwargs):
+                nonlocal parked
+                write("terminal")
+                parked = True
+            def snapshot(self, *args, **kwargs):
+                write("snapshot")
+        factory = Factory(entrypoint=record.launcher, poll_interval_s=0.001)
+        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 0.08)
+        monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: Path(record.sandbox))
+        monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *a, **kw: "https://github.com/owner/repo.git")
+        monkeypatch.setattr(WorklinkRunner, "_factory_launch_order", lambda self, **kw: (
+            WorkOrder(2125, Path(record.sandbox), "", None, 30,
+                {"MIMIR_WORK_ITEM_JSON": spec.env["MIMIR_WORK_ITEM_JSON"], "MIMIR_MODEL_SPEC": "codex-plus:test",
+                 "FACTORY_PUBLISHING_IDENTITY": "fixture-bot", "GIT_AUTHOR_NAME": "Fixture",
+                 "GIT_AUTHOR_EMAIL": "fixture@example.invalid"}, tmp_path / "transcripts"), "fixture-bot"))
+        controller = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))
+        async def invoke():
+            # The actual controller resource guards surround the actual recovery
+            # or supervision method, not a direct call to the drain helper.
+            with factory_checkout_interlock(tmp_path) as outer:
+                assert outer
+                with factory_issue_resource_lock(tmp_path, 2125) as inner:
+                    assert inner
+                    if writer == "release":
+                        return await controller._recover_factory_070(
+                            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+                            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)), claims=object(),
+                            backend=factory, compute=compute, retained=record, launcher=Path(record.launcher),
+                            repo_slug=record.repository, base="main", test_cmd="pytest", runner=lambda *a, **kw: None,
+                            work_item_json=spec.env["MIMIR_WORK_ITEM_JSON"])
+                    return await controller._supervise_factory_070(
+                        issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+                        claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)), claims=SimpleNamespace(
+                            heartbeat_issue=lambda *a, **kw: None, transition_issue=lambda *a, **kw: None),
+                        backend=factory, compute=compute, factory_record=record, test_cmd="pytest",
+                        runner=lambda *a, **kw: None, started_at=datetime.now(UTC))
+        task = asyncio.create_task(invoke())
+        timeout_task = None
+        waiting = None
+        def resources_available():
+            with factory_checkout_interlock(tmp_path, pruning=True) as outer:
+                with factory_issue_resource_lock(tmp_path, 2125) as inner:
+                    return outer, inner
+        try:
+            waiting = asyncio.create_task(entered.wait())
+            done, _ = await asyncio.wait((task, waiting), timeout=3, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                await task  # Surface a pre-writer production-path refusal.
+            assert waiting in done, "production path never entered its writer"
+            if cancellation == "timeout":
+                timeout_task = asyncio.create_task(asyncio.wait_for(task, 0.01))
+                async def cancellation_arrived():
+                    while not task.cancelling():
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(cancellation_arrived(), 1)
+            else:
+                task.cancel()
+            for _ in range(2):
+                await asyncio.sleep(0)
+                task.cancel()
+            assert not task.done() and not settled.is_set() and effects == []
+            assert await asyncio.to_thread(resources_available) == (False, False)
+            finish_writer.set()
+            if timeout_task is not None:
+                with pytest.raises(TimeoutError):
+                    await timeout_task
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert effects == [writer] and settled.is_set()
+            assert await asyncio.to_thread(resources_available) == (True, True)
+        finally:
+            finish_writer.set()
+            if waiting is not None and not waiting.done():
+                waiting.cancel()
+                await asyncio.gather(waiting, return_exceptions=True)
+            await asyncio.gather(task, *( [timeout_task] if timeout_task is not None else []), return_exceptions=True)
             await boundary.controller.release()

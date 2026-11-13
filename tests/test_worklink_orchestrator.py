@@ -10364,7 +10364,7 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
         )
 
     # Incident persistence failure retains the claim and run state.
-    assert status_calls == 5
+    assert status_calls == 6  # Includes post-cancellation factory requalification.
     assert writes == ["factory terminal exception"]
     assert lifecycle == ["cancel", "cleanup"]
     assert releases == []
@@ -11446,6 +11446,23 @@ async def test_factory_completion_preserves_admitted_session_and_mcp_after_obser
             assert evidence["mcp_servers"] == ["fixture-mcp", "<redacted>", "fixture-mcp"]
             assert secret not in encoded
             assert evidence["status"] == ("completed" if case == "success" else "failed")
+            if case == "success":
+                from mimir_cultivate.worklink import control, identities
+                from mimir_cultivate.worklink.worker_client import WorkerClient
+                assert evidence["review_ready"] is True
+                save_factory_record(tmp_path, record)
+                loop = asyncio.get_running_loop()
+                class Peer:
+                    async def session_cancel(self, handle):
+                        future = asyncio.run_coroutine_threadsafe(controller.cancel(), loop)
+                        assert await asyncio.wrap_future(future)
+                monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *a, **kw: Peer())
+                monkeypatch.setattr(identities, "get_identities", lambda: SimpleNamespace(worklink_uid=os.geteuid()))
+                monkeypatch.setattr(FeatureFactoryBackend, "status", lambda *a, **kw: record.status)
+                result = await asyncio.to_thread(control.stop_worklink, tmp_path, 700,
+                    runner=lambda argv: cp(argv))
+                assert result.stopped and result.claim_released
+                assert (tmp_path / "state/worklink/evidence/700-1.json").read_text() == encoded
         finally:
             await controller.release()
 
