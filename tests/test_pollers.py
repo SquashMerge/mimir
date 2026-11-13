@@ -9347,6 +9347,43 @@ print('{"poller": "x", "prompt": "ok"}')
     assert "TOKEN=[REDACTED]" in combined_stderr
 
 
+@pytest.mark.asyncio
+async def test_run_poller_keeps_operator_trusted_bot_login_in_payload(
+    tmp_path: Path, home: Path, monkeypatch,
+):
+    """The trusted-bot allowlist is identity, not a secret.
+
+    github-poller forwards ``MIMIR_GITHUB_TRUSTED_BOT_LOGINS`` and emits the
+    bot's login as the PR author. Masking that value as a secret turned every
+    allowlisted bot's ``author`` into ``[REDACTED]``, so PR authorization saw
+    an author mismatch and refused the review. The forwarded secret still
+    stays masked in the same payload.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_pass_env_value")
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({
+    "poller": "x", "prompt": "ok", "author": "dependabot[bot]",
+    "pr_author": "dependabot[bot]",
+    "leak": os.environ.get("GITHUB_TOKEN", "absent"),
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        pass_env=("GITHUB_TOKEN", "MIMIR_GITHUB_TRUSTED_BOT_LOGINS"),
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert len(enq.events) == 1
+    (item,) = enq.events[0].extra["items"]
+    assert item["author"] == "dependabot[bot]"
+    assert item["pr_author"] == "dependabot[bot]"
+    assert item["leak"] == "[REDACTED]"
+
+
 def test_discover_pollers_rejects_credential_shaped_redaction_exemption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
