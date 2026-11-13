@@ -184,6 +184,33 @@ def wait_for_health() -> None:
                        + run(["docker", "logs", CONTAINER]).stdout)
 
 
+# This image has no native daemon login. Exercise setup's real verification
+# and require its refusal, rather than treating credential absence as readiness.
+SETUP_DAEMON_PROOF = r'''
+import subprocess
+from pathlib import Path
+from mimir_cultivate import setup
+
+calls = []
+def local_exec(argv, *, cwd):
+    assert argv[:7] == ['docker', 'compose', 'exec', '-T', '-u', 'mimir', 'agent'], argv
+    calls.append(argv[5])
+    result = subprocess.run(['/command/s6-setuidgid', argv[5], *argv[7:]],
+                            cwd='/tmp', capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+setup._run = local_exec
+try:
+    setup._verify_opencode_daemon(Path('/tmp'))
+except setup.SetupError as exc:
+    assert 'worklink-opencode-login' in str(exc), str(exc)
+else:
+    raise AssertionError('credential-free image unexpectedly passed daemon verification')
+assert calls == ['mimir'], calls
+print('real-image setup OpenCode missing-login refusal passed')
+'''
+
+
 CONTROLLER_PROOF = r"""
 from __future__ import annotations
 import asyncio
@@ -876,30 +903,7 @@ PY
         # Exercise setup's real generated probes before any fake OpenCode is
         # installed below. Only Docker's transport is adapted: the production
         # argv, named users, private controller venv and installed CLI are real.
-        docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', r'''
-import subprocess
-from pathlib import Path
-from mimir_cultivate import setup
-
-calls = []
-def local_exec(argv, *, cwd):
-    assert argv[:4] == ['docker', 'compose', 'exec', '-T']
-    if argv[5] == 'mimir':
-        assert argv[4:7] == ['-u', 'mimir', 'agent']
-        command = argv[7:]
-    else:
-        assert argv[4:9] == ['-u', 'worklink', '-w', '/tmp', 'agent']
-        command = argv[9:]
-    calls.append(argv[5])
-    result = subprocess.run(['/command/s6-setuidgid', argv[5], *command],
-                            cwd='/tmp', capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
-    return result.stdout.strip()
-setup._run = local_exec
-setup._verify_opencode_daemon(Path('/tmp'))
-assert calls == ['mimir']
-print('real-image setup OpenCode probe passed')
-''')
+        docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', SETUP_DAEMON_PROOF)
 
         docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', TOOLCHAIN_PROOF)
 

@@ -155,6 +155,68 @@ def test_pypi_runtime_proof_refuses_root_before_protocol(monkeypatch):
         exec(namespace['PYPI_RUNTIME_PROOF'], {})
 
 
+@pytest.mark.parametrize(
+    ("state", "error"),
+    [
+        ({"ok": False, "daemon_enabled": True}, None),
+        ({"ok": True, "daemon_enabled": True}, "unexpectedly passed"),
+        ({"ok": True, "daemon_enabled": False}, "unexpectedly passed"),
+    ],
+)
+def test_setup_daemon_image_proof_requires_refusal(state, error, monkeypatch) -> None:
+    import json
+    from mimir_cultivate import setup
+
+    payload = runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"]
+    calls = []
+
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(state), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", execute)
+    # The embedded payload replaces _run as it does in the image. Restore it
+    # after the test, without substituting the real verification function.
+    monkeypatch.setattr(setup, "_run", setup._run)
+    if error:
+        with pytest.raises(AssertionError, match=error):
+            exec(payload, {})
+    else:
+        exec(payload, {})
+    assert calls == [(
+        ["/command/s6-setuidgid", "mimir", "python", "-c", setup._OPENCODE_DAEMON_PROBE],
+        {"cwd": "/tmp", "capture_output": True, "text": True, "timeout": 30},
+    )]
+
+
+def test_setup_daemon_image_proof_rejects_unrelated_setup_error(monkeypatch) -> None:
+    from mimir_cultivate import setup
+
+    def fail(*args, **kwargs):
+        raise setup.SetupError("unrelated setup failure")
+
+    monkeypatch.setattr(setup, "_verify_opencode_daemon", fail)
+    monkeypatch.setattr(setup, "_run", setup._run)
+    with pytest.raises(AssertionError, match="unrelated setup failure"):
+        exec(runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"], {})
+
+
+def test_setup_daemon_image_proof_rejects_wrong_user_before_execution(monkeypatch) -> None:
+    from mimir_cultivate import setup
+
+    def wrong_user(deploy, *argv):
+        return setup._run(["docker", "compose", "exec", "-T", "-u", "worklink", "agent", *argv], cwd=deploy)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("wrong-user probe reached subprocess execution")
+
+    monkeypatch.setattr(setup, "_agent_exec", wrong_user)
+    monkeypatch.setattr(setup, "_run", setup._run)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    with pytest.raises(AssertionError, match="worklink"):
+        exec(runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"], {})
+
+
 def test_wheel_identity_checks_metadata_and_cultivate_pair(tmp_path: Path) -> None:
     wheel_identity = runpy.run_path(str(PROOF))["wheel_identity"]
     wheel = tmp_path / "mimir_cultivate-1.0.0rc2-py3-none-any.whl"
