@@ -153,6 +153,7 @@ class FactoryStatus:
     next_present: bool = False
     slices_total: int | None = None
     slices_counts: dict[str, int] | None = None
+    mcp_servers: tuple[str, ...] = ()
 
     TERMINAL_STATUSES: ClassVar[frozenset[str]] = frozenset(
         {"completed", "blocked", "partial"}
@@ -193,6 +194,7 @@ class FactoryStatus:
             "pr_url": self.pr_url,
             "terminal_result": self.terminal_result,
             "park_snapshot": self.park_snapshot,
+            "mcp_servers": list(self.mcp_servers),
         }
         if self.slices_total is not None:
             payload["slices_total"] = self.slices_total
@@ -412,10 +414,11 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
     next_present = "next" in decoded
     next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
     slices = _structured_status(decoded.get("slices"), "slices")
-    from ..factory_control_output import parse_slice_summary
+    from ..factory_control_output import parse_mcp_servers, parse_slice_summary
 
     try:
         slices_total, slices_counts = parse_slice_summary(decoded, slices)
+        mcp_servers = parse_mcp_servers(decoded.get("mcp_servers", []))
     except ValueError as exc:
         raise FactoryContractError(str(exc)) from exc
     return FactoryStatus(
@@ -447,6 +450,7 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         ),
         next=next_value,
         next_present=next_present,
+        mcp_servers=mcp_servers,
     )
 
 
@@ -862,7 +866,15 @@ class FeatureFactoryBackend:
                 )
         except subprocess.TimeoutExpired as exc:
             raise FactoryContractError("factory control command timed out") from exc
-        _strict_diagnostic(result)
+        if args[0] == "status" and result.returncode == 0:
+            stdout = result.stdout or b""
+            if isinstance(stdout, str):
+                stdout = stdout.encode("utf-8", "strict")
+            if not isinstance(stdout, bytes) or len(stdout) > 256 * 1024:
+                raise FactoryContractError("factory status projection exceeds 256 KiB")
+            _strict_diagnostic(subprocess.CompletedProcess(result.args, 0, b"", result.stderr))
+        else:
+            _strict_diagnostic(result)
         if result.returncode != 0:
             detail = _strict_diagnostic(result)
             raise FactoryContractError(detail or f"factory control exited {result.returncode}")

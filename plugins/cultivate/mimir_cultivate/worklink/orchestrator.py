@@ -5326,6 +5326,8 @@ async def _verify_factory_completion(
         status="failed",
         base_ref=record.base_ref,
         diff_observed=False,
+        opencode_session_id=record.opencode_session_id,
+        mcp_servers=record.mcp_servers,
     )
     try:
         if status is None:
@@ -7331,9 +7333,15 @@ def _publication_failed_validation(
 
 
 def _evidence_json(evidence: WorklinkEvidence) -> dict[str, Any]:
+    from .factory_control_output import parse_mcp_servers
+    from .backends.opencode import redact_daemon_output
+
     data = asdict(evidence)
     data["commands"] = [asdict(command) for command in evidence.commands]
     data["tests"] = asdict(evidence.tests) if evidence.tests else None
+    data["mcp_servers"] = [
+        redact_daemon_output(name) for name in parse_mcp_servers(evidence.mcp_servers)
+    ]
     return data
 
 

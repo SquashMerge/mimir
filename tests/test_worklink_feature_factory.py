@@ -98,6 +98,78 @@ def package_entrypoint(tmp_path: Path) -> Path:
     return entrypoint
 
 
+def test_recorded_mcp_survives_worker_projection_and_record(tmp_path: Path) -> None:
+    from mimir_cultivate.worklink.factory_control_output import _status_projection
+
+    fixture = Path(__file__).parent / "fixtures/worklink/feature_factory_0_14_0/status.raw.stdout.json"
+    source = json.loads(fixture.read_bytes())
+    # Normalize only the captured scratch identity/path for the Chainlink record codec.
+    source.update(run_id="chainlink-2125", sandbox_path=str(tmp_path / "chainlink-2125"))
+    projected = _status_projection(source)
+    launcher = package_entrypoint(tmp_path)
+
+    def control(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, json.dumps(projected).encode(), b"")
+
+    backend = FeatureFactoryBackend(entrypoint=str(launcher), runner=control)
+    status = backend.status("chainlink-2125", sandbox=Path(source["sandbox_path"]), launcher=launcher)
+    assert status.mcp_servers == ("fixture-mcp",)
+    record = FactoryRunRecord(
+        run_id=status.run_id, issue_id=int(status.run_id.removeprefix("chainlink-")),
+        attempt=1, repository="owner/repo", base_ref=status.pr_base or "main",
+        branch=status.branch or "feature/test", launcher="/opt/factory/bin/factory.js",
+        sandbox=status.sandbox_path, session=None, handle=None, status=None,
+        observed_at=None, controller_phase="running",
+    ).observed(status, "2026-11-13T00:00:00+00:00")
+    assert record.mcp_servers == ("fixture-mcp",)
+    save_factory_record(tmp_path, record)
+    recovered = load_factory_record(tmp_path, record.run_id)
+    assert recovered is not None
+    assert recovered.mcp_servers == ("fixture-mcp",)
+    assert recovered.status.to_json()["mcp_servers"] == ["fixture-mcp"]
+
+
+@pytest.mark.parametrize("names", [[], ["alpha", "beta", "alpha"], ["x"] * 1000, ["é" * 512]])
+def test_mcp_projection_preserves_complete_ordered_names(names) -> None:
+    from mimir_cultivate.worklink.factory_control_output import _status_projection
+
+    projected = _status_projection(status_payload(mcp_servers=names))
+    assert projected["mcp_servers"] == names
+    status = parse_factory_status(projected)
+    assert status.mcp_servers == tuple(names)
+    assert status.to_json()["mcp_servers"] == names
+
+
+@pytest.mark.parametrize("names", [None, "server", [False], [""], [" "], ["nul\x00name"],
+                                  ["é" * 513], ["x"] * 1001])
+def test_mcp_invalid_names_are_rejected_before_projection_and_parse(names) -> None:
+    from mimir_cultivate.worklink.factory_control_output import _status_projection
+
+    payload = status_payload(mcp_servers=names)
+    with pytest.raises(ValueError, match="mcp_servers"):
+        _status_projection(payload)
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(payload)
+
+
+def test_legacy_status_defaults_mcp_to_empty() -> None:
+    assert parse_factory_status(status_payload()).mcp_servers == ()
+
+
+def test_control_status_uses_projection_bound_not_diagnostic_bound(tmp_path: Path) -> None:
+    launcher = package_entrypoint(tmp_path)
+    names = [f"{index}:" + "x" * 100 for index in range(1000)]
+    payload = json.dumps(status_payload(mcp_servers=names)).encode()
+    assert 64 * 1024 < len(payload) < 256 * 1024
+
+    def control(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, payload, b"")
+
+    backend = FeatureFactoryBackend(entrypoint=str(launcher), runner=control)
+    status = backend.status("1551", sandbox=tmp_path, launcher=launcher)
+    assert status.mcp_servers == tuple(names)
+
+
 def test_snapshot_uses_attempt_bound_control_and_operator_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

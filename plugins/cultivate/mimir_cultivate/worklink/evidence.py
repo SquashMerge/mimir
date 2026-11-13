@@ -126,6 +126,7 @@ class WorklinkEvidence:
     observed_pr_head_sha: str | None = None
     test_env: dict[str, str] = field(default_factory=dict)
     opencode_session_id: str | None = None
+    mcp_servers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
