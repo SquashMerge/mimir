@@ -497,6 +497,318 @@ def test_worklink_cli_rejects_unknown_subcommand(
         parser.parse_args(["worklink", "docker-broker", "--policy", "/tmp/p.yaml"])
 
 
+@pytest.fixture
+def incident_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import mimir_cultivate.commands as commands
+    import mimir_cultivate.worklink.control as control
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("CHAINLINK_BIN", "chainlink")
+    entry = failures.record_failure(
+        failures.dispatch_failure_state_dir(tmp_path), issue_id=441, attempt=1,
+        exit_status=1, error="unknown worker id", log_path="/retained/log",
+        preserved_ref="refs/worklink/441/1", work_path="/retained/checkout",
+    )
+    calls = []
+    events = []
+
+    def run(args):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, '{"locks": []}', "")
+
+    monkeypatch.setattr(control, "_runner", lambda home: run)
+    monkeypatch.setattr("mimir.event_logger.init_logger", lambda *a, **kw: None)
+    monkeypatch.setattr(commands, "log_durable_event_sync", lambda event, **kw: events.append((event, kw)))
+
+    def invoke(*extra):
+        with pytest.raises(SystemExit) as exc:
+            main(["worklink", "clear-incident", "441", "--home", str(tmp_path), *extra])
+        return exc.value.code
+
+    return invoke, entry, calls, events
+
+
+def test_clear_incident_releases_hold_preserves_record_and_audits(
+    tmp_path: Path, incident_cli, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    invoke, prior, calls, events = incident_cli
+    directory = failures.dispatch_failure_state_dir(tmp_path)
+    assert failures.autonomous_dispatch_block_reason(directory, 441) is not None
+    reason = "Infrastructure repaired " + "x" * 1500
+    assert invoke("--reason", reason, "--signature", prior["signature"],
+                  "--occurrence", prior["occurrence_id"]) == 0
+    cleared = failures.load_failure_state(directory)["issues"]["441"]
+    assert cleared == {
+        **prior, "active": False, "cleared_at": cleared["cleared_at"],
+        "cleared_by": "operator", "cleared_reason": reason[:1000],
+    }
+    assert datetime.fromisoformat(cleared["cleared_at"]).tzinfo is not None
+    assert failures.autonomous_dispatch_block_reason(directory, 441) is None
+    assert events == [("worklink_incident_cleared", {
+        "issue_id": 441, "signature": prior["signature"],
+        "occurrence_id": prior["occurrence_id"], "reason": reason[:1000],
+    })]
+    assert [args[1:3] for args in calls] == [["locks", "list"], ["issue", "comment"]]
+    assert calls[-1][3] == "441"
+    for value in (prior["signature"], prior["occurrence_id"], reason[:1000], "operator"):
+        assert value in calls[-1][-1]
+    assert "incident cleared" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("case, message", [
+    ("missing-file", "no incident entry"), ("missing-entry", "no incident entry"),
+    ("inactive", "already inactive"), ("signature", "signature mismatch"),
+    ("occurrence", "occurrence mismatch"), ("missing-reason", "--reason"),
+    ("empty-reason", "--reason must not be empty"),
+    ("corrupt", "state unavailable"), ("shape", "state unavailable"),
+    ("unreadable", "state unavailable"), ("encoding", "state unavailable"),
+    ("record", "invalid issue record"), ("active", "invalid issue record"),
+    ("issue_id", "invalid issue record"), ("bad-signature", "invalid issue record"),
+    ("bad-occurrence", "invalid issue record"), ("signature-type", "invalid issue record"),
+    ("occurrence-type", "invalid issue record"),
+    ("leaf", "active run"), ("remote-leaf", "active run"), ("bad-leaf", "refused"),
+    ("factory", "active factory run"),
+    ("claim", "active claim"), ("claim-error", "cannot verify active claims"),
+    ("claim-shape", "invalid lock table"), ("claim-identity", "invalid issue identity"),
+])
+def test_clear_incident_refusals_leave_state_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incident_cli,
+    capsys: pytest.CaptureFixture[str], case: str, message: str,
+) -> None:
+    import mimir_cultivate.worklink.control as control
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    invoke, entry, calls, events = incident_cli
+    directory = failures.dispatch_failure_state_dir(tmp_path)
+    path = directory / failures.STATE_FILE
+    extra = ["--reason", "Repaired"]
+    if case == "missing-file":
+        path.unlink()
+    elif case == "missing-entry":
+        failures.save_failure_state(directory, {"version": 1, "issues": {}})
+    elif case in {"inactive", "record", "active", "issue_id", "bad-signature", "bad-occurrence",
+                  "signature-type", "occurrence-type"}:
+        changes = {
+            "inactive": {"active": False}, "active": {"active": "true"},
+            "issue_id": {"issue_id": 442}, "bad-signature": {"signature": ""},
+            "bad-occurrence": {"occurrence_id": None},
+            "signature-type": {"signature": 123}, "occurrence-type": {"occurrence_id": 123},
+        }
+        record = [] if case == "record" else {**entry, **changes[case]}
+        failures.save_failure_state(directory, {"version": 1, "issues": {"441": record}})
+    elif case in {"signature", "occurrence"}:
+        extra += [f"--{case}", "stale"]
+    elif case == "missing-reason":
+        extra = []
+    elif case == "empty-reason":
+        extra = ["--reason", " \n\t"]
+    elif case in {"corrupt", "shape", "encoding"}:
+        path.write_bytes({"corrupt": b"{", "shape": b'{"issues": []}', "encoding": b"\xff"}[case])
+    elif case == "unreadable":
+        original_read = Path.read_text
+
+        def read(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError("ledger unreadable")
+            return original_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    elif case in {"leaf", "remote-leaf"}:
+        state = _state(tmp_path, 441, os.getpid(), ticks=process_start_ticks(os.getpid()),
+                       started_at=datetime.now(UTC))
+        if case == "remote-leaf":
+            save_run_state(tmp_path, replace(state, compute_name="remote", handle_identifier="999999999"))
+    elif case == "factory":
+        save_factory_record(tmp_path, FactoryRunRecord(
+            run_id="chainlink-441", issue_id=441, attempt=1, repository="owner/repo",
+            base_ref="main", branch="feature/441", launcher="/factory.js",
+            sandbox=str(tmp_path / "chainlink-441"), session="session", status=None,
+            observed_at=None, controller_phase="running",
+            handle=LaunchHandle("local_subprocess", str(os.getpid()),
+                                process_start_ticks=process_start_ticks(os.getpid())),
+        ))
+    elif case == "bad-leaf":
+        from mimir_cultivate.worklink.run_state import run_state_path
+
+        leaf = run_state_path(tmp_path, 441)
+        leaf.parent.mkdir(parents=True)
+        leaf.write_text("{}")
+    elif case.startswith("claim"):
+        stdout = {
+            "claim": '{"locks": [{"issue_id": 441}]}', "claim-error": "{}",
+            "claim-shape": '{"locks": null}', "claim-identity": '{"locks": [{}]}',
+        }[case]
+        monkeypatch.setattr(control, "_runner", lambda home: lambda args: subprocess.CompletedProcess(
+            args, 1 if case == "claim-error" else 0, stdout, "unavailable",
+        ))
+    before = path.read_bytes() if path.exists() else None
+    assert invoke(*extra) != 0
+    assert message in capsys.readouterr().err
+    assert (path.read_bytes() if path.exists() else None) == before
+    assert events == []
+    assert all(args[1:3] == ["locks", "list"] for args in calls)
+
+
+def test_clear_incident_newer_same_signature_occurrence_is_not_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incident_cli,
+) -> None:
+    import mimir_cultivate.worklink.control as control
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    invoke, inspected, calls, events = incident_cli
+    directory = failures.dispatch_failure_state_dir(tmp_path)
+    real_runner = control._runner
+
+    def runner(home):
+        def run(args):
+            # Another completed recovery and failure land after the operator's
+            # read, during the command's claim inspection, before its write.
+            failures.record_success(directory, 441)
+            newer = failures.record_failure(
+                directory, issue_id=441, attempt=2, exit_status=1,
+                error=inspected["terminal_error"], log_path="/new/log",
+            )
+            assert newer["signature"] == inspected["signature"]
+            assert newer["occurrence_id"] != inspected["occurrence_id"]
+            return real_runner(home)(args)
+        return run
+
+    monkeypatch.setattr(control, "_runner", runner)
+    assert invoke("--reason", "Repaired", "--signature", inspected["signature"],
+                  "--occurrence", inspected["occurrence_id"]) == 1
+    current = failures.load_failure_state(directory)["issues"]["441"]
+    assert current["active"] is True
+    assert current["attempt"] == 2
+    assert "cleared_at" not in current
+    assert events == []
+    assert len(calls) == 1
+
+
+def test_clear_incident_status_shows_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incident_cli,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import mimir_cultivate.commands as commands
+    from mimir_cultivate.worklink.control import WorklinkStatus
+
+    _, entry, _, _ = incident_cli
+    monkeypatch.setattr(commands, "worklink_status", lambda *a, **kw: [
+        WorklinkStatus(441, "clean", False, None, None),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "status", "441", "--home", str(tmp_path)])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    for field in ("failure_kind", "signature", "occurrence_id", "failed_at"):
+        assert f"{field}={entry[field]}" in output
+
+
+def test_clear_incident_serializes_a_new_failure_after_its_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incident_cli,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    invoke, inspected, _, _ = incident_cli
+    directory = failures.dispatch_failure_state_dir(tmp_path)
+    real_read = failures._read_failure_state_strict
+    writer_started = Event()
+    futures = []
+
+    def write_newer():
+        writer_started.set()
+        return failures.record_failure(
+            directory, issue_id=441, attempt=2, exit_status=1,
+            error=inspected["terminal_error"], log_path="/new/log",
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def read_under_lock(state_dir):
+            state = real_read(state_dir)
+            # Start a competing write after the clearing transaction has read
+            # its incident. It must wait for that transaction's lock to commit.
+            if not futures:
+                futures.append(pool.submit(write_newer))
+                assert writer_started.wait(5)
+            return state
+
+        monkeypatch.setattr(failures, "_read_failure_state_strict", read_under_lock)
+        assert invoke("--reason", "Repaired") == 0
+        newer = futures[0].result(timeout=5)
+    assert newer["active"] is True
+    assert newer["occurrence_id"] != inspected["occurrence_id"]
+    assert failures.load_failure_state(directory)["issues"]["441"] == newer
+
+
+@pytest.mark.parametrize("reason", ["", " \n\t"])
+def test_clear_incident_ledger_api_refuses_empty_reason(
+    tmp_path: Path, incident_cli, reason: str,
+) -> None:
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    directory = failures.dispatch_failure_state_dir(tmp_path)
+    path = directory / failures.STATE_FILE
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="--reason must not be empty"):
+        failures.clear_operator_incident(directory, 441, reason=reason)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("locks", [
+    {"441": {"agent_id": "other"}}, {"other-key": {"issue": 441}},
+    [{"issue_id": 441}], [{"id": 441}],
+])
+def test_clear_incident_refuses_all_claim_table_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incident_cli, locks,
+) -> None:
+    import mimir_cultivate.worklink.control as control
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    invoke, _, _, events = incident_cli
+    path = failures.dispatch_failure_state_dir(tmp_path) / failures.STATE_FILE
+    before = path.read_bytes()
+    monkeypatch.setattr(control, "_runner", lambda home: lambda args: subprocess.CompletedProcess(
+        args, 0, json.dumps({"locks": locks}), "",
+    ))
+    assert invoke("--reason", "Repaired") == 1
+    assert path.read_bytes() == before
+    assert events == []
+
+
+def test_clear_incident_allows_another_issues_claim(
+    monkeypatch: pytest.MonkeyPatch, incident_cli,
+) -> None:
+    import mimir_cultivate.worklink.control as control
+
+    invoke, _, _, events = incident_cli
+    monkeypatch.setattr(control, "_runner", lambda home: lambda args: subprocess.CompletedProcess(
+        args, 0, '{"locks": [{"id": 442}]}', "",
+    ))
+    assert invoke("--reason", "Repaired") == 0
+    assert len(events) == 1
+
+
+def test_clear_incident_reports_comment_failure_after_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incident_cli,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import mimir_cultivate.worklink.control as control
+    from mimir_cultivate.worklink import dispatch_failures as failures
+
+    invoke, _, _, events = incident_cli
+    monkeypatch.setattr(control, "_runner", lambda home: lambda args: subprocess.CompletedProcess(
+        args, 1 if args[1:3] == ["issue", "comment"] else 0, '{"locks": []}', "",
+    ))
+    assert invoke("--reason", "Repaired") == 1
+    assert "incident cleared, but audit delivery failed" in capsys.readouterr().err
+    assert failures.autonomous_dispatch_block_reason(failures.dispatch_failure_state_dir(tmp_path), 441) is None
+    assert len(events) == 1
+
+
 def test_worklink_run_failed_without_attempt_prints_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

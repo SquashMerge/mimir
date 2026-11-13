@@ -103,7 +103,7 @@ def _read_failure_state_strict(state_dir: Path) -> dict[str, Any] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"dispatch failure state unavailable: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("issues"), dict):
         raise ValueError("dispatch failure state unavailable: invalid ledger shape")
@@ -964,6 +964,54 @@ def record_success(state_dir: Path, issue_id: int) -> None:
         entry["active"] = False
         entry["consecutive"] = 0
         entry["notified_signatures"] = []
+
+
+def clear_operator_incident(
+    state_dir: Path,
+    issue_id: int,
+    *,
+    reason: str,
+    signature: str | None = None,
+    occurrence_id: str | None = None,
+) -> dict[str, Any]:
+    """Clear the current incident under one lock, optionally pinning its identity.
+
+    The caller must exclude active runs/claims. Raise on every refusal so the
+    transaction does not rewrite even an unchanged ledger.
+    """
+    if not reason.strip():
+        raise ValueError("--reason must not be empty")
+    safe_reason = redact_text(reason.strip())[:1000]
+    with failure_state_transaction(state_dir) as state:
+        entry = state["issues"].get(str(issue_id))
+        if entry is None:
+            raise ValueError(f"no incident entry for issue {issue_id}")
+        if isinstance(entry, dict) and entry.get("active") is False:
+            raise ValueError(f"incident for issue {issue_id} is already inactive")
+        if (
+            not isinstance(entry, dict)
+            or entry.get("active") is not True
+            or entry.get("issue_id") != issue_id
+            or not isinstance(entry.get("signature"), str)
+            or not entry["signature"]
+            or not isinstance(entry.get("occurrence_id"), str)
+            or not entry["occurrence_id"]
+        ):
+            raise ValueError("dispatch failure state unavailable: invalid issue record")
+        # Both identity components are read and matched inside this transaction;
+        # a writer cannot replace the occurrence between this check and commit.
+        if signature is not None and entry["signature"] != signature:
+            raise ValueError("incident signature mismatch; inspect worklink status again")
+        if occurrence_id is not None and entry["occurrence_id"] != occurrence_id:
+            raise ValueError("incident occurrence mismatch; inspect worklink status again")
+        entry.update(
+            active=False,
+            cleared_at=datetime.now(UTC).isoformat(),
+            cleared_reason=safe_reason,
+            cleared_by="operator",
+        )
+        cleared = dict(entry)
+    return cleared
 
 
 def resolve_failure_if_current(
