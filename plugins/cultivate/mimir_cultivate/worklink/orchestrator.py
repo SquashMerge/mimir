@@ -1839,6 +1839,17 @@ class WorklinkRunner:
                 evidence_path=evidence_path, checkout=lease.path, branch=lease.branch,
             )
         raw = await backend.interpret(order, compute_result)
+        if compute_result.timed_out:
+            # The deadline owns the outcome, even if the worker exited zero or
+            # printed another status before its terminal result was collected.
+            raw = replace(
+                raw,
+                exit_code=raw.exit_code or 124,
+                backend_status="timeout",
+                error=f"Worklink worker timed out (timeout_s={spec.timeout_s:g})",
+                blocked_reason=None,
+                output_overflow=False,
+            )
         executor_tests: TestResult | None = None
         if executor_report_dir is not None:
             executor_tests = read_pytest_result(test_cmd or "", executor_report_dir)
@@ -2354,6 +2365,7 @@ class WorklinkRunner:
                 status=transition_status,
                 review_ready=validation.review_ready,
                 pr_url=pr_url,
+                reason=transition_reason,
                 transition_applied=transition_applied,
                 error=transition_error,
             )

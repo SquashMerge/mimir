@@ -15,6 +15,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import uuid
 from unittest.mock import Mock, call
 
@@ -1192,8 +1193,9 @@ def test_worker_identity_verifier_rejects_any_retained_authority(
         worker_exec._verify_worker_identity()
 
 
+@pytest.mark.parametrize("exited", [False, True], ids=["active", "exited"])
 def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, exited: bool,
 ) -> None:
     identifier = str(uuid.uuid4())
 
@@ -1224,15 +1226,45 @@ def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
         lambda *args, **kwargs: pytest.fail("duplicate launch reached Popen"),
     )
     with worker_exec._jobs_lock:
-        worker_exec._jobs[identifier] = incumbent  # type: ignore[assignment]
+        if exited:
+            worker_exec._exited.add(identifier)
+        else:
+            worker_exec._jobs[identifier] = incumbent  # type: ignore[assignment]
     try:
-        with pytest.raises(RuntimeError, match="already active"):
+        with pytest.raises(RuntimeError, match="already exited" if exited else "already active"):
             worker_exec._handle_launch(object(), request, [0, 1, 2])  # type: ignore[arg-type]
         with worker_exec._jobs_lock:
-            assert worker_exec._jobs[identifier] is incumbent
+            if exited:
+                assert identifier in worker_exec._exited
+                assert identifier not in worker_exec._jobs
+            else:
+                assert worker_exec._jobs[identifier] is incumbent
     finally:
         with worker_exec._jobs_lock:
             worker_exec._jobs.pop(identifier, None)
+            worker_exec._exited.discard(identifier)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
+@pytest.mark.asyncio
+async def test_cancel_never_issued_identifier_fails_closed(monkeypatch) -> None:
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    identifier = str(uuid.uuid4())
+    client_sock, executor_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    monkeypatch.setattr(WorkerClient, "_connect", lambda *args: client_sock)
+    terminate = Mock(side_effect=AssertionError("unknown cancel reached a process"))
+    monkeypatch.setattr(worker_exec, "_terminate_process_group", terminate)
+    thread = threading.Thread(target=worker_exec.handle_connection, args=(executor_sock,))
+    thread.start()
+    try:
+        with pytest.raises(RuntimeError, match="^unknown worker id$"):
+            await asyncio.wait_for(WorkerClient(None).cancel(identifier), 5)
+        terminate.assert_not_called()
+    finally:
+        client_sock.close()
+        thread.join(5)
+        assert not thread.is_alive()
 
 
 def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monkeypatch) -> None:
