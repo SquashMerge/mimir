@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -85,41 +87,58 @@ exec(sys.argv[2])
     helper = bin_dir / "s6-setuidgid"
     helper.write_text('#!/bin/sh\n[ "$1" = mimir ] || exit 90\nshift\nexec "$@"\n')
     helper.chmod(0o755)
-    uv = bin_dir / "uv"
-    uv.write_text('#!/bin/sh\n[ "$1" = run ] && shift\n[ "$1" != --no-sync ] || shift\nexec "$@"\n')
-    uv.chmod(0o755)
     env = {"PATH": f"{bin_dir}:/usr/local/bin:/usr/bin:/bin", "FIXTURE_ROOT": str(tmp_path),
            "MIMIR_PLUGINS": "cultivate", "HOME": str(tmp_path), "MIMIR_HOME": str(tmp_path)}
     return tmp_path, bin_dir, env
 
 
-@pytest.mark.parametrize("writer", ["root", "scaffold", "scaffold-with-plugin", "workspace-final", "pypi-final"])
+@pytest.mark.parametrize("writer", ["root", "scaffold", "scaffold-with-plugin", "workspace-final",
+                                   "workspace-final-with-plugin", "workspace-final-generic", "pypi-final"])
 @pytest.mark.parametrize("state", ["core", "not-installed", "missing-login", "unexpired", "refreshable",
                                   "invalid-marker", "missing-binary", "missing-wrapper"])
 def test_every_startup_writer_enforces_native_gate(startup, monkeypatch, writer, state):
     root, bin_dir, env = startup
     if writer == "root":
         text = (ROOT / "deploy/s6-overlay/s6-rc.d/mimir/run").read_text()
-    elif writer.startswith("scaffold"):
-        plugins = select_plugins(enable="cultivate")
-        if writer.endswith("with-plugin"):
+    elif writer.startswith(("scaffold", "workspace-final")):
+        plugins = () if writer.endswith("generic") else select_plugins(enable="cultivate")
+        if writer.endswith(("with-plugin", "generic")):
             from tests.test_scaffold_docker import _provider
             plugins = (*plugins, _provider(root))
         monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kw: plugins)
         home = root / "scaffold"
         home.mkdir()
         scaffold(home, mode="workspace")
-        text = (home / ".mimir-scaffold/s6-rc.d/mimir/run").read_text()
-        for name in ("type", "run", "dependencies.d/base"):
-            assert (home / ".mimir-scaffold/s6-rc.d/worklink-opencode" / name).read_bytes() == (
-                ROOT / "deploy/s6-overlay/s6-rc.d/worklink-opencode" / name).read_bytes()
+        if writer.startswith("workspace-final"):
+            text = (home / "start.sh").read_text()
+            sync = text.index("uv sync $UV_EXTRAS\n")
+            gate_offset = text.index("resolve_activation(dict(os.environ))")
+            if not writer.endswith("generic"):
+                assert sync < text.index('m.version("mimir-cultivate")') < gate_offset
+                assert "--all-packages" in text
+            if writer.endswith(("with-plugin", "generic")):
+                assert sync < text.index("uv pip install") < text.index(
+                    "touch /run/mimir-plugin-services/ready") < gate_offset
+        else:
+            text = (home / ".mimir-scaffold/s6-rc.d/mimir/run").read_text()
+            for name in ("type", "run", "dependencies.d/base"):
+                assert (home / ".mimir-scaffold/s6-rc.d/worklink-opencode" / name).read_bytes() == (
+                    ROOT / "deploy/s6-overlay/s6-rc.d/worklink-opencode" / name).read_bytes()
     else:
-        text = render_start_sh(mode=writer.split("-")[0])
+        text = render_start_sh(mode="pypi")
+    if "final" in writer:
         # Run the exact final gate and workload exec, without clone/sync/setup.
         guard = next(line for line in text.splitlines() if "resolve_activation(dict(os.environ))" in line)
         final = next(line for line in text.splitlines() if line.startswith("exec "))
         assert text.index(guard) < text.index(final)
         text = "set -eu\n" + guard + "\n" + final + "\n"
+        if writer.startswith("workspace"):
+            # Keep the emitted uv flags intact and use the real parser. Only
+            # project discovery and executable paths differ from the image.
+            uv = shutil.which("uv")
+            assert uv is not None
+            text = text.replace("uv run ", shlex.quote(uv) + " run --no-project ")
+        text = text.replace("python -c", shlex.quote(str(bin_dir / "python")) + " -c")
     if state == "core":
         env["MIMIR_PLUGINS"] = ""
     elif state == "not-installed":
@@ -136,16 +155,18 @@ def test_every_startup_writer_enforces_native_gate(startup, monkeypatch, writer,
         status = json.loads(path.read_text())
         status["login_state"] = "missing" if state == "missing-login" else "refreshable_unverified"
         path.write_text(json.dumps(status))
+    if writer.endswith("generic"):
+        env["MIMIR_PLUGINS"] = ""
     text = (text.replace("/usr/local/libexec/worklink-daemon-gate", str(bin_dir / "gate"))
             .replace("/opt/cultivate-docker/selected", str(root / "selected"))
             .replace("/usr/local/bin/start.sh", str(bin_dir / "workload"))
             .replace("mimir run", str(bin_dir / "workload")))
-    result = subprocess.run(["sh", "-c", text], env=env, text=True, capture_output=True, timeout=10)
-    allowed = state in {"core", "not-installed", "unexpired", "refreshable"}
+    result = subprocess.run(["sh", "-c", text], cwd=root, env=env, text=True, capture_output=True, timeout=10)
+    allowed = writer.endswith("generic") or state in {"core", "not-installed", "unexpired", "refreshable"}
     assert (result.returncode == 0) is allowed, result.stderr
     assert (root / "workload-ran").exists() is allowed
     assert (bin_dir / "opencode").exists() is (state not in {"not-installed", "missing-binary"})
-    if state == "refreshable":
+    if state == "refreshable" and not writer.endswith("generic"):
         assert "unverified" in result.stderr
 
 

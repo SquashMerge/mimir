@@ -223,6 +223,7 @@ def test_shared_service_script_provisions_each_layout(tmp_path: Path, monkeypatc
         assert (libexec / name).read_bytes() == (SCRIPTS / name).read_bytes()
         assert stat.S_IMODE((libexec / name).stat().st_mode) == 0o755
     assert (bindir / "worklink-opencode-login").read_bytes() == (SCRIPTS / "worklink-opencode-login").read_bytes()
+    assert stat.S_IMODE((bindir / "worklink-opencode-login").stat().st_mode) == 0o755
 
 
 def test_sdist_wheel_source_free_context_preserves_daemon_resources(tmp_path: Path) -> None:
@@ -255,12 +256,20 @@ def test_sdist_wheel_source_free_context_preserves_daemon_resources(tmp_path: Pa
                     str(wheels["mimir-cultivate"]), version, hashes["mimir-agent"], hashes["mimir-cultivate"]],
                    check=True, capture_output=True, text=True)
     for package, member, source in resources:
+        # Hatch normalizes write permissions for reproducible archives. Source
+        # executability is authoritative; checkout group-write bits are not.
+        expected_mode = 0o755 if (ROOT / source).stat().st_mode & 0o111 else 0o644
+        if source.endswith("/run") or Path(source).name in {
+                "worklink-opencode-service", "worklink-daemon-gate", "worklink-opencode-login"}:
+            assert expected_mode == 0o755, f"source executable mode: {source}"
         with tarfile.open(next(tmp_path.glob(package.replace("-", "_") + "-*.tar.gz"))) as archive:
             path = next(name for name in archive.getnames() if name.endswith("/" + source.removeprefix("plugins/cultivate/")))
             assert archive.extractfile(path).read() == (ROOT / source).read_bytes()
+            assert stat.S_IMODE(archive.getmember(path).mode) == expected_mode, f"sdist source mode: {source}"
         with ZipFile(wheels[package]) as archive:
             info = archive.getinfo(member)
             assert archive.read(member) == (ROOT / source).read_bytes()
+            assert stat.S_IMODE(info.external_attr >> 16) == expected_mode, f"wheel source mode: {source}"
             for destination in (context, saved):
                 assert (destination / source).read_bytes() == archive.read(member)
-                assert stat.S_IMODE((destination / source).stat().st_mode) == (info.external_attr >> 16) & 0o777
+                assert stat.S_IMODE((destination / source).stat().st_mode) == expected_mode, f"context source mode: {destination.name}/{source}"

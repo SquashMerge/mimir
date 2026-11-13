@@ -1019,7 +1019,7 @@ def render_start_sh(
         boot += "touch /run/mimir-plugin-services/ready\n"
     script = _START_SH_TEMPLATE.replace("{UV_EXTRAS}", flags)
     if selected:
-        script = script.replace("uv run ", "uv run --no-sync ")
+        script = re.sub(r"uv run (?!--no-sync\b)", "uv run --no-sync ", script)
         script = script.replace("# ─── home seed (idempotent", boot + "\n# ─── home seed (idempotent")
     return script
 
