@@ -1245,6 +1245,7 @@ def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
             worker_exec._exited.discard(identifier)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
 @pytest.mark.asyncio
 async def test_cancel_never_issued_identifier_fails_closed(monkeypatch) -> None:
     from mimir_cultivate.worklink.worker_client import WorkerClient

@@ -3151,6 +3151,7 @@ def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) ->
     assert load_run_state(tmp_path, 441) is None
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
 @pytest.mark.parametrize("worker_state,deadline,exit_code", [
     pytest.param("exited", True, 0, id="exited-timeout"),
     pytest.param("live", True, -15, id="live-timeout"),
