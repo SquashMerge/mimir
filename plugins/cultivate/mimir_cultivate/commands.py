@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 from pathlib import Path
 import sys
 
 from mimir.event_logger import log_durable_event_sync
 from .worklink.control import (
+    Runner,
     archive_worklink_factory_records,
     stop_worklink,
     worklink_status,
@@ -50,6 +52,15 @@ def add_argparse(
     )
     archive_p.add_argument("issue_id", type=int, help="Chainlink epic issue id to clear.")
     archive_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    clear_p = worklink_sub.add_parser(
+        "clear-incident", help="Release a dispatch-failure hold without running work."
+    )
+    clear_p.add_argument("issue_id", type=int, help="Chainlink issue id to clear.")
+    clear_p.add_argument("--reason", required=True, help="Why the operator is releasing this hold.")
+    clear_p.add_argument("--signature", help="Require this exact incident signature.")
+    clear_p.add_argument("--occurrence", help="Require this exact incident occurrence id.")
+    clear_p.add_argument("--home", type=Path, default=None, help="Agent home.")
 
     recover_runtime_p = worklink_sub.add_parser(
         "clear-factory-runtime", help="Operator-confirmed cleanup of a quiescent legacy factory store."
@@ -164,6 +175,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if args.worklink_action == "archive-factory-run":
         return _archive_factory_run(args)
+
+    if args.worklink_action == "clear-incident":
+        return _clear_incident(args)
 
     if args.worklink_action == "clear-factory-runtime":
         from .worklink.autonomy import recover_factory_runtime
@@ -280,6 +294,8 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
 
 def _status(args: argparse.Namespace) -> int:
+    from .worklink.dispatch_failures import current_failure_record, dispatch_failure_state_dir
+
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
     try:
         rows = worklink_status(home, issue_ids=args.issue_ids)
@@ -302,6 +318,98 @@ def _status(args: argparse.Namespace) -> int:
         )
         if row.disagreement:
             print(f"  disagreement: {row.disagreement}")
+        try:
+            incident = current_failure_record(dispatch_failure_state_dir(home), row.issue_id)
+        except (OSError, ValueError) as exc:
+            print(f"  incident unavailable: {exc}", file=sys.stderr)
+            return 1
+        if incident is not None:
+            print(
+                f"  active incident: failure_kind={incident.get('failure_kind')} "
+                f"signature={incident['signature']} occurrence_id={incident['occurrence_id']} "
+                f"failed_at={incident.get('failed_at')}"
+            )
+    return 0
+
+
+def _require_incident_quiescent(home: Path, issue_id: int, run: Runner, chainlink_bin: str) -> None:
+    from .worklink.run_state import WorklinkRunState, process_is_alive, run_state_path
+    from .worklink.factory_state import (
+        factory_process_is_verified_dead, load_factory_records_for_issue,
+    )
+
+    try:
+        payload = run_state_path(home, issue_id).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    else:
+        state = WorklinkRunState.from_json(json.loads(payload))
+        if state.compute_name != "local_subprocess" or process_is_alive(state):
+            raise ValueError("issue has an active run (or run liveness is unknown)")
+    for record in load_factory_records_for_issue(home, issue_id):
+        if not factory_process_is_verified_dead(record, allow_missing_start_ticks=True):
+            raise ValueError("issue has an active factory run (or run liveness is unknown)")
+
+    result = run([chainlink_bin, "locks", "list", "--json"])
+    if result.returncode != 0:
+        raise ValueError("cannot verify active claims: chainlink locks list failed")
+    payload = json.loads(result.stdout)
+    locks = payload.get("locks") if isinstance(payload, dict) else payload
+    if not isinstance(locks, (dict, list)):
+        raise ValueError("cannot verify active claims: invalid lock table")
+    items = locks.items() if isinstance(locks, dict) else ((None, value) for value in locks)
+    for key, value in items:
+        raw_id = (
+            value.get("issue_id", value.get("id", value.get("issue", key)))
+            if isinstance(value, dict) else key
+        )
+        if isinstance(raw_id, bool) or not str(raw_id).isascii() or not str(raw_id).isdecimal():
+            raise ValueError("cannot verify active claims: invalid issue identity")
+        if int(raw_id) == issue_id:
+            raise ValueError("issue has an active claim")
+
+
+def _clear_incident(args: argparse.Namespace) -> int:
+    from .worklink.autonomy import chainlink_bin
+    from .worklink.control import _claim_mutex, _runner
+    from .worklink.dispatch_failures import clear_operator_incident, dispatch_failure_state_dir
+    from mimir.event_logger import init_logger
+
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    run = _runner(home)
+    binary = chainlink_bin()
+    try:
+        if not args.reason.strip():
+            raise ValueError("--reason must not be empty")
+        with _claim_mutex(home):
+            _require_incident_quiescent(home, args.issue_id, run, binary)
+            entry = clear_operator_incident(
+                dispatch_failure_state_dir(home), args.issue_id, reason=args.reason,
+                signature=args.signature, occurrence_id=args.occurrence,
+            )
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        print(f"clear-incident refused: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        init_logger(home / "logs" / "events.jsonl", session_id=f"worklink-clear-{args.issue_id}")
+        log_durable_event_sync(
+            "worklink_incident_cleared", issue_id=args.issue_id,
+            signature=entry["signature"], occurrence_id=entry["occurrence_id"],
+            reason=entry["cleared_reason"],
+        )
+        comment = run([
+            binary, "issue", "comment", str(args.issue_id),
+            f"Worklink incident cleared by operator at {entry['cleared_at']}: "
+            f"signature={entry['signature']} occurrence_id={entry['occurrence_id']}. "
+            f"Reason: {entry['cleared_reason']}",
+        ])
+        if comment.returncode != 0:
+            raise RuntimeError("Chainlink comment failed")
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"incident cleared, but audit delivery failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"worklink #{args.issue_id}: incident cleared")
     return 0
 
 
