@@ -54,7 +54,7 @@ def test_current_repository_skill_release_hash(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     version = {
         "github-poller": "2112-pr-identity-scope",
-        "review": "2049-review-tests",
+        "review": "review-trusted-evidence-first",
         "tracker-poller": "2066-pr-publication",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
