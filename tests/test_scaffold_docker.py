@@ -24,8 +24,8 @@ from types import SimpleNamespace
 
 import pytest
 
-FACTORY_VERSION = "0.12.1"
-OPENCODE_VERSION = "1.19.4"
+FACTORY_VERSION = "0.14.0"
+OPENCODE_VERSION = "2.2.7"
 from mimir.scaffold_docker import (
     DEFAULT_BASE_IMAGE,
     Fragment,
@@ -644,7 +644,7 @@ def test_render_dockerfile_is_structurally_parseable(mode, install_opencode):
 
 def test_render_dockerfile_installs_opencode_when_selected():
     """The selected provider supplies the OpenCode install in both modes."""
-    assert FACTORY_VERSION == "0.12.1"
+    assert FACTORY_VERSION == "0.14.0"
     plugins = _cultivate_or_refusal()
     for mode in ("workspace", "pypi"):
         if plugins and mode == "pypi":
@@ -658,12 +658,10 @@ def test_render_dockerfile_installs_opencode_when_selected():
             continue
         base = cultivate_scripts(plugins[0])["base.sh"]
         assert "COPY .mimir-scaffold/cultivate-docker/" in out, mode
-        assert f"opencode-ai@{OPENCODE_VERSION}" in base, mode
+        assert f"@opencode/cli@{OPENCODE_VERSION}" in base, mode
         assert "feature-factory@${FACTORY_VERSION}" in base, mode
-        assert "opencode-feature-factory@${FACTORY_VERSION}" in base, mode
-        assert "opencode-project-memory@0.1.0" in base, mode
-        assert "opencode-openai-codex-auth@4.4.0" in base, mode
-        assert "opencode-anthropic-auth@0.0.13" in base, mode
+        assert "opencode2-feature-factory@${FACTORY_VERSION}" in base, mode
+        assert "@devtheops/opencode-plugin-otel@2.1.0" in base, mode
         assert "MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js" in out, mode
         assert "/home/mimir/.config/opencode/opencode.json" in out, mode
         assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" in out, mode
@@ -795,12 +793,11 @@ def test_selected_cultivate_scaffold_executes_gated_pinned_install(tmp_path, mon
         else:
             assert log.read_text().splitlines() == [
                 "install", "--global", "--prefix", "/opt/mimir-opencode",
-                f"opencode-ai@{OPENCODE_VERSION}",
+                f"@opencode/cli@{OPENCODE_VERSION}",
                 "@openai/codex@0.139.0",
                 f"feature-factory@{FACTORY_VERSION}",
-                f"opencode-feature-factory@{FACTORY_VERSION}",
-                "opencode-project-memory@0.1.0", "opencode-openai-codex-auth@4.4.0",
-                "opencode-anthropic-auth@0.0.13",
+                f"opencode2-feature-factory@{FACTORY_VERSION}",
+                "@devtheops/opencode-plugin-otel@2.1.0",
             ]
 
 
@@ -816,13 +813,13 @@ def test_scaffold_installs_opencode_when_selected(tmp_path: Path, monkeypatch):
         assert not list(home.iterdir())
     else:
         scaffold(home, mode="pypi", install_opencode=True)
-        assert f"opencode-ai@{OPENCODE_VERSION}" not in _scaffold_install_text(home)
+        assert f"@opencode/cli@{OPENCODE_VERSION}" not in _scaffold_install_text(home)
 
     plain = tmp_path / "plain-home"
     plain.mkdir()
     monkeypatch.delenv("MIMIR_PLUGINS")
     scaffold(plain, mode="pypi", install_opencode=False)
-    assert f"opencode-ai@{OPENCODE_VERSION}" not in _scaffold_install_text(plain)
+    assert f"@opencode/cli@{OPENCODE_VERSION}" not in _scaffold_install_text(plain)
     assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" not in (plain / "Dockerfile").read_text()
 
 
@@ -833,7 +830,7 @@ def test_scaffold_installs_opencode_for_workspace_mode(tmp_path: Path, monkeypat
     plugins = _cultivate_or_refusal()
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
     scaffold(home, mode="workspace", install_opencode=True)
-    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
+    assert (f"@opencode/cli@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
 
 
 def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path, monkeypatch):
@@ -846,14 +843,9 @@ def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path, mon
     assert oc_config == home / ".config" / "opencode" / "opencode.json"
     assert oc_config.is_file(), "global opencode.json should be created"
     content = oc_config.read_text()
-    assert "opencode-feature-factory" in content
-    assert "opencode-project-memory" in content
-    assert "opencode-openai-codex-auth" in content
-    assert "opencode-anthropic-auth" in content
-    assert '.opencode/memory' in content
-    assert '"maxIndexBytes": 8192' in content
-    assert '"maxIndexLines": 100' in content
-    assert '"gitExclude": false' in content
+    assert json.loads(content)["plugins"] == [
+        {"package": "opencode2-feature-factory@0.14.0"},
+        {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": False}}]
 
 
 def test_scaffold_skips_opencode_config_when_disabled(tmp_path: Path, monkeypatch):
@@ -868,17 +860,15 @@ def test_scaffold_skips_opencode_config_when_disabled(tmp_path: Path, monkeypatc
 def test_ensure_opencode_config_preserves_existing_options_and_deduplicates(tmp_path: Path):
     config_path = opencode_config_path(tmp_path)
     config_path.parent.mkdir(parents=True)
-    existing_factory = [
-        "opencode-feature-factory",
-        {"profiles": {"review": ["openai", "gpt-5"]}},
-    ]
+    existing_factory = {"package": "opencode2-feature-factory@0.13.0",
+                        "options": {"profiles": {"review": ["openai", "gpt-5"]}}}
     config_path.write_text(json.dumps({
         "$schema": "custom-schema",
         "theme": "tokyonight",
-        "plugin": [
+        "plugins": [
             "operator-plugin",
             existing_factory,
-            "opencode-feature-factory",
+            {"package": "opencode2-feature-factory@0.14.0"},
             ["opencode-project-memory", {"maxIndexLines": 17, "operator": True}],
         ],
     }))
@@ -888,29 +878,11 @@ def test_ensure_opencode_config_preserves_existing_options_and_deduplicates(tmp_
 
     assert merged["$schema"] == "custom-schema"
     assert merged["theme"] == "tokyonight"
-    assert merged["plugin"][0] == "operator-plugin"
-    assert merged["plugin"][1] == existing_factory
-    assert sum(
-        1 for entry in merged["plugin"]
-        if entry == "opencode-feature-factory"
-        or isinstance(entry, list) and entry[0] == "opencode-feature-factory"
-    ) == 1
-    memory = next(
-        entry for entry in merged["plugin"]
-        if isinstance(entry, list) and entry[0] == "opencode-project-memory"
-    )
-    assert memory[1] == {
-        "memoryDir": ".opencode/memory",
-        "index": "MEMORY.md",
-        "maxIndexBytes": 8192,
-        "maxIndexLines": 100,
-        "gitExclude": False,
-        "operator": True,
-    }
-    assert merged["plugin"][-2:] == [
-        "opencode-openai-codex-auth",
-        "opencode-anthropic-auth",
-    ]
+    assert merged["plugins"][0] == "operator-plugin"
+    assert merged["plugins"][1] == {**existing_factory, "package": "opencode2-feature-factory@0.14.0"}
+    assert len(merged["plugins"]) == 3
+    assert merged["plugins"][-1] == {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": False}}
+    assert "opencode-project-memory" not in config_path.read_text()
     before = config_path.read_text()
     assert ensure_opencode_config(config_path) is False
     assert config_path.read_text() == before
@@ -1204,7 +1176,7 @@ def test_cli_exposes_opencode_opt_in(tmp_path: Path, capsys, monkeypatch):
         assert not list(tmp_path.iterdir())
     else:
         assert cmd(args) == 0
-        assert f"opencode-ai@{OPENCODE_VERSION}" not in _scaffold_install_text(tmp_path)
+        assert f"@opencode/cli@{OPENCODE_VERSION}" not in _scaffold_install_text(tmp_path)
 
 
 @pytest.mark.parametrize("installed_version", ["0.0.1", OPENCODE_VERSION])
@@ -1242,7 +1214,7 @@ def test_cmd_flagless_rerun_preserves_deployment_shape(
     dockerfile = (home / "Dockerfile").read_text()
     compose = (home / "compose.yml").read_text()
     assert "Generated by `mimir scaffold-docker --mode pypi`" in dockerfile
-    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
+    assert (f"@opencode/cli@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
     assert "container_name: stable-service" in compose
     assert '"127.0.0.1:9000:8080"' in compose
 

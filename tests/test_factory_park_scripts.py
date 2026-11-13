@@ -10,12 +10,14 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -43,6 +45,7 @@ from mimir_cultivate.worklink.claims import (
     ShutdownAbortRecord,
 )
 from mimir_cultivate.worklink.run_state import process_start_ticks
+from tests.opencode_fixtures import seed_factory_install
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -169,11 +172,12 @@ def _home_with(record, tmp_path: Path) -> Path:
 
 def _park_main(record, home: Path, monkeypatch, run, tmp_path: Path, *, extra=()):
     """Drive park.main() with the compute side stubbed out."""
-    statuses = iter([
-        _status("running", sandbox_path=record.sandbox),
-        _status(sandbox_path=record.sandbox),
-        _status(sandbox_path=record.sandbox),
-    ])
+    values = [_status("running", sandbox_path=record.sandbox)]
+    daemon = record.handle is not None and record.handle.substrate == "opencode_daemon"
+    if daemon:
+        values.append(_status("running", sandbox_path=record.sandbox))
+    values.extend([_status(sandbox_path=record.sandbox), _status(sandbox_path=record.sandbox)])
+    statuses = iter([{**value, **({"lock_session": record.session} if daemon else {})} for value in values])
     monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
     monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
     def publish(*args, **kwargs):
@@ -210,104 +214,103 @@ class TestOperatorRoot:
             park.operator_root(stray)
 
 
+@pytest.fixture
+def cli_snapshot(tmp_path, monkeypatch):
+    """Synthetic CLI-owned publication effects, not an upstream implementation proof."""
+    root = tmp_path / "checkout"
+    plane = _plane(root / ".factory-sandboxes/chainlink-1/.factory/chainlink-1")
+    parked = root / ".factory/.parked"
+    canonical = parked / "chainlink-1"
+    launcher = seed_factory_install(tmp_path / "installed")
+    state = {"fail": False, "ack": True, "corrupt": False, "heartbeat": False}
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:2] == ["node", str(launcher)]
+        if argv[2] == "status":
+            assert argv == ["node", str(launcher), "status", "chainlink-1", "--repo", str(plane.parent.parent), "--json"]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"run_id": "chainlink-1", "valid": True,
+                "sandbox_path": str(plane.parent.parent), "park_snapshot": str(canonical) if state["ack"] else None}), "")
+        assert argv == ["node", str(launcher), "snapshot", "chainlink-1", "--repo", str(root), "--json"]
+        if state["fail"]:
+            return subprocess.CompletedProcess(argv, 1, "", "synthetic CLI refusal")
+        if canonical.exists():
+            shutil.rmtree(canonical)
+        shutil.copytree(plane, canonical, symlinks=True)
+        if state["heartbeat"]:
+            (plane / "factory.lock").write_text("a later heartbeat")
+        if state["corrupt"]:
+            (canonical / "artifacts/factory.lock").write_text("corrupted run state")
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    monkeypatch.setattr(park, "_run", run)
+    return SimpleNamespace(plane=plane, parked=parked, canonical=canonical, launcher=launcher,
+                           state=state, calls=calls, publish=lambda: park.publish_snapshot(
+                               plane, parked, "chainlink-1", launcher=launcher))
+
+
 class TestPublishSnapshot:
-    def test_publishes_a_verified_copy_excluding_only_the_plane_root_lock(self, tmp_path: Path) -> None:
-        plane = _plane(tmp_path / "plane")
-        parked = _parked_dir(tmp_path)
+    def test_publishes_only_through_bound_cli_and_verifies_inventory(self, cli_snapshot):
+        published = cli_snapshot.publish()
+        assert published == cli_snapshot.canonical
+        assert (published / "artifacts/technical-brief.md").read_text() == "brief"
+        assert (published / "reviews/spec-writer.json").read_text() == '{"verdict": "APPROVE"}'
+        assert [call[2] for call in cli_snapshot.calls] == ["snapshot", "status"]
 
-        published = park.publish_snapshot(plane, parked, "chainlink-1")
+    def test_a_heartbeat_during_cli_publication_does_not_fail_verification(self, cli_snapshot):
+        cli_snapshot.state["heartbeat"] = True
+        assert cli_snapshot.publish().is_dir()
 
-        assert published == parked / "chainlink-1"
-        assert (published / "artifacts" / "technical-brief.md").read_text() == "brief"
-        assert (published / "reviews" / "spec-writer.json").read_text() == '{"verdict": "APPROVE"}'
-        # The lock is copied, but excluded from the comparison that gates publication.
-        assert (published / "factory.lock").exists()
+    def test_nested_lock_corruption_is_refused_without_script_repair(self, cli_snapshot):
+        (cli_snapshot.plane / "artifacts/factory.lock").write_text("nested run state")
+        cli_snapshot.state["corrupt"] = True
+        with pytest.raises(park.ParkError, match="inventory mismatch; claim retained"):
+            cli_snapshot.publish()
+        assert (cli_snapshot.canonical / "artifacts/factory.lock").read_text() == "corrupted run state"
+        assert (cli_snapshot.plane / "artifacts/factory.lock").read_text() == "nested run state"
 
-    def test_a_heartbeat_landing_mid_copy_does_not_fail_publication(self, tmp_path: Path, monkeypatch) -> None:
-        """Only the plane-root factory.lock is excluded, and that is why."""
-        plane = _plane(tmp_path / "plane")
-        parked = _parked_dir(tmp_path)
+    def test_cli_failure_preserves_prior_snapshot_without_filesystem_fallback(self, cli_snapshot):
+        cli_snapshot.publish()
+        before = park.plane_inventory(cli_snapshot.canonical)
+        cli_snapshot.state["fail"] = True
+        (cli_snapshot.plane / "artifacts/technical-brief.md").write_text("unpublished revision")
+        with pytest.raises(park.ParkError, match="publication failed"):
+            cli_snapshot.publish()
+        assert park.plane_inventory(cli_snapshot.canonical) == before
 
-        real_inventory = park.plane_inventory
-        calls = {"n": 0}
+    def test_unacknowledged_publication_is_not_a_success(self, cli_snapshot):
+        cli_snapshot.state["ack"] = False
+        with pytest.raises(park.ParkError, match="not acknowledged"):
+            cli_snapshot.publish()
 
-        def ticking_inventory(root: Path):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                (plane / "factory.lock").write_text("heartbeat-2")
-            return real_inventory(root)
+    def test_cli_refusal_does_not_remove_residual_staging(self, cli_snapshot):
+        staging = cli_snapshot.parked / ".staging-chainlink-1"
+        staging.mkdir(parents=True)
+        cli_snapshot.state["fail"] = True
+        with pytest.raises(park.ParkError, match="publication failed"):
+            cli_snapshot.publish()
+        assert staging.is_dir() and not cli_snapshot.canonical.exists()
 
-        monkeypatch.setattr(park, "plane_inventory", ticking_inventory)
-        published = park.publish_snapshot(plane, parked, "chainlink-1")
-        assert published.is_dir()
+    def test_republishing_requires_a_second_cli_effect_and_verification(self, cli_snapshot):
+        cli_snapshot.publish()
+        (cli_snapshot.plane / "artifacts/technical-brief.md").write_text("revised brief")
+        published = cli_snapshot.publish()
+        assert (published / "artifacts/technical-brief.md").read_text() == "revised brief"
+        assert [call[2] for call in cli_snapshot.calls] == ["snapshot", "status", "snapshot", "status"]
 
-    def test_a_nested_factory_lock_is_run_state_and_must_match(self, tmp_path: Path, monkeypatch) -> None:
-        plane = _plane(tmp_path / "plane")
-        (plane / "artifacts" / "factory.lock").write_text("nested-run-state")
-        parked = _parked_dir(tmp_path)
+    def test_symlink_inventory_is_verified_without_following_it(self, cli_snapshot):
+        (cli_snapshot.plane / "artifacts/latest.md").symlink_to("technical-brief.md")
+        published = cli_snapshot.publish()
+        assert (published / "artifacts/latest.md").is_symlink()
+        assert os.readlink(published / "artifacts/latest.md") == "technical-brief.md"
 
-        real_inventory = park.plane_inventory
-        calls = {"n": 0}
-
-        def corrupting_inventory(root: Path):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                (plane / "artifacts" / "factory.lock").write_text("changed-after-copy")
-            return real_inventory(root)
-
-        monkeypatch.setattr(park, "plane_inventory", corrupting_inventory)
-        with pytest.raises(park.ParkError, match="inventory mismatch"):
-            park.publish_snapshot(plane, parked, "chainlink-1")
-        assert not (parked / "chainlink-1").exists()
-        assert not (parked / ".staging-chainlink-1").exists()
-
-    def test_nothing_is_published_when_verification_fails(self, tmp_path: Path, monkeypatch) -> None:
-        plane = _plane(tmp_path / "plane")
-        parked = _parked_dir(tmp_path)
-
-        monkeypatch.setattr(park, "plane_inventory", lambda root: [("differs", "file", 0o644, str(root))])
-        with pytest.raises(park.ParkError, match="nothing published"):
-            park.publish_snapshot(plane, parked, "chainlink-1")
-        assert not (parked / "chainlink-1").exists()
-
-    def test_a_residual_staging_tree_refuses_rather_than_overwriting(self, tmp_path: Path) -> None:
-        plane = _plane(tmp_path / "plane")
-        parked = _parked_dir(tmp_path)
-        (parked / ".staging-chainlink-1").mkdir(parents=True)
-
-        with pytest.raises(park.ParkError, match="residual staging"):
-            park.publish_snapshot(plane, parked, "chainlink-1")
-
-    def test_republishing_replaces_the_previous_snapshot(self, tmp_path: Path) -> None:
-        plane = _plane(tmp_path / "plane")
-        parked = _parked_dir(tmp_path)
-        park.publish_snapshot(plane, parked, "chainlink-1")
-
-        (plane / "artifacts" / "technical-brief.md").write_text("revised brief")
-        published = park.publish_snapshot(plane, parked, "chainlink-1")
-
-        assert (published / "artifacts" / "technical-brief.md").read_text() == "revised brief"
-        assert not (parked / ".prior-chainlink-1").exists()
-
-    def test_symlinks_are_preserved_as_symlinks(self, tmp_path: Path) -> None:
-        plane = _plane(tmp_path / "plane")
-        (plane / "artifacts" / "latest.md").symlink_to("technical-brief.md")
-        parked = _parked_dir(tmp_path)
-
-        published = park.publish_snapshot(plane, parked, "chainlink-1")
-        assert (published / "artifacts" / "latest.md").is_symlink()
-        assert os.readlink(published / "artifacts" / "latest.md") == "technical-brief.md"
-
-    def test_refuses_to_write_through_a_symlinked_parent(self, tmp_path: Path) -> None:
-        plane = _plane(tmp_path / "plane")
-        control = tmp_path / "checkout" / ".factory"
-        control.parent.mkdir(parents=True, exist_ok=True)
+    def test_symlinked_parent_refuses_before_cli_effect(self, cli_snapshot, tmp_path):
+        control = cli_snapshot.parked.parent
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
         control.symlink_to(elsewhere)
-
         with pytest.raises(park.ParkError, match="symlinked parent"):
-            park.publish_snapshot(plane, control / ".parked", "chainlink-1")
+            cli_snapshot.publish()
+        assert cli_snapshot.calls == []
 
 
 class TestPlaneInventory:
@@ -347,16 +350,20 @@ def _record(
     """A retained record shaped as a real parked run's."""
     sandbox = tmp_path / ".factory-sandboxes" / "chainlink-1783"
     sandbox.mkdir(parents=True, exist_ok=True)
+    launcher = tmp_path / "installed/lib/node_modules/feature-factory/bin/factory.js"
+    if not launcher.exists():
+        launcher = seed_factory_install(tmp_path / "installed")
     return FactoryRunRecord(
         run_id="chainlink-1783", issue_id=1783, attempt=1,
         repository="jasoncarreira/mimir", base_ref="base/chainlink-1783",
-        branch="feature/chainlink-1783", launcher="/opt/factory/factory.js",
+        branch="feature/chainlink-1783", launcher=str(launcher),
         sandbox=str(sandbox), session=session,
         handle=_handle(_dead_pid() if pid is None else pid),
         status=None if status is None else FactoryStatus(
             run_id="chainlink-1783", valid=True, sandbox_path=str(sandbox), status=status,
         ),
         observed_at="2026-09-21T05:00:00+00:00", controller_phase=phase,
+        children_reaped=True,
     )
 
 
@@ -387,19 +394,77 @@ def _status(
     }
 
 
-class TestResumePreflight:
-    """The preflight reports mimir's own recovery preconditions.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified", [True, False])
+async def test_operator_park_cancels_actual_daemon_host_before_factory_effects(tmp_path, monkeypatch, verified):
+    import asyncio
+    from mimir_cultivate.worklink import worker_client
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
 
-    The bug these exist for: unparking out of band spends the ``needs-human``
-    transition ``_verify_factory_recovery_target`` is gated on, after which the
-    supported recovery path refuses the run and the attempt is lost.
-    """
+    original = _record(tmp_path, phase="running", status="running")
+    loop = asyncio.get_running_loop()
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await SessionController.create(client, tmp_path / "native-controller.json",
+            request=SessionRequest("epic", {"providerID": "openai", "id": "test"},
+                                   "--autonomous --max-retries 5 chainlink-1783"),
+            issue_id=1783, attempt=1, generation="operator-generation", checkout=Path(original.sandbox),
+            environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+        sid = controller.record.opencode_session_id
+        record = replace(original, handle=LaunchHandle("opencode_daemon", sid,
+            opencode_session_id=sid, launch_generation="operator-generation"),
+            session=sid, opencode_session_id=sid, children_reaped=False)
+        home = _home_with(record, tmp_path)
+        assert resume.preflight(record, {**_status("running"), "lock_session": sid}, Path(record.sandbox)) == []
+        order = []
+        class NativePeer:
+            async def session_cancel(self, handle):
+                assert handle.opencode_session_id == sid
+                future = asyncio.run_coroutine_threadsafe(controller.cancel(timeout_s=25 if verified else 0.05), loop)
+                if not await asyncio.wrap_future(future):
+                    raise RuntimeError("unverified cancellation")
+                order.append("quiescent")
+            async def session_release(self, handle):
+                assert controller.record.cancellation_state == "verified"
+                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(controller.release(), loop))
+                order.append("released")
+        monkeypatch.setattr(worker_client.WorkerClient, "for_path_checkout", lambda *a, **kw: NativePeer())
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **kwargs: order.append(label))
+        calls = []
+        run = _park_stub(calls, _claim_history(1))
+        def command(argv, **kwargs):
+            if argv[:1] == ["node"]:
+                assert order[:3] == ["controller", "quiescent", "released"]
+            return run(argv, **kwargs)
+        daemon.interrupt_noop = not verified
+        try:
+            invocation = asyncio.to_thread(_park_main, record, home, monkeypatch, command, tmp_path)
+            if verified:
+                assert await invocation == 0
+                retained = load_factory_record(home, record.run_id)
+                assert retained.controller_phase == "parked" and retained.children_reaped
+                assert retained.opencode_session_id == retained.session == sid
+                assert any(argv[2:3] == ["terminal"] for argv in calls if argv[:1] == ["node"])
+                assert any(argv[1:3] == ["locks", "release"] for argv in calls)
+            else:
+                with pytest.raises(park.ParkError, match="quiescence unverified"):
+                    await invocation
+                assert controller.path.exists()
+                assert not load_factory_record(home, record.run_id).children_reaped
+                assert not any(argv[:1] == ["node"] or argv[1:3] == ["locks", "release"] for argv in calls)
+        finally:
+            daemon.interrupt_noop = False
+            await controller.release()
+
+
+class TestResumePreflight:
+    """Preflight mirrors recovery; it must not spend the needs-human transition."""
 
     def test_a_swept_sandbox_is_refused_with_the_reason(self, tmp_path: Path) -> None:
-        argv = [
-            "--run-id", "chainlink-1", "--sandbox", str(tmp_path / "gone"),
-            "--home", str(tmp_path), "--launcher", str(tmp_path / "factory.js"),
-        ]
+        argv = ["--run-id", "chainlink-1", "--sandbox", str(tmp_path / "gone"),
+                "--home", str(tmp_path), "--launcher", str(tmp_path / "factory.js")]
         with pytest.raises(resume.ResumeError, match="not resumable"):
             resume.main(argv)
 
@@ -414,11 +479,12 @@ class TestResumePreflight:
         problems = resume.preflight(record, status, Path(record.sandbox))
         assert any("lock owner changed" in problem for problem in problems)
 
-    def test_running_with_verified_dead_driver_passes(self, tmp_path: Path, monkeypatch) -> None:
+    def test_running_historical_driver_requires_operator_park(self, tmp_path: Path, monkeypatch) -> None:
         record = _record(tmp_path, phase="running", status="running")
         monkeypatch.setattr(resume, "factory_process_is_alive", lambda record: False)
         monkeypatch.setattr(resume, "factory_process_is_verified_dead", lambda record: True)
-        assert resume.preflight(record, _status("running"), Path(record.sandbox)) == []
+        assert resume.preflight(record, _status("running"), Path(record.sandbox)) == [
+            "historical host requires a verified park and canonical run before fresh daemon recovery"]
 
     @pytest.mark.skipif(
         sys.platform != "linux",
@@ -525,7 +591,7 @@ class TestResumeDoesNotUnpark:
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
             if cmd[:2] == ["node", str(record.launcher)]:
-                return subprocess.CompletedProcess(cmd, 0, json.dumps(_status()), "")
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(_status(sandbox_path=record.sandbox)), "")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with mock.patch.object(resume, "_run", fake_run):
@@ -620,6 +686,10 @@ class TestParkStopsTheControllerFirst:
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: True)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
         monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: order.append(label))
+        from mimir_cultivate.worklink.worker_client import WorkerClient
+        async def cancelled(self, handle):
+            order.append("recorded driver")
+        monkeypatch.setattr(WorkerClient, "cancel_factory_handle", cancelled)
         monkeypatch.setattr(
             park, "stop_residual_compute", lambda run_id, **k: order.append("residual") or [],
         )
@@ -677,11 +747,29 @@ class TestParkStopsTheControllerFirst:
     def test_stop_pid_verifies_death_rather_than_assuming_the_signal_worked(
         self, monkeypatch
     ) -> None:
-        monkeypatch.setattr(park, "_pid_alive", lambda pid: True)
-        monkeypatch.setattr(park.os, "kill", lambda pid, sig: None)
-        monkeypatch.setattr(park.time, "sleep", lambda seconds: None)
+        fd = os.open(os.devnull, os.O_RDONLY)
+        signals = []
+        monkeypatch.setattr(park.os, "pidfd_open", lambda pid: fd, raising=False)
+        monkeypatch.setattr(park.signal, "pidfd_send_signal", lambda bound, sig: signals.append((bound, sig)), raising=False)
+        monkeypatch.setattr(park.select, "poll", lambda: SimpleNamespace(register=lambda *a: None, poll=lambda timeout: []))
         with pytest.raises(park.ParkError, match="survived SIGKILL"):
-            park.stop_pid(4242, "controller", timeout=0.01)
+            park.stop_pid(4242, "controller", timeout=0.01, verify=lambda pid: None)
+        assert signals == [(fd, park.signal.SIGTERM), (fd, park.signal.SIGKILL)]
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+    def test_changed_controller_identity_is_refused_before_pidfd_signal(self, monkeypatch):
+        fd = os.open(os.devnull, os.O_RDONLY)
+        signals = mock.Mock()
+        monkeypatch.setattr(park.os, "pidfd_open", lambda pid: fd, raising=False)
+        monkeypatch.setattr(park.signal, "pidfd_send_signal", signals, raising=False)
+        def changed(pid):
+            raise park.ParkError("controller identity changed")
+        with pytest.raises(park.ParkError, match="identity changed"):
+            park.stop_pid(4242, "controller", verify=changed)
+        signals.assert_not_called()
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 class TestParkToImmediateDispatch:
     """Park then dispatch, through the real claim-admission path.

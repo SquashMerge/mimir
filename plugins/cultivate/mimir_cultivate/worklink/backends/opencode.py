@@ -18,11 +18,7 @@ from mimir._reasoning_effort import validate_effort
 from mimir.config import model_spec_at_call_time
 from mimir_cultivate.opencode import (
     OpenCodeConfigError,
-    OpenCodeInvocation,
     opencode_model_from_agent_spec,
-    opencode_worker_documents,
-    reconcile_codex_auth,
-    resolve_opencode_invocation,
     resolve_daemon_model,
     redact_daemon_output,
 )
@@ -104,57 +100,6 @@ EventLogger = Callable[..., None]
 Sleeper = Callable[[float], Awaitable[None]]
 CheckoutSnapshot = Callable[[], object]
 Clock = Callable[[], float]
-
-
-@dataclass(frozen=True)
-class WorkerProjection:
-    path: str
-    document: bytes
-
-    def __post_init__(self) -> None:
-        if self.path not in {
-            ".config/opencode/opencode.json",
-            ".local/share/opencode/auth.json",
-        }:
-            raise ValueError("worker projection destination is not permitted")
-        if len(self.document) > 1024 * 1024:
-            raise ValueError("worker projection exceeds size limit")
-        if not isinstance(json.loads(self.document), dict):
-            raise ValueError("worker projection must be a JSON object")
-
-
-@dataclass(frozen=True)
-class WorklinkOpenCodeResolution:
-    invocation: OpenCodeInvocation
-    configured_model: str
-    model_diverged: bool
-    env: Mapping[str, str] = field(repr=False)
-
-
-def resolve_worklink_opencode_invocation(
-    env: Mapping[str, str],
-) -> WorklinkOpenCodeResolution:
-    """Resolve an OpenCode invocation consistently for every Worklink path."""
-    model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
-    dotenv_model_spec = model_spec_at_call_time(model_home)
-    configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
-    resolution_env = filter_otlp_env({**os.environ, **env})
-    resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
-    invocation = resolve_opencode_invocation(env=resolution_env)
-    configured_model = opencode_model_from_agent_spec(configured_model_spec)
-    model_diverged = invocation.model != configured_model
-    if model_diverged:
-        log.warning(
-            "Worklink OpenCode model %s differs from configured agent model %s",
-            invocation.model,
-            configured_model,
-        )
-    return WorklinkOpenCodeResolution(
-        invocation=invocation,
-        configured_model=configured_model,
-        model_diverged=model_diverged,
-        env=resolution_env,
-    )
 
 
 @dataclass(frozen=True)
@@ -473,7 +418,7 @@ def _default_transcript_root() -> Path:
 
 
 def _bounded_transcript_tail(value: str, limit: int) -> str:
-    scrubbed = redact_text(value)
+    scrubbed = redact_daemon_output(value)
     encoded = scrubbed.encode("utf-8")
     if len(encoded) <= limit:
         return scrubbed

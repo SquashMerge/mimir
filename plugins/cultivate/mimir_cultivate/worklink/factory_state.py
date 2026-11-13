@@ -284,8 +284,8 @@ class FactoryRunRecord:
     controller_phase: str
     controller_error: str | None = None
     transcript: str | None = None
-    # Set only after the executor's successful subreaper terminal acknowledgement.
-    # Driver PID death alone does not exclude detached specialists.
+    # Executor proof: process descendants reaped, or owned daemon input/execution
+    # reconciled quiescent. Neither PID death nor a model-turn result proves this.
     children_reaped: bool = False
     version: int = FACTORY_RECORD_VERSION
     opencode_session_id: str | None = None
@@ -310,6 +310,8 @@ class FactoryRunRecord:
         if (self.handle is not None and self.opencode_session_id is not None
                 and self.handle.opencode_session_id != self.opencode_session_id):
             raise FactoryRecordError("factory record session handle mismatch")
+        if self.opencode_session_id is not None and self.session is not None and self.session != self.opencode_session_id:
+            raise FactoryRecordError("factory record lock identity does not match the OpenCode host")
         if type(self.children_reaped) is not bool:
             raise FactoryRecordError("factory record children_reaped is invalid")
         if self.version != FACTORY_RECORD_VERSION:
@@ -499,11 +501,13 @@ class FactoryRunRecord:
             mcp_servers=mcp_servers,
         )
 
-    def observed(self, status: FactoryStatus, observed_at: str) -> FactoryRunRecord:
+    def observed(self, status: FactoryStatus, observed_at: str | None) -> FactoryRunRecord:
+        if self.opencode_session_id is not None and status.lock_session not in {None, self.opencode_session_id}:
+            raise FactoryRecordError("factory lock session does not match the OpenCode host")
         return replace(
             self,
             status=status,
-            session=status.lock_session or self.session,
+            session=self.opencode_session_id or status.lock_session or self.session,
             observed_at=observed_at,
             controller_error=None,
             mcp_servers=status.mcp_servers,
@@ -942,7 +946,10 @@ def report_retained_factory_records(
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:
+    """Conservatively retain daemon activity until the executor proves quiescence."""
     handle = record.handle
+    if handle is not None and handle.substrate == "opencode_daemon":
+        return not record.children_reaped
     if handle is None or handle.substrate != "local_subprocess":
         return False
     pid = handle.shim_pid
@@ -971,6 +978,11 @@ def factory_process_is_verified_dead(
     clean a missing PID or zombie without one, but cannot infer PID reuse.
     """
     handle = record.handle
+    if handle is not None and handle.substrate == "opencode_daemon":
+        return bool(record.children_reaped and record.opencode_session_id == handle.opencode_session_id
+                    and record.session == handle.opencode_session_id)
+    if handle is None:
+        return bool(record.children_reaped and record.opencode_session_id is None)
     if (
         handle is None
         or handle.substrate != "local_subprocess"

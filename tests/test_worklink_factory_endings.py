@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1] / "plugins" / "cultivate" / "mimir_cultivate" / "worklink"
+OPERATOR_PARK = Path(__file__).resolve().parents[1] / "scripts" / "factory_park.py"
 
 # Each entry is an ending or a guard, with its reason. Reconcile this inventory
 # before adding any cancellation/deletion call in the Worklink package.
@@ -26,9 +27,13 @@ SITES = {
     ("orchestrator.py", "reconcile_current_session", "session_compute.cancel"): (1, "early completed-evidence or failed-label recovery verifies the current session before releasing state"),
     ("orchestrator.py", "_finalize", "compute.cancel"): (1, "CI repair session release requires owned-session quiescence"),
     ("orchestrator.py", "_run_factory_070_locked", "_cancel_and_cleanup_factory_handle"): (1, "factory record save failed immediately after launch; containment refused"),
-    ("orchestrator.py", "_recover_factory_070", "_cancel_and_cleanup_factory_handle"): (2, "factory terminal declared or resumed launch record save refused"),
+    ("orchestrator.py", "_recover_factory_070", "_cancel_and_cleanup_factory_handle"): (3, "terminal recovery, verified old-session retirement before fresh context, or failed launch record save"),
     ("orchestrator.py", "_supervise_factory_070", "_cancel_and_cleanup_factory_handle"): (1, "wait task cannot be created; containment refused"),
-    ("orchestrator.py", "_supervise_factory_070", "cancel_once"): (2, "factory terminal/park or verified death/safety refusal"),
+    ("orchestrator.py", "_supervise_factory_070", "cancel_once"): (5, "terminal, explicit recorded stop, or verified quiescence before cleanup; failure retains ownership"),
+    ("control.py", "stop_worklink", "OpenCodeDaemonComputeBackend(client=client).cancel"): (1, "explicit recorded epic stop verifies owned inbox/execution quiescence before claim release"),
+    ("scripts/factory_park.py", "cancel_host", "backend.cancel"): (1, "operator park verifies owned daemon quiescence before release or factory effects"),
+    ("scripts/factory_park.py", "_finish_operator_park", "WorkerClient(None).cancel_factory_handle"): (1, "historical executor handle only; no argv/PID sweep or shared daemon signalling"),
+    ("factory_store.py", "_clear_runtime", "shutil.rmtree"): (1, "legacy attempt-local runtime only, after existing TTL/operator ownership guards; never daemon DB maintenance"),
     ("orchestrator.py", "park_for_reason", "cancel_once"): (1, "explicit budget or idle park"),
     ("orchestrator.py", "cancel_once", "compute.cancel"): (1, "shared cancellation for explicit endings or proven safety refusal"),
     ("orchestrator.py", "_cancel_and_cleanup_factory_handle", "compute.cancel"): (1, "immediate launch refusal or declared terminal recovery"),
@@ -55,8 +60,9 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
         "prune_attempt_checkouts", "cleanup_checkout", "shutil.rmtree", "rmtree_missing_ok",
         "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
         "backend.cancel", "session_compute.cancel",
+        "OpenCodeDaemonComputeBackend(client=client).cancel",
     }
-    for path in ROOT.rglob("*.py"):
+    for path in (*ROOT.rglob("*.py"), OPERATOR_PARK):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -68,14 +74,16 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
                            and parent is not node and parent.lineno <= child.lineno <= parent.end_lineno
                            for parent in ast.walk(node)):
                         continue
-                    key = (str(path.relative_to(ROOT)), node.name, ast.unparse(child.func))
+                    name = "scripts/factory_park.py" if path == OPERATOR_PARK else str(path.relative_to(ROOT))
+                    key = (name, node.name, ast.unparse(child.func))
                     if ast.unparse(child.func) in {
                         "cancel_once", "compute.cancel", "_cancel_and_cleanup_factory_handle",
                         "WorkerClient(None).cancel_factory_handle", "LocalSubprocessComputeBackend().cancel",
                          "prune_attempt_checkouts", "cleanup_checkout",
                           "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
-                              "backend.cancel", "session_compute.cancel",
-                    } or (key[0] in {"checkout.py", "orchestrator.py", "daemon_sessions.py"} and key[2] in {"shutil.rmtree", "rmtree_missing_ok"}):
+                               "backend.cancel", "session_compute.cancel",
+                               "OpenCodeDaemonComputeBackend(client=client).cancel",
+                    } or (key[0] in {"checkout.py", "orchestrator.py", "daemon_sessions.py", "factory_store.py"} and key[2] in {"shutil.rmtree", "rmtree_missing_ok"}):
                         calls[key] += 1
     expected = Counter({key: count for key, (count, reason) in SITES.items() if reason})
     assert sorted((calls - expected).items()) == []

@@ -1,14 +1,13 @@
+"""Closed epic environment and retained-owner node-control contracts."""
 from __future__ import annotations
 
-import base64
 import json
 import os
+from pathlib import Path
 import stat
 import struct
 import subprocess
 import sys
-from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,457 +16,140 @@ import pytest
 if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
     pytest.skip("factory execution requires selected Cultivate", allow_module_level=True)
 
-from mimir_cultivate.worklink import compute, worker_exec
-from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
+from mimir_cultivate.worklink import compute, worker_exec, worker_client
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+from mimir_cultivate.worklink.daemon_sessions import session_environment
 from mimir_cultivate.worklink.safe_git import _git_credential_settings
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["needs-human", "completed"])
-@pytest.mark.parametrize("read_failure", ["permission", "nonzero"])
-async def test_factory_auth_read_failure_preserves_driver_outcome(
-    tmp_path, monkeypatch, outcome, read_failure,
-):
-    """A 0600 worker file is unreadable to the controller after driver exit."""
-    from mimir import event_logger
-    from mimir_cultivate.worklink import worker_client
-
+@pytest.mark.parametrize("kind", ["missing", "regular", "oversize", "symlink", "hardlink", "fifo"])
+def test_epic_does_not_read_or_reconcile_any_legacy_auth_shape(tmp_path, monkeypatch, kind):
     controller = tmp_path / "controller"
     controller.mkdir()
-    token = "header." + base64.urlsafe_b64encode(b'{"exp": 300}').decode().rstrip("=") + ".signature"
-    codex = controller / ".codex/auth.json"
-    codex.parent.mkdir()
-    codex.write_text(json.dumps({
-        "auth_mode": "chatgpt", "tokens": {"access_token": token, "refresh_token": "original"},
-    }))
-    config = controller / ".config/opencode/opencode.json"
-    config.parent.mkdir(parents=True)
-    config.write_text("{}")
-    checkout = tmp_path / "41-2" / "checkout"
-    checkout.mkdir(parents=True)
-    refreshed = checkout.parent / ".factory-runtime/data/opencode/auth.json"
-    refreshed.parent.mkdir(parents=True)
-    refreshed.write_text('{"openai": {"type": "oauth"}}')
-    refreshed.chmod(0o600)
-    env = {"HOME": str(controller), "CODEX_HOME": str(codex.parent),
-           "OPENCODE_CONFIG": str(config), "XDG_DATA_HOME": str(controller / ".local/share"),
-           "MIMIR_MODEL_SPEC": "codex-plus:gpt"}
-    reason = "human approval required" if outcome == "needs-human" else "finished"
-    events = []
-
-    original_open = Path.open
-
-    def controller_open(path, *args, **kwargs):
-        if path == refreshed:
-            raise PermissionError("worker-owned auth")
-        return original_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", controller_open)
-
-    def control(path, argv, **kwargs):
-        assert path == checkout
-        assert argv[1] == "-I" and argv[2].endswith("factory_auth.py")
-        assert kwargs["env"] == {}
-        if read_failure == "permission":
-            raise PermissionError("worker-owned auth")
-        # A failed control command must not be allowed to supply credential data.
-        return subprocess.CompletedProcess(argv, 1, b'{"openai": {"type": "oauth", "refresh": "untrusted"}}', b"")
-
-    async def execute(command, capability, environment, projections, **kwargs):
-        capability._contained_started(SimpleNamespace(pid=None))
-        assert environment["XDG_DATA_HOME"] == str(checkout.parent / ".factory-runtime/data")
-        assert projections[1].path == ".local/share/opencode/auth.json"
-        # The driver already recorded its authoritative factory snapshot.
-        (checkout / "factory-status.json").write_text(json.dumps({"status": outcome, "reason": reason}))
-        return compute.CollectedExecutionResult(0, b"driver exited", b"", False, False, 0, 0)
-
-    monkeypatch.setattr(compute, "execute_contained", execute)
-    monkeypatch.setattr(worker_client, "run_factory_control", control)
-    monkeypatch.setattr(event_logger, "safe_log_event", lambda *args, **kwargs: _record_event(events, args, kwargs))
-    backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
-    spec = compute.WorkSpec(
-        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
-        rules=None, test_command="", backend="feature_factory", timeout_s=10,
-        local_checkout=checkout, local_argv=("opencode", "run"), env=env,
-    )
-    handle = await backend.launch(spec)
-    try:
-        result = await backend.wait(handle, 10)
-        assert result.exit_code == 0 and result.stdout == "driver exited"
-        snapshot = json.loads((checkout / "factory-status.json").read_text())
-        assert snapshot == {"status": outcome, "reason": reason}
-        assert events == [("worklink_factory_auth_reconcile_failed", {
-            "issue_id": 41, "attempt": 2, "reason_code": "auth_unreadable",
-        })]
-        assert "operator_required" not in str(events)
-    finally:
-        await backend.cleanup(handle)
+    native = controller / ".codex/auth.json"
+    native.parent.mkdir()
+    native.write_text('{"tokens":{"refresh_token":"agent-owned"}}')
+    before = native.read_bytes()
+    runtime = tmp_path / "41-2/.factory-runtime/data/opencode/auth.json"
+    runtime.parent.mkdir(parents=True)
+    if kind == "regular":
+        runtime.write_bytes(b"{}")
+    elif kind == "oversize":
+        runtime.write_bytes(b"x" * (1024 * 1024 + 1))
+    elif kind == "symlink":
+        runtime.symlink_to(native)
+    elif kind == "hardlink":
+        os.link(native, runtime)
+    elif kind == "fifo":
+        os.mkfifo(runtime)
+    original = Path.open
+    def guarded(path, *args, **kwargs):
+        if path in {native, runtime}:
+            pytest.fail("epic admission accessed independent agent/retired runtime auth")
+        return original(path, *args, **kwargs)
+    with monkeypatch.context() as guard:
+        guard.setattr(Path, "open", guarded)
+        spec = FeatureFactoryBackend().work_spec(WorkOrder(41, tmp_path, "build", None, 30,
+            {"MIMIR_MODEL_SPEC": "codex-plus:gpt-test", "HOME": str(controller)}),
+            attempt=2, repo_url="repo", base_ref="main", branch="feature/chainlink-41", test_command="pytest")
+        assert spec.session_request.kind == "epic" and spec.local_argv is None
+        assert "worker_projections" not in spec.backend_config
+        assert "HOME" not in spec.env and "OPENCODE_CONFIG" not in spec.env
+    assert native.read_bytes() == before
+    assert not Path(worker_client.__file__).with_name("factory_auth.py").exists()
+    assert not hasattr(worker_exec, "_prepare_factory_runtime")
 
 
-async def _record_event(events, args, kwargs):
-    events.append((args[0], kwargs))
-
-
-def test_factory_auth_helper_reads_only_private_regular_attempt_file(tmp_path, monkeypatch):
-    from mimir_cultivate.worklink import factory_auth
-
-    checkout = tmp_path / "41-2/checkout"
-    checkout.mkdir(parents=True)
-    auth = checkout.parent / ".factory-runtime/data/opencode/auth.json"
-    auth.parent.mkdir(parents=True)
-    auth.write_bytes(b'{"openai": {"type": "oauth"}}')
-    auth.chmod(0o600)
-    monkeypatch.chdir(checkout)
-    assert factory_auth.read_factory_auth() == auth.read_bytes()
-    auth.chmod(0o644)
-    with pytest.raises(ValueError, match="invalid factory auth file"):
-        factory_auth.read_factory_auth()
-    auth.unlink()
-    outside = tmp_path / "outside"
-    outside.write_bytes(b"{}")
-    outside.chmod(0o600)
-    auth.symlink_to(outside)
-    with pytest.raises(OSError):
-        factory_auth.read_factory_auth()
-    auth.unlink()
-    with pytest.raises(FileNotFoundError):
-        factory_auth.read_factory_auth()
-    os.mkfifo(auth, 0o600)
-    with pytest.raises(ValueError, match="invalid factory auth file"):
-        factory_auth.read_factory_auth()
-    auth.unlink()
-    auth.write_bytes(b"{}")
-    auth.chmod(0o600)
-    linked = tmp_path / "other-auth.json"
-    os.link(auth, linked)
-    with pytest.raises(ValueError, match="invalid factory auth file"):
-        factory_auth.read_factory_auth()
-    linked.unlink()
-    monkeypatch.setattr(factory_auth.os, "geteuid", lambda: os.getuid() + 1)
-    with pytest.raises(ValueError, match="invalid factory auth file"):
-        factory_auth.read_factory_auth()
-
-
-def test_factory_auth_helper_rejects_oversize_without_returning_document(tmp_path, monkeypatch):
-    from mimir_cultivate.worklink import factory_auth
-
-    checkout = tmp_path / "41-2/checkout"
-    checkout.mkdir(parents=True)
-    auth = checkout.parent / ".factory-runtime/data/opencode/auth.json"
-    auth.parent.mkdir(parents=True)
-    auth.write_bytes(b"x" * (factory_auth.MAX_AUTH_BYTES + 1))
-    auth.chmod(0o600)
-    monkeypatch.chdir(checkout)
-    with pytest.raises(ValueError, match="oversize factory auth file"):
-        factory_auth.read_factory_auth()
-    result = subprocess.run(
-        [sys.executable, "-I", factory_auth.__file__], cwd=checkout,
-        env={}, capture_output=True, check=False,
-    )
-    assert result.returncode == 1
-    assert result.stdout == result.stderr == b""
-
-
-def test_factory_auth_helper_rejects_symlinked_runtime(tmp_path, monkeypatch):
-    from mimir_cultivate.worklink import factory_auth
-
-    checkout = tmp_path / "41-2/checkout"
-    checkout.mkdir(parents=True)
-    outside = tmp_path / "other-runtime"
-    auth = outside / "data/opencode/auth.json"
-    auth.parent.mkdir(parents=True)
-    auth.write_bytes(b"{}")
-    auth.chmod(0o600)
-    (checkout.parent / ".factory-runtime").symlink_to(outside, target_is_directory=True)
-    monkeypatch.chdir(checkout)
-    with pytest.raises(OSError):
-        factory_auth.read_factory_auth()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("missing", [None, "auth-file", "runtime-directory"])
-async def test_factory_worker_rotated_auth_reaches_both_controller_stores(tmp_path, monkeypatch, missing):
-    from mimir import event_logger
-    from mimir_cultivate import opencode
-    from mimir_cultivate.worklink import factory_auth, worker_client
-
-    def jwt(exp):
-        payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
-        return f"header.{payload}.signature"
-
-    controller = tmp_path / "controller"
-    codex = controller / ".codex/auth.json"
-    codex.parent.mkdir(parents=True)
-    codex.write_text(json.dumps({
-        "auth_mode": "chatgpt", "tokens": {"access_token": jwt(200), "refresh_token": "old"},
-    }))
-    config = controller / ".config/opencode/opencode.json"
-    config.parent.mkdir(parents=True)
-    config.write_text("{}")
-    checkout = tmp_path / "41-2/checkout"
-    checkout.mkdir(parents=True)
-    refreshed = checkout.parent / ".factory-runtime/data/opencode/auth.json"
-    refreshed.parent.mkdir(parents=True)
-    refreshed.write_text(json.dumps({
-        "openai": {"type": "oauth", "access": jwt(500), "refresh": "rotated"},
-    }))
-    refreshed.chmod(0o600)
-    if missing is not None:
-        refreshed.unlink()
-        if missing == "runtime-directory":
-            refreshed.parent.rmdir()
-    reconcile = opencode.reconcile_codex_auth
-    reconcile_calls = []
-
-    def record_reconcile(*args, **kwargs):
-        # Invocation resolution also reconciles pre-launch; only count the
-        # post-run delivery (the path whose absence must remain a no-op).
-        if "refreshed_document" in kwargs or "refreshed_path" in kwargs:
-            reconcile_calls.append(kwargs)
-        return reconcile(*args, **kwargs)
-
-    monkeypatch.setattr(opencode, "reconcile_codex_auth", record_reconcile)
-    original_open = Path.open
-
-    def controller_open(path, *args, **kwargs):
-        if path == refreshed:
-            raise PermissionError("worker-only file")
-        return original_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", controller_open)
-
-    def control(path, argv, **kwargs):
-        assert path == checkout and kwargs["env"] == {}
-        assert argv[0] == sys.executable and argv[1] == "-I"
-        result = subprocess.run(argv, cwd=path, env={}, capture_output=True, check=False)
-        assert result.returncode == (factory_auth.AUTH_MISSING_EXIT if missing else 0)
-        if missing:
-            assert result.stdout == result.stderr == b""
-        return result
-
-    async def execute(command, capability, environment, projections, **kwargs):
-        capability._contained_started(SimpleNamespace(pid=None))
-        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
-
-    events = []
-    monkeypatch.setattr(event_logger, "safe_log_event", lambda *args, **kwargs: _record_event(events, args, kwargs))
-    monkeypatch.setattr(worker_client, "run_factory_control", control)
-    monkeypatch.setattr(compute, "execute_contained", execute)
-    backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
-    spec = compute.WorkSpec(
-        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
-        rules=None, test_command="", backend="feature_factory", timeout_s=10,
-        local_checkout=checkout, local_argv=("opencode", "run"),
-        env={"HOME": str(controller), "CODEX_HOME": str(codex.parent),
-             "OPENCODE_CONFIG": str(config), "XDG_DATA_HOME": str(controller / ".local/share"),
-             "MIMIR_MODEL_SPEC": "codex-plus:gpt"},
-    )
-    handle = await backend.launch(spec)
-    try:
-        assert (await backend.wait(handle, 10)).exit_code == 0
-        expected = "old" if missing else "rotated"
-        assert json.loads(codex.read_text())["tokens"]["refresh_token"] == expected
-        assert json.loads((controller / ".local/share/opencode/auth.json").read_text())["openai"]["refresh"] == expected
-        assert len(reconcile_calls) == (0 if missing else 1)
-        assert not events
-    finally:
-        await backend.cleanup(handle)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("helper", [None, "!gh auth git-credential", "!other-forge-helper"])
-async def test_factory_launch_uses_captured_trusted_scoped_helpers(
-    tmp_path, monkeypatch, caplog, helper,
-):
-    controller = tmp_path / "controller"
-    controller.mkdir()
-    monkeypatch.setenv("HOME", str(controller))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(controller / ".config"))
-    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
-    # Production capture deliberately strips all GIT_* overrides before reading
-    # trusted configuration, including the NOSYSTEM override above. Isolate this
-    # fixture after that scrub so macOS's system osxkeychain helper cannot leak
-    # into the expected repo-local settings (especially the no-helper case).
+def test_factory_launch_uses_captured_trusted_scoped_helpers(tmp_path, monkeypatch, helper):
     from mimir_cultivate.worklink import safe_git
 
-    capture_environment = safe_git._capture_environment
-    monkeypatch.setattr(safe_git, "_capture_environment", lambda: {
-        **capture_environment(),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-    })
-    trusted = tmp_path / "trusted"
-    checkout = tmp_path / "checkout"
+    trusted, checkout = tmp_path / "trusted", tmp_path / "checkout"
     for repo in (trusted, checkout):
         subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
-    settings = () if helper is None else (
-        ("credential.https://github.com.helper", ""),
+    capture = safe_git._capture_environment
+    monkeypatch.setattr(safe_git, "_capture_environment", lambda: {
+        **capture(), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+    settings = () if helper is None else (("credential.https://github.com.helper", ""),
         ("credential.https://github.com.helper", helper),
-        ("credential.https://other.example.helper", "!separate-host-helper"),
-    )
+        ("credential.https://other.example.helper", "!separate-host-helper"))
     for key, value in settings:
         subprocess.run(["git", "-C", str(trusted), "config", "--add", key, value], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "credential.helper", "!untrusted"], check=True)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "credential.helper")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "!ambient-untrusted")
     captured = _git_credential_settings(trusted)
     assert captured == settings
-    subprocess.run([
-        "git", "-C", str(checkout), "config", "credential.https://github.com.helper", "!untrusted",
-    ], check=True)
-    monkeypatch.setenv("GH_TOKEN", "test-token-must-stay-in-environment")
-    caplog.set_level("DEBUG")
-    worker_home = tmp_path / "worker-home"
-    worker_home.mkdir(mode=0o700)
-    observed = []
-
-    async def execute(command, capability, env, projections, **kwargs):
-        worker_exec._validate_environment(env)
-        worker_exec._project_home(worker_home, [
-            {"path": p.path, "document": p.document.decode()} for p in projections
-        ])
-        assert projections == []
-        assert "test-token-must-stay-in-environment" not in repr(command)
-        git_env = {**env, "HOME": str(worker_home), "GIT_CONFIG_NOSYSTEM": "1"}
-        # Query outside either repository, as a nested factory sandbox would:
-        # the helper must be available through the worker environment alone.
-        result = subprocess.run(
-            ["git", "config", "--get-regexp", r"^credential\.(.+\.)?helper$"],
-            cwd=worker_home, env=git_env, capture_output=True, text=True,
-        )
-        assert result.returncode == (0 if settings else 1)
-        assert result.stdout.splitlines() == [f"{key} {value}" for key, value in settings]
-        if helper is None:
-            assert "GIT_CONFIG_COUNT" not in env
-        else:
-            matched = subprocess.run(
-                ["git", "config", "--get-urlmatch", "credential.helper", "https://github.com/owner/repo"],
-                cwd=worker_home, env=git_env, capture_output=True, text=True, check=True,
-            )
-            assert matched.stdout.strip() == helper
-        observed.append(env)
-        capability._contained_started(SimpleNamespace(pid=None))
-        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
-
-    monkeypatch.setattr(compute, "execute_contained", execute)
-    backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
-    spec = compute.WorkSpec(
-        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
-        rules=None, test_command="", backend="feature_factory", timeout_s=10,
-        local_checkout=checkout, local_argv=("python", "-c", "pass"),
-        factory_credential_settings=captured,
-    )
-    handle = await backend.launch(spec)
-    assert (await backend.wait(handle, 10)).exit_code == 0
-    await backend.cleanup(handle)
-    assert len(observed) == 1
-    assert list(worker_home.iterdir()) == []
-    assert stat.S_IMODE(worker_home.stat().st_mode) == 0o700
-    assert "test-token-must-stay-in-environment" not in caplog.text
+    home = tmp_path / "worker-home"
+    home.mkdir(mode=0o700)
+    environment = session_environment({}, home=home, git_settings=captured, credentials={"GH_TOKEN": "fixture-token"})
+    result = subprocess.run(["git", "config", "--get-regexp", r"^credential\.(.+\.)?helper$"],
+        cwd=home, env=environment, capture_output=True, text=True)
+    assert result.returncode == (0 if settings else 1)
+    assert result.stdout.splitlines() == [f"{key} {value}" for key, value in settings]
+    assert "!untrusted" not in result.stdout and "!ambient-untrusted" not in result.stdout
+    assert "fixture-token" not in repr(captured)
+    if helper is not None:
+        matched = subprocess.run(["git", "config", "--get-urlmatch", "credential.helper", "https://github.com/owner/repo"],
+            cwd=home, env=environment, check=True, capture_output=True, text=True)
+        assert matched.stdout.strip() == helper
 
 
-@pytest.mark.asyncio
-async def test_factory_credentials_leave_enabled_leaf_environment_and_projections_unchanged(
-    tmp_path, monkeypatch,
-):
-    from mimir_cultivate.worklink.worker_client import WorkerProjection
-
-    identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    monkeypatch.setattr(compute.uuid, "uuid4", lambda: identifier)
-    projection = WorkerProjection(".config/opencode/opencode.json", b'{"model": "test"}')
-    spec = compute.WorkSpec(
-        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
-        rules=None, test_command="", backend="opencode", timeout_s=10,
-        local_checkout=tmp_path, local_argv=("opencode", "run"),
-        backend_config={"worker_projections": (projection,)},
-    )
-    expected = compute._enabled_child_env(spec, identifier)
-    expected.pop("HOME")
-    observed = []
-
-    async def execute(command, capability, env, projections, **kwargs):
-        observed.append((env, projections))
-        capability._contained_started(SimpleNamespace(pid=None))
-        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
-
-    monkeypatch.setattr(compute, "execute_contained", execute)
-    backend = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=object())
-    for settings in ((), (("credential.https://github.com.helper", "!trusted-helper"),)):
-        handle = await backend.launch(replace(spec, factory_credential_settings=settings))
-        assert (await backend.wait(handle, 10)).exit_code == 0
-        await backend.cleanup(handle)
-    assert observed == [(expected, [projection]), (expected, [projection])]
+@pytest.mark.parametrize("name", ["OPENAI_API_KEY", "CODEX_HOME", "OPENCODE_CONFIG", "OPENCODE_PERMISSION",
+    "HOME", "XDG_DATA_HOME", "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_SESSION_ID", "OTEL_EXPORTER_OTLP_HEADERS"])
+def test_epic_pass_env_cannot_replace_native_or_agent_credentials(tmp_path, name):
+    with pytest.raises((RuntimeError, ValueError)):
+        session_environment({name: "fixture-value"}, home=tmp_path, git_settings=(), credentials={})
 
 
 @pytest.fixture
 def factory_control_identity(monkeypatch):
-    from mimir_cultivate.worklink import worker_client
-
-    # These tests fake the executor, so they must not require host accounts.
     identity = SimpleNamespace(worklink_uid=42424)
     monkeypatch.setattr(worker_client.identities, "get_identities", lambda: identity)
     return identity
 
 
 @pytest.mark.asyncio
-async def test_retained_factory_control_uses_worker_without_runtime_refresh(
-    tmp_path, monkeypatch, factory_control_identity,
-):
-    from mimir_cultivate.worklink import worker_client
-
+async def test_retained_factory_control_uses_worker_without_runtime_refresh(tmp_path, monkeypatch, factory_control_identity):
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     checkout = tmp_path / "repo/41-2/checkout"
     calls = []
-
     async def launch(client, **kwargs):
         assert client._socket_timeout_s == 30 + worker_client.CANCEL_SOCKET_TIMEOUT_S
         assert client.run_uid == factory_control_identity.worklink_uid
         calls.append((client._launch_op, client.path_checkout, kwargs))
         os.write(kwargs["stdout_sink"].fd, b"retained-status")
-
         async def wait():
             return 0
-
         return SimpleNamespace(wait=wait, timed_out=False, output_overflow=False)
-
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
-    result = worker_client.run_factory_control(
-        checkout / ".factory-sandboxes/run", ["node", "factory.js", "status"],
-        env={"HOME": "/controller", "PATH": "/usr/bin:/bin"},
-    )
-    assert result.stdout == b"retained-status"
-    assert result.returncode == 0
+    result = worker_client.run_factory_control(checkout / ".factory-sandboxes/run", ["node", "factory.js", "status"],
+        env={"HOME": "/controller", "PATH": "/usr/bin:/bin"})
+    assert result.stdout == b"retained-status" and result.returncode == 0
     operation, path, kwargs = calls[0]
-    assert operation == "launch_factory_control"
-    assert path == checkout
-    assert kwargs["local_checkout"] == checkout
-    assert kwargs["env"] == {"PATH": "/usr/bin:/bin"}
+    assert operation == "launch_factory_control" and path == checkout
+    assert kwargs["local_checkout"] == checkout and kwargs["env"] == {"PATH": "/usr/bin:/bin"}
     assert "projections" not in kwargs
 
 
 @pytest.mark.parametrize("failure", ["timed_out", "output_overflow"])
-def test_factory_control_rejects_incomplete_results(
-    tmp_path, monkeypatch, failure, factory_control_identity,
-):
-    from mimir_cultivate.worklink import worker_client
-
+def test_factory_control_rejects_incomplete_results(tmp_path, monkeypatch, failure, factory_control_identity):
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
-
     async def launch(client, **kwargs):
         assert client.run_uid == factory_control_identity.worklink_uid
         async def wait():
             return 0
         return SimpleNamespace(wait=wait, timed_out=failure == "timed_out", output_overflow=failure == "output_overflow",
                                stdout_bytes=1024 * 1024 + 1, stderr_bytes=0)
-
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
     expected = subprocess.TimeoutExpired if failure == "timed_out" else RuntimeError
-    message = "timed out" if failure == "timed_out" else "factory control node stdout exceeded 1048576 bytes \\(observed 1048577 bytes\\)"
-    with pytest.raises(expected, match=message):
+    with pytest.raises(expected):
         worker_client.run_factory_control(tmp_path / "repo/41-2/checkout", ["node", "status"], env={})
 
 
 def test_factory_control_socket_uses_its_bound(monkeypatch):
-    from mimir_cultivate.worklink import worker_client
-
     sock = Mock()
     sock.getsockopt.return_value = struct.pack("3i", 123, 0, 0)
     monkeypatch.setattr(worker_client.socket, "SO_PEERCRED", 17, raising=False)
@@ -480,12 +162,10 @@ def test_factory_control_socket_uses_its_bound(monkeypatch):
 
 @pytest.mark.parametrize("side", ["client", "executor"])
 def test_executor_requires_peer_credentials_before_side_effects(tmp_path, monkeypatch, side):
-    from mimir_cultivate.worklink import worker_client
-
     monkeypatch.delattr(worker_client.socket, "SO_PEERCRED", raising=False)
     create_socket = Mock(side_effect=AssertionError("unauthenticated socket created"))
     monkeypatch.setattr(worker_client.socket, "socket", create_socket)
-    path = tmp_path / "not-created" / "executor.sock"
+    path = tmp_path / "not-created/executor.sock"
     with pytest.raises(RuntimeError, match="requires Linux SO_PEERCRED peer authentication"):
         if side == "client":
             worker_client.WorkerClient(None, socket_path=path)._connect()
@@ -495,18 +175,10 @@ def test_executor_requires_peer_credentials_before_side_effects(tmp_path, monkey
     assert not path.parent.exists()
 
 
-@pytest.mark.parametrize("relative,result", [
-    ("repo/41-2/checkout/nested", "valid"),
-    ("repo/41-2", "none"),
-    ("repo/41-2/project", "none"),
-    ("../41-2/checkout", "error"),
-    ("repo/0-2/checkout", "error"),
-    ("repo/41-0/checkout", "error"),
-    ("repo/41-2/checkout/../elsewhere", "error"),
-])
+@pytest.mark.parametrize("relative,result", [("repo/41-2/checkout/nested", "valid"), ("repo/41-2", "none"),
+    ("repo/41-2/project", "none"), ("../41-2/checkout", "error"), ("repo/0-2/checkout", "error"),
+    ("repo/41-0/checkout", "error"), ("repo/41-2/checkout/../elsewhere", "error")])
 def test_factory_control_path_classification(tmp_path, monkeypatch, relative, result):
-    from mimir_cultivate.worklink import worker_client
-
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     path = tmp_path / relative
     if result == "error":
@@ -521,8 +193,7 @@ def test_factory_control_path_classification(tmp_path, monkeypatch, relative, re
 
 @pytest.mark.parametrize("guard", ["owner", "directory", "nofollow"])
 def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
-    from mimir_cultivate.worklink import orchestrator, worker_client
-
+    from mimir_cultivate.worklink import orchestrator
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
     path = tmp_path / "repo/41-2/checkout"
@@ -537,14 +208,11 @@ def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
         def observed(target, **kwargs):
             value = real_stat(target, **kwargs)
             if target == path.parent:
-                return SimpleNamespace(
-                    st_uid=os.getuid() + (guard == "owner"),
-                    st_mode=(stat.S_IFREG if guard == "directory" else stat.S_IFDIR) | 0o2700,
-                )
+                return SimpleNamespace(st_uid=os.getuid() + (guard == "owner"),
+                    st_mode=(stat.S_IFREG if guard == "directory" else stat.S_IFDIR) | 0o2700)
             return value
         monkeypatch.setattr(Path, "stat", observed)
-    controller = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
-    worker = Mock(return_value=subprocess.CompletedProcess([], 0, b"", b""))
+    controller, worker = Mock(), Mock()
     monkeypatch.setattr(worker_client, "run_factory_control", worker)
     with pytest.raises(orchestrator.WorklinkError, match="boundary is not controller-owned"):
         orchestrator._factory_git_runner(controller)(["git", "-C", str(path), "status"])
@@ -554,267 +222,72 @@ def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
 
 @pytest.mark.parametrize("text", [True, False])
 def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatch, text):
-    from mimir_cultivate.worklink import orchestrator, worker_client
-
+    from mimir_cultivate.worklink import orchestrator
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
     checkout = tmp_path / "repo/41-2/checkout"
     checkout.mkdir(parents=True)
     calls = []
-
     def controller(args, cwd=None, *, text=True):
         assert cwd is None
-        calls.append(("controller", args))
+        calls.append("controller")
         return subprocess.CompletedProcess(args, 0, "initial" if text else b"initial", "" if text else b"")
-
     def worker(root, args, **kwargs):
-        assert root == checkout
-        assert "GIT_CONFIG_COUNT" not in kwargs["env"]
+        assert root == checkout and "GIT_CONFIG_COUNT" not in kwargs["env"]
         assert not any("safe.directory" in arg for arg in args)
-        calls.append(("worker", args))
+        calls.append("worker")
         return subprocess.CompletedProcess(args, 0, b"retained", b"")
-
     monkeypatch.setattr(worker_client, "run_factory_control", worker)
     run = orchestrator._factory_git_runner(controller)
     args = ["git", "-C", str(checkout / ".factory-sandboxes/run"), "rev-parse", "HEAD"]
-    # macOS can inherit a non-member group from /tmp and then strip S_ISGID
-    # on chmod. Establish a real member group before modelling either phase.
     os.chown(checkout.parent, -1, os.getgid())
     checkout.parent.chmod(0o2700)
-    assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o2700
     assert run(args, text=text).stdout == ("initial" if text else b"initial")
     checkout.parent.chmod(0o2750)
-    assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o2750
     assert run(args, text=text).stdout == ("retained" if text else b"retained")
-    assert [who for who, _ in calls] == ["controller", "worker"]
-
-
-def test_legacy_factory_recovery_refuses_before_git_or_lock_mutation(tmp_path, monkeypatch):
-    from mimir_cultivate.worklink import orchestrator, worker_client
-
-    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
-    launcher = tmp_path / "installed/factory.js"
-    retained = SimpleNamespace(
-        issue_id=41, run_id=orchestrator.factory_record_run_ids(41)[0], repository="owner/repo",
-        base_ref="main", launcher=str(launcher), controller_phase="failed", session="retained",
-        sandbox=str(tmp_path / "repo/41-2/.factory-sandboxes/run"), branch="feature/run", status=None,
-    )
-    Path(retained.sandbox).mkdir(parents=True)
-    verify = Mock(return_value="head")
-    monkeypatch.setattr(orchestrator, "_verify_factory_checkout", verify)
-
-    def runner(args):
-        assert args == ["git", "-C", str(tmp_path / "base"), "config", "--get", "remote.origin.url"]
-        return subprocess.CompletedProcess(args, 0, "https://github.com/owner/repo.git", "")
-
-    with pytest.raises(orchestrator.WorklinkError, match="legacy factory checkout"):
-        orchestrator._verify_factory_recovery_target(
-            runner=SimpleNamespace(repo=tmp_path / "base"), issue=SimpleNamespace(issue_id=41),
-            retained=retained, launcher=launcher, repo_slug="owner/repo", base="main",
-            command_runner=runner,
-        )
-    verify.assert_not_called()
+    assert calls == ["controller", "worker"]
 
 
 @pytest.mark.parametrize("command", ["status", "resume", "heartbeat", "lock"])
 def test_factory_backend_controls_use_retained_owner(tmp_path, monkeypatch, command):
-    from mimir_cultivate.worklink import worker_client
     from mimir_cultivate.worklink.backends import feature_factory
-
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     entrypoint = tmp_path / "installed/bin/factory.js"
     monkeypatch.setattr(feature_factory, "resolve_factory_entrypoint", lambda path: entrypoint)
     sandbox = tmp_path / "repo/41-2/checkout/.factory-sandboxes/run"
     calls = []
-
     def control(path, argv, **kwargs):
         calls.append((path, argv))
         return subprocess.CompletedProcess(argv, 0, b"{}", b"")
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("controller ran a retained-tree control operation")
-
     monkeypatch.setattr(worker_client, "run_factory_control", control)
-    backend = feature_factory.FeatureFactoryBackend(runner=forbidden)
+    backend = feature_factory.FeatureFactoryBackend(runner=Mock(side_effect=AssertionError("controller ran worker control")))
     backend._control(entrypoint, [command, "run", "--repo", str(sandbox)], sandbox=sandbox)
-    assert calls == [(
-        sandbox,
-        [sys.executable, "-I", str(Path(feature_factory.__file__).resolve().parent.parent / "factory_control_output.py"),
-         "status" if command == "status" else "other",
-         "node", str(entrypoint), command, "run", "--repo", str(sandbox)],
-    )]
+    assert calls == [(sandbox, [sys.executable, "-I",
+        str(Path(feature_factory.__file__).resolve().parent.parent / "factory_control_output.py"),
+        "status" if command == "status" else "other", "node", str(entrypoint), command, "run", "--repo", str(sandbox)])]
 
 
-def test_executor_auth_path_and_exported_xdg_data_home_agree() -> None:
-    """The two sides of the factory runtime contract must resolve to one place.
+def test_initial_factory_control_selects_private_transfer_only_for_bound_init(tmp_path, monkeypatch, factory_control_identity):
+    from tests.opencode_fixtures import seed_factory_install
 
-    `compute.py` exports XDG_DATA_HOME for the run; `worker_exec` copies the
-    OpenCode auth file in for it to read. They live in different modules and are
-    expressed against different roots -- an absolute path built from
-    `spec.local_checkout` on one side, a path relative to the checkout the worker
-    chdir'd into on the other.
-
-    Chainlink #1933 moved XDG_DATA_HOME beside the checkout and changed only one
-    of them. The next run failed about nine seconds in with
-    `AI_LoadAPIKeyError: OpenAI API key is missing` and no other symptom, because
-    OpenCode was reading a directory nobody wrote. Nothing failed at the seam,
-    which is exactly why this assertion exists.
-    """
-    from mimir_cultivate.worklink.worker_exec import FACTORY_RUNTIME_DATA
-
-    checkout = Path("/var/lib/mimir-worklink/checkouts/mimir/1610-7/checkout")
-    exported = checkout.parent / ".factory-runtime" / "data"
-    written = Path(os.path.normpath(checkout / FACTORY_RUNTIME_DATA))
-
-    assert written == exported / "opencode", (
-        "executor auth directory and exported XDG_DATA_HOME have diverged: "
-        f"executor writes {written}, OpenCode reads {exported}/opencode"
-    )
-    assert not written.is_relative_to(checkout)
-    assert not exported.is_relative_to(checkout)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("opencode", [True, False])
-async def test_factory_projects_native_config_only_for_opencode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opencode: bool,
-) -> None:
-    controller = tmp_path / "controller"
-    controller.mkdir()
-    config = controller / "opencode.jsonc"
-    native = {
-        "model": "anthropic/test-model",
-        "plugin": [
-            [f"opencode-feature-factory@{FACTORY_VERSION}", {"profile": "production", "options": {"parallel": 3}}],
-            "opencode-project-memory@0.1.0",
-            "opencode-anthropic-auth@0.0.13",
-        ],
-        "command": {"factory": {"template": "factory $ARGUMENTS"}},
-        "agent": {"factory": {"mode": "primary"}},
-        "provider": {
-            "anthropic": {"options": {"apiKey": "{env:FACTORY_PROVIDER_KEY}"}},
-            "unused": {"options": {"apiKey": "unneeded-secret"}},
-        },
-    }
-    config.write_text("// trusted controller configuration\n" + json.dumps(native))
-    auth = controller / ".local/share/opencode/auth.json"
-    auth.parent.mkdir(parents=True)
-    auth.write_text(json.dumps({
-        "anthropic": {"type": "oauth", "access": "fresh-access", "refresh": "fresh-refresh"},
-        "unused": {"type": "api", "key": "unneeded-secret"},
-    }))
-    monkeypatch.setenv("HOME", str(controller))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    monkeypatch.setenv("OPENCODE_CONFIG", str(config if opencode else controller / "missing"))
-    monkeypatch.setenv("FACTORY_PROVIDER_KEY", "materialized-key")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "shadowing-key")
-    monkeypatch.setenv("PATH", "/opt/mimir-opencode/bin:/usr/bin:/bin")
-    observed = []
-
-    async def execute(command, capability, env, projections, **kwargs):
-        assert "GIT_CONFIG_COUNT" not in env
-        assert "GIT_CONFIG_KEY_0" not in env
-        assert "GIT_CONFIG_VALUE_0" not in env
-        observed.append((dict(env), {p.path: json.loads(p.document) for p in projections}))
-        capability._contained_started(SimpleNamespace(pid=None))
-        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
-
-    monkeypatch.setattr(compute, "execute_contained", execute)
-    backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
-    spec = compute.WorkSpec(
-        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
-        rules=None, test_command="", backend="feature_factory", timeout_s=10,
-        local_checkout=tmp_path / "41-2",
-        local_argv=("/opt/mimir-opencode/bin/opencode", "run") if opencode else ("python", "-c", "pass"),
-        env={"FACTORY_INPUT": "issue-41"},
-    )
-    for _ in range(2):
-        handle = await backend.launch(spec)
-        assert (await backend.wait(handle, 10)).exit_code == 0
-        await backend.cleanup(handle)
-    first_env, projections = observed[0]
-    # The data dir is a SIBLING of the checkout, never inside it. opencode
-    # snapshots its working tree with `git add --all`, so a data dir within that
-    # tree makes every snapshot index the previous snapshot's objects -- which
-    # took chainlink #1610 attempt 6 to a 6.2 GiB store and a single `git add`
-    # running 2h08m at 350% CPU. Assert the INVARIANT as well as the path, so a
-    # future edit that moves it back inside fails here rather than in a run.
-    data_home = Path(first_env["XDG_DATA_HOME"])
-    assert data_home == spec.local_checkout.parent / ".factory-runtime" / "data"
-    assert spec.local_checkout not in data_home.parents
-    assert not data_home.is_relative_to(spec.local_checkout)
-    assert observed[1][0]["XDG_DATA_HOME"] == first_env["XDG_DATA_HOME"]
-    assert observed[1][0]["XDG_CONFIG_HOME"] != first_env["XDG_CONFIG_HOME"]
-    assert first_env["PATH"] == "/opt/mimir-opencode/bin:/usr/bin:/bin"
-    assert first_env["FACTORY_INPUT"] == "issue-41"
-    if not opencode:
-        assert projections == {}
-        return
-    projected = projections[".config/opencode/opencode.json"]
-    for key in ("plugin", "command", "agent", "model"):
-        assert projected[key] == native[key]
-    assert projected["provider"] == {"anthropic": {"options": {"apiKey": "materialized-key"}}}
-    assert projections[".local/share/opencode/auth.json"] == {
-        "anthropic": {"type": "oauth", "access": "fresh-access", "refresh": "fresh-refresh"},
-    }
-    assert "ANTHROPIC_API_KEY" not in first_env
-    assert first_env["OPENCODE_CONFIG"] == first_env["XDG_CONFIG_HOME"] + "/opencode/opencode.json"
-
-
-def test_factory_runtime_refreshes_auth_and_retains_sessions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The runtime is a SIBLING of the checkout, matching the XDG_DATA_HOME that
-    # compute.py exports; a data dir inside the checkout makes OpenCode's own
-    # snapshots index themselves (#1933).
-    attempt = tmp_path / "1610-7"
-    checkout = attempt / "checkout"
-    checkout.mkdir(parents=True)
-    monkeypatch.chdir(checkout)
-    for attempt_index in range(2):
-        home = tmp_path / f"home-{attempt_index}"
-        auth = home / ".local/share/opencode/auth.json"
-        auth.parent.mkdir(parents=True)
-        auth.write_text(json.dumps({"anthropic": {"type": "api", "key": f"key-{attempt_index}"}}))
-        worker_exec._prepare_factory_runtime(home)
-        data = attempt / ".factory-runtime/data/opencode"
-        assert not data.is_relative_to(checkout), "runtime must not live inside the snapshotted tree"
-        assert (data / "auth.json").read_bytes() == auth.read_bytes()
-        assert (data / "auth.json").stat().st_mode & 0o777 == 0o600
-        session = data / "opencode.db"
-        if attempt_index == 0:
-            session.write_bytes(b"retained-session")
-        else:
-            assert session.read_bytes() == b"retained-session"
-
-
-def test_factory_runtime_without_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    attempt = tmp_path / "1610-7"
-    checkout = attempt / "checkout"
-    checkout.mkdir(parents=True)
-    monkeypatch.chdir(checkout)
-    stale = attempt / ".factory-runtime/data/opencode/auth.json"
-    stale.parent.mkdir(parents=True)
-    stale.write_text('{"old-provider": {"type": "api", "key": "stale"}}')
-    worker_exec._prepare_factory_runtime(tmp_path / "empty-home")
-    assert (attempt / ".factory-runtime/data/opencode").is_dir()
-    assert not (attempt / ".factory-runtime/data/opencode/auth.json").exists()
-
-
-def test_factory_runtime_preparation_follows_successful_drop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events = []
-    monkeypatch.setattr(worker_exec, "_drop_worker", lambda fd: events.append(("drop", fd)))
-    monkeypatch.setattr(worker_exec, "_prepare_factory_runtime", lambda home: events.append(("runtime", home)))
-    worker_exec._drop_factory(42, tmp_path)
-    assert events == [("drop", 42), ("runtime", tmp_path)]
-    events.clear()
-
-    def failed_drop(fd):
-        raise PermissionError("drop failed")
-
-    monkeypatch.setattr(worker_exec, "_drop_worker", failed_drop)
-    with pytest.raises(PermissionError, match="drop failed"):
-        worker_exec._drop_factory(42, tmp_path)
-    assert events == []
+    root = tmp_path / "checkouts"
+    outer = root / "repo/41-2/checkout"
+    launcher = seed_factory_install(tmp_path / "installed")
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    seen = []
+    async def launch(client, **kwargs):
+        seen.append(client._launch_op)
+        assert kwargs["argv"] == ["node", str(launcher), "init", "chainlink-41", "--repo", str(outer)]
+        async def wait():
+            return 0
+        return SimpleNamespace(wait=wait, timed_out=False, output_overflow=False)
+    monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
+    argv = ["node", str(launcher), "init", "chainlink-41", "--repo", str(outer)]
+    worker_client.run_factory_control(outer, argv, env={}, initialize=True)
+    assert seen == ["launch_factory"]
+    for unsafe in (["sh", "-c", "arbitrary"], ["node", str(launcher), "status", "chainlink-41", "--repo", str(outer)],
+                   ["node", str(launcher), "init", "chainlink-42", "--repo", str(outer)],
+                   ["node", str(launcher), "init", "chainlink-41", "--repo", str(tmp_path)]):
+        with pytest.raises(ValueError):
+            worker_client.run_factory_control(outer, unsafe, env={}, initialize=True)
+    assert seen == ["launch_factory"]

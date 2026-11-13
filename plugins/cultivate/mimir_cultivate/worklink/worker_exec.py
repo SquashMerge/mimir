@@ -212,25 +212,10 @@ def _drop_worker(checkout_fd: int) -> None:
 #: other symptom. It sits BESIDE the checkout rather than inside it, because a
 #: data dir within the snapshotted tree makes every ``git add --all`` index the
 #: previous snapshot's objects (chainlink #1610 attempt 6, #1933).
-FACTORY_RUNTIME_DATA = Path("../.factory-runtime/data/opencode")
-
-
-def _prepare_factory_runtime(home: Path) -> None:
-    """Refresh auth without discarding attempt-scoped OpenCode session state."""
-    data = FACTORY_RUNTIME_DATA
-    data.mkdir(parents=True, exist_ok=True)
-    auth = home / ".local/share/opencode/auth.json"
-    if auth.is_file():
-        shutil.copyfile(auth, data / "auth.json")
-        (data / "auth.json").chmod(0o600)
-    else:
-        (data / "auth.json").unlink(missing_ok=True)
 
 
 def _drop_factory(checkout_fd: int, home: Path) -> None:
     _drop_worker(checkout_fd)
-    # The checkout is attacker-writable. No runtime writes may precede uid drop.
-    _prepare_factory_runtime(home)
 
 
 def _status_fields() -> dict[str, str]:
@@ -789,41 +774,10 @@ def _leaf_git_environment(environment: dict[str, str], checkout: Path) -> None:
 def _project_home(home: Path, projections: object) -> None:
     if not isinstance(projections, list) or len(projections) > 2:
         raise RuntimeError("at most two worker projections are allowed")
-    seen: set[str] = set()
     for projection in projections:
         if not isinstance(projection, dict) or set(projection) != {"path", "document"}:
             raise RuntimeError("invalid projection document")
-        path = projection["path"]
-        document = projection["document"]
-        if not isinstance(path, str) or path not in _PROJECTION_PATHS or path in seen:
-            raise RuntimeError("invalid projection destination")
-        if not isinstance(document, str):
-            raise RuntimeError("invalid projection document")
-        encoded = document.encode()
-        if len(encoded) > MAX_PROJECTION_BYTES:
-            raise RuntimeError("invalid projection document")
-        parsed = json.loads(document)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("invalid projection document")
-        seen.add(path)
-        relative = PurePosixPath(path)
-        parent = home.joinpath(*relative.parts[:-1])
-        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        target = parent / relative.name
-        fd = os.open(
-            target,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise RuntimeError("incomplete projection write")
-                view = view[written:]
-        finally:
-            os.close(fd)
+        raise RuntimeError("invalid projection destination: worker auth/config projection is retired")
     for root, directories, files in os.walk(home):
         for name in directories:
             os.chown(Path(root) / name, get_identities().worklink_uid, get_identities().worklink_gid, follow_symlinks=False)
@@ -1313,6 +1267,30 @@ def _handle_launch_factory(connection: socket.socket, request: dict[str, Any], f
     _handle_launch(connection, request, fds)
 
 
+def _open_epic_session_checkout(request: dict[str, Any], *, for_launch: bool) -> int:
+    """Open a run sandbox beneath the attempt's existing private boundary."""
+    path = Path(request["path"])
+    issue = _positive_integer(request, "issue")
+    if path.parent.name != ".factory-sandboxes" or path.name not in {str(issue), f"chainlink-{issue}"}:
+        raise RuntimeError("epic session sandbox identity is invalid")
+    outer = path.parent.parent
+    outer_fd = _open_factory_checkout({**request, "path": str(outer)}, for_launch=for_launch)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(".factory-sandboxes", flags, dir_fd=outer_fd)
+        try:
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(outer_fd)
+    info = os.fstat(fd)
+    if info.st_uid != get_identities().worklink_uid or not stat.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise RuntimeError("epic session sandbox ownership is invalid")
+    return fd
+
+
 def _handle_session(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     from .daemon_config import PublishingCredentials, parse_launch_snapshot
     from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
@@ -1328,9 +1306,20 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
         raise RuntimeError("session operation requires the exact contract and checkout FD")
     _validate_executor_identity(request)
     path_addressed = len(fds) == count - 1
+    if create and request.get("request", {}).get("kind") == "epic":
+        epic_path = Path(request["path"])
+        if epic_path.parent.name != ".factory-sandboxes" or epic_path.name != f"chainlink-{_positive_integer(request, 'issue')}":
+            raise RuntimeError("epic creation requires its exact nested sandbox")
+    if create and "MIMIR_WORK_ITEM_JSON" in request.get("pass_env", {}):
+        item = json.loads(request["pass_env"]["MIMIR_WORK_ITEM_JSON"])
+        if (request.get("request", {}).get("kind") != "epic" or not isinstance(item, dict)
+                or item.get("run_id") != f"chainlink-{_positive_integer(request, 'issue')}"):
+            raise RuntimeError("factory work item is outside the admitted epic")
     if path_addressed:
         validated = {**request, "run_uid": get_identities().worklink_uid}
-        if Path(request["path"]).name == "checkout":
+        if Path(request["path"]).parent.name == ".factory-sandboxes":
+            directory_fd = _open_epic_session_checkout(validated, for_launch=create)
+        elif Path(request["path"]).name == "checkout":
             directory_fd = _open_factory_checkout(validated, for_launch=create)
         else:
             directory_fd = _open_path_checkout(validated)

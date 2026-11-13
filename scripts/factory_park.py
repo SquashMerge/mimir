@@ -57,19 +57,23 @@ import json
 import os
 import shutil
 import signal
+import select
+import shlex
 import stat
 import subprocess
 import sys
 import time
 from dataclasses import replace
-from typing import NamedTuple
+from contextlib import contextmanager
+from typing import Callable, NamedTuple
 from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mimir_cultivate.worklink.autonomy import DEFAULT_AGENT_ID  # noqa: E402
-from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status  # noqa: E402
+from mimir_cultivate.worklink.backends.feature_factory import FactoryContractError, parse_factory_status, resolve_factory_entrypoint  # noqa: E402
+from mimir_cultivate.opencode import redact_daemon_output  # noqa: E402
 from mimir_cultivate.worklink.claims import (  # noqa: E402
     ChainlinkClaims,
     _read_clean_park,
@@ -78,6 +82,7 @@ from mimir_cultivate.worklink.claims import (  # noqa: E402
 )
 from mimir_cultivate.worklink.factory_state import (  # noqa: E402
     FactoryRecordError,
+    FactoryRunRecord,
     _require_safe_directory,
     factory_checkout_interlock,
     factory_issue_resource_lock,
@@ -99,6 +104,13 @@ class ClaimAlreadyReconciled(ParkError):
 
 
 def _run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    if cmd and cmd[0] == "node":
+        from mimir_cultivate.worklink.backends.feature_factory import _run_bounded
+
+        result = _run_bounded(cmd, cwd=None, env=os.environ, timeout=timeout,
+                              output_limit=1024 * 1024)
+        return subprocess.CompletedProcess(cmd, result.returncode,
+            result.stdout.decode("utf-8", "replace"), result.stderr.decode("utf-8", "replace"))
     return subprocess.run(
         cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=timeout, check=False,
@@ -123,13 +135,17 @@ def operator_root(sandbox: Path) -> Path:
 
 
 def factory_status(launcher: Path, run_id: str, sandbox: Path) -> dict:
+    launcher = resolve_factory_entrypoint(launcher)
     result = _run(["node", str(launcher), "status", run_id, "--repo", str(sandbox), "--json"])
     if result.returncode != 0:
-        raise ParkError(f"factory status failed: {(result.stderr or result.stdout).strip()[:300]}")
+        raise ParkError(f"factory status failed: {redact_daemon_output((result.stderr or result.stdout).strip())[:300]}")
     try:
-        return json.loads(result.stdout)
-    except ValueError as exc:
-        raise ParkError(f"factory status returned unparseable JSON: {exc}") from exc
+        status = parse_factory_status(result.stdout)
+        if not status.valid or status.run_id != run_id or status.sandbox_path != str(sandbox):
+            raise ParkError("factory status identity could not be qualified")
+        return status.to_json()
+    except (FactoryContractError, ValueError) as exc:
+        raise ParkError("factory status response could not be qualified") from exc
 
 
 def plane_inventory(root: Path) -> list[tuple[str, str, int, str]]:
@@ -164,57 +180,31 @@ def plane_inventory(root: Path) -> list[tuple[str, str, int, str]]:
     return sorted(items)
 
 
-def publish_snapshot(plane: Path, parked_dir: Path, run_id: str) -> Path:
-    """Stage, verify, then commit by rename. The rename is the only commit point."""
+def publish_snapshot(plane: Path, parked_dir: Path, run_id: str, *, launcher: Path) -> Path:
+    """Factory alone publishes; independently verify its acknowledged inventory."""
+    launcher = resolve_factory_entrypoint(launcher)
     canonical = parked_dir / run_id
-    staging = parked_dir / f".staging-{run_id}"
-    prior = parked_dir / f".prior-{run_id}"
-
-    if staging.exists() or staging.is_symlink():
-        raise ParkError(f"residual staging tree present: {staging}")
-    if prior.exists() or prior.is_symlink():
-        shutil.rmtree(prior)
-
-    # The operator root must already exist: it is the run's checkout. If it does
-    # not, the sandbox path was wrong and creating it would publish a snapshot
-    # nowhere the factory looks. Only .factory and .parked are ours to create,
-    # one directory at a time, never through a symlink.
-    root = parked_dir.parent.parent
-    if not root.is_dir() or root.is_symlink():
-        raise ParkError(
-            f"operator root is not an existing directory: {root}; the sandbox path is wrong"
-        )
+    sandbox = plane.parent.parent
+    root = operator_root(sandbox)
+    if plane != sandbox / ".factory" / run_id or parked_dir != root / ".factory" / ".parked":
+        raise ParkError("snapshot paths do not match the run's operator repository")
     for parent in (parked_dir.parent, parked_dir):
         if parent.is_symlink():
-            raise ParkError(f"refusing to write through a symlinked parent: {parent}")
-        if not parent.exists():
-            parent.mkdir(mode=0o2775)
-        elif not parent.is_dir():
-            raise ParkError(f"snapshot parent is not a directory: {parent}")
-
-    shutil.copytree(plane, staging, symlinks=True)
-
+            raise ParkError("snapshot has a symlinked parent; refusing publication")
+        if parent.exists() and not parent.is_dir():
+            raise ParkError("snapshot parent is not a directory")
+    if canonical.is_symlink():
+        raise ParkError("canonical snapshot is a symlink; refusing publication")
     source = [item for item in plane_inventory(plane) if item[0] != "factory.lock"]
-    copied = [item for item in plane_inventory(staging) if item[0] != "factory.lock"]
+    result = _run(["node", str(launcher), "snapshot", run_id, "--repo", str(root), "--json"])
+    if result.returncode:
+        raise ParkError("factory snapshot publication failed; retained state was not acknowledged")
+    status = factory_status(launcher, run_id, sandbox)
+    if status.get("park_snapshot") != str(canonical) or canonical.is_symlink() or not canonical.is_dir():
+        raise ParkError("factory snapshot publication was not acknowledged at the canonical path")
+    copied = [item for item in plane_inventory(canonical) if item[0] != "factory.lock"]
     if source != copied:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise ParkError("snapshot inventory mismatch; staging discarded, nothing published")
-
-    moved_prior = False
-    try:
-        if canonical.exists() or canonical.is_symlink():
-            os.rename(canonical, prior)
-            moved_prior = True
-        os.rename(staging, canonical)
-    except OSError as exc:
-        if moved_prior:
-            os.rename(prior, canonical)
-            raise ParkError(f"commit failed ({exc}); prior snapshot restored, nothing published") from exc
-        shutil.rmtree(staging, ignore_errors=True)
-        raise ParkError(f"commit failed ({exc}); staging discarded, nothing published") from exc
-
-    if moved_prior:
-        shutil.rmtree(prior, ignore_errors=True)
+        raise ParkError("factory snapshot inventory mismatch; claim retained")
     return canonical
 
 
@@ -243,12 +233,15 @@ def verify_controller(pid: int, issue_id: int) -> str:
             f"--controller-pid {pid} is not running. If the controller is already gone, "
             "pass --controller-pid none, which verifies that rather than assuming it."
         )
-    required = ("worklink", "run-epic", str(issue_id))
-    missing = [token for token in required if token not in argv]
-    if missing:
+    required = ["worklink", "run-epic", str(issue_id)]
+    try:
+        tokens = shlex.split(argv)
+    except ValueError:
+        tokens = []
+    if not any(tokens[index:index + 3] == required for index in range(len(tokens))):
         raise ParkError(
             f"--controller-pid {pid} does not look like this run's controller "
-            f"(argv lacks {missing}): {argv[:200]}"
+            f"(argv lacks the exact issue command): {redact_daemon_output(argv)[:200]}"
         )
     return argv
 
@@ -281,79 +274,81 @@ def find_controllers(issue_id: int) -> list[int]:
     return found
 
 
-def stop_pid(pid: int, label: str, *, timeout: float = 20.0) -> None:
-    """SIGTERM, then SIGKILL, then verify the pid is actually gone."""
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            return
-        except PermissionError as exc:
-            raise ParkError(
-                f"not permitted to signal {label} (pid {pid}): {exc}. Run as the uid that owns it."
-            ) from exc
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not _pid_alive(pid):
+def stop_pid(pid: int, label: str, *, timeout: float = 20.0,
+             verify: Callable[[int], object] | None = None) -> None:
+    """Bind the process before revalidation, so PID reuse cannot signal a daemon."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal") or verify is None:
+        raise ParkError("verified controller signalling requires Linux pidfds and identity revalidation")
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        verify(pid)
+        watcher = select.poll()
+        watcher.register(fd, select.POLLIN)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                signal.pidfd_send_signal(fd, sig)
+            except ProcessLookupError:
                 return
-            time.sleep(0.5)
-    if _pid_alive(pid):
+            except PermissionError as exc:
+                raise ParkError(f"not permitted to signal the verified {label}") from exc
+            if watcher.poll(max(1, int(timeout * 1000))):
+                return
         raise ParkError(f"{label} (pid {pid}) survived SIGKILL; refusing to continue the park")
+    finally:
+        os.close(fd)
 
 
 def stop_residual_compute(run_id: str, *, timeout: float = 20.0) -> list[int]:
-    """Stop any supervisor or driver left for this run, supervisor first.
-
-    The record's handle is the authoritative driver and is stopped by the caller
-    before this runs. This is a sweep for the rest of the tree, and the order is
-    the opposite of intuition: a driver that dies under a live supervisor is
-    recorded as a terminal failure, which marks the checkout prunable before the
-    park can complete.
-    """
-    stopped: list[int] = []
-    self_pid = os.getpid()
-    for pattern in ("factory_supervisor", "opencode run"):
-        listing = _run(["ps", "-eo", "pid=,args="])
-        for line in listing.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            head, _, argv = line.partition(" ")
-            try:
-                pid = int(head)
-            except ValueError:
-                continue
-            if pid == self_pid or "factory_park.py" in argv:
-                continue
-            if pattern not in argv or run_id not in argv:
-                continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-                stopped.append(pid)
-            except (OSError, ProcessLookupError):
-                continue
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not any(_pid_alive(pid) for pid in stopped):
-                break
-            time.sleep(0.5)
-    for pid in stopped:
-        if _pid_alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-    return stopped
+    """No argv sweep can prove session ownership; only recorded handles are stopped."""
+    return []
 
 
-def _pid_alive(pid: int) -> bool:
+@contextmanager
+def _park_locks(home: Path, issue_id: int):
+    with factory_checkout_interlock(home) as acquired:
+        if not acquired:
+            raise ParkError("could not acquire the factory checkout interlock; state and claim retained")
+        with factory_issue_resource_lock(home, issue_id) as issue_acquired:
+            if not issue_acquired:
+                raise ParkError("could not acquire the factory issue resource lock; state and claim retained")
+            yield
+
+
+def _require_daemon_owner(record: FactoryRunRecord, status: dict) -> None:
+    if record.handle is not None and record.handle.substrate == "opencode_daemon":
+        actual = record.handle.opencode_session_id
+        if (actual is None or record.opencode_session_id != actual or record.session != actual
+                or status.get("lock_session") not in {None, actual}):
+            raise ParkError("factory lock does not name the retained OpenCode host; state and claim retained")
+
+
+def _quiesce_daemon_host(record: FactoryRunRecord, home: Path) -> FactoryRunRecord:
+    import asyncio
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+    from mimir_cultivate.worklink.identities import get_identities
+    from mimir_cultivate.worklink.control import _mark_operator_stop
+
+    assert record.handle is not None and record.handle.opencode_session_id is not None
+    _mark_operator_stop(home, record.issue_id, record.attempt, opencode_session_id=record.handle.opencode_session_id)
+    backend = OpenCodeDaemonComputeBackend(client=WorkerClient.for_path_checkout(
+        Path(record.sandbox), issue_id=record.issue_id, attempt=record.attempt, run_uid=get_identities().worklink_uid))
+    async def cancel_host() -> None:
+        await backend.cancel(record.handle)
+        await backend.cleanup(record.handle)
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        asyncio.run(cancel_host())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ParkError("session quiescence unverified; checkout, record and claim retained") from exc
+    current = load_factory_record(home, record.run_id)
+    if current is None or current.handle != record.handle:
+        raise ParkError("retained host changed during cancellation; claim retained")
+    record = replace(current, children_reaped=True, observed_at=datetime.now(UTC).isoformat())
+    save_factory_record(home, record)
+    return record
 
 
 def claims_client(chainlink_bin: str, agent_id: str, home: Path) -> ChainlinkClaims:
@@ -573,6 +568,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not plane.is_dir():
         raise ParkError(f"live plane missing: {plane}")
+    args.launcher = resolve_factory_entrypoint(args.launcher)
 
     before = factory_status(args.launcher, args.run_id, sandbox)
     status = before.get("status")
@@ -584,6 +580,11 @@ def main(argv: list[str] | None = None) -> int:
         record = load_factory_record(args.home, args.run_id)
         if record is None:
             raise ParkError(f"no retained record for {args.run_id} under {args.home}")
+        if Path(record.sandbox) != sandbox:
+            raise ParkError("retained sandbox differs from the requested sandbox")
+        if before.get("park_snapshot") != str(parked_dir / args.run_id):
+            raise ParkError("park_snapshot is not acknowledged at the expected canonical path")
+        _require_daemon_owner(record, before)
         if not claim_needs_reconciliation(
             args.chainlink_bin, record.issue_id, args.agent_id, args.home
         ):
@@ -591,9 +592,24 @@ def main(argv: list[str] | None = None) -> int:
                 "run is already parked and its claim needs no reconciliation; nothing to do"
             )
         print("already parked: completing the claim reconciliation a previous run left undone")
-        code, detail = release_parked_claim(
-            args.chainlink_bin, record.issue_id, args.agent_id, args.home,
-        )
+        if args.dry_run:
+            print("dry-run: would verify owned quiescence and reconcile the parked claim")
+            return 0
+        with _park_locks(args.home, record.issue_id):
+            observed = before
+            if record.handle is not None and record.handle.substrate == "opencode_daemon":
+                record = _quiesce_daemon_host(record, args.home)
+                observed = factory_status(args.launcher, args.run_id, sandbox)
+                _require_daemon_owner(record, observed)
+                if observed.get("status") != TERMINAL_PARKED or observed.get("park_snapshot") != str(parked_dir / args.run_id):
+                    raise ParkError("factory park changed during cancellation; claim retained")
+            if not record.children_reaped or not factory_process_is_verified_dead(record):
+                raise ParkError("parked host quiescence is unverified; claim retained")
+            if record.controller_phase != "parked" or record.status is None or not record.status.is_parked:
+                record = replace(record.observed(parse_factory_status(observed), datetime.now(UTC).isoformat()),
+                                 controller_phase="parked")
+                save_factory_record(args.home, record)
+            code, detail = release_parked_claim(args.chainlink_bin, record.issue_id, args.agent_id, args.home)
         if code != 0:
             print(f"PARKED, BUT THE CLAIM IS STILL HELD: {detail}", file=sys.stderr)
             return 3
@@ -607,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ParkError(f"no retained record for {args.run_id} under {args.home}")
     if Path(record.sandbox) != sandbox:
         raise ParkError("retained sandbox differs from the requested sandbox")
+    _require_daemon_owner(record, before)
     expected_snapshot = parked_dir / args.run_id
     if before.get("park_snapshot") is not None and Path(before["park_snapshot"]) != expected_snapshot:
         raise ParkError("park_snapshot differs from the expected canonical path")
@@ -652,28 +669,45 @@ def main(argv: list[str] | None = None) -> int:
     # write this script makes to the retained record can be overwritten by the
     # controller's failure path reacting to the driver's exit.
     if controller_pid is not None:
-        stop_pid(controller_pid, "controller")
+        stop_pid(controller_pid, "controller", verify=lambda pid: verify_controller(pid, record.issue_id))
         print(f"stopped    : controller pid {controller_pid}")
 
+    with _park_locks(args.home, record.issue_id):
+        return _finish_operator_park(args, record, sandbox, plane, parked_dir)
+
+
+def _finish_operator_park(args, record: FactoryRunRecord, sandbox: Path, plane: Path, parked_dir: Path) -> int:
+    current = load_factory_record(args.home, args.run_id)
+    if current is None or (current.handle, current.session, current.sandbox) != (record.handle, record.session, record.sandbox):
+        raise ParkError("retained host changed while stopping the controller; claim retained")
+    record = current
+    already_parked = False
     # The record's handle is the authoritative driver, not a ps pattern match.
-    if factory_process_is_alive(record):
-        handle_pid = record.handle.shim_pid if record.handle else None
-        if handle_pid is None and record.handle is not None:
-            try:
-                handle_pid = int(record.handle.identifier)
-            except ValueError:
-                handle_pid = None
-        if handle_pid is None:
-            raise ParkError("retained handle reports alive but names no pid; refusing to guess")
-        stop_pid(handle_pid, "recorded driver")
-        print(f"stopped    : recorded driver pid {handle_pid}")
+    if record.handle is not None and record.handle.substrate == "opencode_daemon":
+        record = _quiesce_daemon_host(record, args.home)
+        verified_status = factory_status(args.launcher, args.run_id, sandbox)
+        _require_daemon_owner(record, verified_status)
+        if verified_status.get("status") in {"completed", "partial", "blocked"}:
+            raise ParkError("factory became terminal during cancellation; preserve it for completion recovery")
+        already_parked = verified_status.get("status") == TERMINAL_PARKED
+    elif factory_process_is_alive(record):
+        import asyncio
+        from mimir_cultivate.worklink.worker_client import WorkerClient
+        if record.handle is None or record.handle.shim_pid is None:
+            raise ParkError("historical host has no executor correlation; refusing to guess a PID")
+        try:
+            asyncio.run(WorkerClient(None).cancel_factory_handle(record.handle))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ParkError("historical host quiescence is unverified; claim retained") from exc
+        record = replace(record, children_reaped=True, observed_at=datetime.now(UTC).isoformat())
+        save_factory_record(args.home, record)
 
     residual = stop_residual_compute(args.run_id)
     print(f"stopped    : residual {residual or 'none found'}")
 
     # This is the predicate mimir's recovery path applies before it will resume.
     # Asserting it here means a park that publishes is a park that can be resumed.
-    if not factory_process_is_verified_dead(record):
+    if not factory_process_is_verified_dead(record) or not record.children_reaped:
         raise ParkError(
             "cannot verify the recorded factory process is dead. mimir's recovery path requires "
             "factory_process_is_verified_dead before it will resume, so publishing a park now "
@@ -681,15 +715,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     print("verified   : recorded process is dead (the predicate resume will re-check)")
 
-    terminal = _run([
-        "node", str(args.launcher), "terminal", args.run_id, TERMINAL_PARKED,
-        "--reason", args.reason, "--repo", str(sandbox), "--json",
-    ])
-    if terminal.returncode != 0:
-        raise ParkError(f"factory terminal failed: {(terminal.stderr or terminal.stdout).strip()[:300]}")
-    print("terminalized: needs-human")
+    if not already_parked:
+        terminal = _run([
+            "node", str(args.launcher), "terminal", args.run_id, TERMINAL_PARKED,
+            "--reason", args.reason, "--repo", str(sandbox), "--json",
+        ])
+        if terminal.returncode != 0:
+            raise ParkError(f"factory terminal failed: {redact_daemon_output((terminal.stderr or terminal.stdout).strip())[:300]}")
+        print("terminalized: needs-human")
 
-    published = publish_snapshot(plane, parked_dir, args.run_id)
+    published = publish_snapshot(plane, parked_dir, args.run_id, launcher=args.launcher)
     print(f"published  : {published}")
 
     after = factory_status(args.launcher, args.run_id, sandbox)
@@ -702,26 +737,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Reconcile mimir's view last, under the interlock the pruner also takes, so
     # cleanup cannot observe a stale 'running' record and delete a parked run.
-    with factory_checkout_interlock(args.home) as acquired:
-        if not acquired:
-            raise ParkError(
-                "could not acquire the factory checkout interlock; the park is published but "
-                "mimir's record still reads stale. Re-run to reconcile before cleanup runs."
-            )
-        with factory_issue_resource_lock(args.home, record.issue_id) as issue_acquired:
-            if not issue_acquired:
-                raise ParkError(
-                    "could not acquire the factory issue resource lock; the park is published "
-                    "but mimir's record still reads stale. Re-run to reconcile before cleanup runs."
-                )
-            current = load_factory_record(args.home, args.run_id)
-            if current is None:
-                raise ParkError("retained record vanished while parking")
-            reconciled = replace(
-                current.observed(parse_factory_status(after), datetime.now(UTC).isoformat()),
-                controller_phase="parked",
-            )
-            save_factory_record(args.home, reconciled)
+    current = load_factory_record(args.home, args.run_id)
+    if current is None:
+        raise ParkError("retained record vanished while parking")
+    reconciled = replace(current.observed(parse_factory_status(after), datetime.now(UTC).isoformat()),
+                         controller_phase="parked")
+    save_factory_record(args.home, reconciled)
     print("reconciled : controller_phase=parked, observed status=needs-human")
 
     print()

@@ -1899,6 +1899,49 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     assert spawned == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase,expected", [("running", [2125]), ("parked", []),
+    ("failed", []), ("stopped", []), ("terminal", [])])
+async def test_factory_startup_selects_correlated_daemon_without_pid_death(tmp_path, monkeypatch, phase, expected):
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.factory_state import factory_process_is_verified_dead
+    from mimir_cultivate import server
+
+    sandbox = tmp_path / ".worklink/repo/2125-1/checkout/.factory-sandboxes/chainlink-2125"
+    sandbox.mkdir(parents=True)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await SessionController.create(client, tmp_path / "private-controller.json",
+            request=SessionRequest("epic", {"providerID": "openai", "id": "gpt-test"},
+                                   "--autonomous --max-retries 5 chainlink-2125"),
+            issue_id=2125, attempt=1, generation="startup-generation", checkout=sandbox,
+            environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+        sid = controller.record.opencode_session_id
+        record = FactoryRunRecord(run_id="chainlink-2125", issue_id=2125, attempt=1,
+            repository="owner/repo", base_ref="main", branch="feature/chainlink-2125",
+            launcher="/opt/factory/bin/factory.js", sandbox=str(sandbox), session=sid,
+            opencode_session_id=sid, handle=LaunchHandle("opencode_daemon", sid,
+                opencode_session_id=sid, launch_generation="startup-generation"), status=None,
+            observed_at=None, controller_phase=phase)
+        save_factory_record(tmp_path, record)
+        assert not factory_process_is_verified_dead(record)
+        spawned = []
+        try:
+            result = server.reattach_inflight_worklink_runs(tmp_path,
+                popen=lambda argv, **kwargs: spawned.append(list(argv)) or object())
+            assert result == expected
+            assert len(spawned) == len(expected)
+            if expected:
+                assert spawned[0][:4] == ["mimir", "worklink", "run-epic", "2125"]
+            assert len([route for _, route, _, _ in daemon.requests if route.endswith("/command")]) == 1
+        finally:
+            await controller.release()
+
+
 def _factory_restart_record(
     home: Path,
     *,

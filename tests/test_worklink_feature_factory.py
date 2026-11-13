@@ -80,22 +80,9 @@ def status_payload(**overrides: Any) -> dict[str, Any]:
 
 
 def package_entrypoint(tmp_path: Path) -> Path:
-    modules = tmp_path / "lib" / "node_modules"
-    feature = modules / "feature-factory"
-    adapter = modules / "opencode-feature-factory"
-    (feature / "bin").mkdir(parents=True)
-    adapter.mkdir(parents=True)
-    entrypoint = feature / "bin" / "factory.js"
-    entrypoint.write_text("", encoding="utf-8")
-    (feature / "package.json").write_text(
-        json.dumps({"name": "feature-factory", "version": FACTORY_VERSION}),
-        encoding="utf-8",
-    )
-    (adapter / "package.json").write_text(
-        json.dumps({"name": "opencode-feature-factory", "version": FACTORY_VERSION}),
-        encoding="utf-8",
-    )
-    return entrypoint
+    from tests.opencode_fixtures import seed_factory_install
+
+    return seed_factory_install(tmp_path, FACTORY_VERSION)
 
 
 def test_recorded_mcp_survives_worker_projection_and_record(tmp_path: Path) -> None:
@@ -194,6 +181,40 @@ def test_snapshot_uses_attempt_bound_control_and_operator_root(
          "other", "node", str(launcher), "snapshot", "chainlink-700", "--repo", str(tmp_path / "operator")],
     )]
     assert str(sandbox) not in calls[0][1]
+
+
+def test_factory_initialization_is_bounded_owner_control_before_session_admission(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import worker_client
+
+    launcher = package_entrypoint(tmp_path)
+    root = tmp_path / "checkouts"
+    outer = root / "repo/1551-1/checkout"
+    outer.mkdir(parents=True)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    monkeypatch.setenv("OPENAI_API_KEY", "agent-only-model-material")
+    secret = "fixture-" + "bot-material"
+    calls = []
+    def control(path, argv, **kwargs):
+        calls.append((path, argv, kwargs))
+        if "init" in argv:
+            assert path == outer and kwargs["initialize"] is True
+            assert kwargs["timeout"] == 17
+            assert kwargs["env"]["GH_TOKEN"] == kwargs["env"]["GITHUB_TOKEN"] == secret
+            assert kwargs["env"]["FACTORY_PUBLISHING_IDENTITY"] == "fixture-bot"
+            assert "OPENAI_API_KEY" not in kwargs["env"] and "FACTORY_SESSION_ID" not in kwargs["env"]
+            assert secret not in repr(argv)
+            assert argv[argv.index("node"):] == ["node", str(launcher), "init", "chainlink-1551", "--repo", str(outer),
+                "--pr-base", "main", "--mode", "autonomous", "--max-retries", "5", "--publishing-identity", "fixture-bot"]
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        payload = status_payload(run_id="chainlink-1551", sandbox_path=str(outer / ".factory-sandboxes/chainlink-1551"),
+                                 branch="feature/chainlink-1551", lock="absent", lock_session=None, mcp_servers=["fixture-mcp"])
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload).encode(), b"")
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    status = FeatureFactoryBackend(entrypoint=str(launcher)).initialize("chainlink-1551", operator_checkout=outer,
+        base_ref="main", publishing_identity="fixture-bot", credentials={"GITHUB_TOKEN": secret},
+        git_settings=(("user.name", "Fixture Bot"), ("user.email", "fixture@example.invalid")), timeout_s=17)
+    assert len(calls) == 2 and status.mcp_servers == ("fixture-mcp",)
+    assert status.lock_session is None
 
 
 @pytest.mark.parametrize("sandbox_name", ["other-run", "sandbox"])
@@ -809,7 +830,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
-    assert FACTORY_VERSION == "0.12.1"
+    assert FACTORY_VERSION == "0.14.0"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
@@ -819,11 +840,34 @@ def test_admit_rejects_nonexistent_entrypoint(tmp_path: Path) -> None:
         FeatureFactoryBackend(entrypoint=str(tmp_path / "factory.js")).admit()
 
 
+@pytest.mark.parametrize("dependency", [None, "^0.14.0", "0.12.1", "*", {"version": "0.14.0"}])
+def test_resolver_requires_exact_adapter_dependency(tmp_path, dependency):
+    entrypoint = package_entrypoint(tmp_path)
+    manifest = entrypoint.parents[2] / "opencode2-feature-factory/package.json"
+    data = json.loads(manifest.read_text())
+    data["dependencies"] = {"feature-factory": dependency}
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(FactoryContractError, match="exact feature-factory dependency"):
+        resolve_factory_entrypoint(entrypoint)
+
+
+def test_resolver_refuses_managed_v1_but_ignores_optional_claude(tmp_path):
+    entrypoint = package_entrypoint(tmp_path)
+    optional = entrypoint.parents[2] / "claude-code-feature-factory"
+    optional.mkdir()
+    (optional / "package.json").write_text('{"version":"unrelated-operator-install"}')
+    assert resolve_factory_entrypoint(entrypoint) == entrypoint
+    legacy = entrypoint.parents[2] / "opencode-feature-factory"
+    legacy.symlink_to(tmp_path / "missing-legacy")
+    with pytest.raises(FactoryContractError, match="managed V1"):
+        resolve_factory_entrypoint(entrypoint)
+
+
 @pytest.mark.parametrize(
     ("package", "expected_name"),
     [
         ("feature-factory", "feature-factory"),
-        ("opencode-feature-factory", "opencode-feature-factory"),
+        ("opencode2-feature-factory", "opencode2-feature-factory"),
     ],
 )
 def test_admit_rejects_either_package_version_mismatch(
@@ -1106,28 +1150,16 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
         branch="epic/1551",
         test_command="uv run pytest -q",
     )
-    assert tuple(spec.local_argv or ()) == (
-        "opencode",
-        "run",
-        "--log-level",
-        "DEBUG",
-        "--print-logs",
-        "-m",
-        "openai/gpt-5.6-luna",
-        "--dir",
-        str(tmp_path),
-        "--command",
-        "feature",
-        f" --autonomous --max-retries {expected} chainlink-1551",
-    )
-    payload = (spec.local_argv or ())[-1]
-    assert payload.startswith(" ") and not payload.startswith("  ")
+    assert spec.local_argv is None
+    assert spec.session_request is not None and spec.session_request.kind == "epic"
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-5.6-luna"}
+    payload = spec.session_request.text
+    assert payload == f"--autonomous --max-retries {expected} chainlink-1551"
     assert "--autonomous" in payload.split()
     assert "--auto" not in payload.split()
     assert "--base" not in payload.split()
     assert "--pr-base" not in payload.split()
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
-    assert spec.backend_config["model_diverged"] is False
     assert spec.backend_config["run_id"] == "chainlink-1551"
     assert epic_run_id(1551) == "chainlink-1551"
 
@@ -1332,32 +1364,20 @@ def test_recovery_launch_binds_opencode_to_factory_session(
         env={},
     )
 
-    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
-        order,
-        attempt=1,
-        repo_url=str(tmp_path),
-        base_ref="main",
-        branch="feature/chainlink-1551",
-        test_command="pytest -q",
-        session="session-1",
-    )
-
-    argv = tuple(spec.local_argv or ())
-    assert argv[argv.index("--session") + 1] == "session-1"
+    with pytest.raises(FactoryContractError, match="reattach"):
+        FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+            order, attempt=1, repo_url=str(tmp_path), base_ref="main",
+            branch="feature/chainlink-1551", test_command="pytest -q", session="session-1")
 
 
-@pytest.mark.parametrize("session", [None, "session-1"])
 @pytest.mark.parametrize("run_id", ["chainlink-1947", "1947"])
 def test_factory_request_bytes_are_the_bare_run_id_after_leading_options(
-    tmp_path: Path, session: str | None, run_id: str,
+    tmp_path: Path, run_id: str,
 ) -> None:
-    argv = FeatureFactoryBackend.opencode_argv(
-        tmp_path, run_id, "openai/model", session=session,
-    )
+    payload = FeatureFactoryBackend.feature_text(run_id)
     # This pins the byte-level adapter boundary; it is NOT an execution of
     # the external adapter's parser or a proof of resumed-driver context.
-    assert argv[-3:-1] == ("--command", "feature")
-    assert argv[-1] == f" --autonomous --max-retries 5 {run_id}"
+    assert payload == f"--autonomous --max-retries 5 {run_id}"
 
 
 @pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
@@ -1375,11 +1395,11 @@ def test_recovery_launch_uses_retained_legacy_run_id(
         base_ref="main",
         branch="epic/1551",
         test_command="pytest -q",
-        session="session-1",
         run_id="1551",
     )
 
-    assert (spec.local_argv or ())[-1] == " --autonomous --max-retries 5 1551"
+    assert spec.local_argv is None
+    assert spec.session_request.text == "--autonomous --max-retries 5 1551"
 
 
 def test_status_before_sandbox_creation_returns_not_ready(tmp_path: Path) -> None:
@@ -1587,7 +1607,8 @@ def test_work_spec_carries_the_publishing_identity_into_the_launch_spec(
         test_command="uv run pytest -q",
     )
 
-    assert spec.env[FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+    assert spec.backend_config["publishing_identity"] == "mimir-carreira"
+    assert FACTORY_PUBLISHING_IDENTITY_ENV not in spec.env
 
 
 @pytest.mark.asyncio
@@ -1601,20 +1622,8 @@ async def test_launch_child_environment_carries_the_publishing_identity(
     the allowlist to empty so the assertion cannot be satisfied by inheritance.
     """
     _own_opencode_resolution(tmp_path, monkeypatch)
-    from types import SimpleNamespace
-    from mimir_cultivate.contained_execution import CollectedExecutionResult
-
-    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
-
-    captured: dict[str, dict[str, str]] = {}
-
-    async def fake_exec(args, capability, env, projections, **kwargs):
-        captured["env"] = env
-        capability._contained_started(SimpleNamespace(pid=None))
-        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
-
-    monkeypatch.setattr("mimir_cultivate.worklink.compute.execute_contained", fake_exec)
-    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
+    from mimir_cultivate.worklink.daemon_sessions import session_environment
+    from mimir_cultivate.worklink.daemon_config import resolve_daemon_credentials
 
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
         _factory_order(tmp_path, "mimir-carreira"),
@@ -1624,14 +1633,13 @@ async def test_launch_child_environment_carries_the_publishing_identity(
         branch="epic/1551",
         test_command="uv run pytest -q",
     )
-    # The contained executor is mocked; production accounts are not a test input.
-    compute = LocalSubprocessComputeBackend(_worker_client=object())
-    handle = await compute.launch(spec)
-    try:
-        await compute.wait(handle, 30)
-        assert captured["env"][FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
-    finally:
-        await compute.cleanup(handle)
+    credentials = resolve_daemon_credentials({"GITHUB_TOKEN": "fixture-bot",
+        "MIMIR_FACTORY_PUBLISHING_IDENTITY": "mimir-carreira"})
+    environment = session_environment(dict(spec.env), home=tmp_path,
+        git_settings=(), credentials=credentials.environment())
+    assert environment[FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
+    assert environment["GH_TOKEN"] == environment["GITHUB_TOKEN"] == "fixture-bot"
+    assert "OPENCODE_CONFIG" not in environment
 
 
 @pytest.mark.parametrize(

@@ -217,7 +217,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".factory.json").write_text(json.dumps({
-        "publishing_identity": "factory-owner", "bootstrap": "uv sync",
+        "bootstrap": "uv sync",
     }))
     gate_command = "uv run python -c 'print(1949)'"
     # Pin the opencode model/auth inputs work_spec resolves, as the core factory
@@ -229,6 +229,12 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.setenv("GITHUB_TOKEN", "fixture-token")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", "factory-owner")
+    from mimir_cultivate.worklink import daemon_health
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend, ComputeCleanupError
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     auth = operator_home / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}))
@@ -240,7 +246,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     ))
     monkeypatch.setattr(orchestrator, "_read_checkout_git_identity", lambda *a: ("Factory", "factory@example.org"))
     monkeypatch.setattr(orchestrator, "_read_factory_publishing_identity", lambda *a: ("factory-owner", ".factory.json"))
-    monkeypatch.setattr(orchestrator, "_resolve_factory_github_credential", lambda *a: ("token", {"GH_TOKEN": "token"}))
+    monkeypatch.setattr(orchestrator, "_resolve_factory_github_credential", lambda *a: ("token", {"GH_TOKEN": "token", "GITHUB_TOKEN": "token"}))
     monkeypatch.setattr(orchestrator, "GitHubForgeClient", lambda **kw: SimpleNamespace(verify_identity=lambda login: login))
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(orchestrator, "_create_backend_checkout", lambda *a, **kw: CheckoutLease(
@@ -262,10 +268,8 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         labels.append(args) or subprocess.CompletedProcess(args, 0, "", "")
     ))
     monkeypatch.setattr(orchestrator.ChainlinkClaims, "release_issue", lambda *a, **kw: True)
-    dead = subprocess.Popen(["true"])
-    dead.wait()
-    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", lambda self, spec: asyncio.sleep(
-        0, result=LaunchHandle("local_subprocess", str(dead.pid), 1, dead.pid),
+    monkeypatch.setattr(OpenCodeDaemonComputeBackend, "launch", lambda self, spec: asyncio.sleep(
+        0, result=LaunchHandle("opencode_daemon", "ses_completion", opencode_session_id="ses_completion", launch_generation="test-generation"),
     ))
     cancelled = asyncio.Event()
     waits: list[LaunchHandle] = []
@@ -273,19 +277,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     cleanups: list[LaunchHandle] = []
 
     supervision_order = []
-    real_prune = factory_store.prune_factory_store
-
-    def checked_prune(record):
-        # Exercise the production observe -> cancel -> drain -> persist -> prune
-        # wiring, not just a record with an acknowledgement injected in isolation.
-        assert supervision_order == ["cancel", "drained"]
-        assert record.children_reaped is reaped
-        persisted = load_factory_record(tmp_path, record.run_id)
-        assert persisted is not None and persisted.children_reaped is reaped
-        supervision_order.append("prune")
-        return real_prune(record)
-
-    monkeypatch.setattr(factory_store, "prune_factory_store", checked_prune)
+    monkeypatch.setattr(factory_store, "prune_factory_store", lambda record: pytest.fail("daemon store pruned"))
 
     async def wait(self: object, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         waits.append(handle)
@@ -296,15 +288,17 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     async def cancel(self: object, handle: LaunchHandle) -> None:
         cancels.append(handle)
         supervision_order.append("cancel")
+        if not reaped:
+            raise ComputeCleanupError(handle)
         cancelled.set()
 
     async def cleanup(self: object, handle: LaunchHandle) -> None:
         cleanups.append(handle)
 
-    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "wait", wait)
-    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "cancel", cancel)
-    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "cleanup", cleanup)
-    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "job_alive", lambda self, handle: not cancelled.is_set())
+    monkeypatch.setattr(OpenCodeDaemonComputeBackend, "wait", wait)
+    monkeypatch.setattr(OpenCodeDaemonComputeBackend, "cancel", cancel)
+    monkeypatch.setattr(OpenCodeDaemonComputeBackend, "cleanup", cleanup)
+    monkeypatch.setattr(OpenCodeDaemonComputeBackend, "job_alive", lambda self, handle: not cancelled.is_set())
     overflow_events: list[dict[str, object]] = []
     if pr_head == "control_overflow":
         from mimir import event_logger
@@ -452,11 +446,24 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         })
 
     monkeypatch.setattr(FeatureFactoryBackend, "status", status)
+    def initialize(self, run_id, *, operator_checkout, **kwargs):
+        current = status(self, run_id, sandbox=operator_checkout / ".factory-sandboxes" / run_id, launcher=self.entrypoint)
+        return replace(current, status="running")
+    monkeypatch.setattr(FeatureFactoryBackend, "initialize", initialize)
     sandbox = checkout / ".factory-sandboxes" / "chainlink-1949"
     with _executor_in_process(tmp_path, monkeypatch, root, short_socket_dir) as requests:
         result = await orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(1949)
         record = load_factory_record(tmp_path, "chainlink-1949")
-        assert record is not None and record.sandbox == str(sandbox)
+        assert record is not None and record.sandbox == str(sandbox), result.reason
+        assert record.opencode_session_id == "ses_completion"
+        if not reaped:
+            assert result.status == "failed" and "quiescence unverified" in result.reason
+            assert not record.children_reaped
+            assert sandbox.is_dir() and not cleanups
+            assert requests == []
+            with sqlite3.connect(db_path) as db:
+                assert db.execute("SELECT count(*) FROM event").fetchone() == (1,)
+            return
         spec = WorkSpec(
             issue_id=record.issue_id, attempt=record.attempt, repo_url="", base_ref=record.base_ref,
             branch=record.branch, prompt="", rules=None, test_command=gate_command,
@@ -544,9 +551,9 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     if pr_head != "control_overflow":
         assert payload["tests"]["exit_code"] == 0
         assert "1949" in payload["tests"]["summary"]
-    assert supervision_order == ["cancel", "drained", "prune"]
+    assert supervision_order == ["cancel", "drained"]
     with sqlite3.connect(db_path) as db:
-        assert db.execute("SELECT count(*) FROM event").fetchone() == (0 if reaped else 1,)
+        assert db.execute("SELECT count(*) FROM event").fetchone() == (1,)
 
 
 @pytest.mark.asyncio

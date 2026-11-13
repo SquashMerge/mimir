@@ -37,12 +37,12 @@ def test_current_factory_documentation_matches_runtime_version() -> None:
     factory_version = _image_factory_version()
     assert FACTORY_VERSION == factory_version
     for tool in DEFAULT_TOOL_PINS:
-        if tool.name in {"feature-factory", "opencode-feature-factory"}:
+        if tool.name in {"feature-factory", "opencode2-feature-factory"}:
             assert tool.pin == factory_version
     for relative_path in FACTORY_DOCS:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         assert text.count(f"`feature-factory@{factory_version}`") == 1, relative_path
-        assert text.count(f"`opencode-feature-factory@{factory_version}`") == 1, relative_path
+        assert text.count(f"`opencode2-feature-factory@{factory_version}`") == 1, relative_path
         assert "`feature-factory@0.7.0`" not in text, relative_path
         assert "`opencode-feature-factory@0.7.0`" not in text, relative_path
 
@@ -69,8 +69,7 @@ def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None
         "docs/internal/WORKLINK.md",
     )
     launch = (
-        f'--command feature " --autonomous --max-retries '
-        f'{_DEFAULT_FACTORY_MAX_RETRIES} <issue>"'
+        f'`--autonomous --max-retries {_DEFAULT_FACTORY_MAX_RETRIES} chainlink-<id>`'
     )
     retry = (
         f"`MIMIR_FACTORY_MAX_RETRIES` defaults to `{_DEFAULT_FACTORY_MAX_RETRIES}`, "
@@ -90,24 +89,16 @@ def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         normalized = " ".join(text.split())
         assert launch in normalized, relative_path
+        assert "command `feature`" in normalized, relative_path
+        assert "--command feature" not in normalized, relative_path
         assert retry in normalized, relative_path
         assert staging in normalized, relative_path
         assert base in normalized, relative_path
 
 
 def test_factory_identity_preflight_contract_is_identical_in_bounded_documentation() -> None:
-    git_identity = (
-        "Before first factory dispatch only, after checkout creation and before process launch, "
-        "Worklink reads the effective checkout `git config --get user.name` and `git config "
-        "--get user.email`. Both must be nonblank. The child receives `GIT_AUTHOR_NAME`, "
-        "`GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`; Worklink never "
-        "writes sandbox Git identity configuration."
-    )
     publication = (
-        "Worklink reads the nonblank `publishing_identity` from "
-        "`MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise from the "
-        "trusted controller checkout's `.factory.json`. A set but blank or non-string "
-        "override fails instead of falling back. For GitHub publication Worklink verifies the credential "
+        "For GitHub publication Worklink verifies the credential "
         "this process is already bound to, `GITHUB_TOKEN`, rather than selecting among "
         "candidates: `GH_TOKEN` is a child-only alias for `gh`, and verifying a second "
         "credential in a process that already verified one is refused by the forge identity "
@@ -120,7 +111,11 @@ def test_factory_identity_preflight_contract_is_identical_in_bounded_documentati
 
     for relative_path in FACTORY_DOCS:
         normalized = " ".join((ROOT / relative_path).read_text(encoding="utf-8").split())
-        assert git_identity in normalized, relative_path
+        for requirement in ("`git config --get user.name`", "`git config --get user.email`",
+                            "nonblank", "trusted captured Git settings", "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+                            ".factory.json.publishing_identity", "There is no repository fallback.",
+                            "reviewed repository edit"):
+            assert requirement.lower() in normalized.lower(), (relative_path, requirement)
         assert publication in normalized, relative_path
 
 

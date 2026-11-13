@@ -1130,27 +1130,14 @@ async def test_feature_factory_launch_remains_shell_free_argv(
     # Execution is mocked: do not resolve production OS accounts for this argv test.
     compute = LocalSubprocessComputeBackend(_worker_client=object())
 
-    handle = await compute.launch(spec)
-    await compute.wait(handle, 30)
-    await compute.cleanup(handle)
-
-    assert calls[0]["args"] == (
-        "opencode",
-        "run",
-        "--log-level",
-        "DEBUG",
-        "--print-logs",
-        "-m",
-        "openai/gpt-5.6-luna",
-        "--dir",
-        str(tmp_path),
-        "--command",
-        "feature",
-        " --autonomous --max-retries 5 chainlink-1606",
-    )
-    assert "--variant" not in spec.local_argv
-    assert "shell" not in calls[0]["kwargs"]
-    assert calls[0]["checkout"] == tmp_path
+    from mimir_cultivate.worklink.compute import ComputeLaunchError
+    with pytest.raises(ComputeLaunchError, match="local_argv"):
+        await compute.launch(spec)
+    assert calls == []
+    assert spec.local_argv is None
+    assert spec.session_request.kind == "epic"
+    assert spec.session_request.text == "--autonomous --max-retries 5 chainlink-1606"
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "high"}
 
 
 @pytest.mark.asyncio
@@ -1240,18 +1227,6 @@ def test_opencode_test_env_reaches_pytest_through_bash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool, opencode_binary: Path
 ) -> None:
     monkeypatch.setattr(opencode_module, "_coding_enabled", lambda: enabled)
-    monkeypatch.setattr(
-        opencode_module, "resolve_opencode_invocation",
-        lambda **_: OpenCodeInvocation(
-            model="openai/test-model", provider="openai", model_source="test",
-            config_path=tmp_path / "absent.json", auth_path=tmp_path / "auth.json",
-            auth_type=None,
-        ),
-    )
-    monkeypatch.setattr(
-        opencode_module, "opencode_worker_documents",
-        lambda *_: SimpleNamespace(config_document=b"{}", auth_document=None),
-    )
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
         'backends:\n  opencode:\n    test_env:\n      PYTEST_ADDOPTS: "-n 2"\n',
@@ -1267,11 +1242,9 @@ def test_opencode_test_env_reaches_pytest_through_bash(
     assert spec.backend_config["test_env"] == {"PYTEST_ADDOPTS": "-n 2"}
     assert "MIMIR_MODEL_SPEC" not in spec.env
     assert spec.test_command == "uv run pytest -q -n 6"
-    if enabled:
-        assert spec.backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
-        env = compute_module._enabled_child_env(spec, "test-1566")
-    else:
-        env = {**compute_module._local_child_env(), **spec.env}
+    from mimir_cultivate.worklink.daemon_sessions import session_environment
+    assert spec.backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
+    env = session_environment(dict(spec.env), home=tmp_path / "home", git_settings=(), credentials={})
 
     (tmp_path / "pyproject.toml").write_text(
         '[tool.pytest.ini_options]\naddopts = "-n 3"\n', encoding="utf-8"
@@ -1745,17 +1718,7 @@ def test_registry_derives_only_configured_non_python_runner(
     monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str,
     opencode_binary: Path,
 ) -> None:
-    monkeypatch.setattr(
-        "mimir_cultivate.worklink.backends.opencode.resolve_opencode_invocation",
-        lambda **_: OpenCodeInvocation(
-            model="openai/test-model",
-            provider="openai",
-            model_source="test",
-            config_path=Path("/nonexistent/opencode.jsonc"),
-            auth_path=Path("/nonexistent/auth.json"),
-            auth_type=None,
-        ),
-    )
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
     config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
 
     backend = BackendRegistry(config).get("opencode")
@@ -2173,7 +2136,7 @@ def test_worklink_resolution_admits_any_configured_provider(
     because each reaches the worker through the projected auth document rather
     than the worker environment allowlist, so a regression could hide in either.
     """
-    from mimir_cultivate.worklink.backends.opencode import resolve_worklink_opencode_invocation
+    from mimir_cultivate.opencode import resolve_daemon_model
 
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     env = _provider_env(tmp_path, "openrouter:anthropic/claude-opus-4.8")
@@ -2182,12 +2145,9 @@ def test_worklink_resolution_admits_any_configured_provider(
     else:
         env["OPENROUTER_API_KEY"] = "sk-or-synthetic"
 
-    resolution = resolve_worklink_opencode_invocation(env)
-
-    assert resolution.invocation.provider == "openrouter"
-    assert resolution.invocation.model == "openrouter/anthropic/claude-opus-4.8"
-    assert resolution.invocation.auth_type == "api"
-    assert "sk-or-synthetic" not in repr(resolution.invocation)
+    resolution = resolve_daemon_model(env)
+    assert resolution == {"providerID": "openrouter", "id": "anthropic/claude-opus-4.8"}
+    assert "sk-or-synthetic" not in repr(resolution)
 
 
 def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
@@ -2202,7 +2162,7 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
     other ask categories are untouched by this change. Proving that would need an
     integration check against the pinned OpenCode permission evaluator.
     """
-    from mimir_cultivate.worklink.backends.feature_factory import _FACTORY_PERMISSION
+    from mimir_cultivate.worklink.daemon_sessions import session_permissions
 
     home = tmp_path / "home"
     home.mkdir()
@@ -2229,12 +2189,12 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
         test_command="uv run pytest -q",
     )
 
-    permission = json.loads(spec.env["OPENCODE_PERMISSION"])
-    assert permission["read"] == {
-        ".env": "deny", "**/.env": "deny", "**/.env.*": "deny",
-    }
+    permission = session_permissions(spec.session_request)
+    assert permission == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        *[{"action": "read", "resource": pattern, "effect": "deny"}
+          for pattern in (".env", "**/.env", "**/.env.*")]]
 
-    # An operator-supplied override still wins.
+    # V1 environment overrides cannot broaden the reviewed session policy.
     order_override = WorkOrder(
         4242, tmp_path, "prompt", None, 30,
         env={**env, "OPENCODE_PERMISSION": '{"read":{"**":"deny"}}'},
@@ -2247,5 +2207,5 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
         branch="feature/chainlink-4242",
         test_command="uv run pytest -q",
     )
-    assert spec_override.env["OPENCODE_PERMISSION"] == '{"read":{"**":"deny"}}'
-    assert spec_override.env["OPENCODE_PERMISSION"] != _FACTORY_PERMISSION
+    assert "OPENCODE_PERMISSION" not in spec_override.env
+    assert session_permissions(spec_override.session_request) == permission

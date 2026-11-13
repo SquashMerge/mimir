@@ -1187,44 +1187,22 @@ def _existing_scaffold_settings(
 _OPENCODE_CONFIG_TEMPLATE = """\
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "opencode-feature-factory",
-    [
-      "opencode-project-memory",
-      {
-        "memoryDir": ".opencode/memory",
-        "index": "MEMORY.md",
-        "maxIndexBytes": 8192,
-        "maxIndexLines": 100,
-        "gitExclude": false
-      }
-    ],
-    "opencode-openai-codex-auth",
-    "opencode-anthropic-auth"
+  "plugins": [
+    {"package": "opencode2-feature-factory@0.14.0"},
+    {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": false}}
   ]
 }
 """
 
 _OPENCODE_REQUIRED_PLUGINS: tuple[object, ...] = (
-    "opencode-feature-factory",
-    (
-        "opencode-project-memory",
-        {
-            "memoryDir": ".opencode/memory",
-            "index": "MEMORY.md",
-            "maxIndexBytes": 8192,
-            "maxIndexLines": 100,
-            "gitExclude": False,
-        },
-    ),
-    "opencode-openai-codex-auth",
-    "opencode-anthropic-auth",
+    {"package": "opencode2-feature-factory@0.14.0"},
+    {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": False}},
 )
 
 
 def _render_opencode_config() -> str:
     """Render the canonical config used when no OpenCode config exists."""
-    return _OPENCODE_CONFIG_TEMPLATE
+    return json.dumps(json.loads(_OPENCODE_CONFIG_TEMPLATE), indent=2, ensure_ascii=False) + "\n"
 
 
 def _opencode_build_config_block(install_opencode: bool) -> str:
@@ -1241,15 +1219,18 @@ def _opencode_build_config_block(install_opencode: bool) -> str:
 
 
 def _plugin_name(entry: object) -> str | None:
-    """Return a plugin package name from OpenCode's string/tuple syntax."""
+    """Read V2 package entries and recognize obsolete registrations for removal."""
+    if isinstance(entry, dict) and isinstance(entry.get("package"), str):
+        package = entry["package"]
+        return package.rsplit("@", 1)[0] if "@" in package[1:] else package
     if isinstance(entry, str):
-        return entry
+        return entry.rsplit("@", 1)[0] if "@" in entry[1:] else entry
     if (
         isinstance(entry, (list, tuple))
         and entry
         and isinstance(entry[0], str)
     ):
-        return entry[0]
+        return _plugin_name(entry[0])
     return None
 
 
@@ -1263,12 +1244,9 @@ def _required_plugin_entry(entry: object) -> object:
 def merge_opencode_config(existing: str | None) -> tuple[str, bool]:
     """Add mimir's pinned plugins without clobbering operator config.
 
-    OpenCode accepts plugin registrations as either package-name strings or
-    ``[package, options]`` tuples. Existing feature-factory registrations win
-    wholesale, including profile tuples/options. Project-memory preserves
-    unrelated operator options while converging mimir's managed memory keys.
-    Duplicate registrations are collapsed by package name while preserving the
-    first entry and the relative order of all unrelated plugins.
+    Retire V1 registrations, converge managed V2 pins and keep unrelated operator
+    settings. Daemon telemetry is configured separately in its private config;
+    this compatibility bootstrap never enables an exporter.
     """
     if existing is None:
         return _render_opencode_config(), True
@@ -1280,7 +1258,7 @@ def merge_opencode_config(existing: str | None) -> tuple[str, bool]:
     if not isinstance(config, dict):
         raise ValueError("existing OpenCode config must be a JSON object")
 
-    raw_plugins = config.get("plugin", [])
+    raw_plugins = config.get("plugins", config.get("plugin", []))
     if raw_plugins is None:
         raw_plugins = []
     if not isinstance(raw_plugins, list):
@@ -1290,6 +1268,9 @@ def merge_opencode_config(existing: str | None) -> tuple[str, bool]:
     seen: set[str] = set()
     for entry in raw_plugins:
         name = _plugin_name(entry)
+        if name in {"opencode-ai", "opencode-feature-factory", "opencode-project-memory",
+                    "opencode-openai-codex-auth", "opencode-anthropic-auth"}:
+            continue
         if name is not None:
             if name in seen:
                 continue
@@ -1303,27 +1284,12 @@ def merge_opencode_config(existing: str | None) -> tuple[str, bool]:
             plugins.append(_required_plugin_entry(required))
             seen.add(name)
             continue
-        if name == "opencode-project-memory":
-            # These values are the runtime contract, not optional defaults.
-            # Preserve unrelated operator options while converging the six
-            # managed keys to the values needed for tracked project memory.
-            index = next(
-                i for i, entry in enumerate(plugins)
-                if _plugin_name(entry) == name
-            )
-            current = plugins[index]
-            operator_options = (
-                dict(current[1])
-                if isinstance(current, list)
-                and len(current) > 1
-                and isinstance(current[1], dict)
-                else {}
-            )
-            managed_options = dict(required[1])
-            operator_options.update(managed_options)
-            plugins[index] = [name, operator_options]
+        index = next(i for i, entry in enumerate(plugins) if _plugin_name(entry) == name)
+        current = plugins[index]
+        plugins[index] = {**current, **required} if isinstance(current, dict) else required
 
-    config["plugin"] = plugins
+    config.pop("plugin", None)
+    config["plugins"] = plugins
     merged = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
     return merged, merged != existing
 

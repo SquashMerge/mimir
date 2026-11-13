@@ -189,12 +189,26 @@ class OpenCodeDaemonComputeBackend:
             client = WorkerClient(checkout)
         self._client = client
         self._deadlines: dict[str, float] = {}
+        self._quiescent: set[str] = set()
 
     def capabilities(self) -> ComputeCaps:
         return ComputeCaps(True, False, True, True)
 
     async def recover_admission(self, generation: str) -> LaunchHandle | None:
         return await self._client.session_recover_admission(generation)
+
+    def bind_retained_checkout(self, checkout: Path, *, issue_id: int, attempt: int) -> None:
+        """Bind a new controller to retained correlation without admitting input."""
+        from .worker_client import WorkerClient
+        from .identities import get_identities
+
+        if self._bind_on_launch:
+            self._client = WorkerClient.for_path_checkout(checkout, issue_id=issue_id,
+                attempt=attempt, run_uid=get_identities().worklink_uid)
+            self._bind_on_launch = False
+        elif isinstance(self._client, WorkerClient) and self._client.path_checkout is not None:
+            if (self._client.path_checkout, self._client.issue_id, self._client.attempt) != (checkout, issue_id, attempt):
+                raise ComputeLaunchError("daemon compute retained checkout binding mismatch")
 
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
         from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
@@ -241,6 +255,8 @@ class OpenCodeDaemonComputeBackend:
                 git_settings=spec.factory_credential_settings,
             )
         except (SessionAdmissionCancelled, SessionAdmissionError) as exc:
+            if exc.handle is None and not exc.uncertain:
+                exc.quiescent = True
             if exc.handle is not None:
                 try:
                     await asyncio.shield(self.cancel(exc.handle))
@@ -308,16 +324,31 @@ class OpenCodeDaemonComputeBackend:
         outcome = await self._observe(handle)
         return outcome.stdout
 
+    def job_alive(self, handle: LaunchHandle) -> bool:
+        """Conservative supervision hint; only observation proves a host outcome."""
+        return handle.substrate == self.name and handle.identifier not in self._quiescent
+
     async def _observe(self, handle: LaunchHandle) -> SessionOutcome:
         if self._stdout_limit is None:
-            return await self._client.session_observe(handle)
-        return await self._client.session_observe(handle, stdout_limit=self._stdout_limit)
+            outcome = await self._client.session_observe(handle)
+        else:
+            outcome = await self._client.session_observe(handle, stdout_limit=self._stdout_limit)
+        from mimir_cultivate.opencode import redact_daemon_output
+
+        error = outcome.error
+        if error is not None:
+            def bounded(value: str, limit: int) -> str:
+                return redact_daemon_output(value).encode("utf-8")[:limit].decode("utf-8", "ignore")
+            error = replace(error, type=bounded(error.type, 128), message=bounded(error.message, 2048),
+                            body=bounded(error.body, 8192))
+        return replace(outcome, error=error, stdout=redact_daemon_output(outcome.stdout))
 
     async def cancel(self, handle: LaunchHandle) -> None:
         try:
             await self._client.session_cancel(handle)
         except (OSError, RuntimeError, ValueError) as exc:
             raise ComputeCleanupError(handle) from exc
+        self._quiescent.add(handle.identifier)
 
     async def cleanup(self, handle: LaunchHandle) -> None:
         try:
@@ -434,6 +465,8 @@ _ENABLED_SYNTHESIZED_NAMES = frozenset({
     "LC_ALL",
     "OPENCODE_CONFIG",
     "OPENCODE_PERMISSION",
+    "FACTORY_SESSION_ID",
+    "FACTORY_PUBLISHING_IDENTITY",
 })
 _ENABLED_DENIED_PREFIXES = (
     "MIMIR_",
@@ -475,6 +508,16 @@ def _validate_worker_value(name: str, value: object) -> str:
         raise ComputeLaunchError(f"worker environment {name} exceeds size limit")
     if "\x00" in value or "\n" in value or "\r" in value:
         raise ComputeLaunchError(f"worker environment {name} contains a forbidden character")
+    if name == "MIMIR_WORK_ITEM_JSON":
+        import json
+
+        try:
+            item = json.loads(value)
+        except ValueError as exc:
+            raise ComputeLaunchError("factory work item is not JSON") from exc
+        if (not isinstance(item, dict) or not isinstance(item.get("run_id"), str)
+                or re.fullmatch(r"(?:chainlink-)?[1-9][0-9]*", item["run_id"]) is None):
+            raise ComputeLaunchError("factory work item identity is invalid")
     if _refers_to_controller_home(value):
         raise ComputeLaunchError(f"worker environment {name} refers to controller home")
     return value
@@ -486,7 +529,7 @@ def _validate_dynamic_worker_name(name: object) -> str:
     upper = name.upper()
     if (
         name in _ENABLED_SYNTHESIZED_NAMES
-        or upper.startswith(_ENABLED_DENIED_PREFIXES)
+        or (upper.startswith(_ENABLED_DENIED_PREFIXES) and name != "MIMIR_WORK_ITEM_JSON")
         or "GITHUB" in upper
     ):
         raise ComputeLaunchError(f"worker environment {name} is denied")
@@ -815,54 +858,11 @@ class LocalSubprocessComputeBackend:
                             environment[f"GIT_CONFIG_VALUE_{index}"] = value
                     if runtime_path:
                         environment["PATH"] = runtime_path
-                    # MUST stay OUTSIDE the checkout. opencode snapshots its
-                    # working tree with `git add --all` using a git-dir under
-                    # $XDG_DATA_HOME, so a data dir inside that tree makes every
-                    # snapshot index the objects the previous snapshot wrote.
-                    # Observed on chainlink #1610 attempt 6: the store reached
-                    # 6.2 GiB of a 6.8 GiB checkout (the repo itself is 247 MiB),
-                    # and one `git add --all` ran 2h08m at 350% CPU without
-                    # finishing, so the run burned three hours before the first
-                    # spec step. The attempt directory is the right home: still
-                    # per-attempt and still swept with the attempt, but a sibling
-                    # of the tree rather than inside it. checkout.py pre-creates
-                    # it group-writable because the worker runs as `worklink`
-                    # while the attempt boundary stays controller-owned.
-                    environment["XDG_DATA_HOME"] = str(
-                        spec.local_checkout.parent / ".factory-runtime" / "data"
-                    )
                     if Path(command[0]).name == "opencode":
-                        from mimir_cultivate.opencode import _read_object, opencode_worker_documents
-                        from .backends.opencode import resolve_worklink_opencode_invocation
-
-                        resolution = resolve_worklink_opencode_invocation(spec.env)
-                        invocation = resolution.invocation
-                        documents = opencode_worker_documents(invocation, resolution.env)
-                        native = (
-                            _read_object(invocation.config_path, kind="config")[0]
-                            if invocation.config_path.exists() else {}
-                        )
-                        # Preserve trusted native plugin registrations, profiles and
-                        # commands; project only the selected provider credentials.
-                        native.update(json.loads(documents.config_document))
-                        projections[:] = [WorkerProjection(
-                            path=".config/opencode/opencode.json",
-                            document=json.dumps(native).encode(),
-                        )]
-                        if documents.auth_document is not None:
-                            projections.append(WorkerProjection(
-                                path=".local/share/opencode/auth.json",
-                                document=documents.auth_document,
-                            ))
-                        for name in invocation.remove_env:
-                            environment.pop(name, None)
-                        environment["OPENCODE_CONFIG"] = (
-                            f"{environment['XDG_CONFIG_HOME']}/opencode/opencode.json"
-                        )
+                        raise ComputeLaunchError("OpenCode workloads require daemon sessions")
                 else:
                     environment = _enabled_child_env(spec, identifier)
-                try:
-                    return await execute_contained(
+                return await execute_contained(
                         command,
                         capability,
                         filter_otlp_env({
@@ -878,38 +878,6 @@ class LocalSubprocessComputeBackend:
                         stdout_sink=stdout_sink,
                         stderr_sink=stderr_sink,
                     )
-                finally:
-                    if factory and Path(command[0]).name == "opencode" and (
-                        resolution.invocation.provider == "openai"
-                        and resolution.env.get("MIMIR_MODEL_SPEC", "").startswith("codex-plus:")
-                    ):
-                        from mimir.event_logger import safe_log_event
-                        from mimir_cultivate.opencode import OpenCodeAuthError, reconcile_codex_auth
-                        from .worker_client import run_factory_control
-                        from . import factory_auth
-
-                        try:
-                            # The controller cannot open worklink's 0600 runtime
-                            # auth. Factory control revalidates the exact attempt
-                            # boundary and reads it as the checkout owner.
-                            read = await asyncio.to_thread(
-                                run_factory_control, spec.local_checkout,
-                                (sys.executable, "-I", str(Path(factory_auth.__file__).resolve())),
-                                env={}, output_limit=factory_auth.MAX_AUTH_BYTES + 1,
-                            )
-                            if read.returncode == 0:
-                                reconcile_codex_auth(
-                                    resolution.env,
-                                    refreshed_document=read.stdout,
-                                )
-                            elif read.returncode != factory_auth.AUTH_MISSING_EXIT:
-                                raise OpenCodeAuthError("auth_unreadable")
-                        except Exception as exc:
-                            reason = exc.reason_code if isinstance(exc, OpenCodeAuthError) else "auth_unreadable"
-                            await safe_log_event(
-                                "worklink_factory_auth_reconcile_failed",
-                                issue_id=spec.issue_id, attempt=spec.attempt, reason_code=reason,
-                            )
             except asyncio.CancelledError:
                 if not started.done():
                     started.cancel()

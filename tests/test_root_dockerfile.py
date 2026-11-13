@@ -18,8 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
-FACTORY_VERSION = "0.12.1"
-OPENCODE_VERSION = "1.19.4"
+FACTORY_VERSION = "0.14.0"
+OPENCODE_VERSION = "2.2.7"
 from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
@@ -55,8 +55,11 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
     assert "ARG FACTORY_VERSION=0.10.16" in fixture  # Historical snapshot; pins have since advanced.
 
     def normal(text: str) -> str:
-        return " ".join(text.replace("\\\n", " ").replace('"', "").replace("'", "")
-                        .replace("opencode-ai@1.18.21", "opencode-ai@1.19.4").split())
+        text = " ".join(text.replace("\\\n", " ").replace('"', "").replace("'", "").split())
+        return (text.replace("opencode-ai@1.18.21", "@opencode/cli@2.2.7 @openai/codex@0.139.0")
+                .replace("opencode-feature-factory@", "opencode2-feature-factory@")
+                .replace("opencode-project-memory@0.1.0 opencode-openai-codex-auth@4.4.0 opencode-anthropic-auth@0.0.13",
+                         "@devtheops/opencode-plugin-otel@2.1.0"))
 
     baseline = (
         blocks[0], blocks[1], blocks[2] + "\n" + blocks[3], blocks[4], blocks[5]
@@ -70,10 +73,9 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
          "poppler-utils tesseract-ocr tesseract-ocr-eng libjemalloc2",
          "curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -",
          "apt-get install -y --no-install-recommends nodejs",
-         "npm install --global --prefix /opt/mimir-opencode", "opencode-ai@1.19.4",
-         "feature-factory@${FACTORY_VERSION}", "opencode-feature-factory@${FACTORY_VERSION}",
-         "opencode-project-memory@0.1.0", "opencode-openai-codex-auth@4.4.0",
-         "opencode-anthropic-auth@0.0.13", "apt-get clean", "rm -rf /var/lib/apt/lists/*"),
+          "npm install --global --prefix /opt/mimir-opencode", "@opencode/cli@2.2.7", "@openai/codex@0.139.0",
+          "feature-factory@${FACTORY_VERSION}", "opencode2-feature-factory@${FACTORY_VERSION}",
+          "@devtheops/opencode-plugin-otel@2.1.0", "apt-get clean", "rm -rf /var/lib/apt/lists/*"),
         ("groupadd --gid 1001 mimir", "groupadd --gid 1002 worklink",
          "useradd --create-home --uid 1001 --gid mimir --groups worklink --shell /bin/bash mimir",
          "useradd --no-create-home --uid 1002 --gid worklink --home-dir /nonexistent --shell /usr/sbin/nologin worklink",
@@ -152,9 +154,7 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
             new = "xz-utils lsof file unzip less make netcat-openbsd iproute2 psmisc poppler-utils"
             expected_steps = [step.replace(old, new) for step in expected_steps]
             # The container-owned Codex login uses a pinned CLI in the image.
-            expected_steps = [step.replace("opencode-ai@1.18.21",
-                                           "opencode-ai@1.19.4 @openai/codex@0.139.0")
-                              for step in expected_steps]
+            expected_steps = [normal(step) for step in expected_steps]
         if name == "executor.sh":
             # Intentional post-extraction changes, each pinned exactly:
             # 0. The executor never embeds; filter the controller-only extra.
@@ -1003,12 +1003,13 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     assert "ARG MIMIR_ENABLE_OPENCODE=0" in text
     assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in text
     assert "npm install --global --prefix /opt/mimir-opencode" in text
-    assert f"opencode-ai@{OPENCODE_VERSION}" in text
+    assert f"@opencode/cli@{OPENCODE_VERSION}" in text
     assert '"feature-factory@${FACTORY_VERSION}"' in text
-    assert '"opencode-feature-factory@${FACTORY_VERSION}"' in text
-    assert "opencode-project-memory@0.1.0" in text
-    assert "opencode-openai-codex-auth@4.4.0" in text
-    assert "opencode-anthropic-auth@0.0.13" in text
+    assert '"opencode2-feature-factory@${FACTORY_VERSION}"' in text
+    assert "@devtheops/opencode-plugin-otel@2.1.0" in text
+    for retired in ("opencode-ai@", "opencode-feature-factory@", "opencode-project-memory@",
+                    "opencode-openai-codex-auth@", "opencode-anthropic-auth@"):
+        assert retired not in text
     assert "MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js" in text
     assert "prime" not in text.lower()
     assert 'if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then' in text

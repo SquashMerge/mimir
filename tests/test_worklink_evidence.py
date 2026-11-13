@@ -169,28 +169,17 @@ def test_opencode_resolver_filters_otlp_carriers_before_projection(monkeypatch, 
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/ordinary")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-    seen = {}
-    invocation = type("Invocation", (), {"model": "openai/model"})()
-
-    def resolve(*, env):
-        seen["resolver"] = dict(env)
-        return invocation
-
-    monkeypatch.setattr(opencode, "resolve_opencode_invocation", resolve)
-    monkeypatch.setattr(opencode, "opencode_model_from_agent_spec", lambda value: "openai/model")
     monkeypatch.setattr(opencode, "model_spec_at_call_time", lambda home: "codex-plus:model")
-    resolution = opencode.resolve_worklink_opencode_invocation({"MIMIR_HOME": str(tmp_path)})
-    assert resolution.invocation is invocation
     from mimir_cultivate.worklink.backends.base import WorkOrder
     spec = opencode.OpenCodeBackend().work_spec(
         WorkOrder(845, tmp_path, "build", None, 30, {"MIMIR_MODEL_SPEC": "codex-plus:model", **_OTLP_CARRIERS}),
         attempt=1, repo_url="repo", base_ref="main", branch="issue/845-a1", test_command="uv run pytest")
     refreshed = opencode.OpenCodeBackend().refresh_codex_projections(spec, {"MIMIR_HOME": str(tmp_path), **_OTLP_CARRIERS})
-    for observed in (seen["resolver"], resolution.env, refreshed.env):
+    for observed in (spec.env, refreshed.env):
         assert not _OTLP_CARRIERS.keys() & observed.keys()
         assert not any(value in repr(observed) for value in _OTLP_CARRIERS.values())
-    assert resolution.env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
-    assert resolution.env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" not in spec.env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in spec.env
     assert "worker_projections" not in refreshed.backend_config
 
     # The production gate environment must not recreate any leaf auth document.

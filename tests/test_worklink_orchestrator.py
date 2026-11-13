@@ -42,7 +42,6 @@ from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimR
 from mimir_cultivate.worklink.checkout import CheckoutLease
 from mimir_cultivate.worklink.detached_dispatch import FactoryRecoveryIdentity
 from mimir_cultivate.worklink.backends.feature_factory import (
-    _FACTORY_PERMISSION,
     FactoryContractError,
     FactoryStatus,
     FeatureFactoryBackend,
@@ -779,6 +778,7 @@ def test_factory_launch_binding_requires_the_resolved_publishing_identity(
     """
     import mimir_cultivate.worklink.orchestrator as orchestrator
     from mimir_cultivate.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
+    from mimir_cultivate.worklink.backends.base import SessionRequest
 
     def _spec(env: dict[str, str]) -> WorkSpec:
         return WorkSpec(
@@ -793,9 +793,10 @@ def test_factory_launch_binding_requires_the_resolved_publishing_identity(
             backend="feature_factory",
             timeout_s=30,
             env=env,
-            backend_config={"run_id": "chainlink-700"},
+            backend_config={"run_id": "chainlink-700", "publishing_identity": env.get(FACTORY_PUBLISHING_IDENTITY_ENV)},
             local_checkout=tmp_path,
-            local_argv=("opencode", "run", " --autonomous chainlink-700"),
+            session_request=SessionRequest("epic", {"providerID": "openai", "id": "test"},
+                                           "--autonomous --max-retries 5 chainlink-700"),
         )
 
     with pytest.raises(WorklinkError, match="publishing identity"):
@@ -2011,7 +2012,7 @@ def test_epic_run_requests_tracker_transitions_in_order(tmp_path, monkeypatch) -
         kwargs["factory_record"] = current.observed(
             replace(
                 _factory_lifecycle_status(Path(current.sandbox), status="completed"),
-                run_id=current.run_id, branch=current.branch,
+                run_id=current.run_id, branch=current.branch, lock_session=current.opencode_session_id,
             ),
             datetime.now(UTC).isoformat(),
         )
@@ -5431,7 +5432,7 @@ def test_run_epic_autonomy_refusal_emits_leaf_event_name(
             "worklink_autonomous_refused",
             {
                 "issue_id": 701,
-                "compute_backend": "local_subprocess",
+                "compute_backend": "opencode_daemon",
                 "reason": result.reason,
             },
         )
@@ -5620,30 +5621,38 @@ def test_checkout_git_identity_collects_all_failures_before_refusing(
     assert calls == ["user.name", "user.email"]
 
 
+@pytest.mark.parametrize("configured", [False, True])
 @pytest.mark.parametrize(
-    ("payload", "expected"),
+    "payload",
     [
-        ({"publishing_identity": " factory-owner "}, "factory-owner"),
-        ({"publishing_identity": ""}, None),
-        ({"publishing_identity": 7}, None),
-        ({"bootstrap": "token=should-not-leak"}, None),
+        {"publishing_identity": " factory-owner "},
+        {"publishing_identity": ""},
+        {"publishing_identity": 7},
+        {"bootstrap": "token=should-not-leak"},
     ],
 )
 def test_factory_publishing_identity_is_read_only_and_nonblank(
-    tmp_path: Path, payload: dict[str, object], expected: str | None
+    tmp_path: Path, payload: dict[str, object], configured: bool,
 ) -> None:
     declaration = tmp_path / ".factory.json"
     declaration.write_text(json.dumps(payload), encoding="utf-8")
     before = declaration.read_bytes()
 
-    if expected is None:
-        with pytest.raises(RuntimeError, match="factory publishing identity is missing") as exc:
-            _read_factory_publishing_identity(tmp_path, {})
+    environ = {"GITHUB_TOKEN": "fixture-token"}
+    if configured:
+        environ["MIMIR_FACTORY_PUBLISHING_IDENTITY"] = " env-owner "
+    original = dict(environ)
+    if "publishing_identity" in payload or not configured:
+        message = "legacy" if "publishing_identity" in payload else "requires MIMIR_FACTORY_PUBLISHING_IDENTITY"
+        with pytest.raises(RuntimeError, match=message) as exc:
+            _read_factory_publishing_identity(tmp_path, environ)
         assert "should-not-leak" not in str(exc.value)
     else:
-        assert _read_factory_publishing_identity(tmp_path, {}) == (expected, ".factory.json")
+        assert _read_factory_publishing_identity(tmp_path, environ) == (
+            "env-owner", "environment variable MIMIR_FACTORY_PUBLISHING_IDENTITY")
 
     assert declaration.read_bytes() == before
+    assert environ == original
 
 
 @pytest.mark.parametrize(
@@ -5671,28 +5680,29 @@ def test_factory_publishing_identity_missing_declaration_is_secret_safe(tmp_path
     assert str(exc.value) == "factory publishing identity declaration is unreadable"
 
 
-def test_factory_publishing_identity_environment_override_wins_without_reading_file(
+def test_factory_publishing_identity_uses_environment_without_repository_fallback(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / ".factory.json").write_text("{}")
     assert _read_factory_publishing_identity(
-        tmp_path, {"MIMIR_FACTORY_PUBLISHING_IDENTITY": " deployment-owner "}
+        tmp_path, {"GITHUB_TOKEN": "fixture-token", "MIMIR_FACTORY_PUBLISHING_IDENTITY": " deployment-owner "}
     ) == (
         "deployment-owner",
         "environment variable MIMIR_FACTORY_PUBLISHING_IDENTITY",
     )
 
 
-@pytest.mark.parametrize("value", ["", "   ", 7, None])
+@pytest.mark.parametrize("value", ["", "   ", 7, None, "owner\nspoof", "owner\x00spoof"])
 def test_factory_publishing_identity_invalid_environment_override_fails_closed(
     tmp_path: Path, value: object
 ) -> None:
     (tmp_path / ".factory.json").write_text(
-        json.dumps({"publishing_identity": "file-owner"}), encoding="utf-8"
+        "{}", encoding="utf-8"
     )
 
     with pytest.raises(RuntimeError, match="MIMIR_FACTORY_PUBLISHING_IDENTITY"):
         _read_factory_publishing_identity(
-            tmp_path, {"MIMIR_FACTORY_PUBLISHING_IDENTITY": value}
+            tmp_path, {"GITHUB_TOKEN": "fixture-token", "MIMIR_FACTORY_PUBLISHING_IDENTITY": value}
         )
 
 
@@ -5803,7 +5813,7 @@ def _stub_factory_launch_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         orchestrator, "_read_factory_publishing_identity",
-        lambda repo: ("factory-owner", ".factory.json"),
+        lambda repo, environ=None: ("factory-owner", "environment variable MIMIR_FACTORY_PUBLISHING_IDENTITY"),
     )
     monkeypatch.setattr(
         orchestrator, "_resolve_factory_github_credential",
@@ -5884,7 +5894,7 @@ def _run_factory_preflight_case(
     checkout = tmp_path / "factory-checkout"
     checkout.mkdir()
     (repo / ".factory.json").write_text(
-        json.dumps({"publishing_identity": publishing_identity, "bootstrap": "uv sync"}),
+        json.dumps({"bootstrap": "uv sync"}),
         encoding="utf-8",
     )
     epic = json.dumps(
@@ -5940,7 +5950,8 @@ def _run_factory_preflight_case(
             return await compute_launch(self, spec)
         if outcome is None:
             raise RuntimeError("launch reached")
-        return LaunchHandle("local_subprocess", "123", 456)
+        return LaunchHandle("opencode_daemon", "ses_fixture", opencode_session_id="ses_fixture",
+                            launch_generation="fixture-generation")
 
     verified_tokens: list[str] = []
 
@@ -5957,11 +5968,22 @@ def _run_factory_preflight_case(
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", raising=False)
+    if isinstance(publishing_identity, str):
+        monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", publishing_identity)
     if publishing_identity_override is not None:
         monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", publishing_identity_override)
     for key, value in (credentials or {}).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    from mimir_cultivate.worklink import daemon_health
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True, "launch_generation": "fixture"})
+    def initialize(self, run_id, *, operator_checkout, base_ref, publishing_identity, git_settings=(), timeout_s=60, credentials=None, max_retries=None):
+        sandbox = operator_checkout / ".factory-sandboxes" / run_id
+        sandbox.mkdir(parents=True)
+        return FactoryStatus(run_id=run_id, valid=True, sandbox_path=str(sandbox), status="running",
+            mode="autonomous", branch=f"feature/{run_id}", pr_base=base_ref, pr_draft=False,
+            lock="absent", lock_session=None, dead_lock=False)
+    monkeypatch.setattr(FeatureFactoryBackend, "initialize", initialize)
     def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
         before_claim = kwargs.get("before_claim")
         if callable(before_claim):
@@ -5990,16 +6012,21 @@ def _run_factory_preflight_case(
 
     monkeypatch.setattr(orchestrator, "_create_backend_checkout", create_checkout)
     monkeypatch.setattr(orchestrator, "GitHubForgeClient", Client)
-    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    monkeypatch.setattr(OpenCodeDaemonComputeBackend, "launch", launch)
     if outcome is not None:
         async def supervise(*args: object, **kwargs: object) -> object:
+            current = kwargs["factory_record"]
+            current = replace(current, children_reaped=True)
+            kwargs["factory_record"] = current
+            save_factory_record(tmp_path, current)
             if terminal is not None:
                 return await terminal(_supervisor=args[0], **kwargs)
             if outcome == "post_merge_refusal":
                 current = kwargs["factory_record"]
                 assert isinstance(current, FactoryRunRecord)
                 sandbox = Path(current.sandbox)
-                sandbox.mkdir(parents=True)
+                sandbox.mkdir(parents=True, exist_ok=True)
                 status = parse_factory_status({
                     "run_id": current.run_id,
                     "issue_key": str(current.issue_id),
@@ -6012,7 +6039,7 @@ def _run_factory_preflight_case(
                     "pr_draft": False,
                     "lock": "fresh",
                     "dead_lock": False,
-                    "lock_session": "session-1",
+                    "lock_session": current.opencode_session_id,
                     "gates": {
                         "pre_pr": {
                             "status": "running", "at": None, "artifact": None,
@@ -6034,7 +6061,7 @@ def _run_factory_preflight_case(
                     replace(
                         current,
                         status=status,
-                        session="session-1",
+                        session=current.opencode_session_id,
                         controller_phase="terminal",
                     ),
                 )
@@ -6119,7 +6146,7 @@ def test_factory_success_prompt_only_after_success(tmp_path, monkeypatch, autono
         kwargs["factory_record"] = current.observed(
             replace(
                 _factory_lifecycle_status(Path(current.sandbox), status=status),
-                run_id=current.run_id, branch=current.branch,
+                run_id=current.run_id, branch=current.branch, lock_session=current.opencode_session_id,
             ),
             datetime.now(UTC).isoformat(),
         )
@@ -6375,7 +6402,7 @@ def test_factory_failure_is_durable_before_release_and_blocks_concurrent_core_ad
         assert order_seen == ["incident", "release"]
 
 
-def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
+def test_factory_initial_launch_delegates_nested_checkout_permissions_to_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import stat
@@ -6400,12 +6427,13 @@ def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
     assert len(checkout_calls) == 1
     assert checkout_calls[0]["worker_eligible"] is True
     sandbox_root = tmp_path / "factory-checkout" / ".factory-sandboxes"
-    assert ownership == [(sandbox_root, -1, 12345)]
-    assert stat.S_IMODE(sandbox_root.stat().st_mode) == 0o2770
+    assert ownership == []
+    assert launched[0].local_checkout == sandbox_root / "chainlink-700"
+    assert launched[0].session_request.kind == "epic"
 
 
 @pytest.mark.parametrize("coding", ["0", "1"])
-def test_factory_permission_failure_prevents_launch(
+def test_factory_controller_chown_is_not_a_daemon_admission_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding: str,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
@@ -6422,10 +6450,8 @@ def test_factory_permission_failure_prevents_launch(
         tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
         outcome="needs-human",
     )
-    assert result.status == "failed"
-    assert not launched
-    assert "cannot share the factory sandbox directory" in result.reason
-    assert "no agent-user fallback" in result.reason
+    assert result.status == "needs-human"
+    assert len(launched) == 1 and launched[0].session_request.kind == "epic"
 
 
 def test_factory_missing_worker_identity_is_actionable(
@@ -6642,20 +6668,18 @@ def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
     assert result.reason == "launch reached"
     assert verified_tokens == [selected]
     assert len(launched) == 1
-    assert launched[0].factory_credential_settings == settings
-    assert launched[0].env["GH_TOKEN"] == selected
-    assert launched[0].env["GITHUB_TOKEN"] == selected
+    assert launched[0].factory_credential_settings == (*settings, ("user.name", "Factory Author"),
+                                                     ("user.email", "factory@example.com"))
+    assert "GH_TOKEN" not in launched[0].env
+    assert "GITHUB_TOKEN" not in launched[0].env
     assert json.loads(launched[0].env["MIMIR_WORK_ITEM_JSON"]) == {
         "run_id": "chainlink-700",
         "title": "epic",
         "body": "build",
     }
-    assert launched[0].env["GIT_AUTHOR_NAME"] == "Factory Author"
-    assert launched[0].env["GIT_AUTHOR_EMAIL"] == "factory@example.com"
-    assert launched[0].env["GIT_COMMITTER_NAME"] == "Factory Author"
-    assert launched[0].env["GIT_COMMITTER_EMAIL"] == "factory@example.com"
+    assert not any(key.startswith("GIT_") for key in launched[0].env)
     assert launched[0].branch == "feature/chainlink-700"
-    assert launched[0].local_checkout == tmp_path / "factory-checkout"
+    assert launched[0].local_checkout == tmp_path / "factory-checkout/.factory-sandboxes/chainlink-700"
     checkout_configs = [
         command
         for command in commands
@@ -6676,10 +6700,11 @@ def test_factory_dispatched_environment_sets_real_commit_author_and_committer(
     checkout = tmp_path / "factory-checkout"
     subprocess.run(["git", "-C", str(checkout), "init", "-q"], check=True)
     (checkout / "change.txt").write_text("factory change\n", encoding="utf-8")
-    child_env = dict(os.environ)
-    child_env.update(launched[0].env)
-    child_env["GIT_CONFIG_NOSYSTEM"] = "1"
-    child_env["GIT_CONFIG_GLOBAL"] = os.devnull
+    from mimir_cultivate.worklink.daemon_sessions import session_environment
+    worker_home = tmp_path / "worker-home"
+    worker_home.mkdir()
+    child_env = session_environment(dict(launched[0].env), home=worker_home,
+        git_settings=launched[0].factory_credential_settings, credentials={})
     subprocess.run(["git", "-C", str(checkout), "add", "change.txt"], check=True, env=child_env)
     subprocess.run(
         ["git", "-C", str(checkout), "commit", "-q", "-m", "factory commit"],
@@ -6762,7 +6787,7 @@ def test_missing_factory_publishing_identity_prevents_launch(
         publishing_identity=" ",
     )
 
-    assert result.reason == "factory publishing identity is missing"
+    assert result.reason == "invalid MIMIR_FACTORY_PUBLISHING_IDENTITY"
     assert launched == []
     assert verified_tokens == []
 
@@ -6778,7 +6803,7 @@ def test_blank_factory_publishing_identity_override_prevents_launch_without_fall
         publishing_identity_override=" ",
     )
 
-    assert result.reason == "MIMIR_FACTORY_PUBLISHING_IDENTITY is set but blank"
+    assert result.reason == "invalid MIMIR_FACTORY_PUBLISHING_IDENTITY"
     assert launched == []
     assert verified_tokens == []
 
@@ -6914,14 +6939,14 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     )
     declaration = repo / ".factory.json"
     declaration.write_text(
-        json.dumps({"publishing_identity": "factory-owner", "bootstrap": "uv sync"}),
+        json.dumps({"bootstrap": "uv sync"}),
         encoding="utf-8",
     )
     declaration_before = declaration.read_bytes()
     lease.path.mkdir()
     sandbox_declaration = lease.path / ".factory.json"
     sandbox_declaration.write_text(
-        json.dumps({"publishing_identity": "sandbox-owner"}), encoding="utf-8"
+        json.dumps({"bootstrap": "sandbox-specific-bootstrap"}), encoding="utf-8"
     )
     sandbox_declaration_before = sandbox_declaration.read_bytes()
 
@@ -6944,28 +6969,15 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     async def stop_after_placement(self: object, spec: WorkSpec) -> LaunchHandle:
         preflight_events.append("launch")
         assert spec.branch == "feature/chainlink-700"
+        assert spec.local_checkout == lease.path / ".factory-sandboxes/chainlink-700"
+        assert spec.session_request.kind == "epic" and spec.local_argv is None
         assert spec.env == {
-            "MIMIR_HOME": str(tmp_path),
             "MIMIR_WORK_ITEM_JSON": json.dumps(
                 {"body": description, "run_id": "chainlink-700", "title": "epic"},
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
             ),
-            "GH_TOKEN": "selected-token",
-            "GITHUB_TOKEN": "selected-token",
-            "GIT_AUTHOR_NAME": "Factory Author",
-            "GIT_AUTHOR_EMAIL": "factory@example.com",
-            "GIT_COMMITTER_NAME": "Factory Author",
-            "GIT_COMMITTER_EMAIL": "factory@example.com",
-            # Forwarded under the FACTORY child's name, resolved controller-side.
-            "FACTORY_PUBLISHING_IDENTITY": "factory-owner",
-            # Default launch policy: a headless factory run cannot answer an
-            # interactive permission prompt, so secret reads are denied rather
-            # than left to OpenCode's built-in ask rule. A WorkOrder may override
-            # this, which is why it is asserted here as part of the exact
-            # launch-environment contract.
-            "OPENCODE_PERMISSION": _FACTORY_PERMISSION,
         }
         raise RuntimeError("stop after placement")
 
@@ -6977,9 +6989,9 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
         preflight_events.append("git-identity")
         return original_read_git_identity(checkout, command_runner)
 
-    def read_publishing_identity(checkout_repo: Path) -> str:
+    def read_publishing_identity(checkout_repo: Path, environ=None) -> tuple[str, str]:
         preflight_events.append("publishing-identity")
-        return original_read_publishing_identity(checkout_repo)
+        return original_read_publishing_identity(checkout_repo, os.environ if environ is None else environ)
 
     def resolve_credential(environ: object) -> tuple[str, dict[str, str]]:
         preflight_events.append("credential")
@@ -6996,6 +7008,18 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
 
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", " selected-token ")
+    monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", "factory-owner")
+    from mimir_cultivate.worklink import daemon_health
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
+    def initialize(self, run_id, **kwargs):
+        preflight_events.append("initialize")
+        assert kwargs["operator_checkout"] == lease.path and kwargs["base_ref"] == expected_base
+        sandbox = lease.path / ".factory-sandboxes" / run_id
+        sandbox.mkdir(parents=True)
+        return FactoryStatus(run_id, True, str(sandbox), status="running", mode="autonomous",
+            branch=f"feature/{run_id}", pr_base=expected_base, pr_draft=False, lock="absent", dead_lock=False)
+    monkeypatch.setattr(FeatureFactoryBackend, "initialize", initialize)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims,
@@ -7014,7 +7038,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     monkeypatch.setattr(orchestrator, "_resolve_factory_github_credential", resolve_credential)
     monkeypatch.setattr(orchestrator, "GitHubForgeClient", VerifiedClient)
     monkeypatch.setattr(
-        orchestrator.LocalSubprocessComputeBackend, "launch", stop_after_placement
+        OpenCodeDaemonComputeBackend, "launch", stop_after_placement
     )
     monkeypatch.setattr(
         orchestrator,
@@ -7041,6 +7065,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
         "publishing-identity",
         "credential",
         "verify",
+        "initialize",
         "launch",
     ]
     assert worklink_events[-1] == (
@@ -7328,7 +7353,7 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
         "run_id": "factory status run id mismatch",
         "sandbox_path": "factory status sandbox mismatch",
         "branch": "factory status branch mismatch",
-        "snapshot": "factory recovery requires a published park snapshot",
+        "snapshot": "legacy factory host requires operator parking and fresh daemon recovery",
         "nonresumable_status": "factory recovery status is not resumable",
         "probe_runtime_error": "checkout probe unavailable",
         "probe_os_error": "checkout probe unavailable",
@@ -8222,7 +8247,8 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
         branch="epic/700",
         launcher="/opt/factory/bin/factory.js",
         sandbox=str(sandbox),
-        session="session-1",
+        session=handle.opencode_session_id or "session-1",
+        opencode_session_id=handle.opencode_session_id,
         handle=handle,
         status=None,
         observed_at=None,
@@ -8236,79 +8262,60 @@ class _FactoryLifecycleClaims:
 
 
 @pytest.mark.parametrize("outcome", ["needs-human", "completed"])
-def test_factory_auth_read_failure_preserves_worklink_outcome(tmp_path, monkeypatch, outcome):
-    """Real compute collection feeds real supervision, persistence and label transitions."""
+def test_factory_terminal_outcome_never_reads_back_agent_auth(tmp_path, monkeypatch, outcome):
+    """Agent auth is independent, including when terminal bookkeeping runs."""
     from mimir import event_logger
-    from mimir_cultivate.worklink import compute, dispatch_failures, orchestrator, worker_client
-
-    original_launch = compute.LocalSubprocessComputeBackend.launch
-    original_wait = compute.LocalSubprocessComputeBackend.wait
-    original_supervise = WorklinkRunner._supervise_factory_070
-    collected = threading.Event()
+    from mimir_cultivate.worklink import dispatch_failures, orchestrator
     original_transition = ChainlinkClaims.transition_issue
     events = []
     reason = "human approval required for factory decision"
-    status = None
-
-    def control(*args, **kwargs):
-        raise PermissionError("worker-owned auth")
-
-    async def execute(command, capability, environment, projections, **kwargs):
-        capability._contained_started(SimpleNamespace(pid=None))
-        return compute.CollectedExecutionResult(0, b"driver exited", b"", False, False, 0, 0)
+    private = tmp_path / "agent/.codex/auth.json"
+    private.parent.mkdir(parents=True)
+    private.write_text('{"refresh":"independent-agent-material"}')
+    before = private.read_bytes()
+    def model_only(home, patch):
+        patch.setenv("HOME", str(private.parents[1]))
+        patch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test")
+    monkeypatch.setattr(sys.modules[__name__], "_configure_opencode_oauth", model_only)
 
     async def log_event(name, **kwargs):
         events.append((name, kwargs))
 
-    async def launch(backend, spec):
-        nonlocal status
-        backend._worker_client = object()
-        handle = await original_launch(backend, spec)
-        sandbox = spec.local_checkout / ".factory-sandboxes/chainlink-700"
-        sandbox.mkdir(parents=True)
-        snapshot = spec.local_checkout / ".factory/.parked/chainlink-700"
+    async def terminal(_supervisor, **kwargs):
+        current = kwargs["factory_record"]
+        sandbox = Path(current.sandbox)
+        snapshot = sandbox.parent.parent / ".factory/.parked/chainlink-700"
         snapshot.mkdir(parents=True)
         status = replace(
             _factory_lifecycle_status(sandbox, status=outcome, lock="absent",
-                                      park_snapshot=str(snapshot) if outcome == "needs-human" else None),
+                                      session=None, park_snapshot=str(snapshot) if outcome == "needs-human" else None),
             run_id="chainlink-700", branch="feature/chainlink-700", next=reason,
         )
-        return handle
-
-    async def wait(backend, handle, timeout_s):
-        try:
-            return await original_wait(backend, handle, timeout_s)
-        finally:
-            collected.set()
-
-    def read_status(*args, **kwargs):
-        # Let real supervision drain compute first: the raising mutation must
-        # propagate through its wait task, not fail artificially at launch.
-        assert collected.wait(10)
-        return status
-
-    async def supervise(_supervisor, **kwargs):
+        current = replace(current.observed(status, datetime.now(UTC).isoformat()),
+                          controller_phase="parked" if outcome == "needs-human" else "terminal")
+        save_factory_record(tmp_path, current)
+        kwargs["factory_record"] = current
+        kwargs.pop("autonomous")
         monkeypatch.setattr(ChainlinkClaims, "transition_issue", original_transition)
-        return await original_supervise(_supervisor, **kwargs)
+        return await _supervisor._finish_factory_070(**kwargs)
 
     async def verify(**kwargs):
         assert kwargs["record"].status.status == "completed"
         return tmp_path / "evidence.json", "https://github.com/owner/repo/pull/42"
 
-    async def cancel(*args):
-        pass  # The fake driver has already exited; there is no OS child to cancel.
-
-    monkeypatch.setattr(compute, "execute_contained", execute)
-    monkeypatch.setattr(worker_client, "run_factory_control", control)
     monkeypatch.setattr(event_logger, "safe_log_event", log_event)
-    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "cancel", cancel)
-    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "wait", wait)
     monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
-    monkeypatch.setattr(FeatureFactoryBackend, "status", read_status)
-    result, launched, _, commands = _run_factory_preflight_case(
-        tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
-        outcome=outcome, terminal=supervise, compute_launch=launch,
-    )
+    original_open = Path.open
+    def guarded(path, *args, **kwargs):
+        if path == private:
+            pytest.fail("factory bookkeeping attempted to access agent auth")
+        return original_open(path, *args, **kwargs)
+    with monkeypatch.context() as guard:
+        guard.setattr(Path, "open", guarded)
+        result, launched, _, commands = _run_factory_preflight_case(
+            tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
+            outcome=outcome, terminal=terminal)
+    assert private.read_bytes() == before
     assert len(launched) == 1
     assert result.status == ("needs-human" if outcome == "needs-human" else "review_ready"), result.reason
     assert result.next == reason
@@ -8322,9 +8329,7 @@ def test_factory_auth_read_failure_preserves_worklink_outcome(tmp_path, monkeypa
     assert retained.controller_error is None
     failures = dispatch_failures.load_failure_state(dispatch_failures.dispatch_failure_state_dir(tmp_path))
     assert not failures.get("issues", {})
-    assert events == [("worklink_factory_auth_reconcile_failed", {
-        "issue_id": 700, "attempt": 1, "reason_code": "auth_unreadable",
-    })]
+    assert events == []
 
 
 @pytest.mark.parametrize("failure", [None, "transition", "milestone"])
@@ -8410,19 +8415,20 @@ def test_factory_recovery_credits_only_prior_park_not_crashed_resumes(tmp_path, 
     from mimir_cultivate.worklink.claims import ChainlinkClaims
     _stub_factory_launch_identity(monkeypatch)
     _configure_opencode_oauth(tmp_path, monkeypatch)
-    sandbox = tmp_path / "checkout/.factory-sandboxes/700"
+    sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-700"
     sandbox.mkdir(parents=True)
-    snapshot = sandbox.parent.parent / ".factory/.parked/700"
+    snapshot = sandbox.parent.parent / ".factory/.parked/chainlink-700"
     snapshot.mkdir(parents=True)
     now = datetime.now(UTC)
     prior = ClaimRecord(700, 1, "agent", now - timedelta(hours=2))
     park_time = (now - timedelta(hours=1)).isoformat()
-    pre = _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot))
-    retained = _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)).observed(pre, park_time)
+    pre = replace(_factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot)), run_id="chainlink-700")
+    retained = replace(_factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)),
+                       run_id="chainlink-700", children_reaped=True).observed(pre, park_time)
     if evidence == "missing-time":
         retained = replace(retained, observed_at=None)
     elif evidence == "running":
-        retained = retained.observed(_factory_lifecycle_status(sandbox, status="running"), park_time)
+        retained = retained.observed(replace(_factory_lifecycle_status(sandbox, status="running"), run_id=retained.run_id), park_time)
     elif evidence == "too-old":
         retained = replace(retained, observed_at=(prior.claimed_at - timedelta(seconds=1)).isoformat())
     assert retained.controller_phase != "parked"
@@ -8433,31 +8439,42 @@ def test_factory_recovery_credits_only_prior_park_not_crashed_resumes(tmp_path, 
     claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path)
     monkeypatch.setattr(claims, "_issue_comments", lambda issue_id, *, strict: list(history))
     expected_credit = int(evidence == "verified")
+    state = pre
+    from mimir_cultivate.worklink import daemon_health
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     class Backend(FeatureFactoryBackend):
         def status(self, *args, **kwargs):
-            return pre
+            return state
+        def lock(self, *args, **kwargs):
+            nonlocal state
+            assert args[1] == "release"
+            state = replace(state, lock="absent", lock_session=None)
         def resume(self, *args, **kwargs):
-            observed = load_factory_record(tmp_path, retained.run_id)
-            assert observed.observed_at == retained.observed_at
+            pytest.fail("fresh recovery must use the new plugin context")
+    class Compute:
+        async def launch(self, spec):
             if expected_credit:
-                assert observed.controller_phase == "parked"
-                assert observed.status == pre
+                archived = json.loads((tmp_path / "state/worklink/clean-parks/700-1.json").read_text())
+                assert archived["record"]["controller_phase"] == "parked"
+                assert archived["record"]["observed_at"] == park_time
             assert claims.attempts_used([prior.to_comment()]) == 1 - expected_credit
             assert claims.attempts_used([claim.to_comment()]) == 1
-            raise RuntimeError("resume crashed before leaving needs-human")
+            error = RuntimeError("admission crashed before leaving needs-human")
+            error.quiescent = True
+            raise error
     monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: sandbox)
     monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda rec: False)
     monkeypatch.setattr(orchestrator, "factory_process_is_verified_dead", lambda rec: True)
     for attempt in range(2, 6):
         claim = ClaimRecord(700, attempt, "agent", now + timedelta(seconds=attempt))
         history.append(claim.to_comment())
-        with pytest.raises(RuntimeError, match="resume crashed"):
+        with pytest.raises(RuntimeError, match="admission crashed"):
             asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
                 claim_record=claim, claims=claims, backend=Backend(entrypoint=retained.launcher),
-                compute=object(), retained=load_factory_record(tmp_path, retained.run_id),
+                compute=Compute(), retained=load_factory_record(tmp_path, retained.run_id),
                 launcher=Path(retained.launcher), repo_slug="owner/repo", base="main",
-                test_cmd="pytest -q", runner=lambda args: cp(args),
+                test_cmd="pytest -q", runner=lambda args: cp(args, stdout="https://github.com/owner/repo.git"),
                 work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
             ))
         assert claims.attempts_used(history) == len(history) - expected_credit
@@ -9510,7 +9527,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
         monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kw: "https://github.com/owner/repo.git")
         monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
         monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
-        recovered = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+        recovery = WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(700, 2, "agent", datetime.now(UTC)),
             claims=Claims(), backend=RecoveryBackend(entrypoint=retained.launcher),
@@ -9520,9 +9537,10 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
             work_item_json=orchestrator.render_work_item(
                 IssueContext(700, "epic", "build", {"worklink:epic"}),
             ),
-        ))
-        assert recovered.status == "needs-human"
-        assert recovery_events == ["claim", "resume", "release", "launch", "supervise"]
+        )
+        with pytest.raises(WorklinkError, match="legacy factory host"):
+            asyncio.run(recovery)
+        assert recovery_events == []
 
 
 def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) -> None:
@@ -9775,7 +9793,7 @@ def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
         def terminal(self, *args: object, **kwargs: object) -> None:
             raise AssertionError("dead process must take the existing failure path")
 
-    with pytest.raises(WorklinkError, match="OpenCode process exited"):
+    with pytest.raises(WorklinkError, match="OpenCode host stopped"):
         asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
@@ -10189,6 +10207,7 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
                 _factory_lifecycle_status(Path(self.record.sandbox), status="running"),
                 run_id=self.record.run_id,
                 branch=self.record.branch,
+                lock_session=self.record.session,
             )
             if status_calls <= 2 or terminal == "timeout":
                 return running
@@ -10304,6 +10323,7 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
                 _factory_lifecycle_status(Path(self.record.sandbox), status="running"),
                 run_id=self.record.run_id,
                 branch=self.record.branch,
+                lock_session=self.record.session,
             )
 
         def heartbeat(self, *args: object, **kwargs: object) -> None:
@@ -10656,12 +10676,12 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
-    handle = LaunchHandle("local_subprocess", "123", None)
+    handle = LaunchHandle("opencode_daemon", "ses_test1", opencode_session_id="ses_test1", launch_generation="test-generation")
     stopped = asyncio.Event()
     released = _factory_lifecycle_status(
         sandbox, status="running", lock="absent", session=None,
     )
-    record = replace(_factory_lifecycle_record(sandbox, handle), session="session-1")
+    record = _factory_lifecycle_record(sandbox, handle)
     status_calls = 0
     lifecycle: list[str] = []
 
@@ -10689,7 +10709,7 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
             status_calls += 1
             if lock_owner is not None:
                 return _factory_lifecycle_status(
-                    sandbox, status="running", lock="fresh", session=lock_owner,
+                    sandbox, status="running", lock="fresh", session="foreign-session",
                 )
             return released
 
@@ -10701,7 +10721,7 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
     monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", "3")
-    expected = "did not acquire the run lock before startup deadline"
+    expected = ("lock session does not match" if lock_owner else "did not acquire the run lock before startup deadline")
     with pytest.raises(WorklinkError, match=expected):
         asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
@@ -10709,11 +10729,11 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
             claims=object(), backend=Backend(), compute=Compute(),
             factory_record=record, test_cmd="pytest -q",
             runner=lambda args: cp(args), started_at=datetime.now(UTC),
-            initial_status=released, recovery_session="session-1",
+            initial_status=released, recovery_session="ses_test1",
         ))
-    assert status_calls >= 2
+    assert status_calls >= 1
     assert lifecycle == ["cancel", "cleanup"]
-    assert load_factory_record(tmp_path, "700").session == "session-1"
+    assert load_factory_record(tmp_path, "700").session == "ses_test1"
 
 
 @pytest.mark.parametrize("record_session", ["session-1", None], ids=["recovery", "initial-launch"])
@@ -10807,7 +10827,7 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
             recovery_session=None if pre_manifest else "session-1",
         )
 
-    if guard != "dead":
+    if guard != "dead" or record_session is None:
         with pytest.raises(WorklinkError):
             asyncio.run(run())
         assert "terminal" not in events
@@ -10826,12 +10846,7 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
     retained = load_factory_record(tmp_path, "700")
     assert retained.controller_phase == "parked"
     assert retained.status.park_snapshot == snapshot
-    # Recovery admits only a retained session, so a session-less launch gets a
-    # controller-owned one; an existing session is kept unchanged.
-    if record_session is None:
-        assert retained.session and retained.session.startswith("worklink-repark-")
-    else:
-        assert retained.session == record_session
+    assert retained.session == record_session
 
     _stub_factory_launch_identity(monkeypatch)
     _configure_opencode_oauth(tmp_path, monkeypatch)
@@ -10872,7 +10887,7 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
     monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kw: "https://github.com/owner/repo.git")
     monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
     monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
-    recovered = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+    recovery = WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
         issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
         claim_record=ClaimRecord(700, 2, "agent", datetime.now(UTC)),
         claims=Claims(), backend=RecoveryBackend(entrypoint=retained.launcher),
@@ -10880,9 +10895,10 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
         repo_slug="owner/repo", base="main", test_cmd="pytest -q",
         runner=lambda args: cp(args),
         work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
-    ))
-    assert recovered.status == "needs-human"
-    assert recovery_events == ["claim", "resume", "release", "launch", "supervise"]
+    )
+    with pytest.raises(WorklinkError, match="legacy factory host"):
+        asyncio.run(recovery)
+    assert recovery_events == []
 
 
 @pytest.mark.parametrize("after_valid", [False, True])
@@ -11383,6 +11399,57 @@ def test_factory_git_runner_forwards_controller_options(tmp_path: Path, args, te
     assert calls == [(args, tmp_path, text, options)]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["success", "github_failure"])
+async def test_factory_completion_preserves_admitted_session_and_mcp_after_observation(
+    tmp_path, monkeypatch, factory_completion_sandbox, case,
+):
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    sandbox = factory_completion_sandbox.with_name("chainlink-700")
+    sandbox.mkdir()
+    secret = "opaque-" + "completion-mcp-" + "header"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", secret)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await SessionController.create(client, tmp_path / "completion-controller.json",
+            request=SessionRequest("epic", {"providerID": "openai", "id": "gpt-test"},
+                                   "--autonomous --max-retries 5 chainlink-700"),
+            issue_id=700, attempt=1, generation="completion-generation", checkout=sandbox,
+            environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+        sid = controller.record.opencode_session_id
+        original = _completion_record(sandbox)
+        record = replace(original, run_id="chainlink-700", status=replace(original.status, run_id="chainlink-700"),
+            session=sid, opencode_session_id=sid,
+            handle=LaunchHandle("opencode_daemon", sid, opencode_session_id=sid,
+                                launch_generation="completion-generation"),
+            mcp_servers=("fixture-mcp", secret, "fixture-mcp"))
+        async def observed(**kwargs):
+            return _completion_validation(sandbox)
+        monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+        try:
+            invocation = orchestrator._verify_factory_completion(home=tmp_path,
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}), record=record,
+                test_command="pytest -q", started_at=datetime.now(UTC),
+                runner=_completion_runner(sandbox, case=case))
+            if case == "success":
+                await invocation
+            else:
+                with pytest.raises(WorklinkError):
+                    await invocation
+            encoded = (tmp_path / "state/worklink/evidence/700-1.json").read_text()
+            evidence = json.loads(encoded)
+            assert evidence["opencode_session_id"] == sid
+            assert evidence["mcp_servers"] == ["fixture-mcp", "<redacted>", "fixture-mcp"]
+            assert secret not in encoded
+            assert evidence["status"] == ("completed" if case == "success" else "failed")
+        finally:
+            await controller.release()
+
+
 def test_factory_completion_requires_entire_success_conjunction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_completion_sandbox: Path,
 ) -> None:
@@ -11601,7 +11668,7 @@ def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
 @pytest.mark.parametrize("retained_session", ["session-1", "session-2"])
 @pytest.mark.parametrize("idle_park", [False, True], ids=["operator-park", "idle-park"])
 @pytest.mark.parametrize("live_running", [False, True], ids=["live-parked", "dead-driver-running"])
-def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
+def test_process_era_recovery_never_guesses_a_daemon_host_or_consumes_a_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     lock: str,
@@ -11617,9 +11684,6 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     _stub_factory_launch_identity(monkeypatch)
     from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
     from mimir_cultivate.worklink.run_state import process_start_ticks
-
-    if local_compute and sys.platform != "linux":
-        pytest.skip("real process identity/reclamation integration requires Linux /proc")
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
     attempt = 3 if local_compute else 1
@@ -11745,70 +11809,18 @@ print(json.dumps([str(path) for path in pruned]))
 
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             self.launches += 1
-            assert spec.factory_credential_settings == credential_settings
-            # The full retained identity/diagnostics survive until launch publishes
-            # the replacement handle. Only observation fields may have changed.
-            saved = load_factory_record(tmp_path, "700")
-            assert saved is not None
-            assert saved.observed_at is not None
-            assert saved.observed_at != retained.observed_at
-            expected_status = (
-                replace(live_parked, lock="fresh", dead_lock=False,
-                        lock_session=retained_session, next="implementation", next_present=True)
-                if live_running else live_initial
-            )
-            expected_record = replace(
-                retained, status=expected_status, observed_at=saved.observed_at,
-                # The running path persists an observed park before resume;
-                # observed() clears the old driver diagnostic, not its identity.
-                controller_error=None if live_running else retained.controller_error,
-            )
-            if saved != expected_record:
-                pytest.fail(f"retained launch record {saved!r} differs from {expected_record!r}", pytrace=False)
-            if local_compute:
-                self.process = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(300)"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                ticks = process_start_ticks(self.process.pid)
-                assert ticks is not None
-                self.handle = LaunchHandle("local_subprocess", str(self.process.pid), ticks)
-                # Pruning must still see the complete dead-worker record.
-                pruned = prune_in_child()
-                if pruned:
-                    pytest.fail(f"launch pruned retained checkout: {pruned}", pytrace=False)
-                assert self.process.poll() is None
-                assert sandbox.is_dir()
-            assert spec.local_argv is not None
-            assert "--session" not in spec.local_argv
-            assert spec.local_argv[-1] == " --autonomous --max-retries 5 700"
-            _assert_fresh_driver_launch(spec, sandbox.parent.parent, "700")
-            return self.handle
+            pytest.fail("a process-era run cannot manufacture a daemon session identity")
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
-            while not self.cancelled:
-                await asyncio.sleep(0)
-            return ComputeResult(-15, "", "cancelled", handle=handle)
+            pytest.fail("legacy recovery must refuse before host observation")
 
         def job_alive(self, handle: LaunchHandle) -> bool:
             return True
 
         async def cancel(self, handle: LaunchHandle) -> None:
-            if self.process is not None:
-                self.process.terminate()
-                self.process.wait(timeout=10)
             self.cancelled = True
 
         async def cleanup(self, handle: LaunchHandle) -> None:
-            if local_compute:
-                # Publication is not enough: finalization still needs the tree
-                # when the replacement worker has already died.
-                assert self.process is not None and self.process.poll() is not None
-                assert load_factory_record(tmp_path, "700").handle == self.handle
-                assert prune_in_child() == []
-                assert sandbox.is_dir()
             self.cleaned = True
 
     class LocalCompute(Compute, LocalSubprocessComputeBackend):
@@ -11903,64 +11915,29 @@ print(json.dumps([str(path) for path in pruned]))
             if compute.process.poll() is None:
                 compute.process.kill()
             compute.process.wait(timeout=10)
-    assert result.status == "needs-human", result.reason
-    expected = [("status", "700", str(sandbox), retained.launcher)] * 2
-    if action is not None:
-        expected.extend([
-            ("lock", "700", action, retained_session, str(sandbox)),
-            ("status", "700", str(sandbox), retained.launcher),
-        ])
-    if live_running:
-        expected.extend([
-            ("park", "700", "needs-human", str(sandbox)),
-            ("status", "700", str(sandbox), retained.launcher),
-        ])
-    expected.extend([
-        ("resume", "700", retained_session, str(sandbox)),
-        ("status", "700", str(sandbox), retained.launcher),
-        ("lock", "700", "release", retained_session, str(sandbox)),
-        ("status", "700", str(sandbox), retained.launcher),
-    ])
-    assert calls[:len(expected)] == expected
-    assert calls[-1] == ("heartbeat", "700", "session-3", str(sandbox))
-    assert load_factory_record(tmp_path, "700").session == "session-3"
-    assert compute.cancelled and compute.cleaned
-    assert compute.launches == 1
-    if local_compute:
-        finalized = load_factory_record(tmp_path, "700")
-        assert finalized.controller_phase == "parked"
-        assert prune_in_child() == []
-        assert sandbox.is_dir()
-        save_factory_record(tmp_path, replace(
-            finalized, status=None, controller_phase="failed",
-            observed_at=(datetime.now(UTC) - timedelta(minutes=16)).isoformat(),
-        ))
-        assert prune_in_child() == [str(original_checkout)]
-        assert not original_checkout.exists()
-        assert compute.spec.local_checkout == original_checkout
-        assert compute.spec.issue_id == retained.issue_id == 700
-        assert compute.spec.attempt == retained.attempt == 3
-        argv = tuple(compute.spec.local_argv or ())
-        # A fresh driver launches from the operator checkout, as on the initial launch.
-        assert argv[argv.index("--dir") + 1] == str(original_checkout)
+    assert result.status == "blocked", result.reason
+    assert calls == [("status", "700", str(sandbox), retained.launcher)]
+    assert load_factory_record(tmp_path, "700") == retained
+    assert not compute.cancelled and not compute.cleaned and compute.launches == 0
+    assert sandbox.is_dir()
 
 
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
         ("fresh_foreign", ["status"]),
-        ("changed_owner", ["status", "lock:claim", "status"]),
-        ("changed_history", ["status", "lock:claim", "status"]),
-        ("missing_next", ["status", "resume", "status"]),
+        ("changed_owner", ["status"]),
+        ("changed_history", ["status"]),
+        ("missing_next", ["status"]),
         ("live_process", ["status"]),
         # Identity is resolved before any lock or resume, so a refusal changes nothing.
         ("identity_refused", ["status"]),
-        ("release_failed", ["status", "resume", "status", "lock:release"]),
-        ("release_held", ["status", "resume", "status", "lock:release", "status"]),
-        ("release_owner", ["status", "resume", "status", "lock:release", "status"]),
-        ("release_history", ["status", "resume", "status", "lock:release", "status"]),
-        ("release_status", ["status", "resume", "status", "lock:release", "status"]),
-        ("release_next", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_failed", ["status"]),
+        ("release_held", ["status"]),
+        ("release_owner", ["status"]),
+        ("release_history", ["status"]),
+        ("release_status", ["status"]),
+        ("release_next", ["status"]),
     ],
 )
 def test_factory_recovery_rejection_command_matrix(
@@ -12076,6 +12053,7 @@ def test_factory_recovery_rejection_command_matrix(
         observed_at="2026-08-18T12:00:00+00:00",
         controller_phase="parked",
     )
+    save_factory_record(tmp_path, retained)
     monkeypatch.setattr(
         orchestrator,
         "_verify_factory_recovery_binding",
@@ -12121,16 +12099,10 @@ def test_factory_recovery_rejection_command_matrix(
                 work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
         )
 
-    if case.startswith("release_"):
-        result = asyncio.run(recover())
-        assert result.status == "needs-human"
-        assert result.reason == "factory recovery could not verify the retained lock was released"
-        assert load_factory_record(tmp_path, "700").controller_phase == "parked"
-    else:
-        with pytest.raises(Exception):
-            asyncio.run(recover())
-
+    with pytest.raises(WorklinkError, match="legacy factory host"):
+        asyncio.run(recover())
     assert events == expected
+    assert load_factory_record(tmp_path, "700") == retained
 
 
 @pytest.mark.parametrize(
@@ -12156,29 +12128,32 @@ def test_factory_recovery_launch_start(
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
-    sandbox = tmp_path / "sandbox"
+    sandbox = tmp_path / "chainlink-700"
     sandbox.mkdir()
-    pre = _factory_lifecycle_status(sandbox, status="needs-human")
+    pre = replace(_factory_lifecycle_status(sandbox, status="needs-human", session="ses_test1", park_snapshot=str(tmp_path / "parked")), run_id="chainlink-700")
     resumed = _factory_lifecycle_status(sandbox, status="running")
-    released = parse_factory_status({**resumed.to_json(), "lock": "absent", "lock_session": None})
+    released = replace(pre, lock="absent", lock_session=None)
     retained = replace(
-        _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)),
+        _factory_lifecycle_record(sandbox, LaunchHandle("opencode_daemon", "ses_test1", opencode_session_id="ses_test1", launch_generation="test-generation")),
+        run_id="chainlink-700",
         attempt=3,
         status=pre,
         controller_phase="parked",
         children_reaped=True,  # The old run's acknowledgement cannot cover a relaunch.
     )
-    handle = LaunchHandle("local_subprocess", "999999998", 2)
+    handle = LaunchHandle("opencode_daemon", "ses_test2", opencode_session_id="ses_test2", launch_generation="test-generation")
+    from mimir_cultivate.worklink import daemon_health
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     state_dir = failures.dispatch_failure_state_dir(tmp_path)
-    key = "worklink-factory_start:700:700:3"
+    key = "worklink-factory_start:700:chainlink-700:3"
     expected = {
         "kind": "factory_start", "issue_id": 700, "issue_title": "epic",
-        "run_id": "700", "attempt": 3,
+        "run_id": "chainlink-700", "attempt": 3,
         "pr_url": None, "delivery_key": key, "notified": existing_start,
     }
     if existing_start:
         failures.record_factory_transition(
-            state_dir, kind="factory_start", issue_id=700, issue_title="epic", run_id="700", attempt=3,
+            state_dir, kind="factory_start", issue_id=700, issue_title="epic", run_id="chainlink-700", attempt=3,
         )
         with failures.failure_state_transaction(state_dir) as state:
             state["factory_transitions"][key]["notified"] = True
@@ -12204,11 +12179,11 @@ def test_factory_recovery_launch_start(
             return handle
 
         async def cancel(self, selected: LaunchHandle) -> None:
-            assert selected == handle
+            assert selected in (retained.handle, handle)
             events.append("cancel")
 
         async def cleanup(self, selected: LaunchHandle) -> None:
-            assert selected == handle
+            assert selected in (retained.handle, handle)
             events.append("cleanup")
 
     async def supervise(self: object, **kwargs: Any) -> str:
@@ -12216,7 +12191,7 @@ def test_factory_recovery_launch_start(
         assert kwargs["factory_record"].handle == handle
         assert kwargs["factory_record"].children_reaped is False
         assert kwargs["autonomous"] is autonomous
-        persisted = load_factory_record(tmp_path, "700")
+        persisted = load_factory_record(tmp_path, retained.run_id)
         assert persisted.handle == handle
         assert persisted.children_reaped is False
         transitions = failures.load_failure_state(state_dir).get("factory_transitions", {})
@@ -12237,7 +12212,12 @@ def test_factory_recovery_launch_start(
     if write_failure == "transition":
         monkeypatch.setattr(failures, "atomic_write_json", fail_write)
     elif write_failure == "record":
-        monkeypatch.setattr(orchestrator, "save_factory_record", fail_write)
+        save_record = orchestrator.save_factory_record
+        def fail_relaunched(home, record):
+            if record.handle == handle:
+                fail_write()
+            save_record(home, record)
+        monkeypatch.setattr(orchestrator, "save_factory_record", fail_relaunched)
 
     recovery = WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
         issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
@@ -12257,13 +12237,13 @@ def test_factory_recovery_launch_start(
     if write_failure == "record":
         with pytest.raises(OSError, match="recovery persistence failed"):
             asyncio.run(recovery)
-        assert events == ["released", "launch", "cancel", "cleanup"]
+        assert events == ["cancel", "cleanup", "released", "launch", "cancel", "cleanup"]
         assert not failures.load_failure_state(state_dir).get("factory_transitions")
-        saved = load_factory_record(tmp_path, "700")
-        assert saved.handle == retained.handle
+        saved = load_factory_record(tmp_path, retained.run_id)
+        assert saved.handle is None
     else:
         assert asyncio.run(recovery) == "supervised"
-        assert events == ["released", "launch", "supervise"]
+        assert events == ["cancel", "cleanup", "released", "launch", "supervise"]
 
 
 @pytest.mark.parametrize(
@@ -12406,20 +12386,12 @@ def test_factory_recovery_parks_running_before_resume(
             work_item_json=orchestrator.render_work_item(issue),
         )
 
-    if case == "ok":
-        assert asyncio.run(recover()) == "supervised"
-    elif case in {"live", "unverified", "foreign"}:
-        with pytest.raises(WorklinkError):
-            asyncio.run(recover())
-    else:
-        result = asyncio.run(recover())
-        assert result.status == "needs-human"
-        assert result.reason == "factory recovery could not verify the running factory was parked"
-        saved = load_factory_record(tmp_path, "700")
-        assert saved.controller_phase == "parked"
-        assert saved.status is not None and saved.status.next == pre.next
-        assert saved.status.lock_session == retained.session
-    assert events == expected
+    # A process-era record cannot authorize daemon claim/resume, regardless of
+    # apparent process death or the manifest's status. Operator parking is required.
+    with pytest.raises(WorklinkError, match="legacy factory host"):
+        asyncio.run(recover())
+    assert events == ["status"]
+    assert load_factory_record(tmp_path, "700") == retained
 
 
 @pytest.mark.parametrize("run_id", ["chainlink-700", "700"], ids=["canonical", "legacy"])
@@ -12440,10 +12412,10 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
             **_factory_lifecycle_status(sandbox, status=status).to_json(), "run_id": run_id, **changes,
         })
 
-    pre, resumed = lifecycle("needs-human"), lifecycle("running")
-    released = lifecycle("running", lock="absent", lock_session=None)
+    pre, resumed = lifecycle("needs-human", lock_session="ses_test1", park_snapshot=str(tmp_path / "parked")), lifecycle("running")
+    released = replace(pre, lock="absent", lock_session=None)
     retained = replace(
-        _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)),
+        _factory_lifecycle_record(sandbox, LaunchHandle("opencode_daemon", "ses_test1", opencode_session_id="ses_test1", launch_generation="test-generation")),
         run_id=run_id, attempt=3, status=pre, controller_phase="parked",
     )
     save_factory_record(tmp_path, retained)
@@ -12464,7 +12436,13 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
     class Compute:
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             launched.append(spec)
-            return LaunchHandle("local_subprocess", "999999998", 2)
+            return LaunchHandle("opencode_daemon", "ses_test2", opencode_session_id="ses_test2", launch_generation="test-generation")
+
+        async def cancel(self, handle):
+            assert handle == retained.handle
+
+        async def cleanup(self, handle):
+            assert handle == retained.handle
 
     async def supervise(self: object, **kwargs: Any) -> str:
         return "supervised"
@@ -12476,8 +12454,10 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
     monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
     monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
 
+    from mimir_cultivate.worklink import daemon_health
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     issue = IssueContext(700, "epic", "build", {"worklink:epic"})
-    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+    recovery = WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
         issue=issue,
         claim_record=ClaimRecord(700, 3, "agent", datetime.now(UTC)),
         claims=object(),
@@ -12490,11 +12470,19 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
         test_cmd="pytest -q",
         runner=lambda args: cp(args),
         work_item_json=orchestrator.render_work_item(issue),
-    ))
+    )
+    if run_id == "700":
+        with pytest.raises(WorklinkError, match="canonical"):
+            asyncio.run(recovery)
+        assert launched == [] and events == []
+        return
+    result = asyncio.run(recovery)
     assert result == "supervised"
     [spec] = launched
-    _assert_fresh_driver_launch(spec, operator_checkout, run_id)
-    assert spec.local_argv[-1].split()[-1] == run_id
+    assert spec.local_argv is None
+    assert spec.local_checkout == sandbox
+    assert spec.session_request.kind == "epic"
+    assert spec.session_request.text.split()[-1] == run_id
     work_item = json.loads(spec.env["MIMIR_WORK_ITEM_JSON"])
     assert work_item == {"run_id": run_id, "title": "epic", "body": "build"}
 
@@ -12518,7 +12506,7 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
             "terminal_result": {"reason": "opaque"},
         }
     )
-    handle = LaunchHandle("local_subprocess", "123", 456)
+    handle = LaunchHandle("opencode_daemon", "ses_test1", opencode_session_id="ses_test1", launch_generation="test-generation")
     retained = replace(
         _factory_lifecycle_record(sandbox, handle),
         status=terminal,
