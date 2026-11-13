@@ -1,0 +1,13 @@
+#!/bin/sh
+exec /opt/mimir-worklink/venv/bin/python -c '
+import os
+import sys
+from mimir.worklink_daemon_activation import ActivationError, resolve_activation
+try:
+    enabled = resolve_activation(dict(os.environ)).enabled
+except ActivationError:
+    sys.exit("Invalid Worklink daemon activation; inspect image installation and plugin selection")
+if enabled:
+    from mimir_cultivate.worklink.daemon_gate import main
+    sys.exit(main())
+'

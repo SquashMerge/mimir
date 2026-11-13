@@ -137,3 +137,21 @@ def test_internal_factory_status_contract_matches_runtime_binding() -> None:
         "Completed\n  publication verification requires a non-null matching PR base before evidence"
         in worklink
     )
+
+
+def test_daemon_rollout_docs_preserve_independent_login_and_rotation_boundary() -> None:
+    plugins = (ROOT / "docs/plugins.md").read_text()
+    credentials = (ROOT / "docs/credentials.md").read_text()
+    worklink = (ROOT / "docs/internal/WORKLINK.md").read_text()
+    configuration = (ROOT / "docs/configuration.md").read_text()
+    for text in (plugins, credentials, worklink):
+        assert "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login" in text
+        assert "--server http://127.0.0.1:4096 --method chatgpt-headless openai" in text
+        assert "refreshable_unverified" in text
+        assert "worklink-daemon" in text
+    for text in (credentials, worklink, configuration):
+        assert "--force-recreate" in text
+    assert "reconciles its OAuth store" not in plugins
+    assert "$XDG_DATA_HOME/opencode/auth.json" not in credentials
+    assert "disabledTraces:[session,llm,tool]" in worklink
+    assert "disabled_sensitive_otlp" in worklink

@@ -13,6 +13,74 @@ and `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` at image build) and s
 load this provider or expose Worklink commands and tools. Historical rollout
 notes below describe the original architecture, not the current package boundary.
 
+## OpenCode 2 daemon operation
+
+Current OpenCode execution uses `OpenCodeDaemonComputeBackend` and
+`opencode_daemon` handles identified by `ses_...`, not per-build OpenCode PIDs.
+The `local_subprocess` configuration name and autonomous opt-in remain for
+compatibility; process-specific historical architecture notes below do not
+describe daemon-session lifecycle. Each invocation creates one exclusive session,
+sets a closed shell environment and submits one input. Reconnection observes the
+same durable log/history/inbox without replaying admission. Success requires
+correlated execution and outcome witnesses; a connected stream, initial idle,
+HTTP acknowledgment or model turn alone is not completion. Epic status remains
+authoritative through node factory.js, with lock session equal to OpenCode
+session ID. Evidence records `opencode_session_id` (null before session creation).
+Unverified cancellation retains checkout/controller state; it never kills or
+vacuums the shared daemon. Historical active V1 handles must be safely parked
+and recovered by an operator into a fresh session, never guessed PID resumption.
+
+Activation is runtime-selected trusted Cultivate **and** the root-owned image
+marker `/opt/cultivate-docker/opencode-enabled` set to `1`. Unselected/core and
+marker-0 images bypass daemon/login requirements; invalid markers or enabled
+missing binaries fail closed. One independent s6 `worklink-opencode` longrun
+executes plain `opencode serve --hostname 127.0.0.1 --port 4096` as worklink.
+Root preparation clean-execs through s6-setuidgid with a closed environment;
+the worklink supervisor never inherits the privileged interpreter's memory.
+The daemon is independent of native login and Mimir/plugin-ready markers.
+Root Mimir, both scaffold wrapper writers and both final workload templates
+gate enabled workloads, leaving the daemon available when login is missing.
+
+Setup prints `docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login`.
+The wrapper privately authenticates to the daemon and executes
+`opencode auth login --server http://127.0.0.1:4096 --method chatgpt-headless openai`.
+Use the actual service name in custom Compose projects. This login is independent
+of the agent's unchanged Codex device login; no auth.json seeding or refresh-token
+reconciliation remains. Daemon state lives in private worklink-owned directories
+under `/var/lib/mimir-worklink/daemon`, persisted in the `worklink-daemon` volume.
+Keep that volume during recreation. Native DB migrations belong to OpenCode.
+Read-only local health accepts `locally_unexpired` or `refreshable_unverified`,
+warning for the latter; it does not prove provider validity or subscription.
+
+Daemon credentials are only the generated private API password, normalized equal
+bot `GH_TOKEN`/`GITHUB_TOKEN` and optional canonical publishing identity. Both token
+aliases may be absent for native login; conflicting nonempty aliases refuse.
+Epic admission still requires original agent GITHUB_TOKEN and env-only identity.
+Builds intentionally share worklink uid and can read daemon API/native login/bot
+credentials. Compose.env, MIMIR_HOME, `/home/mimir`, agent Codex, model/Saga,
+tracker/alert/API secrets and OTLP headers remain mimir-private. This is an OS
+boundary from mimir, not isolation between same-uid builds.
+
+Apply changed credentials/identity/telemetry using the project's normal env and
+interpolation options with `docker compose up -d --force-recreate <actual-agent-service>`.
+Host env_file edits alone are not watched. Compose/s6 restart retains the current
+container environment; daemon restart snapshots that already-effective input.
+Agent/launch-snapshot mismatch reports sanitized `bot_token_stale`. Installed-bit
+changes require rebuild+recreate. Setup `--no-start` writes configuration and
+instructions/builds/provisions but starts/probes neither daemon nor workload.
+
+The pinned OTEL plugin uses inline options only. Tracing off disables it. Any
+sensitive OTLP carrier or credential-bearing endpoint disables it with
+`disabled_sensitive_otlp` and a setup/health explanation. Headers never enter
+daemon config/env, build env, transcripts or evidence. With tracing on and no
+sensitive input, capture-off uses `logsEnabled:false`,
+`disabledTraces:[session,llm,tool]`, `disabledMetrics:[]`,
+`capturePromptInLogs:false` and `captureModelContext:false`: metrics only.
+Capture-on enables logs/all traces and both content flags. Endpoint protocol is
+`http/protobuf`; `service.name` derives from MIMIR_OTEL_SERVICE_NAME plus identity
+(stable `worklink` if absent). Local daemon stderr is local container logging,
+not exported build evidence. Agent Python telemetry remains unchanged.
+
 Status: **Live and autonomous** (as of 2026-07-08; the original #380 slices
 have all shipped, and the #832 substrate cleanup has retired the
 `docker-sibling` broker and `ecs-runtask` compute paths). The production model
@@ -1418,15 +1486,19 @@ registry construction instead of falling back to another backend. Remove any
 vestigial `backends.codex`, `backends.claude_cli`, or routes/defaults selecting
 those retired names from operator-owned `worklink.yaml` files.
 
-Worklink's OpenCode backend passes a per-run `OPENCODE_PERMISSION` override with
-`external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
+Worklink's OpenCode leaf backend creates a fresh exclusive daemon session with
+ordered `external_directory/* deny`, `shell/* deny`, then exactly the validated
+leaf shell allows (derived defaults: `git *` and the selected test runner).
 This is deliberately `deny`, never `ask`: Worklink runs headlessly, so an
 approval request would wait forever. A denied tool call is returned by OpenCode
 as a permission error and recorded in the Worklink transcript rather than
 opening an interactive prompt. Configure `backends.opencode.bash_allowlist` with
 the command patterns required by the selected repository's test runner, package
-manager/build, and Git workflow. The list replaces the defaults; an empty list
-denies every shell command.
+manager/build, and Git workflow. Explicit lists retain nonempty/catch-all/test
+command validation. Spawn instead permits general-purpose shell after its admin,
+depth/rate and contained-checkout gates. Epics retain external-directory and
+`.env`, `**/.env`, `**/.env.*` read denials, with no session shell deny overriding
+the adapter's shell grant. Read-tool denials are not shell isolation.
 
 This policy is defense-in-depth for **trusted code work only**, not process
 confinement. OpenCode's file/path checks and shell command matcher run inside the

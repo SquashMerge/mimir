@@ -19,7 +19,8 @@ from mimir.scaffold_docker import render_dockerfile, scaffold
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / "plugins/cultivate/mimir_cultivate/docker"
-SCRIPT_NAMES = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh")
+SCRIPT_NAMES = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh",
+                "worklink-opencode-service", "worklink-daemon-gate", "worklink-opencode-login")
 
 
 def _candidate(*, name: str = "cultivate", distribution: str = "mimir-cultivate",
@@ -123,7 +124,7 @@ def test_selected_scaffold_writes_worker_resources(tmp_path: Path, monkeypatch, 
     assert 'ENTRYPOINT ["/init"]' in dockerfile
     assert "MIMIR_ENABLE_OPENCODE" in (tmp_path / "compose.yml").read_text()
     start = (tmp_path / "start.sh").read_text()
-    assert 'os.environ.get("MIMIR_PLUGINS", "")' in start
+    assert 'resolve_activation(dict(os.environ))' in start
     assert "MIMIR_CODING_ENABLED" not in start
     assert "mimir-cultivate==" not in start
     if mode == "workspace":
@@ -155,7 +156,7 @@ def test_build_bootstrap_selects_provider_only_for_invocation(tmp_path: Path, mo
     for enabled in ("0", "1"):
         subprocess.run(["sh", str(SCRIPTS / "bootstrap.sh")], check=True,
                        env={**env, "MIMIR_PLUGINS": "cultivate", "MIMIR_ENABLE_OPENCODE": enabled})
-    assert output.read_text() == "cultivate:opencode-bootstrap --home /home/mimir\n"
+    assert not output.exists(), "image bootstrap must not seed agent OpenCode state"
 
 
 def test_actual_selected_cli_bootstraps_and_missing_provider_fails(tmp_path: Path) -> None:
@@ -163,7 +164,8 @@ def test_actual_selected_cli_bootstraps_and_missing_provider_fails(tmp_path: Pat
     result = subprocess.run([sys.executable, "-m", "mimir.cli", "opencode-bootstrap", "--home",
                              str(tmp_path / "home")], cwd=ROOT, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert (tmp_path / "home/.config/opencode/opencode.json").is_file()
+    assert not (tmp_path / "home").exists()
+    assert "worklink-opencode-login" in result.stdout
 
     code = ("import importlib.metadata as metadata; _real = metadata.entry_points; metadata.entry_points = lambda **kw: () if kw.get('group') == 'mimir.plugins' else _real(**kw); "
             "from mimir.cli import main; main()")
@@ -195,17 +197,70 @@ def test_shared_service_script_provisions_each_layout(tmp_path: Path, monkeypatc
     s6 = tmp_path / "s6-rc.d"
     source_layout = (ROOT / "deploy/s6-overlay/s6-rc.d" if mode == "root"
                      else home / ".mimir-scaffold/s6-rc.d")
-    for name in ("mimir", "worklink-execd") + (("watchdog",) if mode == "root" else ()):
+    for name in ("mimir", "worklink-execd", "worklink-opencode") + (("watchdog",) if mode == "root" else ()):
         run = s6 / name / "run"
         run.parent.mkdir(parents=True)
         run.write_bytes((source_layout / name / "run").read_bytes())
         run.chmod(0o644)
     libexec = tmp_path / "libexec"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    for name in ("worklink-opencode-service", "worklink-daemon-gate", "worklink-opencode-login"):
+        (resources / name).write_bytes((SCRIPTS / name).read_bytes())
+    (resources / "opencode-enabled").write_text("1\n")
     source = (SCRIPTS / "service.sh").read_text()
     source = source.replace("/etc/s6-overlay/s6-rc.d", str(s6)).replace(
-        "/usr/local/libexec", str(libexec)).replace("install -d -o root -g root -m 0755", "mkdir -p")
+        "/usr/local/libexec", str(libexec)).replace("/usr/local/bin", str(bindir)).replace(
+        "/opt/cultivate-docker", str(resources)).replace("-o root -g root ", "")
     subprocess.run(["sh", "-c", source], check=True)
-    for name in ("mimir", "worklink-execd") + (("watchdog",) if mode == "root" else ()):
+    for name in ("mimir", "worklink-execd", "worklink-opencode") + (("watchdog",) if mode == "root" else ()):
         assert (s6 / name / "run").stat().st_mode & stat.S_IXUSR
     assert (libexec / "worklink-execd").stat().st_mode & stat.S_IXUSR
     assert "mimir_cultivate.worklink.worker_exec" in (libexec / "worklink-execd").read_text()
+    for name in ("worklink-opencode-service", "worklink-daemon-gate"):
+        assert (libexec / name).read_bytes() == (SCRIPTS / name).read_bytes()
+        assert stat.S_IMODE((libexec / name).stat().st_mode) == 0o755
+    assert (bindir / "worklink-opencode-login").read_bytes() == (SCRIPTS / "worklink-opencode-login").read_bytes()
+
+
+def test_sdist_wheel_source_free_context_preserves_daemon_resources(tmp_path: Path) -> None:
+    import hashlib
+    import tarfile
+
+    from mimir.plugin_dockerfile import _S6_FILES, _CONTEXT_SCRIPTS, build_pypi_context
+    from mimir_cultivate.setup import _BUILD_CONTEXT_HELPER
+
+    env = isolated_uv_env(tmp_path)
+    # uv builds each wheel from its freshly built sdist, not the checkout.
+    for package in ("mimir-agent", "mimir-cultivate"):
+        subprocess.run(["uv", "build", "--package", package, "--out-dir", str(tmp_path)],
+                       cwd=ROOT, env=env, check=True, capture_output=True, text=True)
+    wheels = {package: next(tmp_path.glob(package.replace("-", "_") + "-*.whl"))
+              for package in ("mimir-agent", "mimir-cultivate")}
+    resources = [("mimir-agent", f"mimir/docker_context/deploy/s6-overlay/s6-rc.d/{name}",
+                  f"deploy/s6-overlay/s6-rc.d/{name}") for name in _S6_FILES]
+    resources += [("mimir-cultivate", f"mimir_cultivate/docker/{name}",
+                   f"plugins/cultivate/mimir_cultivate/docker/{name}") for name in _CONTEXT_SCRIPTS]
+    version = wheels["mimir-agent"].name.split("-")[1]
+    hashes = {key: hashlib.sha256(path.read_bytes()).hexdigest() for key, path in wheels.items()}
+    context = tmp_path / "context"
+    build_pypi_context(context, agent_wheel=wheels["mimir-agent"], cultivate_wheel=wheels["mimir-cultivate"],
+                       version=version, agent_sha256=hashes["mimir-agent"], cultivate_sha256=hashes["mimir-cultivate"])
+    helper = tmp_path / "build_context.py"
+    helper.write_text(_BUILD_CONTEXT_HELPER)
+    saved = tmp_path / "saved"
+    subprocess.run([sys.executable, "-I", "-S", str(helper), str(saved), str(wheels["mimir-agent"]),
+                    str(wheels["mimir-cultivate"]), version, hashes["mimir-agent"], hashes["mimir-cultivate"]],
+                   check=True, capture_output=True, text=True)
+    for package, member, source in resources:
+        with tarfile.open(next(tmp_path.glob(package.replace("-", "_") + "-*.tar.gz"))) as archive:
+            path = next(name for name in archive.getnames() if name.endswith("/" + source.removeprefix("plugins/cultivate/")))
+            assert archive.extractfile(path).read() == (ROOT / source).read_bytes()
+        with ZipFile(wheels[package]) as archive:
+            info = archive.getinfo(member)
+            assert archive.read(member) == (ROOT / source).read_bytes()
+            for destination in (context, saved):
+                assert (destination / source).read_bytes() == archive.read(member)
+                assert stat.S_IMODE((destination / source).stat().st_mode) == (info.external_attr >> 16) & 0o777

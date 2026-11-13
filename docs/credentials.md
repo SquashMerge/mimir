@@ -76,7 +76,25 @@ traffic windows when possible.
 | `$MIMIR_HOME/.claude/.credentials.json` (path resolved by `MIMIR_CLAUDE_OAUTH_CREDENTIALS`; falls back to `$HOME/.claude/.credentials.json` only if MIMIR_HOME is unset) | Claude Max OAuth subprocess for `ANTHROPIC_BASE_URL`-routed deployments | `claude /login` from a terminal with access to the host browser | `mimir oauth-usage-check` (already exists); a non-failing `oauth_usage_polled` event in `events.jsonl` |
 | Gmail OAuth refresh tokens (gog keyring) | `gog` CLI for Gmail / Calendar | `gog auth login <account>` (interactive) | `gog gmail search 'newer_than:1h' --max 1 --account <name>` succeeds |
 | Google Workspace OAuth (gogcli) | Google Calendar, Drive | Same as above | `gog calendar list --account <name>` |
-| `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`) | OpenCode providers selected by native `opencode.jsonc` | `opencode auth login` using the provider/plugin's own flow | Inspect `opencode auth list` and the selected provider's stored `type`. For OpenAI subscription use, it must be `oauth`; a successful model response or ambient `OPENAI_API_KEY` proves connectivity only, not subscription billing. Mimir removes the conventional ambient API key from OAuth-backed coding runs. This store is separate from `~/.codex/auth.json`. |
+| `/var/lib/mimir-worklink/daemon/data/opencode/opencode.db` | Worklink OpenCode 2 daemon; native `openai` / `chatgpt-headless` OAuth | From the deployment directory: `docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login` | Sanitized local health inspects the native DB read-only as worklink, never `/api/credential`. `locally_unexpired` and `refreshable_unverified` permit workloads; neither proves subscription, revocation or future refresh validity. OpenCode owns DB migrations. This login is independent of the agent's `~/.codex/auth.json`; never seed, copy or reconcile refresh tokens between them. |
+
+The native login wrapper targets the authenticated loopback daemon with
+`opencode auth login --server http://127.0.0.1:4096 --method chatgpt-headless openai`.
+Its API password is loaded privately from mode-600 `daemon/api.json` into the
+client environment, never argv. Preserve the `worklink-daemon` volume across
+container recreation. Daemon directories are worklink-owned 0700 and sensitive
+files 0600. Builds share that uid: they **can read** the daemon API password,
+native Codex login and bot publishing token, intentionally including leaf/spawn.
+This is not a same-uid secret boundary. Other agent secrets, compose.env,
+MIMIR_HOME, `/home/mimir`, agent Codex and OTLP headers remain mimir-private.
+
+The daemon projects only equal `GH_TOKEN`/`GITHUB_TOKEN` aliases and optional
+`FACTORY_PUBLISHING_IDENTITY` from canonical `MIMIR_FACTORY_PUBLISHING_IDENTITY`,
+plus its generated API auth. Conflicting nonempty tokens refuse startup. A
+GH-only daemon is allowed; epic admission still requires the agent's original
+`GITHUB_TOKEN` and canonical publishing identity. Apply rotated credentials by
+`docker compose up -d --force-recreate agent` with the project's normal env and
+interpolation options. Restart alone does not reload a changed host env_file.
 
 For `claude-code:*` / Max OAuth inference, a CLI-managed `claude login`
 (including macOS Keychain storage) is accepted when a bounded
