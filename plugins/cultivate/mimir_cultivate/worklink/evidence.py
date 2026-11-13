@@ -86,6 +86,9 @@ class TestResult:
     retention_error: str | None = None
     gate_run_id: str | None = None
     gate_phase: str | None = None
+    output_truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -814,6 +817,9 @@ async def _observe_evidence_from_ref(
                     timed_out=timed_out,
                     gate_run_id=run_id,
                     gate_phase=phase,
+                    output_truncated=result.output_truncated if result is not None else False,
+                    stdout_bytes=result.stdout_bytes if result is not None else 0,
+                    stderr_bytes=result.stderr_bytes if result is not None else 0,
                 )
                 if test.returncode != 0 or timed_out or phase == "rerun":
                     try:
@@ -1001,6 +1007,7 @@ async def _run_compute_gate(
                 run_factory_control, checkout, ("/bin/sh", "-c", command_in_sandbox),
                 env=filter_otlp_env({**_local_child_env(), **gate_spec.env}),
                 timeout=gate_spec.timeout_s, output_limit=20_000_000,
+                allow_output_truncation=True,
             )
         except subprocess.TimeoutExpired:
             return ComputeResult(124, "", "factory gate timed out", timed_out=True)
@@ -1008,6 +1015,9 @@ async def _run_compute_gate(
             observed.returncode,
             observed.stdout.decode("utf-8", errors="replace"),
             observed.stderr.decode("utf-8", errors="replace"),
+            output_truncated=getattr(observed, "output_truncated", False),
+            stdout_bytes=getattr(observed, "stdout_bytes", len(observed.stdout)),
+            stderr_bytes=getattr(observed, "stderr_bytes", len(observed.stderr)),
         )
     # Enter the contained worker path explicitly; never let a provider gate
     # choose launch()'s controller fallback.

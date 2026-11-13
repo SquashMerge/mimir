@@ -43,7 +43,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v14-exited-worker-cancel"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v15-bounded-control-output"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -103,6 +103,7 @@ class _FactoryProcess:
     error: str | None = None
     returncode: int | None = None
     stop_deadline: float | None = None
+    control_output: tuple[_ControlOutput, ...] = ()
 
     @property
     def pid(self) -> int:
@@ -1048,6 +1049,69 @@ def _handle_cancel_factory_handle(
     _send(connection, {"id": identifier, "status": "exited"})
 
 
+class _ControlOutput:
+    """Drain a pipe into a fixed-size head and circular tail, owned by execd.
+
+    Neither a noisy child nor controller loss can grow the retained file. Only
+    one read chunk is held in memory, except for the bounded tail normalization.
+    """
+
+    def __init__(self, source: Any, fd: int, limit: int) -> None:
+        self.source = source
+        self.fd = fd
+        self.limit = limit
+        self.head = (limit + 1) // 2
+        self.tail = limit - self.head
+        self.total = 0
+        os.set_blocking(source.fileno(), False)
+
+    def _write(self, data: bytes, offset: int) -> None:
+        while data:
+            written = os.pwrite(self.fd, data, offset)
+            if written <= 0:
+                raise OSError("incomplete factory control output write")
+            offset += written
+            data = data[written:]
+
+    def drain(self, *, final: bool = False) -> None:
+        # Bound each poll's work so continuous output cannot starve timeout or
+        # supervisor packets. After verified cleanup, the pipes have finite data.
+        chunks = 0
+        while final or chunks < 16:
+            try:
+                data = os.read(self.source.fileno(), 64 * 1024)
+            except BlockingIOError:
+                if final:
+                    raise RuntimeError("factory control output remained open after cleanup")
+                return
+            if not data:
+                return
+            chunks += 1
+            start = min(len(data), max(0, self.head - self.total))
+            self._write(data[:start], self.total)
+            offset = self.total + start
+            self.total += len(data)
+            data = data[start:]
+            if self.tail and data:
+                # At most the last tail-sized portion can survive this chunk.
+                if len(data) > self.tail:
+                    offset += len(data) - self.tail
+                    data = data[-self.tail:]
+                position = (offset - self.head) % self.tail
+                split = min(len(data), self.tail - position)
+                self._write(data[:split], self.head + position)
+                self._write(data[split:], self.head)
+
+    def finish(self) -> None:
+        self.drain(final=True)
+        if self.total > self.limit and self.tail:
+            position = (self.total - self.head) % self.tail
+            tail = os.pread(self.fd, self.tail - position, self.head + position)
+            tail += os.pread(self.fd, position, self.head)
+            self._write(tail, self.head)
+        os.ftruncate(self.fd, min(self.total, self.limit))
+
+
 def _wait_with_output_limits(
     proc: subprocess.Popen[bytes],
     timeout_s: float,
@@ -1096,6 +1160,8 @@ def _wait_factory(
     proc.channel.setblocking(False)
     try:
         while True:
+            for capture in proc.control_output:
+                capture.drain()
             for index, (fd, limit) in enumerate(((stdout_fd, stdout_limit), (stderr_fd, stderr_limit))):
                 size = os.fstat(fd).st_size
                 observed[index] = max(observed[index], size)
@@ -1128,6 +1194,11 @@ def _wait_factory(
                     if proc.process.wait(timeout=_PROCESS_REAP_TIMEOUT_S) != 0:
                         raise RuntimeError("worklink_factory_supervisor_lost: abnormal supervisor exit")
                     proc.returncode = packet["exit_code"]
+                    if proc.control_output:
+                        for capture in proc.control_output:
+                            capture.finish()
+                        observed = [capture.total for capture in proc.control_output]
+                        overflow = any(capture.total > capture.limit for capture in proc.control_output)
                     return proc.returncode, timed_out, overflow, *observed
                 else:
                     raise RuntimeError("worklink_factory_supervisor_lost: invalid supervisor packet")
@@ -1198,6 +1269,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     home = Path()
     proc: subprocess.Popen[bytes] | _FactoryProcess | None = None
     supervisor_parent = supervisor_child = None
+    control_pipes = []
     try:
         if path_addressed:
             fds.insert(0, _open_factory_checkout(request, for_launch=True) if factory else _open_path_checkout(request))
@@ -1239,11 +1311,12 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
                 sys.executable, "-I", str(Path(__file__).with_name("factory_supervisor.py")),
                 str(supervisor_child.fileno()), *command,
             ]
+        control = request.get("op") == "launch_factory_control"
         proc = subprocess.Popen(
             launch_command,
             stdin=subprocess.DEVNULL,
-            stdout=fds[1],
-            stderr=fds[2],
+            stdout=subprocess.PIPE if control else fds[1],
+            stderr=subprocess.PIPE if control else fds[2],
             env=environment,
             preexec_fn=(
                 (lambda: _drop_factory(fds[0], home))
@@ -1255,6 +1328,13 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         )
         if factory:
             supervisor_child.close()
+            captures = ()
+            if control:
+                control_pipes = [proc.stdout, proc.stderr]
+                captures = tuple(
+                    _ControlOutput(source, fd, limit)
+                    for source, fd, limit in zip(control_pipes, fds[1:], (stdout_limit, stderr_limit))
+                )
 
             def emit(packet: dict[str, Any]) -> None:
                 connection.send(json.dumps({
@@ -1262,7 +1342,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
                     "run_id": identifier, "issue_id": request["issue"], "attempt": request["attempt"],
                 }).encode(), socket.MSG_DONTWAIT)
 
-            proc = _FactoryProcess(proc, supervisor_parent, emit)
+            proc = _FactoryProcess(proc, supervisor_parent, emit, control_output=captures)
         with _jobs_lock:
             _jobs[identifier] = proc
             _launching.remove(identifier)
@@ -1309,6 +1389,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         for channel in (supervisor_parent, supervisor_child):
             if channel is not None:
                 channel.close()
+        for pipe in control_pipes:
+            pipe.close()
         if home != Path():
             _cleanup_home(home)
 

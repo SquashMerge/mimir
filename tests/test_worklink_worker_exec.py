@@ -1911,7 +1911,7 @@ def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory
     def spawn(command, **kwargs):
         kwargs["preexec_fn"]()
         drop.assert_called_once_with(kwargs["pass_fds"][0])
-        return SimpleNamespace(pid=123)
+        return SimpleNamespace(pid=123, stdout=open(os.devnull, "rb"), stderr=open(os.devnull, "rb"))
 
     def wait(proc, *args):
         proc.done.set()
@@ -1926,6 +1926,83 @@ def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory
         finally:
             if len(fds) == 3:
                 os.close(fds[0])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux factory supervisor")
+@pytest.mark.parametrize("limit,size", [(1, 0), (1, 1), (1, 100), (63, 62), (63, 63), (63, 64), (64, 1_000_123)])
+def test_factory_control_keeps_bounded_head_tail_and_exact_counts(tmp_path, monkeypatch, limit, size):
+    from mimir_cultivate.worklink import worker_client
+    from tests.worklink_control_helpers import install_local_control_executor
+
+    install_local_control_executor(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (tmp_path, 41, 2))
+    drain = worker_exec._ControlOutput.drain
+    samples = []
+
+    def bounded(self, **kwargs):
+        drain(self, **kwargs)
+        samples.append(os.fstat(self.fd).st_size)
+        assert samples[-1] <= limit
+
+    monkeypatch.setattr(worker_exec._ControlOutput, "drain", bounded)
+    payload = f"import os; data=(bytes(range(256))*({size}//256+1))[:{size}]; os.write(1,data); os.write(2,data[::-1])"
+    result = worker_client.run_factory_control(
+        tmp_path, [sys.executable, "-c", payload], env={}, output_limit=limit,
+        allow_output_truncation=True,
+    )
+    assert result.returncode == 0
+    assert result.output_truncated is (size > limit)
+    assert (result.stdout_bytes, result.stderr_bytes) == (size, size)
+    data = (bytes(range(256)) * (size // 256 + 1))[:size]
+    head = (limit + 1) // 2
+    tail = limit - head
+    for actual, full in ((result.stdout, data), (result.stderr, data[::-1])):
+        assert actual == (full if size <= limit else full[:head] + (full[-tail:] if tail else b""))
+        assert len(actual) <= limit
+    assert samples
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux factory supervisor")
+def test_factory_control_rejects_truncated_structured_output_by_default(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import worker_client
+    from tests.worklink_control_helpers import install_local_control_executor
+
+    install_local_control_executor(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (tmp_path, 41, 2))
+    with pytest.raises(RuntimeError, match="exceeded 16 bytes"):
+        worker_client.run_factory_control(
+            tmp_path, [sys.executable, "-c", "print('x'*100)"], env={}, output_limit=16,
+        )
+
+
+def test_factory_control_capture_refuses_incomplete_cleanup(tmp_path):
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(read_fd, "rb") as source, (tmp_path / "capture").open("w+b") as output:
+            capture = worker_exec._ControlOutput(source, output.fileno(), 64)
+            with pytest.raises(RuntimeError, match="remained open after cleanup"):
+                capture.finish()
+    finally:
+        os.close(write_fd)
+
+
+def test_factory_control_capture_refuses_incomplete_write(tmp_path, monkeypatch):
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(read_fd, "rb") as source, (tmp_path / "capture").open("w+b") as output:
+            capture = worker_exec._ControlOutput(source, output.fileno(), 64)
+            pwrite = os.pwrite
+            calls = []
+
+            def short_write(fd, data, offset):
+                calls.append(offset)
+                return 0 if len(calls) == 1 else pwrite(fd, data, offset)
+
+            monkeypatch.setattr(os, "pwrite", short_write)
+            with pytest.raises(OSError, match="incomplete factory control output write"):
+                capture._write(b"sample", 0)
+    finally:
+        os.close(write_fd)
 
 
 def test_factory_file_child_write_edit_and_escape_guards(tmp_path: Path, monkeypatch) -> None:

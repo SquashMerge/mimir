@@ -426,7 +426,10 @@ async def test_retained_factory_control_uses_worker_without_runtime_refresh(
         async def wait():
             return 0
 
-        return SimpleNamespace(wait=wait, timed_out=False, output_overflow=False)
+        return SimpleNamespace(
+            wait=wait, timed_out=False, output_overflow=False,
+            stdout_bytes=len(b"retained-status"), stderr_bytes=0,
+        )
 
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
     result = worker_client.run_factory_control(
