@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 import errno
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,8 @@ class WorklinkRunState:
     phase: str = "spawned"
     version: int = RUN_STATE_VERSION
     test_env: dict[str, str] = field(default_factory=dict)
+    opencode_session_id: str | None = None
+    launch_generation: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -87,6 +90,21 @@ class WorklinkRunState:
         ticks = int(data["process_start_ticks"]) if data.get("process_start_ticks") is not None else None
         phase = str(data.get("phase") or "spawned")
         local_handle = str(data["handle_substrate"]) == "local_subprocess"
+        sid, generation = data.get("opencode_session_id"), data.get("launch_generation")
+        if data["handle_substrate"] == "opencode_daemon":
+            uncertain = phase == "admission_uncertain" and sid is None and identifier == "admission"
+            if ((not uncertain and (not isinstance(sid, str) or re.fullmatch(r"ses_[A-Za-z0-9_-]{1,128}", sid) is None
+                    or sid != identifier)) or not isinstance(generation, str) or not generation
+                    or len(generation) > 128 or ticks is not None or shim_pid is not None):
+                raise ValueError("invalid daemon run identity")
+        elif data["handle_substrate"] in {"controller", "local_subprocess"}:
+            if (sid is not None or generation is not None) and (
+                not isinstance(sid, str) or re.fullmatch(r"ses_[A-Za-z0-9_-]{1,128}", sid) is None
+                or not isinstance(generation, str) or not generation or len(generation) > 128
+            ):
+                raise ValueError("invalid gate session identity")
+        elif sid is not None or generation is not None:
+            raise ValueError("session identity is only valid for daemon runs")
         if phase == "spawned" and local_handle:
             if shim_pid is None:
                 if not identifier.isascii() or not identifier.isdecimal():
@@ -127,6 +145,8 @@ class WorklinkRunState:
             phase=phase,
             version=version,
             test_env=dict(data.get("test_env", {})),
+            opencode_session_id=sid,
+            launch_generation=generation,
         )
 
 
@@ -273,6 +293,10 @@ def process_is_alive(state: WorklinkRunState) -> bool:
     Permission errors mean the process exists. A start-tick mismatch is dead for
     this run even though the reused PID itself is alive.
     """
+    if state.handle_substrate == "opencode_daemon":
+        # Only the owned controller can establish session quiescence. An absent
+        # local process is not a reason to discard the recovery identity.
+        return True
     pid = _state_pid(state)
     if pid is None:
         return False

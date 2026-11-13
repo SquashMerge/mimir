@@ -16,7 +16,8 @@ import pytest
 
 pytest.importorskip("mimir_cultivate.opencode")
 
-from mimir_cultivate.contained_execution import CollectedExecutionResult
+from mimir_cultivate.worklink.compute import ComputeResult
+from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome, SessionError
 from mimir_cultivate import contained_execution as provider_contained_execution
 from mimir_cultivate import opencode as provider_opencode
 from mimir_cultivate.opencode import _spawn_open_code_impl
@@ -25,6 +26,15 @@ from mimir.tools.registry import (
     _spawn_reset_for_tests,
     set_spawn_config,
 )
+
+
+def CollectedExecutionResult(code, stdout, stderr, timed_out, overflow, stdout_dropped, stderr_dropped,
+                             *, error_type=None):
+    error = SessionError(error_type, stderr.decode()) if error_type else None
+    handle = LaunchHandle("opencode_daemon", "ses_spawn", opencode_session_id="ses_spawn", launch_generation="generation")
+    return ComputeResult(code, stdout.decode(), stderr.decode(), timed_out=timed_out,
+                         output_overflow=overflow, handle=handle, session_error=error,
+                         session_outcome=SessionOutcome("ses_spawn", "failed" if code else "succeeded", error=error))
 
 
 def _git(path: Path, *args: str) -> str:
@@ -47,6 +57,8 @@ def spawn_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, P
     seed.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "telemetry-" + "canary")
+    monkeypatch.setenv("GITHUB_TOKEN", "refresh-" + "secret")
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
@@ -72,8 +84,9 @@ class FakeCheckout:
         self.base_tree = _git(destination, "rev-parse", "HEAD^{tree}")
         self.closed = False
 
-    def close(self) -> None:
+    def close(self, *, retain=False) -> None:
         self.closed = True
+        self.retained = retain
 
 
 def factory_for(tmp_path: Path, record: dict):
@@ -89,11 +102,9 @@ def factory_for(tmp_path: Path, record: dict):
 
 
 def runner_for(record: dict, *, exit_code: int = 0, stdout: bytes = b"done", stderr: bytes = b""):
-    async def runner(argv, directory, worker_env, projections=(), **kwargs):
-        record["argv"] = list(argv)
+    async def runner(directory, request, **kwargs):
+        record["request"] = request
         record["directory"] = directory
-        record["env"] = dict(worker_env)
-        record["projections"] = tuple(projections)
         record["kwargs"] = kwargs
         if exit_code == 0:
             (directory.path / "generated.txt").write_text("generated\n")
@@ -116,21 +127,24 @@ async def invoke(seed: Path, tmp_path: Path, record: dict, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_run_uses_fresh_checkout_worker_env_and_oauth_projection(spawn_tree, tmp_path):
+async def test_run_uses_fresh_checkout_and_typed_session_without_oauth_projection(spawn_tree, tmp_path):
     home, seed = spawn_tree
     record = {}
     payload = await invoke(seed, tmp_path, record, model="openai/gpt-5", agent="build")
     assert payload["status"] == "succeeded"
     assert record["factory_seed"] == seed
     assert record["directory"].path != seed
-    assert record["argv"][:4] == ["opencode", "run", "--dir", "."]
-    assert record["argv"][-2:] == ["--", "do the thing"]
-    assert str(seed) not in record["argv"]
-    assert "HOME" not in record["env"]
-    assert record["env"][_SPAWN_DEPTH_ENV] == "1"
-    assert str(home) not in json.dumps(record["env"])
-    assert len(record["projections"]) == 2
-    assert b"refresh-secret" in record["projections"][1].document
+    assert record["request"].kind == "spawn"
+    assert record["request"].text == "do the thing"
+    assert record["request"].model == {"providerID": "openai", "id": "gpt-5"}
+    assert record["request"].agent == "build"
+    assert record["request"].spawn_depth == 1
+    assert record["request"].shell_allowlist == ()
+    assert record["kwargs"]["timeout_s"] == 30
+    assert record["kwargs"]["stdout_limit"] == 1024 * 1024
+    assert callable(record["kwargs"]["on_session"])
+    assert callable(record["kwargs"]["on_quiescence"])
+    assert "refresh-secret" not in repr(record["request"])
     assert record["checkout"].closed
 
 
@@ -190,10 +204,10 @@ async def test_artifact_write_refuses_run_directory_symlink_swap(
     record = {}
 
     async def swapping_runner(
-        argv, directory, worker_env, projections=(), **kwargs
+        directory, request, **kwargs
     ):
-        record["argv"] = list(argv)
-        run_directory = home / "artifacts" / kwargs["identifier"]
+        record["request"] = request
+        run_directory, = (home / "artifacts").iterdir()
         assert run_directory.is_dir()
         shutil.rmtree(run_directory)
         run_directory.symlink_to(outside, target_is_directory=True)
@@ -201,7 +215,7 @@ async def test_artifact_write_refuses_run_directory_symlink_swap(
         return CollectedExecutionResult(0, b"done", b"", False, False, 0, 0)
 
     payload = await invoke(seed, tmp_path, record, runner=swapping_runner)
-    assert record["argv"][-1] == "do the thing"
+    assert record["request"].text == "do the thing"
     assert list(outside.iterdir()) == []
     assert payload["status"] == "artifact_unavailable"
     assert payload["artifact_dir"] is None
@@ -274,7 +288,7 @@ async def test_agent_sensitive_path_is_prompt_refused(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sensitive_kind", ("home", "auth"))
-async def test_worker_environment_sensitive_path_is_configuration_refused(
+async def test_spawn_never_constructs_legacy_worker_environment(
     spawn_tree, tmp_path, monkeypatch, sensitive_kind
 ):
     home, seed = spawn_tree
@@ -287,17 +301,14 @@ async def test_worker_environment_sensitive_path_is_configuration_refused(
     )
 
     def unsafe_environment(base, invocation):
-        environment = original(base, invocation)
-        environment["VALIDATOR_SELECTOR"] = str(sensitive)
-        return environment
+        pytest.fail("daemon spawn must not construct a CLI environment")
 
     monkeypatch.setattr(
         provider_contained_execution, "opencode_worker_environment", unsafe_environment
     )
     payload = await invoke(seed, tmp_path, record)
-    assert payload["status"] == "configuration_refused"
-    assert "argv" not in record
-    assert "factory_seed" not in record
+    assert payload["status"] == "succeeded"
+    assert str(sensitive) not in repr(record["request"])
 
 
 @pytest.mark.asyncio
@@ -328,8 +339,12 @@ async def test_benign_complete_argv_and_environment_values_launch(
             contained_execution, "opencode_worker_environment", benign_environment
         )
     payload = await invoke(seed, tmp_path, record, **kwargs)
-    assert payload["status"] == "succeeded"
-    assert "argv" in record
+    if ingress == "spawn_args":
+        assert payload["status"] == "configuration_refused"
+        assert "request" not in record
+    else:
+        assert payload["status"] == "succeeded"
+        assert "request" in record
 
 
 @pytest.mark.asyncio
@@ -338,7 +353,7 @@ async def test_unrelated_path_in_prompt_is_verbatim(spawn_tree, tmp_path):
     record = {}
     prompt = "compare /opt/operator/reference exactly"
     await invoke(seed, tmp_path, record, prompt=prompt)
-    assert record["argv"][-1] == prompt
+    assert record["request"].text == prompt
 
 
 @pytest.mark.asyncio
@@ -401,7 +416,7 @@ async def test_nonzero_worker_is_classified(spawn_tree, tmp_path):
         seed, tmp_path, record,
         runner=runner_for(record, exit_code=1, stderr=b"401 unauthorized"),
     )
-    assert payload["status"] == "authentication_required"
+    assert payload["status"] == "failed"  # stderr wording is not a typed authentication outcome
     assert payload["exit_code"] == 1
 
 
@@ -424,22 +439,22 @@ async def test_sensitive_output_is_scrubbed_everywhere(spawn_tree, tmp_path):
 
 @pytest.mark.asyncio
 async def test_sensitive_material_absent_from_real_event_logger_and_caplog(
-    spawn_tree, tmp_path, caplog
+    spawn_tree, tmp_path, caplog, monkeypatch
 ):
     from mimir import event_logger
 
     home, seed = spawn_tree
     auth_path = home / ".local/share/opencode/auth.json"
     config_path = home / ".config/opencode/opencode.jsonc"
-    credential = b"opaque projected credential 47!"
-    auth_path.write_bytes(json.dumps({
-        "openai": {"type": "oauth", "refresh": credential.decode()}
-    }).encode())
+    credential = b"opaque " + b"publishing 47!"
+    telemetry = b"distinct " + b"header 48!"
+    monkeypatch.setenv("GITHUB_TOKEN", credential.decode())
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", telemetry.decode())
     event_path = tmp_path / "events.jsonl"
     event_logger._reset_logger_for_tests()
     event_logger.init_logger(event_path, "spawn-sensitive-test")
     record = {}
-    emitted = b" | ".join((credential, os.fsencode(auth_path), os.fsencode(config_path)))
+    emitted = b" | ".join((credential, telemetry, os.fsencode(auth_path), os.fsencode(config_path)))
     caplog.clear()
     try:
         payload = await invoke(
@@ -458,7 +473,7 @@ async def test_sensitive_material_absent_from_real_event_logger_and_caplog(
             *(path.read_bytes() for path in artifact.iterdir()),
         ]
         assert b"spawn_open_code_completed" in event_bytes
-        for sensitive in (credential, os.fsencode(auth_path), os.fsencode(config_path)):
+        for sensitive in (credential, telemetry, os.fsencode(auth_path), os.fsencode(config_path)):
             assert all(sensitive not in sink for sink in observed_sinks)
     finally:
         event_logger._reset_logger_for_tests()
@@ -477,7 +492,7 @@ async def test_artifact_run_directory_failure_precedes_execution(
         events.append((event, fields))
     monkeypatch.setattr(event_logger, "safe_log_event", capture)
     monkeypatch.setattr(
-        provider_opencode, "resolve_opencode_invocation",
+        provider_opencode, "resolve_daemon_model",
         lambda *a, **k: (_ for _ in ()).throw(OpenCodeConfigError("config_malformed")),
     )
     artifact_file = tmp_path / "home" / "not-a-directory"
@@ -499,7 +514,7 @@ async def test_artifact_run_directory_failure_precedes_execution(
 async def test_generated_payload_containment_and_unsafe_negative_control(
     spawn_tree, tmp_path
 ):
-    from mimir_cultivate.contained_execution import execute_contained
+    from mimir_cultivate.contained_execution import execute_contained_session
 
     _home, seed = spawn_tree
     controller_home = tmp_path / "controller-home"
@@ -536,10 +551,12 @@ async def test_generated_payload_containment_and_unsafe_negative_control(
             return self.returncode
 
     class ContainedPayloadClient:
-        async def launch(self, **kwargs):
-            checkout = Path(kwargs["local_checkout"])
-            prompt = kwargs["argv"][-1]
-            attack = materialize(prompt, checkout)
+        def __init__(self, checkout):
+            self.checkout = checkout
+
+        async def session_create(self, request, **kwargs):
+            checkout = self.checkout
+            attack = materialize(request.text, checkout)
             wrapper = (
                 "import pwd,runpy,sys,types;"
                 f"pwd.getpwuid=lambda uid:types.SimpleNamespace(pw_dir={str(worker_home)!r});"
@@ -552,20 +569,28 @@ async def test_generated_payload_containment_and_unsafe_negative_control(
                 stderr=subprocess.PIPE,
                 check=False,
             )
-            return Process(completed)
+            self.completed = completed
+            return LaunchHandle("opencode_daemon", "ses_payload", opencode_session_id="ses_payload", launch_generation="generation")
 
-        async def cancel(self, identifier: str) -> None:
-            raise AssertionError(f"unexpected cancellation: {identifier}")
+        async def session_observe(self, handle, **kwargs):
+            assert self.completed.returncode == 0
+            return SessionOutcome(handle.identifier, "succeeded", stdout=self.completed.stdout.decode())
+
+        async def session_release(self, handle):
+            pass
+
+        async def session_cancel(self, handle):
+            raise AssertionError(f"unexpected cancellation: {handle}")
 
     positive = {}
 
     def contained_factory(*args, **kwargs):
         checkout = factory_for(tmp_path / "positive", positive)(*args, **kwargs)
-        checkout.capability._contained_worker_client = ContainedPayloadClient()
+        checkout.capability._contained_worker_client = ContainedPayloadClient(checkout.path)
         return checkout
 
-    async def unsafe_runner(argv, directory, worker_env, projections=(), **kwargs):
-        attack = materialize(argv[-1], directory.path)
+    async def unsafe_runner(directory, request, **kwargs):
+        attack = materialize(request.text, directory.path)
         wrapper = (
             "import pwd,runpy,sys,types;"
             f"pwd.getpwuid=lambda uid:types.SimpleNamespace(pw_dir={str(controller_home)!r});"
@@ -594,7 +619,7 @@ async def test_generated_payload_containment_and_unsafe_negative_control(
             tmp_path,
             positive,
             prompt=generated_input,
-            runner=execute_contained,
+            runner=execute_contained_session,
             factory=contained_factory,
         )
         assert result["status"] == "succeeded"
@@ -677,13 +702,13 @@ async def test_terminal_state_contract(
     if case == "config":
         prompt = f"task {home}"
         monkeypatch.setattr(
-            provider_opencode, "resolve_opencode_invocation",
+            provider_opencode, "resolve_daemon_model",
             lambda *a, **k: (_ for _ in ()).throw(OpenCodeConfigError("config_malformed")),
         )
     elif case == "auth":
         prompt = f"task {home}"
         monkeypatch.setattr(
-            provider_opencode, "resolve_opencode_invocation",
+            provider_opencode, "resolve_daemon_model",
             lambda *a, **k: (_ for _ in ()).throw(OpenCodeAuthError("auth_invalid")),
         )
     elif case == "prompt_auth":
@@ -708,7 +733,8 @@ async def test_terminal_state_contract(
             raise error
     elif case == "containment":
         async def runner(*args, **kwargs):
-            raise OSError("socket")
+            from mimir_cultivate.worklink.backends.base import SessionAdmissionError
+            raise SessionAdmissionError(uncertain=False)
     elif case in {"timeout", "overflow", "auth_worker", "failed"}:
         values = {
             "timeout": (None, False, True, b""),
@@ -716,7 +742,7 @@ async def test_terminal_state_contract(
             "auth_worker": (1, False, False, b"401 unauthorized"),
             "failed": (2, False, False, b"compile failed"),
         }[case]
-        async def runner(argv, directory, worker_env, projections=(), **kwargs):
+        async def runner(directory, request, **kwargs):
             code, overflow, timed_out, err = values
             return CollectedExecutionResult(
                 code,
@@ -726,10 +752,11 @@ async def test_terminal_state_contract(
                 overflow,
                 0,
                 0,
+                error_type="provider.auth" if case == "auth_worker" else None,
             )
     elif case == "no_changes":
         runner = runner_for(record, exit_code=0)
-        async def runner(argv, directory, worker_env, projections=(), **kwargs):
+        async def runner(directory, request, **kwargs):
             return CollectedExecutionResult(
                 0, b"refresh-secret", b"refresh-secret", False, False, 0, 0
             )
@@ -760,11 +787,14 @@ async def test_terminal_state_contract(
     assert len(guard.recent) == 1 + int(work_ran)
     assert guard.recent[0] == other_token
     assert (payload["proposal"] is not None) is proposal_file
-    assert events == [(event_type, {
+    expected_events = [(event_type, {
         "run_id": payload["run_id"],
         "status": status,
         "reason_code": reason,
     })]
+    if case == "containment":
+        assert not record["checkout"].retained
+    assert events == expected_events
     artifact = tmp_path / "home/artifacts" / payload["artifact_dir"]
     expected_artifacts = {"prompt.md", "stdout.txt", "stderr.txt", "manifest.json"}
     if proposal_file:
@@ -859,7 +889,7 @@ async def test_terminal_state_first_match_precedence(
         prompt = f"inspect {home}/secret"
         monkeypatch.setattr(
             provider_opencode,
-            "resolve_opencode_invocation",
+            "resolve_daemon_model",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 OpenCodeConfigError("config_malformed")
             ),
@@ -912,10 +942,10 @@ async def test_post_execution_artifact_write_failure_is_artifact_unavailable(
     async def capture(event, **fields):
         events.append((event, fields))
 
-    async def runner(argv, directory, worker_env, projections=(), **kwargs):
-        record["argv"] = list(argv)
+    async def runner(directory, request, **kwargs):
+        record["request"] = request
         (directory.path / "generated.txt").write_text("generated\n")
-        artifact_directory = tmp_path / "home/artifacts" / kwargs["identifier"]
+        artifact_directory, = (tmp_path / "home/artifacts").iterdir()
         stdout_path = artifact_directory / "stdout.txt"
         stdout_path.unlink()
         stdout_path.mkdir()
@@ -924,7 +954,7 @@ async def test_post_execution_artifact_write_failure_is_artifact_unavailable(
     monkeypatch.setattr(event_logger, "safe_log_event", capture)
     payload = await invoke(seed, tmp_path, record, runner=runner)
 
-    assert record["argv"][-1] == "do the thing"
+    assert record["request"].text == "do the thing"
     assert payload["status"] == "artifact_unavailable"
     assert payload["artifact_dir"] is None
     artifact = tmp_path / "home/artifacts" / payload["run_id"]
@@ -958,3 +988,45 @@ async def test_cleanup_failure_does_not_mutate_terminal_result(
     assert payload["status"] == "succeeded"
     assert events[0][0] == "spawn_open_code_cleanup_failed"
     assert events[-1][0] == "spawn_open_code_completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_admission_refusal_only_retains_uncertain_checkout(spawn_tree, tmp_path, uncertain):
+    from mimir_cultivate.worklink.backends.base import SessionAdmissionError
+
+    home, seed = spawn_tree
+    record = {}
+    from mimir.tools import registry
+    guard = registry._spawn_guard_init()
+
+    async def runner(*args, **kwargs):
+        raise SessionAdmissionError(uncertain=uncertain, generation="generation")
+
+    payload = await invoke(seed, tmp_path, record, runner=runner)
+    assert record["checkout"].retained is uncertain
+    assert payload["opencode_session_id"] is None
+    manifest = json.loads((home / "artifacts" / payload["artifact_dir"] / "manifest.json").read_text())
+    assert manifest["admission_state"] == ("uncertain" if uncertain else "refused")
+    assert manifest["launch_generation"] == "generation"
+    assert len(guard.recent) == int(uncertain)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quiescent", [False, True])
+async def test_known_handle_exception_keeps_spawn_evidence(spawn_tree, tmp_path, quiescent):
+    home, seed = spawn_tree
+    record = {}
+
+    async def runner(*args, **kwargs):
+        kwargs["on_session"](LaunchHandle("opencode_daemon", "ses_current",
+                                         opencode_session_id="ses_current", launch_generation="generation"))
+        if quiescent:
+            kwargs["on_quiescence"]()
+        raise RuntimeError("ordinary failure after admission")
+
+    payload = await invoke(seed, tmp_path, record, runner=runner)
+    assert payload["opencode_session_id"] == "ses_current"
+    assert record["checkout"].retained is not quiescent
+    manifest = json.loads((home / "artifacts" / payload["artifact_dir"] / "manifest.json").read_text())
+    assert manifest["opencode_session_id"] == "ses_current"

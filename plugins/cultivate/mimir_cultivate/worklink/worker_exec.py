@@ -1329,10 +1329,12 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
     _validate_executor_identity(request)
     path_addressed = len(fds) == count - 1
     if path_addressed:
-        if Path(request["path"]).name != "checkout":
-            raise RuntimeError("session checkout requires an issued FD capability")
         validated = {**request, "run_uid": get_identities().worklink_uid}
-        fds.insert(0, _open_factory_checkout(validated, for_launch=create))
+        if Path(request["path"]).name == "checkout":
+            directory_fd = _open_factory_checkout(validated, for_launch=create)
+        else:
+            directory_fd = _open_path_checkout(validated)
+        fds.insert(0, directory_fd)
         observed = os.fstat(fds[0])
         if (observed.st_dev, observed.st_ino) != (request["device"], request["inode"]):
             raise RuntimeError("session checkout identity mismatch")

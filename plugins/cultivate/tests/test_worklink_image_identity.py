@@ -6,6 +6,7 @@ with --all-packages; core-only jobs must not depend on an optional provider.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,25 @@ from mimir_cultivate.setup import _PYTHON_BASE_IMAGE
 
 ROOT = Path(__file__).resolve().parents[3]
 PROOF = ROOT / "scripts/worklink_image_identity.py"
+
+
+def test_offline_identity_proof_captures_production_leaf_and_spawn(tmp_path, monkeypatch):
+    from mimir.tools.registry import _spawn_reset_for_tests
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_SPAWN_DEPTH", raising=False)
+    monkeypatch.delenv("MIMIR_OPENCODE_SPAWN_ARGS", raising=False)
+    _spawn_reset_for_tests()
+    try:
+        proof = runpy.run_path(str(PROOF))["prove_offline"]
+        result = asyncio.run(proof(tmp_path))
+    finally:
+        _spawn_reset_for_tests()
+    assert result["leaf_session"].startswith("ses_")
+    assert result["spawn_session"].startswith("ses_")
+    assert result["leaf_session"] != result["spawn_session"]
+    assert result["creates"][0]["model"] == {"providerID": "openai", "id": "fixture-model", "variant": "high"}
+    assert result["creates"][1]["location"]["directory"] == str(tmp_path / "spawn-checkout")
+    assert result["uid_isolation_proven"] is False
 
 
 def test_pypi_generated_setup_rebuild_executes_closed_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

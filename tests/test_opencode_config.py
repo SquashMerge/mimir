@@ -511,7 +511,7 @@ def test_stale_worker_refresh_does_not_overwrite_newer_codex(tmp_path: Path) -> 
 
 
 @pytest.mark.usefixtures("stub_opencode")
-def test_worklink_refreshes_projected_auth_immediately_before_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_leaf_ignores_agent_refresh_family_before_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mimir_cultivate.worklink.backends import opencode as backend_module
     from mimir_cultivate.worklink.backends.base import WorkOrder
 
@@ -530,8 +530,11 @@ def test_worklink_refreshes_projected_auth_immediately_before_launch(tmp_path: P
     document["tokens"].update(access_token=_jwt(500), refresh_token="new-family-token")
     codex_path.write_text(json.dumps(document))
     refreshed = backend.refresh_codex_projections(spec, env)
-    assert json.loads(spec.backend_config["worker_projections"][1].document)["openai"]["refresh"] == "refresh-200"
-    assert json.loads(refreshed.backend_config["worker_projections"][1].document)["openai"]["refresh"] == "new-family-token"
+    assert "worker_projections" not in spec.backend_config
+    assert "worker_projections" not in refreshed.backend_config
+    assert refreshed.session_request == spec.session_request
+    assert json.loads(codex_path.read_text()) == document
+    assert not (tmp_path / ".local/share/opencode/auth.json").exists()
 
 
 @pytest.mark.parametrize("plugins", [None, [], ["file:///opt/opencode-feature-factory/plugin/index.js"],
@@ -568,16 +571,10 @@ def test_codex_worklink_never_passes_ambient_key(tmp_path: Path, monkeypatch: py
         WorkOrder(2020, tmp_path, "prompt", None, 30, env),
         attempt=1, repo_url="u", base_ref="main", branch="issue/2020-a1", test_command="true",
     )
-    # Uncontained runs must explicitly override the inherited parent key;
-    # contained runs carry only the credential-free allowlist and OAuth projection.
-    if coding_enabled:
-        assert "OPENAI_API_KEY" not in spec.env
-        assert "OPENAI_API_KEY" not in spec.backend_config["pass_env"]
-        projections = spec.backend_config["worker_projections"]
-        assert "plugin" not in json.loads(projections[0].document)
-        assert json.loads(projections[1].document)["openai"]["type"] == "oauth"
-    else:
-        assert spec.env["OPENAI_API_KEY"] == ""
+    assert "OPENAI_API_KEY" not in spec.env
+    assert "OPENAI_API_KEY" not in spec.backend_config["pass_env"]
+    assert "worker_projections" not in spec.backend_config
+    assert spec.local_argv is None
     assert "metered-key" not in str(spec.local_argv)
 
 
@@ -598,7 +595,7 @@ def test_codex_invalid_bundle_fails_without_secrets(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_worklink_reconciles_before_and_after_invocation(tmp_path: Path) -> None:
+async def test_leaf_compatibility_hook_never_reconciles_agent_login(tmp_path: Path) -> None:
     from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
     from mimir_cultivate.worklink.compute import ComputeResult
 
@@ -609,7 +606,7 @@ async def test_worklink_reconciles_before_and_after_invocation(tmp_path: Path) -
     worker.parent.mkdir()
 
     async def invoke() -> ComputeResult:
-        assert json.loads(path.read_text())["openai"]["refresh"] == "refresh-200"
+        assert not path.exists()
         worker.write_text(json.dumps({"openai": {"type": "oauth", "access": _jwt(500), "refresh": "refreshed"}}))
         return ComputeResult(exit_code=0, stdout="", stderr="")
 
@@ -618,7 +615,8 @@ async def test_worklink_reconciles_before_and_after_invocation(tmp_path: Path) -
         refreshed_path=worker,
     )
     assert result.exit_code == 0
-    assert json.loads((tmp_path / ".codex/auth.json").read_text())["tokens"]["refresh_token"] == "refreshed"
+    assert json.loads((tmp_path / ".codex/auth.json").read_text())["tokens"]["refresh_token"] == "refresh-200"
+    assert not path.exists()
 
 
 def test_oversize_config_is_refused_before_parsing(tmp_path: Path) -> None:

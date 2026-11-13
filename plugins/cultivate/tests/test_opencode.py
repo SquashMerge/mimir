@@ -13,6 +13,30 @@ from mimir_cultivate import opencode, repository
 from tests.opencode_fixtures import seed_codex_subscription
 
 
+def test_converted_consumers_have_no_legacy_execution_or_auth_fallback():
+    import ast
+    import inspect
+    import textwrap
+    from mimir_cultivate import setup
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+
+    forbidden = {"resolve_opencode_invocation", "resolve_worklink_opencode_invocation",
+                 "opencode_worker_documents", "reconcile_codex_auth", "resolve_opencode_binary",
+                 "opencode_worker_environment", "_verify_opencode_binary", "_verify_opencode_model"}
+    for consumer in (OpenCodeBackend.work_spec, opencode._spawn_open_code_impl, setup._verify):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(consumer)))
+        calls = {node.func.id for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        assert not calls & forbidden
+        constants = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        assert "OPENCODE_PERMISSION" not in constants
+    wrapper = inspect.getsource(opencode.spawn_open_code.coroutine)
+    assert "contained_runner=execute_contained_session" in wrapper
+    assert "resolve_daemon_model" in setup._OPENCODE_DAEMON_PROBE
+    assert "wait_for_daemon" in setup._OPENCODE_DAEMON_PROBE
+    assert "resolve_opencode_invocation" not in setup._OPENCODE_DAEMON_PROBE
+
+
 def test_selected_spawn_factory_is_provider_owned() -> None:
     from mimir_cultivate.policy import _factory
 

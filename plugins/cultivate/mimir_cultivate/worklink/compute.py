@@ -144,12 +144,46 @@ class ComputeBackend(Protocol):
     async def cleanup(self, handle: LaunchHandle) -> None: ...
 
 
+class ComputeCleanupError(RuntimeError):
+    def __init__(self, handle: LaunchHandle) -> None:
+        super().__init__("daemon session quiescence unverified; retain checkout and recovery state")
+        self.handle = handle
+
+
+async def admit_session(client: WorkerClient, request: SessionRequest, **kwargs: Any) -> LaunchHandle:
+    """Settle the one admission request before cancellation can lose its identity."""
+    from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
+    pending = asyncio.create_task(client.session_create(request, **kwargs))
+    cancelled = False
+    while True:
+        try:
+            handle = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            if pending.cancelled():
+                raise SessionAdmissionCancelled(None, uncertain=True) from None
+            cancelled = True
+            continue
+        except SessionAdmissionError as exc:
+            if cancelled:
+                raise SessionAdmissionCancelled(exc.handle, uncertain=exc.uncertain,
+                                                generation=exc.launch_generation) from None
+            raise
+        if cancelled:
+            raise SessionAdmissionCancelled(handle) from None
+        return handle
+
+
 class OpenCodeDaemonComputeBackend:
     """Session identity and authoritative outcomes, not helper PIDs or exits."""
 
     name = "opencode_daemon"
 
-    def __init__(self, checkout: CheckoutCapability | None = None, *, client: WorkerClient | None = None) -> None:
+    def __init__(self, checkout: CheckoutCapability | None = None, *, client: WorkerClient | None = None,
+                 stdout_limit: int | None = None) -> None:
+        if stdout_limit is not None and (type(stdout_limit) is not int or not 0 < stdout_limit <= 64 * 1024 * 1024):
+            raise ValueError("invalid session stdout limit")
+        self._stdout_limit = stdout_limit
+        self._bind_on_launch = client is None and checkout is None
         if client is None:
             from .worker_client import WorkerClient
             client = WorkerClient(checkout)
@@ -159,18 +193,64 @@ class OpenCodeDaemonComputeBackend:
     def capabilities(self) -> ComputeCaps:
         return ComputeCaps(True, False, True, True)
 
+    async def recover_admission(self, generation: str) -> LaunchHandle | None:
+        return await self._client.session_recover_admission(generation)
+
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
+        from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
         if spec.session_request is None:
             raise ComputeLaunchError("daemon compute requires a typed session request")
+        from .worker_client import WorkerClient
+        if self._bind_on_launch:
+            if spec.local_checkout is None:
+                raise ComputeLaunchError("daemon compute requires a checkout")
+            from .identities import get_identities
+            self._client = WorkerClient.for_path_checkout(
+                spec.local_checkout, issue_id=spec.issue_id, attempt=spec.attempt,
+                run_uid=get_identities().worklink_uid)
+            self._bind_on_launch = False
+        if isinstance(self._client, WorkerClient):
+            if self._client.path_checkout is not None and (
+                self._client.path_checkout != spec.local_checkout or self._client.issue_id != spec.issue_id
+                or self._client.attempt != spec.attempt
+            ):
+                raise ComputeLaunchError("daemon compute checkout binding mismatch")
+            if self._client.checkout is not None:
+                authorization = self._client.checkout
+                authorization.verify(spec.local_checkout)
+                if (authorization.issue_id, authorization.attempt) != (spec.issue_id, spec.attempt):
+                    raise ComputeLaunchError("daemon compute attempt binding mismatch")
         requested = spec.backend_config.get("pass_env", ())
         if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
             raise ComputeLaunchError("session pass_env must be a sequence")
+        if (any(not isinstance(name, str) for name in requested) or len(set(requested)) != len(requested)
+                or any(name not in spec.env for name in requested)):
+            raise ComputeLaunchError("session pass_env requires unique present environment names")
+        pass_env = {name: spec.env[name] for name in requested}
+        from .daemon_sessions import session_environment
+        try:
+            session_environment(pass_env, home=Path("/var/lib/mimir-worklink/session-validation"),
+                                git_settings=spec.factory_credential_settings, credentials={})
+        except (ValueError, ComputeLaunchError) as exc:
+            raise ComputeLaunchError("session environment refused") from exc
         deadline = asyncio.get_running_loop().time() + spec.timeout_s
-        handle = await self._client.session_create(
-            spec.session_request, timeout_s=spec.timeout_s,
-            pass_env={name: spec.env[name] for name in requested if name in spec.env},
-            git_settings=spec.factory_credential_settings,
-        )
+        try:
+            handle = await admit_session(self._client,
+                spec.session_request, timeout_s=spec.timeout_s,
+                pass_env=pass_env,
+                git_settings=spec.factory_credential_settings,
+            )
+        except (SessionAdmissionCancelled, SessionAdmissionError) as exc:
+            if exc.handle is not None:
+                try:
+                    await asyncio.shield(self.cancel(exc.handle))
+                    await asyncio.shield(self.cleanup(exc.handle))
+                    exc.quiescent = True
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ComputeLaunchError("OpenCode daemon session admission unavailable") from exc
         self._deadlines[handle.identifier] = deadline
         return handle
 
@@ -183,21 +263,25 @@ class OpenCodeDaemonComputeBackend:
             async with asyncio.timeout(min(timeout_s, max(0, remaining))):
                 while True:
                     try:
-                        outcome = await self._client.session_observe(handle)
+                        outcome = await self._observe(handle)
                     except SessionTransportLostError:
                         await asyncio.sleep(0.1)
                         continue
                     if asyncio.get_running_loop().time() >= deadline:
                         raise TimeoutError
                     if outcome.output_overflow:
-                        await self.cancel(handle)
+                        try:
+                            await self.cancel(handle)
+                        except (OSError, RuntimeError, ValueError):
+                            outcome = replace(outcome, cancellation_state="unverified")
                         return ComputeResult(1, outcome.stdout, "", output_overflow=True,
                                              handle=handle, session_outcome=outcome)
                     if outcome.execution_state in {"succeeded", "failed", "interrupted", "incomplete"}:
                         return ComputeResult(
                             0 if outcome.execution_state == "succeeded" else 1, outcome.stdout, "",
                             handle=handle, session_outcome=outcome, session_error=outcome.error,
-                            timed_out=outcome.error is not None and outcome.error.type == "timeout",
+                            timed_out=(outcome.execution_state == "incomplete" and outcome.error is not None
+                                       and outcome.error.type == "timeout"),
                         )
                     await asyncio.sleep(0.1)
         except TimeoutError:
@@ -210,16 +294,36 @@ class OpenCodeDaemonComputeBackend:
             outcome = SessionOutcome(handle.identifier, "incomplete", cancellation, error)
             return ComputeResult(1, "", "", timed_out=True, handle=handle,
                                  session_outcome=outcome, session_error=error)
+        except (OSError, RuntimeError, ValueError):
+            cancellation = "verified"
+            try:
+                await self.cancel(handle)
+            except (OSError, RuntimeError, ValueError):
+                cancellation = "unverified"
+            error = SessionError("backend_error", "OpenCode session observation failed")
+            outcome = SessionOutcome(handle.identifier, "incomplete", cancellation, error)
+            return ComputeResult(1, "", "", handle=handle, session_outcome=outcome, session_error=error)
 
     async def logs(self, handle: LaunchHandle) -> str:
-        outcome = await self._client.session_observe(handle)
+        outcome = await self._observe(handle)
         return outcome.stdout
 
+    async def _observe(self, handle: LaunchHandle) -> SessionOutcome:
+        if self._stdout_limit is None:
+            return await self._client.session_observe(handle)
+        return await self._client.session_observe(handle, stdout_limit=self._stdout_limit)
+
     async def cancel(self, handle: LaunchHandle) -> None:
-        await self._client.session_cancel(handle)
+        try:
+            await self._client.session_cancel(handle)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ComputeCleanupError(handle) from exc
 
     async def cleanup(self, handle: LaunchHandle) -> None:
-        await self._client.session_release(handle)
+        try:
+            await self._client.session_release(handle)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ComputeCleanupError(handle) from exc
         self._deadlines.pop(handle.identifier, None)
 
 

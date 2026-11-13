@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 import json
 import subprocess
+import sys
 import pytest
 from pathlib import Path
 from typing import Sequence
@@ -275,6 +276,166 @@ def test_run_state_roundtrip(tmp_path: Path) -> None:
     clear_run_state(tmp_path, 561)
 
 
+async def _cancel_with_trace(controller, daemon, traces, *, timeout_s=None):
+    """Observe only this controller's swallowed errors and bounded wire metadata."""
+    from mimir_cultivate.worklink.daemon_client import DaemonClientError
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+
+    trace = {"checkpoints": [], "exceptions": [], "result": None}
+    request_start = len(daemon.requests)
+    code = SessionController.cancel.__code__
+
+    def observe(frame, event, arg):
+        if frame.f_code is not code or frame.f_locals.get("self") is not controller:
+            return None
+        if event == "exception" and isinstance(arg[1], (TimeoutError, DaemonClientError)):
+            trace["exceptions"].append(type(arg[1]).__name__)
+            del trace["exceptions"][:-16]
+        return observe
+
+    def checkpoint(name, stage, error=None):
+        record = controller.record
+        trace["checkpoints"].append({"name": name, "stage": stage, "error": error,
+            "execution": record.execution_state, "cancellation": record.cancellation_state,
+            "cursor": record.last_seq})
+        del trace["checkpoints"][:-16]
+
+    previous = sys.gettrace()
+    with pytest.MonkeyPatch.context() as patch:
+        for name in ("_read_log", "_messages", "_inbox"):
+            original = getattr(controller, name)
+
+            async def wrapped(*args, _name=name, _original=original, **kwargs):
+                checkpoint(_name, "entered")
+                try:
+                    result = await _original(*args, **kwargs)
+                except BaseException as exc:
+                    checkpoint(_name, "raised", type(exc).__name__)
+                    raise
+                checkpoint(_name, "returned")
+                return result
+
+            patch.setattr(controller, name, wrapped)
+        sys.settrace(observe)
+        try:
+            trace["result"] = await controller.cancel(**({"timeout_s": timeout_s} if timeout_s is not None else {}))
+            return trace["result"]
+        finally:
+            sys.settrace(previous)
+            record = controller.record
+            session = daemon.sessions[record.opencode_session_id]
+            trace.update(execution=record.execution_state, cancellation=record.cancellation_state,
+                         cursor=record.last_seq, active=session.active,
+                         pending=[item["id"] for item in session.inbox][:16],
+                         events=[(event["durable"]["seq"], event["type"]) for event in session.log[-16:]],
+                         requests=[(method, route) for method, route, _, _ in
+                                   daemon.requests[max(request_start, len(daemon.requests) - 32):]])
+            traces.append(trace)
+            del traces[:-8]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["terminal", "interrupted", "failed"])
+async def test_failed_leaf_reattach_retains_until_real_session_quiescence(tmp_path, monkeypatch, recovery):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon, SyntheticFault
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / ".worklink/repo/561-1"
+    checkout.mkdir(parents=True)
+    calls = []
+    labels = ["worklink:in-progress"]
+    runner = _remote_runner(repo, calls, issue_id=561, labels=labels)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await SessionController.create(
+            client, tmp_path / "controller.json",
+            request=SessionRequest("leaf", {"providerID": "openai", "id": "gpt-test"}, "build", ("git *",)),
+            issue_id=561, attempt=1, generation="generation", checkout=checkout,
+            environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+        sid = controller.record.opencode_session_id
+        traces = []
+
+        class Boundary:
+            async def session_observe(self, handle):
+                if recovery == "interrupted":
+                    raise asyncio.CancelledError("reattach interrupted")
+                raise AssertionError("reattach observation failed")
+
+            async def session_cancel(self, handle):
+                assert (handle.identifier, handle.launch_generation) == (sid, "generation")
+                if not await _cancel_with_trace(controller, daemon, traces):
+                    raise RuntimeError("unverified cancellation: " + json.dumps(traces[-1]))
+
+            async def session_release(self, handle):
+                await controller.release()
+
+        boundary = Boundary()
+        monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *args, **kwargs: boundary)
+        registry = BackendRegistry(WorklinkConfig())
+        registry.register(OpenCodeBackend(bash_allowlist=("git *",)))
+        registry.register_compute(OpenCodeDaemonComputeBackend(client=boundary))
+        state = WorklinkRunState(
+            issue_id=561, attempt=1, backend="opencode", compute_name="opencode_daemon",
+            handle_substrate="opencode_daemon", handle_identifier=sid, branch="issue/561-a1",
+            base_ref="main", local_base="main", repo=str(repo), repo_url="repo", test_command=None,
+            started_at="2026-06-18T16:00:00+00:00", checkout=str(checkout),
+            opencode_session_id=sid, launch_generation="generation")
+        save_run_state(tmp_path, state)
+        claims = ChainlinkClaims(chainlink_bin="chainlink", agent_id="test", runner=lambda args: runner(args))
+        claims.transition_issue(561, status="failed", review_ready=False, attempt=1, reason="cleanup unverified")
+        labels[:] = ["worklink:failed"]
+        daemon.faults[("GET", f"/api/experimental/session/{sid}/log")].append(SyntheticFault(status=401))
+        result = await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+        assert result.reason == "session quiescence unverified; recovery retained"
+        assert load_run_state(tmp_path, 561) == state
+        assert checkout.exists() and controller.path.exists()
+        assert ["chainlink", "locks", "release", "561"] not in calls
+        assert json.loads(result.evidence_path.read_text())["opencode_session_id"] == sid
+        assert traces[0]["exceptions"] == ["DaemonClientError"], traces
+        assert traces[0]["result"] is False and traces[0]["active"], traces
+        assert traces[0]["cancellation"] == "unverified" and traces[0]["cursor"] == 0, traces
+
+        daemon.finish(sid, outcome="interrupted")
+        if recovery != "terminal":
+            labels[:] = ["worklink:in-progress"]
+            from mimir_cultivate.worklink import orchestrator
+            monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture",
+                                lambda *args: SimpleNamespace(close=lambda: None))
+            if recovery == "interrupted":
+                with pytest.raises(asyncio.CancelledError):
+                    await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+                evidence = json.loads(result.evidence_path.read_text())
+                assert evidence["status"] == "interrupted"
+            else:
+                result = await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+                evidence = json.loads(result.evidence_path.read_text())
+                assert result.status == "failed"
+            assert evidence["opencode_session_id"] == sid
+            assert not controller.path.exists()
+            assert traces[-1]["result"] is True and traces[-1]["exceptions"] == [], traces
+            assert traces[-1]["execution"] == "interrupted" and not traces[-1]["pending"], traces
+            assert traces[-1]["cancellation"] == "verified" and not traces[-1]["active"], traces
+            assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == 1
+            return
+        result = await WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(561)
+        assert result.reason == "retained session cancellation verified"
+        assert traces[-1]["result"] is True and traces[-1]["exceptions"] == [], traces
+        assert traces[-1]["execution"] == "interrupted" and not traces[-1]["pending"], traces
+        assert traces[-1]["cancellation"] == "verified" and not traces[-1]["active"], traces
+        assert load_run_state(tmp_path, 561) is None
+        assert not controller.path.exists()
+        assert ["chainlink", "locks", "release", "561"] in calls
+        assert sum(route.endswith("/prompt") for _, route, _, _ in daemon.requests) == 1
+
+
 def test_list_run_states_skips_unparseable(tmp_path: Path) -> None:
     good = WorklinkRunState(
         issue_id=1, attempt=1, backend="codex", compute_name="fake_persistent",
@@ -348,6 +509,416 @@ def _write_completed_evidence(
         encoding="utf-8",
     )
     return path
+
+
+@pytest.fixture
+async def daemon_recovery(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / ".worklink/repo/561-1"
+    checkout.mkdir(parents=True)
+    path = tmp_path / "controller.json"
+    labels, calls, operations, traces = ["worklink:failed"], [], [], []
+    runner = _remote_runner(repo, calls, issue_id=561, labels=labels)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        async def create(text):
+            return await SessionController.create(
+                client, path, request=SessionRequest("leaf", {"providerID": "openai", "id": "gpt-test"}, text, ("git *",)),
+                issue_id=561, attempt=1, generation="generation", checkout=checkout,
+                environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+
+        class Boundary:
+            def recover(self, handle, operation):
+                operations.append((operation, handle.opencode_session_id, handle.launch_generation))
+                assert handle.identifier == handle.opencode_session_id
+                return SessionController.recover_owned(
+                    client, path, session_id=handle.opencode_session_id,
+                    generation=handle.launch_generation, checkout=checkout)
+
+            async def session_observe(self, handle):
+                return await self.recover(handle, "observe").observe()
+
+            async def session_cancel(self, handle):
+                controller = self.recover(handle, "cancel")
+                if not await _cancel_with_trace(controller, daemon, traces):
+                    raise RuntimeError("session cancellation unverified: " + json.dumps(traces[-1]))
+
+            async def session_release(self, handle):
+                await self.recover(handle, "release").release()
+
+        boundary = Boundary()
+        monkeypatch.setattr(WorkerClient, "for_path_checkout", lambda *args, **kwargs: boundary)
+        registry = BackendRegistry(WorklinkConfig())
+        registry.register(OpenCodeBackend(bash_allowlist=("git *",)))
+        registry.register_compute(OpenCodeDaemonComputeBackend(client=boundary))
+
+        def save(controller):
+            sid = controller.record.opencode_session_id
+            state = WorklinkRunState(
+                issue_id=561, attempt=1, backend="opencode", compute_name="opencode_daemon",
+                handle_substrate="opencode_daemon", handle_identifier=sid, branch="issue/561-a1",
+                base_ref="main", local_base="main", repo=str(repo), repo_url="repo", test_command=None,
+                started_at="2026-06-18T16:00:00+00:00", checkout=str(checkout),
+                opencode_session_id=sid, launch_generation="generation")
+            save_run_state(tmp_path, state)
+            return state
+
+        yield SimpleNamespace(daemon=daemon, client=client, create=create, save=save, boundary=boundary,
+                              repo=repo, checkout=checkout, path=path, labels=labels, calls=calls,
+                              operations=operations, traces=traces, registry=registry,
+                              runner=WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["deadline", "protocol"])
+async def test_cancel_trace_distinguishes_budget_exhaustion_from_protocol_refusal(monkeypatch, daemon_recovery, cause):
+    from tests.worklink_daemon_fixtures import SyntheticFault
+
+    fixture = daemon_recovery
+    controller = await fixture.create("diagnose cancellation")
+    sid = controller.record.opencode_session_id
+    traces = []
+    original_read = controller._read_log
+    fixture.daemon.faults[("GET", f"/api/experimental/session/{sid}/log")].append(SyntheticFault(status=401))
+    assert not await _cancel_with_trace(controller, fixture.daemon, traces)
+    assert traces[0]["exceptions"] == ["DaemonClientError"], traces
+    assert traces[0]["active"] and traces[0]["cancellation"] == "unverified", traces
+    fixture.daemon.finish(sid, outcome="interrupted")
+    if cause == "deadline":
+        entered, proceed = asyncio.Event(), asyncio.Event()
+
+        async def held_checkpoint(*args, **kwargs):
+            entered.set()
+            await proceed.wait()
+            return await original_read(*args, **kwargs)
+
+        monkeypatch.setattr(controller, "_read_log", held_checkpoint)
+        # Reproduce the old helper's budget exhaustion with a terminal witness
+        # already present. The owned checkpoint, not machine load, holds it.
+        assert not await asyncio.wait_for(
+            _cancel_with_trace(controller, fixture.daemon, traces, timeout_s=0.5), 3)
+        assert entered.is_set()
+        assert traces[1]["exceptions"] == ["TimeoutError"], traces
+        assert any(item["name"] == "_read_log" and item["error"] == "CancelledError"
+                   for item in traces[1]["checkpoints"]), traces
+        assert not traces[1]["active"] and not traces[1]["pending"], traces
+        assert traces[1]["cancellation"] == "unverified", traces
+        monkeypatch.setattr(controller, "_read_log", original_read)
+    assert await _cancel_with_trace(controller, fixture.daemon, traces)
+    assert traces[-1]["exceptions"] == [] and traces[-1]["execution"] == "interrupted", traces
+    assert traces[-1]["cursor"] > traces[0]["cursor"], traces
+    assert not traces[-1]["active"] and not traces[-1]["pending"], traces
+    await controller.release()
+    assert not controller.path.exists()
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 1
+    print(json.dumps({"cause": cause, "cancellation_trace": traces}))
+
+
+@pytest.mark.asyncio
+async def test_completed_initial_evidence_cannot_release_active_repair(tmp_path, daemon_recovery):
+    from tests.worklink_daemon_fixtures import SyntheticFault
+
+    fixture = daemon_recovery
+    initial = await fixture.create("initial build")
+    initial_id = initial.record.opencode_session_id
+    fixture.daemon.finish(initial_id, outcome="succeeded")
+    await initial.release()
+    repair = await fixture.create("repair CI")
+    state = fixture.save(repair)
+    evidence_path = _write_completed_evidence(tmp_path, issue_id=561)
+    evidence = json.loads(evidence_path.read_text())
+    evidence["opencode_session_id"] = initial_id
+    evidence_path.write_text(json.dumps(evidence))
+
+    fixture.daemon.faults[("GET", f"/api/experimental/session/{state.opencode_session_id}/log")].append(
+        SyntheticFault(status=401))
+    result = await fixture.runner.reattach(561)
+    assert result.status == "failed" and not result.review_ready
+    assert result.reason == "session quiescence unverified; recovery retained"
+    assert load_run_state(tmp_path, 561) == state
+    assert fixture.checkout.exists() and fixture.path.exists()
+    assert ["chainlink", "locks", "release", "561"] not in fixture.calls
+    assert fixture.operations == [("cancel", state.opencode_session_id, "generation")]
+    assert fixture.traces[0]["exceptions"] == ["DaemonClientError"], fixture.traces
+    assert fixture.traces[0]["active"] and fixture.traces[0]["result"] is False, fixture.traces
+    assert fixture.traces[0]["cancellation"] == "unverified" and fixture.traces[0]["cursor"] == 0, fixture.traces
+
+    fixture.daemon.finish(state.opencode_session_id, outcome="interrupted")
+    result = await fixture.runner.reattach(561)
+    assert result.reason == "retained session cancellation verified"
+    assert load_run_state(tmp_path, 561) is None
+    assert ["chainlink", "locks", "release", "561"] in fixture.calls
+    assert fixture.traces[-1]["exceptions"] == [] and fixture.traces[-1]["result"] is True, fixture.traces
+    assert fixture.traces[-1]["execution"] == "interrupted" and not fixture.traces[-1]["pending"], fixture.traces
+    assert fixture.traces[-1]["cancellation"] == "verified" and not fixture.traces[-1]["active"], fixture.traces
+    assert all(sid == state.opencode_session_id and generation == "generation"
+               for _, sid, generation in fixture.operations)
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence_is_current", [False, True])
+async def test_completed_evidence_requires_current_session_and_verified_cleanup(tmp_path, daemon_recovery, evidence_is_current):
+    fixture = daemon_recovery
+    initial = await fixture.create("initial build")
+    initial_id = initial.record.opencode_session_id
+    fixture.daemon.finish(initial_id, outcome="succeeded")
+    await initial.release()
+    repair = await fixture.create("repair CI")
+    state = fixture.save(repair)
+    if evidence_is_current:
+        fixture.daemon.finish(state.opencode_session_id, outcome="succeeded")
+    evidence_path = _write_completed_evidence(tmp_path, issue_id=561)
+    evidence = json.loads(evidence_path.read_text())
+    evidence["opencode_session_id"] = state.opencode_session_id if evidence_is_current else initial_id
+    evidence_path.write_text(json.dumps(evidence))
+
+    result = await fixture.runner.reattach(561)
+    assert result.status == ("completed" if evidence_is_current else "failed")
+    assert load_run_state(tmp_path, 561) is None
+    assert ["chainlink", "locks", "release", "561"] in fixture.calls
+    assert fixture.operations == [(operation, state.opencode_session_id, "generation")
+                                  for operation in ("cancel", "release")]
+    assert json.loads(result.evidence_path.read_text())["opencode_session_id"] == state.opencode_session_id
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_retained_session_reconciliation_interruption_writes_current_identity(tmp_path, monkeypatch, daemon_recovery):
+    fixture = daemon_recovery
+    controller = await fixture.create("repair CI")
+    state = fixture.save(controller)
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+    original_cancel = fixture.boundary.session_cancel
+
+    async def paused_cancel(handle):
+        assert (handle.identifier, handle.launch_generation) == (state.opencode_session_id, "generation")
+        entered.set()
+        await proceed.wait()
+        await original_cancel(handle)
+
+    monkeypatch.setattr(fixture.boundary, "session_cancel", paused_cancel)
+    canary = "opaque-" + "retained-interruption"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", canary)
+    task = asyncio.create_task(fixture.runner.reattach(561))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel(canary + "x" * 3000)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    evidence = json.loads((tmp_path / "state/worklink/evidence/561-1.json").read_text())
+    assert evidence["status"] == "interrupted"
+    assert evidence["opencode_session_id"] == state.opencode_session_id
+    assert canary not in evidence["failure_reason"]
+    assert len(evidence["failure_reason"]) <= 2048
+    assert load_run_state(tmp_path, 561) == state
+    assert fixture.path.exists() and fixture.checkout.exists()
+    assert ["chainlink", "locks", "release", "561"] not in fixture.calls
+
+    monkeypatch.setattr(fixture.boundary, "session_cancel", original_cancel)
+    result = await fixture.runner.reattach(561)
+    assert result.reason == "retained session cancellation verified"
+    assert load_run_state(tmp_path, 561) is None
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_retirement_witness_is_scoped_to_session_and_generation(daemon_recovery):
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+
+    fixture = daemon_recovery
+    initial = await fixture.create("initial")
+    initial_id = initial.record.opencode_session_id
+    fixture.daemon.finish(initial_id, outcome="succeeded")
+    await initial.release()
+    repair = await fixture.create("repair")
+    repair_id = repair.record.opencode_session_id
+    requests_before = len(fixture.daemon.requests)
+    retired = SessionController.recover_owned(fixture.client, fixture.path, session_id=initial_id,
+                                              generation="generation", checkout=fixture.checkout)
+    assert await retired.cancel()
+    await retired.release()
+    assert len(fixture.daemon.requests) == requests_before
+    assert fixture.daemon.sessions[repair_id].active
+    assert fixture.path.exists()
+    assert SessionController.recover(fixture.client, fixture.path, generation="generation",
+                                     checkout=fixture.checkout).record.opencode_session_id == repair_id
+    with pytest.raises(ValueError, match="generation mismatch"):
+        SessionController.recover_owned(fixture.client, fixture.path, session_id=initial_id,
+                                        generation="foreign-generation", checkout=fixture.checkout)
+
+
+@pytest.mark.parametrize("sid, generation", [(None, "generation"), ("ses_current", None),
+                                            ("not-a-session", "generation")])
+def test_process_gate_state_rejects_invalid_session_correlation(sid, generation):
+    import uuid
+
+    state = WorklinkRunState(
+        issue_id=561, attempt=1, backend="opencode", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier=str(uuid.uuid4()), branch="issue/561-a1",
+        base_ref="main", local_base="main", repo="/repo", repo_url="repo", test_command="pytest",
+        started_at="2026-06-18T16:00:00+00:00", process_start_ticks=1, shim_pid=12345,
+        opencode_session_id=sid, launch_generation=generation)
+    with pytest.raises(ValueError, match="gate session identity"):
+        WorklinkRunState.from_json(state.to_json())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_stop", [False, True], ids=["startup", "stop-startup"])
+@pytest.mark.parametrize("kind", ["gate", "ci_wait"])
+@pytest.mark.parametrize("repair", [False, True], ids=["initial", "repair"])
+@pytest.mark.parametrize("live", [False, True], ids=["dead", "live"])
+async def test_stop_and_startup_dispatch_correlated_terminal_recovery(tmp_path, monkeypatch, daemon_recovery,
+                                                                    kind, repair, live, request_stop):
+    import uuid
+    from types import SimpleNamespace
+    from mimir_cultivate import server
+    from mimir_cultivate.worklink import control, orchestrator
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+
+    fixture = daemon_recovery
+    controller = await fixture.create("initial build")
+    fixture.daemon.finish(controller.record.opencode_session_id, outcome="succeeded")
+    await controller.release()
+    initial_id = controller.record.opencode_session_id
+    if repair:
+        controller = await fixture.create("repair CI")
+        fixture.daemon.finish(controller.record.opencode_session_id, outcome="succeeded")
+        await controller.release()
+    state = fixture.save(controller)
+    sid = state.opencode_session_id
+    state = replace(state, compute_name="local_subprocess",
+                    handle_substrate="local_subprocess" if kind == "gate" else "controller",
+                    handle_identifier=str(uuid.uuid4()) if kind == "gate" else "12345",
+                    shim_pid=12345 if kind == "gate" else None, process_start_ticks=42,
+                    phase="spawned" if kind == "gate" else "ci_wait")
+    save_run_state(tmp_path, state)
+    fixture.labels[:] = ["worklink:in-progress"]
+    process_live = live
+    monkeypatch.setattr(control, "process_is_alive", lambda current: process_live)
+    monkeypatch.setattr(control, "process_identity_verified", lambda current: process_live)
+    monkeypatch.setattr(orchestrator, "process_is_alive", lambda current: process_live)
+    monkeypatch.setenv("WORKLINK_REPO", str(fixture.repo))
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "fixture-mimir")
+    cancellations = []
+
+    async def cancel_process(self, handle):
+        nonlocal process_live
+        assert handle.identifier == state.handle_identifier
+        assert handle.opencode_session_id is None and handle.launch_generation is None
+        assert handle.shim_pid == state.shim_pid
+        cancellations.append(handle)
+        process_live = False
+
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel_process)
+    evidence_path = tmp_path / "state/worklink/evidence/561-1.json"
+
+    def checked_runner(args, **kwargs):
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            evidence = json.loads(evidence_path.read_text())
+            assert evidence["opencode_session_id"] == sid
+            assert evidence["status"] == "failed"
+            assert load_run_state(tmp_path, 561).opencode_session_id == sid
+        return fixture.runner.runner(args, **kwargs)
+
+    if request_stop:
+        result = await asyncio.to_thread(control.stop_worklink, tmp_path, 561, runner=checked_runner)
+        assert result.stopped and not result.state_cleared and not result.claim_released
+    assert load_run_state(tmp_path, 561) == state
+    assert control.operator_stop_requested(tmp_path, 561, 1) is request_stop
+    assert ["chainlink", "locks", "release", "561"] not in fixture.calls
+    assert len(cancellations) == int(request_stop and live and kind == "gate")
+
+    recovery = WorklinkRunner(home=tmp_path, repo=fixture.repo, runner=checked_runner, registry=fixture.registry)
+    children, argv_seen, events = [], [], []
+
+    def spawn(argv, **kwargs):
+        argv_seen.append(argv)
+        assert argv == reattach_dispatch_argv(["fixture-mimir"], tmp_path, str(fixture.repo), 561)
+        assert kwargs["start_new_session"] is True
+        children.append(asyncio.create_task(recovery.reattach(561)))
+        return SimpleNamespace(pid=43210)
+
+    requests_before = len(fixture.daemon.requests)
+    dispatched = server.reattach_inflight_worklink_runs(
+        tmp_path, popen=spawn, event_logger=lambda event, **fields: events.append((event, fields)))
+    assert dispatched == [561], events
+    outcome = await children[-1]
+    assert json.loads(outcome.evidence_path.read_text())["opencode_session_id"] == sid
+    if live and kind == "ci_wait":
+        assert "still live" in outcome.reason
+        assert load_run_state(tmp_path, 561) == state
+        assert ["chainlink", "locks", "release", "561"] not in fixture.calls
+        process_live = False
+        assert server.reattach_inflight_worklink_runs(tmp_path, popen=spawn) == [561]
+        outcome = await children[-1]
+    assert outcome.status == "failed"
+    assert load_run_state(tmp_path, 561) is None
+    assert ["chainlink", "locks", "release", "561"] in fixture.calls
+    assert fixture.checkout.exists()
+    assert len(cancellations) == int(live and kind == "gate")
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["opencode_session_id"] == sid
+    assert (sid != initial_id) is repair
+    retired = SessionController.recover_owned(fixture.client, fixture.path, session_id=sid,
+                                              generation=state.launch_generation, checkout=fixture.checkout)
+    assert retired.record.cancellation_state == "verified"
+    assert all(current_id == sid and generation == state.launch_generation
+               for _, current_id, generation in fixture.operations)
+    assert len(fixture.daemon.requests) == requests_before
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == (2 if repair else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["gate", "ci_wait"])
+async def test_startup_terminal_recovery_keeps_pointer_until_evidence_is_written(tmp_path, monkeypatch, daemon_recovery, kind):
+    import uuid
+    from types import SimpleNamespace
+    from mimir_cultivate import server
+    from mimir_cultivate.worklink import control, orchestrator
+
+    fixture = daemon_recovery
+    controller = await fixture.create("initial build")
+    fixture.daemon.finish(controller.record.opencode_session_id, outcome="succeeded")
+    await controller.release()
+    state = replace(fixture.save(controller), compute_name="local_subprocess",
+                    handle_substrate="local_subprocess" if kind == "gate" else "controller",
+                    handle_identifier=str(uuid.uuid4()) if kind == "gate" else "12345",
+                    shim_pid=12345 if kind == "gate" else None, process_start_ticks=42,
+                    phase="spawned" if kind == "gate" else "ci_wait")
+    save_run_state(tmp_path, state)
+    monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+    monkeypatch.setattr(orchestrator, "process_is_alive", lambda state: False)
+    monkeypatch.setenv("WORKLINK_REPO", str(fixture.repo))
+    write_evidence = orchestrator._write_session_failure
+    monkeypatch.setattr(orchestrator, "_write_session_failure", lambda *args, **kwargs: None)
+    children = []
+
+    def spawn(argv, **kwargs):
+        children.append(asyncio.create_task(fixture.runner.reattach(561)))
+        return SimpleNamespace(pid=43210)
+
+    assert server.reattach_inflight_worklink_runs(tmp_path, popen=spawn) == [561]
+    result = await children[-1]
+    assert result.reason == "terminal evidence unavailable; session recovery retained"
+    assert load_run_state(tmp_path, 561) == state
+    assert ["chainlink", "locks", "release", "561"] not in fixture.calls
+    monkeypatch.setattr(orchestrator, "_write_session_failure", write_evidence)
+    assert server.reattach_inflight_worklink_runs(tmp_path, popen=spawn) == [561]
+    result = await children[-1]
+    assert json.loads(result.evidence_path.read_text())["opencode_session_id"] == state.opencode_session_id
+    assert load_run_state(tmp_path, 561) is None
+    assert ["chainlink", "locks", "release", "561"] in fixture.calls
+    assert sum(route.endswith("/prompt") for _, route, _, _ in fixture.daemon.requests) == 1
 
 
 @pytest.mark.parametrize("release_ok", [True, False])

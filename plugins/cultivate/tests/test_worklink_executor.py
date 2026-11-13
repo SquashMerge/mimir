@@ -427,14 +427,12 @@ def test_opencode_work_spec_scrubs_model_selection_with_empty_remove_env(
         attempt=1, repo_url="repo", base_ref="main", branch="issue/1949",
         test_command="true",
     )
-    assert spec.backend_config["args"] == ["-m", "openai/gpt-agent"]
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent"}
     assert "MIMIR_MODEL_SPEC" not in spec.env
-    expected = image_bin if image_install else fallback
-    assert spec.local_argv[:4] == (str(expected), "run", "--dir", str(tmp_path))
-    assert spec.local_argv[0] == spec.backend_config["bin"]
-    assert expected.is_absolute() and expected.is_file()
-    assert spec.local_argv[0] != "opencode"
-    assert spec.local_argv[0] != str(hostile / "opencode")
+    assert spec.local_argv is None
+    assert "bin" not in spec.backend_config
+    assert "PATH" not in spec.env
+    assert "worker_projections" not in spec.backend_config
 
 
 def test_opencode_image_symlink_is_preserved_and_missing_binary_fails_closed(tmp_path, monkeypatch):

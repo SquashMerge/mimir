@@ -18,9 +18,13 @@ SITES = {
     ("daemon_sessions.py", "_executor_operation", "rmtree_missing_ok"): (1, "attempt HOME only after verified session release"),
     ("control.py", "stop_worklink", "WorkerClient(None).cancel_factory_handle"): (1, "explicit operator stop; verified process identity"),
     ("control.py", "stop_worklink", "LocalSubprocessComputeBackend().cancel"): (2, "explicit operator stop for factory or leaf; verified process identity"),
-    ("orchestrator.py", "invoke_backend", "compute.cancel"): (1, "leaf launch-state failure, not a factory handle"),
+    ("orchestrator.py", "invoke_backend", "compute.cancel"): (2, "leaf launch-state failure or verified daemon quiescence before release"),
+    ("control.py", "cancel_owned_session", "backend.cancel"): (1, "operator stop uses owned session identity and verified cancellation"),
     ("evidence.py", "_run_compute_gate", "compute.cancel"): (2, "leaf evidence gate, not a factory handle"),
     ("orchestrator.py", "reattach", "LocalSubprocessComputeBackend().cancel"): (1, "explicit leaf reattach stop"),
+    ("orchestrator.py", "reattach", "compute.cancel"): (1, "owned session must be quiescent after observation before release"),
+    ("orchestrator.py", "reconcile_current_session", "session_compute.cancel"): (1, "early completed-evidence or failed-label recovery verifies the current session before releasing state"),
+    ("orchestrator.py", "_finalize", "compute.cancel"): (1, "CI repair session release requires owned-session quiescence"),
     ("orchestrator.py", "_run_factory_070_locked", "_cancel_and_cleanup_factory_handle"): (1, "factory record save failed immediately after launch; containment refused"),
     ("orchestrator.py", "_recover_factory_070", "_cancel_and_cleanup_factory_handle"): (2, "factory terminal declared or resumed launch record save refused"),
     ("orchestrator.py", "_supervise_factory_070", "_cancel_and_cleanup_factory_handle"): (1, "wait task cannot be created; containment refused"),
@@ -50,6 +54,7 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
         "WorkerClient(None).cancel_factory_handle", "LocalSubprocessComputeBackend().cancel",
         "prune_attempt_checkouts", "cleanup_checkout", "shutil.rmtree", "rmtree_missing_ok",
         "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
+        "backend.cancel", "session_compute.cancel",
     }
     for path in ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -68,7 +73,8 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
                         "cancel_once", "compute.cancel", "_cancel_and_cleanup_factory_handle",
                         "WorkerClient(None).cancel_factory_handle", "LocalSubprocessComputeBackend().cancel",
                          "prune_attempt_checkouts", "cleanup_checkout",
-                         "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
+                          "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
+                              "backend.cancel", "session_compute.cancel",
                     } or (key[0] in {"checkout.py", "orchestrator.py", "daemon_sessions.py"} and key[2] in {"shutil.rmtree", "rmtree_missing_ok"}):
                         calls[key] += 1
     expected = Counter({key: count for key, (count, reason) in SITES.items() if reason})

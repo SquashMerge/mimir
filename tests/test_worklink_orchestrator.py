@@ -2786,7 +2786,7 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
     monkeypatch.setattr(orch.ControllerGitPublication, "capture", lambda *a, **kw: SimpleNamespace(close=lambda: None))
 
     class WorkerCompute(FakeCompute):
-        name = "local_subprocess"
+        name = "opencode_daemon"
 
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             if spec.local_argv and spec.local_argv[0] == "/bin/sh":
@@ -2821,6 +2821,7 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
             return RawResult(1, order.transcript_root / "fake.json", "failed", "build failed")
 
     bound = WorkerCompute(shared_filesystem=True)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: bound)
     monkeypatch.setattr(orch, "OpenCodeBackend", WorkerBackend)
     monkeypatch.setattr(LocalSubprocessComputeBackend, "for_path_checkout", classmethod(lambda cls, uid: bound))
     registry = BackendRegistry(WorklinkConfig())
@@ -9244,6 +9245,9 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     transitions: list[dict[str, object]] = []
     terminal_reasons: list[str] = []
     terminal_times: list[float] = []
+    cancel_times: list[float] = []
+    running_poll_times: list[float] = []
+    pre_idle_boundary_observed = False
     parked = False
     parked_status_reads = 0
     running_status_reads = 0
@@ -9296,6 +9300,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
 
         async def cancel(self, selected: LaunchHandle) -> None:
             lifecycle.append("cancel")
+            cancel_times.append(factory_clock.now)
             cancel_called.set()
             if cancellation_stops_driver:
                 stopped.set()
@@ -9315,6 +9320,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
             )
             if not parked:
                 running_status_reads += 1
+                running_poll_times.append(factory_clock.now)
                 if contended and running_status_reads % 2:
                     raise lock_timeout
                 return running
@@ -9352,8 +9358,26 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
                 raise FactoryContractError("snapshot refused by factory")
             Path(snapshot).mkdir(parents=True)
 
+    # Keep early lock-contention observations and every diagnostic window, but
+    # do not turn two hours of simulated silence into 1,440 durable writes.
+    idle_poll_times = [0.0, 5.0, 10.0, 15.0, *map(float, range(900, 7200, 900)), 7199.0, 7200.0]
+    quiet_advances = iter(idle_poll_times[1:])
+
     async def advance(delay: float) -> None:
-        factory_clock.now += delay
+        nonlocal pre_idle_boundary_observed
+        if idle and not cancel_called.is_set():
+            assert delay == Backend.poll_interval_s
+            if factory_clock.now == 7199.0:
+                assert running_poll_times[-1] == 7199.0
+                assert not parked and terminal_times == [] and snapshot_calls == []
+                assert not stopped.is_set() and lifecycle == []
+                pre_idle_boundary_observed = True
+            target = next(quiet_advances, None)
+            assert target is not None, "factory did not cancel and park at exactly 7200 seconds"
+            assert target > factory_clock.now
+            factory_clock.now = target
+        else:
+            factory_clock.now += delay
         await asyncio.sleep(0)
 
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 10000.0 if idle else 20.0)
@@ -9384,6 +9408,10 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
         assert lifecycle == ["cancel", "cleanup"]
         assert terminal_reasons == []
         assert transitions == []
+        if idle:
+            assert pre_idle_boundary_observed
+            assert running_poll_times == idle_poll_times
+            assert cancel_times == [7200.0]
         return
 
     result = run()
@@ -9391,6 +9419,10 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     assert lifecycle == ["cancel", "terminal", *([] if snapshot_published else ["snapshot"]), "cleanup"]
     reason = terminal_reasons[0]
     if idle:
+        assert pre_idle_boundary_observed
+        assert running_poll_times == idle_poll_times
+        assert running_status_reads == len(idle_poll_times)
+        assert cancel_times == [7200.0]
         assert terminal_times == [7200.0]
         assert reason.startswith("factory driver idle: no progress since ")
         assert datetime.fromisoformat(
@@ -13531,7 +13563,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             assert spec.local_checkout is not None
             assert spec.local_checkout.resolve(strict=True).is_dir()
             assert publication.closed == 0
-            if spec.local_argv[:2] == ("/bin/sh", "-c") and "shutil.rmtree" in spec.local_argv[2]:
+            if spec.local_argv and spec.local_argv[:2] == ("/bin/sh", "-c") and "shutil.rmtree" in spec.local_argv[2]:
                 cleanup_specs.append(spec)
                 return LaunchHandle("local_subprocess", "123e4567-e89b-42d3-a456-426614174004")
             bound_specs.append(spec)
@@ -13590,11 +13622,15 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
     worker_uid = 4242
     bound = BoundCompute(_worker_uid=worker_uid)
+    daemon = BoundCompute(_worker_uid=worker_uid)
+    daemon.name = "opencode_daemon"
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: daemon)
 
     class WorkerBackend(FakeBackend):
         name = "opencode"
 
         def work_spec(self, order, **kwargs):
+            from mimir_cultivate.worklink.backends.base import SessionRequest
             if scenario == "work_spec_exception":
                 raise RuntimeError("work spec failed")
             return WorkSpec(
@@ -13612,6 +13648,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                 backend_config={"pass_env": ()},
                 local_checkout=order.checkout,
                 local_argv=("opencode", "run"),
+                session_request=SessionRequest("leaf", {"providerID": "openai", "id": "test"}, order.prompt),
             )
 
         async def invoke_with_startup_retry(self, invoke, **kwargs):
@@ -13734,7 +13771,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         return
     assert result is not None
     assert checkout_kwargs["worker_eligible"] is True
-    assert requested_uids == [worker_uid]
+    assert requested_uids == [worker_uid] * (
+        max(0, len(bound_specs) - 1) + len(cleanup_specs) + (scenario == "publication_exception"))
     assert lifecycle.count("publication-acquired") == 1
     assert lifecycle[-1:] == ["publication"]
     assert publication.closed == 1
@@ -13749,7 +13787,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     }
     assert result.status == (
         "completed" if expected_published else ("blocked" if expected_blocked else "failed")
-    )
+    ), result.reason
     assert checkout.exists() is (not expected_published)
     assert sibling_marker.read_text() == "keep me\n"
     expected_launches = {

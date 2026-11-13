@@ -42,9 +42,10 @@ class ContainedCheckout:
     def capability(self) -> CheckoutAuthorization:
         return self.authorization
 
-    def close(self) -> None:
+    def close(self, *, retain: bool = False) -> None:
         self.authorization.close()
-        _remove_boundary(self.path.parent)
+        if not retain:
+            _remove_boundary(self.path.parent)
 
     def __enter__(self) -> ContainedCheckout:
         return self

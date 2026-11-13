@@ -345,6 +345,10 @@ def stop_worklink(
         state = load_run_state(home, issue_id)
         state_cleared = False
         if state is not None and not process_is_alive(state):
+            if state.opencode_session_id is not None:
+                _mark_operator_stop(home, issue_id, state.attempt)
+                return WorklinkStopResult(issue_id, True,
+                    reason="recorded gate or CI waiter has exited; session terminal recovery via reattach is required")
             clear_run_state(home, issue_id)
             state_cleared = load_run_state(home, issue_id) is None
             # Epic dispatch uses factory records, not leaf run state. A stale
@@ -417,6 +421,28 @@ def stop_worklink(
             return WorklinkStopResult(issue_id, True)
         if state.phase != "spawned":
             return WorklinkStopResult(issue_id, False, reason="no live run")
+        if state.handle_substrate == "opencode_daemon":
+            from .compute import OpenCodeDaemonComputeBackend
+            from .worker_client import WorkerClient
+            from .identities import get_identities
+
+            handle = LaunchHandle(state.handle_substrate, state.handle_identifier,
+                                  opencode_session_id=state.opencode_session_id,
+                                  launch_generation=state.launch_generation)
+            client = WorkerClient.for_path_checkout(Path(state.checkout), issue_id=state.issue_id,
+                attempt=state.attempt, run_uid=get_identities().worklink_uid)
+            async def cancel_owned_session() -> None:
+                backend = OpenCodeDaemonComputeBackend(client=client)
+                await backend.cancel(handle)
+            _mark_operator_stop(home, issue_id, state.attempt)
+            try:
+                asyncio.run(cancel_owned_session())
+            except (RuntimeError, OSError, ValueError):
+                return WorklinkStopResult(issue_id, False, reason="session cancellation unverified; recovery state retained")
+            # The waiter still needs its correlation record to observe the stop.
+            # Finalization (or explicit reattach) releases it and routes the claim.
+            return WorklinkStopResult(issue_id, True,
+                reason="session cancelled; controller finalization or reattach is required")
         if not process_identity_verified(state):
             return WorklinkStopResult(
                 issue_id, False, reason="live PID could not be verified; refusing to signal it"
@@ -434,6 +460,13 @@ def stop_worklink(
         except (KeyError, RuntimeError, OSError) as exc:
             _operator_stop_path(home, issue_id).unlink(missing_ok=True)
             return WorklinkStopResult(issue_id, False, reason=str(exc))
+
+        if state.opencode_session_id is not None:
+            # A local gate has its own process handle, but its build-session
+            # correlation must survive until the waiter or reattach writes the
+            # terminal evidence and routes the claim.
+            return WorklinkStopResult(issue_id, True,
+                reason="gate cancelled; controller finalization or reattach is required")
 
         clear_run_state(home, issue_id)
         state_cleared = load_run_state(home, issue_id) is None
@@ -487,7 +520,9 @@ def reconcile_run_states(
                     reason="unparseable run state",
                 )
     for state in known_paths.values():
-        if state.compute_name != "local_subprocess" or process_is_alive(state):
+        if state.opencode_session_id is not None or state.compute_name != "local_subprocess" or process_is_alive(state):
+            # Correlated gates and CI waiters need session-aware terminal
+            # evidence/routing, not the historical process-only orphan reaper.
             alive.append(state)
             continue
         with _claim_mutex(home):

@@ -137,52 +137,38 @@ def test_opencode_resolver_filters_otlp_carriers_before_projection(monkeypatch, 
         seen["resolver"] = dict(env)
         return invocation
 
-    def documents(selected, env):
-        assert selected is invocation
-        seen["projection"] = dict(env)
-        return type("Documents", (), {"config_document": json.dumps(dict(env)).encode(), "auth_document": None})()
-
     monkeypatch.setattr(opencode, "resolve_opencode_invocation", resolve)
-    monkeypatch.setattr(opencode, "opencode_worker_documents", documents)
     monkeypatch.setattr(opencode, "opencode_model_from_agent_spec", lambda value: "openai/model")
     monkeypatch.setattr(opencode, "model_spec_at_call_time", lambda home: "codex-plus:model")
     resolution = opencode.resolve_worklink_opencode_invocation({"MIMIR_HOME": str(tmp_path)})
     assert resolution.invocation is invocation
-    spec = WorkSpec(
-        845, 1, "repo", "main", "issue/845-a1", "", None, "pytest", "opencode", 30,
-        env=dict(_OTLP_CARRIERS), backend_config={"codex": True, "model": invocation.model, "worker_projections": (), "pass_env": ()},
-    )
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    spec = opencode.OpenCodeBackend().work_spec(
+        WorkOrder(845, tmp_path, "build", None, 30, {"MIMIR_MODEL_SPEC": "codex-plus:model", **_OTLP_CARRIERS}),
+        attempt=1, repo_url="repo", base_ref="main", branch="issue/845-a1", test_command="uv run pytest")
     refreshed = opencode.OpenCodeBackend().refresh_codex_projections(spec, {"MIMIR_HOME": str(tmp_path), **_OTLP_CARRIERS})
-    for observed in (seen["resolver"], seen["projection"], resolution.env, refreshed.env):
+    for observed in (seen["resolver"], resolution.env, refreshed.env):
         assert not _OTLP_CARRIERS.keys() & observed.keys()
         assert not any(value in repr(observed) for value in _OTLP_CARRIERS.values())
     assert resolution.env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
     assert resolution.env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-    projection = json.loads(refreshed.backend_config["worker_projections"][0].document)
-    assert not _OTLP_CARRIERS.keys() & projection.keys()
-    assert projection["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
+    assert "worker_projections" not in refreshed.backend_config
 
-    # The bounded launcher consumes the projection returned by the production
-    # refresh path, rather than a separately constructed test document.
+    # The production gate environment must not recreate any leaf auth document.
     from mimir_cultivate.worklink.compute import _enabled_child_env
 
     worker_home = tmp_path / "worker-home"
-    for item in refreshed.backend_config["worker_projections"]:
-        destination = worker_home / item.path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(item.document)
+    worker_home.mkdir()
     child_env = _enabled_child_env(refreshed, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     child_env["HOME"] = str(worker_home)
     child = subprocess.run(
-        [sys.executable, "-c", "import json,os,pathlib; print(json.dumps({'env': dict(os.environ), 'config': json.loads((pathlib.Path.home()/'.config/opencode/opencode.json').read_text())}))"],
+        [sys.executable, "-c", "import json,os,pathlib; print(json.dumps({'env': dict(os.environ), 'config_exists': (pathlib.Path.home()/'.config/opencode/opencode.json').exists()}))"],
         cwd=tmp_path, env=child_env, capture_output=True, text=True, check=True,
     )
     observed = json.loads(child.stdout)
     assert not _OTLP_CARRIERS.keys() & observed["env"].keys()
-    assert not _OTLP_CARRIERS.keys() & observed["config"].keys()
-    assert observed["config"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
-    assert observed["config"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-    assert not any(value in child.stdout + child.stderr + repr(refreshed.backend_config["worker_projections"]) for value in _OTLP_CARRIERS.values())
+    assert observed["config_exists"] is False
+    assert not any(value in child.stdout + child.stderr + repr(refreshed.backend_config) for value in _OTLP_CARRIERS.values())
 
 
 @pytest.mark.asyncio
@@ -221,15 +207,12 @@ async def test_worklink_runner_filters_retry_environment_after_order_merge(tmp_p
                 backend_config={"codex": False}, local_checkout=order.checkout,
             )
 
-        async def invoke_with_startup_retry(self, invoke, **kwargs):
-            observed.append(dict(kwargs["env"]))
-            return await super().invoke_with_startup_retry(invoke, **kwargs)
-
     class Compute:
         name = "fake_compute"
         shared_filesystem = True
 
         async def launch(self, spec):
+            observed.append(dict(spec.env))
             return LaunchHandle(self.name, "one")
 
         async def wait(self, handle, timeout_s):
@@ -240,6 +223,7 @@ async def test_worklink_runner_filters_retry_environment_after_order_merge(tmp_p
 
     backend = Backend()
     compute = Compute()
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: compute)
 
     class Registry:
         def get(self, name):

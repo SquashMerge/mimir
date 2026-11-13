@@ -226,7 +226,7 @@ def reattach_inflight_worklink_runs(
     state_dir = home / "state" / "worklink" / "runs"
     dispatched: list[int] = []
     for state in states:
-        if state.compute_name == "local_subprocess":
+        if state.compute_name == "local_subprocess" and state.opencode_session_id is None:
             continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
         log_path = state_dir / f"reattach-{state.issue_id}.log"

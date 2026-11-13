@@ -8,6 +8,7 @@ evidence validation, and state transitions stay in shared Worklink plumbing.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -18,6 +19,27 @@ class SessionTransportLostError(RuntimeError):
     """Observation can reconnect to the durable session, without readmission."""
 
 
+class SessionAdmissionError(RuntimeError):
+    def __init__(self, *, uncertain: bool, generation: str | None = None,
+                 handle: LaunchHandle | None = None) -> None:
+        super().__init__("OpenCode admission uncertain; retain recovery state" if uncertain
+                         else "OpenCode daemon admission unavailable")
+        self.uncertain = uncertain
+        self.launch_generation = generation
+        self.handle = handle
+        self.quiescent = False
+
+
+class SessionAdmissionCancelled(asyncio.CancelledError):
+    def __init__(self, handle: LaunchHandle | None, *, uncertain: bool = False,
+                 generation: str | None = None) -> None:
+        super().__init__("OpenCode admission cancelled")
+        self.handle = handle
+        self.uncertain = uncertain
+        self.launch_generation = handle.launch_generation if handle else generation
+        self.quiescent = False
+
+
 @dataclass(frozen=True)
 class SessionRequest:
     kind: str
@@ -25,10 +47,15 @@ class SessionRequest:
     text: str
     shell_allowlist: tuple[str, ...] = ()
     spawn_depth: int = 1
+    agent: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"leaf", "spawn", "epic"}:
             raise ValueError("invalid session kind")
+        if self.agent is not None and (not isinstance(self.agent, str) or not self.agent
+                                      or len(self.agent.encode()) > 1024
+                                      or any(not char.isprintable() for char in self.agent)):
+            raise ValueError("invalid session agent")
         if type(self.spawn_depth) is not int or not 0 <= self.spawn_depth <= 1000:
             raise ValueError("invalid server-generated spawn depth")
         if (not isinstance(self.model, Mapping) or not {"providerID", "id"} <= self.model.keys()
@@ -232,6 +259,8 @@ class RawResult:
     error: str | None
     blocked_reason: str | None = None
     output_overflow: bool = False
+    opencode_session_id: str | None = None
+    retry_after_ms: int | None = None
 
 
 class ToolBackend(Protocol):

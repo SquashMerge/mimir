@@ -156,6 +156,8 @@ class SessionController:
         record.validate()
         self.client = client
         self.path = path
+        self._record_path = path
+        self._retired = False
         self.record = record
         self._lock = asyncio.Lock()
         self.sensitive_values: tuple[str, ...] = ()
@@ -207,7 +209,7 @@ class SessionController:
         raw = json.dumps(asdict(record), allow_nan=False).encode()
         if len(raw) > 16384:
             raise ValueError("session controller exceeds size limit")
-        atomic_json(self.path, asdict(record), uid=os.geteuid(), gid=os.getegid(), mode=0o600)
+        atomic_json(self._record_path, asdict(record), uid=os.geteuid(), gid=os.getegid(), mode=0o600)
         self.record = record
 
     @classmethod
@@ -226,6 +228,25 @@ class SessionController:
                 or str(checkout) != self.record.checkout_path
                 or (info.st_dev, info.st_ino) != (self.record.checkout_device, self.record.checkout_inode)):
             raise ValueError("session checkout or generation mismatch")
+
+    @classmethod
+    def recover_owned(cls, client: OpenCodeDaemonClient, path: Path, *, session_id: str,
+                      generation: str, checkout: Path) -> SessionController:
+        """Resolve the current controller or its durable verified retirement."""
+        if not isinstance(session_id, str) or re.fullmatch(r"ses_[A-Za-z0-9_-]{1,128}", session_id) is None:
+            raise ValueError("invalid session identity")
+        retired_path = path.with_name(f"{path.stem}.{session_id}.retired.json")
+        try:
+            controller = cls.recover(client, retired_path, generation=generation, checkout=checkout)
+        except FileNotFoundError:
+            controller = cls.recover(client, path, generation=generation, checkout=checkout)
+            if controller.record.opencode_session_id != session_id:
+                raise ValueError("session ownership mismatch")
+            return controller
+        if controller.record.opencode_session_id != session_id or controller.record.cancellation_state != "verified":
+            raise ValueError("invalid session retirement witness")
+        controller._retired = True
+        return controller
 
     @classmethod
     async def create(cls, client: OpenCodeDaemonClient, path: Path, *, request: SessionRequest,
@@ -249,7 +270,8 @@ class SessionController:
         deadline = int(time.time() * 1000) + timeout_s * 1000
         async with asyncio.timeout(timeout_s):
             response = await client.create_session(directory=str(checkout), model=request.model,
-                                                   permissions=session_permissions(request))
+                                                   permissions=session_permissions(request),
+                                                   **({"agent": request.agent} if request.agent is not None else {}))
         sid = response["data"]["id"]
         record = ControllerRecord(1, str(uuid.uuid4()), issue_id, attempt, request.kind, sid,
                                   generation, str(checkout), info.st_dev, info.st_ino, 0, 0, [],
@@ -443,6 +465,8 @@ class SessionController:
 
     async def cancel(self, timeout_s: float = 25) -> bool:
         async with self._lock:
+            if self._retired:
+                return True
             self._cancelling = True
             try:
                 self._persist(stop_requested=True, cancellation_state="requested")
@@ -482,9 +506,20 @@ class SessionController:
                 self._cancelling = False
 
     async def release(self) -> None:
+        """Free the admission slot without discarding verified retirement proof."""
+        if self._retired:
+            return
         if not await self.cancel():
             raise RuntimeError("session cleanup unverified; retaining controller and checkout")
-        self.path.unlink()
+        retired_path = self.path.with_name(f"{self.path.stem}.{self.record.opencode_session_id}.retired.json")
+        self.path.replace(retired_path)
+        self._record_path = retired_path
+        self._retired = True
+        directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def session_environment(pass_env: object, *, home: Path, git_settings: object,
@@ -544,7 +579,13 @@ async def _executor_operation(request: dict) -> dict:
     root = Path(DAEMON_ROOT) / "sessions"
     lock = os.open(root / f"{key}.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        recovering_admission = request["op"] == "session_observe" and request["opencode_session_id"] is None
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if recovering_admission:
+                return {"admission_state": "busy"}
+            raise
         async with OpenCodeDaemonClient(base_url=api["url"], username=api["username"], password=api["password"], timeout=5) as client:
             path = root / f"{key}.json"
             checkout = Path(request["path"])
@@ -552,10 +593,22 @@ async def _executor_operation(request: dict) -> dict:
             if (info.st_dev, info.st_ino) != (request["device"], request["inode"]):
                 raise ValueError("session checkout identity changed")
             home = root / f"{key}.home"
+            if recovering_admission:
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    return {"admission_state": "absent"}
+                controller = SessionController.recover(client, path, generation=request["generation"], checkout=checkout)
+                if (controller.record.issue_id, controller.record.attempt) != (request["issue"], request["attempt"]):
+                    raise ValueError("session attempt mismatch")
+                return {"admission_state": "retained", "opencode_session_id": controller.record.opencode_session_id}
             if request["op"] == "session_create":
                 launch = read_json(paths.daemon / "launch.json", uid=identities.worklink_uid, mode=0o600)
                 if launch.get("launch_generation") != request["generation"]:
                     raise ValueError("session daemon generation is stale")
+                if path.exists():
+                    retained = SessionController.recover(client, path, generation=request["generation"], checkout=checkout)
+                    return {"admission_state": "conflict", "opencode_session_id": retained.record.opencode_session_id}
                 home.mkdir(mode=0o700, exist_ok=True)
                 (home / "tmp").mkdir(mode=0o700, exist_ok=True)
                 env = session_environment(request["pass_env"], home=home, git_settings=request["git_settings"],
@@ -567,7 +620,9 @@ async def _executor_operation(request: dict) -> dict:
                     environment=env, timeout_s=request["timeout_s"],
                 )
                 return {"opencode_session_id": controller.record.opencode_session_id}
-            controller = SessionController.recover(client, path, generation=request["generation"], checkout=checkout)
+            controller = SessionController.recover_owned(
+                client, path, session_id=request["opencode_session_id"],
+                generation=request["generation"], checkout=checkout)
             controller.sensitive_values = (api["password"], *(os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ))
             if controller.record.opencode_session_id != request["opencode_session_id"]:
                 raise ValueError("session ownership mismatch")
@@ -588,9 +643,11 @@ async def _executor_operation(request: dict) -> dict:
                 await controller.cancel()
                 return {"cancellation_state": controller.record.cancellation_state}
             if request["op"] == "session_release":
+                already_retired = controller._retired
                 await controller.release()
                 from mimir._rmtree import rmtree_missing_ok
-                rmtree_missing_ok(home)
+                if not already_retired:
+                    rmtree_missing_ok(home)
                 return {"released": True}
             raise ValueError("invalid session operation")
     finally:

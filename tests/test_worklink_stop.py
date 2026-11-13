@@ -41,6 +41,36 @@ from mimir_cultivate.worklink.run_state import (
 )
 
 
+def test_process_gate_stop_retains_distinct_build_session_correlation(tmp_path, monkeypatch):
+    state = WorklinkRunState(
+        issue_id=700, attempt=3, backend="opencode", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier=str(uuid.uuid4()),
+        process_start_ticks=42, shim_pid=12345,
+        branch="issue/700-a3", base_ref="main", local_base="main", repo=str(tmp_path),
+        repo_url="", test_command="pytest", started_at=datetime.now(UTC).isoformat(),
+        opencode_session_id="ses_current_repair", launch_generation="generation")
+    save_run_state(tmp_path, state)
+    monkeypatch.setattr(control, "process_is_alive", lambda current: current == state)
+    monkeypatch.setattr(control, "process_identity_verified", lambda current: current == state)
+    cancelled = []
+    calls = []
+
+    async def cancel(self, handle):
+        cancelled.append(handle)
+        assert control.operator_stop_requested(tmp_path, 700, 3)
+        assert handle.identifier == state.handle_identifier
+        assert handle.shim_pid == state.shim_pid
+        assert handle.opencode_session_id is None
+
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    result = stop_worklink(tmp_path, 700,
+        runner=lambda args: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""))
+    assert result.stopped and not result.state_cleared and not result.claim_released
+    assert len(cancelled) == 1
+    assert load_run_state(tmp_path, 700) == state
+    assert not any(args[1:3] == ["locks", "release"] for args in calls)
+
+
 @pytest.mark.asyncio
 async def test_operator_stop_records_terminal_evidence_without_incident(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import orchestrator
