@@ -165,7 +165,7 @@ def test_pypi_runtime_proof_refuses_root_before_protocol(monkeypatch):
 )
 def test_setup_daemon_image_proof_requires_refusal(state, error, monkeypatch) -> None:
     import json
-    from mimir_cultivate import setup
+    setup = pytest.importorskip("mimir_cultivate.setup", reason="daemon setup belongs to Cultivate")
 
     payload = runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"]
     calls = []
@@ -190,7 +190,7 @@ def test_setup_daemon_image_proof_requires_refusal(state, error, monkeypatch) ->
 
 
 def test_setup_daemon_image_proof_rejects_unrelated_setup_error(monkeypatch) -> None:
-    from mimir_cultivate import setup
+    setup = pytest.importorskip("mimir_cultivate.setup", reason="daemon setup belongs to Cultivate")
 
     def fail(*args, **kwargs):
         raise setup.SetupError("unrelated setup failure")
@@ -202,7 +202,7 @@ def test_setup_daemon_image_proof_rejects_unrelated_setup_error(monkeypatch) -> 
 
 
 def test_setup_daemon_image_proof_rejects_wrong_user_before_execution(monkeypatch) -> None:
-    from mimir_cultivate import setup
+    setup = pytest.importorskip("mimir_cultivate.setup", reason="daemon setup belongs to Cultivate")
 
     def wrong_user(deploy, *argv):
         return setup._run(["docker", "compose", "exec", "-T", "-u", "worklink", "agent", *argv], cwd=deploy)
@@ -219,6 +219,7 @@ def test_setup_daemon_image_proof_rejects_wrong_user_before_execution(monkeypatc
 
 @pytest.mark.parametrize("kind", ["leaf", "spawn"])
 async def test_image_daemon_fixture_uses_production_session_controller(kind, tmp_path, monkeypatch):
+    pytest.importorskip("mimir_cultivate", reason="daemon sessions belong to Cultivate")
     import asyncio
     from http.server import ThreadingHTTPServer
     from threading import Thread
@@ -271,6 +272,7 @@ async def test_image_daemon_fixture_uses_production_session_controller(kind, tmp
 
 
 async def test_missing_login_image_payload_uses_real_health_and_refuses_before_session(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("mimir_cultivate", reason="daemon health belongs to Cultivate")
     import json
     import os
     import time
