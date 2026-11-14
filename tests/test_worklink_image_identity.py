@@ -81,6 +81,14 @@ def test_live_proofs_initialize_lease_root_before_services(
     ]
 
 
+def test_source_fixture_uses_shared_root_privilege_launch():
+    script = PROOF.read_text()
+    assert "'--detach', '--user', 'root'" in script
+    assert 'from mimir_cultivate.worklink.daemon_service import exec_worklink' in script
+    assert 'exec_worklink(("/opt/mimir-worklink/venv/bin/python", ' in script
+    assert 'printf attacked > {shlex.quote(str(repo / \'tracked\'))}' in script
+
+
 def test_source_mode_keeps_explicit_build_arg_and_live_proof() -> None:
     script = PROOF.read_text()
     assert '"MIMIR_INSTALL_MODE=source"' in script

@@ -24,12 +24,167 @@ def test_root_start_execs_only_closed_environment(monkeypatch):
     monkeypatch.setattr(service, "resolve_activation", lambda env: SimpleNamespace(enabled=True))
     monkeypatch.setattr(service, "get_identities", lambda: object())
     monkeypatch.setattr(service, "prepare", lambda env, ids: clean)
-    monkeypatch.setattr(service.os, "chdir", lambda path: None)
-    monkeypatch.setattr(service.os, "umask", lambda mode: None)
-    monkeypatch.setattr(service.os, "execve", lambda *args: calls.append(args))
+    monkeypatch.setattr(service, "exec_worklink", lambda *args, **kw: calls.append((args, kw)))
     service.root_start(inherited)
-    assert calls == [(service.UID_HELPER, service.SUPERVISOR_ARGV, clean)]
-    assert "OTHER_AGENT_KEY" not in calls[0][2]
+    assert calls == [((service.SUPERVISOR_ARGV, clean), {"cwd": "/"})]
+    assert "OTHER_AGENT_KEY" not in calls[0][0][1]
+
+
+def test_daemon_exec_drops_before_closed_exec(monkeypatch):
+    from mimir_cultivate.worklink import worker_exec
+
+    events = []
+    monkeypatch.setattr(service.os, "getuid", lambda: 0)
+    monkeypatch.setattr(service.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(service.os, "chdir", lambda path: events.append(("cwd", path)))
+    monkeypatch.setattr(worker_exec, "_drop_worker_privileges", lambda: events.append(("drop",)))
+    monkeypatch.setattr(service.os, "umask", lambda mask: events.append(("umask", mask)))
+    monkeypatch.setattr(service.os, "execve", lambda *args: events.append(("exec", *args)))
+    service.exec_worklink(service.SUPERVISOR_ARGV, {"PATH": "/usr/bin:/bin"}, cwd="/")
+    assert events == [("cwd", "/"), ("drop",), ("umask", 0o002),
+                      ("exec", service.PYTHON, service.SUPERVISOR_ARGV, {"PATH": "/usr/bin:/bin"})]
+
+
+def test_daemon_descendant_has_worker_privileges_and_no_drop_mutation_fails():
+    """Real kernel/exec inheritance; required (not skipped) in the root CI leg."""
+    import shutil
+    import subprocess
+    from mimir_cultivate.worklink import worker_exec
+
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("requires Linux root; covered by required worker-uid root CI leg")
+    ids = worker_exec.get_identities()
+    python = shutil.which("python3", path="/usr/bin:/bin")
+    assert python is not None
+    child = f'''
+import os
+from pathlib import Path
+status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+assert os.getresuid() == ({ids.worklink_uid},) * 3
+assert os.getresgid() == ({ids.worklink_gid},) * 3
+assert os.getgroups() == [], os.getgroups()
+for key in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb', 'CapBnd'):
+    assert int(status[key], 16) == 0, (key, status[key])
+assert status['NoNewPrivs'].strip() == '1', status['NoNewPrivs']
+print('daemon child privileges verified')
+'''
+    daemon = f"import subprocess, sys; sys.exit(subprocess.run([sys.executable, '-c', {child!r}], timeout=10).returncode)"
+    script = f'''
+from types import SimpleNamespace
+from mimir_cultivate.worklink import daemon_service as service, worker_exec
+import sys
+service.resolve_activation = lambda env: SimpleNamespace(enabled=True)
+service.prepare = lambda env, ids: {{'PATH': '/usr/bin:/bin'}}
+service.SUPERVISOR_ARGV = ({python!r}, '-c', {daemon!r})
+if sys.argv[1] == 'mutant':
+    worker_exec._drop_worker_privileges = lambda: None
+service.root_start({{}})
+'''
+    baseline = subprocess.run([sys.executable, "-c", script, "baseline"],
+                              capture_output=True, text=True, timeout=30)
+    assert baseline.returncode == 0, baseline.stderr
+    assert baseline.stdout.strip() == "daemon child privileges verified"
+    mutant = subprocess.run([sys.executable, "-c", script, "mutant"],
+                            capture_output=True, text=True, timeout=30)
+    assert mutant.returncode != 0, "no-drop mutation survived the real descendant assertion"
+    assert "AssertionError" in mutant.stderr
+    assert "daemon child privileges verified" not in mutant.stdout
+
+
+def test_daemon_child_output_cleanup_and_private_umask_mutation(tmp_path):
+    """Distinct real UIDs: 002 output cleans up; restoring 077 must refuse."""
+    import pwd
+    import shutil
+    import subprocess
+    import tempfile
+
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("requires Linux root; mandatory in the distinct-identity CI leg")
+    from mimir_cultivate.worklink.identities import get_identities
+    ids = get_identities()
+    controller_gid = pwd.getpwuid(ids.mimir_uid).pw_gid
+    assert ids.mimir_uid not in (0, ids.worklink_uid)
+    python = shutil.which("python3", path="/usr/bin:/bin")
+    assert python is not None
+    # The daemon uid must traverse this test-owned workspace, independently of
+    # pytest's root-only basetemp. Never chmod ancestors owned by another test.
+    with tempfile.TemporaryDirectory(prefix="daemon-cleanup-") as directory:
+        workspace = Path(directory)
+        workspace.chmod(0o755)
+        os.chown(workspace, ids.mimir_uid, controller_gid)
+        env = {**os.environ, "MIMIR_PLUGINS": "cultivate",
+               "WORKLINK_CHECKOUT_ROOT": str(workspace / "checkouts")}
+        controller = dict(user=ids.mimir_uid, group=controller_gid,
+                          extra_groups=[ids.worklink_gid], env=env,
+                          capture_output=True, text=True, timeout=30)
+        repo = workspace / "base"
+        setup = f'''
+from pathlib import Path
+import subprocess
+p = Path({str(repo)!r})
+p.mkdir(mode=0o755)
+subprocess.run(['git', 'init', '-q', '-b', 'main', str(p)], check=True)
+subprocess.run(['git', '-C', str(p), '-c', 'user.name=test', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'base'], check=True)
+subprocess.run(['git', '-C', str(p), 'remote', 'add', 'origin', str(p)], check=True)
+'''
+        result = subprocess.run([sys.executable, "-c", setup], **controller)
+        assert result.returncode == 0, result.stderr
+        for attempt, mutant in ((1, False), (2, True)):
+            checkout = workspace / "checkouts" / repo.name / f"2138-{attempt}"
+            create = f'''
+from pathlib import Path
+from mimir_cultivate.worklink.checkout import create_isolated_checkout
+lease = create_isolated_checkout(Path({str(repo)!r}), issue_id=2138, attempt={attempt}, base='main', worker_eligible=True)
+assert str(lease.path) == {str(checkout)!r}
+'''
+            result = subprocess.run([sys.executable, "-c", create], **controller)
+            assert result.returncode == 0, result.stderr
+            child = ("from pathlib import Path; "
+                     f"p=Path({str(checkout)!r}) / 'worker-hooks'; p.mkdir(); "
+                     "(p / 'pre-commit').write_text('worker output'); "
+                     "import time; time.sleep(60)")
+            supervise = f'''
+import asyncio
+from pathlib import Path
+from mimir_cultivate.worklink import daemon_service as service, daemon_health
+service.SERVE_ARGV = ({python!r}, '-c', {child!r})
+stop = asyncio.Event()
+async def publish(*args, **kwargs):
+    if (Path({str(checkout)!r}) / 'worker-hooks/pre-commit').exists():
+        stop.set()
+daemon_health.inspect_and_publish = publish
+{'service.os.umask = lambda mode: None' if mutant else ''}
+asyncio.run(service.supervise(service.RuntimePaths(Path('/'), Path('/')), stop=stop))
+'''
+            mutation = "service.os.umask(0o077); service.os.umask = lambda mode: None" if mutant else ""
+            launch = f'''
+from mimir_cultivate.worklink import daemon_service as service
+{mutation}
+service.exec_worklink(({sys.executable!r}, '-c', {supervise!r}), dict(__import__('os').environ), cwd='/')
+'''
+            result = subprocess.run([sys.executable, "-c", launch], env=env,
+                                    capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+            hooks = checkout / "worker-hooks"
+            assert hooks.stat().st_uid == ids.worklink_uid
+            assert hooks.stat().st_mode & 0o777 == (0o700 if mutant else 0o775)
+            assert (hooks / "pre-commit").stat().st_mode & 0o777 == (0o600 if mutant else 0o664)
+            cleanup = f'''
+from pathlib import Path
+from mimir_cultivate.worklink.checkout import CheckoutLease, cleanup_checkout
+lease = CheckoutLease(2138, {attempt}, Path({str(repo)!r}), Path({str(checkout)!r}), 'issue/2138-a{attempt}', 'main', isolated_checkout=True)
+assert cleanup_checkout(lease, outcome='completed')
+assert not lease.path.exists()
+print('controller cleanup succeeded')
+'''
+            result = subprocess.run([sys.executable, "-c", cleanup], **controller)
+            if mutant:
+                assert result.returncode != 0, "umask-077 mutation survived controller cleanup"
+                assert "PermissionError" in result.stderr, result.stderr
+                assert hooks.exists()
+            else:
+                assert result.returncode == 0, result.stderr
+                assert result.stdout.strip() == "controller cleanup succeeded"
 
 
 def test_disabled_service_execs_pause_without_preparation(monkeypatch):
@@ -67,8 +222,12 @@ def test_preparation_private_layout_and_socket_preservation(tmp_path, monkeypatc
     monkeypatch.setattr(service.os, "fchown", lambda fd, uid, gid: owners.append((os.fstat(fd).st_ino, uid, gid)))
     monkeypatch.setattr(service, "protect_agent_paths", lambda env, identities: None)
     secret = "agent-" + "secret-only"
-    env = service.prepare({"GH_TOKEN": "bot-value", "OTHER_KEY": secret,
-                           "MIMIR_FACTORY_PUBLISHING_IDENTITY": "bot"}, ids, paths)
+    previous_umask = os.umask(0o002)
+    try:
+        env = service.prepare({"GH_TOKEN": "bot-value", "OTHER_KEY": secret,
+                               "MIMIR_FACTORY_PUBLISHING_IDENTITY": "bot"}, ids, paths)
+    finally:
+        os.umask(previous_umask)
     assert env["GH_TOKEN"] == env["GITHUB_TOKEN"] == "bot-value"
     assert env["FACTORY_PUBLISHING_IDENTITY"] == "bot"
     assert "OTHER_KEY" not in env
@@ -76,7 +235,11 @@ def test_preparation_private_layout_and_socket_preservation(tmp_path, monkeypatc
     assert paths.run.stat().st_mode & 0o777 == 0o711
     for relative in ("home", "tmp", "sessions", "config/opencode", "data", "state", "cache"):
         assert (paths.daemon / relative).stat().st_mode & 0o777 == 0o700
-    assert paths.api.stat().st_mode & 0o777 == 0o600
+    assert paths.daemon.stat().st_mode & 0o777 == 0o700
+    assert (paths.daemon / "config").stat().st_mode & 0o777 == 0o700
+    for path in (paths.api, paths.daemon / "launch.json",
+                 paths.daemon / "config/opencode/opencode.json", paths.snapshot):
+        assert path.stat().st_mode & 0o777 == 0o600, path
     api = json.loads(paths.api.read_text())
     assert api["password"] == env["OPENCODE_SERVER_PASSWORD"]
     assert api["url"] == "http://127.0.0.1:4096"
@@ -152,13 +315,13 @@ def test_private_state_through_search_only_parent(tmp_path):
         parent.chmod(0o700)
 
 
-def test_no_same_interpreter_uid_drop_or_secret_argv():
+def test_uid_drop_is_factored_and_service_argv_has_no_secrets():
     tree = ast.parse(Path(service.__file__).read_text())
     calls = [node.func.attr for node in ast.walk(tree)
              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
     assert not {"setuid", "setgid", "setresuid", "setresgid", "setgroups", "clear"} & set(calls)
     assert service.SUPERVISOR_ARGV == (
-        "/command/s6-setuidgid", "worklink", "/opt/mimir-worklink/venv/bin/python", "-m",
+        "/opt/mimir-worklink/venv/bin/python", "-m",
         "mimir_cultivate.worklink.daemon_service", "--supervise")
     assert service.SERVE_ARGV == (
         "/opt/mimir-opencode/bin/opencode", "serve", "--hostname", "127.0.0.1", "--port", "4096")
@@ -166,8 +329,9 @@ def test_no_same_interpreter_uid_drop_or_secret_argv():
 
 @pytest.mark.asyncio
 async def test_supervisor_awaits_only_its_serve_child(tmp_path, monkeypatch):
-    from mimir_cultivate.worklink import daemon_health
+    from mimir_cultivate.worklink import daemon_health, worker_exec
 
+    monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: None)
     home = tmp_path / "home"
     home.mkdir()
     executable = tmp_path / "fixture-serve"
@@ -176,7 +340,8 @@ async def test_supervisor_awaits_only_its_serve_child(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "SERVE_ARGV", (str(executable),))
     monkeypatch.setattr(service, "assert_worklink_identity", lambda ids: None)
     monkeypatch.setattr(service, "get_identities", lambda: WorklinkIdentities(1, 2, 3))
-    monkeypatch.setattr(service.os, "umask", lambda mode: None)
+    masks = []
+    monkeypatch.setattr(service.os, "umask", lambda mode: masks.append(mode))
     stop = asyncio.Event()
     states = []
     async def publish(paths, ids, *, down=False):
@@ -193,6 +358,7 @@ async def test_supervisor_awaits_only_its_serve_child(tmp_path, monkeypatch):
     monkeypatch.setattr(service.asyncio, "create_subprocess_exec", spawn)
     assert await service.supervise(service.RuntimePaths(tmp_path, tmp_path / "run"), stop=stop) == 0
     assert len(owned) == 1 and owned[0].returncode is not None
+    assert masks == [0o002]
     assert states == [False, True]
 
 

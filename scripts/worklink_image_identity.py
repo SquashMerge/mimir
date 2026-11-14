@@ -1073,8 +1073,11 @@ PY
         docker_exec('/command/s6-svc', '-wD', '-T', '30000', '-d', '/run/service/worklink-opencode')
         docker_exec('/bin/sh', '-ceu', 'cat > /tmp/worklink-daemon-fixture.py; chmod 0644 /tmp/worklink-daemon-fixture.py',
                     input_text=DAEMON_FIXTURE)
-        run(['docker', 'exec', '--detach', '--user', 'worklink', CONTAINER,
-             '/opt/mimir-worklink/venv/bin/python', '/tmp/worklink-daemon-fixture.py'])
+        run(['docker', 'exec', '--detach', '--user', 'root', CONTAINER,
+             '/opt/mimir-worklink/venv/bin/python', '-c',
+             'from mimir_cultivate.worklink.daemon_service import exec_worklink; '
+             'import os; exec_worklink(("/opt/mimir-worklink/venv/bin/python", '
+             '"/tmp/worklink-daemon-fixture.py"), dict(os.environ), cwd="/")'])
         docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', '''
 import time
 import urllib.request

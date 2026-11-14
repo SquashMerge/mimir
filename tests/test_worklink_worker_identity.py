@@ -337,13 +337,15 @@ def test_ci_worker_uid_leg_executes_the_selected_cultivate_identity_tests() -> N
     assert 'MIMIR_PLUGINS="$MIMIR_PLUGINS"' in root["run"]
     assert "--junitxml" in root["run"]
     # The executed-count check, not just the pytest exit status.
-    assert 'len(cases) != 4 or len(ran) != 4' in root["run"]
+    assert 'len(cases) != 6 or len(ran) != 6' in root["run"]
     assert "|| true" not in root["run"]
     for selector in (
         "tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests",
         "tests/test_worklink_remediation_e2e.py::test_leaf_checkout_lets_the_worklink_uid_run_real_git",
         "tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller",
         "tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit",
+        "plugins/cultivate/tests/test_worklink_daemon_service.py::test_daemon_descendant_has_worker_privileges_and_no_drop_mutation_fails",
+        "plugins/cultivate/tests/test_worklink_daemon_service.py::test_daemon_child_output_cleanup_and_private_umask_mutation",
     ):
         assert selector in root["run"]
 
