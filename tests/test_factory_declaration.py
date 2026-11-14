@@ -131,9 +131,9 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
         "max_retries",
         "pr_draft",
     }
-    # `verify` queues on the host's shared heavy-run lock through scripts/heavy_run.sh,
-    # which runs the suite unwrapped where the lock tools are absent (Linux containers, CI).
-    assert data["verify"] == "sh scripts/heavy_run.sh uv run pytest -q --tb=short"
+    # uv supplies Python for the portable lease helper. Configured leases fail
+    # closed on unusable paths/missing timeout tools, on both macOS and Linux.
+    assert data["verify"] == "uv run sh scripts/heavy_run.sh uv run pytest -q --tb=short"
     # `verify_timeout_ms` is declared because the factory default of 900000 (15 min) is
     # shorter than this suite. A canonical run reached ~79% of 8937 tests before the
     # factory sent SIGTERM, and that surfaces as a numeric test failure rather than a
