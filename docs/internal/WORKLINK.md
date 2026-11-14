@@ -518,9 +518,12 @@ Per-issue flow (one `run`):
    This preserves executable bits and leaves untracked/ignored worktree paths
    alone (including symlink targets). Restore controller ownership separately for any worker-owned entries;
    chmod cannot repair ownership. For a linked base worktree, also remediate its
-   referenced Git directory and common Git directory. Image services, generated
-   startup scripts, and Worklink executor/daemon entry points set umask 022
-   explicitly, including when launched through `docker exec` with umask 0000.
+   referenced Git directory and common Git directory. Controller-side image
+   services, generated startup scripts, and the root Worklink executor process
+   set umask 022 explicitly, including when launched through `docker exec` with
+   umask 0000. The worker privilege drop and its children instead use umask 002:
+   issued checkouts need group-write for the controller's cleanup via group
+   `worklink`. Neither mask grants other-write; base-repo refusal is unchanged.
    Operator Git/deployment shells should likewise start with `umask 022` so later
    writes preserve the boundary. Worklink never changes base permissions itself.
 4. **Render the prompt** from issue fields: description, acceptance

@@ -203,7 +203,10 @@ def _drop_worker(checkout_fd: int) -> None:
     os.setresgid(get_identities().worklink_gid, get_identities().worklink_gid, get_identities().worklink_gid)
     os.setresuid(get_identities().worklink_uid, get_identities().worklink_uid, get_identities().worklink_uid)
     _set_capabilities(set())
-    os.umask(0o022)
+    # Issued checkouts are shared with the controller through group worklink.
+    # Keep worker-created directories group-writable for controller cleanup;
+    # the executor/controller itself uses 022, and neither grants other-write.
+    os.umask(0o002)
     os.setsid()
     os.fchdir(checkout_fd)
     _verify_worker_identity()
