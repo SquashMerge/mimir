@@ -362,16 +362,43 @@ _GATE_RETENTION_ENTRIES = 2048
 _GATE_RETENTION_DEPTH = 32
 
 
+def _configured_gate_tmp_root() -> Path | None:
+    """Validate operator-provisioned scratch without creating or repairing it."""
+    value = os.environ.get("MIMIR_WORKLINK_GATE_TMPDIR")
+    if value is None:
+        return None
+    from .identities import get_identities
+
+    reason = "MIMIR_WORKLINK_GATE_TMPDIR"
+    root = Path(value)
+    if not root.is_absolute():
+        raise ValueError(f"{reason} must be an absolute directory path")
+    try:
+        root = root.resolve(strict=True)
+        metadata = root.stat()
+    except OSError as exc:
+        raise ValueError(f"{reason} directory unavailable: {exc}") from exc
+    if not stat_module.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{reason} must be a directory")
+    if metadata.st_uid != get_identities().worklink_uid:
+        raise ValueError(f"{reason} must be owned by the worker uid")
+    if stat_module.S_IMODE(metadata.st_mode) != 0o700:
+        raise ValueError(f"{reason} must have mode 0700")
+    return root
+
+
 def _gate_tmp_directory(report_dir: Path) -> Path:
     # Pytest makes basetemp private. It must never be a child of the controller's
     # TemporaryDirectory: that identity cannot chmod/remove a worker's 0700 tree.
     # Nor may it live in the group-writable checkout: output_capture rejects that
-    # ancestor. Use the shared host /tmp (sticky), not TMPDIR or per-launch HOME.
+    # ancestor. By default use shared host /tmp (sticky), not inherited TMPDIR
+    # or per-launch HOME. Configured scratch has a separate worker-private parent.
     # Resolve only the trusted parent: macOS /tmp -> /private/tmp would otherwise
     # fail _gate_open's O_NOFOLLOW walk. Never resolve the worker-controlled leaf.
     # Hash the controller's unique report path into a single confined leaf.
     identity = hashlib.sha256(os.fsencode(report_dir.absolute())).hexdigest()
-    return Path("/tmp").resolve() / f"worklink-gate-{identity}-tmp"
+    parent = _configured_gate_tmp_root()
+    return (parent if parent is not None else Path("/tmp").resolve()) / f"worklink-gate-{identity}-tmp"
 
 
 def _export_gate_tmp(root: str, max_bytes: int, max_entries: int, max_depth: int) -> dict:
@@ -544,15 +571,20 @@ async def _retain_gate_failure(
         tmp = _gate_tmp_directory(report_dir)
         # A missing basetemp means pytest never used tmp_path. Permission/I/O
         # failures instead mean its contents are unknown, not known empty.
-        try:
-            tmp.lstat()
-        except FileNotFoundError:
-            tmp_available = False
-        except OSError:
-            tmp_available = False
-            reasons.append("tmp_unavailable")
-        else:
+        if worker_uid_drop and _configured_gate_tmp_root() is not None:
+            # The controller cannot traverse the worker's 0700 scratch parent.
+            # The exporter handles missing trees under the owning identity.
             tmp_available = True
+        else:
+            try:
+                tmp.lstat()
+            except FileNotFoundError:
+                tmp_available = False
+            except OSError:
+                tmp_available = False
+                reasons.append("tmp_unavailable")
+            else:
+                tmp_available = True
         exported_tmp = {"files": [], "reasons": [], "entries": 0}
         if tmp_available and worker_uid_drop:
             # Execute only the exporter in this guard, never the test command.
@@ -845,13 +877,23 @@ async def _observe_evidence_from_ref(
                         except FileNotFoundError:
                             pass
                     else:
-                        try:
-                            tmp.lstat()
-                        except FileNotFoundError:
-                            pass
-                        else:
+                        tmp_available = _configured_gate_tmp_root() is not None
+                        if not tmp_available:
+                            try:
+                                tmp.lstat()
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                tmp_available = True
+                        if tmp_available:
+                            code = (
+                                "import shutil\n"
+                                "try:\n"
+                                f" shutil.rmtree({str(tmp)!r})\n"
+                                "except FileNotFoundError:\n pass\n"
+                            )
                             cleanup = await _run_compute_gate(
-                                shlex.join(["python3", "-I", "-c", "import shutil; shutil.rmtree(" + repr(str(tmp)) + ")"]),
+                                shlex.join(["python3", "-I", "-c", code]),
                                 checkout=checkout, work_spec=replace(work_spec, output_root=None), compute=compute,
                                 diagnostic=True,
                             )
@@ -1165,18 +1207,29 @@ def pytest_report_environment(
     create_directory: bool = True,
     basetemp: Path | None = None,
 ) -> dict[str, str]:
-    """Configure pytest's machine reports without changing the retained output."""
-    if not _is_pytest_command(command):
+    """Configure gate scratch and pytest reports without moving retained output."""
+    configured = _configured_gate_tmp_root() is not None
+    if not _is_pytest_command(command) and not configured:
         return {}
+    scratch = basetemp if basetemp is not None else _gate_tmp_directory(report_dir)
+    environment: dict[str, str] = {}
+    if configured:
+        environment.update(TMPDIR=str(scratch), WORKLINK_GATE_SCRATCH=str(scratch))
+    if not _is_pytest_command(command):
+        return environment
+    pytest_tmp = scratch / "pytest" if configured else scratch
     if create_directory:
         report_dir.mkdir(parents=True, exist_ok=True)
     options = (
         f"--junitxml={shlex.quote(str(report_dir / 'junit.xml'))} "
-        f"--basetemp={shlex.quote(str(basetemp if basetemp is not None else _gate_tmp_directory(report_dir)))} "
+        f"--basetemp={shlex.quote(str(pytest_tmp))} "
         "-o tmp_path_retention_policy=all "
         f"-o cache_dir={shlex.quote(str(report_dir / 'cache'))}"
     )
-    return {"PYTEST_ADDOPTS": " ".join(part for part in (existing, options) if part)}
+    # Keep tempfile scratch outside pytest's destructive basetemp reset. Both
+    # remain in the same per-run tree for bounded retention and cleanup.
+    environment["PYTEST_ADDOPTS"] = " ".join(part for part in (existing, options) if part)
+    return environment
 
 
 def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
@@ -1248,6 +1301,9 @@ def _command_with_pytest_report(command: str, report_dir: Path) -> str:
     environment = pytest_report_environment(command, report_dir, existing=os.environ.get("PYTEST_ADDOPTS"))
     if not environment:
         return command
+    if "TMPDIR" in environment:
+        assignments = " ".join(f"{key}={shlex.quote(value)}" for key, value in environment.items())
+        return f"export {assignments}; mkdir -p -m 700 -- {shlex.quote(environment['TMPDIR'])} && {command}"
     return f"PYTEST_ADDOPTS={shlex.quote(environment['PYTEST_ADDOPTS'])} {command}"
 
 

@@ -944,15 +944,19 @@ def test_leaf_git_environment_rejects_supplied_git_config(
         ]
     ],
 ])
+@pytest.mark.parametrize("gate_scratch", [False, True])
 def test_path_launch_git_environment_at_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    operation: str, git_config: dict[str, str],
+    operation: str, git_config: dict[str, str], gate_scratch: bool,
 ) -> None:
     """Exercise real launch wiring without root, Linux uid drops, or a child."""
     checkout = tmp_path / "issued"
     checkout.mkdir()
     identifier = str(uuid.uuid4())
     supplied = {"PATH": "/usr/bin:/bin", "CUSTOM": "preserved", **git_config}
+    scratch = tmp_path / "scratch"
+    if gate_scratch:
+        supplied.update(TMPDIR=str(scratch), WORKLINK_GATE_SCRATCH=str(scratch))
     request = {
         "version": 1, "op": operation,
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
@@ -969,6 +973,8 @@ def test_path_launch_git_environment_at_spawn(
     monkeypatch.setattr(worker_exec, "_open_path_checkout", leaf_open)
     monkeypatch.setattr(worker_exec, "_open_factory_checkout", factory_open)
     monkeypatch.setattr(worker_exec.os, "chown", lambda *args: None)
+    monkeypatch.setattr(worker_exec, "_drop_worker", lambda *args: None)
+    monkeypatch.setattr(worker_exec, "_drop_factory", lambda *args: None)
     monkeypatch.setattr(worker_exec, "_execution_checkout_fd", lambda _cmd, fd, _home, **_kw: os.dup(fd))
     # Only the supervisor transport is stubbed; _handle_launch and the Git
     # environment helper remain real. No platform-specific socket is needed.
@@ -978,6 +984,10 @@ def test_path_launch_git_environment_at_spawn(
     spawned = []
 
     def spawn(_command, **kwargs):
+        if gate_scratch:
+            assert not scratch.exists()
+            kwargs["preexec_fn"]()
+            assert scratch.is_dir()
         spawned.append(kwargs["env"].copy())
         return SimpleNamespace(pid=123, returncode=0)
 
@@ -1017,6 +1027,25 @@ def test_path_launch_git_environment_at_spawn(
     assert identifier not in worker_exec._jobs
     assert identifier not in worker_exec._launching
     assert not (homes / identifier).exists()
+
+
+@pytest.mark.parametrize("operation", ["launch_path", "launch_factory", "launch_factory_control"])
+def test_gate_scratch_is_created_only_after_worker_drop(tmp_path, monkeypatch, operation):
+    scratch = tmp_path / "gate-scratch"
+    drops = []
+
+    def dropped(*args):
+        assert not scratch.exists()
+        drops.append(args)
+
+    monkeypatch.setattr(worker_exec, "_drop_worker", dropped)
+    monkeypatch.setattr(worker_exec, "_drop_factory", dropped)
+    worker_exec._drop_launch_worker(123, tmp_path, operation, {
+        "TMPDIR": str(scratch), "WORKLINK_GATE_SCRATCH": str(scratch),
+    })
+    assert drops == ([(123, tmp_path)] if operation == "launch_factory" else [(123,)])
+    assert scratch.is_dir()
+    assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
 
 
 @pytest.mark.parametrize("operation,handler", [

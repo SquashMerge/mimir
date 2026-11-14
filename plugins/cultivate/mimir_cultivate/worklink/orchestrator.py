@@ -57,6 +57,7 @@ from .control import operator_stop_requested
 from .autonomy import chainlink_bin
 from .evidence import (
     _gate_tmp_directory,
+    _configured_gate_tmp_root,
     _paths_from_status,
     _run_compute_gate,
     EvidenceValidation,
@@ -5455,23 +5456,26 @@ async def _remove_executor_basetemp_best_effort(
     tmp: Path | None = None
     try:
         tmp = _gate_tmp_directory(report_dir)
-        try:
-            mode = tmp.lstat().st_mode
-        except FileNotFoundError:
-            return
-        if not stat.S_ISDIR(mode):
-            raise ValueError("executor basetemp leaf is not a directory")
+        if not (worker_uid_drop and _configured_gate_tmp_root() is not None):
+            try:
+                mode = tmp.lstat().st_mode
+            except FileNotFoundError:
+                return
+            if not stat.S_ISDIR(mode):
+                raise ValueError("executor basetemp leaf is not a directory")
         if worker_uid_drop:
             if spec is None or checkout is None:
                 raise ValueError("worker compute unavailable for executor basetemp cleanup")
             # The child repeats the leaf check under the worker identity. Its
             # shutil.rmtree also refuses a symlink substituted after lstat.
             code = (
-                "import os, stat, shutil; "
-                f"p = {str(tmp)!r}; "
-                "s = os.lstat(p); "
-                "assert stat.S_ISDIR(s.st_mode), 'executor basetemp leaf is not a directory'; "
-                "shutil.rmtree(p)"
+                "import os, stat, shutil\n"
+                f"p = {str(tmp)!r}\n"
+                "try:\n s = os.lstat(p)\n"
+                "except FileNotFoundError:\n pass\n"
+                "else:\n"
+                " assert stat.S_ISDIR(s.st_mode), 'executor basetemp leaf is not a directory'\n"
+                " shutil.rmtree(p)\n"
             )
             cleanup = await _run_compute_gate(
                 shlex.join(["python3", "-I", "-c", code]),

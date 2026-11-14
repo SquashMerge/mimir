@@ -43,7 +43,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v15-bounded-control-output"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v16-gate-scratch"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -236,6 +236,18 @@ def _drop_factory(checkout_fd: int, home: Path) -> None:
     _drop_worker(checkout_fd)
     # The checkout is attacker-writable. No runtime writes may precede uid drop.
     _prepare_factory_runtime(home)
+
+
+def _drop_launch_worker(checkout_fd: int, home: Path, operation: str, environment: dict[str, str]) -> None:
+    if operation == "launch_factory":
+        _drop_factory(checkout_fd, home)
+    else:
+        _drop_worker(checkout_fd)
+    # Never write inside a worker-owned scratch parent while privileged. This
+    # marker is supplied only for gates with explicitly configured scratch.
+    scratch = environment.get("WORKLINK_GATE_SCRATCH")
+    if scratch is not None:
+        Path(scratch).mkdir(mode=0o700, exist_ok=True)
 
 
 def _status_fields() -> dict[str, str]:
@@ -1318,11 +1330,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             stdout=subprocess.PIPE if control else fds[1],
             stderr=subprocess.PIPE if control else fds[2],
             env=environment,
-            preexec_fn=(
-                (lambda: _drop_factory(fds[0], home))
-                if request.get("op") == "launch_factory"
-                else (lambda: _drop_worker(fds[0]))
-            ),
+            preexec_fn=lambda: _drop_launch_worker(fds[0], home, request["op"], environment),
             close_fds=True,
             pass_fds=(fds[0], supervisor_child.fileno()) if factory else (fds[0],),
         )

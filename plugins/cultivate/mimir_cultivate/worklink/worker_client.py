@@ -30,7 +30,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v15-bounded-control-output"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v16-gate-scratch"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
