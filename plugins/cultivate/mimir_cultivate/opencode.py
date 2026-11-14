@@ -418,44 +418,75 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _run_git(checkout: Path, *args: str, limit: int | None = None) -> bytes:
+class _ProposalGitError(OSError):
+    """Internal diagnostics only; public results retain a closed reason code."""
+
+    def __init__(self, operation: str, returncode: int, diagnostic: str) -> None:
+        super().__init__("proposal Git operation failed")
+        self.operation = operation
+        self.returncode = returncode
+        self.diagnostic = diagnostic
+
+
+def _run_git(
+    checkout: Path, *args: str, limit: int | None = None,
+    scrubber: SensitiveMaterialScrubber | None = None,
+) -> bytes:
+    from mimir.output_capture import open_output_sink
+
     env = _sanitized_git_env()
     filters = _maintenance_git_filter_overrides(checkout, "git", effective_config=True, env=env)
     if filters is None:
         raise OSError("proposal Git filter configuration unavailable")
-    command = ("git", "-C", os.fspath(checkout), *_MAINTENANCE_GIT_BASE_OVERRIDES, *filters, *args)
-    if limit is None:
-        completed = subprocess.run(
-            command, check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
-        )
-        if completed.returncode != 0:
-            raise OSError("proposal Git operation failed")
-        return completed.stdout
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
-    if process.stdout is None:
-        _stop_process(process)
-        raise OSError("proposal Git output unavailable")
-    output = process.stdout.read(limit)
-    if len(output) == limit:
+    # Session admission transfers this issued checkout to worklink. Match the
+    # filter probe's exact-path trust for controller-side Git too; never persist
+    # trust in global config or trust unrelated repositories with '*'.
+    command = ("git", "-C", os.fspath(checkout), *_MAINTENANCE_GIT_BASE_OVERRIDES,
+               "-c", f"safe.directory={checkout}", *filters, *args)
+    stderr = open_output_sink(None, 4096)
+    try:
+        def failure(returncode: int) -> _ProposalGitError:
+            raw, _ = stderr.read_bounded(scrubber=scrubber)
+            text = scrubber.scrub_text(raw) if scrubber is not None else raw.decode("utf-8", "replace")
+            return _ProposalGitError(args[0], returncode, redact_daemon_output(text)[:4096])
+
+        if limit is None:
+            completed = subprocess.run(
+                command, check=False, stdout=subprocess.PIPE, stderr=stderr.fd, env=env,
+                stdin=subprocess.DEVNULL,
+            )
+            if completed.returncode != 0:
+                raise failure(completed.returncode)
+            return completed.stdout
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr.fd,
+                                   env=env, stdin=subprocess.DEVNULL)
+        if process.stdout is None:
+            _stop_process(process)
+            raise OSError("proposal Git output unavailable")
+        output = process.stdout.read(limit)
+        if len(output) == limit:
+            process.stdout.close()
+            _stop_process(process)
+            return output
+        return_code = process.wait()
         process.stdout.close()
-        _stop_process(process)
+        if return_code != 0:
+            raise failure(return_code)
         return output
-    return_code = process.wait()
-    process.stdout.close()
-    if return_code != 0:
-        raise OSError("proposal Git operation failed")
-    return output
+    finally:
+        stderr.close()
 
 
 def build_opencode_proposal(
     checkout: Path | str, *, scrubber: SensitiveMaterialScrubber, base_tree: str | None = None,
 ) -> ProposalBuildResult:
     root = Path(checkout)
+    scrubber.add_path(root)
     try:
-        _run_git(root, "add", "-A")
+        _run_git(root, "add", "-A", scrubber=scrubber)
         name_stream = _run_git(
             root, "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
-            limit=MAX_PROPOSAL_NAME_STREAM_BYTES + 1,
+            limit=MAX_PROPOSAL_NAME_STREAM_BYTES + 1, scrubber=scrubber,
         )
         if len(name_stream) > MAX_PROPOSAL_NAME_STREAM_BYTES:
             return ProposalBuildResult(None, "path_bytes")
@@ -474,15 +505,19 @@ def build_opencode_proposal(
                 return ProposalBuildResult(None, "proposal_unavailable")
         patch = _run_git(
             root, "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-textconv",
-            limit=MAX_PROPOSAL_PATCH_BYTES + 1,
+            limit=MAX_PROPOSAL_PATCH_BYTES + 1, scrubber=scrubber,
         )
         if len(patch) > MAX_PROPOSAL_PATCH_BYTES:
             return ProposalBuildResult(None, "patch_bytes")
         if scrubber.contains_sensitive(patch):
             return ProposalBuildResult(None, "proposal_sensitive_content")
-        tree = base_tree or _run_git(root, "rev-parse", "HEAD^{tree}").decode("ascii").strip()
+        tree = base_tree or _run_git(root, "rev-parse", "HEAD^{tree}", scrubber=scrubber).decode("ascii").strip()
         if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", tree) is None:
             return ProposalBuildResult(None, "proposal_unavailable")
+    except _ProposalGitError as exc:
+        log.warning("OpenCode proposal Git failure: operation=%s exit=%s stderr=%s",
+                    exc.operation, exc.returncode, exc.diagnostic)
+        return ProposalBuildResult(None, "proposal_unavailable")
     except (OSError, UnicodeError, ValueError):
         return ProposalBuildResult(None, "proposal_unavailable")
     proposal = OpenCodeProposal(
@@ -697,13 +732,20 @@ async def _spawn_open_code_impl(
 
     try:
         try:
-            reference = resolve_daemon_model(dict(os.environ), model)
-            invocation = OpenCodeInvocation(
-                model=f"{reference['providerID']}/{reference['id']}", provider=reference['providerID'],
-                model_source="explicit" if model else "agent_model", config_path=config_path,
-                auth_path=auth_path, auth_type=None, scrubber=scrubber)
-            scrubber.add_path(seed)
-            scrubber.add_path(artifact_base)
+            from .worklink.daemon_gate import workload_refusal
+            from .worklink.daemon_health import daemon_health
+
+            reason = workload_refusal(daemon_health(dict(os.environ)))
+            if reason is not None:
+                terminal = SpawnTerminalResult("refused", None, reason, "spawn_open_code_configuration_refused")
+            else:
+                reference = resolve_daemon_model(dict(os.environ), model)
+                invocation = OpenCodeInvocation(
+                    model=f"{reference['providerID']}/{reference['id']}", provider=reference['providerID'],
+                    model_source="explicit" if model else "agent_model", config_path=config_path,
+                    auth_path=auth_path, auth_type=None, scrubber=scrubber)
+                scrubber.add_path(seed)
+                scrubber.add_path(artifact_base)
         except OpenCodeAuthError as exc:
             terminal = classify_spawn_terminal_state(authentication_reason=exc.reason_code)
         except OpenCodeConfigError as exc:

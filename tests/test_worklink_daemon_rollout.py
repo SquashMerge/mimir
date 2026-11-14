@@ -96,7 +96,7 @@ exec(sys.argv[2])
                                    "workspace-final-with-plugin", "workspace-final-generic", "pypi-final"])
 @pytest.mark.parametrize("state", ["core", "not-installed", "missing-login", "unexpired", "refreshable",
                                   "invalid-marker", "missing-binary", "missing-wrapper"])
-def test_every_startup_writer_enforces_native_gate(startup, monkeypatch, writer, state):
+def test_every_startup_writer_starts_agent_without_daemon_login(startup, monkeypatch, writer, state):
     root, bin_dir, env = startup
     if writer == "root":
         text = (ROOT / "deploy/s6-overlay/s6-rc.d/mimir/run").read_text()
@@ -112,13 +112,13 @@ def test_every_startup_writer_enforces_native_gate(startup, monkeypatch, writer,
         if writer.startswith("workspace-final"):
             text = (home / "start.sh").read_text()
             sync = text.index("uv sync $UV_EXTRAS\n")
-            gate_offset = text.index("resolve_activation(dict(os.environ))")
+            agent_offset = text.index(next(line for line in text.splitlines() if line.startswith("exec ")))
             if not writer.endswith("generic"):
-                assert sync < text.index('m.version("mimir-cultivate")') < gate_offset
+                assert sync < text.index('m.version("mimir-cultivate")') < agent_offset
                 assert "--all-packages" in text
             if writer.endswith(("with-plugin", "generic")):
                 assert sync < text.index("uv pip install") < text.index(
-                    "touch /run/mimir-plugin-services/ready") < gate_offset
+                    "touch /run/mimir-plugin-services/ready") < agent_offset
         else:
             text = (home / ".mimir-scaffold/s6-rc.d/mimir/run").read_text()
             for name in ("type", "run", "dependencies.d/base"):
@@ -127,11 +127,11 @@ def test_every_startup_writer_enforces_native_gate(startup, monkeypatch, writer,
     else:
         text = render_start_sh(mode="pypi")
     if "final" in writer:
-        # Run the exact final gate and workload exec, without clone/sync/setup.
-        guard = next(line for line in text.splitlines() if "resolve_activation(dict(os.environ))" in line)
-        final = next(line for line in text.splitlines() if line.startswith("exec "))
-        assert text.index(guard) < text.index(final)
-        text = "set -eu\n" + guard + "\n" + final + "\n"
+        # Run the final startup section without clone/sync/setup. Retain every
+        # command after setup so restoring the old gate makes this test fail.
+        text = text[text.index("# ─── home seed"):]
+        text = text[text.index("}\n") + 2:]
+        text = "set -eu\n" + text
         if writer.startswith("workspace"):
             # Keep the emitted uv flags intact and use the real parser. Only
             # project discovery and executable paths differ from the image.
@@ -157,17 +157,53 @@ def test_every_startup_writer_enforces_native_gate(startup, monkeypatch, writer,
         path.write_text(json.dumps(status))
     if writer.endswith("generic"):
         env["MIMIR_PLUGINS"] = ""
+    if state == "missing-login" and not writer.endswith("generic"):
+        # Prove this is an enabled daemon with a genuinely refusing native
+        # login gate, rather than an unselected/no-op path.
+        gate = subprocess.run([str(bin_dir / "gate")], env=env, text=True,
+                              capture_output=True, timeout=10)
+        assert gate.returncode == 1 and "not ready for workloads" in gate.stderr
     text = (text.replace("/usr/local/libexec/worklink-daemon-gate", str(bin_dir / "gate"))
             .replace("/opt/cultivate-docker/selected", str(root / "selected"))
             .replace("/usr/local/bin/start.sh", str(bin_dir / "workload"))
             .replace("mimir run", str(bin_dir / "workload")))
     result = subprocess.run(["sh", "-c", text], cwd=root, env=env, text=True, capture_output=True, timeout=10)
-    allowed = writer.endswith("generic") or state in {"core", "not-installed", "unexpired", "refreshable"}
-    assert (result.returncode == 0) is allowed, result.stderr
-    assert (root / "workload-ran").exists() is allowed
+    assert result.returncode == 0, result.stderr
+    assert (root / "workload-ran").exists()
     assert (bin_dir / "opencode").exists() is (state not in {"not-installed", "missing-binary"})
-    if state == "refreshable" and not writer.endswith("generic"):
-        assert "unverified" in result.stderr
+
+
+def test_image_wiring_keeps_daemon_gate_out_of_agent_startup():
+    services = ROOT / "deploy/s6-overlay/s6-rc.d"
+    pending = ["mimir"]
+    visited = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        assert name not in {"worklink-daemon-gate", "worklink-opencode"}
+        service = services / name
+        for script in ("run", "up"):
+            path = service / script
+            if path.exists():
+                assert "worklink-daemon-gate" not in path.read_text()
+                assert "daemon_gate" not in path.read_text()
+        pending.extend(path.name for path in (service / "dependencies.d").glob("*"))
+        dependencies = service / "dependencies"
+        if dependencies.exists():
+            pending.extend(dependencies.read_text().split())
+    image = (ROOT / "Dockerfile").read_text()
+    assert "COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/" in image
+    assert "sh /opt/cultivate-docker/service.sh" in image
+    assert "worklink-daemon-gate" not in image
+    # The wrapper remains available for explicit workload readiness checks,
+    # but image setup must not inject it into the service graph or run script.
+    wiring = (DOCKER / "service.sh").read_text()
+    assert "install -o root -g root -m 0755 /opt/cultivate-docker/worklink-daemon-gate" in wiring
+    assert "dependencies" not in wiring
+    assert all(line.startswith("chmod ") for line in wiring.splitlines()
+               if "/etc/s6-overlay/s6-rc.d/mimir" in line)
 
 
 def test_reserved_service_and_wrappers_use_immutable_interpreter():

@@ -57,6 +57,8 @@ def spawn_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, P
     seed.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
+    from mimir_cultivate.worklink import daemon_health
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "telemetry-" + "canary")
     monkeypatch.setenv("GITHUB_TOKEN", "refresh-" + "secret")
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)

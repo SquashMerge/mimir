@@ -102,7 +102,7 @@ def test_proposal_neutralizes_checkout_commands(
         _git(repo, "config", "diff.hostile.textconv", command)
 
     if not hardened:
-        def original_run_git(checkout: Path, *args: str, limit: int | None = None) -> bytes:
+        def original_run_git(checkout: Path, *args: str, limit: int | None = None, scrubber=None) -> bytes:
             # Pre-fix argv/environment, including diff's former textconv default.
             args = tuple(arg for arg in args if arg != "--no-textconv")
             completed = subprocess.run(
@@ -150,6 +150,72 @@ def test_proposal_git_uses_minimal_environment_for_every_process(
     for command in calls:
         assert "core.hooksPath=/dev/null" in command
         assert "core.fsmonitor=" in command
+        assert f"safe.directory={repo}" in command
+        assert "safe.directory=*" not in command
+
+
+def test_proposal_foreign_owner_git_handoff_and_mutation(tmp_path, monkeypatch, caplog):
+    """Exercise Git's real ownership refusal without requiring chown/root."""
+    repo = _repository(tmp_path)
+    (repo / "file.txt").write_text("session output\n")
+    original_env = proposal_module._sanitized_git_env
+    monkeypatch.setattr(proposal_module, "_sanitized_git_env",
+                        lambda: {**original_env(), "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"})
+    scrubber = SensitiveMaterialScrubber(home=tmp_path / "home")
+    result = build_opencode_proposal(repo, scrubber=scrubber)
+    assert result.reason_code == "proposal_created"
+    assert b"session output" in base64.b64decode(result.proposal.patch)
+    original_popen = subprocess.Popen
+
+    def remove_execution_trust(command, *args, **kwargs):
+        # The filter probe already had exact-path trust before this fix. Remove
+        # it only from execution, reproducing the production probe/exec mismatch.
+        if "config" not in command:
+            command = list(command)
+            index = command.index(f"safe.directory={repo}")
+            assert command[index - 1] == "-c"
+            del command[index - 1:index + 1]
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", remove_execution_trust)
+    assert build_opencode_proposal(repo, scrubber=scrubber) == ProposalBuildResult(None, "proposal_unavailable")
+    assert "dubious ownership" in caplog.text
+    assert str(repo) not in caplog.text
+
+
+@pytest.mark.parametrize("operation", ["add", "diff"])
+def test_proposal_failure_diagnostics_bounded_scrubbed_and_internal(
+    tmp_path, monkeypatch, caplog, operation,
+):
+    import sys
+
+    repo = _repository(tmp_path)
+    (repo / "file.txt").write_text("session output\n")
+    secret = "private-proposal-diagnostic-value"
+    scrubber = SensitiveMaterialScrubber(home=tmp_path / "home")
+    scrubber.add_scalar(secret)
+    original_popen = subprocess.Popen
+    # Put a registered secret across the raw byte cap; never log its prefix.
+    diagnostic = (f"failure at {repo} {secret}\n".encode() + b"x" * 4090 + secret.encode())
+    diagnostic = diagnostic[:4090] + secret.encode() + b"y" * 10000
+
+    def failing_git(command, *args, **kwargs):
+        if operation in command and "config" not in command:
+            command = (sys.executable, "-c",
+                       f"import os; os.write(2, {diagnostic!r}); raise SystemExit(23)")
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", failing_git)
+    with caplog.at_level("WARNING", logger=proposal_module.__name__):
+        result = build_opencode_proposal(repo, scrubber=scrubber)
+    assert result == ProposalBuildResult(None, "proposal_unavailable")
+    record = next(r for r in caplog.records if "OpenCode proposal Git failure" in r.message)
+    assert f"operation={operation} exit=23" in record.message
+    assert "failure at <redacted> <redacted>" in record.message
+    assert str(repo) not in record.message and secret not in record.message
+    assert "private-" not in record.message
+    assert len(record.args[2]) <= 4096
+    assert secret not in repr(result) and "failure at" not in repr(result)
 
 
 def test_proposal_refuses_failed_filter_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

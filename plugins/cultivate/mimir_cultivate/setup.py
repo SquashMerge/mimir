@@ -1928,8 +1928,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     if not no_start:
         if codex:
             _require_codex_login(deploy, run)
-        # s6 starts the daemon independently; the Mimir workload remains gated
-        # until the operator provisions its separate native login.
+        # s6 starts the agent and daemon independently; setup and daemon-backed
+        # workloads require the separate native login, not agent liveness.
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
         _verify_opencode_daemon(deploy, run=run)
     if old_image and old_image[1] != layer_tag:

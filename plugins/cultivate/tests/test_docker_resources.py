@@ -124,7 +124,8 @@ def test_selected_scaffold_writes_worker_resources(tmp_path: Path, monkeypatch, 
     assert 'ENTRYPOINT ["/init"]' in dockerfile
     assert "MIMIR_ENABLE_OPENCODE" in (tmp_path / "compose.yml").read_text()
     start = (tmp_path / "start.sh").read_text()
-    assert 'resolve_activation(dict(os.environ))' in start
+    assert 'resolve_activation(dict(os.environ))' not in start
+    assert 'worklink-daemon-gate' not in (context / "s6-rc.d/mimir/run").read_text()
     assert "MIMIR_CODING_ENABLED" not in start
     assert "mimir-cultivate==" not in start
     if mode == "workspace":

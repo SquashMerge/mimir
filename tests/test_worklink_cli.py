@@ -982,11 +982,13 @@ def test_cli_owned_inner_interruption_does_not_fallback_record(
 
     import mimir_cultivate.commands as worklink_cmd
     import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink import daemon_health
     from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
     from mimir_cultivate.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
     from mimir_cultivate.worklink.claims import ClaimRecord, ClaimResult
     from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
 
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     home = tmp_path / "home"
     repo = tmp_path / "repo"
     home.mkdir()

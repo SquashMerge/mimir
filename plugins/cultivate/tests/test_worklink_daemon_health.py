@@ -170,6 +170,88 @@ def test_gate_main_refuses_missing_login(tmp_path, monkeypatch, capsys):
     assert env["GITHUB_TOKEN"] not in output.out + output.err
 
 
+@pytest.mark.parametrize(("state", "login", "reason"), [
+    ("down", "missing", "daemon_down"),
+    ("ready", "missing", "login_missing"),
+    ("ready", "expired_no_refresh", "login_expired"),
+])
+@pytest.mark.parametrize("workload", ["leaf", "factory", "spawn"])
+@pytest.mark.asyncio
+async def test_workloads_refuse_with_real_daemon_health(tmp_path, monkeypatch, state, login, reason, workload):
+    from functools import partial
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+    from mimir_cultivate import opencode
+    from mimir.tools.registry import _spawn_reset_for_tests, set_spawn_config
+
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login=login)
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    payload = json.loads(paths.status.read_text())
+    payload.update(daemon_state=state, daemon_version="2.2.7" if state == "ready" else None)
+    paths.status.write_text(json.dumps(payload))
+    monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
+    observed = health.daemon_health(dict(os.environ))
+    assert observed["daemon_enabled"] is True and observed["ok"] is False
+    assert observed["login_state"] == login
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unhealthy workload reached claim, checkout, initialization or launch")
+
+    if workload == "spawn":
+        _spawn_reset_for_tests()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        set_spawn_config({"default_cwd": tmp_path, "artifact_root": tmp_path / "artifacts"})
+        try:
+            result = json.loads(await opencode._spawn_open_code_impl(
+                "build", contained_runner=forbidden, checkout_factory=forbidden))
+            assert result["status"] == "refused" and result["reason_code"] == reason
+            assert result["opencode_session_id"] is None
+        finally:
+            _spawn_reset_for_tests()
+        return
+
+    description = """Acceptance criteria:
+- [ ] Build the fix.
+Review criteria:
+Verify the fix.
+Worklink notes:
+- Scope: fixture
+- Out of scope: deployment
+- Suggested test command: pytest
+"""
+    issue = orchestrator.IssueContext(2138, "Fix", description, {"worklink:ready", "worklink"})
+    if workload == "factory":
+        issue.labels.add("worklink:epic")
+    # Real backend/compute selection and admission policy; only tracker and Git
+    # metadata are fixtures. Any side effect after preflight fails the test.
+    monkeypatch.setattr(orchestrator.ChainlinkIssueReader, "read", lambda self, id: issue)
+    monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *a, **kw: "https://github.com/acme/widget.git")
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", forbidden)
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", forbidden)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", forbidden)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(OpenCodeBackend())
+    registry.register(FeatureFactoryBackend())
+    registry.select_compute = lambda **kw: LocalSubprocessComputeBackend()
+    worker = orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path, registry=registry)
+    result = (await worker.run_epic(2138) if workload == "factory"
+              else await worker.run(2138, backend_name="opencode"))
+    assert result.status == "refused" and result.reason == reason
+    assert result.attempt is None
+
+
+@pytest.mark.parametrize("payload", [{}, {"ok": False}, {"ok": "true"}, {"ok": 1}, {"daemon_enabled": False}])
+def test_workload_health_requires_explicit_readiness(payload):
+    assert gate.workload_refusal(payload) == "daemon_down"
+
+
+def test_workload_health_preserves_stale_token_reason():
+    assert gate.workload_refusal({"ok": False, "daemon_error": "bot_token_stale"}) == "bot_token_stale"
+
+
 @pytest.mark.parametrize("login", sorted(health.LOGIN_STATES))
 def test_gate_local_login_policy(tmp_path, monkeypatch, login):
     paths, ids, env = fixture_status(tmp_path, monkeypatch, login=login)
@@ -353,7 +435,7 @@ def test_gate_main_refuses_stale_or_unavailable(tmp_path, monkeypatch, capsys, c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["login", "stale", "down"])
-async def test_healthy_executor_does_not_mask_daemon_failure(tmp_path, monkeypatch, failure):
+async def test_healthy_executor_reports_daemon_failure_without_failing_agent(tmp_path, monkeypatch, failure):
     from functools import partial
     from mimir_cultivate import server
     from mimir_cultivate.worklink import worker_client
@@ -379,7 +461,7 @@ async def test_healthy_executor_does_not_mask_daemon_failure(tmp_path, monkeypat
                                            "worklink_controller_identity": identity})
     assert result["worklink_install_status"] == "matched"
     assert result["worklink_executor_source_status"] == "matched"
-    assert result["ok"] is False
+    assert "ok" not in result  # The core endpoint supplies agent liveness.
     assert result["daemon_enabled"] is True
     assert result["login_state"] == "expired_no_refresh"
     assert result["telemetry_state"] == "disabled_sensitive_otlp"
@@ -390,6 +472,97 @@ async def test_healthy_executor_does_not_mask_daemon_failure(tmp_path, monkeypat
         assert result["daemon_state"] == "down"
     assert env["GITHUB_TOKEN"] not in json.dumps(result)
     assert "changed-private-token" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["source", "pypi"])
+@pytest.mark.parametrize("identity_failure", [None, "executor", "controller"])
+async def test_agent_health_missing_login_preserves_identity_gate(
+    tmp_path, monkeypatch, mode, identity_failure,
+):
+    from functools import partial
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir.plugins.manager import load_plugins
+    from mimir.server import _handle_health
+    from mimir_cultivate import install_identity
+    from mimir_cultivate.worklink import worker_client
+
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login="missing")
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
+    observed = health.daemon_health(dict(os.environ))
+    assert observed["ok"] is False and observed["login_state"] == "missing"
+    socket = tmp_path / "executor.sock"
+    socket.touch()
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
+    if mode == "source":
+        controller = {"mode": mode, "source_commit": "a" * 40}
+        changed = {"mode": mode, "source_commit": "b" * 40}
+    else:
+        controller = {"mode": mode, "distributions": {name: {
+            "version": "1.2", "wheel": f"{name}-1.2.whl", "sha256": "a" * 64,
+        } for name in install_identity.PROJECTS}}
+        changed = {"mode": mode, "distributions": {**controller["distributions"],
+            "mimir-agent": {**controller["distributions"]["mimir-agent"], "sha256": "b" * 64}}}
+    monkeypatch.setattr(install_identity, "controller_identity",
+                        lambda: changed if identity_failure == "controller" else controller)
+
+    async def verified():
+        return changed if identity_failure == "executor" else controller
+
+    monkeypatch.setattr(worker_client, "verify_executor_identity", verified)
+    app = web.Application()
+    # Use the production plugin registration and HTTP handler, not an injected
+    # replacement health hook; both the aggregator and HTTP status are exercised.
+    app["plugin_manager"] = load_plugins(enable="cultivate")
+    app["check_worker_executor_health"] = True
+    app["worklink_controller_identity"] = (
+        changed if mode == "source" and identity_failure == "controller" else controller)
+    app.router.add_get("/health", _handle_health)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/health")
+        result = await response.json()
+    assert response.status == (503 if identity_failure else 200)
+    assert result["ok"] is (identity_failure is None)
+    assert result["worklink_install_status"] == ("mismatched" if identity_failure else "matched")
+    for field, value in observed.items():
+        if field != "ok":
+            assert result[field] == value
+    assert result["daemon_enabled"] is True
+    assert result["daemon_state"] == "ready"
+    assert result["login_state"] == "missing"
+    assert "daemon_error" not in result  # Missing login is reported by login_state.
+    assert env["GITHUB_TOKEN"] not in json.dumps(result)
+    if identity_failure is None:
+        from contextlib import redirect_stdout
+        import io
+        from mimir_cultivate import setup
+        from mimir import worklink_daemon_activation as activation
+
+        monkeypatch.setattr(activation, "resolve_activation", partial(
+            activation.resolve_activation, marker=paths.run / "opencode-enabled"))
+        assert activation.resolve_activation(dict(os.environ)).enabled
+
+        # A live /health must not admit setup: execute its actual daemon probe
+        # against this same missing-login fixture, adapting only Docker transport.
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:fixture-model")
+        probes = []
+
+        def agent_exec(deploy, *argv):
+            assert argv == ("python", "-c", setup._OPENCODE_DAEMON_PROBE)
+            probes.append(argv)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(compile(argv[-1], "<setup-daemon-probe>", "exec"), {})
+            return output.getvalue()
+
+        monkeypatch.setattr(setup, "_agent_exec", agent_exec)
+        monkeypatch.setattr(setup, "_http", lambda *a, **kw: pytest.fail(
+            "setup trusted top-level HTTP liveness before daemon readiness"))
+        with pytest.raises(setup.SetupError, match="worklink-opencode-login"):
+            setup._verify(tmp_path, 8123, "owner", "key", "node", "22.16.0")
+        assert len(probes) == 1
 
 
 def test_gate_readiness_wait_is_bounded_without_stopping_daemon(tmp_path, monkeypatch, capsys):

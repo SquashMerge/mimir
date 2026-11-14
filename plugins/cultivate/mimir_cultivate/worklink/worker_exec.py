@@ -183,7 +183,8 @@ def _arm_parent_death_signal(expected_parent_pid: int) -> None:
         os._exit(128 + signal.SIGKILL)
 
 
-def _drop_worker(checkout_fd: int) -> None:
+def _drop_worker_privileges() -> None:
+    """Irreversibly remove authority before any worker or daemon exec."""
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
         error = ctypes.get_errno()
@@ -202,6 +203,11 @@ def _drop_worker(checkout_fd: int) -> None:
     os.setresgid(get_identities().worklink_gid, get_identities().worklink_gid, get_identities().worklink_gid)
     os.setresuid(get_identities().worklink_uid, get_identities().worklink_uid, get_identities().worklink_uid)
     _set_capabilities(set())
+    _verify_worker_identity()
+
+
+def _drop_worker(checkout_fd: int) -> None:
+    _drop_worker_privileges()
     os.umask(0o002)
     os.setsid()
     os.fchdir(checkout_fd)
