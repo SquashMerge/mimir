@@ -247,8 +247,10 @@ async def test_other_integration_cannot_supply_codex_tokens(stores):
 
 
 async def test_oversize_valid_agent_document_is_refused(stores):
-    stores.document["padding"] = "x" * 65536
+    stores.document["padding"] = ""
+    stores.document["padding"] = "x" * (65537 - len(json.dumps(stores.document).encode()))
     stores.save()
+    assert stores.path.stat().st_size == 65537
     with pytest.raises(opencode.CodexReconcileError, match="codex login"):
         await stores.reconcile()
     assert stores.reads == stores.writes == 0
