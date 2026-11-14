@@ -103,6 +103,119 @@ def test_repository_git_path_validation_stays_closed() -> None:
         repository._validated_paths(("../outside",), required=True)
 
 
+@pytest.fixture
+def repository_git_policy():
+    from mimir.plugins.core import policy_scope
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.mark.usefixtures("repository_git_policy")
+@pytest.mark.parametrize("already_staged", [False, True])
+@pytest.mark.parametrize("name", ["deleted.txt", "literal[1]*\nfile.txt"])
+def test_stage_and_commit_deletion(tmp_path: Path, already_staged: bool, name: str) -> None:
+    _, _, scope, state = _repo_scope_and_state(tmp_path, base_files={name: b"retired\n"})
+    checkout = state.checkout_lease.path
+    tools = repository.RepoGitTools(state)
+    (checkout / name).unlink()
+    if already_staged:
+        _git(checkout, "rm", "--cached", "--quiet", "--", f":(literal){name}")
+    else:
+        assert _git(checkout, "ls-files", "-z", "--", f":(literal){name}") == name + "\x00"
+
+    assert tools.execute(repository.GitStage((name,))).ok
+    assert _git(checkout, "diff", "--cached", "--name-only", "-z") == name + "\x00"
+    assert tools.execute(repository.GitCommit((name,), "remove retired file")).ok
+    assert name not in _git(checkout, "ls-tree", "-r", "--name-only", "-z", "HEAD").split("\x00")
+    assert _git(checkout, "rev-parse", "HEAD^") == scope.observed_head_sha
+
+
+@pytest.mark.usefixtures("repository_git_policy")
+@pytest.mark.parametrize("replacement", ["file", "dangling_symlink"])
+def test_stage_recreated_file_after_staged_deletion(tmp_path: Path, replacement: str) -> None:
+    name = "deleted.txt"
+    _, _, _, state = _repo_scope_and_state(tmp_path, base_files={name: b"retired\n"})
+    checkout = state.checkout_lease.path
+    tools = repository.RepoGitTools(state)
+    _git(checkout, "rm", "--quiet", "--", name)
+    if replacement == "file":
+        (checkout / name).write_text("replacement\n", encoding="utf-8")
+    else:
+        (checkout / name).symlink_to("missing-target")
+
+    assert tools.execute(repository.GitStage((name,))).ok
+    assert tools.execute(repository.GitCommit((name,), "replace retired file")).ok
+    assert _git(checkout, "show", f"HEAD:{name}") == (
+        "replacement" if replacement == "file" else "missing-target"
+    )
+
+
+@pytest.mark.usefixtures("repository_git_policy")
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("with_deletion", [False, True])
+def test_stage_never_existing_path_is_refused(
+    tmp_path: Path, commit: bool, with_deletion: bool,
+) -> None:
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    checkout = state.checkout_lease.path
+    tools = repository.RepoGitTools(state)
+    paths = ("never-existed.txt",)
+    if with_deletion:
+        # A real staged deletion cannot make an unrelated missing path acceptable.
+        _git(checkout, "rm", "--quiet", "--", "tracked.txt")
+        paths = ("tracked.txt", *paths)
+    operation = repository.GitCommit(paths, "invalid commit") if commit else repository.GitStage(paths)
+    with pytest.raises(repository.GitRefusal) as refusal:
+        tools.execute(operation)
+    assert refusal.value.code == "git_failed"
+    assert "did not match any files" in str(refusal.value)
+    assert _git(checkout, "rev-parse", "HEAD") == scope.observed_head_sha
+
+
+@pytest.mark.usefixtures("repository_git_policy")
+def test_merge_deletion_stages_and_commits_with_two_parents(tmp_path: Path) -> None:
+    name = "retired.txt"
+    origin, source, scope, old_state = _repo_scope_and_state(
+        tmp_path, base_files={name: b"retired\n"},
+    )
+    _git(source, "checkout", "-q", "main")
+    _git(source, "rm", "--quiet", "--", name)
+    (source / "tracked.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "commit", "-qam", "delete retired file and advance base")
+    base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, observed_base_sha=base)
+    state = RepoReviewState(scope)
+    repository.create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+    checkout = state.checkout_lease.path
+    tools = repository.RepoGitTools(state)
+    with pytest.raises(repository.GitRefusal) as conflict:
+        tools.execute(repository.GitMerge())
+    assert conflict.value.code == "merge_conflict"
+    assert not (checkout / name).exists()
+    assert _git(checkout, "ls-files", "--", name) == ""
+    assert _git(checkout, "diff", "--cached", "--diff-filter=D", "--name-only") == name
+
+    # The auto-staged deletion cannot bypass the unmerged-index proof rule.
+    with pytest.raises(repository.GitRefusal) as refusal:
+        tools.execute(repository.GitStage((name,)))
+    assert refusal.value.code == "unproven_conflict_path"
+    (checkout / "tracked.txt").write_text("resolved base and head\n", encoding="utf-8")
+    assert tools.execute(repository.GitStage(("tracked.txt",))).ok
+    assert tools.execute(repository.GitStage((name,))).ok
+    assert tools.execute(repository.GitCommit(("tracked.txt", name), "merge main deletion")).ok
+
+    assert _git(checkout, "log", "-1", "--format=%P").split() == [scope.observed_head_sha, base]
+    assert _git(checkout, "ls-tree", "HEAD", "--", name) == ""
+    assert _git(checkout, "show", "HEAD:tracked.txt") == "resolved base and head"
+    assert _git(checkout, "status", "--porcelain") == ""
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+
+
 def test_project_test_failure_summary_requires_source_inventory(tmp_path: Path) -> None:
     path = tmp_path / "test_sample.py"
     path.write_text("def test_known():\n    assert False\n", encoding="utf-8")
