@@ -568,7 +568,7 @@ async def test_admitted_peer_completion_retrieves_and_reports_failure(
     # Unlike awaiting _run_peer under pytest.raises, wait does not retrieve
     # the exception. Only the production completion callback can do that.
     # Hang guard only; completion speed is not part of the callback contract.
-    done, pending = await asyncio.wait({task}, timeout=5.0)
+    done, pending = await asyncio.wait({task}, timeout=60.0)
     assert done == {task} and not pending
     await asyncio.sleep(0)
     assert not daemon._peers
@@ -671,7 +671,7 @@ async def test_total_shutdown_deadline_never_awaits_stuck_cleanup(
     monkeypatch.setattr("mimir.acp.daemon.ACP_SHUTDOWN_TIMEOUT", 0.01)
     # The patched total deadline drives the assertion; this is only a hang guard.
     with pytest.raises(AcpDaemonError, match="total deadline"):
-        await asyncio.wait_for(daemon.stop(), 5.0)
+        await asyncio.wait_for(daemon.stop(), 60.0)
     release.set()
     await peer_task
     shutil.rmtree(home)
@@ -748,7 +748,7 @@ async def test_postauth_watchdog_terminates_non_draining_peer(
     # Hang guard, not a latency assertion: allow scheduling stalls during teardown.
     with pytest.raises(AcpDaemonError, match="stopped draining"):
         await asyncio.wait_for(
-            daemon._run_peer(asyncio.StreamReader(), writer), 5.0
+            daemon._run_peer(asyncio.StreamReader(), writer), 60.0
         )
     assert authenticated.is_set()
     assert cancelled.is_set()
