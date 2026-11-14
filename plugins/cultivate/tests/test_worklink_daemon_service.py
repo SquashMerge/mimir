@@ -45,12 +45,17 @@ def test_daemon_exec_drops_before_closed_exec(monkeypatch):
                       ("exec", service.PYTHON, service.SUPERVISOR_ARGV, {"PATH": "/usr/bin:/bin"})]
 
 
-def test_daemon_descendant_has_worker_privileges_and_no_drop_mutation_fails():
+@pytest.mark.real_worklink_identities
+def test_daemon_descendant_has_worker_privileges_and_no_drop_mutation_fails(
+    synthetic_worklink_identities,
+):
     """Real kernel/exec inheritance; required (not skipped) in the root CI leg."""
     import shutil
     import subprocess
     from mimir_cultivate.worklink import worker_exec
 
+    # Check the isolation opt-out even where the real UID execution must skip.
+    assert synthetic_worklink_identities is None
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root; covered by required worker-uid root CI leg")
     ids = worker_exec.get_identities()
@@ -91,13 +96,17 @@ service.root_start({{}})
     assert "daemon child privileges verified" not in mutant.stdout
 
 
-def test_daemon_child_output_cleanup_and_private_umask_mutation(tmp_path):
+@pytest.mark.real_worklink_identities
+def test_daemon_child_output_cleanup_and_private_umask_mutation(
+    tmp_path, synthetic_worklink_identities,
+):
     """Distinct real UIDs: 002 output cleans up; restoring 077 must refuse."""
     import pwd
     import shutil
     import subprocess
     import tempfile
 
+    assert synthetic_worklink_identities is None
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root; mandatory in the distinct-identity CI leg")
     from mimir_cultivate.worklink.identities import get_identities
