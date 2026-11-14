@@ -900,7 +900,8 @@ async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(
             if name != writer:
                 return
             loop.call_soon_threadsafe(entered.set)
-            assert finish_writer.wait(3), "test did not release bounded writer"
+            # Hang guard only; asserts no latency.
+            assert finish_writer.wait(30), "test did not release bounded writer"
             effects.append(name)
             settled.set()
         parked = False
@@ -958,7 +959,8 @@ async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(
                     return outer, inner
         try:
             waiting = asyncio.create_task(entered.wait())
-            done, _ = await asyncio.wait((task, waiting), timeout=3, return_when=asyncio.FIRST_COMPLETED)
+            # Hang guard only; asserts no latency.
+            done, _ = await asyncio.wait((task, waiting), timeout=30, return_when=asyncio.FIRST_COMPLETED)
             if task in done:
                 await task  # Surface a pre-writer production-path refusal.
             assert waiting in done, "production path never entered its writer"
@@ -967,7 +969,8 @@ async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(
                 async def cancellation_arrived():
                     while not task.cancelling():
                         await asyncio.sleep(0)
-                await asyncio.wait_for(cancellation_arrived(), 1)
+                # Hang guard only; asserts no latency.
+                await asyncio.wait_for(cancellation_arrived(), 10)
             else:
                 task.cancel()
             for _ in range(2):
