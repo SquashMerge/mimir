@@ -311,8 +311,8 @@ def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> Non
 def test_ci_worker_uid_leg_executes_the_selected_cultivate_identity_tests() -> None:
     """The root real-identity leg must run Cultivate, not skip it to exit 5.
 
-    All four tests importorskip ``mimir_cultivate``; with only core synced they
-    all skip and pytest exits 5. Pin the order: the workspace provider is synced
+    These tests require ``mimir_cultivate``; with only core synced they
+    skip or fail to import instead of exercising the real identities. Pin the order: the workspace provider is synced
     before the tree becomes read-only, selected for the root leg, every selected
     test must have executed, and the whole-suite worker leg is core-only again.
     """
@@ -337,7 +337,7 @@ def test_ci_worker_uid_leg_executes_the_selected_cultivate_identity_tests() -> N
     assert 'MIMIR_PLUGINS="$MIMIR_PLUGINS"' in root["run"]
     assert "--junitxml" in root["run"]
     # The executed-count check, not just the pytest exit status.
-    assert 'len(cases) != 6 or len(ran) != 6' in root["run"]
+    assert 'len(cases) != 7 or len(ran) != 7' in root["run"]
     assert "|| true" not in root["run"]
     for selector in (
         "tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests",
@@ -346,6 +346,7 @@ def test_ci_worker_uid_leg_executes_the_selected_cultivate_identity_tests() -> N
         "tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit",
         "plugins/cultivate/tests/test_worklink_daemon_service.py::test_daemon_descendant_has_worker_privileges_and_no_drop_mutation_fails",
         "plugins/cultivate/tests/test_worklink_daemon_service.py::test_daemon_child_output_cleanup_and_private_umask_mutation",
+        "plugins/cultivate/tests/test_worklink_daemon_service.py::test_spawn_checkout_real_session_path_and_scope_mutation",
     ):
         assert selector in root["run"]
 

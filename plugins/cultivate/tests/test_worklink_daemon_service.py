@@ -230,6 +230,152 @@ print('controller cleanup succeeded')
                 assert result.stdout.strip() == "controller cleanup succeeded"
 
 
+@pytest.mark.real_worklink_identities
+async def test_spawn_checkout_real_session_path_and_scope_mutation(
+    synthetic_worklink_identities, monkeypatch,
+):
+    """Real factory, FD executor, session helper, HTTP and distinct-UID cleanup."""
+    import pwd
+    import subprocess
+    import tempfile
+    import uuid
+    from mimir_cultivate.worklink import worker_exec
+    from tests.test_worklink_remediation_e2e import _ExecutorServer
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+
+    assert synthetic_worklink_identities is None
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("requires Linux root; mandatory in the distinct-identity CI leg")
+    ids = worker_exec.get_identities()
+    controller_gid = pwd.getpwuid(ids.mimir_uid).pw_gid
+    with tempfile.TemporaryDirectory(prefix="spawn-session-") as directory:
+        workspace = Path(directory)
+        workspace.chmod(0o755)
+        os.chown(workspace, ids.mimir_uid, controller_gid)
+        root = workspace / "opencode-checkouts"
+        root.mkdir(mode=0o771)
+        root.chmod(0o771)
+        os.chown(root, ids.mimir_uid, controller_gid)
+        repo = workspace / "base"
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"GH_USER_NAME", "GH_USER_EMAIL"}}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        controller = dict(user=ids.mimir_uid, group=controller_gid,
+                          extra_groups=[ids.worklink_gid], env=env,
+                          capture_output=True, text=True, timeout=60)
+        setup = subprocess.run([sys.executable, "-c", _daemon_cleanup_base_setup(repo)], **controller)
+        assert setup.returncode == 0, setup.stderr
+        daemon_root, run = workspace / "daemon", workspace / "run"
+        for path in (daemon_root, daemon_root / "sessions", run, run / "agent"):
+            path.mkdir(mode=0o700)
+            os.chown(path, ids.worklink_uid, ids.worklink_gid)
+        run.chmod(0o711)
+        paths = service.RuntimePaths(daemon_root, run)
+        generation = str(uuid.uuid4())
+        for path, value, uid, gid in (
+            (paths.snapshot, {"version": 1, "launch_generation": generation,
+                              "bot_token": None, "publishing_identity": None}, ids.mimir_uid, controller_gid),
+            (daemon_root / "launch.json", {"version": 1, "launch_generation": generation,
+                                          "telemetry_state": "off"}, ids.worklink_uid, ids.worklink_gid),
+        ):
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+            os.chown(path, uid, gid)
+        # The controller snapshot is private to mimir, as in the shipped layout.
+        os.chown(run / "agent", ids.mimir_uid, controller_gid)
+        monkeypatch.setattr(service, "RuntimePaths", lambda: paths)
+        monkeypatch.setattr(worker_exec, "OPENCODE_CHECKOUT_ROOT", root)
+        socket_path = workspace / "executor.sock"
+
+        class PayloadDaemon(FakeOpenCodeDaemon):
+            async def _dispatch(self, request, payload):
+                response = await super()._dispatch(request, payload)
+                if request.path.endswith("/prompt"):
+                    sid = request.match_info["sessionID"]
+                    checkout = Path(self.sessions[sid].info["location"]["directory"])
+                    # Synthetic provider only: actual pathname access and kernel
+                    # ownership/umask are exercised by a real worker descendant.
+                    child = subprocess.run(
+                        ["/usr/bin/python3", "-c",
+                         "import os; from pathlib import Path; os.umask(0o002); "
+                         f"p=Path({str(checkout)!r})/'worker-hooks'; p.mkdir(); "
+                         "(p/'pre-commit').write_text('spawn worker output')"],
+                        user=ids.worklink_uid, group=ids.worklink_gid, extra_groups=[],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    assert child.returncode == 0, child.stderr
+                    self.finish(sid)
+                return response
+
+        async with PayloadDaemon() as daemon:
+            paths.api.write_text(json.dumps({"version": 1, "url": daemon.base_url,
+                                             "username": daemon.username, "password": daemon.password}))
+            paths.api.chmod(0o600)
+            os.chown(paths.api, ids.worklink_uid, ids.worklink_gid)
+            shim = workspace / "session-helper"
+            helper = f'''
+from pathlib import Path
+from mimir_cultivate.worklink import daemon_service, daemon_sessions, daemon_config, daemon_health
+paths = daemon_service.RuntimePaths(Path({str(daemon_root)!r}), Path({str(run)!r}))
+daemon_service.RuntimePaths = lambda: paths
+daemon_config.DAEMON_ROOT = {str(daemon_root)!r}
+daemon_health.DAEMON_URL = {daemon.base_url!r}
+raise SystemExit(daemon_sessions.main())
+'''
+            # Replace only the installed native-helper path, retaining the real
+            # privilege drop, session controller and wire operations.
+            shim.write_text(f"#!{sys.executable}\nimport sys\nfrom mimir_cultivate.worklink.daemon_service import exec_worklink\n"
+                            f"exec_worklink(({sys.executable!r}, '-c', {helper!r}), dict(__import__('os').environ), cwd='/')\n")
+            shim.chmod(0o755)
+            monkeypatch.setattr(service, "UID_HELPER", str(shim))
+            script = f'''
+import asyncio, json, os, sys
+from dataclasses import asdict
+from pathlib import Path
+from mimir_cultivate import contained_checkout
+from mimir_cultivate.worklink import checkout, worker_client
+from mimir_cultivate.worklink.backends.base import SessionRequest
+root = Path({str(root)!r})
+contained_checkout.OPENCODE_CHECKOUT_ROOT = root
+checkout._OPENCODE_CHECKOUT_ROOT = root
+issued = contained_checkout.create_opencode_checkout(Path({str(repo)!r}), default_cwd=Path({str(repo)!r}))
+scope = issued.path.parent.parent
+assert scope.stat().st_uid == {ids.mimir_uid}
+assert scope.stat().st_gid == {ids.worklink_gid}
+assert scope.stat().st_mode & 0o777 == 0o710
+if sys.argv[1] == 'mutant':
+    scope.chmod(0o700)
+async def main():
+    client = worker_client.WorkerClient(issued.capability, socket_path=Path({str(socket_path)!r}))
+    response = await client._session_rpc('session_create', {{
+        'generation': {generation!r}, 'request': asdict(SessionRequest('spawn', {{'providerID': 'proof', 'id': 'model'}}, 'build')),
+        'timeout_s': 30, 'pass_env': {{}}, 'git_settings': [],
+    }})
+    handle = client._admission_handle(response, {generation!r})
+    outcome = await client.session_observe(handle)
+    assert outcome.execution_state == 'succeeded', outcome
+    await client.session_cancel(handle)
+    await client.session_release(handle)
+    hooks = issued.path / 'worker-hooks'
+    assert hooks.stat().st_uid == {ids.worklink_uid}
+    assert hooks.stat().st_mode & 0o777 == 0o775
+    assert (hooks / 'pre-commit').read_text() == 'spawn worker output'
+    issued.close()
+    assert not issued.path.parent.exists()
+    print('spawn session and controller cleanup passed')
+asyncio.run(main())
+'''
+            with _ExecutorServer(socket_path, controller_uid=ids.mimir_uid):
+                baseline = await asyncio.to_thread(subprocess.run, [sys.executable, "-c", script, "baseline"], **controller)
+                assert baseline.returncode == 0, baseline.stderr
+                assert baseline.stdout.strip() == "spawn session and controller cleanup passed"
+                assert len(daemon.sessions) == 1
+                mutant = await asyncio.to_thread(subprocess.run, [sys.executable, "-c", script, "mutant"], **controller)
+                assert mutant.returncode != 0, "controller-only scope mutation survived"
+                assert "session executor operation failed" in mutant.stderr, mutant.stderr
+                assert len(daemon.sessions) == 1, "mutation unexpectedly reached session creation"
+
+
 def test_disabled_service_execs_pause_without_preparation(monkeypatch):
     calls = []
     monkeypatch.setattr(service.os, "getuid", lambda: 0)
