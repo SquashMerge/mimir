@@ -55,6 +55,12 @@ def test_native_local_state_matrix_read_only(tmp_path, updates, expected):
     assert "synthetic" not in repr(result)
 
 
+@pytest.mark.parametrize("method", ["chatgpt-browser", "chatgpt-headless", "unknown"])
+def test_native_health_accepts_only_supported_codex_methods(method):
+    result = health.classify_native(json.dumps(native(methodID=method)), method, now=NOW)
+    assert result.state == ("malformed" if method == "unknown" else "locally_unexpired")
+
+
 @pytest.mark.parametrize(("rows", "expected"), [
     ([], "missing"), ([("{}", "chatgpt-headless", 0)], "inactive"),
     ([("{}", "browser", 1)], "malformed"),
