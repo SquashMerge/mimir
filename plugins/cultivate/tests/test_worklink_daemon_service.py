@@ -360,6 +360,27 @@ async def main():
     assert hooks.stat().st_uid == {ids.worklink_uid}
     assert hooks.stat().st_mode & 0o777 == 0o775
     assert (hooks / 'pre-commit').read_text() == 'spawn worker output'
+    # The real executor has transferred ownership, but shared modes permit the
+    # distinct controller to update Git's index/objects and extract a proposal.
+    assert issued.path.stat().st_uid == {ids.worklink_uid}
+    assert (issued.path / '.git').stat().st_uid == {ids.worklink_uid}
+    from mimir_cultivate import opencode
+    if sys.argv[1] == 'proposal-mutant':
+        import subprocess
+        original_popen = subprocess.Popen
+        def remove_execution_trust(command, *args, **kwargs):
+            if 'config' not in command:
+                command = list(command)
+                index = command.index('safe.directory=' + str(issued.path))
+                assert command[index - 1] == '-c'
+                del command[index - 1:index + 1]
+            return original_popen(command, *args, **kwargs)
+        subprocess.Popen = remove_execution_trust
+    proposal = opencode.build_opencode_proposal(
+        issued.path, scrubber=opencode.SensitiveMaterialScrubber(home=Path({str(workspace)!r}) / 'home'))
+    assert proposal.reason_code == 'proposal_created', proposal
+    import base64
+    assert b'spawn worker output' in base64.b64decode(proposal.proposal.patch)
     issued.close()
     assert not issued.path.parent.exists()
     print('spawn session and controller cleanup passed')
@@ -374,6 +395,12 @@ asyncio.run(main())
                 assert mutant.returncode != 0, "controller-only scope mutation survived"
                 assert "session executor operation failed" in mutant.stderr, mutant.stderr
                 assert len(daemon.sessions) == 1, "mutation unexpectedly reached session creation"
+                proposal_mutant = await asyncio.to_thread(
+                    subprocess.run, [sys.executable, "-c", script, "proposal-mutant"], **controller)
+                assert proposal_mutant.returncode != 0, "missing exact-path trust mutation survived"
+                assert "dubious ownership" in proposal_mutant.stderr, proposal_mutant.stderr
+                assert "proposal_unavailable" in proposal_mutant.stderr
+                assert len(daemon.sessions) == 2, "proposal mutation must reach successful session execution"
 
 
 def test_disabled_service_execs_pause_without_preparation(monkeypatch):
