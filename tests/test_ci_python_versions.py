@@ -97,6 +97,25 @@ def test_ci_python_versions_match_package(job_name: str) -> None:
             assert "--durations=25" in suite["run"]
 
 
+def test_macos_provisions_real_timeout_before_lease_tests() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    job = workflow["jobs"]["pytest-macos"]
+    assert job["runs-on"] == "macos-latest"
+    steps = job["steps"]
+    provision = next(
+        step for step in steps
+        if step.get("name") == "Install GNU timeout for heavy-run lease tests"
+    )
+    suite = next(step for step in steps if step.get("name") == "Run mimir test suite")
+    assert steps.index(provision) < steps.index(suite)
+    assert "if" not in provision
+    assert not provision.get("continue-on-error", False)
+    assert [shlex.split(line) for line in provision["run"].splitlines() if line.strip()] == [
+        ["brew", "install", "coreutils"],
+        ["gtimeout", "--version"],
+    ]
+
+
 @pytest.mark.parametrize(
     "requires_python, versions",
     [
