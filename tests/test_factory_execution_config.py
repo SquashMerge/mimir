@@ -123,7 +123,12 @@ async def test_retained_factory_control_uses_worker_without_runtime_refresh(tmp_
         os.write(kwargs["stdout_sink"].fd, b"retained-status")
         async def wait():
             return 0
-        return SimpleNamespace(wait=wait, timed_out=False, output_overflow=False)
+
+        return SimpleNamespace(
+            wait=wait, timed_out=False, output_overflow=False,
+            stdout_bytes=len(b"retained-status"), stderr_bytes=0,
+        )
+
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
     result = worker_client.run_factory_control(checkout / ".factory-sandboxes/run", ["node", "factory.js", "status"],
         env={"HOME": "/controller", "PATH": "/usr/bin:/bin"})
@@ -145,8 +150,9 @@ def test_factory_control_rejects_incomplete_results(tmp_path, monkeypatch, failu
                                stdout_bytes=1024 * 1024 + 1, stderr_bytes=0)
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
     expected = subprocess.TimeoutExpired if failure == "timed_out" else RuntimeError
-    with pytest.raises(expected):
+    with pytest.raises(expected) as error:
         worker_client.run_factory_control(tmp_path / "repo/41-2/checkout", ["node", "status"], env={})
+    assert error.value.quiescent is True
 
 
 def test_factory_control_socket_uses_its_bound(monkeypatch):
@@ -280,7 +286,8 @@ def test_initial_factory_control_selects_private_transfer_only_for_bound_init(tm
         assert kwargs["argv"] == ["node", str(launcher), "init", "chainlink-41", "--repo", str(outer)]
         async def wait():
             return 0
-        return SimpleNamespace(wait=wait, timed_out=False, output_overflow=False)
+        return SimpleNamespace(wait=wait, timed_out=False, output_overflow=False,
+                               stdout_bytes=0, stderr_bytes=0)
     monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
     argv = ["node", str(launcher), "init", "chainlink-41", "--repo", str(outer)]
     worker_client.run_factory_control(outer, argv, env={}, initialize=True)

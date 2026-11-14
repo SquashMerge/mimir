@@ -223,7 +223,7 @@ def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(name: 
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
-    expected_protocol = "worklink-executor-v14-exited-worker-cancel"
+    expected_protocol = "worklink-executor-v16-opencode-daemon-bounded-control-output"
     assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_exec.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_client.MAX_REQUEST_BYTES == worker_exec.MAX_REQUEST_BYTES == 256 * 1024
@@ -352,9 +352,11 @@ async def test_executor_identity_requires_matching_independent_root(
     assert "align WORKLINK_CHECKOUT_ROOT" in str(mismatch.value)
     assert "rebuild" not in str(mismatch.value)
     # A stale protocol still gets the image-rebuild remedy, even if roots differ.
-    response["executor_identity"] = "old-protocol"
-    with pytest.raises(worker_client.StaleWorkerExecutorError, match="rebuild the image"):
-        await worker_client.verify_executor_identity()
+    for old_identity in ("old-protocol", "worklink-executor-v14-exited-worker-cancel",
+                         "worklink-executor-v15-bounded-control-output"):
+        response["executor_identity"] = old_identity
+        with pytest.raises(worker_client.StaleWorkerExecutorError, match="rebuild the image"):
+            await worker_client.verify_executor_identity()
     response["executor_identity"] = worker_exec.EXECUTOR_PROTOCOL_IDENTITY
     del response["checkout_root"]
     with pytest.raises(worker_client.StaleWorkerExecutorError, match="rebuild the image"):

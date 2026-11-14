@@ -1454,11 +1454,16 @@ def test_repo_test_execution_copy_is_fd_sourced_for_checkout_local_runner(
     assert stat.S_IMODE(copied_runner.stat().st_mode) & 0o007 == 0
 
 
-def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
+@pytest.mark.parametrize("identity", [
+    "stale-controller-protocol",
+    "worklink-executor-v14-exited-worker-cancel",
+    "worklink-executor-v15-bounded-control-output",
+])
+def test_executor_rejects_mismatched_launch_protocol_identity(identity) -> None:
     request = {
         "version": 1,
         "op": "launch",
-        "executor_identity": "stale-controller-protocol",
+        "executor_identity": identity,
         "id": str(uuid.uuid4()),
         "issue": 41,
         "attempt": 2,
@@ -2494,7 +2499,7 @@ def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory
     def spawn(command, **kwargs):
         kwargs["preexec_fn"]()
         drop.assert_called_once_with(kwargs["pass_fds"][0])
-        return SimpleNamespace(pid=123)
+        return SimpleNamespace(pid=123, stdout=open(os.devnull, "rb"), stderr=open(os.devnull, "rb"))
 
     def wait(proc, *args):
         proc.done.set()
@@ -2509,6 +2514,139 @@ def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory
         finally:
             if len(fds) == 3:
                 os.close(fds[0])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux factory supervisor")
+@pytest.mark.parametrize("limit,size", [(1, 0), (1, 1), (1, 100), (63, 62), (63, 63), (63, 64), (64, 1_000_123)])
+def test_factory_control_keeps_bounded_head_tail_and_exact_counts(tmp_path, monkeypatch, limit, size):
+    from mimir_cultivate.worklink import worker_client
+    from tests.worklink_control_helpers import install_local_control_executor
+
+    install_local_control_executor(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (tmp_path, 41, 2))
+    drain = worker_exec._ControlOutput.drain
+    samples = []
+
+    def bounded(self, **kwargs):
+        drain(self, **kwargs)
+        samples.append(os.fstat(self.fd).st_size)
+        assert samples[-1] <= limit
+
+    monkeypatch.setattr(worker_exec._ControlOutput, "drain", bounded)
+    payload = f"import os; data=(bytes(range(256))*({size}//256+1))[:{size}]; os.write(1,data); os.write(2,data[::-1])"
+    result = worker_client.run_factory_control(
+        tmp_path, [sys.executable, "-c", payload], env={}, output_limit=limit,
+        allow_output_truncation=True,
+    )
+    assert result.returncode == 0
+    assert result.output_truncated is (size > limit)
+    assert (result.stdout_bytes, result.stderr_bytes) == (size, size)
+    data = (bytes(range(256)) * (size // 256 + 1))[:size]
+    head = (limit + 1) // 2
+    tail = limit - head
+    for actual, full in ((result.stdout, data), (result.stderr, data[::-1])):
+        assert actual == (full if size <= limit else full[:head] + (full[-tail:] if tail else b""))
+        assert len(actual) <= limit
+    assert samples
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux factory supervisor")
+@pytest.mark.parametrize("size", [10, 1_000_123])
+def test_initial_factory_control_uses_bounded_capture(tmp_path, monkeypatch, size):
+    from mimir_cultivate.worklink import worker_client
+    from tests.opencode_fixtures import seed_factory_install
+    from tests.worklink_control_helpers import install_local_control_executor
+
+    calls = install_local_control_executor(monkeypatch, tmp_path)
+    root = tmp_path / "checkouts"
+    checkout = root / "repo/41-2/checkout"
+    checkout.mkdir(parents=True)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    launcher = seed_factory_install(tmp_path / "installed")
+    # A fixture-owned node stand-in executes the bound init argv and emits more
+    # than the capture limit. No ambient Node/factory install is required.
+    node = tmp_path / "node"
+    node.write_text(f"#!{sys.executable}\nimport os\nos.write(1, b'x'*{size})\nos.write(2, b'y'*{size})\n")
+    node.chmod(0o755)
+    argv = ["node", str(launcher), "init", "chainlink-41", "--repo", str(checkout)]
+    drain = worker_exec._ControlOutput.drain
+    samples = []
+
+    def bounded(self, **kwargs):
+        drain(self, **kwargs)
+        samples.append(os.fstat(self.fd).st_size)
+        assert samples[-1] <= 64
+
+    monkeypatch.setattr(worker_exec._ControlOutput, "drain", bounded)
+    kwargs = dict(env={"PATH": str(tmp_path)}, output_limit=64, initialize=True)
+    if size > 64:
+        with pytest.raises(RuntimeError, match="exceeded 64 bytes") as error:
+            worker_client.run_factory_control(checkout, argv, **kwargs)
+        assert error.value.quiescent is True
+    else:
+        result = worker_client.run_factory_control(checkout, argv, **kwargs)
+        assert isinstance(result, worker_client.FactoryControlResult)
+        assert (result.stdout, result.stderr) == (b"x" * size, b"y" * size)
+        assert (result.stdout_bytes, result.stderr_bytes) == (size, size)
+        assert result.output_truncated is False
+    assert samples
+    assert calls[-1]["exit_code"] == 0 and calls[-1]["timed_out"] is False
+    assert calls[-1]["output_overflow"] is (size > 64)
+    assert (calls[-1]["stdout_bytes"], calls[-1]["stderr_bytes"]) == (size, size)
+
+
+@pytest.mark.parametrize("operation,value", [
+    ("launch_factory", False), ("launch_factory", 1),
+    ("launch_factory_control", True), ("launch_path", True),
+])
+def test_init_capture_flag_requires_exact_factory_launch_contract(operation, value):
+    request = dict.fromkeys(worker_exec._PATH_LAUNCH_FIELDS)
+    request.update(op=operation, control_output=value)
+    with pytest.raises(RuntimeError, match="exact contract"):
+        worker_exec._handle_launch(object(), request, [-1, -1])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux factory supervisor")
+def test_factory_control_rejects_truncated_structured_output_by_default(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import worker_client
+    from tests.worklink_control_helpers import install_local_control_executor
+
+    install_local_control_executor(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (tmp_path, 41, 2))
+    with pytest.raises(RuntimeError, match="exceeded 16 bytes"):
+        worker_client.run_factory_control(
+            tmp_path, [sys.executable, "-c", "print('x'*100)"], env={}, output_limit=16,
+        )
+
+
+def test_factory_control_capture_refuses_incomplete_cleanup(tmp_path):
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(read_fd, "rb") as source, (tmp_path / "capture").open("w+b") as output:
+            capture = worker_exec._ControlOutput(source, output.fileno(), 64)
+            with pytest.raises(RuntimeError, match="remained open after cleanup"):
+                capture.finish()
+    finally:
+        os.close(write_fd)
+
+
+def test_factory_control_capture_refuses_incomplete_write(tmp_path, monkeypatch):
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(read_fd, "rb") as source, (tmp_path / "capture").open("w+b") as output:
+            capture = worker_exec._ControlOutput(source, output.fileno(), 64)
+            pwrite = os.pwrite
+            calls = []
+
+            def short_write(fd, data, offset):
+                calls.append(offset)
+                return 0 if len(calls) == 1 else pwrite(fd, data, offset)
+
+            monkeypatch.setattr(os, "pwrite", short_write)
+            with pytest.raises(OSError, match="incomplete factory control output write"):
+                capture._write(b"sample", 0)
+    finally:
+        os.close(write_fd)
 
 
 def test_factory_file_child_write_edit_and_escape_guards(tmp_path: Path, monkeypatch) -> None:

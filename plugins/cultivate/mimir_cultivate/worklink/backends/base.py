@@ -136,6 +136,9 @@ class ComputeResult:
     children_reaped: bool = False
     session_outcome: SessionOutcome | None = None
     session_error: SessionError | None = None
+    output_truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
 
 class ComputeLaunchError(RuntimeError):

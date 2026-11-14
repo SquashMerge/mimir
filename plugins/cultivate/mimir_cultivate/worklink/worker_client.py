@@ -31,7 +31,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v14-exited-worker-cancel"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v16-opencode-daemon-bounded-control-output"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -79,12 +79,23 @@ def factory_checkout_for_path(path: Path) -> tuple[Path, int, int] | None:
     return root.joinpath(*parts[:3]), int(match[1]), int(match[2])
 
 
+class FactoryControlResult(subprocess.CompletedProcess[bytes]):
+    output_truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+
+
 def run_factory_control(
     checkout: Path, argv: Sequence[str], *, env: Mapping[str, str],
     timeout: float = 30, output_limit: int = 1024 * 1024,
     initialize: bool = False,
-) -> subprocess.CompletedProcess[bytes]:
-    """Run retained-tree operations as its owner, without refreshing runtime auth."""
+    allow_output_truncation: bool = False,
+) -> FactoryControlResult:
+    """Run retained-tree operations as its owner, without refreshing runtime auth.
+
+    Capture is always bounded by the executor. Gates may accept head/tail output;
+    structured control responses must remain complete and fail on truncation.
+    """
     binding = factory_checkout_for_path(checkout)
     if binding is None:
         raise ValueError("factory control requires an inner checkout")
@@ -111,9 +122,10 @@ def run_factory_control(
             raise ValueError("initial factory control requires the trusted output projector")
         resolve_factory_entrypoint(entrypoint)
 
-    async def run() -> subprocess.CompletedProcess[bytes]:
+    async def run() -> FactoryControlResult:
         client = WorkerClient.for_factory_checkout(root, issue_id=issue, attempt=attempt)
         client._launch_op = "launch_factory" if initialize else "launch_factory_control"
+        client._bounded_control_output = initialize
         client._socket_timeout_s = timeout + CANCEL_SOCKET_TIMEOUT_S
         stdout, stderr = open_output_pair(None, output_limit, None, output_limit)
         try:
@@ -128,7 +140,7 @@ def run_factory_control(
                 error = subprocess.TimeoutExpired(argv, timeout)
                 error.quiescent = True
                 raise error
-            if process.output_overflow:
+            if process.output_overflow and not allow_output_truncation:
                 command = _factory_control_name(argv)
                 observed = max(process.stdout_bytes, process.stderr_bytes)
                 stream = "stdout" if process.stdout_bytes > output_limit else "stderr"
@@ -143,9 +155,13 @@ def run_factory_control(
                 error = RuntimeError(reason)
                 error.quiescent = True
                 raise error
-            return subprocess.CompletedProcess(
+            result = FactoryControlResult(
                 argv, code, stdout.read_bounded()[0], stderr.read_bounded()[0],
             )
+            result.output_truncated = process.output_overflow
+            result.stdout_bytes = process.stdout_bytes
+            result.stderr_bytes = process.stderr_bytes
+            return result
         finally:
             stdout.close()
             stderr.close()
@@ -609,6 +625,8 @@ class WorkerClient:
             "stdout_limit": stdout_sink.limit if stdout_sink is not None else 1,
             "stderr_limit": stderr_sink.limit if stderr_sink is not None else 1,
         }
+        if getattr(self, "_bounded_control_output", False):
+            request["control_output"] = True
         if path_addressed:
             request.update({
                 "path": str(self.path_checkout),
