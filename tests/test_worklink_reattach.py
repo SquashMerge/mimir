@@ -1156,6 +1156,7 @@ def test_run_persists_state_for_persistent_compute_then_clears(tmp_path: Path) -
     be added."""
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / ".git").mkdir()
     issue_id = 441
     calls: list = []
     runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
@@ -1202,6 +1203,7 @@ def test_run_persists_state_for_persistent_compute_then_clears(tmp_path: Path) -
 def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / ".git").mkdir()
     issue_id = 442
     calls: list = []
 

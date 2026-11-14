@@ -29,6 +29,11 @@ _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _AUTHORIZATION_FACTORY = object()
 _DIRTY_PATH_SAMPLE_LIMIT = 20
+_WRITABLE_PATH_SAMPLE_LIMIT = 5
+BASE_PERMISSIONS_REMEDIATION = (
+    '(cd "$WORKLINK_REPO" && { git ls-files -z; find .git -print0; } | '
+    'xargs -0 -r sh -c \'for p do [ -L "$p" ] || chmod go-w -- "$p" || exit; done\' sh)'
+)
 
 
 def _cultivate_selected() -> bool:
@@ -737,6 +742,7 @@ def _prepare_fresh_base(
     if not base_fetch:
         raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
     _assert_base_repo_clean(repo, runner=runner, event_logger=event_logger)
+    assert_base_repo_not_worker_writable(repo, runner=runner, event_logger=event_logger)
     _repair_base_alternates(repo, base=base, runner=runner, event_logger=event_logger)
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
         raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
@@ -858,6 +864,74 @@ def _assert_base_repo_clean(
         detail=f"{dirty_count} dirty path(s); {detail}",
         **payload,
     )
+
+
+def assert_base_repo_not_worker_writable(
+    repo: Path,
+    *,
+    runner: Runner = _default_runner,
+    event_logger: EventLogger | None = None,
+) -> None:
+    """Inspect tracked paths and Git metadata, never ignored/untracked worktree data.
+
+    Use the worker's identity, not os.access() as the controller (or root).
+    Ownership alone is unsafe: an owner can chmod a read-only entry back to writable.
+    """
+    try:
+        tracked = runner(["git", "-C", str(repo), "ls-files", "-z"])
+        if tracked.returncode != 0:
+            raise ValueError((tracked.stderr or tracked.stdout).strip() or "git ls-files failed")
+        identities = get_identities()
+        groups = set(os.getgrouplist("worklink", identities.worklink_gid))
+        paths = {repo / name for name in tracked.stdout.split("\0") if name}
+        dot_git = repo / ".git"
+        # A linked base worktree has a .git marker and a separate common store.
+        git_dirs = [dot_git]
+        if dot_git.is_file():
+            marker = dot_git.read_text().strip()
+            # The successful Git listing above already validated this marker.
+            git_dir = (repo / marker.removeprefix("gitdir:").strip()).resolve()
+            git_dirs.append(git_dir)
+            common = git_dir / "commondir"
+            if common.exists():
+                git_dirs.append((git_dir / common.read_text().strip()).resolve())
+
+        def walk_error(exc: OSError) -> None:
+            raise exc
+
+        for git_dir in git_dirs:
+            paths.add(git_dir)
+            if git_dir.is_dir():
+                for root, dirs, files in os.walk(git_dir, onerror=walk_error):
+                    paths.update(Path(root) / name for name in dirs + files)
+        writable: list[str] = []
+        for path in sorted(paths):
+            metadata = path.lstat()
+            # Symlink mode bits are not access permissions on POSIX. Their
+            # containing Git directory is checked, as is their ownership.
+            mode = 0 if stat.S_ISLNK(metadata.st_mode) else metadata.st_mode
+            if (
+                metadata.st_uid == identities.worklink_uid
+                or mode & stat.S_IWOTH
+                or (mode & stat.S_IWGRP and metadata.st_gid in groups)
+            ):
+                writable.append(os.path.relpath(path, repo))
+    except (OSError, RuntimeError, ValueError) as exc:
+        _refuse_base_repo(
+            repo, event_logger, reason="permissions_check_failed", detail=str(exc),
+        )
+    if writable:
+        examples = writable[:_WRITABLE_PATH_SAMPLE_LIMIT]
+        _refuse_base_repo(
+            repo, event_logger, reason="worker_writable",
+            detail=(
+                f"{len(writable)} worker-writable path(s): {', '.join(map(repr, examples))}; "
+                "operator: restore controller ownership for worker-owned paths, then "
+                f"strip group/other write bits as the base owner: {BASE_PERMISSIONS_REMEDIATION}"
+            ),
+            writable_count=len(writable), writable_paths=examples,
+            sample_limit=_WRITABLE_PATH_SAMPLE_LIMIT,
+        )
 
 
 def _refuse_base_repo(

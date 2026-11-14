@@ -23,6 +23,16 @@ from mimir_cultivate.policy import RetainedFactoryScope
 from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir
 
 
+@pytest.fixture
+def controller_umask():
+    """Model controller startup for tests that call checkout creation directly."""
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
 def test_checkout_capability_requires_issued_directory(tmp_path: Path) -> None:
     issued = tmp_path / "checkout"
     issued.mkdir()
@@ -86,7 +96,7 @@ def test_selected_checkout_path_and_pruning_ignore_legacy_flag(
 
 
 def test_selected_worker_leaf_checkout_is_path_addressed_like_base(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controller_umask,
 ) -> None:
     """Leaf builds keep base's model: a worker-traversable path checkout.
 
@@ -100,7 +110,7 @@ def test_selected_worker_leaf_checkout_is_path_addressed_like_base(
     root = tmp_path / "worker-checkouts"
     monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
     monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(
-        mimir_uid=os.getuid(), worklink_gid=os.getgid(),
+        mimir_uid=os.getuid(), worklink_gid=os.getgid(), worklink_uid=os.getuid() + 1,
     ))
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -143,7 +153,7 @@ def test_selected_worker_leaf_checkout_is_path_addressed_like_base(
 
 
 def test_selected_worker_checkout_refuses_replaced_checkout_symlink(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controller_umask,
 ) -> None:
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
@@ -151,7 +161,7 @@ def test_selected_worker_checkout_refuses_replaced_checkout_symlink(
     root = tmp_path / "worker-checkouts"
     monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
     monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(
-        mimir_uid=os.getuid(), worklink_gid=os.getgid(),
+        mimir_uid=os.getuid(), worklink_gid=os.getgid(), worklink_uid=os.getuid() + 1,
     ))
     repo = tmp_path / "repo"
     repo.mkdir()

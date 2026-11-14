@@ -1160,6 +1160,7 @@ def test_drop_worker_uses_irreversible_identity_sequence(
     assert ("groups", []) in events
     assert ("gid", (worker_gid, worker_gid, worker_gid)) in events
     assert ("uid", (worker_uid, worker_uid, worker_uid)) in events
+    assert ("umask", 0o022) in events
     assert events.index(("groups", [])) < events.index(
         ("gid", (worker_gid, worker_gid, worker_gid))
     )
@@ -1168,6 +1169,15 @@ def test_drop_worker_uses_irreversible_identity_sequence(
     )
     assert events[-1] == ("verify",)
     assert events.count(("caps", set())) == 1
+
+
+def test_daemon_sets_umask_before_initialization(monkeypatch) -> None:
+    masks = []
+    monkeypatch.setattr(worker_exec.os, "umask", masks.append)
+    monkeypatch.delattr(worker_exec.socket, "SO_PEERCRED", raising=False)
+    with pytest.raises(RuntimeError, match="requires Linux SO_PEERCRED"):
+        worker_exec.serve()
+    assert masks == [0o022]
 
 
 def test_worker_identity_verifier_rejects_any_retained_authority(

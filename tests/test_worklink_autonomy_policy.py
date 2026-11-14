@@ -98,6 +98,7 @@ def _run(
 ):
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
+    (repo / ".git").mkdir(exist_ok=True)
     # The gate reads the safety opt-in from the authoritative worklink.yaml.
     # Fake compute selection remains an in-memory registry extension; file-backed
     # config intentionally rejects backend names unavailable in shipped code.

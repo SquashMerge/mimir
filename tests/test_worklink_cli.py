@@ -992,6 +992,7 @@ def test_cli_owned_inner_interruption_does_not_fallback_record(
     home.mkdir()
     repo.mkdir()
     issue_id = 700 if kind == "factory" else 441
+    (repo / ".git").mkdir()
     labels = ["worklink", "worklink:epic", "worklink:ready"] if kind == "factory" else [
         "worklink",
         "worklink:ready",

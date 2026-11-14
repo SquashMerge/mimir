@@ -220,6 +220,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         "publishing_identity": "factory-owner", "bootstrap": "uv sync",
     }))
     gate_command = "uv run python -c 'print(1949)'"
+    (repo / ".git").mkdir()
     # Pin the opencode model/auth inputs work_spec resolves, as the core factory
     # tests do; otherwise the launch reads the host's ~/.local/share/opencode and
     # fails with feature_factory_opencode_resolution_failed:auth_missing anywhere
@@ -417,6 +418,8 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
             assert args[3:] == ["https://github.com/owner/repository/pull/42", "--json", "headRefOid"]
             return subprocess.CompletedProcess(args, 0, json.dumps({"headRefOid": heads[0]}), "")
         if isinstance(args, list) and args[:3] == ["git", "-C", str(repo)]:
+            if args[3:] == ["ls-files", "-z"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
             return subprocess.CompletedProcess(args, 0, "git@github.com:owner/repository.git\n", "")
         if isinstance(args, list) and args[:3] == ["git", "-C", str(checkout)]:
             if args[3:5] == ["config", "--get"]:

@@ -204,7 +204,7 @@ def assemble_services(candidates: tuple[PluginCandidate, ...], destination: Path
         # Same identity contract as deploy/s6-overlay run scripts (#2004): s6-setuidgid
         # keeps the supervisor environment, so set the dropped user's identity explicitly.
         wrapper.write_text(
-            "#!/bin/sh\nexec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir "
+            "#!/bin/sh\numask 022\nexec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir "
             f"/usr/local/libexec/mimir-plugin-services/{service.plugin}/{service.name}/run\n"
         )
         wrapper.chmod(0o755)

@@ -82,7 +82,10 @@ from .run_state import (
     run_state_path,
     save_run_state,
 )
-from .checkout import CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout
+from .checkout import (
+    CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout,
+    assert_base_repo_not_worker_writable,
+)
 from .worker_client import worklink_checkout_root
 from mimir.redaction import redact_text
 from mimir.otel_credentials import filter_otlp_env
@@ -1219,6 +1222,11 @@ class WorklinkRunner:
                     compute_backend=compute.name,
                 )
                 return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
+
+        try:
+            assert_base_repo_not_worker_writable(self.repo, runner=runner, event_logger=_log_event)
+        except RuntimeError as exc:
+            return WorklinkRunResult(issue.issue_id, None, "refused", reason=str(exc))
 
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
@@ -2914,6 +2922,10 @@ class WorklinkRunner:
                     reason=reason,
                 )
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
+        try:
+            assert_base_repo_not_worker_writable(self.repo, runner=runner, event_logger=_log_event)
+        except RuntimeError as exc:
+            return WorklinkRunResult(issue_id, None, "refused", reason=str(exc))
         launcher = selected.admit()
         inventory = RepositoryInventory.load(self.home / "repositories.yaml")
         repository_config = inventory.repository(repo_slug) if inventory.declared else None
@@ -5616,6 +5628,7 @@ def run_worklink(
     base_branch: str | None = None,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
+    os.umask(0o022)
     from .dispatch_failures import (
         current_failure_identity,
         dispatch_failure_state_dir,
@@ -5785,6 +5798,7 @@ def run_worklink_reattach(
     *, home: Path, repo: Path, issue_id: int, autonomous: bool = False
 ) -> WorklinkRunResult:
     """Resume one in-flight run after a controller restart (#561)."""
+    os.umask(0o022)
     from .dispatch_failures import (
         current_failure_identity,
         dispatch_failure_state_dir,
@@ -5853,6 +5867,7 @@ def run_worklink_epic(
     expected_recovery: FactoryRecoveryIdentity | None = None,
 ) -> WorklinkRunResult:
     """Run and publish one complete factory lifecycle under both leases."""
+    os.umask(0o022)
     with factory_checkout_interlock(home) as checkout_acquired:
         if not checkout_acquired:
             return WorklinkRunResult(
