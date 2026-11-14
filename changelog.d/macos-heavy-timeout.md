@@ -1,1 +1,0 @@
-- Install GNU coreutils in macOS CI so heavy-run lease, timeout, and signal tests run with their required real timeout tool instead of failing during wrapper startup.
