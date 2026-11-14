@@ -32,7 +32,7 @@ _DIRTY_PATH_SAMPLE_LIMIT = 20
 _WRITABLE_PATH_SAMPLE_LIMIT = 5
 BASE_PERMISSIONS_REMEDIATION = (
     '(cd "$WORKLINK_REPO" && { git ls-files -z; find .git -print0; } | '
-    'xargs -0 -r sh -c \'for p do [ -L "$p" ] || chmod go-w -- "$p" || exit; done\' sh)'
+    'xargs -0 -r sh -c \'for p do [ -L "$p" ] || chmod go-w "./$p" || exit; done\' sh)'
 )
 
 

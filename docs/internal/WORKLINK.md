@@ -512,7 +512,7 @@ Per-issue flow (one `run`):
    `WORKLINK_REPO` set to that base clone, strip group/other write bits in one line:
 
    ```sh
-   (cd "$WORKLINK_REPO" && { git ls-files -z; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w -- "$p" || exit; done' sh)
+   (cd "$WORKLINK_REPO" && { git ls-files -z; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w "./$p" || exit; done' sh)
    ```
 
    This preserves executable bits and leaves untracked/ignored worktree paths

@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 import errno
 import inspect
 import os
+import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -383,7 +385,26 @@ def test_base_permission_inspection_fails_closed(
         checkout_module.assert_base_repo_not_worker_writable(repo, runner=runner)
 
 
-def test_base_permissions_remediation_leaves_ignored_data_untouched(tmp_path: Path) -> None:
+@pytest.mark.parametrize("portable_chmod", [False, True])
+def test_base_permissions_remediation_leaves_ignored_data_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portable_chmod: bool,
+) -> None:
+    if portable_chmod:
+        # Model BSD chmod's missing '--' support even on GNU hosts, but still
+        # execute the real chmod to verify modes and symlink-target preservation.
+        real_chmod = shutil.which("chmod")
+        assert real_chmod is not None
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        wrapper = bin_dir / "chmod"
+        wrapper.write_text(
+            '#!/bin/sh\n'
+            '[ "$#" -eq 2 ] && [ "$1" = go-w ] || exit 2\n'
+            'case "$2" in ./*) ;; *) exit 2 ;; esac\n'
+            f'exec {shlex.quote(real_chmod)} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     repo = _repo_with_main(tmp_path)
     _git(repo, "config", "core.filemode", "false")
     (repo / "shared.txt").chmod(0o666)
@@ -394,13 +415,19 @@ def test_base_permissions_remediation_leaves_ignored_data_untouched(tmp_path: Pa
     ignored.write_text("ignored\n")
     ignored.chmod(0o666)
     (repo / "tracked-link").symlink_to(".venv/python")
-    _git(repo, "add", "tracked-link")
-    _git(repo, "commit", "-qm", "track a symlink to ignored data")
+    executable = repo / "-executable script\nname"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    _git(repo, "add", "--", "tracked-link", executable.name)
+    _git(repo, "commit", "-qm", "track a symlink and an option-like executable path")
+    executable.chmod(0o777)
     exclude = repo / ".git/info/exclude"
     exclude.write_text(exclude.read_text() + "\n.venv/\n")
     subprocess.run(["sh", "-c", checkout_module.BASE_PERMISSIONS_REMEDIATION],
                    env={**os.environ, "WORKLINK_REPO": str(repo)}, check=True)
     assert stat.S_IMODE(ignored.stat().st_mode) == 0o666
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o755
+    docs = Path(__file__).resolve().parents[1] / "docs/internal/WORKLINK.md"
+    assert checkout_module.BASE_PERMISSIONS_REMEDIATION in docs.read_text()
     assert stat.S_IMODE((repo / "shared.txt").stat().st_mode) == 0o644
     assert stat.S_IMODE((repo / ".git/HEAD").stat().st_mode) == 0o644
     assert stat.S_IMODE((repo / ".git/refs").stat().st_mode) == 0o755
