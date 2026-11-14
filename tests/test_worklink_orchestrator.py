@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import multiprocessing
 from contextlib import nullcontext
@@ -81,6 +83,7 @@ from mimir_cultivate.worklink.orchestrator import (
     render_work_order,
     run_worklink,
     run_worklink_epic,
+    run_worklink_reattach,
     validate_leaf,
 )
 
@@ -614,6 +617,10 @@ def cp(
     stdout: str | bytes = "",
     stderr: str | bytes = "",
 ) -> subprocess.CompletedProcess:
+    if (isinstance(args, list) and args[:2] == ["git", "-C"]
+            and args[3:] == ["ls-files", "-z"] and returncode == 0):
+        # A successful fake Git listing also supplies inspectable base metadata.
+        (Path(args[2]) / ".git").mkdir(parents=True, exist_ok=True)
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
 
 
@@ -1956,6 +1963,39 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert "worklink_evidence" in body
     assert "worklink_transition" in body
     _reset_logger_for_tests()
+
+
+@pytest.mark.parametrize("factory", [False, True])
+def test_worker_writable_base_refuses_before_claim(tmp_path: Path, factory: bool) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git/HEAD").write_text("ref: refs/heads/main\n")
+    (repo / ".git/HEAD").chmod(0o666)
+    worktree = tmp_path / ".worklink/repo/441-1"
+    issue_json = ISSUE_JSON.replace('"worklink:ready"', '"worklink:ready", "worklink:epic"') if factory else ISSUE_JSON
+    calls, runner = _orchestrator_runner(repo, worktree, issue_json=issue_json)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    worker = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+    result = asyncio.run(worker._run_factory_070_locked(441, autonomous=False) if factory else
+                         worker.run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status == "refused", result.reason
+    assert result.attempt is None
+    assert "1 worker-writable path(s): '.git/HEAD'" in result.reason
+    assert not any(isinstance(call, list) and call[:3] == ["chainlink", "locks", "claim"] for call in calls)
+    assert not any(isinstance(call, list) and call[:2] == ["git", "clone"] for call in calls)
+    assert not (tmp_path / "state/worklink/runs/441.json").exists()
+
+
+@pytest.mark.parametrize("entrypoint", [run_worklink, run_worklink_epic, run_worklink_reattach])
+def test_executor_entrypoints_set_umask_before_initialization(entrypoint) -> None:
+    function = ast.parse(inspect.getsource(entrypoint)).body[0]
+    statements = function.body
+    if isinstance(statements[0], ast.Expr) and isinstance(statements[0].value, ast.Constant):
+        statements = statements[1:]
+    call = statements[0].value
+    assert ast.unparse(call.func) == "os.umask"
+    assert ast.literal_eval(call.args[0]) == 0o022
 
 
 def test_leaf_run_requests_tracker_transitions_at_both_points(tmp_path: Path) -> None:

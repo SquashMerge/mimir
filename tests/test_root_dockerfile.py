@@ -169,6 +169,9 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
             link = "ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv"
             expected_steps[expected_steps.index(link)] = link.replace("ln -s", "ln -sf")
         if name == "service.sh":
+            # The installed daemon wrapper now sets its own umask (#2140).
+            expected_steps = [step.replace("#!/bin/sh exec", "#!/bin/sh umask 022 exec")
+                              for step in expected_steps]
             # The original single chmod is intentionally split so scaffold's
             # absent watchdog is optional. Both present services remain required.
             original_chmod = expected_steps.pop()

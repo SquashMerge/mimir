@@ -118,6 +118,11 @@ def test_selected_scaffold_writes_worker_resources(tmp_path: Path, monkeypatch, 
     assert (context / "s6-rc.d/user/contents.d/worklink-execd").is_file()
     assert (context / "s6-rc.d/worklink-execd/run").read_text().rstrip().endswith(
         "exec /usr/local/libexec/worklink-execd")
+    for run in (context / "s6-rc.d").glob("*/run"):
+        script = run.read_text()
+        assert script.index("umask 022") < script.index("exec ")
+        if "install " in script:
+            assert script.index("umask 022") < script.index("install ")
     dockerfile = (tmp_path / "Dockerfile").read_text()
     assert "RUN sh /opt/cultivate-docker/service.sh" in dockerfile
     assert 'ENTRYPOINT ["/init"]' in dockerfile
@@ -209,3 +214,4 @@ def test_shared_service_script_provisions_each_layout(tmp_path: Path, monkeypatc
         assert (s6 / name / "run").stat().st_mode & stat.S_IXUSR
     assert (libexec / "worklink-execd").stat().st_mode & stat.S_IXUSR
     assert "mimir_cultivate.worklink.worker_exec" in (libexec / "worklink-execd").read_text()
+    assert (libexec / "worklink-execd").read_text().splitlines()[1] == "umask 022"

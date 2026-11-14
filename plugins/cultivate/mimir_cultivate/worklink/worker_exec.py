@@ -203,7 +203,7 @@ def _drop_worker(checkout_fd: int) -> None:
     os.setresgid(get_identities().worklink_gid, get_identities().worklink_gid, get_identities().worklink_gid)
     os.setresuid(get_identities().worklink_uid, get_identities().worklink_uid, get_identities().worklink_uid)
     _set_capabilities(set())
-    os.umask(0o002)
+    os.umask(0o022)
     os.setsid()
     os.fchdir(checkout_fd)
     _verify_worker_identity()
@@ -1447,6 +1447,7 @@ def handle_connection(connection: socket.socket) -> None:
 
 
 def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
+    os.umask(0o022)
     if not hasattr(socket, "SO_PEERCRED"):
         raise RuntimeError("worker executor requires Linux SO_PEERCRED peer authentication")
     socket_path.parent.mkdir(mode=0o710, parents=True, exist_ok=True)
@@ -1489,6 +1490,7 @@ def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
 
 
 if __name__ == "__main__":
+    os.umask(0o022)
     if sys.argv[1:] == ["--factory-file-child"]:
         try:
             child_request = json.loads(sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1))

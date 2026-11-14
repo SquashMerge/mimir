@@ -49,6 +49,41 @@ def _scaffold_install_text(home: Path) -> str:
     return dockerfile + (fragment.read_text() if fragment.is_file() else "")
 
 
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_generated_start_sh_sets_umask_before_startup(mode: str) -> None:
+    script = render_start_sh(mode=mode)
+    commands = [line.strip() for line in script.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+    assert commands[:2] == ["set -euo pipefail", "umask 022"]
+    assert script.index("umask 022") < script.index("\ngit config") < script.index("\nexec ")
+
+
+def test_all_installed_s6_runs_set_umask_before_service_start() -> None:
+    root = Path(__file__).resolve().parents[1] / "deploy/s6-overlay/s6-rc.d"
+    runs = sorted(root.glob("*/run"))
+    assert {run.parent.name for run in runs} == {"mimir", "watchdog", "worklink-execd"}
+    for run in runs:
+        script = run.read_text()
+        commands = [line.strip() for line in script.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+        assert commands[0 if run.parent.name != "worklink-execd" else 1] == "umask 022"
+        assert script.index("umask 022") < script.index("exec ")
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_generated_plugin_services_set_umask(tmp_path: Path, monkeypatch, mode: str) -> None:
+    candidate = _provider(tmp_path)
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (candidate,))
+    home = tmp_path / "home"
+    home.mkdir()
+    scaffold(home, mode=mode)
+    runs = list((home / ".mimir-scaffold/s6-rc.d").glob("*/run"))
+    assert len(runs) == 2
+    for run in runs:
+        commands = [line for line in run.read_text().splitlines() if line and not line.startswith("#")]
+        assert commands[0] == "umask 022"
+
+
 def _cultivate_installed() -> bool:
     try:
         version("mimir-cultivate")

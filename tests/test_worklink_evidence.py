@@ -199,6 +199,7 @@ async def test_worklink_runner_filters_retry_environment_after_order_merge(tmp_p
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/ordinary")
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / ".git").mkdir()
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     observed = []

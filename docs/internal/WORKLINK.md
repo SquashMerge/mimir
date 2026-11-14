@@ -498,6 +498,31 @@ Per-issue flow (one `run`):
    bounded samples of staged, unstaged, and non-ignored untracked paths; ignored
    local directories such as `.venv/` and `.worktrees/` do not count. Worklink
    never resets or cleans the shared base automatically.
+
+   Before claiming work, and again before preparing a checkout, Worklink also
+   refuses a base whose tracked files or `.git` entries are writable by the
+   `worklink` account: other-write, group-write for any group the account holds,
+   or worker ownership (even read-only owners can change modes). Inspection
+   failures are refused too. This is an operator-actionable `refused` outcome,
+   without consuming a claim/attempt. The `worklink_base_repo_refused` event
+   names the count and at most five example paths. Untracked/ignored worktree
+   data, including `.venv/` and `node_modules/`, is not permission-scanned.
+
+   **Remediation:** as the base repository's controller owner, with
+   `WORKLINK_REPO` set to that base clone, strip group/other write bits in one line:
+
+   ```sh
+   (cd "$WORKLINK_REPO" && { git ls-files -z; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w -- "$p" || exit; done' sh)
+   ```
+
+   This preserves executable bits and leaves untracked/ignored worktree paths
+   alone (including symlink targets). Restore controller ownership separately for any worker-owned entries;
+   chmod cannot repair ownership. For a linked base worktree, also remediate its
+   referenced Git directory and common Git directory. Image services, generated
+   startup scripts, and Worklink executor/daemon entry points set umask 022
+   explicitly, including when launched through `docker exec` with umask 0000.
+   Operator Git/deployment shells should likewise start with `umask 022` so later
+   writes preserve the boundary. Worklink never changes base permissions itself.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
    Template lives at `mimir_cultivate/prompt_templates/worklink-order.md` (operator-tunable). The

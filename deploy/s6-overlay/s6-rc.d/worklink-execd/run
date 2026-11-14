@@ -1,5 +1,6 @@
 #!/command/with-contenv sh
 set -eu
+umask 022
 install -d -o root -g root -m 0711 /run/mimir-worklink
 install -d -o root -g mimir -m 0710 /run/mimir-worklink/socket
 exec /usr/local/libexec/worklink-execd
