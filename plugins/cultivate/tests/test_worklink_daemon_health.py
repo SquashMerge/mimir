@@ -560,7 +560,7 @@ async def test_agent_health_missing_login_preserves_identity_gate(
         monkeypatch.setattr(setup, "_agent_exec", agent_exec)
         monkeypatch.setattr(setup, "_http", lambda *a, **kw: pytest.fail(
             "setup trusted top-level HTTP liveness before daemon readiness"))
-        with pytest.raises(setup.SetupError, match="worklink-opencode-login"):
+        with pytest.raises(setup.SetupError, match="codex agent login --device-auth"):
             setup._verify(tmp_path, 8123, "owner", "key", "node", "22.16.0")
         assert len(probes) == 1
 

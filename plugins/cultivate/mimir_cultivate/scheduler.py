@@ -16,6 +16,20 @@ from mimir.poller_hooks import PollerHooks
 _REAP_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worklink-reap")
 
 
+def add_codex_reconcile_job(scheduler: Any, cron_expr: str = "*/15 * * * *") -> bool:
+    from .worklink.daemon_gate import prepare_daemon_health
+
+    async def fire() -> None:
+        health = await asyncio.to_thread(prepare_daemon_health, dict(os.environ))
+        if health.get("codex_error"):
+            await log_event("worklink_codex_reconcile_failed", reason="agent_codex_login_unavailable")
+
+    return scheduler.register_callable(
+        name="worklink-codex-reconcile", fn=fire, default_cron=cron_expr,
+        job_id="worklink-codex-reconcile", max_instances=1, coalesce=True,
+    )
+
+
 def active_pr_checkout_lease_paths() -> set[Path]:
     """Protect leases held by live turns, including discovered PR scopes."""
     paths: set[Path] = set()

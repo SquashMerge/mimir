@@ -954,13 +954,13 @@ def setup_environment(tmp_path, monkeypatch):
 def test_setup_native_login_refusal_keeps_daemon_available(setup_environment, capsys):
     deploy, args, state, calls, invoke = setup_environment
     state['daemon_health'] = {'ok': False, 'daemon_enabled': True}
-    with pytest.raises(installer.SetupError, match='Native login: docker compose exec --user worklink agent'):
+    with pytest.raises(installer.SetupError, match='codex agent login --device-auth'):
         invoke()
     assert state['running'], 'container/daemon must remain available for native login'
     assert not state['verified']
     assert calls.index(['docker', 'compose', 'up', '-d', 'agent']) < next(
         index for index, argv in enumerate(calls) if argv[-1] == installer._OPENCODE_DAEMON_PROBE)
-    assert 'worklink-opencode-login' in capsys.readouterr().out
+    assert 'worklink-opencode-login' not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('enabled', [False, True])
@@ -970,7 +970,7 @@ def test_setup_reports_effective_daemon_telemetry_and_login(setup_environment, c
                               'refresh_unverified': enabled, 'sensitive_telemetry_disabled': enabled}
     invoke()
     output = capsys.readouterr().out
-    assert ('worklink-opencode-login' in output) is enabled
+    assert 'worklink-opencode-login' not in output
     assert ('Native login refresh is unverified' in output) is enabled
     assert ('telemetry is disabled because sensitive OTLP' in output) is enabled
 
@@ -2140,6 +2140,10 @@ def test_setup_daemon_probe_uses_actual_activation_and_gate(tmp_path, monkeypatc
     monkeypatch.setattr(daemon_health, 'resolve_activation', activation.resolve_activation)
     ids = WorklinkIdentities(os.getuid(), os.getuid(), os.getgid())
     monkeypatch.setattr(daemon_health, 'get_identities', lambda: ids)
+    # This matrix owns status/activation, not provider credential reconciliation.
+    # Credential API seeding and rejection are exercised in test_opencode_auth.
+    from mimir_cultivate import opencode
+    monkeypatch.setattr(opencode, 'reconcile_codex_auth', lambda *a, **kw: 'equal')
     generation = str(uuid.uuid4())
     token = 'fixture-' + 'bot-token'
     paths.snapshot.write_text(json.dumps({'version': 1, 'launch_generation': generation,

@@ -133,6 +133,8 @@ async def configure_worklink(scheduler: Any, home: Path, alert_channel: str | No
     from . import scheduler as jobs
 
     for job, install in (
+        ("worklink-codex-reconcile", lambda: jobs.add_codex_reconcile_job(
+            scheduler, cron_expr=os.environ.get("MIMIR_WORKLINK_CODEX_RECONCILE_CRON", "*/15 * * * *"))),
         ("worklink-reaper", lambda: jobs.add_reaper_job(
             scheduler, home, cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", "*/30 * * * *"))),
         ("worklink-factory-park-alert", lambda: jobs.add_factory_park_alert_job(
@@ -282,6 +284,14 @@ def reattach_inflight_worklink_runs(
 
 
 async def reconcile_startup(home: Path, log_event: Any) -> None:
+    from .worklink.daemon_gate import wait_for_daemon
+
+    try:
+        health = await asyncio.to_thread(wait_for_daemon, dict(os.environ))
+        if health.get("codex_error"):
+            await log_event("worklink_codex_reconcile_failed", reason="agent_codex_login_unavailable")
+    except (OSError, ValueError, RuntimeError):
+        await log_event("worklink_codex_reconcile_failed", reason="daemon_unavailable")
     try:
         resumed = reattach_inflight_worklink_runs(home)
         await log_event("worklink_reattach_dispatched", issues=resumed)

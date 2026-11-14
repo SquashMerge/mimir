@@ -65,6 +65,10 @@ class RuntimePaths:
     def snapshot(self) -> Path:
         return self.run / "agent/launch.json"
 
+    @property
+    def controller_api(self) -> Path:
+        return self.run / "agent/api.json"
+
 
 class PrivateStateError(ValueError):
     """Invalid local state; never include file contents in diagnostics."""
@@ -194,6 +198,9 @@ def prepare(environ: dict[str, str], identities: WorklinkIdentities,
     prepare_directory(paths.run / "agent", uid=identities.mimir_uid, gid=-1, mode=0o700)
     atomic_json(paths.api, {"version": 1, "url": DAEMON_URL, "username": "opencode", "password": password},
                 uid=identities.worklink_uid, gid=identities.worklink_gid, mode=0o600)
+    atomic_json(paths.controller_api,
+                {"version": 1, "url": DAEMON_URL, "username": "opencode", "password": password},
+                uid=identities.mimir_uid, gid=-1, mode=0o600)
     atomic_json(paths.daemon / "config/opencode/opencode.json", configuration.config,
                 uid=identities.worklink_uid, gid=identities.worklink_gid, mode=0o600)
     atomic_json(paths.daemon / "launch.json", {"version": 1, "launch_generation": generation,

@@ -41,12 +41,11 @@ The daemon is independent of native login and Mimir/plugin-ready markers.
 Root Mimir, both scaffold wrapper writers and both final workload templates
 gate enabled workloads, leaving the daemon available when login is missing.
 
-Setup prints `docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login`.
-The wrapper privately authenticates to the daemon and executes
-`opencode auth login --server http://127.0.0.1:4096 --method chatgpt-headless openai`.
-Use the actual service name in custom Compose projects. This login is independent
-of the agent's unchanged Codex device login; no auth.json seeding or refresh-token
-reconciliation remains. Daemon state lives in private worklink-owned directories
+Setup seeds the daemon automatically from the agent's Codex device login, through
+the authenticated credential API. The mimir controller reconciles both ways before
+builds and epic launches and every 15 minutes; see [credentials](../credentials.md#type-c--oauth-refresh-dance)
+for locking, preservation and the residual simultaneous-refresh race. No separate
+daemon login is required. Daemon state lives in private worklink-owned directories
 under `/var/lib/mimir-worklink/daemon`, persisted in the `worklink-daemon` volume.
 Keep that volume during recreation. Native DB migrations belong to OpenCode.
 Read-only local health accepts `locally_unexpired` or `refreshable_unverified`,

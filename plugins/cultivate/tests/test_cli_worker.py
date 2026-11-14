@@ -122,8 +122,8 @@ def test_opencode_bootstrap_reports_service_owned_config(
     main(["opencode-bootstrap", "--home", str(tmp_path)])
     output = capsys.readouterr().out
     assert "generated privately by the Worklink daemon service" in output
-    assert "docker compose exec --user worklink" in output
-    assert "/usr/local/bin/worklink-opencode-login" in output
+    assert "docker compose exec --user mimir" in output
+    assert "codex login --device-auth" in output
     assert list(tmp_path.iterdir()) == []
 
 

@@ -148,6 +148,26 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("invalid server identity")
         return result
 
+    async def credentials(self) -> list[dict[str, Any]]:
+        """Controller-only secret export. Callers must never log this result."""
+        result = _object(await self._request("GET", "/api/credential"))
+        self._list(result)
+        return result["data"]
+
+    async def create_credential(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        result = _object(await self._request("POST", "/api/credential", payload={
+            "integrationID": "openai", "label": "agent Codex", "activate": True,
+            "value": dict(value),
+        }))
+        return _object(result.get("data"))
+
+    async def remove_credential(self, credential_id: str) -> None:
+        # Credential IDs are opaque in the pinned schema. Quote the whole path
+        # component rather than allowing a remote ID to change the endpoint.
+        from urllib.parse import quote
+
+        await self._request("DELETE", "/api/credential/" + quote(credential_id, safe=""), status=204)
+
     async def create_session(
         self, *, directory: str, model: Mapping[str, str], permissions: list[dict[str, str]],
         agent: str | None = None,

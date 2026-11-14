@@ -1,0 +1,9 @@
+{
+  "version": "2.2.7",
+  "unauthenticated": 401,
+  "import_stdout": "",
+  "create_status": 200,
+  "replacement_method": "chatgpt-headless",
+  "replacement_status": 200,
+  "remove_status": 204
+}
