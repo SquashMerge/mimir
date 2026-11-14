@@ -217,6 +217,108 @@ def test_setup_daemon_image_proof_rejects_wrong_user_before_execution(monkeypatc
         exec(runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"], {})
 
 
+@pytest.mark.parametrize("kind", ["leaf", "spawn"])
+async def test_image_daemon_fixture_uses_production_session_controller(kind, tmp_path, monkeypatch):
+    import asyncio
+    from http.server import ThreadingHTTPServer
+    from threading import Thread
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient, DaemonClientError
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+
+    namespace = {"__name__": "image_fixture"}
+    exec(runpy.run_path(str(PROOF))["DAEMON_FIXTURE"], namespace)
+    namespace["api"] = {"username": "fixture", "password": "fixture-password"}
+    calls = []
+
+    def payload(argv, **kwargs):
+        calls.append((argv, kwargs))
+        assert kwargs["cwd"] == str(tmp_path)
+        assert kwargs["env"]["MIMIR_WORKLINK_GATE"] == "1"
+        assert kwargs["env"]["MIMIR_MODEL_SPEC"] == "proof/model"
+        assert kwargs["timeout"] == 25
+        return subprocess.CompletedProcess(argv, 0, stdout="fixed payload ran", stderr="")
+
+    namespace["subprocess"] = SimpleNamespace(run=payload)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), namespace["Handler"])
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = {"base_url": f"http://127.0.0.1:{server.server_port}", **namespace["api"]}
+    try:
+        async with OpenCodeDaemonClient(**{**connection, "password": "wrong"}) as bad:
+            with pytest.raises(DaemonClientError, match="HTTP 401"):
+                await bad.info()
+        async with OpenCodeDaemonClient(**connection) as client:
+            controller = await SessionController.create(
+                client, tmp_path / "record.json", request=SessionRequest(
+                    kind, {"providerID": "proof", "id": "model"}, "fixed input", ("git *",)),
+                issue_id=1, attempt=1, generation="fixture", checkout=tmp_path,
+                environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+            result = await controller.observe()
+            assert result.execution_state == "succeeded"
+            assert result.stdout == "fixed payload ran"
+            assert controller.record.admission_state == "admitted"
+            await controller.release()
+            assert controller.record.cancellation_state == "verified"
+        assert len(namespace["sessions"]) == 1
+        assert calls[0][0] == ["/tmp/opencode-proof" if kind == "leaf" else "/tmp/opencode-spawn-proof"]
+        assert len(calls) == 1
+    finally:
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        thread.join(timeout=5)
+
+
+async def test_missing_login_image_payload_uses_real_health_and_refuses_before_session(tmp_path, monkeypatch, capsys):
+    import json
+    import os
+    import time
+    from types import SimpleNamespace
+    from mimir.tools.registry import _STATE
+    from mimir.worklink_daemon_activation import DaemonActivation
+    from mimir_cultivate.worklink import daemon_health as health_module
+    from mimir_cultivate.worklink.daemon_config import make_launch_snapshot, resolve_daemon_credentials
+
+    namespace = {"__name__": "image_refusal"}
+    exec(runpy.run_path(str(PROOF))["MISSING_LOGIN_PROOF"], namespace)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    generation = "12345678-1234-4234-8234-123456789abc"
+    status = {"version": 1, "launch_generation": generation, "checked_at_ms": time.time_ns() // 1_000_000,
+              "daemon_state": "ready", "daemon_version": "2.2.7", "login_state": "missing",
+              "login_expires_at_ms": None, "telemetry_state": "off"}
+    snapshot = make_launch_snapshot(resolve_daemon_credentials(dict(os.environ)), generation).to_dict()
+    monkeypatch.setattr(health_module, "resolve_activation", lambda env: DaemonActivation(True, "enabled"))
+    monkeypatch.setattr(health_module, "get_identities", lambda: SimpleNamespace(worklink_uid=1002, mimir_uid=1001))
+    monkeypatch.setattr(health_module, "read_json", lambda path, **kw: status if path.name == "status.json" else snapshot)
+    monkeypatch.setitem(_STATE, "spawn_config", _STATE["spawn_config"])
+    namespace["os"] = SimpleNamespace(environ=os.environ, geteuid=lambda: 1001)
+    namespace["Path"] = lambda path: tmp_path / "artifacts" if path == "/home/mimir/worklink-refusal-artifacts" else Path(path)
+    await namespace["main"]()
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"proof": "missing_login", "reason_code": "login_missing",
+                      "sessions_started": 0, "native_login_proven": False}
+
+
+def test_positive_image_proofs_keep_session_fixture_boundaries_and_evidence():
+    namespace = runpy.run_path(str(PROOF))
+    for name in ("CONTROLLER_PROOF", "SPAWN_PROOF"):
+        payload = namespace[name]
+        compile(payload, name, "exec")
+        assert 'patch("mimir_cultivate.worklink.daemon_health.daemon_health"' in payload
+        assert '"native_login_proven": False' in payload
+    assert "ControllerGitPublication.capture" in namespace["CONTROLLER_PROOF"]
+    assert '"gate-euid=1002"' in namespace["CONTROLLER_PROOF"]
+    assert '"spawn-euid=1002"' in namespace["SPAWN_PROOF"]
+    assert 'proposal["sha256"]' in namespace["SPAWN_PROOF"] or 'proposal.get("sha256")' in namespace["SPAWN_PROOF"]
+    script = PROOF.read_text()
+    assert script.index("'-c', MISSING_LOGIN_PROOF, user='mimir'") < script.index("input_text=DAEMON_FIXTURE")
+    assert "chmod 0755 /usr/local/bin/opencode" not in script
+
+
 def test_wheel_identity_checks_metadata_and_cultivate_pair(tmp_path: Path) -> None:
     wheel_identity = runpy.run_path(str(PROOF))["wheel_identity"]
     wheel = tmp_path / "mimir_cultivate-1.0.0rc2-py3-none-any.whl"
