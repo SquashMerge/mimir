@@ -42,6 +42,7 @@ def test_offline_identity_proof_captures_production_leaf_and_spawn(tmp_path, mon
     assert result["creates"][0]["model"] == {"providerID": "openai", "id": "fixture-model", "variant": "high"}
     assert result["creates"][1]["location"]["directory"] == str(tmp_path / "spawn-checkout")
     assert result["uid_isolation_proven"] is False
+    assert result["native_login_proven"] is False
 
 
 def test_pypi_generated_setup_rebuild_executes_closed_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

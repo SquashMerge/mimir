@@ -2187,26 +2187,23 @@ def test_setup_reuses_daemon_model_validator_without_cli_catalog(monkeypatch, sp
 
 
 def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):
-    import ast
+    import runpy
     import subprocess
 
-    # Execute the shipped image-proof payload, not a copy of its adapter. Only
-    # the final setuid transport is faked; setup generates both real argv shapes.
+    # Execute the shipped credential-free payload, not a copy of its adapter.
+    # Only the final setuid transport is faked; setup's refusal remains real.
     script = Path(__file__).resolve().parents[3] / 'scripts/worklink_image_identity.py'
-    payloads = [node.value for node in ast.walk(ast.parse(script.read_text()))
-                if isinstance(node, ast.Constant) and isinstance(node.value, str)
-                and 'real-image setup OpenCode probe passed' in node.value]
-    assert len(payloads) == 1
+    payload = runpy.run_path(str(script))['SETUP_DAEMON_PROOF']
     calls = []
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
-        output = json.dumps({'ok': True, 'daemon_enabled': True})
+        output = json.dumps({'ok': False, 'daemon_enabled': True})
         return SimpleNamespace(returncode=0, stdout=output, stderr='')
 
     monkeypatch.setattr(subprocess, 'run', run)
     monkeypatch.setattr(installer, '_run', installer._run)
-    exec(compile(payloads[0], '<real-image-setup-probe>', 'exec'), {})
+    exec(compile(payload, '<real-image-setup-probe>', 'exec'), {})
     assert [argv for argv, _ in calls] == [
         ['/command/s6-setuidgid', 'mimir', 'python', '-c', installer._OPENCODE_DAEMON_PROBE],
     ]

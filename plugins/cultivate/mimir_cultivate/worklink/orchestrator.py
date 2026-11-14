@@ -1217,6 +1217,14 @@ class WorklinkRunner:
                 )
                 return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
 
+        if compute.name == "opencode_daemon":
+            from .daemon_gate import workload_refusal
+            from .daemon_health import daemon_health
+
+            reason = workload_refusal(daemon_health(dict(os.environ)))
+            if reason is not None:
+                return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
+
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
@@ -3131,6 +3139,13 @@ class WorklinkRunner:
                     compute_backend=compute.name,
                     reason=reason,
                 )
+                return WorklinkRunResult(issue_id, None, "refused", reason=reason)
+        if compute.name == "opencode_daemon":
+            from .daemon_gate import workload_refusal
+            from .daemon_health import daemon_health
+
+            reason = workload_refusal(daemon_health(dict(os.environ)))
+            if reason is not None:
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
         launcher = selected.admit()
         inventory = RepositoryInventory.load(self.home / "repositories.yaml")

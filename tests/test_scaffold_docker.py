@@ -735,8 +735,8 @@ def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch
     assert ("ARG MIMIR_ENABLE_OPENCODE=0" in dockerfile) is bool(plugins)
     start = render_start_sh(mode=mode)
     assert "MIMIR_CODING_ENABLED" not in start
-    assert "resolve_activation(dict(os.environ))" in start
-    assert "/usr/local/libexec/worklink-daemon-gate" in start
+    assert "resolve_activation(dict(os.environ))" not in start
+    assert "/usr/local/libexec/worklink-daemon-gate" not in start
     assert "opencode-bootstrap" not in start
 
 
@@ -895,12 +895,12 @@ def test_scaffold_opencode_config_is_idempotent(tmp_path: Path, monkeypatch):
     assert ".config/opencode/opencode.json (no changes)" in second_result.files_skipped
 
 
-def test_start_scripts_gate_workloads_without_agent_config_bootstrap():
+def test_start_scripts_boot_agent_without_daemon_gate_or_config_bootstrap():
     workspace = render_start_sh(mode="workspace")
     pypi = render_start_sh(mode="pypi")
     for text in (workspace, pypi):
-        assert 'resolve_activation(dict(os.environ))' in text
-        assert '/usr/local/libexec/worklink-daemon-gate' in text
+        assert 'resolve_activation(dict(os.environ))' not in text
+        assert '/usr/local/libexec/worklink-daemon-gate' not in text
         assert 'opencode-bootstrap' not in text
 
 

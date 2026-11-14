@@ -1,4 +1,4 @@
-"""Credential-free workload gate. Refusal never stops the daemon service."""
+"""Credential-free workload gate. Refusal never stops the agent or daemon."""
 from __future__ import annotations
 
 import os
@@ -7,6 +7,19 @@ import time
 
 from .daemon_health import daemon_health
 from .daemon_service import RuntimePaths
+
+
+def workload_refusal(health: dict[str, object]) -> str | None:
+    """Project existing health into a bounded workload refusal reason."""
+    if health.get("ok") is True:
+        return None
+    if health.get("daemon_error") == "bot_token_stale":
+        return "bot_token_stale"
+    if health.get("daemon_state") != "ready":
+        return "daemon_down"
+    if health.get("login_state") == "expired_no_refresh":
+        return "login_expired"
+    return "login_missing"
 
 
 def wait_for_daemon(environ: dict[str, str], *, paths: RuntimePaths = RuntimePaths(),

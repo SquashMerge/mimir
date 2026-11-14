@@ -89,10 +89,16 @@ def _prepare_boundary(root: Path, scope: str, boundary_name: str) -> tuple[Path,
         observed_scope = scope_path.stat(follow_symlinks=False)
         if not stat.S_ISDIR(observed_scope.st_mode):
             raise RuntimeError("contained checkout scope is unavailable")
+    # Daemon sessions resolve spawn checkouts by pathname, unlike the legacy
+    # FD-entered worker. Permit only traversal of their controller-owned scope;
+    # the per-attempt boundary stays private until the executor hands it off.
+    pathname_session = root == OPENCODE_CHECKOUT_ROOT
     os.chown(
-        scope_path, identities.mimir_uid, identities.mimir_uid, follow_symlinks=False
+        scope_path, identities.mimir_uid,
+        identities.worklink_gid if pathname_session else identities.mimir_uid,
+        follow_symlinks=False,
     )
-    os.chmod(scope_path, 0o700, follow_symlinks=False)
+    os.chmod(scope_path, 0o710 if pathname_session else 0o700, follow_symlinks=False)
     boundary = scope_path / boundary_name
     boundary.mkdir(mode=0o700)
     try:

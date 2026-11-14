@@ -26,6 +26,10 @@ pytestmark = pytest.mark.usefixtures("authorized_fake_backend_gate")
 @pytest.fixture(autouse=True)
 def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+    # These controller-flow tests supply fake compute/daemon outcomes. Native
+    # health admission is exercised with real status files in daemon health tests.
+    from mimir_cultivate.worklink import daemon_health
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
 
 try:
     version("mimir-cultivate")

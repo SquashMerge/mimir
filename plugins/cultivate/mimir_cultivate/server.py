@@ -104,10 +104,10 @@ async def executor_health(app: Any) -> dict[str, object]:
     from .worklink.daemon_health import daemon_health
 
     health = await asyncio.to_thread(daemon_health, dict(os.environ))
-    daemon_ok = health.pop("ok", True)
+    # Daemon readiness gates workloads and setup, not agent liveness. Retain
+    # its diagnostics without overriding the controller/executor identity gate.
+    health.pop("ok", None)
     result.update(health)
-    if not daemon_ok:
-        result["ok"] = False
     return result
 
 

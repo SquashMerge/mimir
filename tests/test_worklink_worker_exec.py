@@ -221,6 +221,50 @@ async def _boundary_create(boundary):
     return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation=boundary.generation)
 
 
+async def test_spawn_factory_crosses_executor_and_retires_before_checkout_cleanup(
+    session_boundary, tmp_path, monkeypatch,
+):
+    from mimir_cultivate import contained_checkout
+    from mimir_cultivate.worklink import checkout as checkout_module
+    from tests.test_contained_checkout import _repo
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from dataclasses import asdict
+
+    boundary = session_boundary
+    monkeypatch.setattr(contained_checkout, "get_identities", lambda: boundary.identities)
+    root = tmp_path / "opencode-checkouts"
+    root.mkdir(mode=0o771)
+    monkeypatch.setattr(contained_checkout, "OPENCODE_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(checkout_module, "_OPENCODE_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(worker_exec, "OPENCODE_CHECKOUT_ROOT", root)
+    source = _repo(tmp_path)
+    issued = contained_checkout.create_opencode_checkout(source, default_cwd=source)
+    try:
+        scope, attempt = issued.path.parent.parent, issued.path.parent
+        assert stat.S_IMODE(scope.stat().st_mode) == 0o710
+        assert scope.stat().st_gid == boundary.identities.worklink_gid
+        assert stat.S_IMODE(attempt.stat().st_mode) == 0o700
+        client = WorkerClient(issued.capability)
+        monkeypatch.setattr(client, "_connect", boundary.connect)
+        response = await client._session_rpc("session_create", {
+            "generation": boundary.generation, "request": asdict(SessionRequest(
+                "spawn", {"providerID": "proof", "id": "model"}, "build")),
+            "timeout_s": 30, "pass_env": {}, "git_settings": [],
+        })
+        handle = client._admission_handle(response, boundary.generation)
+        assert stat.S_IMODE(attempt.stat().st_mode) == 0o710
+        create = next(body for method, path, _, body in boundary.daemon.requests
+                      if method == "POST" and path == "/api/session")
+        assert create["location"] == {"directory": str(issued.path)}
+        boundary.daemon.finish(handle.identifier)
+        assert (await client.session_observe(handle)).execution_state == "succeeded"
+        await client.session_cancel(handle)
+        await client.session_release(handle)
+    finally:
+        issued.close()
+    assert not scope.exists()
+
+
 async def test_epic_nested_checkout_crosses_real_executor_and_controller(session_boundary, tmp_path, monkeypatch, request):
     import tempfile
     from mimir_cultivate.worklink import daemon_health

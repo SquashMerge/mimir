@@ -26,9 +26,26 @@ from .daemon_config import (
 from .identities import WorklinkIdentities, assert_worklink_identity, get_identities
 
 PYTHON = "/opt/mimir-worklink/venv/bin/python"
+# Session RPC helpers still use this transport; daemon startup must not.
 UID_HELPER = "/command/s6-setuidgid"
 SERVE_ARGV = ("/opt/mimir-opencode/bin/opencode", "serve", "--hostname", "127.0.0.1", "--port", "4096")
-SUPERVISOR_ARGV = (UID_HELPER, "worklink", PYTHON, "-m", "mimir_cultivate.worklink.daemon_service", "--supervise")
+SUPERVISOR_ARGV = (PYTHON, "-m", "mimir_cultivate.worklink.daemon_service", "--supervise")
+
+
+def exec_worklink(argv: tuple[str, ...], environment: dict[str, str], *, cwd: str) -> None:
+    """Root-only launch shared by the service and the real-image wire fixture.
+
+    Drop before exec (not a preexec_fn in the threaded supervisor). The fresh
+    supervisor and all daemon tool children inherit the legacy worker boundary.
+    """
+    from .worker_exec import _drop_worker_privileges
+
+    if os.getuid() != 0 or os.geteuid() != 0:
+        raise PrivateStateError("privilege preparation requires root")
+    os.chdir(cwd)
+    _drop_worker_privileges()
+    os.umask(0o002)  # Worker output must remain removable by the controller group.
+    os.execve(argv[0], argv, environment)
 
 
 @dataclass(frozen=True)
@@ -195,9 +212,7 @@ def root_start(environ: dict[str, str]) -> None:
         os.execve("/command/s6-pause", ("/command/s6-pause",), {"PATH": "/usr/bin:/bin"})
         return
     clean_env = prepare(environ, get_identities())
-    os.chdir("/")
-    os.umask(0o077)
-    os.execve(UID_HELPER, SUPERVISOR_ARGV, clean_env)
+    exec_worklink(SUPERVISOR_ARGV, clean_env, cwd="/")
 
 
 async def supervise(paths: RuntimePaths = RuntimePaths(), *, stop: asyncio.Event | None = None) -> int:
@@ -205,7 +220,9 @@ async def supervise(paths: RuntimePaths = RuntimePaths(), *, stop: asyncio.Event
 
     identities = get_identities()
     assert_worklink_identity(identities)
-    os.umask(0o077)
+    from .worker_exec import _verify_worker_identity
+    _verify_worker_identity()
+    os.umask(0o002)  # Worker output must remain removable by the controller group.
     stop = stop if stop is not None else asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):

@@ -900,7 +900,6 @@ echo "[start.sh] mimir setup (idempotent)"
 uv run mimir setup --home "${MIMIR_HOME}" || {
     echo "[start.sh] WARNING: mimir setup non-zero — home may be partial" >&2
 }
-uv run --no-sync python -c 'import os, subprocess; from mimir.worklink_daemon_activation import resolve_activation; a = resolve_activation(dict(os.environ)); subprocess.run(["/usr/local/libexec/worklink-daemon-gate"], check=True) if a.enabled else None'
 
 # ─── run ───────────────────────────────────────────────────────────
 echo "[start.sh] starting mimir run (home=${MIMIR_HOME}, port=${MIMIR_WEB_PORT:-8080})"
@@ -952,7 +951,6 @@ echo "[start.sh] mimir setup (idempotent)"
 mimir setup --home "${MIMIR_HOME}" || {
     echo "[start.sh] WARNING: mimir setup non-zero — home may be partial" >&2
 }
-python -c 'import os, subprocess; from mimir.worklink_daemon_activation import resolve_activation; a = resolve_activation(dict(os.environ)); subprocess.run(["/usr/local/libexec/worklink-daemon-gate"], check=True) if a.enabled else None'
 
 # ─── run ───────────────────────────────────────────────────────────
 echo "[start.sh] starting mimir run (home=${MIMIR_HOME}, port=${MIMIR_WEB_PORT:-8080})"
@@ -1309,10 +1307,7 @@ def bootstrap_opencode_config(home: Path) -> bool:
 
 
 def _mimir_service_run(*, cultivate: bool) -> str:
-    guard = ("test -x /usr/local/libexec/worklink-daemon-gate\n"
-             "s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir "
-             "/usr/local/libexec/worklink-daemon-gate\n") if cultivate else ""
-    return ("#!/command/with-contenv sh\nset -eu\n" + guard
+    return ("#!/command/with-contenv sh\nset -eu\n"
             + "exec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir /usr/local/bin/start.sh\n")
 
 
