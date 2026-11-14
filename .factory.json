@@ -1,6 +1,6 @@
 {
   "resolve": "[ -n \"$MIMIR_WORK_ITEM_JSON\" ] && { printf %s \"$MIMIR_WORK_ITEM_JSON\"; exit 0; }; export CLICOLOR_FORCE=0 NO_COLOR=1; n=$(printf %s \"$FACTORY_INPUT\" | tr \"\\n\" \" \" | sed -e \"s|^[[:space:]]*||\" -e \"s|[[:space:]]*$||\" | sed -n -e \"s|^#\\{0,1\\}\\([0-9][0-9]*\\)$|\\1|p\" -e \"s|^https://github.com/SquashMerge/mimir/issues/\\([0-9][0-9]*\\)$|\\1|p\"); [ -n \"$n\" ] || exit 0; kind=$(gh api \"repos/SquashMerge/mimir/issues/$n\" --jq 'if .pull_request then \"pr\" else \"issue\" end') || exit 1; [ \"$kind\" = \"issue\" ] || { printf 'reference %s is not an issue (%s)\\n' \"$n\" \"$kind\" >&2; exit 1; }; gh issue view \"$n\" --repo SquashMerge/mimir --json number,title,body,url,state,labels,assignees --jq '{run_id:(.number|tostring)} + .'",
-  "verify": "sh scripts/heavy_run.sh uv run pytest -q --tb=short",
+  "verify": "uv run sh scripts/heavy_run.sh uv run pytest -q --tb=short",
   "verify_timeout_ms": 7500000,
   "bootstrap": "uv sync --locked --extra dev --extra bench",
   "max_retries": 5,
