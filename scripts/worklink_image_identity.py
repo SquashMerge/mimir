@@ -19,6 +19,105 @@ IMAGE = f"mimir-worklink-identity:{os.getpid()}"
 CONTAINER = f"mimir-worklink-identity-{os.getpid()}"
 
 
+async def prove_offline(directory: Path) -> dict[str, object]:
+    """Exercise production session consumers, not native UID isolation or a provider."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import uuid
+    from mimir_cultivate import contained_execution, opencode
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, WorkOrder
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+    from mimir.tools.registry import _STATE, set_spawn_config
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+
+    checkout = directory / "checkout"
+    checkout.mkdir()
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as api:
+        class Executor:
+            def __init__(self, path):
+                self.path = path
+
+            async def session_create(self, request, *, timeout_s, pass_env=None, git_settings=()):
+                self.controller = await SessionController.create(
+                    api, directory / (uuid.uuid4().hex + ".json"), request=request,
+                    issue_id=2125, attempt=1, generation="offline-generation", checkout=self.path,
+                    environment={"PATH": "/usr/bin:/bin", **(pass_env or {})}, timeout_s=timeout_s)
+                sid = self.controller.record.opencode_session_id
+                if request.kind == "spawn":
+                    (self.path / "generated.txt").write_text("offline proposal\n")
+                daemon.finish(sid)
+                return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation="offline-generation")
+
+            async def session_observe(self, handle, *, stdout_limit=64 * 1024 * 1024):
+                return await self.controller.observe(stdout_limit=stdout_limit)
+
+            async def session_cancel(self, handle):
+                if not await self.controller.cancel(timeout_s=1):
+                    raise RuntimeError("offline cancellation unverified")
+
+            async def session_release(self, handle):
+                await self.controller.release()
+
+        backend = OpenCodeBackend()
+        order = WorkOrder(2125, checkout, "offline leaf", "rules", 30,
+                          {"MIMIR_MODEL_SPEC": "codex-plus:fixture-model#high", "MIMIR_HOME": str(directory)}, directory / "transcripts")
+        spec = backend.work_spec(order, attempt=1, repo_url="offline", base_ref="main",
+                                 branch="issue/2125-a1", test_command="uv run pytest")
+        compute = OpenCodeDaemonComputeBackend(client=Executor(checkout))
+        handle = await compute.launch(spec)
+        raw = await backend.interpret(order, await compute.wait(handle, 30))
+        assert raw.backend_status == "success" and raw.opencode_session_id == handle.identifier
+        await compute.cleanup(handle)
+
+        seed = directory / "seed"
+        seed.mkdir()
+        for args in (("init", "-q"), ("config", "user.name", "Offline Fixture"),
+                     ("config", "user.email", "offline@example.invalid"),
+                     ("commit", "--allow-empty", "-qm", "seed")):
+            subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                            "-C", str(seed), *args], check=True, capture_output=True, env=opencode._sanitized_git_env())
+
+        class Checkout:
+            def __init__(self):
+                self.path = directory / "spawn-checkout"
+                subprocess.run(["git", "clone", "-q", str(seed), str(self.path)], check=True, env=opencode._sanitized_git_env())
+                self.base_tree = subprocess.check_output(["git", "-C", str(self.path), "rev-parse", "HEAD^{tree}"], text=True,
+                                                        env=opencode._sanitized_git_env()).strip()
+                self.capability = SimpleNamespace(_contained_worker_client=Executor(self.path))
+
+            def close(self, *, retain=False):
+                assert not retain
+
+        previous = _STATE["spawn_config"]
+        try:
+            set_spawn_config({"default_cwd": seed, "artifact_root": directory / "artifacts"})
+            # Like Executor above, readiness belongs to this synthetic offline
+            # fixture. This proof does not establish native login validity.
+            with patch("mimir_cultivate.worklink.daemon_health.daemon_health", return_value={"ok": True}):
+                spawned = json.loads(await opencode._spawn_open_code_impl(
+                    "offline spawn", str(seed), 30, model="openai/fixture-model", agent="build",
+                    contained_runner=contained_execution.execute_contained_session,
+                    checkout_factory=lambda *args, **kwargs: Checkout()))
+        finally:
+            _STATE["spawn_config"] = previous
+        assert spawned["status"] == "succeeded" and spawned["proposal"]
+        assert spawned["opencode_session_id"] != raw.opencode_session_id
+        creates = [body for method, path, _, body in daemon.requests if method == "POST" and path == "/api/session"]
+        assert len(creates) == 2
+        assert creates[0]["permissions"][:2] == [
+            {"action": "external_directory", "resource": "*", "effect": "deny"},
+            {"action": "shell", "resource": "*", "effect": "deny"}]
+        assert creates[1]["permissions"] == [
+            {"action": "external_directory", "resource": "*", "effect": "deny"},
+            {"action": "shell", "resource": "*", "effect": "allow"}]
+        assert creates[1]["agent"] == "build"
+        return {"leaf_session": raw.opencode_session_id, "spawn_session": spawned["opencode_session_id"],
+                "creates": creates, "uid_isolation_proven": False, "native_login_proven": False}
+
+
 def run(args: list[str], *, input_text: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         args, cwd=ROOT, input=input_text, text=True, stdout=subprocess.PIPE,
@@ -85,6 +184,178 @@ def wait_for_health() -> None:
                        + run(["docker", "logs", CONTAINER]).stdout)
 
 
+# This image has no native daemon login. Exercise setup's real verification
+# and require its refusal, rather than treating credential absence as readiness.
+SETUP_DAEMON_PROOF = r'''
+import subprocess
+from pathlib import Path
+from mimir_cultivate import setup
+
+calls = []
+def local_exec(argv, *, cwd):
+    assert argv[:7] == ['docker', 'compose', 'exec', '-T', '-u', 'mimir', 'agent'], argv
+    calls.append(argv[5])
+    result = subprocess.run(['/command/s6-setuidgid', argv[5], *argv[7:]],
+                            cwd='/tmp', capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+setup._run = local_exec
+try:
+    setup._verify_opencode_daemon(Path('/tmp'))
+except setup.SetupError as exc:
+    assert 'worklink-opencode-login' in str(exc), str(exc)
+else:
+    raise AssertionError('credential-free image unexpectedly passed daemon verification')
+assert calls == ['mimir'], calls
+print('real-image setup OpenCode missing-login refusal passed')
+'''
+
+
+# Synthetic OpenCode wire peer only: production WorkerClient, root executor,
+# SessionController, UID drop, checkout and publication paths remain real.
+# No provider request or native login is established by this fixture.
+DAEMON_FIXTURE = r'''
+import json
+import os
+from pathlib import Path
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from mimir_cultivate.worklink.daemon_health import load_api
+from mimir_cultivate.worklink.daemon_service import RuntimePaths
+
+sessions = {}
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def send(self, body, *, status=200, content_type='application/json'):
+        raw = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def handle_request(self):
+        import base64
+        expected = 'Basic ' + base64.b64encode(
+            (api['username'] + ':' + api['password']).encode()).decode()
+        if self.headers.get('Authorization') != expected:
+            return self.send({}, status=401)
+        path = self.path.split('?')[0]
+        body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
+        if path == '/api/info':
+            return self.send({'version': '2.2.7'})
+        if path == '/api/session' and self.command == 'POST':
+            sid = 'ses_image_' + str(len(sessions) + 1)
+            rules = body['permissions']
+            assert rules[0] == {'action': 'external_directory', 'resource': '*', 'effect': 'deny'}
+            assert rules[1]['action'] == 'shell'
+            kind = 'leaf' if rules[1]['effect'] == 'deny' else 'spawn'
+            if kind == 'spawn':
+                assert rules[1] == {'action': 'shell', 'resource': '*', 'effect': 'allow'}
+            else:
+                assert any(rule['effect'] == 'allow' for rule in rules[2:])
+            info = {'id': sid, **body}
+            sessions[sid] = {'info': info, 'kind': kind, 'messages': [], 'events': []}
+            return self.send({'data': info})
+        parts = path.split('/')
+        sid = parts[4] if path.startswith('/api/experimental/session/') else parts[3]
+        state = sessions[sid]
+        if path.endswith('/environment'):
+            state['environment'] = body['variables']
+            return self.send('', status=204)
+        if path.endswith('/prompt'):
+            item = {'id': 'msg_' + sid + '_user', 'sessionID': sid, 'time': {'created': 1},
+                    'type': 'user', 'payload': {'text': body['text']}, 'delivery': 'queue'}
+            state['messages'].append({'id': item['id'], 'time': item['time'], 'type': 'user', 'text': body['text']})
+            # The fake provider executes its fixed payload as the daemon's real
+            # worklink uid, using the production session environment and cwd.
+            payload = '/tmp/opencode-proof' if state['kind'] == 'leaf' else '/tmp/opencode-spawn-proof'
+            result = subprocess.run([payload], cwd=state['info']['location']['directory'],
+                                    env=state['environment'], capture_output=True, text=True, timeout=25)
+            outcome = 'succeeded' if result.returncode == 0 else 'failed'
+            state['messages'].append({'id': 'msg_' + sid + '_assistant', 'time': {'created': 2},
+                                      'type': 'assistant', 'content': [{'type': 'text', 'text': result.stdout + result.stderr}]})
+            idle = {'id': 'msg_' + sid + '_idle', 'time': {'created': 3}, 'type': 'idle', 'outcome': outcome}
+            for index, event in enumerate(('started', outcome), 1):
+                data = {'sessionID': sid}
+                if event == 'failed':
+                    data['error'] = {'type': 'fixture_payload_failed', 'message': 'fixed image payload failed'}
+                    idle['error'] = data['error']
+                state['events'].append({'id': 'evt_' + sid + '_' + str(index), 'created': index,
+                    'type': 'session.execution.' + event,
+                    'durable': {'aggregateID': sid, 'seq': index, 'version': 1}, 'data': data})
+            state['messages'].append(idle)
+            return self.send({'data': item})
+        if path.endswith('/message'):
+            return self.send({'data': state['messages'], 'cursor': {'previous': None, 'next': None}})
+        if path.endswith('/inbox'):
+            return self.send({'data': []})
+        if path.endswith('/interrupt'):
+            return self.send({'interrupted': False})
+        if path.endswith('/log'):
+            from urllib.parse import parse_qs, urlsplit
+            after = int(parse_qs(urlsplit(self.path).query).get('after', ['0'])[0])
+            events = [event for event in state['events'] if event['durable']['seq'] > after]
+            events.append({'type': 'log.synced', 'aggregateID': sid, 'seq': len(state['events'])})
+            return self.send(''.join('event: ' + event['type'] + '\ndata: ' + json.dumps(event) + '\n\n'
+                                     for event in events), content_type='text/event-stream')
+        return self.send({'data': state['info']})
+
+    do_GET = do_POST = do_PUT = handle_request
+
+if __name__ == '__main__':
+    assert os.geteuid() == 1002
+    api = load_api(RuntimePaths(), uid=os.geteuid())
+    ThreadingHTTPServer(('127.0.0.1', 4096), Handler).serve_forever()
+'''
+
+
+MISSING_LOGIN_PROOF = r'''
+import asyncio
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+from mimir.tools.registry import set_spawn_config
+from mimir_cultivate.opencode import spawn_open_code
+from mimir_cultivate.worklink.daemon_health import daemon_health
+from mimir_cultivate.worklink.daemon_gate import workload_refusal
+from mimir_cultivate.worklink.worker_client import WorkerClient
+
+async def main():
+    assert os.geteuid() == 1001, 'missing-login proof must run as mimir'
+    # Do not mock health: wait for the real credential-free daemon to publish.
+    for _ in range(150):
+        health = daemon_health(dict(os.environ))
+        if workload_refusal(health) == 'login_missing':
+            break
+        await asyncio.sleep(0.2)
+    assert health.get('daemon_enabled') is True and health.get('login_state') == 'missing', health
+    assert workload_refusal(health) == 'login_missing', health
+    calls = []
+    async def forbidden_session(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError('missing login reached session admission')
+    seed = Path(os.environ['WORKLINK_REPO'])
+    artifacts = Path('/home/mimir/worklink-refusal-artifacts')
+    set_spawn_config({'default_cwd': seed, 'artifact_root': artifacts})
+    with patch.object(WorkerClient, 'session_create', forbidden_session):
+        result = json.loads(await spawn_open_code.ainvoke({
+            'prompt': 'credential-free refusal proof', 'cwd': str(seed), 'timeout_s': 30,
+            'model': 'proof/model', 'artifact_root': str(artifacts)}))
+    assert result['status'] == 'refused' and result['reason_code'] == 'login_missing', result
+    assert result['opencode_session_id'] is None and not calls, result
+    print(json.dumps({'proof': 'missing_login', 'reason_code': result['reason_code'], 'sessions_started': 0,
+                      'native_login_proven': False}))
+
+if __name__ == '__main__':
+    asyncio.run(main())
+'''
+
+
 CONTROLLER_PROOF = r"""
 from __future__ import annotations
 import asyncio
@@ -97,7 +368,7 @@ import subprocess
 from mimir_cultivate.worklink.backends.base import WorkOrder
 from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
 from mimir_cultivate.worklink.checkout import cleanup_checkout, create_isolated_checkout
-from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
 from mimir_cultivate.worklink.evidence import observe_evidence
 from mimir_cultivate.worklink.safe_git import ControllerGitPublication
 
@@ -113,8 +384,8 @@ test "$(cat tracked)" = worker-modified
 test "$(cat created)" = worker-created
 test "$(cat controller-continuation)" = continued
 ! test -e deleted
-test -r "$HOME/.config/opencode/opencode.json"
-test -r "$HOME/.local/share/opencode/auth.json"
+! test -e "$HOME/.config/opencode/opencode.json"
+! test -e "$HOME/.local/share/opencode/auth.json"
 ! cat /home/mimir/worklink-canary
 '''
 
@@ -149,8 +420,8 @@ async def main():
         )
     finally:
         os.close(checkout_fd)
-    compute = LocalSubprocessComputeBackend.for_path_checkout(1002)
-    backend = OpenCodeBackend(bin=CLI)
+    compute = OpenCodeDaemonComputeBackend()
+    backend = OpenCodeBackend()
     order = WorkOrder(
         issue_id=1410,
         checkout=lease.path,
@@ -170,9 +441,16 @@ async def main():
         test_command=GATE_TEST,
     )
     projections = spec.backend_config.get("worker_projections", ())
-    if len(projections) != 2:
-        raise RuntimeError("configured provider config and auth were not projected")
-    handle = await compute.launch(spec)
+    if projections or spec.local_argv is not None:
+        raise RuntimeError("daemon leaf attempted a legacy auth projection or process launch")
+    from unittest.mock import patch
+    from mimir_cultivate.worklink.daemon_service import RuntimePaths, read_json
+    generation = read_json(RuntimePaths().snapshot, uid=1001, mode=0o600)["launch_generation"]
+    # Readiness is a fixture, not evidence of native login. Session admission
+    # still crosses WorkerClient -> root executor -> real SessionController.
+    with patch("mimir_cultivate.worklink.daemon_health.daemon_health",
+               return_value={"ok": True, "launch_generation": generation}):
+        handle = await compute.launch(spec)
     try:
         result = await compute.wait(handle, spec.timeout_s)
     finally:
@@ -226,6 +504,8 @@ async def main():
     publication.close()
     if lease.path.exists():
         raise RuntimeError("production checkout cleanup failed")
+    print(json.dumps({"proof": "controller", "native_login_proven": False,
+                      "uid_isolation_proven": True, "publication_proven": True}))
 
 asyncio.run(main())
 """
@@ -326,14 +606,20 @@ async def main():
         ).stdout
 
     source_status = seed_status()
-    raw = await spawn_open_code.ainvoke({
-        "prompt": "generate and execute the containment proof payload",
-        "cwd": str(SEED),
-        "timeout_s": 30,
-        "name": "shipped-image-proof",
-        "model": "proof/model",
-        "artifact_root": str(ARTIFACTS),
-    })
+    from unittest.mock import patch
+    from mimir_cultivate.worklink.daemon_service import RuntimePaths, read_json
+    generation = read_json(RuntimePaths().snapshot, uid=1001, mode=0o600)["launch_generation"]
+    # The fixed synthetic wire peer executes the payload, not a provider.
+    with patch("mimir_cultivate.worklink.daemon_health.daemon_health",
+               return_value={"ok": True, "launch_generation": generation}):
+        raw = await spawn_open_code.ainvoke({
+            "prompt": "generate and execute the containment proof payload",
+            "cwd": str(SEED),
+            "timeout_s": 30,
+            "name": "shipped-image-proof",
+            "model": "proof/model",
+            "artifact_root": str(ARTIFACTS),
+        })
     result = json.loads(raw)
     if result["status"] != "succeeded" or result["exit_code"] != 0:
         raise RuntimeError(f"live spawn failed: {result}")
@@ -343,15 +629,8 @@ async def main():
         raise RuntimeError("live spawn did not return its relative artifact handle")
     if "spawn-euid=1002" not in result["stdout"]:
         raise RuntimeError("live fake OpenCode did not report worker identity")
-    identifier_line = next(
-        (line for line in result["stdout"].splitlines() if line.startswith("spawn-identifier=")),
-        None,
-    )
-    if identifier_line is None:
-        raise RuntimeError("live fake OpenCode did not report its execution identifier")
-    identifier = uuid.UUID(identifier_line.partition("=")[2])
-    if identifier.version != 4 or str(identifier) != identifier_line.partition("=")[2]:
-        raise RuntimeError("live fake OpenCode did not receive a canonical UUIDv4 identifier")
+    if not isinstance(result.get("opencode_session_id"), str) or not result["opencode_session_id"].startswith("ses_"):
+        raise RuntimeError("spawn did not preserve its owned OpenCode session identity")
     proposal = result.get("proposal")
     if not isinstance(proposal, dict):
         raise RuntimeError("live spawn did not produce a proposal")
@@ -386,6 +665,8 @@ async def main():
         else:
             path.rmdir()
     ARTIFACTS.rmdir()
+    print(json.dumps({"proof": "spawn", "native_login_proven": False,
+                      "uid_isolation_proven": True, "proposal_proven": True}))
 
 asyncio.run(main())
 """
@@ -784,31 +1065,33 @@ PY
         # Exercise setup's real generated probes before any fake OpenCode is
         # installed below. Only Docker's transport is adapted: the production
         # argv, named users, private controller venv and installed CLI are real.
-        docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', r'''
-import subprocess
-from pathlib import Path
-from mimir_cultivate import setup
+        docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', SETUP_DAEMON_PROOF)
+        print(docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', MISSING_LOGIN_PROOF, user='mimir'))
 
-calls = []
-def local_exec(argv, *, cwd):
-    assert argv[:4] == ['docker', 'compose', 'exec', '-T']
-    if argv[5] == 'mimir':
-        assert argv[4:7] == ['-u', 'mimir', 'agent']
-        command = argv[7:]
-    else:
-        assert argv[4:9] == ['-u', 'worklink', '-w', '/tmp', 'agent']
-        command = argv[9:]
-    calls.append(argv[5])
-    result = subprocess.run(['/command/s6-setuidgid', argv[5], *command],
-                            cwd='/tmp', capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
-    return result.stdout.strip()
-setup._run = local_exec
-binary = setup._verify_opencode_binary(Path('/tmp'))
-for model in ('openai/gpt-6.1-sol', 'openai/gpt-6-luna', 'anthropic/claude-haiku-5-5'):
-    setup._verify_opencode_model(Path('/tmp'), binary, model)
-assert calls == ['mimir', 'worklink', 'worklink', 'worklink', 'worklink']
-print('real-image setup OpenCode probe passed')
+        # Replace only the wire peer after proving refusal with real health.
+        # The shipped root executor and its session helpers stay untouched.
+        docker_exec('/command/s6-svc', '-wD', '-T', '30000', '-d', '/run/service/worklink-opencode')
+        docker_exec('/bin/sh', '-ceu', 'cat > /tmp/worklink-daemon-fixture.py; chmod 0644 /tmp/worklink-daemon-fixture.py',
+                    input_text=DAEMON_FIXTURE)
+        run(['docker', 'exec', '--detach', '--user', 'root', CONTAINER,
+             '/opt/mimir-worklink/venv/bin/python', '-c',
+             'from mimir_cultivate.worklink.daemon_service import exec_worklink; '
+             'import os; exec_worklink(("/opt/mimir-worklink/venv/bin/python", '
+             '"/tmp/worklink-daemon-fixture.py"), dict(os.environ), cwd="/")'])
+        docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', '''
+import time
+import urllib.request
+for _ in range(100):
+    try:
+        urllib.request.urlopen('http://127.0.0.1:4096/api/info', timeout=1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            break  # synthetic peer is listening and still requires auth
+        raise
+    except OSError:
+        time.sleep(0.1)
+else:
+    raise RuntimeError('synthetic daemon peer did not start')
 ''')
 
         docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', TOOLCHAIN_PROOF)
@@ -860,17 +1143,11 @@ import sys
 
 if os.geteuid() != 1002:
     raise SystemExit("coding CLI did not run as worklink")
-if "--dir" not in sys.argv or sys.argv[sys.argv.index("--dir") + 1] != ".":
-    raise SystemExit(f"coding CLI did not receive the FD-anchored checkout: {sys.argv}")
 home = Path(os.environ["HOME"])
-if home.parent != Path("/var/lib/mimir-worklink/homes"):
-    raise SystemExit("coding CLI received an invalid HOME")
-config = json.loads((home / ".config/opencode/opencode.json").read_text())
-auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
-if config != {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid", "apiKey": "provider-reference"}}, "permission": {"external_directory": "deny"}}:
-    raise SystemExit("selected provider configuration was not projected exactly")
-if auth != {"proof": {"type": "api", "key": "projected-secret"}}:
-    raise SystemExit("selected provider auth was not projected exactly")
+if home.parent != Path("/var/lib/mimir-worklink/daemon/sessions") or not home.name.endswith('.home'):
+    raise SystemExit("daemon payload received an invalid session HOME")
+if (home / '.config/opencode/opencode.json').exists() or (home / '.local/share/opencode/auth.json').exists():
+    raise SystemExit('daemon session received legacy credential projections')
 if "PROOF_TOKEN" in os.environ:
     raise SystemExit("selected provider credential leaked into the worker environment")
 checkout = Path.cwd()
@@ -889,12 +1166,14 @@ if sibling.read_text() != "sibling-original":
     raise SystemExit("worker could not reach the intentionally shared sibling checkout")
 parent = home.parent
 repo = Path(Path("/tmp/worklink-proof-repo").read_text())
+# Daemon sessions intentionally share the worklink uid and daemon-owned
+# session root. Unlike the retired CLI HOME root, that parent is not a
+# cross-session security boundary. Controller-owned paths remain denied.
 checks = [
-    ["ls", str(parent)],
-    ["touch", str(parent / "parent-write")],
-    ["touch", str(parent / "sibling")],
-    ["mv", str(home), str(parent / "moved")],
-    ["rmdir", str(home)],
+    ["ls", "/var/lib/mimir-worklink/homes"],
+    ["touch", "/var/lib/mimir-worklink/homes/parent-write"],
+    ["cat", "/home/mimir/worklink-opencode/opencode.json"],
+    ["cat", "/home/mimir/worklink-opencode/data/opencode/auth.json"],
     ["cat", "/home/mimir/worklink-canary"],
     ["sh", "-c", "printf attacked > /home/mimir/worklink-canary"],
     ["sh", "-c", f"printf attacked > {shlex.quote(str(repo / 'tracked'))}"],
@@ -939,11 +1218,11 @@ PY
             "/bin/sh", "-c", "cat > /tmp/worklink-runtime-proof.py && chmod 0644 /tmp/worklink-runtime-proof.py",
             input_text=CONTROLLER_PROOF,
         )
-        docker_exec(
+        print(docker_exec(
             "/bin/sh", "-ceu",
             "PROOF_TOKEN=provider-reference /opt/mimir-worklink/venv/bin/python /tmp/worklink-runtime-proof.py",
             user="mimir",
-        )
+        ))
         spawn_setup = r"""
             set -eu
             cat > /home/mimir/worklink-opencode/opencode.json <<'JSON'
@@ -954,7 +1233,7 @@ JSON
 JSON
             chown mimir:mimir /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
             chmod 0600 /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
-            cat > /usr/local/bin/opencode <<'PY'
+            cat > /tmp/opencode-spawn-proof <<'PY'
 #!/opt/mimir-worklink/venv/bin/python
 import json
 import os
@@ -964,20 +1243,11 @@ import uuid
 
 if os.geteuid() != 1002:
     raise SystemExit("spawn fake did not run as worklink")
-if "--dir" not in sys.argv or sys.argv[sys.argv.index("--dir") + 1] != ".":
-    raise SystemExit(f"spawn fake did not receive the FD-anchored checkout: {sys.argv}")
 home = Path(os.environ["HOME"])
-identifier = uuid.UUID(home.name)
-if identifier.version != 4 or str(identifier) != home.name:
-    raise SystemExit("spawn fake did not receive a canonical UUIDv4 identifier")
-config = json.loads((home / ".config/opencode/opencode.json").read_text())
-auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
-expected_config = {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid"}}, "permission": {"external_directory": "deny"}}
-expected_auth = {"proof": {"type": "oauth", "access": "oauth-access-proof", "refresh": "oauth-refresh-proof", "expires": 4102444800000}}
-if config != expected_config:
-    raise SystemExit("spawn fake did not read the selected provider config projection")
-if auth != expected_auth:
-    raise SystemExit("spawn fake did not read the OAuth projection")
+if home.parent != Path('/var/lib/mimir-worklink/daemon/sessions') or not home.name.endswith('.home'):
+    raise SystemExit('spawn payload did not receive a daemon session HOME')
+if (home / '.config/opencode/opencode.json').exists() or (home / '.local/share/opencode/auth.json').exists():
+    raise SystemExit('spawn session received legacy credential projections')
 payload = Path("generated-containment-proof.py")
 payload.write_text(
     "import os\n"
@@ -993,25 +1263,20 @@ payload.write_text(
 )
 exec(compile(payload.read_bytes(), str(payload), "exec"), {"__name__": "__main__"})
 print("spawn-euid=1002")
-print(f"spawn-identifier={identifier}")
-print("oauth-access-proof oauth-refresh-proof")
-print("/home/mimir/worklink-opencode/opencode.json")
-print("/home/mimir/worklink-opencode/data/opencode/auth.json", file=sys.stderr)
 PY
-            chmod 0755 /usr/local/bin/opencode
+            chmod 0755 /tmp/opencode-spawn-proof
         """
         docker_exec("/bin/sh", "-ceu", spawn_setup)
         docker_exec(
             "/bin/sh", "-c", "cat > /tmp/worklink-spawn-proof.py && chmod 0644 /tmp/worklink-spawn-proof.py",
             input_text=SPAWN_PROOF,
         )
-        docker_exec(
-            # This separate protocol proof intentionally uses its fake CLI,
-            # not the real /opt installation exercised by the setup probe.
-            "env", "PATH=/usr/local/bin:/usr/bin:/bin",
+        print(docker_exec(
+            # Readiness/wire outcomes are synthetic; executor and UID boundaries
+            # remain shipped code. This does not exercise a provider or login.
             "/opt/mimir-worklink/venv/bin/python", "/tmp/worklink-spawn-proof.py",
             user="mimir",
-        )
+        ))
         docker_exec("/bin/sh", "-ceu", """
             test "$(cat /home/mimir/worklink-canary)" = controller-reset
             test -z "$(find /var/lib/mimir-worklink/homes -mindepth 1 -maxdepth 1 -print -quit)"
@@ -1031,11 +1296,19 @@ def main() -> None:
 
 def cli() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("source", "pypi"), required=True)
+    parser.add_argument("--mode", choices=("source", "pypi", "offline"), required=True)
     parser.add_argument("--agent-wheel", type=Path)
     parser.add_argument("--cultivate-wheel", type=Path)
     args = parser.parse_args()
-    if args.mode == "source":
+    if args.mode == "offline":
+        import asyncio
+        if args.agent_wheel or args.cultivate_wheel:
+            parser.error("offline mode does not accept wheels")
+        with tempfile.TemporaryDirectory(prefix="worklink-session-proof-") as directory:
+            os.environ.update(HOME=directory, MIMIR_HOME=directory, MIMIR_MODEL_SPEC="codex-plus:fixture-model")
+            result = asyncio.run(prove_offline(Path(directory)))
+            print(json.dumps(result, sort_keys=True))
+    elif args.mode == "source":
         if args.agent_wheel or args.cultivate_wheel:
             parser.error("source mode does not accept wheels")
         prove_source()

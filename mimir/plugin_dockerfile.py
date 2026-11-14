@@ -16,12 +16,15 @@ from .plugins.discovery import PluginCandidate, PluginDiscoveryError, discover_p
 
 
 _CULTIVATE_PACKAGE = "mimir-cultivate"
-_CULTIVATE_SCRIPTS = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh")
+_CULTIVATE_SCRIPTS = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh",
+                      "worklink-opencode-service", "worklink-daemon-gate", "worklink-opencode-login")
 _CONTEXT_SCRIPTS = (*_CULTIVATE_SCRIPTS, "verify_wheels.py")
 _S6_FILES = (
     "mimir/type", "mimir/run", "watchdog/type", "watchdog/run",
     "worklink-execd/type", "worklink-execd/run", "worklink-execd/dependencies.d/base",
     "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd",
+    "worklink-opencode/type", "worklink-opencode/run", "worklink-opencode/dependencies.d/base",
+    "user/contents.d/worklink-opencode",
 )
 
 
@@ -64,6 +67,7 @@ def build_pypi_context(destination: Path, *, agent_wheel: Path, cultivate_wheel:
             output = destination / target
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(opened[archive].read(member))
+            output.chmod((opened[archive].getinfo(member).external_attr >> 16) & 0o777)
         wheel_dir = destination / "plugins/cultivate/mimir_cultivate/docker/wheels"
         wheel_dir.mkdir()
         for _, path, _ in inputs:

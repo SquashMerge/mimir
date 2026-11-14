@@ -16,36 +16,35 @@ def install_local_control_executor(monkeypatch, tmp_path):
     # guards are exercised separately; retain real launch, capture and subreaping.
     monkeypatch.setattr(worker_exec, "_open_factory_checkout", lambda request, **kw: os.open(request["path"], os.O_RDONLY | os.O_DIRECTORY))
     monkeypatch.setattr(worker_exec, "_drop_worker", os.fchdir)
+    monkeypatch.setattr(worker_exec, "_drop_factory", lambda fd, home: os.fchdir(fd))
     monkeypatch.setattr(worker_exec.os, "chown", lambda *args: None)
     calls = []
 
-    async def launch(self, *, local_checkout, argv, env, identifier, timeout_s, stdout_sink, stderr_sink):
-        assert self._launch_op == "launch_factory_control"
-        responses = []
-        connection = SimpleNamespace(send=lambda payload, *args: responses.append(json.loads(payload)))
-        request = {
-            "version": 1, "op": self._launch_op, "executor_identity": worker_client.EXECUTOR_PROTOCOL_IDENTITY,
-            "id": identifier, "issue": self.issue_id, "attempt": self.attempt,
-            "path": str(local_checkout), "run_uid": self.run_uid,
-            "argv": list(argv), "env": dict(env), "projections": [], "timeout_s": timeout_s,
-            "stdout_limit": stdout_sink.limit, "stderr_limit": stderr_sink.limit,
-        }
-        fds = [os.dup(stdout_sink.fd), os.dup(stderr_sink.fd)]
-        try:
-            worker_exec._handle_launch(connection, request, fds)
-        finally:
-            for fd in fds:
-                os.close(fd)
-        terminal = responses[-1]
-        assert terminal["status"] == "terminal"
-        calls.append(terminal)
+    class Socket:
+        def __init__(self):
+            self.responses = []
 
-        async def wait():
-            return terminal["exit_code"]
+        def sendmsg(self, buffers, ancillary):
+            # Keep real client request serialization and terminal decoding; only
+            # replace the socket transport and privileged checkout setup.
+            request = json.loads(b"".join(buffers))
+            assert request["op"] in {"launch_factory_control", "launch_factory"}
+            connection = SimpleNamespace(send=lambda payload, *args: self.responses.append(payload))
+            fds = [os.dup(fd) for fd in ancillary[0][2]]
+            try:
+                worker_exec._handle_launch(connection, request, fds)
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            terminal = json.loads(self.responses[-1])
+            assert terminal["status"] == "terminal"
+            calls.append(terminal)
 
-        return SimpleNamespace(wait=wait, **{name: terminal[name] for name in (
-            "timed_out", "output_overflow", "stdout_bytes", "stderr_bytes",
-        )})
+        def recv(self, size):
+            return self.responses.pop(0)
 
-    monkeypatch.setattr(worker_client.WorkerClient, "launch", launch)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", lambda self: Socket())
     return calls

@@ -578,22 +578,19 @@ def configure_opencode_bootstrap(
 ) -> argparse.ArgumentParser:
     parser = sub.add_parser(
         "opencode-bootstrap",
-        help="Create or preserving-merge mimir's pinned plugins into OpenCode's global XDG config path.",
+        help="Report daemon-native setup instructions (compatibility command; never seeds agent auth/config).",
     )
     parser.add_argument(
         "--home", type=Path, default=None,
-        help="User home containing .config/opencode (default: $HOME).",
+        help="Legacy argument, accepted for compatibility; daemon state is service-owned.",
     )
     return parser
 
 
 def dispatch_opencode_bootstrap(args: argparse.Namespace) -> int:
-    from mimir.scaffold_docker import ensure_opencode_config, opencode_config_path
-
-    user_home = (args.home or Path.home()).expanduser().resolve()
-    config_path = opencode_config_path(user_home)
-    changed = ensure_opencode_config(config_path)
-    print(f"{'updated' if changed else 'unchanged'} {config_path}")
+    print("OpenCode configuration is generated privately by the Worklink daemon service. "
+          "Start your selected Cultivate container, then run docker compose exec --user worklink "
+          "<service> /usr/local/bin/worklink-opencode-login for its independent native Codex login.")
     return 0
 
 

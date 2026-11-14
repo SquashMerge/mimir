@@ -18,7 +18,7 @@ from tests.nested_pytest import pytest_command
 from tests.opencode_fixtures import opencode_binary
 
 from mimir_cultivate.opencode import OpenCodeInvocation
-from mimir_cultivate.worklink.backends.base import RawResult, WorkOrder, blocked_reason_from_output
+from mimir_cultivate.worklink.backends.base import RawResult, WorkOrder, blocked_reason_from_output, SessionOutcome, SessionError
 from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
 from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
 from mimir_cultivate.worklink.backends.registry import (
@@ -31,6 +31,12 @@ from mimir_cultivate.worklink.compute import (
 )
 import mimir_cultivate.worklink.compute as compute_module
 import mimir_cultivate.worklink.backends.opencode as opencode_module
+
+
+def session_result(code=0, stdout="", stderr="", *, error_type=None):
+    error = SessionError(error_type, stderr or stdout) if error_type else None
+    outcome = SessionOutcome("ses_owned", "failed" if code else "succeeded", error=error, stdout=stdout)
+    return ComputeResult(code, stdout, stderr, session_outcome=outcome, session_error=error)
 
 
 class FakeProcess:
@@ -853,11 +859,10 @@ def test_worklink_output_limits_use_safe_defaults_and_env_overrides(
 
 
 def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> None:
-    result = ComputeResult(
-        exit_code=1,
+    result = session_result(
+        code=0,
         stdout="I cannot implement this safely.\nWORKLINK_BLOCKED: design requires raw docker.sock access",
         stderr="",
-        command=("opencode",),
     )
     order = WorkOrder(
         issue_id=466,
@@ -876,7 +881,7 @@ def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_opencode_retries_transient_sqlite_startup_contention() -> None:
+async def test_opencode_never_replays_invocation_for_sqlite_text() -> None:
     attempts = 0
     sleeps: list[float] = []
     events: list[tuple[str, dict[str, object]]] = []
@@ -899,18 +904,10 @@ async def test_opencode_retries_transient_sqlite_startup_contention() -> None:
         sleeper=sleep,
     )
 
-    assert result.exit_code == 0
-    assert attempts == 3
-    assert sleeps == [0.1, 0.2]
-    assert [(event, payload["outcome"]) for event, payload in events] == [
-        ("worklink_backend_startup_contention", "retrying"),
-        ("worklink_backend_startup_contention", "retrying"),
-        ("worklink_backend_startup_contention", "succeeded"),
-    ]
-    assert all(
-        payload["resource"] == "opencode_sqlite_session_store"
-        for _event, payload in events
-    )
+    assert result.exit_code == 1
+    assert attempts == 1
+    assert sleeps == []
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -940,17 +937,11 @@ async def test_opencode_persistent_sqlite_contention_exhausts_with_named_reason(
     order = WorkOrder(1085, tmp_path, "p", None, 30, transcript_root=tmp_path / "t")
     raw = await backend.interpret(order, result)
 
-    assert attempts == 5
-    assert sleeps == [0.1, 0.2, 0.4, 0.8]
-    assert raw.error == "opencode_startup_sqlite_contention_exhausted"
-    assert [event["outcome"] for event in events] == [
-        "retrying",
-        "retrying",
-        "retrying",
-        "retrying",
-        "exhausted",
-    ]
-    assert events[-1]["max_attempts"] == 5
+    assert attempts == 1
+    assert sleeps == []
+    assert raw.backend_status == "backend_error"
+    assert raw.error == "OpenCode session outcome unavailable"
+    assert events == []
     assert raw.transcript_path is not None
     transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
     assert "SQLITE_BUSY" in transcript["stderr"]
@@ -1139,27 +1130,14 @@ async def test_feature_factory_launch_remains_shell_free_argv(
     # Execution is mocked: do not resolve production OS accounts for this argv test.
     compute = LocalSubprocessComputeBackend(_worker_client=object())
 
-    handle = await compute.launch(spec)
-    await compute.wait(handle, 30)
-    await compute.cleanup(handle)
-
-    assert calls[0]["args"] == (
-        "opencode",
-        "run",
-        "--log-level",
-        "DEBUG",
-        "--print-logs",
-        "-m",
-        "openai/gpt-5.6-luna",
-        "--dir",
-        str(tmp_path),
-        "--command",
-        "feature",
-        " --autonomous --max-retries 5 chainlink-1606",
-    )
-    assert "--variant" not in spec.local_argv
-    assert "shell" not in calls[0]["kwargs"]
-    assert calls[0]["checkout"] == tmp_path
+    from mimir_cultivate.worklink.compute import ComputeLaunchError
+    with pytest.raises(ComputeLaunchError, match="local_argv"):
+        await compute.launch(spec)
+    assert calls == []
+    assert spec.local_argv is None
+    assert spec.session_request.kind == "epic"
+    assert spec.session_request.text == "--autonomous --max-retries 5 chainlink-1606"
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "high"}
 
 
 @pytest.mark.asyncio
@@ -1219,29 +1197,19 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         branch="issue/782-a1",
         test_command="uv run pytest -q",
     )
-    compute = LocalSubprocessComputeBackend()
-    handle = await compute.launch(spec)
-    compute_result = await compute.wait(handle, spec.timeout_s)
-    await compute.cleanup(handle)
+    assert spec.local_argv is None
+    assert spec.session_request.text == "-starts with dash"
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "high"}
+    compute_result = session_result(stdout="done")
     result = await backend.interpret(order, compute_result)
 
     assert result.backend_status == "success"
-    assert calls[0]["args"] == (
-        str(binary), "run", "--dir", str(order.checkout),
-        "-m", "openai/gpt-5.6-luna", "--variant", "high", "--", "-starts with dash"
-    )
-    assert calls[0]["args"].count("-m") == 1
+    assert calls == []
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
-    assert spec.backend_config["model_diverged"] is False
     assert spec.backend_config["variant"] == "high"
-    assert spec.backend_config["variant_source"] == "agent"
     assert spec.test_command == "uv run pytest -q"
-    assert "MIMIR_MODEL_SPEC" not in calls[0]["kwargs"]["env"]
-    permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
-    assert permission == {
-        "external_directory": {"/**": "deny"},
-        "bash": {"*": "deny", "git *": "allow", "uv *": "allow"},
-    }
+    assert spec.env == {}
+    assert spec.session_request.shell_allowlist == ("git *", "uv *")
     assert result.transcript_path is not None
     assert result.transcript_path.parent == transcript_root
     transcript = json.loads(result.transcript_path.read_text())
@@ -1259,18 +1227,6 @@ def test_opencode_test_env_reaches_pytest_through_bash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool, opencode_binary: Path
 ) -> None:
     monkeypatch.setattr(opencode_module, "_coding_enabled", lambda: enabled)
-    monkeypatch.setattr(
-        opencode_module, "resolve_opencode_invocation",
-        lambda **_: OpenCodeInvocation(
-            model="openai/test-model", provider="openai", model_source="test",
-            config_path=tmp_path / "absent.json", auth_path=tmp_path / "auth.json",
-            auth_type=None,
-        ),
-    )
-    monkeypatch.setattr(
-        opencode_module, "opencode_worker_documents",
-        lambda *_: SimpleNamespace(config_document=b"{}", auth_document=None),
-    )
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
         'backends:\n  opencode:\n    test_env:\n      PYTEST_ADDOPTS: "-n 2"\n',
@@ -1286,11 +1242,9 @@ def test_opencode_test_env_reaches_pytest_through_bash(
     assert spec.backend_config["test_env"] == {"PYTEST_ADDOPTS": "-n 2"}
     assert "MIMIR_MODEL_SPEC" not in spec.env
     assert spec.test_command == "uv run pytest -q -n 6"
-    if enabled:
-        assert spec.backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
-        env = compute_module._enabled_child_env(spec, "test-1566")
-    else:
-        env = {**compute_module._local_child_env(), **spec.env}
+    from mimir_cultivate.worklink.daemon_sessions import session_environment
+    assert spec.backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
+    env = session_environment(dict(spec.env), home=tmp_path / "home", git_settings=(), credentials={})
 
     (tmp_path / "pyproject.toml").write_text(
         '[tool.pytest.ini_options]\naddopts = "-n 3"\n', encoding="utf-8"
@@ -1386,10 +1340,9 @@ def test_opencode_backend_logs_native_model_divergence_from_home_default(
             test_command="true",
         )
 
-    assert spec.backend_config["model"] == "openai/gpt-native"
-    assert spec.backend_config["configured_model"] == "openai/gpt-agent"
-    assert spec.backend_config["model_diverged"] is True
-    assert "differs from configured agent model" in caplog.text
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent"}
+    assert spec.env == {}
+    assert "differs from configured agent model" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1406,21 +1359,21 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     backend = OpenCodeBackend()
 
     blocked = await backend.interpret(
-        order, ComputeResult(0, "some work\nWORKLINK_BLOCKED: needs a decision", "")
+        order, session_result(0, "some work\nWORKLINK_BLOCKED: needs a decision", "")
     )
     assert blocked.backend_status == "blocked"
     assert blocked.blocked_reason == "needs a decision"
 
-    auth = await backend.interpret(order, ComputeResult(1, "", "provider: unauthorized token"))
+    auth = await backend.interpret(order, session_result(1, "", "provider: unauthorized token", error_type="provider.auth"))
     assert auth.backend_status == "auth_error"
-    assert "provider 'unknown'" in (auth.error or "")
+    assert "provider.auth" in (auth.error or "")
 
-    quota = await backend.interpret(order, ComputeResult(1, "Error: Rate limit exceeded", ""))
+    quota = await backend.interpret(order, session_result(1, "Error: Rate limit exceeded", "", error_type="provider.quota"))
     assert quota.backend_status == "quota_exhausted"
 
-    plain = await backend.interpret(order, ComputeResult(3, "", "boom"))
+    plain = await backend.interpret(order, session_result(3, "", "boom", error_type="provider.error"))
     assert plain.backend_status == "failed"
-    assert plain.error == "boom"
+    assert plain.error == "provider.error: boom"
 
 
 @pytest.mark.parametrize("line", [
@@ -1640,10 +1593,8 @@ async def test_opencode_backend_transcript_filename_contract(
         branch="issue/831-a1",
         test_command="echo ok",
     )
-    compute = LocalSubprocessComputeBackend()
-    handle = await compute.launch(spec)
-    compute_result = await compute.wait(handle, spec.timeout_s)
-    await compute.cleanup(handle)
+    assert spec.local_argv is None
+    compute_result = session_result(stdout="done")
     result = await backend.interpret(order, compute_result)
 
     assert result == RawResult(
@@ -1651,6 +1602,7 @@ async def test_opencode_backend_transcript_filename_contract(
         transcript_path=result.transcript_path,
         backend_status="success",
         error=None,
+        opencode_session_id="ses_owned",
     )
     assert result.transcript_path is not None
     filename = result.transcript_path.name
@@ -1766,35 +1718,24 @@ def test_registry_derives_only_configured_non_python_runner(
     monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str,
     opencode_binary: Path,
 ) -> None:
-    monkeypatch.setattr(
-        "mimir_cultivate.worklink.backends.opencode.resolve_opencode_invocation",
-        lambda **_: OpenCodeInvocation(
-            model="openai/test-model",
-            provider="openai",
-            model_source="test",
-            config_path=Path("/nonexistent/opencode.jsonc"),
-            auth_path=Path("/nonexistent/auth.json"),
-            auth_type=None,
-        ),
-    )
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
     config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
 
     backend = BackendRegistry(config).get("opencode")
-    permission = json.loads(
-        backend.work_spec(
+    spec = backend.work_spec(
             WorkOrder(1, Path("/tmp/worktree"), "p", None, 30, {}),
             attempt=1,
             repo_url="u",
             base_ref="main",
             branch="issue/1-a1",
             test_command=test_command,
-        ).env["OPENCODE_PERMISSION"]
-    )
+        )
 
     assert backend.bash_allowlist == ("git *", runner_pattern)
-    assert permission["bash"] == {"*": "deny", "git *": "allow", runner_pattern: "allow"}
-    assert "uv *" not in permission["bash"]
-    assert "rm *" not in permission["bash"]
+    assert spec.session_request.shell_allowlist == ("git *", runner_pattern)
+    assert "uv *" not in spec.session_request.shell_allowlist
+    assert "rm *" not in spec.session_request.shell_allowlist
+    assert "OPENCODE_PERMISSION" not in spec.env
 
 
 def test_operator_bash_allowlist_beats_derivation() -> None:
@@ -1857,14 +1798,11 @@ async def test_opencode_permission_refusal_names_effective_allowlist(tmp_path: P
 
     result = await backend.interpret(
         order,
-        ComputeResult(0, "Error: permission denied for bash command rm -rf build", ""),
+        session_result(1, "Error: permission denied for bash command rm -rf build", "", error_type="provider.invalid-request"),
     )
 
     assert result.backend_status == "failed"
-    assert result.error == (
-        "OpenCode refused an executor shell command because it is not allowed by "
-        "backends.opencode.bash_allowlist; effective patterns: ['git *', 'npm *']"
-    )
+    assert result.error == "provider.invalid-request: Error: permission denied for bash command rm -rf build"
 
 
 @pytest.mark.asyncio
@@ -1878,10 +1816,10 @@ async def test_opencode_startup_permission_error_surfaces_backend_stderr(
         "  '/var/lib/mimir-worklink/checkouts/scope/1259-1/checkout'"
     )
 
-    result = await backend.interpret(order, ComputeResult(1, "", stderr))
+    result = await backend.interpret(order, session_result(1, "", stderr, error_type="provider.error"))
 
     assert result.backend_status == "failed"
-    assert result.error == stderr
+    assert result.error == "provider.error: " + stderr
     assert "bash_allowlist" not in result.error
 
 
@@ -1962,7 +1900,7 @@ async def test_permission_words_in_executor_source_do_not_fail_a_successful_run(
 
     raw = await backend.interpret(
         order,
-        ComputeResult(0, f"edited a file\n{_AUTHZ_SOURCE_LINE}\nall todos complete", ""),
+        session_result(0, f"edited a file\n{_AUTHZ_SOURCE_LINE}\nall todos complete", ""),
     )
 
     assert raw.backend_status == "success"
@@ -1986,12 +1924,11 @@ async def test_permission_refusal_that_stopped_the_executor_still_fails_with_its
     backend = OpenCodeBackend(bash_allowlist=("git *",))
 
     raw = await backend.interpret(
-        order, ComputeResult(1, "", "permission denied: bash command not allowed")
+        order, session_result(1, "", "permission denied: bash command not allowed", error_type="provider.invalid-request")
     )
 
     assert raw.backend_status == "failed"
-    assert "OpenCode refused an executor shell command" in (raw.error or "")
-    assert "git *" in (raw.error or "")
+    assert raw.error == "provider.invalid-request: permission denied: bash command not allowed"
 
 
 @pytest.mark.asyncio
@@ -2019,15 +1956,16 @@ async def test_midstream_refusal_that_crashed_the_executor_is_still_reported(
 
     raw = await backend.interpret(
         order,
-        ComputeResult(
+        session_result(
             2,
             "",
             "permission denied for bash command\naborting run\nsession closed",
+            error_type="provider.error",
         ),
     )
 
     assert raw.backend_status == "failed"
-    assert "OpenCode refused an executor shell command" in (raw.error or "")
+    assert "provider.error: permission denied for bash command" in (raw.error or "")
 
 
 def test_blocked_marker_in_echoed_output_does_not_block_a_completed_run() -> None:
@@ -2128,13 +2066,10 @@ def test_opencode_leaf_reasoning_variant(
         attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
         test_command="uv run pytest -q",
     )
-    args = spec.backend_config["args"]
-    assert args[:2] == ["-m", "openai/gpt-agent"]
-    assert args[2:] == (["--variant", expected] if expected else [])
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent",
+                                          **({"variant": expected} if expected else {})}
     assert spec.backend_config["variant"] == expected
-    assert spec.backend_config["variant_source"] == source
-    assert spec.backend_config["model_source"] == "agent_model"
-    assert spec.local_argv[4:4 + len(args)] == tuple(args)
+    assert spec.local_argv is None
 
 
 @pytest.mark.usefixtures("stub_opencode")
@@ -2156,9 +2091,8 @@ def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(tmp_path: Pat
         attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
         test_command="true",
     )
-    assert spec.backend_config["args"] == ["-m", "openai/gpt-native", "--variant", "xhigh"]
-    assert spec.backend_config["model_source"] == "opencode_config"
-    assert spec.backend_config["variant_source"] == "worklink_override"
+    assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent", "variant": "xhigh"}
+    assert spec.local_argv is None
 
 
 @pytest.mark.parametrize("name", ["MIMIR_MODEL_REASONING_EFFORT", "MIMIR_WORKLINK_REASONING_EFFORT"])
@@ -2188,9 +2122,7 @@ def test_opencode_leaf_other_provider_passes_variant_through(tmp_path: Path) -> 
         attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
         test_command="true",
     )
-    assert spec.backend_config["args"] == [
-        "-m", "openrouter/anthropic/claude-opus", "--variant", "turbo",
-    ]
+    assert spec.session_request.model == {"providerID": "openrouter", "id": "anthropic/claude-opus", "variant": "turbo"}
 
 
 @pytest.mark.parametrize("credential", ["saved_auth", "ambient_key"])
@@ -2204,7 +2136,7 @@ def test_worklink_resolution_admits_any_configured_provider(
     because each reaches the worker through the projected auth document rather
     than the worker environment allowlist, so a regression could hide in either.
     """
-    from mimir_cultivate.worklink.backends.opencode import resolve_worklink_opencode_invocation
+    from mimir_cultivate.opencode import resolve_daemon_model
 
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     env = _provider_env(tmp_path, "openrouter:anthropic/claude-opus-4.8")
@@ -2213,12 +2145,9 @@ def test_worklink_resolution_admits_any_configured_provider(
     else:
         env["OPENROUTER_API_KEY"] = "sk-or-synthetic"
 
-    resolution = resolve_worklink_opencode_invocation(env)
-
-    assert resolution.invocation.provider == "openrouter"
-    assert resolution.invocation.model == "openrouter/anthropic/claude-opus-4.8"
-    assert resolution.invocation.auth_type == "api"
-    assert "sk-or-synthetic" not in repr(resolution.invocation)
+    resolution = resolve_daemon_model(env)
+    assert resolution == {"providerID": "openrouter", "id": "anthropic/claude-opus-4.8"}
+    assert "sk-or-synthetic" not in repr(resolution)
 
 
 def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
@@ -2233,7 +2162,7 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
     other ask categories are untouched by this change. Proving that would need an
     integration check against the pinned OpenCode permission evaluator.
     """
-    from mimir_cultivate.worklink.backends.feature_factory import _FACTORY_PERMISSION
+    from mimir_cultivate.worklink.daemon_sessions import session_permissions
 
     home = tmp_path / "home"
     home.mkdir()
@@ -2260,12 +2189,12 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
         test_command="uv run pytest -q",
     )
 
-    permission = json.loads(spec.env["OPENCODE_PERMISSION"])
-    assert permission["read"] == {
-        ".env": "deny", "**/.env": "deny", "**/.env.*": "deny",
-    }
+    permission = session_permissions(spec.session_request)
+    assert permission == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        *[{"action": "read", "resource": pattern, "effect": "deny"}
+          for pattern in (".env", "**/.env", "**/.env.*")]]
 
-    # An operator-supplied override still wins.
+    # V1 environment overrides cannot broaden the reviewed session policy.
     order_override = WorkOrder(
         4242, tmp_path, "prompt", None, 30,
         env={**env, "OPENCODE_PERMISSION": '{"read":{"**":"deny"}}'},
@@ -2278,5 +2207,5 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
         branch="feature/chainlink-4242",
         test_command="uv run pytest -q",
     )
-    assert spec_override.env["OPENCODE_PERMISSION"] == '{"read":{"**":"deny"}}'
-    assert spec_override.env["OPENCODE_PERMISSION"] != _FACTORY_PERMISSION
+    assert "OPENCODE_PERMISSION" not in spec_override.env
+    assert session_permissions(spec_override.session_request) == permission

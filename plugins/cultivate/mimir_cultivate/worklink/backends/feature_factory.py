@@ -16,10 +16,10 @@ import threading
 from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from ..compute import ComputeResult, WorkSpec
-from .base import Caps, CheckoutShape, RawResult, WorkOrder
+from .base import Caps, CheckoutShape, RawResult, SessionRequest, WorkOrder
 
 
-FACTORY_VERSION = "0.12.1"
+FACTORY_VERSION = "0.14.0"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -46,18 +46,6 @@ _MAX_STATUS_BYTES = 1024 * 1024
 _MAX_LIST_ITEMS = 1000
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_JSON_DEPTH = 32
-# The leaf OpenCode backend sends a permission override; the factory path never
-# has, so factory runs execute under OpenCode's defaults and its built-in `ask`
-# rules stay live. An autonomous run has nobody to answer a prompt, so the first
-# one wedges the run forever: attempt 8 of chainlink #1762 stopped dead on a read
-# of `.env`, emitting `asking ... permission=read patterns=[".env"]` and nothing
-# further, while the controller kept heartbeating so the run still looked alive.
-# Deny the secret reads outright. A denial surfaces as a tool error the run can
-# observe and route around; an `ask` cannot be answered and is unrecoverable.
-_FACTORY_PERMISSION = json.dumps(
-    {"read": {".env": "deny", "**/.env": "deny", "**/.env.*": "deny"}},
-    separators=(",", ":"),
-)
 log = logging.getLogger(__name__)
 
 _DEFAULT_FACTORY_MAX_RETRIES = 5
@@ -153,6 +141,7 @@ class FactoryStatus:
     next_present: bool = False
     slices_total: int | None = None
     slices_counts: dict[str, int] | None = None
+    mcp_servers: tuple[str, ...] = ()
 
     TERMINAL_STATUSES: ClassVar[frozenset[str]] = frozenset(
         {"completed", "blocked", "partial"}
@@ -193,6 +182,7 @@ class FactoryStatus:
             "pr_url": self.pr_url,
             "terminal_result": self.terminal_result,
             "park_snapshot": self.park_snapshot,
+            "mcp_servers": list(self.mcp_servers),
         }
         if self.slices_total is not None:
             payload["slices_total"] = self.slices_total
@@ -412,10 +402,11 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
     next_present = "next" in decoded
     next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
     slices = _structured_status(decoded.get("slices"), "slices")
-    from ..factory_control_output import parse_slice_summary
+    from ..factory_control_output import parse_mcp_servers, parse_slice_summary
 
     try:
         slices_total, slices_counts = parse_slice_summary(decoded, slices)
+        mcp_servers = parse_mcp_servers(decoded.get("mcp_servers", []))
     except ValueError as exc:
         raise FactoryContractError(str(exc)) from exc
     return FactoryStatus(
@@ -447,6 +438,7 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         ),
         next=next_value,
         next_present=next_present,
+        mcp_servers=mcp_servers,
     )
 
 
@@ -487,7 +479,13 @@ def resolve_factory_entrypoint(configured: str | Path) -> Path:
     if package_root.name != "feature-factory":
         raise FactoryContractError("feature_factory entrypoint is not package-bound")
     _read_manifest(package_root / "package.json", "feature-factory")
-    _read_manifest(package_root.parent / "opencode-feature-factory" / "package.json", "opencode-feature-factory")
+    legacy = package_root.parent / "opencode-feature-factory"
+    if legacy.exists() or legacy.is_symlink():
+        raise FactoryContractError("managed V1 opencode-feature-factory sibling is not supported")
+    adapter = _read_manifest(package_root.parent / "opencode2-feature-factory" / "package.json", "opencode2-feature-factory")
+    dependencies = adapter.get("dependencies")
+    if not isinstance(dependencies, dict) or dependencies.get("feature-factory") != FACTORY_VERSION:
+        raise FactoryContractError("opencode2-feature-factory requires exact feature-factory dependency")
     return resolved
 
 
@@ -733,17 +731,22 @@ class FeatureFactoryBackend:
         test_command: str,
         session: str | None = None,
         run_id: str | None = None,
+        max_retries: int | None = None,
     ) -> WorkSpec:
-        from mimir_cultivate.opencode import OpenCodeConfigError
-        from .opencode import resolve_worklink_opencode_invocation
+        from mimir.config import model_spec_at_call_time
+        from mimir_cultivate.opencode import OpenCodeConfigError, resolve_daemon_model
 
         try:
-            resolution = resolve_worklink_opencode_invocation(order.env)
+            values = {**os.environ, **order.env}
+            model_home = values.get("MIMIR_HOME")
+            values.setdefault("MIMIR_MODEL_SPEC", model_spec_at_call_time(Path(model_home) if model_home else None))
+            model = resolve_daemon_model(values)
         except OpenCodeConfigError as exc:
             raise FactoryContractError(
                 f"feature_factory_opencode_resolution_failed:{exc.reason_code}"
             ) from exc
-        invocation = resolution.invocation
+        if session is not None:
+            raise FactoryContractError("reattach the existing daemon session without another feature command")
         run_id = run_id or epic_run_id(order.issue_id)
         if _RUN_ID.fullmatch(run_id) is None:
             raise FactoryContractError("factory launch run_id has an invalid shape")
@@ -755,12 +758,7 @@ class FeatureFactoryBackend:
                 raise FactoryContractError("factory work item JSON is malformed") from exc
             if not isinstance(work_item, dict) or work_item.get("run_id") != run_id:
                 raise FactoryContractError("factory work item run_id does not match the launch run_id")
-        command = self.opencode_argv(
-            order.checkout,
-            run_id,
-            invocation.model,
-            session=session,
-        )
+        environment = {"MIMIR_WORK_ITEM_JSON": work_item_json} if work_item_json is not None else {}
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -772,56 +770,56 @@ class FeatureFactoryBackend:
             test_command=test_command,
             backend=self.name,
             timeout_s=order.timeout_s,
-            env={"OPENCODE_PERMISSION": _FACTORY_PERMISSION, **order.env},
+            env=environment,
             backend_config={
                 "entrypoint": str(self.entrypoint),
                 "run_id": run_id,
-                "model": invocation.model,
-                "configured_model": resolution.configured_model,
-                "model_diverged": resolution.model_diverged,
-                "model_source": invocation.model_source,
+                "model": f"{model['providerID']}/{model['id']}",
+                "variant": model.get("variant"),
+                "pass_env": tuple(environment),
+                "publishing_identity": order.env.get(FACTORY_PUBLISHING_IDENTITY_ENV),
             },
             local_checkout=order.checkout,
-            local_argv=command,
+            session_request=SessionRequest("epic", model, self.feature_text(run_id, max_retries=max_retries)),
             output_root=order.transcript_root,
         )
 
     @staticmethod
-    def opencode_argv(
-        operator_checkout: Path,
-        run_id: str,
-        model: str,
-        *,
-        session: str | None = None,
-    ) -> tuple[str, ...]:
+    def feature_text(run_id: str, *, max_retries: int | None = None) -> str:
         if _RUN_ID.fullmatch(run_id) is None:
             raise FactoryContractError("factory launch run_id has an invalid shape")
-        if session is not None and (not session.strip() or "\x00" in session):
-            raise FactoryContractError("factory launch session is invalid")
-        retries = _factory_max_retries()
+        retries = _factory_max_retries() if max_retries is None else max_retries
+        if type(retries) is not int or not 0 < retries <= _MAX_FACTORY_MAX_RETRIES:
+            raise FactoryContractError("factory retry budget is invalid")
         # The budget is frozen into run state by ``factory init``, so record what
         # this launch actually resolved rather than what the environment intended.
         log.info("factory launch %s: retry budget %d", run_id, retries)
-        # feature-factory 0.7.5 stages the workflow inside the run directory, so
-        # OpenCode --auto must not bypass it.
-        session_args = ("--session", session) if session is not None else ()
-        # /feature preserves the request after leading options byte-for-byte
-        # for run selection. Never append controller context to those bytes.
-        return (
-            "opencode",
-            "run",
-            "--log-level",
-            "DEBUG",
-            "--print-logs",
-            *session_args,
-            "-m",
-            model,
-            "--dir",
-            str(operator_checkout),
-            "--command",
-            "feature",
-            f" --autonomous --max-retries {retries} {run_id}",
-        )
+        return f"--autonomous --max-retries {retries} {run_id}"
+
+    def initialize(self, run_id: str, *, operator_checkout: Path, base_ref: str,
+                   publishing_identity: str, git_settings: Sequence[tuple[str, str]] = (),
+                   timeout_s: float = 60, credentials: Mapping[str, str] | None = None,
+                   max_retries: int | None = None) -> FactoryStatus:
+        """Let factory create its sandbox before binding a session to its inode."""
+        from ..daemon_config import resolve_epic_credentials
+
+        publishing = resolve_epic_credentials({**(credentials or {}),
+            "MIMIR_FACTORY_PUBLISHING_IDENTITY": publishing_identity}, repository_config={})
+        retries = _factory_max_retries() if max_retries is None else max_retries
+        if type(retries) is not int or not 0 < retries <= _MAX_FACTORY_MAX_RETRIES:
+            raise FactoryContractError("factory retry budget is invalid")
+        self._control(self.entrypoint, ("init", run_id, "--repo", str(operator_checkout),
+            "--pr-base", base_ref, "--mode", "autonomous", "--max-retries", str(retries),
+            "--publishing-identity", publishing_identity), sandbox=operator_checkout,
+            git_settings=git_settings, timeout_s=timeout_s, credentials=publishing.environment())
+        try:
+            return self.status(run_id, sandbox=operator_checkout / ".factory-sandboxes" / run_id,
+                               launcher=self.entrypoint)
+        except (FactoryContractError, RuntimeError, OSError, ValueError) as exc:
+            # The mutating init already returned the executor's terminal receipt.
+            # A failed subsequent read cannot make that bounded writer active.
+            exc.quiescent = True
+            raise
 
     def _lock_contended_control(
         self, launcher: str | Path, args: Sequence[str], *, sandbox: Path,
@@ -839,8 +837,21 @@ class FeatureFactoryBackend:
         args: Sequence[str],
         *,
         sandbox: Path,
+        git_settings: Sequence[tuple[str, str]] = (),
+        timeout_s: float = 30,
+        credentials: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[Any]:
         entrypoint = resolve_factory_entrypoint(launcher)
+        environment = _control_environment()
+        if credentials is not None:
+            if set(credentials) - {"GH_TOKEN", "GITHUB_TOKEN", FACTORY_PUBLISHING_IDENTITY_ENV}:
+                raise FactoryContractError("factory control credential projection is invalid")
+            environment.update(credentials)
+        if git_settings:
+            from ..daemon_sessions import session_environment
+
+            trusted = session_environment({}, home=sandbox, git_settings=git_settings, credentials={})
+            environment.update({key: value for key, value in trusted.items() if key.startswith("GIT_CONFIG_")})
         try:
             from ..worker_client import factory_checkout_for_path, run_factory_control
 
@@ -852,20 +863,36 @@ class FeatureFactoryBackend:
                 result = run_factory_control(
                     sandbox, [sys.executable, "-I", str(projection),
                               "status" if args[0] == "status" else "other", *command],
-                    env=_control_environment(), timeout=30,
+                    env=environment, timeout=timeout_s,
                     output_limit=_MAX_STATUS_BYTES,
+                    **({"initialize": True} if args[0] == "init" else {}),
                 )
             else:
                 result = _invoke_bounded_or_injected(
-                    self.runner, command, env=_control_environment(),
-                    timeout=30, output_limit=_MAX_STATUS_BYTES,
+                    self.runner, command, env=environment,
+                    timeout=timeout_s, output_limit=_MAX_STATUS_BYTES,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise FactoryContractError("factory control command timed out") from exc
-        _strict_diagnostic(result)
+            error = FactoryContractError("factory control command timed out")
+            error.quiescent = bool(getattr(exc, "quiescent", False))
+            raise error from exc
+        if args[0] == "status" and result.returncode == 0:
+            stdout = result.stdout or b""
+            if isinstance(stdout, str):
+                stdout = stdout.encode("utf-8", "strict")
+            if not isinstance(stdout, bytes) or len(stdout) > 256 * 1024:
+                raise FactoryContractError("factory status projection exceeds 256 KiB")
+            _strict_diagnostic(subprocess.CompletedProcess(result.args, 0, b"", result.stderr))
+        else:
+            _strict_diagnostic(result)
         if result.returncode != 0:
             detail = _strict_diagnostic(result)
-            raise FactoryContractError(detail or f"factory control exited {result.returncode}")
+            from mimir_cultivate.opencode import redact_daemon_output
+
+            diagnostic = redact_daemon_output(detail).encode("utf-8")[:8192].decode("utf-8", "ignore")
+            error = FactoryContractError(diagnostic or f"factory control exited {result.returncode}")
+            error.quiescent = True
+            raise error
         return result
 
     def status(self, run_id: str, *, sandbox: Path, launcher: str | Path) -> FactoryStatus:
@@ -953,13 +980,23 @@ class FeatureFactoryBackend:
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
             raise TypeError("FeatureFactoryBackend.interpret expects ComputeResult")
+        from mimir_cultivate.opencode import redact_daemon_output
+
+        sid = result.handle.opencode_session_id if result.handle else (
+            result.session_outcome.opencode_session_id if result.session_outcome else None)
         if result.launch_error:
-            return RawResult(-1, None, "backend_error", result.launch_error)
+            return RawResult(-1, None, "backend_error", redact_daemon_output(result.launch_error),
+                             opencode_session_id=sid)
         if result.timed_out:
-            return RawResult(-1, None, "failed", "OpenCode process timed out")
-        if result.exit_code != 0:
-            return RawResult(result.exit_code, None, "failed", result.stderr or None)
-        return RawResult(0, None, "interrupted", None)
+            return RawResult(-1, None, "failed", "OpenCode host deadline exceeded", opencode_session_id=sid)
+        outcome = result.session_outcome
+        if outcome is None:
+            return RawResult(-1, None, "backend_error", "OpenCode host outcome is missing", opencode_session_id=sid)
+        error = result.session_error or outcome.error
+        detail = redact_daemon_output(f"{error.type}: {error.message}") if error else None
+        if outcome.execution_state not in {"succeeded", "interrupted"}:
+            return RawResult(1, None, "failed", detail or "OpenCode host did not complete", opencode_session_id=sid)
+        return RawResult(0, None, "interrupted", detail, opencode_session_id=sid)
 
 
 # feature-factory 0.8.0+'s own variable, read by the factory CHILD. Distinct from

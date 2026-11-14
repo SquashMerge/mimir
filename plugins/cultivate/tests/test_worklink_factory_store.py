@@ -1,10 +1,9 @@
-"""Quiescent OpenCode store reclamation and session continuity."""
+"""No per-run daemon DB maintenance; retain guarded legacy runtime cleanup."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -60,7 +59,7 @@ def test_factory_store_refuses_live_driver(tmp_path: Path) -> None:
         with sqlite3.connect(db) as conn:
             conn.execute("CREATE TABLE event (type TEXT)")
             conn.execute("INSERT INTO event VALUES ('message.part.updated')")
-        with pytest.raises(RuntimeError, match="driver death is not verified"):
+        with pytest.raises(RuntimeError, match="not supported"):
             prune_factory_store(record)
         with sqlite3.connect(db) as conn:
             assert conn.execute("SELECT count(*) FROM event").fetchone() == (1,)
@@ -77,19 +76,19 @@ def test_factory_store_refuses_other_attempt_and_symlink(tmp_path: Path) -> None
     other = Path(record.sandbox).parents[2].parent / "1983-2" / "checkout" / ".factory-sandboxes" / record.run_id
     other.mkdir(parents=True)
     foreign = replace(record, sandbox=str(other), status=replace(record.status, sandbox_path=str(other)))
-    with pytest.raises(RuntimeError, match="outside the attempt boundary"):
+    with pytest.raises(RuntimeError, match="not supported"):
         prune_factory_store(foreign)
     legacy = replace(record, run_id="1983", status=replace(record.status, run_id="1983"))
-    with pytest.raises(RuntimeError, match="outside the attempt boundary"):
+    with pytest.raises(RuntimeError, match="not supported"):
         prune_factory_store(legacy)
     other_parent = Path(record.sandbox).parent.parent / "unrelated" / record.run_id
     other_parent.mkdir(parents=True)
     foreign = replace(record, sandbox=str(other_parent), status=replace(record.status, sandbox_path=str(other_parent)))
-    with pytest.raises(RuntimeError, match="outside the attempt boundary"):
+    with pytest.raises(RuntimeError, match="not supported"):
         prune_factory_store(foreign)
     db.rename(db.with_suffix(".kept"))
     db.symlink_to(db.with_suffix(".kept"))
-    with pytest.raises(RuntimeError, match="not a regular file"):
+    with pytest.raises(RuntimeError, match="not supported"):
         prune_factory_store(record)
     with sqlite3.connect(db.with_suffix(".kept")) as conn:
         assert conn.execute("SELECT count(*) FROM event").fetchone() == (1,)
@@ -101,14 +100,14 @@ def test_factory_store_refuses_linked_file_and_symlink_directory(tmp_path: Path)
         conn.execute("CREATE TABLE event (type TEXT)")
     linked = tmp_path / "linked.db"
     os.link(db, linked)
-    with pytest.raises(RuntimeError, match="not a regular file"):
+    with pytest.raises(RuntimeError, match="not supported"):
         _prune_db(db)
     linked.unlink()
     data = db.parent.parent
     target = data.with_name("outside")
     data.rename(target)
     data.symlink_to(target, target_is_directory=True)
-    with pytest.raises(RuntimeError, match="directory is unsafe"):
+    with pytest.raises(RuntimeError, match="not supported"):
         _prune_db(db)
 
 
@@ -117,7 +116,7 @@ def test_factory_store_requires_verified_death(tmp_path: Path) -> None:
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE event (type TEXT)")
         conn.execute("INSERT INTO event VALUES ('message.part.updated')")
-    with pytest.raises(RuntimeError, match="driver death is not verified"):
+    with pytest.raises(RuntimeError, match="not supported"):
         prune_factory_store(record)
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT count(*) FROM event").fetchone() == (1,)
@@ -152,13 +151,13 @@ def test_factory_store_refuses_busy_wal_reader(tmp_path: Path) -> None:
             reader.execute("SELECT * FROM event").fetchall()
             writer.execute("INSERT INTO event VALUES ('message.updated')")
             writer.commit()
-            with pytest.raises(RuntimeError, match="reader or writer"):
+            with pytest.raises(RuntimeError, match="not supported"):
                 _prune_db(db)
         assert writer.execute("SELECT count(*) FROM event").fetchone() == (2,)
 
 
 @pytest.mark.asyncio
-async def test_factory_park_prunes_without_touching_recovery_evidence(
+async def test_factory_park_preserves_database_and_recovery_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record, db = _record(tmp_path, _dead_handle())
@@ -181,7 +180,7 @@ async def test_factory_park_prunes_without_touching_recovery_evidence(
     )
     assert result.status == "needs-human" and transitions == ["blocked"]
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT count(*) FROM event").fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM event").fetchone() == (1,)
     assert run_json.read_text() == '{"status": "needs-human"}'
     assert artifact.read_text() == "retained artifact"
 
@@ -315,7 +314,7 @@ def test_attempt_pruner_requires_runtime_preparation(tmp_path: Path) -> None:
     assert attempt.is_dir()
 
 
-def test_event_filter_and_vacuum_are_exact(tmp_path):
+def test_retired_compaction_preserves_all_event_types_and_database_bytes(tmp_path):
     _, db = _record(tmp_path, _dead_handle())
     retained = ["message.updated", "session.updated", "worklink", "message.part.updated.2"]
     with sqlite3.connect(db) as conn:
@@ -324,18 +323,20 @@ def test_event_filter_and_vacuum_are_exact(tmp_path):
                          [(name, b"keep") for name in retained] +
                          [(name, b"x" * 8192) for name in
                           ["message.part.updated", "message.part.updated.1"] for _ in range(100)])
-    metrics = _prune_db(db)
-    assert metrics["rows_deleted"] == 200
-    assert metrics["bytes_after"] < metrics["bytes_before"]
+    before = db.read_bytes()
+    with pytest.raises(RuntimeError, match="not supported"):
+        _prune_db(db)
+    assert db.read_bytes() == before
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT type, data FROM event").fetchall() == [(name, b"keep") for name in retained]
+        assert conn.execute("SELECT type, data FROM event WHERE data = ?", (b"keep",)).fetchall() == [(name, b"keep") for name in retained]
+        assert conn.execute("SELECT count(*) FROM event").fetchone() == (204,)
 
 
 def test_unacknowledged_specialists_refuse_prune_and_ttl(tmp_path):
     record, db = _record(tmp_path, _dead_handle())
     record = replace(record, children_reaped=False)
     db.write_bytes(b"untouched")
-    with pytest.raises(RuntimeError, match="specialist reaping"):
+    with pytest.raises(RuntimeError, match="not supported"):
         prune_factory_store(record)
     attempt = Path(record.sandbox).parents[2]
     assert not autonomy._prepare_factory_runtime_prune(attempt, [record])
@@ -472,23 +473,20 @@ def test_operator_runtime_recovery_cli_requires_confirmation_and_dispatches(tmp_
     assert calls == [((tmp_path, tmp_path / "1983-1"), {"operator_confirmed_quiescent": True})]
 
 
-def test_executor_prune_uses_current_isolated_interpreter(tmp_path, monkeypatch):
+def test_retired_prune_never_launches_an_executor_or_opens_its_store(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import worker_client
     record, db = _record(tmp_path, _dead_handle())
     db.write_bytes(b"worker-owned")
     checkout = Path(record.sandbox).parent.parent
     calls = []
     monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (checkout, 1983, 1))
-    metrics = {"bytes_before": 20, "bytes_after": 10, "rows_deleted": 1}
     def control(path, argv, **kwargs):
-        assert path == checkout
-        assert argv == [sys.executable, "-I", str(Path(sys.modules[prune_factory_store.__module__].__file__).resolve()),
-                        "--prune", str(db)]
         calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, json.dumps(metrics).encode(), b"")
+        pytest.fail("per-run database maintenance must not be delegated")
     monkeypatch.setattr(worker_client, "run_factory_control", control)
-    assert prune_factory_store(record) == metrics
-    assert len(calls) == 1
+    with pytest.raises(RuntimeError, match="not supported"):
+        prune_factory_store(record)
+    assert calls == [] and db.read_bytes() == b"worker-owned"
 
 
 def test_ttl_cleanup_timeout_is_fail_closed(tmp_path, monkeypatch):
@@ -506,7 +504,8 @@ def test_legacy_store_layout_has_no_sibling_runtime(tmp_path):
     record, _ = _record(tmp_path, _dead_handle())
     sandbox = tmp_path / "legacy" / record.run_id
     record = replace(record, sandbox=str(sandbox), status=None)
-    assert prune_factory_store(record) is None
+    with pytest.raises(RuntimeError, match="not supported"):
+        prune_factory_store(record)
 
 
 def test_executor_runtime_cleanup_uses_current_interpreter_and_precedes_rmtree(tmp_path, monkeypatch):
@@ -554,26 +553,20 @@ async def test_housekeeping_failure_preserves_run_outcome(tmp_path, monkeypatch,
     )
     assert result.status == ("needs-human" if state == "needs-human" else "review_ready")
     assert transitions == (["blocked"] if state == "needs-human" else ["review"])
-    assert any(name == "worklink_factory_opencode_prune_failed" and fields["reason"] for name, fields in events)
+    assert not any(name == "worklink_factory_opencode_prune_failed" for name, fields in events)
 
 
 @pytest.mark.asyncio
-async def test_cancellation_drains_store_thread_before_return(tmp_path, monkeypatch):
-    from mimir_cultivate.worklink import factory_store
+async def test_cancellation_drains_bounded_node_control_before_releasing_locks(tmp_path, monkeypatch):
     record, _ = _record(tmp_path, _dead_handle())
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
-    def prune(record):
+    def control():
         entered.set()
         assert release.wait(5)
         finished.set()
-    monkeypatch.setattr(factory_store, "prune_factory_store", prune)
     runner = orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)
     async def finish_under_production_locks(*args, **kwargs):
-        return await runner._finish_factory_070(
-            issue=orchestrator.IssueContext(1983, "Factory", "run", set()),
-            claim_record=object(), claims=object(), backend=object(), compute=object(),
-            factory_record=record, test_cmd="pytest", runner=object(), started_at=datetime.now(UTC),
-        )
+        return await orchestrator._await_factory_control(control)
     monkeypatch.setattr(orchestrator.WorklinkRunner, "_run_factory_070_locked", finish_under_production_locks)
     task = asyncio.create_task(runner.run_epic(1983))
     try:
@@ -599,126 +592,38 @@ async def test_cancellation_drains_store_thread_before_return(tmp_path, monkeypa
         assert acquired
 
 
-@pytest.mark.real_coding_cli("opencode")
-def test_opencode_task_id_resume_after_prune(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_coding_cli: str,
-) -> None:
-    """Use the real OpenCode CLI/schema and a local deterministic model endpoint."""
-    binary = real_coding_cli
-    requests: list[dict] = []
-    events: list[tuple[str, dict]] = []
-    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda name, **fields: events.append((name, fields)))
-    tool_step = 0
-    child_id = None
+@pytest.mark.asyncio
+async def test_daemon_session_continuity_requires_no_database_maintenance(tmp_path):
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
 
-    class Model(BaseHTTPRequestHandler):
-        def log_message(self, *args: object) -> None:
-            pass
-
-        def do_POST(self) -> None:
-            nonlocal tool_step
-            length = int(self.headers["Content-Length"])
-            request = json.loads(self.rfile.read(length))
-            requests.append(request)
-            if request.get("tools") and tool_step < 2:
-                step = tool_step
-                tool_step += 1
-                function = (
-                    {"name": "task", "arguments": json.dumps({
-                        "description": "Child continuity fixture", "subagent_type": "general",
-                        "prompt": "Read the continuity fixture",
-                        **({"task_id": child_id} if child_id else {}),
-                    })}
-                    if step == 0 else
-                    {"name": "read", "arguments": json.dumps({"filePath": str(resume_path if child_id else first_path)})}
-                )
-                chunks = [
-                    {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
-                        {"index": 0, "id": f"call_fixture_{step}", "type": "function", "function": function},
-                    ]}}]},
-                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
-                ]
-            else:
-                chunks = [
-                    {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "session resumed with tool output"}}]},
-                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
-                ]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            for chunk in chunks:
-                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-
-    with ThreadingHTTPServer(("127.0.0.1", 0), Model) as server:
-        thread = threading.Thread(target=server.serve_forever)
-        thread.start()
-        try:
-            record, db = _record(tmp_path, _dead_handle())
-            checkout = Path(record.sandbox).parent.parent
-            first_path = checkout / "continuity-first.txt"
-            resume_path = checkout / "continuity-resume.txt"
-            first_path.write_text(str(checkout))
-            resume_path.write_text("child-resume-second-turn")
-            config = {
-                "model": "fixture/fixture", "provider": {"fixture": {
-                    "npm": "@ai-sdk/openai-compatible", "name": "Fixture",
-                    "options": {"baseURL": f"http://127.0.0.1:{server.server_port}/v1", "apiKey": "fixture"},
-                    "models": {"fixture": {"name": "Fixture", "limit": {"context": 32000, "output": 2048}}},
-                }},
-            }
-            env = dict(os.environ, XDG_DATA_HOME=str(db.parent.parent),
-                       XDG_CONFIG_HOME=str(tmp_path / "config"), XDG_CACHE_HOME=str(tmp_path / "cache"),
-                       OPENCODE_CONFIG_CONTENT=json.dumps(config))
-
-            def run(*args: str) -> subprocess.CompletedProcess[str]:
-                result = subprocess.run([binary, *args, "--pure", "--dir", str(checkout)],
-                                        env=env, capture_output=True, text=True, timeout=50)
-                assert result.returncode == 0, (result.stdout, result.stderr)
-                return result
-
-            first = run("run", "Read the continuity fixture", "--format", "json")
-            task_ids = [json.loads(line)["sessionID"] for line in first.stdout.splitlines()
-                        if line.startswith("{") and "sessionID" in json.loads(line)]
-            assert task_ids and db.exists() and len(requests) >= 2
-            with sqlite3.connect(db) as conn:
-                children = conn.execute("SELECT id FROM session WHERE parent_id = ?", (task_ids[0],)).fetchall()
-                assert len(children) == 1
-                child_id = children[0][0]
-                child_messages_before = conn.execute("SELECT count(*) FROM message WHERE session_id = ?", (child_id,)).fetchone()[0]
-                assert conn.execute("SELECT count(*) FROM part WHERE json_extract(data, '$.type') = 'tool'").fetchone()[0] >= 2
-                before = conn.execute("SELECT count(*) FROM event WHERE type IN ('message.part.updated', 'message.part.updated.1')").fetchone()[0]
-                retained = conn.execute("SELECT count(*) FROM event WHERE type NOT IN ('message.part.updated', 'message.part.updated.1')").fetchone()[0]
-                assert before > 0
-            metrics = prune_factory_store(record)
-            assert metrics is not None and metrics["rows_deleted"] == before
-            assert events == [("worklink_factory_opencode_pruned", {
-                "issue_id": 1983, "attempt": 1, "run_id": "chainlink-1983", **metrics,
-            })]
-            with sqlite3.connect(db) as conn:
-                assert conn.execute("SELECT count(*) FROM event WHERE type IN ('message.part.updated', 'message.part.updated.1')").fetchone() == (0,)
-                assert conn.execute("SELECT count(*) FROM event").fetchone() == (retained,)
-                assert conn.execute("SELECT count(*) FROM session WHERE id = ?", (task_ids[0],)).fetchone() == (1,)
-            request_count = len(requests)
-            tool_step = 0  # Call task again using the retained child task_id.
-            run("run", "Recall the tool output", "--session", task_ids[0], "--format", "json")
-            history = json.dumps([message for request in requests[request_count:]
-                                  for message in request.get("messages", [])])
-            assert "Read the continuity fixture" in history
-            assert str(checkout) in history and '"role": "tool"' in history
-            assert child_id in history
-            with sqlite3.connect(db) as conn:
-                assert conn.execute("SELECT id FROM session WHERE parent_id = ?", (task_ids[0],)).fetchall() == [(child_id,)]
-                assert conn.execute("SELECT count(*) FROM message WHERE session_id = ?", (child_id,)).fetchone()[0] > child_messages_before
-                child_tools = [json.loads(row[0]) for row in conn.execute(
-                    "SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'tool'", (child_id,))]
-                assert any(part.get("state", {}).get("status") == "completed" and
-                           "child-resume-second-turn" in part.get("state", {}).get("output", "")
-                               for part in child_tools)
-                assert any("child-resume-second-turn" in str(message.get("content", ""))
-                           for request in requests[request_count:] for message in request.get("messages", [])
-                           if message.get("role") == "tool")
-        finally:
-            server.shutdown()
-            thread.join(timeout=5)
+    checkout = tmp_path / "checkout/.factory-sandboxes/chainlink-1983"
+    checkout.mkdir(parents=True)
+    shared = tmp_path / "daemon-owned.db"
+    with sqlite3.connect(shared) as db:
+        db.execute("CREATE TABLE event (type TEXT)")
+        db.execute("INSERT INTO event VALUES ('retained-native-history')")
+    before = shared.read_bytes()
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        path = tmp_path / "private-controller.json"
+        controller = await SessionController.create(client, path,
+            request=SessionRequest("epic", {"providerID": "openai", "id": "test"},
+                                   "--autonomous --max-retries 5 chainlink-1983"),
+            issue_id=1983, attempt=1, generation="continuity", checkout=checkout,
+            environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+        sid = controller.record.opencode_session_id
+        daemon.finish(sid)
+        result = await controller.observe()
+        assert result.execution_state == "succeeded"
+        cursor, input_id = controller.record.last_seq, controller.record.input_id
+        with pytest.raises(RuntimeError, match="not supported"):
+            _prune_db(shared)
+        recovered = SessionController.recover(client, path, generation="continuity", checkout=checkout)
+        result = await recovered.observe()
+        assert result.opencode_session_id == sid and result.execution_state == "succeeded"
+        assert recovered.record.last_seq == cursor and recovered.record.input_id == input_id
+        assert len([route for _, route, _, _ in daemon.requests if route.endswith("/command")]) == 1
+        assert shared.read_bytes() == before
+        await recovered.release()

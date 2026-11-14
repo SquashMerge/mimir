@@ -133,30 +133,28 @@ running agent can instead activate a newly installed poller through its
 
 Factory epics use the same repository declaration and isolated-checkout allocator,
 but have separate admission and concurrency. The image installs
-`feature-factory@0.12.1` and `opencode-feature-factory@0.12.1` under
+`feature-factory@0.14.0` and `opencode2-feature-factory@0.14.0` under
 `/opt/mimir-opencode`; `MIMIR_FACTORY_ENTRYPOINT` names the absolute
 `feature-factory/bin/factory.js`. Set `MIMIR_FACTORY_EPICS_ENABLED=1` to let the
 poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults
 to `1`, independently of the leaf default `2`.
 
-The launch ends with `--command feature " --autonomous --max-retries 5
-<issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
+The daemon receives command `feature` with exactly `--autonomous --max-retries 5
+chainlink-<id>`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
 `[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
 invalid values. feature-factory 0.7.5 stages the workflow inside the run
 directory; exact token `--auto` is never passed. Worklink's base selects the
 checkout start point and PR target; it is not factory `--base`, which is never
 passed.
 
-Before first factory dispatch only, after checkout creation and before process
-launch, Worklink reads the effective checkout `git config --get user.name` and
-`git config --get user.email`. Both must be nonblank. The child receives
-`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
-`GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
+Before initialization, Worklink requires nonblank effective checkout
+`git config --get user.name` and `git config --get user.email`, forwarding only
+trusted captured Git settings into the session environment.
 
-Worklink reads the nonblank `publishing_identity` from
-`MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise from
-the trusted controller checkout's `.factory.json`. A set but blank or non-string
-override fails instead of falling back. For GitHub publication Worklink
+Worklink requires canonical `MIMIR_FACTORY_PUBLISHING_IDENTITY`; the legacy
+`.factory.json.publishing_identity` key refuses admission even with a valid
+environment identity. Remove that key through a reviewed repository edit.
+There is no repository fallback. For GitHub publication Worklink
 verifies the credential this process is already bound to, `GITHUB_TOKEN`, rather
 than selecting among candidates: `GH_TOKEN` is a child-only alias for `gh`, and
 verifying a second credential in a process that already verified one is refused
@@ -168,12 +166,13 @@ dispatch as an operator ambiguity rather than one being preferred, and a missing
 values.
 
 Worklink supervises OpenCode while `/feature` owns factory transitions. The
-12-hour `MIMIR_FACTORY_RUN_TIMEOUT_S` default is only a process liveness
-backstop. The 900-second `MIMIR_FACTORY_STALE_HEARTBEAT_S` threshold produces
+12-hour `MIMIR_FACTORY_RUN_TIMEOUT_S` default bounds the owned host session.
+The 900-second `MIMIR_FACTORY_STALE_HEARTBEAT_S` threshold produces
 diagnostics and never authorizes duplicate dispatch or takeover. A
 `needs-human` result remains parked in the retained sandbox. Resume performs
-status, justified run-ID-first lock acquisition, status, explicit resume,
-authoritative status, reconciliation, and exact OpenCode relaunch.
+verified old-session cancellation before a fresh session's real plugin context
+claims and resumes the parked run. A running retained host is observed again
+without another POST. Successful model turns never imply factory completion.
 
 A factory `completed` status does not by itself move the issue to review.
 Worklink independently runs the configured repository test command, requires a

@@ -13,6 +13,74 @@ and `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` at image build) and s
 load this provider or expose Worklink commands and tools. Historical rollout
 notes below describe the original architecture, not the current package boundary.
 
+## OpenCode 2 daemon operation
+
+Current OpenCode execution uses `OpenCodeDaemonComputeBackend` and
+`opencode_daemon` handles identified by `ses_...`, not per-build OpenCode PIDs.
+The `local_subprocess` configuration name and autonomous opt-in remain for
+compatibility; process-specific historical architecture notes below do not
+describe daemon-session lifecycle. Each invocation creates one exclusive session,
+sets a closed shell environment and submits one input. Reconnection observes the
+same durable log/history/inbox without replaying admission. Success requires
+correlated execution and outcome witnesses; a connected stream, initial idle,
+HTTP acknowledgment or model turn alone is not completion. Epic status remains
+authoritative through node factory.js, with lock session equal to OpenCode
+session ID. Evidence records `opencode_session_id` (null before session creation).
+Unverified cancellation retains checkout/controller state; it never kills or
+vacuums the shared daemon. Historical active V1 handles must be safely parked
+and recovered by an operator into a fresh session, never guessed PID resumption.
+
+Activation is runtime-selected trusted Cultivate **and** the root-owned image
+marker `/opt/cultivate-docker/opencode-enabled` set to `1`. Unselected/core and
+marker-0 images bypass daemon/login requirements; invalid markers or enabled
+missing binaries fail closed. One independent s6 `worklink-opencode` longrun
+executes plain `opencode serve --hostname 127.0.0.1 --port 4096` as worklink.
+Root preparation clean-execs through s6-setuidgid with a closed environment;
+the worklink supervisor never inherits the privileged interpreter's memory.
+The daemon is independent of native login and Mimir/plugin-ready markers.
+Root Mimir, both scaffold wrapper writers and both final workload templates
+gate enabled workloads, leaving the daemon available when login is missing.
+
+Setup prints `docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login`.
+The wrapper privately authenticates to the daemon and executes
+`opencode auth login --server http://127.0.0.1:4096 --method chatgpt-headless openai`.
+Use the actual service name in custom Compose projects. This login is independent
+of the agent's unchanged Codex device login; no auth.json seeding or refresh-token
+reconciliation remains. Daemon state lives in private worklink-owned directories
+under `/var/lib/mimir-worklink/daemon`, persisted in the `worklink-daemon` volume.
+Keep that volume during recreation. Native DB migrations belong to OpenCode.
+Read-only local health accepts `locally_unexpired` or `refreshable_unverified`,
+warning for the latter; it does not prove provider validity or subscription.
+
+Daemon credentials are only the generated private API password, normalized equal
+bot `GH_TOKEN`/`GITHUB_TOKEN` and optional canonical publishing identity. Both token
+aliases may be absent for native login; conflicting nonempty aliases refuse.
+Epic admission still requires original agent GITHUB_TOKEN and env-only identity.
+Builds intentionally share worklink uid and can read daemon API/native login/bot
+credentials. Compose.env, MIMIR_HOME, `/home/mimir`, agent Codex, model/Saga,
+tracker/alert/API secrets and OTLP headers remain mimir-private. This is an OS
+boundary from mimir, not isolation between same-uid builds.
+
+Apply changed credentials/identity/telemetry using the project's normal env and
+interpolation options with `docker compose up -d --force-recreate <actual-agent-service>`.
+Host env_file edits alone are not watched. Compose/s6 restart retains the current
+container environment; daemon restart snapshots that already-effective input.
+Agent/launch-snapshot mismatch reports sanitized `bot_token_stale`. Installed-bit
+changes require rebuild+recreate. Setup `--no-start` writes configuration and
+instructions/builds/provisions but starts/probes neither daemon nor workload.
+
+The pinned OTEL plugin uses inline options only. Tracing off disables it. Any
+sensitive OTLP carrier or credential-bearing endpoint disables it with
+`disabled_sensitive_otlp` and a setup/health explanation. Headers never enter
+daemon config/env, build env, transcripts or evidence. With tracing on and no
+sensitive input, capture-off uses `logsEnabled:false`,
+`disabledTraces:[session,llm,tool]`, `disabledMetrics:[]`,
+`capturePromptInLogs:false` and `captureModelContext:false`: metrics only.
+Capture-on enables logs/all traces and both content flags. Endpoint protocol is
+`http/protobuf`; `service.name` derives from MIMIR_OTEL_SERVICE_NAME plus identity
+(stable `worklink` if absent). Local daemon stderr is local container logging,
+not exported build evidence. Agent Python telemetry remains unchanged.
+
 Status: **Live and autonomous** (as of 2026-07-08; the original #380 slices
 have all shipped, and the #832 substrate cleanup has retired the
 `docker-sibling` broker and `ecs-runtask` compute paths). The production model
@@ -64,8 +132,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.12.1` through the lockstep
-`opencode-feature-factory@0.12.1` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.14.0` through the lockstep
+`opencode2-feature-factory@0.14.0` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -95,27 +163,24 @@ executor together by rebuilding the executor image before enabling this layout.
   starts or resumes the opencode feature-factory in the target repo. Until the
   flag is set, epics are only excluded from leaf dispatch and are never
   dispatched (no dispatch-then-refuse churn).
-- **Launch**: Worklink supervises exactly `opencode run --log-level DEBUG
-  --print-logs --dir <checkout> --command feature " --autonomous --max-retries
-  5 <issue>"`.
-  Cancellation is verified process-group cancellation through `mimir worklink
-  stop`; feature-factory has no cancel transition.
+- **Launch**: The daemon receives command `feature` with exactly
+  `--autonomous --max-retries 5 chainlink-<id>` in the verified epic sandbox.
+  Cancellation through `mimir worklink stop` verifies owned inbox/execution
+  quiescence; feature-factory has no cancel transition. The shared daemon is
+  never terminated or vacuumed for a run.
 - **Retry and staging**: `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts
   exactly ASCII `[0-9]+` in range `1..9007199254740991`, and falls back to `5`
   for absent or invalid values. feature-factory 0.7.5 stages the workflow inside
   the run directory; exact token `--auto` is never passed. Worklink's base
   selects the checkout start point and PR target; it is not factory `--base`,
   which is never passed.
-- **First-dispatch identity**: Before first factory dispatch only, after checkout
-  creation and before process launch, Worklink reads the effective checkout `git
-  config --get user.name` and `git config --get user.email`. Both must be
-  nonblank. The child receives `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
-  `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`; Worklink never writes sandbox
-  Git identity configuration.
-- **Publication credential**: Worklink reads the nonblank `publishing_identity`
-  from `MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise
-  from the trusted controller checkout's `.factory.json`. A set but blank or
-  non-string override fails instead of falling back. For GitHub
+- **First-dispatch identity**: Before initialization, Worklink requires nonblank
+  effective checkout `git config --get user.name` and `git config --get user.email`.
+  Only trusted captured Git settings enter the session environment.
+- **Publication credential**: Worklink requires canonical
+  `MIMIR_FACTORY_PUBLISHING_IDENTITY`. A legacy `.factory.json.publishing_identity`
+  key refuses admission even with a valid environment identity; removal requires
+  a reviewed repository edit. There is no repository fallback. For GitHub
   publication Worklink verifies the credential this process is already bound to,
   `GITHUB_TOKEN`, rather than selecting among candidates: `GH_TOKEN` is a
   child-only alias for `gh`, and verifying a second credential in a process that
@@ -126,7 +191,7 @@ executor together by rebuilding the executor image before enabling this layout.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.12.1 verification and
+  Worklink admits the launcher only after package/adapter 0.14.0 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume uses the retained session, while
   heartbeat uses the newly claimed session after recovery; lock actions use
@@ -615,7 +680,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.12.1 controls. |
+| `feature_factory` | daemon command `feature`, text `--autonomous --max-retries 5 chainlink-<id>` | Epic adapter with session-supervised OpenCode and absolute 0.14.0 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -1421,15 +1486,19 @@ registry construction instead of falling back to another backend. Remove any
 vestigial `backends.codex`, `backends.claude_cli`, or routes/defaults selecting
 those retired names from operator-owned `worklink.yaml` files.
 
-Worklink's OpenCode backend passes a per-run `OPENCODE_PERMISSION` override with
-`external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
+Worklink's OpenCode leaf backend creates a fresh exclusive daemon session with
+ordered `external_directory/* deny`, `shell/* deny`, then exactly the validated
+leaf shell allows (derived defaults: `git *` and the selected test runner).
 This is deliberately `deny`, never `ask`: Worklink runs headlessly, so an
 approval request would wait forever. A denied tool call is returned by OpenCode
 as a permission error and recorded in the Worklink transcript rather than
 opening an interactive prompt. Configure `backends.opencode.bash_allowlist` with
 the command patterns required by the selected repository's test runner, package
-manager/build, and Git workflow. The list replaces the defaults; an empty list
-denies every shell command.
+manager/build, and Git workflow. Explicit lists retain nonempty/catch-all/test
+command validation. Spawn instead permits general-purpose shell after its admin,
+depth/rate and contained-checkout gates. Epics retain external-directory and
+`.env`, `**/.env`, `**/.env.*` read denials, with no session shell deny overriding
+the adapter's shell grant. Read-tool denials are not shell isolation.
 
 This policy is defense-in-depth for **trusted code work only**, not process
 confinement. OpenCode's file/path checks and shell command matcher run inside the
@@ -1466,10 +1535,10 @@ even if another signal is absent.
 tool_pins:
   - name: opencode               # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
-    pin: "1.19.4"              # required: version, tag, or SHA currently expected
+    pin: "2.2.7"               # required: version, tag, or SHA currently expected
     smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
-    package: "opencode-ai"       # optional upstream package/repo identifier
+    package: "@opencode/cli"     # optional upstream package/repo identifier
   - name: codex
     category: coding-cli
     pin: "0.139.0"

@@ -187,7 +187,7 @@ unless your collector and retention policy are approved for that data.
 | `MIMIR_MODEL_MAX_TOKENS` | int | `0` | Per-call **output** token cap for non-`claude-code` providers. `0` = provider default. Raise for thinking-via-Anthropic-compat models whose reasoning counts against output. |
 | `MIMIR_MODEL_REASONING_EFFORT` | str | `""` | Reasoning effort forwarded to supported model providers. Codex-Plus accepts `none`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; unset/`""` uses the model default. Other providers retain their provider-specific values and behavior. |
 | `MIMIR_WORKLINK_REASONING_EFFORT` | str | `""` | Optional override of `MIMIR_MODEL_REASONING_EFFORT` for Worklink OpenCode leaf builds only. Exported env wins over `<home>/.env`; unset or empty falls back to the agent effort. `none` omits `--variant`, as does an unset effort. OpenAI models accept Codex-Plus effort values; other providers use their own variant names. Feature-factory runs use their per-agent variants instead. |
-| `OPENCODE_CONFIG` | path | `$XDG_CONFIG_HOME/opencode/opencode.jsonc` or `~/.config/opencode/opencode.jsonc` | OpenCode's native operator-owned JSON/JSONC. Its `model`, `provider`, plugin, proxy, and `{env:NAME}` settings are used unchanged by both `spawn_open_code` and the Worklink backend. If `model` is absent, the live `MIMIR_MODEL_SPEC` is translated to `provider/model`; an explicit spawn `model` wins over both. |
+| `OPENCODE_CONFIG` | path | `/var/lib/mimir-worklink/daemon/config/opencode/opencode.json` | Service-owned private daemon config; agent/project configs are not projected. Worklink translates `MIMIR_MODEL_SPEC` to a session model; an explicit spawn model overrides it. |
 | `MIMIR_EFFORT` | str | `high` | Effort level recorded on the config. |
 | `MIMIR_EMBED_MODEL` | str | `BAAI/bge-small-en-v1.5` | Embedding model id. |
 | `MIMIR_CONTEXT_1M` | bool | `true` | Opt into Anthropic's 1M-context beta header for Claude 4.x. Disable for accounts/models without the beta. |
@@ -530,7 +530,7 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
-| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.12.1 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
+| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.14.0 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
 | `MIMIR_FACTORY_MAX_CONCURRENT` | positive int | `1` | Factory-only concurrent Chainlink claim cap. The ordinary leaf cap remains `defaults.max_concurrent` with default `2`. |
 | `MIMIR_FACTORY_MAX_RETRIES` | ASCII decimal integer | `5` | Factory `/feature` retry budget. Accepts exactly ASCII `[0-9]+` valued from `1` through `9007199254740991`; absent or invalid values fall back to `5`. |
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
@@ -541,24 +541,23 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 | `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 
-The factory launch ends with `--command feature " --autonomous --max-retries 5
-<issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
+The daemon receives command `feature` with exactly `--autonomous --max-retries 5
+chainlink-<id>`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
 `[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
 invalid values. feature-factory 0.7.5 stages the workflow inside the run
 directory; exact token `--auto` is never passed. Worklink's base selects the
 checkout start point and PR target; it is not factory `--base`, which is never
 passed.
 
-Before first factory dispatch only, after checkout creation and before process
-launch, Worklink reads the effective checkout `git config --get user.name` and
-`git config --get user.email`. Both must be nonblank. The child receives
-`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
-`GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
+Before factory initialization, Worklink reads the effective checkout
+`git config --get user.name` and `git config --get user.email`. Both must be
+nonblank. Trusted captured Git settings enter the session environment; ambient
+`GIT_*` values and agent authentication homes do not.
 
-Worklink reads the nonblank `publishing_identity` from
-`MIMIR_FACTORY_PUBLISHING_IDENTITY` when that variable is set, otherwise from
-the trusted controller checkout's `.factory.json`. A set but blank or non-string
-override fails instead of falling back. For GitHub publication Worklink
+Worklink requires canonical `MIMIR_FACTORY_PUBLISHING_IDENTITY`, without control
+characters. A legacy `.factory.json.publishing_identity` key refuses admission
+even when that environment variable is valid; remove the key through a reviewed
+repository edit. There is no repository fallback. For GitHub publication Worklink
 verifies the credential this process is already bound to, `GITHUB_TOKEN`, rather
 than selecting among candidates: `GH_TOKEN` is a child-only alias for `gh`, and
 verifying a second credential in a process that already verified one is refused
@@ -569,14 +568,10 @@ dispatch as an operator ambiguity rather than one being preferred, and a missing
 `GITHUB_TOKEN` fails naming that variable - in both cases without disclosing
 values.
 
-`MIMIR_FACTORY_PUBLISHING_IDENTITY` and `FACTORY_PUBLISHING_IDENTITY` are two
-different variables with two different consumers, and a mimirbot-shaped deployment
-needs both. The first is read by the CONTROLLER for its pre-dispatch verification.
-  The second is inherited by the FACTORY CHILD (feature-factory 0.8.0+) and is what
-the driver compares against `gh api /user`. Setting only the controller variable
-lets the pre-flight pass and the run then park at Gate 1 naming the file's
-identity, which reads as a misconfiguration rather than a variable the child never
-received.
+The daemon projects canonical `MIMIR_FACTORY_PUBLISHING_IDENTITY` as
+`FACTORY_PUBLISHING_IDENTITY`; operators do not configure a second precedence
+source. Epic admission still requires the original agent `GITHUB_TOKEN`. A
+GH-only daemon configuration never manufactures that parent credential.
 
 ## Worklink YAML
 
@@ -591,7 +586,7 @@ above configures the Mimir process. Omitted keys use the defaults below.
 | `routes` | list[mapping] | `[]` | Selects tool/compute backends using first-match-wins rules. | `routes: [{label: worklink:epic, backend: feature_factory}]` |
 | `backends` | mapping | `{}` | Configures the shipping tool-backend adapters. | `backends: {opencode: {bin: opencode}}` |
 | `compute_backends` | mapping | `{}` | Configures compute substrates; the sole shipping substrate accepts an empty block only. | `compute_backends: {local_subprocess: {}}` |
-| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.19.4", smoke: "opencode --version"}]` |
+| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "2.2.7", smoke: "opencode --version"}]` |
 
 ### Repository Inventory
 
@@ -760,14 +755,14 @@ bypass that gate; the default Python suite remains required.
 | `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
 | `defaults.reaper_ttl_s` | positive int | `86400` | Lost-heartbeat recovery grace in seconds. Minimum `2 * timeout_s` (3600 for a 1800-second leaf); lower values warn and are raised at load. Backend waiting and finalization, including gate reruns, heartbeat throughout; this is not a total-runtime bound or atomic publication fence. Factory claims are excluded from the leaf reaper. | `reaper_ttl_s: 86400` |
 | `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
-| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.12.1 runtime consumes it. | `epic_branch_prefix: "epic/"` |
-| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.12.1 runtime consumes it. | `max_review_retries: 3` |
-| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.12.1 runtime consumes it. | `max_claim_attempts: 5` |
-| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.12.1 runtime consumes it. | `reviewer_backend: opencode` |
+| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.14.0 runtime consumes it. | `epic_branch_prefix: "epic/"` |
+| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.14.0 runtime consumes it. | `max_review_retries: 3` |
+| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.14.0 runtime consumes it. | `max_claim_attempts: 5` |
+| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.14.0 runtime consumes it. | `reviewer_backend: opencode` |
 | `defaults.tiered_review` | mapping | framework defaults | Compatibility-only parsed review classifier; its child keys are described below. | `tiered_review: {multi_vote_reviewer_count: 5}` |
 
 `defaults.trusted_test_retries` is **retired**, not an operator setting in
-0.12.1. It belonged to the removed distributed trusted-test runner. A value in
+0.14.0. It belonged to the removed distributed trusted-test runner. A value in
 YAML has no effect and must not be used as a retry guarantee; for example,
 remove `trusted_test_retries: 1` from an older deployment file.
 
@@ -819,7 +814,7 @@ routes:
 ### Backend blocks
 
 `backends` defaults to `{}`. Only `opencode` and `feature_factory` ship in
-0.12.1. An unknown referenced backend fails configuration loading; stale settings
+0.14.0. An unknown referenced backend fails configuration loading; stale settings
 for an unreferenced backend are warned and dropped.
 
 | Key | Type | Default | Effect | Example |
@@ -830,7 +825,7 @@ for an unreferenced backend are warned and dropped.
 | `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
 | `backends.feature_factory.entrypoint` | absolute path | `MIMIR_FACTORY_ENTRYPOINT` or the fixed image path | Exact `feature-factory/bin/factory.js` used by every `node` control command and retained recovery record. | `entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` |
 
-The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.12.1` and `opencode-feature-factory@0.12.1` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
+The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.14.0` and `opencode2-feature-factory@0.14.0` under one npm prefix and registers only the OpenCode adapter. Its exact factory dependency must match; managed V1 siblings are refused. The optional Claude adapter is not required. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition or shared-daemon database maintenance.
 
 For example, to bound pytest runs launched by the model (including through bash):
 
@@ -865,10 +860,10 @@ remaining fields are optional and default to unset.
 |---|---|---|---|---|
 | `tool_pins[].name` | str | required | Stable local tool name. | `name: opencode` |
 | `tool_pins[].category` | str | required | Tool class used in maintenance output. | `category: coding-cli` |
-| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "1.19.4"` |
+| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "2.2.7"` |
 | `tool_pins[].smoke` | str | required | Command recorded as bump evidence; issue rendering does not execute it. | `smoke: "opencode --version"` |
 | `tool_pins[].source` | str | unset | Upstream lookup strategy. | `source: npm` |
-| `tool_pins[].package` | str | unset | Upstream package identifier. | `package: opencode-ai` |
+| `tool_pins[].package` | str | unset | Upstream package identifier. | `package: "@opencode/cli"` |
 | `tool_pins[].repo` | str | unset | Upstream repository identifier. | `repo: anomalyco/opencode` |
 | `tool_pins[].install` | str | unset | Human-readable install surface. | `install: scaffold Dockerfile` |
 | `tool_pins[].risk` | str | unset | Human-readable upgrade risk. | `risk: high` |
@@ -942,7 +937,7 @@ These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
 | `MIMIR_GIT_URL` | str | `https://github.com/SquashMerge/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
 | `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
-| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Root Dockerfile build arg: `1` installs pinned OpenCode and bootstraps its config. Selected Cultivate scaffold images use the same build argument and pass it to runtime bootstrap; this is not the runtime plugin selection (`MIMIR_PLUGINS`). |
+| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Image build arg: `1` installs pinned OpenCode and writes the root-owned installed marker. Runtime activation also requires selected trusted Cultivate; environment variables cannot override the built bit. Private daemon config is generated at service startup, never seeded from agent auth. |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
 | `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
 
@@ -956,11 +951,25 @@ or absent provider supplies no coding tools. For image builds, select Cultivate
 at build time with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
 `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` as described in
 [plugins](plugins.md#docker-image-assembly-and-services).
-`MIMIR_ENABLE_OPENCODE` is a build argument for the pinned CLI/bootstrap, not
+`MIMIR_ENABLE_OPENCODE` is a build argument for the pinned daemon installation, not
 a runtime coding switch. Compose reads its project `.env` for build argument
 interpolation, not `compose.env`; place runtime `MIMIR_PLUGINS` in the process
 environment. Regenerate scaffolds and rebuild images after changing installed
-plugins. `--opencode` only optionally bakes the home's config into the image.
+plugins. Selected Cultivate images never bake agent OpenCode config; the daemon
+generates its own private config. Core-only generic scaffolds retain their
+optional config-baking compatibility flag.
+
+Activation requires both runtime-selected trusted Cultivate and image marker
+`/opt/cultivate-docker/opencode-enabled` equal to `1`. Missing/`0` bypasses native
+login/workload requirements and reports `daemon_enabled:false`; invalid marker
+or an enabled image with a missing binary fails closed. Core/unselected paths
+do not import Cultivate or read daemon state. Installed-bit changes require
+rebuild and recreation. Bot token/identity/telemetry changes require
+`docker compose up -d --force-recreate <actual-agent-service>` using the project's
+normal env/interpolation options. Host env-file edits alone are not watched;
+Compose restart/s6 restart use the already-effective container environment.
+Agent effective values differing from the daemon launch snapshot report
+`bot_token_stale` without values, hashes or prefixes.
 
 Before an operator chooses to enable coding, provision all prerequisites:
 

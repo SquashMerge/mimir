@@ -1,0 +1,591 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from mimir_cultivate.worklink import daemon_health as health
+from mimir_cultivate.worklink import daemon_gate as gate
+from mimir_cultivate.worklink.daemon_service import RuntimePaths
+from mimir_cultivate.worklink.identities import WorklinkIdentities
+
+NOW = 1800000000000
+
+
+def native(**updates):
+    return {"type": "oauth", "methodID": "chatgpt-headless", "access": "synthetic-access",
+            "refresh": "synthetic-refresh", "expires": NOW + 60000, "metadata": {}, **updates}
+
+
+def database(path, rows):
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL, value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)")
+        for index, (value, method, active) in enumerate(rows):
+            connection.execute("INSERT INTO credential VALUES (?, 'openai', 'native', ?, NULL, ?, ?, 1, 1)",
+                               (str(index), value, method, active))
+    path.chmod(0o600)
+
+
+@pytest.mark.parametrize(("updates", "expected"), [
+    ({}, "locally_unexpired"), ({"refresh": None}, "locally_unexpired"),
+    ({"expires": NOW + 5001}, "locally_unexpired"),
+    ({"expires": NOW + 5000}, "refreshable_unverified"),
+    ({"expires": NOW - 1}, "refreshable_unverified"),
+    ({"expires": NOW - 1, "refresh": ""}, "expired_no_refresh"),
+    ({"expires": 0}, "zero_expiry"), ({"expires": True}, "malformed"),
+    ({"expires": -1}, "malformed"), ({"expires": "123"}, "malformed"),
+    ({"expires": 1.2}, "malformed"), ({"access": ""}, "malformed"),
+    ({"access": None}, "malformed"), ({"type": "api"}, "malformed"),
+    ({"methodID": "browser"}, "malformed"), ({"refresh": {}}, "malformed"),
+])
+def test_native_local_state_matrix_read_only(tmp_path, updates, expected):
+    path = tmp_path / "opencode.db"
+    database(path, [(json.dumps(native(**updates)), "chatgpt-headless", 1)])
+    before = path.read_bytes()
+    result = health.inspect_native_login(path, uid=os.getuid(), now=NOW)
+    assert result.state == expected
+    assert path.read_bytes() == before
+    assert "synthetic" not in repr(result)
+
+
+@pytest.mark.parametrize(("rows", "expected"), [
+    ([], "missing"), ([("{}", "chatgpt-headless", 0)], "inactive"),
+    ([("{}", "browser", 1)], "malformed"),
+    ([("not-json", "chatgpt-headless", 1)], "malformed"),
+    ([("x" * 65537, "chatgpt-headless", 1)], "malformed"),
+    ([(json.dumps(native()), "chatgpt-headless", 1)] * 2, "malformed"),
+])
+def test_native_row_bounds_and_inactive(tmp_path, rows, expected):
+    path = tmp_path / "opencode.db"
+    database(path, rows)
+    assert health.inspect_native_login(path, uid=os.getuid(), now=NOW).state == expected
+
+
+def test_native_missing_table_unavailable_and_no_follow(tmp_path):
+    path = tmp_path / "opencode.db"
+    assert health.inspect_native_login(path, uid=os.getuid()).state == "missing"
+    assert not path.exists()
+    with sqlite3.connect(path):
+        pass
+    path.chmod(0o600)
+    assert health.inspect_native_login(path, uid=os.getuid()).state == "missing"
+    path.write_bytes(b"not a database")
+    assert health.inspect_native_login(path, uid=os.getuid()).state == "unavailable"
+    path.rename(tmp_path / "real")
+    path.symlink_to(tmp_path / "real")
+    assert health.inspect_native_login(path, uid=os.getuid()).state == "unavailable"
+
+
+def status(**updates):
+    return {"version": 1, "launch_generation": str(uuid4()), "checked_at_ms": NOW,
+            "daemon_state": "ready", "daemon_version": "2.2.7", "login_state": "locally_unexpired",
+            "login_expires_at_ms": NOW + 60000, "telemetry_state": "off", **updates}
+
+
+@pytest.mark.parametrize("updates", [
+    {"version": 2}, {"version": True}, {"extra": "refused"}, {"launch_generation": "invalid"},
+    {"checked_at_ms": NOW - 15001}, {"checked_at_ms": NOW + 5001}, {"checked_at_ms": True},
+    {"daemon_state": "unknown"}, {"login_state": "valid"}, {"telemetry_state": "on"},
+    {"daemon_version": "x" * 129}, {"daemon_version": "2.2.6"}, {"login_expires_at_ms": False},
+])
+def test_status_rejects_invalid_stale_future_and_version(updates):
+    with pytest.raises(ValueError):
+        health.parse_status(status(**updates), now=NOW)
+
+
+@pytest.mark.parametrize("age", [-5000, 0, 15000])
+def test_status_freshness_edges(age):
+    payload = status(checked_at_ms=NOW - age)
+    assert health.parse_status(payload, now=NOW) == payload
+
+
+def fixture_status(tmp_path, monkeypatch, *, login="locally_unexpired"):
+    paths = RuntimePaths(tmp_path / "daemon", tmp_path / "run")
+    paths.status.parent.mkdir(parents=True, mode=0o755)
+    paths.status.parent.chmod(0o755)
+    paths.snapshot.parent.mkdir(parents=True, mode=0o700)
+    payload = status(login_state=login)
+    paths.status.write_text(json.dumps(payload))
+    paths.status.chmod(0o644)
+    token = "bot-" + "private-fragment"
+    snapshot = {"version": 1, "launch_generation": payload["launch_generation"],
+                "bot_token": token, "publishing_identity": "publisher"}
+    paths.snapshot.write_text(json.dumps(snapshot))
+    paths.snapshot.chmod(0o600)
+    monkeypatch.setattr(health, "now_ms", lambda: NOW)
+    monkeypatch.setattr(health, "resolve_activation", lambda env: SimpleNamespace(enabled=True))
+    ids = WorklinkIdentities(os.getuid(), os.getuid(), os.getgid())
+    env = {"GITHUB_TOKEN": token, "MIMIR_FACTORY_PUBLISHING_IDENTITY": "publisher"}
+    return paths, ids, env
+
+
+def bind_gate_fixture(paths, ids, env, monkeypatch, *, timeout=0):
+    from mimir import worklink_daemon_activation as activation
+
+    marker = paths.run / "opencode-enabled"
+    marker.write_text("1\n")
+    marker.chmod(0o644)
+    binary = paths.run / "opencode"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    marker_inode = marker.stat().st_ino
+    fstat = os.fstat
+
+    def fixture_owner(fd):
+        info = fstat(fd)
+        if info.st_ino == marker_inode:
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=0, st_size=info.st_size)
+        return info
+
+    # Only the image marker's root owner and installed binary path are supplied
+    # by the fixture; selection, marker parsing and health policy run unchanged.
+    monkeypatch.setattr(activation.os, "fstat", fixture_owner)
+    monkeypatch.setattr(activation, "DAEMON_PATH", str(paths.run))
+    monkeypatch.setattr(health, "resolve_activation", lambda values: activation.resolve_activation(values, marker=marker))
+    monkeypatch.setattr(health, "get_identities", lambda: ids)
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "MIMIR_FACTORY_PUBLISHING_IDENTITY"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in {**env, "MIMIR_PLUGINS": "cultivate"}.items():
+        monkeypatch.setenv(name, value)
+    assert health.resolve_activation(dict(os.environ)).enabled
+    wait = gate.wait_for_daemon
+    monkeypatch.setattr(gate, "wait_for_daemon", lambda values: wait(values, paths=paths, timeout=timeout))
+
+
+def test_gate_main_refuses_missing_login(tmp_path, monkeypatch, capsys):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login="missing")
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    result = health.daemon_health(dict(os.environ), paths=paths, identities=ids)
+    assert result["daemon_state"] == "ready" and result["login_state"] == "missing"
+    assert gate.main() == 1
+    output = capsys.readouterr()
+    assert "not ready for workloads" in output.err
+    assert env["GITHUB_TOKEN"] not in output.out + output.err
+
+
+@pytest.mark.parametrize(("state", "login", "reason"), [
+    ("down", "missing", "daemon_down"),
+    ("ready", "missing", "login_missing"),
+    ("ready", "expired_no_refresh", "login_expired"),
+])
+@pytest.mark.parametrize("workload", ["leaf", "factory", "spawn"])
+@pytest.mark.asyncio
+async def test_workloads_refuse_with_real_daemon_health(tmp_path, monkeypatch, state, login, reason, workload):
+    from functools import partial
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+    from mimir_cultivate import opencode
+    from mimir.tools.registry import _spawn_reset_for_tests, set_spawn_config
+
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login=login)
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    payload = json.loads(paths.status.read_text())
+    payload.update(daemon_state=state, daemon_version="2.2.7" if state == "ready" else None)
+    paths.status.write_text(json.dumps(payload))
+    monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
+    observed = health.daemon_health(dict(os.environ))
+    assert observed["daemon_enabled"] is True and observed["ok"] is False
+    assert observed["login_state"] == login
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unhealthy workload reached claim, checkout, initialization or launch")
+
+    if workload == "spawn":
+        _spawn_reset_for_tests()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        set_spawn_config({"default_cwd": tmp_path, "artifact_root": tmp_path / "artifacts"})
+        try:
+            result = json.loads(await opencode._spawn_open_code_impl(
+                "build", contained_runner=forbidden, checkout_factory=forbidden))
+            assert result["status"] == "refused" and result["reason_code"] == reason
+            assert result["opencode_session_id"] is None
+        finally:
+            _spawn_reset_for_tests()
+        return
+
+    description = """Acceptance criteria:
+- [ ] Build the fix.
+Review criteria:
+Verify the fix.
+Worklink notes:
+- Scope: fixture
+- Out of scope: deployment
+- Suggested test command: pytest
+"""
+    issue = orchestrator.IssueContext(2138, "Fix", description, {"worklink:ready", "worklink"})
+    if workload == "factory":
+        issue.labels.add("worklink:epic")
+    # Real backend/compute selection and admission policy; only tracker and Git
+    # metadata are fixtures. Any side effect after preflight fails the test.
+    monkeypatch.setattr(orchestrator.ChainlinkIssueReader, "read", lambda self, id: issue)
+    monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *a, **kw: "https://github.com/acme/widget.git")
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", forbidden)
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", forbidden)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", forbidden)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(OpenCodeBackend())
+    registry.register(FeatureFactoryBackend())
+    registry.select_compute = lambda **kw: LocalSubprocessComputeBackend()
+    worker = orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path, registry=registry)
+    result = (await worker.run_epic(2138) if workload == "factory"
+              else await worker.run(2138, backend_name="opencode"))
+    assert result.status == "refused" and result.reason == reason
+    assert result.attempt is None
+
+
+@pytest.mark.parametrize("payload", [{}, {"ok": False}, {"ok": "true"}, {"ok": 1}, {"daemon_enabled": False}])
+def test_workload_health_requires_explicit_readiness(payload):
+    assert gate.workload_refusal(payload) == "daemon_down"
+
+
+def test_workload_health_preserves_stale_token_reason():
+    assert gate.workload_refusal({"ok": False, "daemon_error": "bot_token_stale"}) == "bot_token_stale"
+
+
+@pytest.mark.parametrize("login", sorted(health.LOGIN_STATES))
+def test_gate_local_login_policy(tmp_path, monkeypatch, login):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login=login)
+    result = health.daemon_health(env, paths=paths, identities=ids)
+    assert result["ok"] == (login in health.ALLOWED_LOGIN)
+    assert result["login_state"] == login
+    assert ("daemon_warning" in result) == (login == "refreshable_unverified")
+    assert env["GITHUB_TOKEN"] not in json.dumps(result)
+    monkeypatch.setattr(health, "get_identities", lambda: ids)
+    assert gate.wait_for_daemon(env, paths=paths, timeout=0) == result
+
+
+@pytest.mark.parametrize("change", ["token", "identity", "generation", "invalid"])
+def test_effective_configuration_private_stale_comparison(tmp_path, monkeypatch, change):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch)
+    if change == "token":
+        env["GITHUB_TOKEN"] = "new-private-value"
+    elif change == "identity":
+        env["MIMIR_FACTORY_PUBLISHING_IDENTITY"] = "new-publisher"
+    elif change == "invalid":
+        env["GH_TOKEN"] = "conflicting-private-value"
+    else:
+        payload = json.loads(paths.status.read_text())
+        payload["launch_generation"] = str(uuid4())
+        paths.status.write_text(json.dumps(payload))
+    result = health.daemon_health(env, paths=paths, identities=ids)
+    assert result["ok"] is False
+    assert result["daemon_error"] in {"bot_token_stale", "daemon_status_unavailable"}
+    assert not any(value in json.dumps(result) for value in env.values())
+
+
+def test_host_file_edit_not_watched(tmp_path, monkeypatch):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch)
+    (tmp_path / "compose.env").write_text("GITHUB_TOKEN=host-only-edit")
+    assert health.daemon_health(env, paths=paths, identities=ids)["ok"] is True
+
+
+def test_disabled_health_and_gate_never_read_credentials(monkeypatch, capsys):
+    from mimir.worklink_daemon_activation import resolve_activation
+
+    monkeypatch.setattr(health, "resolve_activation", resolve_activation)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    monkeypatch.setattr(health, "read_json", lambda *args, **kwargs: pytest.fail("disabled credential access"))
+    assert health.daemon_health({"MIMIR_PLUGINS": ""}) == {"daemon_enabled": False, "daemon_reason": "unselected"}
+    assert gate.main() == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_status_size_bound_and_sanitized_exception(tmp_path, monkeypatch):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch)
+    paths.status.write_text(" " * 16385)
+    result = health.daemon_health(env, paths=paths, identities=ids)
+    assert result == {"daemon_enabled": True, "ok": False, "daemon_error": "daemon_status_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_health_hook_preserves_executor_and_sanitizes_errors(tmp_path, monkeypatch):
+    from mimir_cultivate import server
+    from mimir_cultivate.worklink import worker_client
+
+    socket = tmp_path / "executor.sock"
+    socket.touch()
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
+    async def unavailable():
+        raise RuntimeError("must-not-export-private-value")
+    monkeypatch.setattr(worker_client, "verify_executor_identity", unavailable)
+    monkeypatch.setattr(health, "daemon_health", lambda env: {"daemon_enabled": False, "daemon_reason": "not_installed"})
+    result = await server.executor_health({"check_worker_executor_health": True})
+    assert result["ok"] is False
+    assert result["worklink_install_status"] == "mismatched"
+    assert result["daemon_enabled"] is False
+    assert "must-not-export" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("version", "expected"), [("2.2.7", "ready"), ("2.2.6", "version_mismatch"),
+                                                    ("not-a-version-private", "version_mismatch"),
+                                                    ("unauthorized", "down"), ("transport", "down"),
+                                                    ("server_error", "down")])
+async def test_authenticated_info_status_publication(tmp_path, monkeypatch, capsys, version, expected):
+    from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon, SyntheticFault
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+
+    paths = RuntimePaths(tmp_path / "daemon", tmp_path / "run")
+    paths.daemon.mkdir(mode=0o700)
+    paths.status.parent.mkdir(parents=True, mode=0o755)
+    generation = str(uuid4())
+    launch = paths.daemon / "launch.json"
+    launch.write_text(json.dumps({"version": 1, "launch_generation": generation, "telemetry_state": "off"}))
+    launch.chmod(0o600)
+    ids = WorklinkIdentities(os.getuid(), os.getuid(), os.getgid())
+    # No privileged filesystem operations: fixture ownership remains unchanged.
+    monkeypatch.setattr(os, "fchown", lambda *args: None)
+    async with FakeOpenCodeDaemon() as fake:
+        private = "provider-" + "private-fragment"
+        if version == "transport":
+            # aiohttp retries an idempotent GET once on disconnect.
+            fake.faults[("GET", "/api/info")].extend([SyntheticFault(disconnect=True)] * 2)
+        elif version == "server_error":
+            fake.faults[("GET", "/api/info")].append(SyntheticFault(status=503, body=private.encode()))
+        elif version != "unauthorized":
+            fake.faults[("GET", "/api/info")].append(SyntheticFault(body=json.dumps({"version": version}).encode()))
+        password = "wrong-" + fake.password if version == "unauthorized" else fake.password
+        paths.api.write_text(json.dumps({"version": 1, "url": "http://127.0.0.1:4096", "username": "opencode",
+                                        "password": password}))
+        paths.api.chmod(0o600)
+        def fixture_client(**kwargs):
+            assert kwargs["base_url"] == "http://127.0.0.1:4096"
+            return OpenCodeDaemonClient(**{**kwargs, "base_url": fake.base_url})
+        monkeypatch.setattr(health, "OpenCodeDaemonClient", fixture_client)
+        await health.inspect_and_publish(paths, ids)
+        result = health.parse_status(json.loads(paths.status.read_text()))
+        assert result["daemon_state"] == expected
+        assert result["daemon_version"] == (version if version in {"2.2.7", "2.2.6"} else None)
+        assert result["login_state"] == "missing"
+        assert fake.password not in paths.status.read_text()
+        assert "not-a-version-private" not in paths.status.read_text()
+        expected_requests = 0 if version == "unauthorized" else (2 if version == "transport" else 1)
+        assert [request[1] for request in fake.requests] == ["/api/info"] * expected_requests
+        request_count = len(fake.requests)
+        await health.inspect_and_publish(paths, ids, down=True)
+        assert json.loads(paths.status.read_text())["daemon_state"] == "down"
+        assert len(fake.requests) == request_count
+        output = capsys.readouterr()
+        for secret in (fake.password, password, private):
+            assert secret not in paths.status.read_text() + output.out + output.err
+
+
+@pytest.mark.parametrize(("login", "expected"), [
+    ("locally_unexpired", 0), ("refreshable_unverified", 0),
+    ("malformed", 1), ("expired_no_refresh", 1),
+])
+def test_gate_main_native_login_outcomes(tmp_path, monkeypatch, capsys, login, expected):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch)
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    db = tmp_path / "opencode.db"
+    updates = {"locally_unexpired": {}, "refreshable_unverified": {"expires": NOW - 1},
+               "malformed": {"access": ""}, "expired_no_refresh": {"expires": NOW - 1, "refresh": ""}}
+    database(db, [(json.dumps(native(**updates[login])), "chatgpt-headless", 1)])
+    local = health.inspect_native_login(db, uid=ids.worklink_uid, now=NOW)
+    assert local.state == login
+    payload = json.loads(paths.status.read_text())
+    payload.update(login_state=local.state, login_expires_at_ms=local.expires_at_ms)
+    paths.status.write_text(json.dumps(payload))
+    assert gate.main() == expected
+    output = capsys.readouterr()
+    assert ("refresh is unverified" in output.err) == (login == "refreshable_unverified")
+    assert ("not ready" in output.err) == bool(expected)
+    assert env["GITHUB_TOKEN"] not in output.out + output.err
+
+
+@pytest.mark.parametrize("change", ["token", "identity", "generation", "invalid", "stale", "unavailable",
+                                    "missing_status", "invalid_status"])
+def test_gate_main_refuses_stale_or_unavailable(tmp_path, monkeypatch, capsys, change):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch)
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    payload = json.loads(paths.status.read_text())
+    if change == "token":
+        monkeypatch.setenv("GITHUB_TOKEN", "new-" + "private-token")
+    elif change == "identity":
+        monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", "new-publisher")
+    elif change == "invalid":
+        monkeypatch.setenv("GH_TOKEN", "conflicting-" + "private-token")
+    elif change == "generation":
+        payload["launch_generation"] = str(uuid4())
+    elif change == "stale":
+        payload["checked_at_ms"] = NOW - 15001
+    else:
+        payload.update(daemon_state="down", daemon_version=None)
+    if change == "missing_status":
+        paths.status.unlink()
+    elif change == "invalid_status":
+        paths.status.write_text("invalid-" + "private-fragment")
+    else:
+        paths.status.write_text(json.dumps(payload))
+    assert gate.main() == 1
+    output = capsys.readouterr()
+    assert "not ready for workloads" in output.err
+    assert not any(value in output.out + output.err for value in env.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["login", "stale", "down"])
+async def test_healthy_executor_reports_daemon_failure_without_failing_agent(tmp_path, monkeypatch, failure):
+    from functools import partial
+    from mimir_cultivate import server
+    from mimir_cultivate.worklink import worker_client
+
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login="expired_no_refresh")
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    payload = json.loads(paths.status.read_text())
+    payload["telemetry_state"] = "disabled_sensitive_otlp"
+    if failure == "stale":
+        monkeypatch.setenv("GITHUB_TOKEN", "changed-" + "private-token")
+    elif failure == "down":
+        payload.update(daemon_state="down", daemon_version=None)
+    paths.status.write_text(json.dumps(payload))
+    monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
+    socket = tmp_path / "executor.sock"
+    socket.touch()
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
+    identity = {"mode": "source", "source_commit": "a" * 40}
+    async def verified():
+        return identity
+    monkeypatch.setattr(worker_client, "verify_executor_identity", verified)
+    result = await server.executor_health({"check_worker_executor_health": True,
+                                           "worklink_controller_identity": identity})
+    assert result["worklink_install_status"] == "matched"
+    assert result["worklink_executor_source_status"] == "matched"
+    assert "ok" not in result  # The core endpoint supplies agent liveness.
+    assert result["daemon_enabled"] is True
+    assert result["login_state"] == "expired_no_refresh"
+    assert result["telemetry_state"] == "disabled_sensitive_otlp"
+    assert "sensitive or invalid OTLP" in result["telemetry_warning"]
+    if failure == "stale":
+        assert result["daemon_error"] == "bot_token_stale"
+    if failure == "down":
+        assert result["daemon_state"] == "down"
+    assert env["GITHUB_TOKEN"] not in json.dumps(result)
+    assert "changed-private-token" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["source", "pypi"])
+@pytest.mark.parametrize("identity_failure", [None, "executor", "controller"])
+async def test_agent_health_missing_login_preserves_identity_gate(
+    tmp_path, monkeypatch, mode, identity_failure,
+):
+    from functools import partial
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir.plugins.manager import load_plugins
+    from mimir.server import _handle_health
+    from mimir_cultivate import install_identity
+    from mimir_cultivate.worklink import worker_client
+
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login="missing")
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
+    observed = health.daemon_health(dict(os.environ))
+    assert observed["ok"] is False and observed["login_state"] == "missing"
+    socket = tmp_path / "executor.sock"
+    socket.touch()
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
+    if mode == "source":
+        controller = {"mode": mode, "source_commit": "a" * 40}
+        changed = {"mode": mode, "source_commit": "b" * 40}
+    else:
+        controller = {"mode": mode, "distributions": {name: {
+            "version": "1.2", "wheel": f"{name}-1.2.whl", "sha256": "a" * 64,
+        } for name in install_identity.PROJECTS}}
+        changed = {"mode": mode, "distributions": {**controller["distributions"],
+            "mimir-agent": {**controller["distributions"]["mimir-agent"], "sha256": "b" * 64}}}
+    monkeypatch.setattr(install_identity, "controller_identity",
+                        lambda: changed if identity_failure == "controller" else controller)
+
+    async def verified():
+        return changed if identity_failure == "executor" else controller
+
+    monkeypatch.setattr(worker_client, "verify_executor_identity", verified)
+    app = web.Application()
+    # Use the production plugin registration and HTTP handler, not an injected
+    # replacement health hook; both the aggregator and HTTP status are exercised.
+    app["plugin_manager"] = load_plugins(enable="cultivate")
+    app["check_worker_executor_health"] = True
+    app["worklink_controller_identity"] = (
+        changed if mode == "source" and identity_failure == "controller" else controller)
+    app.router.add_get("/health", _handle_health)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/health")
+        result = await response.json()
+    assert response.status == (503 if identity_failure else 200)
+    assert result["ok"] is (identity_failure is None)
+    assert result["worklink_install_status"] == ("mismatched" if identity_failure else "matched")
+    for field, value in observed.items():
+        if field != "ok":
+            assert result[field] == value
+    assert result["daemon_enabled"] is True
+    assert result["daemon_state"] == "ready"
+    assert result["login_state"] == "missing"
+    assert "daemon_error" not in result  # Missing login is reported by login_state.
+    assert env["GITHUB_TOKEN"] not in json.dumps(result)
+    if identity_failure is None:
+        from contextlib import redirect_stdout
+        import io
+        from mimir_cultivate import setup
+        from mimir import worklink_daemon_activation as activation
+
+        monkeypatch.setattr(activation, "resolve_activation", partial(
+            activation.resolve_activation, marker=paths.run / "opencode-enabled"))
+        assert activation.resolve_activation(dict(os.environ)).enabled
+
+        # A live /health must not admit setup: execute its actual daemon probe
+        # against this same missing-login fixture, adapting only Docker transport.
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:fixture-model")
+        probes = []
+
+        def agent_exec(deploy, *argv):
+            assert argv == ("python", "-c", setup._OPENCODE_DAEMON_PROBE)
+            probes.append(argv)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(compile(argv[-1], "<setup-daemon-probe>", "exec"), {})
+            return output.getvalue()
+
+        monkeypatch.setattr(setup, "_agent_exec", agent_exec)
+        monkeypatch.setattr(setup, "_http", lambda *a, **kw: pytest.fail(
+            "setup trusted top-level HTTP liveness before daemon readiness"))
+        with pytest.raises(setup.SetupError, match="worklink-opencode-login"):
+            setup._verify(tmp_path, 8123, "owner", "key", "node", "22.16.0")
+        assert len(probes) == 1
+
+
+def test_gate_readiness_wait_is_bounded_without_stopping_daemon(tmp_path, monkeypatch, capsys):
+    paths, ids, env = fixture_status(tmp_path, monkeypatch)
+    bind_gate_fixture(paths, ids, env, monkeypatch, timeout=60)
+    payload = json.loads(paths.status.read_text())
+    payload.update(daemon_state="down", daemon_version=None)
+    paths.status.write_text(json.dumps(payload))
+    clock = [0.0]
+    monkeypatch.setattr(gate.time, "monotonic", lambda: clock[0])
+    count = []
+    def sleep(delay):
+        count.append(delay)
+        clock[0] += delay
+    monkeypatch.setattr(gate.time, "sleep", sleep)
+    with subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as daemon:
+        assert daemon.stdout.readline().strip() == "ready"
+        try:
+            assert gate.main() == 1
+            assert clock[0] == 60 and count == [1] * 60
+            assert daemon.poll() is None
+            assert "not ready" in capsys.readouterr().err
+        finally:
+            daemon.stdin.close()
+            daemon.wait(timeout=5)

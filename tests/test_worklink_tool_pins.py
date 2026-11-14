@@ -18,14 +18,28 @@ from mimir.scaffold_docker import render_dockerfile
 from mimir.plugins.discovery import PluginDiscoveryError
 
 
+def test_shipped_skill_example_matches_canonical_opencode_inventory() -> None:
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    skill = (root / "plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/SKILL.md").read_text()
+    example = yaml.safe_load(skill.split("```yaml\n", 1)[1].split("```", 1)[0])
+    entry = next(row for row in example["tool_pins"] if row["name"] == "opencode")
+    pin = next(pin for pin in default_tool_pins() if pin.name == "opencode")
+    assert entry["pin"] == pin.pin == "2.2.7"
+    assert entry["package"] == pin.package == "@opencode/cli"
+    assert entry["smoke"] == pin.smoke == "opencode --version"
+    assert "opencode-ai" not in skill
+    assert "1.19.4" not in skill
+
+
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
-    assert pins["opencode"].pin == "1.19.4"
+    assert pins["opencode"].pin == "2.2.7"
 
     expected = {
         "chainlink", "mermaid-cli", "osv-scanner", "gogcli",
-        "opencode", "codex", "feature-factory", "opencode-feature-factory", "opencode-project-memory",
-        "opencode-openai-codex-auth", "opencode-anthropic-auth",
+        "opencode", "codex", "feature-factory", "opencode2-feature-factory", "opencode-plugin-otel",
     }
     assert set(pins) == expected
     assert pins["chainlink"].category == "issue-cli"
@@ -35,11 +49,11 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     assert pins["opencode"].category == "coding-cli"
     assert pins["opencode"].pin == OPENCODE_VERSION
     assert pins["feature-factory"].pin == FACTORY_VERSION
-    assert pins["opencode-feature-factory"].pin == FACTORY_VERSION
-    assert pins["opencode-feature-factory"].category == "coding-plugin"
-    assert pins["opencode-project-memory"].category == "coding-plugin"
-    assert pins["opencode-openai-codex-auth"].category == "coding-plugin"
-    assert pins["opencode-anthropic-auth"].category == "coding-plugin"
+    assert pins["opencode2-feature-factory"].pin == FACTORY_VERSION
+    assert pins["opencode2-feature-factory"].category == "coding-plugin"
+    assert pins["opencode-plugin-otel"].category == "coding-plugin"
+    assert pins["opencode-plugin-otel"].pin == "2.1.0"
+    assert pins["opencode-plugin-otel"].package == "@devtheops/opencode-plugin-otel"
     for pin in pins.values():
         assert pin.pin
         assert pin.smoke
@@ -68,7 +82,7 @@ def test_worklink_docs_describe_current_tool_pin_inventory() -> None:
     tool_pins_example = docs.split("```yaml\ntool_pins:", 1)[1].split("```", 1)[0]
     assert "name: opencode" in tool_pins_example
     assert 'smoke: "opencode --version"' in tool_pins_example
-    assert 'package: "opencode-ai"' in tool_pins_example
+    assert 'package: "@opencode/cli"' in tool_pins_example
     assert "name: codex" in tool_pins_example
     assert 'smoke: "codex --version"' in tool_pins_example
     assert 'package: "@openai/codex"' in tool_pins_example
@@ -95,11 +109,11 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     assert f"@mermaid-js/mermaid-cli@{pins['mermaid-cli'].pin}" in install_text
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
-    assert f"opencode-ai@{pins['opencode'].pin}" in install_text
+    assert f"@opencode/cli@{pins['opencode'].pin}" in install_text
     assert pins["codex"].source == "npm"
     assert pins["codex"].package == "@openai/codex"
     assert f"{pins['codex'].package}@{pins['codex'].pin}" in install_text
-    assert pins["feature-factory"].pin == pins["opencode-feature-factory"].pin
+    assert pins["feature-factory"].pin == pins["opencode2-feature-factory"].pin
     dockerfile = install_sources["Dockerfile"]
     factory_arg = re.search(r"(?m)^ARG FACTORY_VERSION=([^\s]+)$", dockerfile)
     assert factory_arg is not None
@@ -107,7 +121,7 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     cultivate = install_sources["plugins/cultivate/mimir_cultivate/docker/base.sh"]
     assert cultivate.splitlines()[1] == f"# factory-version: {FACTORY_VERSION}"
     assert "feature-factory@${FACTORY_VERSION}" in cultivate
-    assert "opencode-feature-factory@${FACTORY_VERSION}" in cultivate
+    assert "opencode2-feature-factory@${FACTORY_VERSION}" in cultivate
     try:
         version("mimir-cultivate")
     except PackageNotFoundError:
@@ -120,8 +134,8 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
         assert selected[0].name == "cultivate"
         fragment = cultivate_scripts(selected[0])["base.sh"]
         assert fragment.splitlines()[1] == f"# factory-version: {pins['feature-factory'].pin}"
-        assert f"opencode-ai@{pins['opencode'].pin}" in fragment
-        for package in ("feature-factory", "opencode-feature-factory"):
+        assert f"@opencode/cli@{pins['opencode'].pin}" in fragment
+        for package in ("feature-factory", "opencode2-feature-factory"):
             assert f"{package}@${{FACTORY_VERSION}}" in fragment
     for mode in ("workspace", "pypi"):
         if selected:
@@ -135,8 +149,9 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
                 assert 'FACTORY_VERSION="$FACTORY_VERSION" sh /opt/cultivate-docker/base.sh' in scaffold
         unselected = render_dockerfile([], mode=mode)
         assert "cultivate-docker" not in unselected
-        assert "opencode-ai@" not in unselected
+        assert "@opencode/cli@" not in unselected
         assert "feature-factory@" not in unselected
-    assert f"opencode-project-memory@{pins['opencode-project-memory'].pin}" in install_text
-    assert f"opencode-openai-codex-auth@{pins['opencode-openai-codex-auth'].pin}" in install_text
-    assert f"opencode-anthropic-auth@{pins['opencode-anthropic-auth'].pin}" in install_text
+    assert f"{pins['opencode-plugin-otel'].package}@{pins['opencode-plugin-otel'].pin}" in install_text
+    for retired in ("opencode-ai@", "opencode-feature-factory@", "opencode-project-memory@",
+                    "opencode-openai-codex-auth@", "opencode-anthropic-auth@"):
+        assert retired not in install_text
