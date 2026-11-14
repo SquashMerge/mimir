@@ -435,7 +435,7 @@ def test_gate_main_refuses_stale_or_unavailable(tmp_path, monkeypatch, capsys, c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["login", "stale", "down"])
-async def test_healthy_executor_does_not_mask_daemon_failure(tmp_path, monkeypatch, failure):
+async def test_healthy_executor_reports_daemon_failure_without_failing_agent(tmp_path, monkeypatch, failure):
     from functools import partial
     from mimir_cultivate import server
     from mimir_cultivate.worklink import worker_client
@@ -461,7 +461,7 @@ async def test_healthy_executor_does_not_mask_daemon_failure(tmp_path, monkeypat
                                            "worklink_controller_identity": identity})
     assert result["worklink_install_status"] == "matched"
     assert result["worklink_executor_source_status"] == "matched"
-    assert result["ok"] is False
+    assert "ok" not in result  # The core endpoint supplies agent liveness.
     assert result["daemon_enabled"] is True
     assert result["login_state"] == "expired_no_refresh"
     assert result["telemetry_state"] == "disabled_sensitive_otlp"
@@ -472,6 +472,97 @@ async def test_healthy_executor_does_not_mask_daemon_failure(tmp_path, monkeypat
         assert result["daemon_state"] == "down"
     assert env["GITHUB_TOKEN"] not in json.dumps(result)
     assert "changed-private-token" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["source", "pypi"])
+@pytest.mark.parametrize("identity_failure", [None, "executor", "controller"])
+async def test_agent_health_missing_login_preserves_identity_gate(
+    tmp_path, monkeypatch, mode, identity_failure,
+):
+    from functools import partial
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir.plugins.manager import load_plugins
+    from mimir.server import _handle_health
+    from mimir_cultivate import install_identity
+    from mimir_cultivate.worklink import worker_client
+
+    paths, ids, env = fixture_status(tmp_path, monkeypatch, login="missing")
+    bind_gate_fixture(paths, ids, env, monkeypatch)
+    monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
+    observed = health.daemon_health(dict(os.environ))
+    assert observed["ok"] is False and observed["login_state"] == "missing"
+    socket = tmp_path / "executor.sock"
+    socket.touch()
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket)
+    if mode == "source":
+        controller = {"mode": mode, "source_commit": "a" * 40}
+        changed = {"mode": mode, "source_commit": "b" * 40}
+    else:
+        controller = {"mode": mode, "distributions": {name: {
+            "version": "1.2", "wheel": f"{name}-1.2.whl", "sha256": "a" * 64,
+        } for name in install_identity.PROJECTS}}
+        changed = {"mode": mode, "distributions": {**controller["distributions"],
+            "mimir-agent": {**controller["distributions"]["mimir-agent"], "sha256": "b" * 64}}}
+    monkeypatch.setattr(install_identity, "controller_identity",
+                        lambda: changed if identity_failure == "controller" else controller)
+
+    async def verified():
+        return changed if identity_failure == "executor" else controller
+
+    monkeypatch.setattr(worker_client, "verify_executor_identity", verified)
+    app = web.Application()
+    # Use the production plugin registration and HTTP handler, not an injected
+    # replacement health hook; both the aggregator and HTTP status are exercised.
+    app["plugin_manager"] = load_plugins(enable="cultivate")
+    app["check_worker_executor_health"] = True
+    app["worklink_controller_identity"] = (
+        changed if mode == "source" and identity_failure == "controller" else controller)
+    app.router.add_get("/health", _handle_health)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/health")
+        result = await response.json()
+    assert response.status == (503 if identity_failure else 200)
+    assert result["ok"] is (identity_failure is None)
+    assert result["worklink_install_status"] == ("mismatched" if identity_failure else "matched")
+    for field, value in observed.items():
+        if field != "ok":
+            assert result[field] == value
+    assert result["daemon_enabled"] is True
+    assert result["daemon_state"] == "ready"
+    assert result["login_state"] == "missing"
+    assert "daemon_error" not in result  # Missing login is reported by login_state.
+    assert env["GITHUB_TOKEN"] not in json.dumps(result)
+    if identity_failure is None:
+        from contextlib import redirect_stdout
+        import io
+        from mimir_cultivate import setup
+        from mimir import worklink_daemon_activation as activation
+
+        monkeypatch.setattr(activation, "resolve_activation", partial(
+            activation.resolve_activation, marker=paths.run / "opencode-enabled"))
+        assert activation.resolve_activation(dict(os.environ)).enabled
+
+        # A live /health must not admit setup: execute its actual daemon probe
+        # against this same missing-login fixture, adapting only Docker transport.
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:fixture-model")
+        probes = []
+
+        def agent_exec(deploy, *argv):
+            assert argv == ("python", "-c", setup._OPENCODE_DAEMON_PROBE)
+            probes.append(argv)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(compile(argv[-1], "<setup-daemon-probe>", "exec"), {})
+            return output.getvalue()
+
+        monkeypatch.setattr(setup, "_agent_exec", agent_exec)
+        monkeypatch.setattr(setup, "_http", lambda *a, **kw: pytest.fail(
+            "setup trusted top-level HTTP liveness before daemon readiness"))
+        with pytest.raises(setup.SetupError, match="worklink-opencode-login"):
+            setup._verify(tmp_path, 8123, "owner", "key", "node", "22.16.0")
+        assert len(probes) == 1
 
 
 def test_gate_readiness_wait_is_bounded_without_stopping_daemon(tmp_path, monkeypatch, capsys):
