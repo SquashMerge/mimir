@@ -96,6 +96,45 @@ service.root_start({{}})
     assert "daemon child privileges verified" not in mutant.stdout
 
 
+def _daemon_cleanup_base_setup(repo: Path) -> str:
+    """Shared payload: keep fixture provisioning executable without root."""
+    return f'''
+from pathlib import Path
+import subprocess
+p = Path({str(repo)!r})
+p.mkdir(mode=0o755)
+subprocess.run(['git', 'init', '-q', '-b', 'main', str(p)], check=True)
+# Checkout creation resolves the base's persistent identity, not commit-only -c flags.
+subprocess.run(['git', '-C', str(p), 'config', '--local', 'user.name', 'daemon-cleanup-test'], check=True)
+subprocess.run(['git', '-C', str(p), 'config', '--local', 'user.email', 'daemon-cleanup@example.invalid'], check=True)
+subprocess.run(['git', '-C', str(p), 'commit', '-q', '--allow-empty', '-m', 'base'], check=True)
+subprocess.run(['git', '-C', str(p), 'remote', 'add', 'origin', str(p)], check=True)
+'''
+
+
+def test_daemon_cleanup_base_lends_identity_without_ambient_git_config(tmp_path):
+    import subprocess
+
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"GH_USER_NAME", "GH_USER_EMAIL"}}
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                "WORKLINK_CHECKOUT_ROOT": str(tmp_path / "checkouts")})
+    repo = tmp_path / "base"
+    script = _daemon_cleanup_base_setup(repo) + f'''
+from mimir_cultivate.worklink.checkout import create_isolated_checkout
+lease = create_isolated_checkout(Path({str(repo)!r}), issue_id=2138, attempt=1,
+                                base='main', worker_eligible=False)
+for key, expected in (('user.name', 'daemon-cleanup-test'),
+                      ('user.email', 'daemon-cleanup@example.invalid')):
+    result = subprocess.run(['git', '-C', str(lease.path), 'config', '--local', '--get', key],
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == expected, (key, result.stdout)
+'''
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.real_worklink_identities
 def test_daemon_child_output_cleanup_and_private_umask_mutation(
     tmp_path, synthetic_worklink_identities,
@@ -121,21 +160,16 @@ def test_daemon_child_output_cleanup_and_private_umask_mutation(
         workspace = Path(directory)
         workspace.chmod(0o755)
         os.chown(workspace, ids.mimir_uid, controller_gid)
-        env = {**os.environ, "MIMIR_PLUGINS": "cultivate",
-               "WORKLINK_CHECKOUT_ROOT": str(workspace / "checkouts")}
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"GH_USER_NAME", "GH_USER_EMAIL"}}
+        env.update({"MIMIR_PLUGINS": "cultivate",
+                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                    "WORKLINK_CHECKOUT_ROOT": str(workspace / "checkouts")})
         controller = dict(user=ids.mimir_uid, group=controller_gid,
                           extra_groups=[ids.worklink_gid], env=env,
                           capture_output=True, text=True, timeout=30)
         repo = workspace / "base"
-        setup = f'''
-from pathlib import Path
-import subprocess
-p = Path({str(repo)!r})
-p.mkdir(mode=0o755)
-subprocess.run(['git', 'init', '-q', '-b', 'main', str(p)], check=True)
-subprocess.run(['git', '-C', str(p), '-c', 'user.name=test', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'base'], check=True)
-subprocess.run(['git', '-C', str(p), 'remote', 'add', 'origin', str(p)], check=True)
-'''
+        setup = _daemon_cleanup_base_setup(repo)
         result = subprocess.run([sys.executable, "-c", setup], **controller)
         assert result.returncode == 0, result.stderr
         for attempt, mutant in ((1, False), (2, True)):
