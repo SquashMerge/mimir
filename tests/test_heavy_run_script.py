@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import subprocess
@@ -16,11 +17,31 @@ import time
 import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "heavy_run.sh"
+TIMEOUT_HELPER = Path(__file__).with_name("heavy_timeout.py")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_tools(tmp_path: Path, monkeypatch) -> None:
+    # Exercise every lease test as on a macOS runner without coreutils. Only
+    # ordinary POSIX utilities needed by the wrapper/payloads are available.
+    bindir = tmp_path / "posix-bin"
+    bindir.mkdir()
+    for name in ("sh", "dirname", "uname", "touch", "sleep", "true"):
+        tool = shutil.which(name)
+        assert tool is not None, f"missing POSIX utility: {name}"
+        (bindir / name).symlink_to(tool)
+    monkeypatch.setenv("PATH", str(bindir))
+    assert shutil.which("timeout") is None and shutil.which("gtimeout") is None
+    timeout = tmp_path / "test-timeout"
+    timeout.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
+                       f'{shlex.quote(str(TIMEOUT_HELPER))} "$@"\n')
+    timeout.chmod(0o755)
 
 
 def _env(tmp_path: Path, **extra: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("MIMIR_HEAVY_")}
     env.update(MIMIR_HEAVY_LOCK_FILE=str(tmp_path / "heavy.lock"),
+               MIMIR_HEAVY_TIMEOUT_TOOL=str(tmp_path / "test-timeout"),
                MIMIR_HEAVY_PYTHON=sys.executable, MIMIR_HEAVY_LOCK_TIMEOUT="60",
                MIMIR_HEAVY_HEARTBEAT_SECONDS="0.03")
     env.update(extra)
@@ -127,10 +148,43 @@ def test_signal_kills_command_group_before_release(tmp_path: Path, start, sig: i
 def test_overall_timeout_covers_queue_and_execution(tmp_path: Path, start) -> None:
     holder = start("sleep", "60", MIMIR_HEAVY_LOCK_TIMEOUT="3")
     _wait(lambda: (_lease(tmp_path) / "owner").exists())
-    queued = _run(tmp_path, "touch", str(tmp_path / "unexpected"), MIMIR_HEAVY_LOCK_TIMEOUT="0.3")
+    queued = start("touch", str(tmp_path / "unexpected"), MIMIR_HEAVY_LOCK_TIMEOUT="0.3")
+    queued.communicate(timeout=5)  # Far below the payload's unbounded 60-second run.
     assert queued.returncode == 124 and not (tmp_path / "unexpected").exists()
     assert holder.wait(timeout=15) == 124
     assert not _lease(tmp_path).exists()
+
+
+def test_timeout_helper_allows_term_cleanup_during_kill_grace(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    payload = ("import signal,time; "
+               "signal.signal(signal.SIGTERM, lambda *_: print('term', flush=True)); "
+               + _blocking_payload(release))
+    child = subprocess.Popen([sys.executable, str(TIMEOUT_HELPER), "-k", "5s", "0.5s",
+                              sys.executable, "-c", payload],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "term"
+        assert child.poll() is None, "SIGTERM must allow cleanup before SIGKILL"
+        release.touch()
+        child.communicate(timeout=3)
+        assert child.returncode == 124
+    finally:
+        release.touch()
+        child.terminate()
+        child.communicate(timeout=10)
+
+
+def test_timeout_helper_kills_stubborn_command_group_after_grace(tmp_path: Path) -> None:
+    payload = ("import signal,subprocess,sys,time; "
+               "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+               "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+               "print('ready', flush=True); time.sleep(60)")
+    result = subprocess.run([sys.executable, str(TIMEOUT_HELPER), "-k", "0.2s", "0.5s",
+                             sys.executable, "-c", payload],
+                            capture_output=True, text=True, timeout=5)
+    assert result.stdout.strip() == "ready"
+    assert result.returncode == 137, result.stderr
 
 
 def test_heartbeat_stops_when_child_exits(tmp_path: Path, start) -> None:
@@ -377,6 +431,7 @@ def test_unusable_configuration_fails_closed(tmp_path: Path, fault: str) -> None
         bindir.mkdir()
         (bindir / "python3").symlink_to(sys.executable)
         extra["PATH"] = str(bindir)
+        extra["MIMIR_HEAVY_TIMEOUT_TOOL"] = ""
     elif fault == "python":
         extra["MIMIR_HEAVY_PYTHON"] = str(tmp_path / "absent-python")
     elif fault == "invalid-interval":
@@ -387,6 +442,8 @@ def test_unusable_configuration_fails_closed(tmp_path: Path, fault: str) -> None
     assert result.returncode != 0, result
     assert "RAN" not in result.stdout
     assert "heavy_run:" in result.stderr
+    if fault in {"timeout", "no-timeout"}:
+        assert "requires gtimeout or timeout" in result.stderr
 
 
 @pytest.mark.parametrize("setting", ["unset", "empty", "held"])
@@ -416,7 +473,9 @@ def test_timeout_tool_override_and_arguments(tmp_path: Path, override: str) -> N
     log = tmp_path / "timeout-args"
     timeout.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" "$2" "$3" > "{log}"\nshift 3\nexec "$@"\n')
     timeout.chmod(0o755)
-    result = _run(tmp_path, "true", **{override: str(timeout), "MIMIR_HEAVY_LOCK_TIMEOUT": "123"})
+    extra = {"MIMIR_HEAVY_TIMEOUT_TOOL": "", override: str(timeout),
+             "MIMIR_HEAVY_LOCK_TIMEOUT": "123"}
+    result = _run(tmp_path, "true", **extra)
     assert result.returncode == 0, result.stderr
     assert log.read_text().splitlines() == ["-k", "10s", "123s"]
 
@@ -434,7 +493,8 @@ def test_timeout_tool_is_selected_for_platform(tmp_path: Path, platform: str, ex
     uname.write_text(f'#!/bin/sh\nprintf "%s" "{platform}"\n')
     uname.chmod(0o755)
     (bindir / "dirname").symlink_to(shutil.which("dirname"))
-    result = _run(tmp_path, sys.executable, "-c", "pass", PATH=str(bindir))
+    result = _run(tmp_path, sys.executable, "-c", "pass", PATH=str(bindir),
+                  MIMIR_HEAVY_TIMEOUT_TOOL="")
     assert result.returncode == 0, result.stderr
     assert log.read_text() == expected
 
