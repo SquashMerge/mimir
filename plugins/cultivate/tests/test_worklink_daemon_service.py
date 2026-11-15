@@ -455,16 +455,18 @@ def test_preparation_private_layout_and_socket_preservation(tmp_path, monkeypatc
         assert (paths.daemon / relative).stat().st_mode & 0o777 == 0o700
     assert paths.daemon.stat().st_mode & 0o777 == 0o700
     assert (paths.daemon / "config").stat().st_mode & 0o777 == 0o700
-    for path in (paths.api, paths.daemon / "launch.json",
+    for path in (paths.api, paths.controller_api, paths.daemon / "launch.json",
                  paths.daemon / "config/opencode/opencode.json", paths.snapshot):
         assert path.stat().st_mode & 0o777 == 0o600, path
     api = json.loads(paths.api.read_text())
     assert api["password"] == env["OPENCODE_SERVER_PASSWORD"]
+    assert json.loads(paths.controller_api.read_text()) == api
     assert api["url"] == "http://127.0.0.1:4096"
     assert paths.snapshot.stat().st_mode & 0o777 == 0o600
     assert paths.snapshot.parent.stat().st_mode & 0o777 == 0o700
     assert paths.status.parent.stat().st_mode & 0o777 == 0o755
     assert (paths.snapshot.stat().st_ino, ids.mimir_uid, -1) in owners
+    assert (paths.controller_api.stat().st_ino, ids.mimir_uid, -1) in owners
     assert (paths.api.stat().st_ino, ids.worklink_uid, ids.worklink_gid) in owners
     contents = "".join(p.read_text() for p in tmp_path.rglob("*.json"))
     assert secret not in contents

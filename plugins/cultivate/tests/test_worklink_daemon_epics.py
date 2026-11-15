@@ -554,7 +554,7 @@ async def test_live_supervisor_observes_operator_stop_after_idle_turn(tmp_path, 
         _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
         boundary.outcome = outcome
         loop = asyncio.get_running_loop()
-        finished, polling = asyncio.Event(), asyncio.Event()
+        finished, polling = threading.Event(), asyncio.Event()
         release_poll = threading.Event()
         stopping = False
         released = False
@@ -565,7 +565,11 @@ async def test_live_supervisor_observes_operator_stop_after_idle_turn(tmp_path, 
             return result
         monkeypatch.setattr(compute, "wait", wait)
         def status(*args, **kwargs):
-            if finished.is_set() and not stopping:
+            # This scenario stops BETWEEN an idle result and its next status
+            # read. Own that ordering: otherwise the interrupted result can
+            # finish after status returned and end supervision before polling.
+            assert finished.wait(3), "owned session result did not finish"
+            if not stopping:
                 loop.call_soon_threadsafe(polling.set)
                 # Hang guard, not a latency budget.
                 assert release_poll.wait(60), "operator stop did not finish"
@@ -613,7 +617,8 @@ async def test_live_supervisor_observes_operator_stop_after_idle_turn(tmp_path, 
 
 
 @pytest.mark.parametrize("missed_poll", [False, True])
-async def test_successful_host_lock_refusal_precedes_rewait(tmp_path, missed_poll):
+async def test_successful_host_lock_refusal_precedes_rewait(tmp_path, monkeypatch, missed_poll):
+    import threading
     from mimir_cultivate.worklink.control import _mark_operator_stop
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
@@ -623,7 +628,17 @@ async def test_successful_host_lock_refusal_precedes_rewait(tmp_path, missed_pol
             "model": {"providerID": "openai", "id": "synthetic"},
             "content": [{"type": "text", "text": "Another live session holds the run lock; did not acquire the lock"}],
         })
+        observed = threading.Event()
+        real_wait = compute.wait
+        async def wait(*args, **kwargs):
+            result = await real_wait(*args, **kwargs)
+            observed.set()
+            return result
+        monkeypatch.setattr(compute, "wait", wait)
         def status(*args, **kwargs):
+            # Refusal precedence is tested after its owned result is available,
+            # not against whichever HTTP/status thread the scheduler runs first.
+            assert observed.wait(3), "owned refusal result was not observed"
             if missed_poll:
                 raise RuntimeError("synthetic unavailable status")
             return replace(record.status, lock="absent", lock_session=None)

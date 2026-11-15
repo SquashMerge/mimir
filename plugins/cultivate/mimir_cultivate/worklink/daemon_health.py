@@ -37,7 +37,7 @@ def now_ms() -> int:
 
 def classify_native(value: object, method: object, *, now: int) -> NativeLogin:
     if (not isinstance(value, str) or len(value.encode("utf-8")) > 65536
-            or method != "chatgpt-headless"):
+            or method not in {"chatgpt-headless", "chatgpt-browser"}):
         return NativeLogin("malformed")
     try:
         credential = json.loads(value)
@@ -56,7 +56,18 @@ def classify_native(value: object, method: object, *, now: int) -> NativeLogin:
                                         or any(ord(c) < 32 for c in refresh)))):
         return NativeLogin("malformed")
     if expires == 0:
-        return NativeLogin("zero_expiry", expires)
+        # Only this caller's openai ChatGPT OAuth methods support the deliberate
+        # no-refresh sentinel. It does not make an expired JWT healthy.
+        from ..opencode import _jwt_exp
+
+        jwt_expiry = _jwt_exp(access) * 1000
+        metadata = credential.get("metadata")
+        account = metadata.get("accountID") if isinstance(metadata, dict) else None
+        if (jwt_expiry <= 0 or not refresh or not refresh.strip()
+                or not isinstance(account, str) or not account.strip()
+                or any(ord(c) < 32 for c in account)):
+            return NativeLogin("zero_expiry", expires)
+        return NativeLogin("locally_unexpired" if jwt_expiry > now + 5000 else "expired_no_refresh", jwt_expiry)
     if expires > now + 5000:
         return NativeLogin("locally_unexpired", expires)
     if refresh and refresh.strip():
@@ -130,8 +141,8 @@ def parse_status(payload: object, *, now: int | None = None) -> dict[str, object
     return dict(payload)
 
 
-def load_api(paths: RuntimePaths, *, uid: int) -> dict[str, str]:
-    payload = read_json(paths.api, uid=uid, mode=0o600)
+def load_api(paths: RuntimePaths, *, uid: int, controller: bool = False) -> dict[str, str]:
+    payload = read_json(paths.controller_api if controller else paths.api, uid=uid, mode=0o600)
     if (not isinstance(payload, dict) or set(payload) != {"version", "url", "username", "password"}
             or type(payload["version"]) is not int or payload["version"] != 1
             or payload["url"] != DAEMON_URL or payload["username"] != "opencode"

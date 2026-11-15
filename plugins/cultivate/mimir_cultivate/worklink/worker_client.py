@@ -324,10 +324,10 @@ class WorkerClient:
     async def session_create(self, request: SessionRequest, *, timeout_s: int, pass_env: Mapping[str, str] | None = None,
                              git_settings: Sequence[tuple[str, str]] = ()) -> LaunchHandle:
         from dataclasses import asdict
-        from .daemon_health import daemon_health
+        from .daemon_gate import prepare_daemon_health
         from .backends.base import SessionAdmissionError
 
-        health = daemon_health(dict(os.environ))
+        health = await asyncio.to_thread(prepare_daemon_health, dict(os.environ))
         if health.get("ok") is not True:
             raise SessionAdmissionError(uncertain=False)
         generation = health["launch_generation"]

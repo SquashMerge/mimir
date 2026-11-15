@@ -1387,12 +1387,9 @@ def _verify_opencode_daemon(deploy: Path, *, run=None) -> None:
         state = json.loads(output)
     except (ValueError, TypeError):
         state = {}
-    if isinstance(state, dict) and state.get("daemon_enabled") is True:
-        print("Worklink native Codex login (independent of the agent): "
-              "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
     if not isinstance(state, dict) or state.get("ok") is not True:
-        raise SetupError("OpenCode daemon verification failed; inspect installation, readiness, native login and stale bot-token health. "
-                         "Native login: docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
+        raise SetupError("OpenCode daemon verification failed; inspect installation, readiness, agent Codex login and stale bot-token health. "
+                         "Log in for this deployment: " + _codex_login_command(deploy))
     if state.get("refresh_unverified") is True:
         print("Native login refresh is unverified; local health does not prove provider validity.")
     if state.get("sensitive_telemetry_disabled") is True:
@@ -1929,7 +1926,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if codex:
             _require_codex_login(deploy, run)
         # s6 starts the agent and daemon independently; setup and daemon-backed
-        # workloads require the separate native login, not agent liveness.
+        # workloads seed/reconcile the agent's login before checking readiness.
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
         _verify_opencode_daemon(deploy, run=run)
     if old_image and old_image[1] != layer_tag:
@@ -1938,11 +1935,6 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
               + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
     if no_start:
         print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
-        from mimir.worklink_daemon_activation import planned_activation
-
-        if planned_activation(trusted_cultivate=True, opencode_installed=True).enabled:
-            print("Then provision the separate Worklink native Codex login: "
-                  "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login")
         if codex:
             print("First log in for this deployment: " + _codex_login_command(deploy))
         print("Then re-run mimir cultivate setup with the same deployment and settings, without --no-start, "

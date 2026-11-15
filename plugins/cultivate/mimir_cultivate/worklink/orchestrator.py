@@ -1218,10 +1218,9 @@ class WorklinkRunner:
                 return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
 
         if compute.name == "opencode_daemon":
-            from .daemon_gate import workload_refusal
-            from .daemon_health import daemon_health
+            from .daemon_gate import prepare_daemon_health, workload_refusal
 
-            reason = workload_refusal(daemon_health(dict(os.environ)))
+            reason = workload_refusal(await asyncio.to_thread(prepare_daemon_health, dict(os.environ)))
             if reason is not None:
                 return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
 
@@ -3141,10 +3140,9 @@ class WorklinkRunner:
                 )
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
         if compute.name == "opencode_daemon":
-            from .daemon_gate import workload_refusal
-            from .daemon_health import daemon_health
+            from .daemon_gate import prepare_daemon_health, workload_refusal
 
-            reason = workload_refusal(daemon_health(dict(os.environ)))
+            reason = workload_refusal(await asyncio.to_thread(prepare_daemon_health, dict(os.environ)))
             if reason is not None:
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
         launcher = selected.admit()

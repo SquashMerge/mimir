@@ -113,33 +113,40 @@ different UID. Login before rerunning setup to start the agent; without a valid
 still builds and provisions before login. Do not copy or mount the host's `~/.codex`: refresh
 tokens are single-use, and sharing one login across deployments can revoke
 the entire token family. Log in separately for **each** deployment. This is the
-agent's login only: it is never copied into Worklink.
+agent's login: the controller also seeds the Worklink daemon's credential store.
 
 Worklink uses a separate OpenCode 2.2.7 daemon, supervised by the
 `worklink-opencode` s6 longrun as `worklink` (uid 1002). Setup starts the container
 and waits at most 60 seconds for local daemon readiness. The Mimir workload is
-gated, but the daemon remains available even when native login is missing. From
-the deployment directory provision its **independent** native Codex login:
+gated, but the daemon remains available when login is missing. As `mimir`, the
+controller automatically imports the agent's ChatGPT login through the authenticated
+credential API; no second device-code login is required. Setup and direct Compose
+startup both seed/reconcile before checking that the daemon has a usable login.
+A missing, API-key-only or invalid agent login repeats the existing deployment
+Codex login guidance. `--no-start` builds/provisions without probing the daemon.
 
-```sh
-docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login
-```
-
-The private wrapper executes the pinned command
-`opencode auth login --server http://127.0.0.1:4096 --method chatgpt-headless openai`
-and loads API authentication privately, never from printed arguments. Substitute
-your actual Compose service name for `agent` in hand-maintained deployments.
-Rerun setup after login. Direct Compose startup enforces the same workload gate;
-it is not merely a healthcheck. `--no-start` builds/provisions and prints
-instructions without starting or probing the daemon or workload.
+Reconciliation also runs before each leaf build and factory epic launch, and every
+15 minutes by default (`MIMIR_WORKLINK_CODEX_RECONCILE_CRON`, default `*/15 * * * *`).
+The newer access-token JWT expiry wins during legacy migration. All imports use
+`expires: 0`, disabling OpenCode's own refresh for ChatGPT OAuth. Equal expiries
+normalize legacy positive-expiry entries; identical normalized bundles do not write.
+Write-back preserves all other Codex fields, takes codex-plus's `auth.json.lock`
+flock, and atomically replaces `auth.json` with mode 0600. The controller proactively
+refreshes within 20 minutes of JWT expiry through codex-plus's coordinated API,
+then re-locks and re-reads before propagation. The agent's reactive 401 path uses
+the same API; only that coordinated provider can spend the refresh token.
+Keep custom reconcile intervals below 20 minutes. Delayed propagation can leave a
+stale daemon access token, but not an independently refreshing token family.
 
 The daemon's private HOME/config/data/state/cache and native credential SQLite
 DB live under `/var/lib/mimir-worklink/daemon`, retained in the `worklink-daemon`
 volume. Do not remove that volume during upgrades. Local health accepts
 `locally_unexpired` or `refreshable_unverified`; the latter warns that refresh
 and provider validity have not been checked. Missing, inactive, malformed,
-zero-expiry or expired-without-refresh credentials refuse workloads. No health
-probe initiates OAuth or checks a subscription with the provider.
+invalid-zero-expiry or expired-without-refresh credentials refuse workloads.
+Intentional sentinel credentials are healthy only while their real JWT is unexpired.
+Local inspection never initiates OAuth or checks a subscription; controller
+preflight reconciliation can proactively refresh through codex-plus.
 
 Daemon telemetry is metrics-only by default when tracing is enabled: logs and
 all three trace types are disabled. Content capture explicitly enables logs,

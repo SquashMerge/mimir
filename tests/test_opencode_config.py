@@ -60,10 +60,11 @@ def test_retired_worker_home_documents_are_refused(path):
         worker_client.WorkerProjection(path=path, document=b"{}")
 
 
-def test_retired_auth_sources_and_reconciliation_have_no_production_callers():
+def test_retired_auth_sources_have_no_production_callers():
     forbidden = {"resolve_opencode_invocation", "resolve_worklink_opencode_invocation",
-                 "opencode_worker_documents", "reconcile_codex_auth", "read_factory_auth"}
+                 "opencode_worker_documents", "read_factory_auth"}
     root = Path(opencode.__file__).parent
+    reconciler_consumers = set()
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
@@ -71,9 +72,14 @@ def test_retired_auth_sources_and_reconciliation_have_no_production_callers():
                 name = node.func.id if isinstance(node.func, ast.Name) else (
                     node.func.attr if isinstance(node.func, ast.Attribute) else "")
                 assert name not in forbidden, (path, name)
+                if name == "reconcile_codex_auth":
+                    reconciler_consumers.add(path.relative_to(root).as_posix())
             elif isinstance(node, ast.ImportFrom):
                 assert not forbidden.intersection(alias.name for alias in node.names), path
     assert not (root / "worklink/factory_auth.py").exists()
+    # OpenCode 2 reconciliation is controller-only, through the shared preflight
+    # used by setup, launch hooks and periodic maintenance. No worker projection.
+    assert reconciler_consumers == {"worklink/daemon_gate.py"}
     for name in forbidden:
         assert not hasattr(opencode, name)
         assert name not in setup._OPENCODE_DAEMON_PROBE

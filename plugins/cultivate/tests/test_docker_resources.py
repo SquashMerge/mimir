@@ -166,7 +166,8 @@ def test_actual_selected_cli_bootstraps_and_missing_provider_fails(tmp_path: Pat
                              str(tmp_path / "home")], cwd=ROOT, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "home").exists()
-    assert "worklink-opencode-login" in result.stdout
+    assert "codex login --device-auth" in result.stdout
+    assert "automatically seeds and reconciles" in result.stdout
 
     code = ("import importlib.metadata as metadata; _real = metadata.entry_points; metadata.entry_points = lambda **kw: () if kw.get('group') == 'mimir.plugins' else _real(**kw); "
             "from mimir.cli import main; main()")

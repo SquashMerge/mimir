@@ -76,17 +76,44 @@ traffic windows when possible.
 | `$MIMIR_HOME/.claude/.credentials.json` (path resolved by `MIMIR_CLAUDE_OAUTH_CREDENTIALS`; falls back to `$HOME/.claude/.credentials.json` only if MIMIR_HOME is unset) | Claude Max OAuth subprocess for `ANTHROPIC_BASE_URL`-routed deployments | `claude /login` from a terminal with access to the host browser | `mimir oauth-usage-check` (already exists); a non-failing `oauth_usage_polled` event in `events.jsonl` |
 | Gmail OAuth refresh tokens (gog keyring) | `gog` CLI for Gmail / Calendar | `gog auth login <account>` (interactive) | `gog gmail search 'newer_than:1h' --max 1 --account <name>` succeeds |
 | Google Workspace OAuth (gogcli) | Google Calendar, Drive | Same as above | `gog calendar list --account <name>` |
-| `/var/lib/mimir-worklink/daemon/data/opencode/opencode.db` | Worklink OpenCode 2 daemon; native `openai` / `chatgpt-headless` OAuth | From the deployment directory: `docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login` | Sanitized local health inspects the native DB read-only as worklink, never `/api/credential`. `locally_unexpired` and `refreshable_unverified` permit workloads; neither proves subscription, revocation or future refresh validity. OpenCode owns DB migrations. This login is independent of the agent's `~/.codex/auth.json`; never seed, copy or reconcile refresh tokens between them. |
+| `/var/lib/mimir-worklink/daemon/data/opencode/opencode.db` | Worklink OpenCode 2 daemon; `openai` / `chatgpt-browser` OAuth (also accepts existing `chatgpt-headless`) | Automatically seeded from the agent's `~/.codex/auth.json` (`$CODEX_HOME/auth.json` if set); use setup's existing agent `codex login --device-auth` command | Controller reconciliation uses authenticated `/api/credential`, equivalent to pinned 2.2.7 `auth export`/`import`. Sanitized local health inspects the DB read-only as worklink. `locally_unexpired` and `refreshable_unverified` permit workloads; neither proves subscription, revocation or future refresh validity. OpenCode owns DB writes and migrations. |
 
-The native login wrapper targets the authenticated loopback daemon with
-`opencode auth login --server http://127.0.0.1:4096 --method chatgpt-headless openai`.
-Its API password is loaded privately from mode-600 `daemon/api.json` into the
-client environment, never argv. Preserve the `worklink-daemon` volume across
+The controller (`mimir` uid) reconciles before leaf builds and factory epic launches,
+at startup, and every 15 minutes (`MIMIR_WORKLINK_CODEX_RECONCILE_CRON`, default
+`*/15 * * * *`). Newest access-token JWT expiry wins when migrating legacy
+credentials. Daemon-newer tokens replace only the agent access/refresh/account
+fields and `last_refresh`, preserving `id_token`, `oauth_provenance`,
+`login_owner_id` and all unknown keys. All daemon imports use `expires: 0`:
+OpenCode 2.2.7's no-refresh sentinel. Equal expiries still normalize legacy
+positive-expiry entries; an identical normalized bundle does not write.
+Reads, atomic mode-0600 write-back and daemon propagation hold the same exclusive
+`auth.json.lock` flock as codex-plus and re-read after acquiring it.
+
+Only codex-plus performs refresh HTTP requests. The controller proactively calls
+its coordinated refresh API when the access JWT expires within 20 minutes, so
+an idle agent does not need to receive a 401 first. That API acquires the lock
+itself and adopts an intervening on-disk rotation instead of reusing its stale
+refresh token. The controller releases its own flock before calling it, then
+reacquires and re-reads both stores to propagate the current bundle. The agent's
+401 recovery uses the same API. Keep the reconcile interval below the 20-minute
+margin for uninterrupted daemon access. No exported payload is logged or written
+to evidence or temporary export files.
+
+The daemon API password has a controller-only mode-0600 copy at
+`/run/mimir-worklink/agent/api.json` inside a mimir-owned 0700 directory; it never
+appears in argv. Preserve the `worklink-daemon` volume across
 container recreation. Daemon directories are worklink-owned 0700 and sensitive
 files 0600. Builds share that uid: they **can read** the daemon API password,
 native Codex login and bot publishing token, intentionally including leaf/spawn.
 This is not a same-uid secret boundary. Other agent secrets, compose.env,
-MIMIR_HOME, `/home/mimir`, agent Codex and OTLP headers remain mimir-private.
+MIMIR_HOME, `/home/mimir`, the agent Codex file and OTLP headers remain mimir-private.
+Only the shared OAuth access/refresh/account bundle enters the daemon store.
+The no-refresh sentinel prevents simultaneous rotations by the agent and daemon.
+A delayed job, API failure or reactive agent refresh can temporarily leave a stale
+daemon access token until successful reconciliation, but the daemon cannot spend
+its superseded refresh token. Local health checks the real JWT expiry for sentinel
+credentials and refuses expired ones; zero is not an infinite-health claim.
+Do not share a deployment's login with another deployment.
 
 The daemon projects only equal `GH_TOKEN`/`GITHUB_TOKEN` aliases and optional
 `FACTORY_PUBLISHING_IDENTITY` from canonical `MIMIR_FACTORY_PUBLISHING_IDENTITY`,

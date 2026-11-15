@@ -139,16 +139,26 @@ def test_internal_factory_status_contract_matches_runtime_binding() -> None:
     )
 
 
-def test_daemon_rollout_docs_preserve_independent_login_and_rotation_boundary() -> None:
+def test_daemon_rollout_docs_describe_shared_login_and_rotation_boundary() -> None:
     plugins = (ROOT / "docs/plugins.md").read_text()
     credentials = (ROOT / "docs/credentials.md").read_text()
     worklink = (ROOT / "docs/internal/WORKLINK.md").read_text()
     configuration = (ROOT / "docs/configuration.md").read_text()
     for text in (plugins, credentials, worklink):
-        assert "docker compose exec --user worklink agent /usr/local/bin/worklink-opencode-login" in text
-        assert "--server http://127.0.0.1:4096 --method chatgpt-headless openai" in text
+        assert "worklink-opencode-login" not in text
+        assert "credential API" in text or "`/api/credential`" in text
         assert "refreshable_unverified" in text
         assert "worklink-daemon" in text
+    for text in (plugins, credentials):
+        assert "MIMIR_WORKLINK_CODEX_RECONCILE_CRON" in text
+        assert "auth.json.lock" in text
+        assert "JWT expiry wins" in text
+    assert "oauth_provenance" in credentials and "login_owner_id" in credentials
+    for text in (plugins, credentials, worklink):
+        assert "expires: 0" in text
+        assert "20 minutes" in text
+    assert "coordinated refresh API" in credentials
+    assert "prevents simultaneous rotations" in credentials
     for text in (credentials, worklink, configuration):
         assert "--force-recreate" in text
     assert "reconciles its OAuth store" not in plugins

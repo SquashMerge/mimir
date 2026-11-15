@@ -203,7 +203,7 @@ setup._run = local_exec
 try:
     setup._verify_opencode_daemon(Path('/tmp'))
 except setup.SetupError as exc:
-    assert 'worklink-opencode-login' in str(exc), str(exc)
+    assert 'codex agent login --device-auth' in str(exc), str(exc)
 else:
     raise AssertionError('credential-free image unexpectedly passed daemon verification')
 assert calls == ['mimir'], calls

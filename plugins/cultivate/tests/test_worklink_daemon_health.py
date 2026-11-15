@@ -55,6 +55,12 @@ def test_native_local_state_matrix_read_only(tmp_path, updates, expected):
     assert "synthetic" not in repr(result)
 
 
+@pytest.mark.parametrize("method", ["chatgpt-browser", "chatgpt-headless", "unknown"])
+def test_native_health_accepts_only_supported_codex_methods(method):
+    result = health.classify_native(json.dumps(native(methodID=method)), method, now=NOW)
+    assert result.state == ("malformed" if method == "unknown" else "locally_unexpired")
+
+
 @pytest.mark.parametrize(("rows", "expected"), [
     ([], "missing"), ([("{}", "chatgpt-headless", 0)], "inactive"),
     ([("{}", "browser", 1)], "malformed"),
@@ -560,7 +566,7 @@ async def test_agent_health_missing_login_preserves_identity_gate(
         monkeypatch.setattr(setup, "_agent_exec", agent_exec)
         monkeypatch.setattr(setup, "_http", lambda *a, **kw: pytest.fail(
             "setup trusted top-level HTTP liveness before daemon readiness"))
-        with pytest.raises(setup.SetupError, match="worklink-opencode-login"):
+        with pytest.raises(setup.SetupError, match="codex agent login --device-auth"):
             setup._verify(tmp_path, 8123, "owner", "key", "node", "22.16.0")
         assert len(probes) == 1
 

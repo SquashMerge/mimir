@@ -578,7 +578,7 @@ def configure_opencode_bootstrap(
 ) -> argparse.ArgumentParser:
     parser = sub.add_parser(
         "opencode-bootstrap",
-        help="Report daemon-native setup instructions (compatibility command; never seeds agent auth/config).",
+        help="Report daemon setup instructions (compatibility command).",
     )
     parser.add_argument(
         "--home", type=Path, default=None,
@@ -589,8 +589,8 @@ def configure_opencode_bootstrap(
 
 def dispatch_opencode_bootstrap(args: argparse.Namespace) -> int:
     print("OpenCode configuration is generated privately by the Worklink daemon service. "
-          "Start your selected Cultivate container, then run docker compose exec --user worklink "
-          "<service> /usr/local/bin/worklink-opencode-login for its independent native Codex login.")
+          "Start your selected Cultivate container, then run docker compose exec --user mimir "
+          "<service> codex login --device-auth; the controller automatically seeds and reconciles the daemon login.")
     return 0
 
 
