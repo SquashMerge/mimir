@@ -58,7 +58,7 @@ def classify_native(value: object, method: object, *, now: int) -> NativeLogin:
         return NativeLogin("malformed")
     if method is None:
         method = credential.get("methodID")
-        if method not in SUPPORTED_METHODS:
+        if not isinstance(method, str) or method not in SUPPORTED_METHODS:
             return NativeLogin("malformed")
     expires = credential.get("expires")
     access = credential.get("access")

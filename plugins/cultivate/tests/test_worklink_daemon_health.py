@@ -67,6 +67,7 @@ def test_native_health_accepts_only_supported_codex_methods(method):
     ("chatgpt-browser", None, "locally_unexpired"),
     ("chatgpt-headless", None, "locally_unexpired"),
     ("unknown", None, "malformed"), (None, None, "malformed"),
+    ([], None, "malformed"), ({}, None, "malformed"), (1, None, "malformed"),
     # A present column must be supported and agree with the value.
     ("chatgpt-browser", "chatgpt-headless", "malformed"),
     ("chatgpt-browser", "unknown", "malformed"),
@@ -155,6 +156,11 @@ def fixture_status(tmp_path, monkeypatch, *, login="locally_unexpired"):
     paths.snapshot.chmod(0o600)
     monkeypatch.setattr(health, "now_ms", lambda: NOW)
     monkeypatch.setattr(health, "resolve_activation", lambda env: SimpleNamespace(enabled=True))
+    # These cases exercise the health/login policy. Codex reconciliation is the
+    # controller's own contract (test_opencode_auth.py); left real, it would read
+    # whatever ~/.codex and daemon API the host happens to have.
+    import mimir_cultivate.opencode as opencode
+    monkeypatch.setattr(opencode, "reconcile_codex_auth", lambda env=None, **kwargs: "equal")
     ids = WorklinkIdentities(os.getuid(), os.getuid(), os.getgid())
     env = {"GITHUB_TOKEN": token, "MIMIR_FACTORY_PUBLISHING_IDENTITY": "publisher"}
     return paths, ids, env
