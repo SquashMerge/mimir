@@ -1,6 +1,7 @@
 """Portable directory lease implementation; public entry point is heavy_run.sh."""
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -76,7 +77,23 @@ def _counter(fd: int) -> str | None:
 def _retire(path: Path) -> None:
     retired = path.with_name(path.name + ".retired-" + uuid.uuid4().hex)
     path.rename(retired)
-    shutil.rmtree(retired)
+    # Waiters may still hold a descriptor to this detached generation. Once
+    # rmtree removes "breaking", a delayed waiter can briefly recreate it,
+    # then remove it after noticing the generation is no longer current.
+    # Retry only those traversal races, only on the detached path, and with a
+    # bound so real cleanup failures cannot spin indefinitely.
+    for attempt in range(100):
+        try:
+            shutil.rmtree(retired)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                raise
+            if not retired.exists():
+                return
+            if attempt == 99:
+                raise
+            time.sleep(0.01)
 
 
 def _break_stale(path: Path, fd: int, observed: str | None) -> bool:
@@ -87,7 +104,11 @@ def _break_stale(path: Path, fd: int, observed: str | None) -> bool:
     except (FileExistsError, FileNotFoundError):
         return False
     if not _is_current(path, fd) or _counter(fd) != observed:
-        os.rmdir("breaking", dir_fd=fd)
+        try:
+            os.rmdir("breaking", dir_fd=fd)
+        except FileNotFoundError:
+            # The retiring winner may already have removed this late claim.
+            pass
         return False
     try:
         _retire(path)
