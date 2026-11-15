@@ -145,3 +145,22 @@ def test_setup_option_validates_preserves_and_clears(tmp_path):
             installer._heavy_lock_dir(args(bad), {})
     with pytest.raises(installer.SetupError, match="manifest"):
         installer._heavy_lock_dir(args(None), {"heavy_lock_dir": 7})
+
+
+def test_daemon_session_environment_carries_the_lease(monkeypatch, tmp_path):
+    # Builder sessions get a constructed environment (set_environment), not the
+    # daemon's own: the lease must be carried here too.
+    from mimir_cultivate.worklink.daemon_sessions import session_environment
+
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", LOCK)
+    env = session_environment({}, home=tmp_path, git_settings=(), credentials={})
+    assert env["MIMIR_HEAVY_LOCK_FILE"] == LOCK
+    # pass_env can neither supply nor override it.
+    with pytest.raises(Exception):
+        session_environment({"MIMIR_HEAVY_LOCK_FILE": "/elsewhere/heavy.lock"}, home=tmp_path,
+                            git_settings=(), credentials={})
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE")
+    assert "MIMIR_HEAVY_LOCK_FILE" not in session_environment({}, home=tmp_path, git_settings=(), credentials={})
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", "/home/mimir/heavy.lock")
+    with pytest.raises(ValueError, match="MIMIR_HEAVY_LOCK_FILE"):
+        session_environment({}, home=tmp_path, git_settings=(), credentials={})
