@@ -651,3 +651,106 @@ def test_timeout_tool_is_selected_for_platform(tmp_path: Path, platform: str, ex
 def test_requires_a_command(tmp_path: Path) -> None:
     result = _run(tmp_path)
     assert result.returncode == 64 and "usage" in result.stderr
+
+
+def test_lease_generation_is_shared_across_identities_whatever_the_umask(tmp_path: Path) -> None:
+    # Participants are different uids without a shared group (host user, container
+    # mimir and worklink). A stale waiter must create its breaker claim inside the
+    # holder's generation and read its heartbeat, so a strict holder umask must not
+    # leak into the lease. The payload observes the live generation.
+    probe = tmp_path / "modes.json"
+    payload = ("import json, os, stat; from pathlib import Path; "
+               f"lease=Path({str(_lease(tmp_path))!r}); "
+               "mode=lambda p: stat.S_IMODE(os.stat(p).st_mode); "
+               f"Path({str(probe)!r}).write_text(json.dumps("
+               "{'lease': mode(lease), 'owner': mode(lease/'owner'), 'heartbeat': mode(lease/'heartbeat')}))")
+    child = subprocess.Popen(["sh", str(SCRIPT), sys.executable, "-c", payload], env=_env(tmp_path),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             umask=0o077)
+    out, err = child.communicate(timeout=60)
+    assert child.returncode == 0, (out, err)
+    assert json.loads(probe.read_text()) == {"lease": 0o777, "owner": 0o644, "heartbeat": 0o644}
+
+
+def test_failed_generation_chmod_releases_the_empty_lease(tmp_path: Path, monkeypatch) -> None:
+    module = _helper()
+
+    def refuse(fd, mode):
+        raise PermissionError(errno.EPERM, "fchmod refused")
+
+    monkeypatch.setattr(module.os, "fchmod", refuse)
+    with pytest.raises(PermissionError):
+        module._acquire(_lease(tmp_path), 600, 1)
+    assert not _lease(tmp_path).exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux" or os.geteuid() != 0,
+                    reason="two real identities need Linux root")
+@pytest.mark.parametrize("holder_uid, waiter_uid", [(41001, 41002), (41002, 41001)])
+def test_stale_lease_recovers_across_identities_without_a_shared_group(
+        tmp_path: Path, holder_uid: int, waiter_uid: int) -> None:
+    # Real wrappers as two uids with distinct primary groups, no supplementary
+    # groups and umask 022: the holder dies by SIGKILL, the other identity must
+    # retire its lease. Everything both identities touch lives in one shared tree.
+    import tempfile
+    shared = Path(tempfile.mkdtemp(prefix="heavy-xuid-", dir="/tmp"))
+    try:
+        shared.chmod(0o755)
+        locks = shared / "locks"
+        locks.mkdir()
+        locks.chmod(0o777)  # shared parent: writable by all, not sticky
+        tools = shared / "bin"
+        tools.mkdir()
+        for name in ("sh", "dirname", "uname", "sleep"):
+            (tools / name).symlink_to(shutil.which(name, path=os.defpath) or f"/bin/{name}")
+        timeout = shared / "test-timeout"
+        timeout.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
+                           f'{shlex.quote(str(TIMEOUT_HELPER))} "$@"\n')
+        timeout.chmod(0o755)
+        env = _env(locks, PATH=str(tools), MIMIR_HEAVY_TIMEOUT_TOOL=str(timeout),
+                   MIMIR_HEAVY_STALE_SECONDS="1")
+        probe = subprocess.run([sys.executable, "-c", "pass"], user=holder_uid, group=holder_uid,
+                               extra_groups=[], capture_output=True)
+        if probe.returncode:
+            pytest.skip("interpreter is not readable by an unprivileged identity here")
+
+        def wrapper(uid: int, log: Path, *command: str) -> subprocess.Popen[bytes]:
+            # Files, not pipes: the holder's orphaned command group would keep a pipe open.
+            with log.open("wb") as output:
+                return subprocess.Popen(["sh", str(SCRIPT), *command], env=env, user=uid, group=uid,
+                                        extra_groups=[], umask=0o022, start_new_session=True,
+                                        stdout=output, stderr=subprocess.STDOUT)
+
+        scratch = shared / "scratch"
+        scratch.mkdir()
+        scratch.chmod(0o777)
+        pid_file = scratch / "holder.pid"
+        holder_log = shared / "holder.log"
+        holder = wrapper(holder_uid, holder_log, sys.executable, "-c",
+                         f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(300)")
+        try:
+            _wait(lambda: pid_file.exists() and (_lease(locks) / "heartbeat").exists())
+        except AssertionError:
+            os.killpg(holder.pid, signal.SIGKILL)
+            holder.wait(timeout=15)
+            raise AssertionError(holder_log.read_text()) from None
+        # Kill the lease helper itself (the timeout tool runs it in its own group)
+        # before its command, so it can never release: a dead holder, not an exit.
+        helper_pid = json.loads((_lease(locks) / "owner").read_text())["pid"]
+        os.kill(helper_pid, signal.SIGKILL)
+        os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait(timeout=15)
+        os.kill(int(pid_file.read_text()), signal.SIGKILL)  # the orphaned command group
+        assert _lease(locks).stat().st_uid == holder_uid
+
+        done = scratch / "waiter-ran"
+        waiter_log = shared / "waiter.log"
+        waiter = wrapper(waiter_uid, waiter_log, sys.executable, "-c", f"open({str(done)!r}, 'w').close()")
+        waiter.wait(timeout=60)
+        err = waiter_log.read_text()
+        assert waiter.returncode == 0, err
+        assert done.exists()
+        assert err.count("retired stale lease") == 1, err
+        assert not _lease(locks).exists()
+    finally:
+        shutil.rmtree(shared, ignore_errors=True)

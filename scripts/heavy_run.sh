@@ -18,6 +18,12 @@
 # eventually break the lease while that orphan still runs. Kill the orphan before
 # restarting heavy work. No userspace lease can clean up after its own SIGKILL.
 #
+# Participants may run as different uids without a shared group (host user,
+# container mimir and worklink). The lease's parent directory must be writable
+# by all of them and NOT sticky (waiters rename other holders' stale leases);
+# each lease generation is created mode 0777 and its files 0644 regardless of
+# umask so a waiter can read the heartbeat and place its breaker claim.
+#
 # Unset/empty LOCK_FILE means no lease. Nonempty LOCK_HELD means an ancestor owns
 # it: run directly to avoid deadlock. Otherwise unusable paths or missing tools
 # fail closed. The timeout covers both queueing and execution.

@@ -57,8 +57,10 @@ def _is_current(path: Path, fd: int) -> bool:
 
 def _write(fd: int, name: str, value: str) -> None:
     # Relative to the held generation, never accidentally update a newer lease.
+    # Waiters running as other identities read the counter: 0644 whatever the umask.
     with open(os.open(name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
                       0o644, dir_fd=fd), "w") as out:
+        os.fchmod(out.fileno(), 0o644)
         out.write(value)
     os.rename(name + ".tmp", name, src_dir_fd=fd, dst_dir_fd=fd)
 
@@ -175,7 +177,17 @@ def _acquire(path: Path, stale: float, interval: float) -> int:
                 os.close(fd)
             time.sleep(min(interval, 0.1))
         else:
-            return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            # Participants are different uids (host user, mimir, worklink) without
+            # a shared group, and a stale waiter must create its breaker claim
+            # inside this generation. Mode 0777 whatever the holder's umask.
+            try:
+                os.fchmod(fd, 0o777)
+            except OSError:
+                os.close(fd)
+                path.rmdir()  # still empty: nothing else may write before the owner
+                raise
+            return fd
 
 
 def run(command: list[str]) -> int:

@@ -229,7 +229,9 @@ which otherwise receive no `MIMIR_*` settings. Commands join the lease through
 works across a VM bind mount where kernel `lockf` locks do not); the repository's
 test command must use it. The directory must already exist and be writable by
 container uids 1001 and 1002; on Linux hosts that means mode `0777`, not a
-sticky `1777`, because waiters retire other holders' stale leases. `none`
+sticky `1777`, because waiters retire other holders' stale leases. Each lease
+generation is created `0777` with `0644` files regardless of the holder's
+umask, so participants need no shared group. `none`
 clears the setting; omitting the flag on a rerun preserves it.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
