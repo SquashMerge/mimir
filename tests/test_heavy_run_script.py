@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import importlib.util
 import json
 import os
@@ -187,6 +188,31 @@ def test_timeout_helper_kills_stubborn_command_group_after_grace(tmp_path: Path)
     assert result.returncode == 137, result.stderr
 
 
+def _is_zombie(pid: int) -> bool:
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():  # Linux; slim images ship no ps.
+        return stat.read_text().rpartition(")")[2].split()[0] == "Z"
+    return subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.strip().startswith("Z")
+
+
+def test_timeout_helper_tolerates_a_zombie_only_command_group() -> None:
+    """macOS answers killpg on an all-zombie group with EPERM (chainlink #2146 fallout)."""
+    spec = importlib.util.spec_from_file_location("heavy_timeout_under_test", TIMEOUT_HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not _is_zombie(leader.pid):
+            assert time.monotonic() < deadline, "leader never became a zombie"
+            time.sleep(0.01)
+        helper.signal_group(leader.pid, signal.SIGKILL)  # Zombie-only group.
+    finally:
+        leader.wait(timeout=10)
+    helper.signal_group(leader.pid, signal.SIGKILL)  # Reaped group.
+
+
 def test_heartbeat_stops_when_child_exits(tmp_path: Path, start) -> None:
     release = tmp_path / "release"
     holder = start(sys.executable, "-c", _blocking_payload(release))
@@ -230,6 +256,129 @@ def test_stale_lease_has_single_winner_among_process_waiters(tmp_path: Path, sta
     assert all(p.returncode == 0 for p in waiters), outputs
     assert sum(err.count("retired stale lease") for _, err in outputs) == 1
     assert not _lease(tmp_path).exists()
+
+
+def test_retired_cleanup_races_losing_waiter_without_failing_run(tmp_path: Path, monkeypatch, capsys) -> None:
+    module = _helper()
+    lease = _frozen(tmp_path)
+    loser_fd = os.open(lease, os.O_RDONLY | os.O_DIRECTORY)
+    claimed, resume = threading.Event(), threading.Event()
+    real_current, real_rmdir = module._is_current, module.os.rmdir
+    retired = []
+    loser = None
+
+    def pause_loser(path, fd):
+        if fd == loser_fd:
+            claimed.set()  # _break_stale has created breaking through its fd.
+            assert resume.wait(10)
+        return real_current(path, fd)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def race_final_rmdir(path, *, dir_fd=None):
+            nonlocal loser
+            if dir_fd is None and Path(path).name.startswith(lease.name + ".retired-") and not retired:
+                retired.append(Path(path))
+                assert not (Path(path) / "breaking").exists()
+                loser = pool.submit(module._break_stale, lease, loser_fd, "7\n")
+                assert claimed.wait(10)
+                assert (Path(path) / "breaking").is_dir()
+                # Real rmdir now raises ENOTEMPTY, with the loser still paused.
+            return real_rmdir(path, dir_fd=dir_fd)
+
+        monkeypatch.setattr(module, "_is_current", pause_loser)
+        monkeypatch.setattr(module.os, "rmdir", race_final_rmdir)
+        # run() owns signal handlers in production; keep this in-process test
+        # from changing the test runner's handlers.
+        monkeypatch.setattr(module.signal, "signal", lambda *args: None)
+        for name, value in _env(tmp_path, MIMIR_HEAVY_STALE_SECONDS="0.06").items():
+            monkeypatch.setenv(name, value)
+        marker = tmp_path / "ran-with-leftover"
+        payload = ("from pathlib import Path; "
+                   f"p=Path({str(tmp_path)!r}); "
+                   "assert len(list(p.glob('heavy.lock.lease.retired-*'))) == 1; "
+                   f"Path({str(marker)!r}).touch()")
+        try:
+            assert module.run([sys.executable, "-c", payload]) == 0
+            assert marker.exists(), "winner's command must run despite ENOTEMPTY"
+            assert len(retired) == 1 and not retired[0].exists(), "release must sweep the leftover"
+        finally:
+            resume.set()
+            try:
+                if loser is not None:
+                    assert loser.result(timeout=10) is False
+            finally:
+                os.close(loser_fd)
+    warnings = [line for line in capsys.readouterr().err.splitlines() if "cleanup deferred" in line]
+    assert len(warnings) == 1
+    assert f"errno={errno.ENOTEMPTY}" in warnings[0]
+
+
+@pytest.mark.parametrize("operation", ["acquire", "release"])
+def test_sweep_only_retired_directories_for_this_lease(tmp_path: Path, capsys, operation: str) -> None:
+    module = _helper()
+    lease = tmp_path / "heavy[1].lock.lease"
+    fd = module._acquire(lease, stale=600, interval=1) if operation == "release" else None
+    retired = lease.with_name(lease.name + ".retired-old")
+    retired.mkdir()
+    (retired / "breaking").mkdir()
+    other = tmp_path / "heavy1.lock.lease.retired-other"
+    other.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    link = lease.with_name(lease.name + ".retired-link")
+    link.symlink_to(target, target_is_directory=True)
+    ordinary_file = lease.with_name(lease.name + ".retired-file")
+    ordinary_file.touch()
+    try:
+        if operation == "acquire":
+            fd = module._acquire(lease, stale=600, interval=1)
+            assert lease.is_dir()
+        else:
+            module._release(lease, fd)
+        assert not retired.exists()
+        assert other.is_dir() and target.is_dir() and link.is_symlink() and ordinary_file.is_file()
+        assert capsys.readouterr().err == ""
+    finally:
+        if fd is not None:
+            module._release(lease, fd)
+            os.close(fd)
+
+
+@pytest.mark.parametrize("operation", ["acquire", "release"])
+@pytest.mark.parametrize("fault", ["delete", "scan", "already-removed"])
+def test_retired_sweep_errors_are_nonfatal_and_sanitized(tmp_path: Path, monkeypatch, capsys,
+                                                       operation: str, fault: str) -> None:
+    module = _helper()
+    parent = tmp_path / "parent\n\x1b[31m"
+    parent.mkdir()
+    lease = parent / "heavy\n\x1b[31m.lock.lease"
+    fd = module._acquire(lease, stale=600, interval=1)
+    retired = lease.with_name(lease.name + ".retired-old")
+    retired.mkdir()
+
+    def fail(*args, **kwargs):
+        error = FileNotFoundError if fault == "already-removed" else PermissionError
+        raise error(errno.ENOENT if fault == "already-removed" else errno.EACCES, "unsafe\n\x1btext")
+
+    monkeypatch.setattr(module.os if fault == "scan" else module.shutil,
+                        "scandir" if fault == "scan" else "rmtree", fail)
+    try:
+        if operation == "acquire":
+            # Keep the live generation as a replacement, but make a fresh
+            # acquisition possible without invoking release's sweep.
+            lease.rename(tmp_path / "displaced")
+            acquired = module._acquire(lease, stale=600, interval=1)
+            os.close(acquired)
+        else:
+            module._release(lease, fd)
+    finally:
+        os.close(fd)
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == (0 if fault == "already-removed" else 1 if operation == "acquire" else 2)
+    for line in lines:
+        assert "cleanup deferred" in line and "errno=13" in line
+        assert "\x1b" not in line and "unsafe" not in line
+        assert "\\n" in line and "\\x1b" in line
 
 
 def test_stale_break_single_winner_preserves_replacement(tmp_path: Path, monkeypatch) -> None:
