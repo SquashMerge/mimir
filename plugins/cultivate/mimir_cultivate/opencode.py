@@ -325,6 +325,11 @@ def _atomic_auth_write(path: Path, document: dict[str, Any]) -> None:
             pass
 
 
+# Larger than the default 15-minute job interval: an idle agent must not be
+# needed to trigger refresh before the daemon's access JWT expires.
+_CODEX_REFRESH_MARGIN_SECONDS = 20 * 60
+
+
 async def _reconcile_codex_locked(path: Path, client: Any) -> str:
     # Both stores are read AFTER taking codex-plus's lock. A refresh that held
     # the lock before us may have replaced auth.json while we were waiting.
@@ -348,7 +353,7 @@ async def _reconcile_codex_locked(path: Path, client: Any) -> str:
     account = metadata.get("accountID") if isinstance(metadata, dict) else None
     valid = (isinstance(value, dict) and value.get("type") == "oauth"
              and value.get("methodID") in {"chatgpt-browser", "chatgpt-headless"}
-             and type(value.get("expires")) is int and 0 < value["expires"] <= 9007199254740991
+             and type(value.get("expires")) is int and 0 <= value["expires"] <= 9007199254740991
              and _oauth_tokens(value.get("access"), value.get("refresh"), account))
     if valid and account != tokens["account_id"]:
         raise CodexReconcileError("Agent and OpenCode Codex accounts differ; reconcile the login account")
@@ -360,12 +365,17 @@ async def _reconcile_codex_locked(path: Path, client: Any) -> str:
         tokens.update(access_token=value["access"], refresh_token=value["refresh"], account_id=account)
         document["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         _atomic_auth_write(path, document)
-        return "daemon_newer"
-    if daemon_exp == agent_exp:
-        return "equal"
+    # expires=0 disables OpenCode 2.2.7's on-use refresh. Normalize legacy
+    # positive-expiry entries even when their JWT expiry equals the agent's.
+    # This is scoped to the ChatGPT OAuth methods in the openai integration.
     imported = {"type": "oauth", "methodID": "chatgpt-browser", "access": tokens["access_token"],
-                "refresh": tokens["refresh_token"], "expires": agent_exp * 1000,
+                "refresh": tokens["refresh_token"], "expires": 0,
                 "metadata": {"accountID": tokens["account_id"]}}
+    outcome = "daemon_newer" if daemon_exp > agent_exp else "agent_newer" if valid else "seeded"
+    if valid and value == imported:
+        return "equal"
+    if daemon_exp == agent_exp:
+        outcome = "agent_newer"  # Includes migration to the no-refresh sentinel.
     created = await client.create_credential(imported)
     # Verify the supported API actually persisted the complete refreshable
     # bundle before removing the superseded active entry. No direct DB writes.
@@ -375,7 +385,28 @@ async def _reconcile_codex_locked(path: Path, client: Any) -> str:
         raise CodexReconcileError("OpenCode credential import verification failed")
     if entry is not None and entry["id"] != created["id"]:
         await client.remove_credential(entry["id"])
-    return "agent_newer" if valid else "seeded"
+    return outcome
+
+
+def _codex_refresh_candidate(path: Path) -> Any:
+    from langchain_codex_plus.codex_auth import load_codex_auth
+
+    auth = load_codex_auth(path)
+    if auth is None:
+        raise CodexReconcileError(_CODEX_LOGIN_GUIDANCE)
+    if _jwt_exp(auth.access_token) <= datetime.now(timezone.utc).timestamp() + _CODEX_REFRESH_MARGIN_SECONDS:
+        return auth
+    return None
+
+
+def _refresh_codex_coordinated(path: Path, stale: Any) -> None:
+    from langchain_codex_plus import refresh_codex_auth_coordinated
+    from langchain_codex_plus.codex_auth import CodexAuthRefreshError
+
+    try:
+        refresh_codex_auth_coordinated(stale, path=path)
+    except CodexAuthRefreshError:
+        raise CodexReconcileError("OpenCode coordinated Codex refresh unavailable") from None
 
 
 def reconcile_codex_auth(
@@ -383,9 +414,9 @@ def reconcile_codex_auth(
 ) -> str:
     """Controller-side OpenCode 2/Codex newest-JWT reconciliation.
 
-    Run off the event loop. The exclusive flock is the exact auth.json.lock
-    used by codex-plus; never fall back to an unlocked operation. OpenCode's
-    own autonomous refresh does not take this flock (a residual race).
+    Run off the event loop. Only codex-plus refreshes; OpenCode receives the
+    expires=0 no-refresh sentinel. Its coordinated API owns the refresh flock;
+    our own lock protects normalization and propagation, never a nested call.
     """
     from .worklink.daemon_client import DaemonClientError, OpenCodeDaemonClient
     from .worklink.daemon_health import load_api
@@ -409,13 +440,26 @@ def reconcile_codex_auth(
                                        password=api["password"]) as client:
             return await _reconcile_codex_locked(path, client)
 
-    try:
+    def propagate() -> tuple[str, Any]:
         fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            return asyncio.run(reconcile())
+            outcome = asyncio.run(reconcile())
+            return outcome, _codex_refresh_candidate(path)
         finally:
             os.close(fd)
+
+    try:
+        # Disable the daemon refresher BEFORE any proactive rotation. Do not
+        # pass a snapshot read before this locked normalization to codex-plus.
+        outcome, stale = propagate()
+        if stale is not None:
+            _refresh_codex_coordinated(path, stale)
+            # An agent 401 may have refreshed while we were waiting. Re-read
+            # under the lock rather than importing the API's returned snapshot.
+            propagate()
+            return "agent_newer"
+        return outcome
     except CodexReconcileError:
         raise
     except FileNotFoundError:

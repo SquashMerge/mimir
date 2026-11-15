@@ -124,7 +124,7 @@ async def test_seed_supported_api_only_and_secret_nowhere_else(stores, tmp_path,
     assert len(s.entries) == 1 and s.entries[0]["active"]
     value = s.entries[0]["value"]
     assert value == {"type": "oauth", "methodID": "chatgpt-browser", "access": s.document["tokens"]["access_token"],
-                     "refresh": s.secret, "expires": 1900000000000, "metadata": {"accountID": "synthetic-account"}}
+                     "refresh": s.secret, "expires": 0, "metadata": {"accountID": "synthetic-account"}}
     assert all(s.locked)
     assert s.secret not in caplog.text + str(capsys.readouterr())
     for path in tmp_path.rglob("*"):
@@ -157,7 +157,8 @@ async def test_daemon_newer_preserves_provenance_owner_and_every_extra_key_under
     assert after["last_refresh"] != "old"
     assert s.path.stat().st_mode & 0o777 == 0o600
     assert s.path.stat().st_ino != inode
-    assert s.writes == 0 and all(s.locked)
+    assert s.writes == 2 and all(s.locked)
+    assert s.entries[0]["value"]["expires"] == 0
 
 
 async def test_agent_newer_import_and_equal_no_write(stores):
@@ -174,13 +175,16 @@ async def test_agent_newer_import_and_equal_no_write(stores):
     assert s.path.read_bytes() == original
 
 
-async def test_equal_expiry_different_token_bytes_does_not_write(stores):
+async def test_equal_expiry_legacy_credential_is_normalized(stores):
     stores.entries = [stores.credential(1900000000)]
-    before = copy.deepcopy(stores.entries)
     raw = stores.path.read_bytes()
+    assert await stores.reconcile() == "agent_newer"
+    assert stores.entries[0]["value"]["expires"] == 0
+    assert stores.entries[0]["value"]["access"] == stores.document["tokens"]["access_token"]
+    assert stores.path.read_bytes() == raw
+    assert stores.writes == 2
     assert await stores.reconcile() == "equal"
-    assert stores.entries == before and stores.path.read_bytes() == raw
-    assert stores.writes == 0
+    assert stores.writes == 2
 
 
 @pytest.mark.parametrize("change", [
@@ -209,7 +213,7 @@ async def test_invalid_jwt_expiry_never_seeds(stores, exp):
 
 @pytest.mark.parametrize("updates", [
     {"type": "key"}, {"methodID": "unrecognized"}, {"refresh": ""},
-    {"access": "bad-jwt"}, {"metadata": {}}, {"expires": 0}, {"expires": True},
+    {"access": "bad-jwt"}, {"metadata": {}}, {"expires": True},
 ])
 async def test_invalid_daemon_credential_is_seeded(stores, updates):
     stores.entries = [stores.credential(1900000100, **updates)]
@@ -353,6 +357,132 @@ def test_pinned_auth_export_import_contract():
     for entry in exported:
         OpenCodeSchema().named("Credential.Entry", entry)
     assert exported[0]["value"]["methodID"] == "chatgpt-browser"
+
+
+@pytest.mark.parametrize("method", ["chatgpt-browser", "chatgpt-headless"])
+@pytest.mark.parametrize("remaining", [60000, 0, -1000])
+def test_sentinel_health_checks_real_jwt_expiry_and_method(method, remaining):
+    now = 1900000000000
+    value = {"type": "oauth", "methodID": method, "access": jwt((now + remaining) // 1000),
+             "refresh": "synthetic-refresh", "expires": 0, "metadata": {"accountID": "synthetic-account"}}
+    OpenCodeSchema().named("Credential.CreateInput", {"integrationID": "openai", "value": value,
+                                                      "label": "agent Codex", "activate": True})
+    result = daemon_health.classify_native(json.dumps(value), method, now=now)
+    assert result.state == ("locally_unexpired" if remaining > 5000 else "expired_no_refresh")
+    assert result.expires_at_ms == now + remaining
+    assert daemon_health.classify_native(json.dumps(value), "other", now=now).state == "malformed"
+
+
+@pytest.mark.parametrize("minute", [40, 55])
+async def test_idle_refresh_and_concurrent_401_use_one_family(stores, monkeypatch, minute):
+    """Real coordinated API + HTTP transport; no live login or provider calls."""
+    import httpx
+    import langchain_codex_plus as provider
+    from langchain_codex_plus.codex_auth import load_codex_auth
+    from urllib.parse import parse_qs
+    from datetime import datetime, timezone
+
+    s = stores
+    issued = 1900000000
+    clock = SimpleNamespace(seconds=issued + minute * 60)
+
+    class Clock:
+        @staticmethod
+        def now(tz=None):
+            return datetime.fromtimestamp(clock.seconds, tz=timezone.utc)
+
+    monkeypatch.setattr(opencode, "datetime", Clock)
+    s.document["tokens"]["access_token"] = jwt(issued + 3600)
+    s.save()
+    stale = load_codex_auth(s.path)
+    rotated_access = jwt(issued + 7200)
+    rotated_refresh = "next-" + s.secret
+    requests = []
+    waiting = threading.Event()
+    agent = []
+    original = provider.refresh_codex_auth_coordinated
+    flock = fcntl.flock
+
+    def observed(fd, operation):
+        if threading.current_thread().name == "synthetic-agent-401" and operation & fcntl.LOCK_EX:
+            waiting.set()
+        return flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", observed)
+
+    def transport(request):
+        assert s.lock_held(), "provider HTTP refresh must hold auth.json.lock"
+        assert s.entries[0]["value"]["expires"] == 0, "daemon must not refresh before rotation"
+        fields = (json.loads(request.content) if "application/json" in request.headers.get("content-type", "")
+                  else {key: values[0] for key, values in parse_qs(request.content.decode()).items()})
+        assert fields["refresh_token"] == s.secret
+        requests.append(fields)
+        # The agent's reactive 401 path uses the same real coordinated API.
+        # Start it while proactive HTTP owns the lock, not after completion.
+        def unauthorized():
+            try:
+                agent.append(original(stale, path=s.path, http_client=client,
+                                      refresh_reason="unauthorized_recovery"))
+            except Exception as exc:
+                agent.append(exc)
+        thread = threading.Thread(target=unauthorized, name="synthetic-agent-401", daemon=True)
+        s.agent_thread = thread
+        thread.start()
+        assert waiting.wait(5), "agent never attempted the contested flock"
+        return httpx.Response(200, json={"access_token": rotated_access,
+            "refresh_token": rotated_refresh, "id_token": "synthetic-next-id", "expires_in": 3600})
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        def coordinated(auth, **kwargs):
+            assert not s.lock_held(), "must not nest the provider's flock"
+            try:
+                return original(auth, http_client=client, **kwargs)
+            except Exception as exc:
+                raise AssertionError(f"synthetic coordinated API failed: {type(exc).__name__}: {exc}") from exc
+        monkeypatch.setattr(provider, "refresh_codex_auth_coordinated", coordinated)
+        assert await s.reconcile() == "agent_newer"
+        await asyncio.to_thread(s.agent_thread.join, 5)
+        assert not s.agent_thread.is_alive()
+    assert len(requests) == 1, "concurrent 401 must adopt, never spend the old refresh token"
+    assert len(agent) == 1 and not isinstance(agent[0], Exception), repr(agent)
+    assert agent[0].access_token == rotated_access
+    current = json.loads(s.path.read_text())
+    value = s.entries[0]["value"]
+    assert value["access"] == current["tokens"]["access_token"] == rotated_access
+    assert value["refresh"] == current["tokens"]["refresh_token"] == rotated_refresh
+    assert value["expires"] == 0 and all(s.locked)
+    assert opencode._jwt_exp(value["access"]) > issued + 3600
+    # The idle daemon uses the propagated token even after the old JWT expires.
+    clock.seconds = issued + 3601
+    assert daemon_health.classify_native(json.dumps(value), value["methodID"],
+                                         now=clock.seconds * 1000).state == "locally_unexpired"
+
+
+async def test_refresh_not_before_margin_and_failure_is_sanitized(stores, monkeypatch):
+    import langchain_codex_plus as provider
+    from langchain_codex_plus.codex_auth import CodexAuthRefreshError
+    from datetime import datetime, timezone
+
+    s = stores
+    now = int(datetime.now(timezone.utc).timestamp())
+    s.document["tokens"]["access_token"] = jwt(now + opencode._CODEX_REFRESH_MARGIN_SECONDS + 60)
+    s.save()
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(kwargs)
+        raise CodexAuthRefreshError(s.secret)
+
+    monkeypatch.setattr(provider, "refresh_codex_auth_coordinated", fail)
+    assert await s.reconcile() == "seeded"
+    assert not calls
+    s.entries.clear()
+    s.document["tokens"]["access_token"] = jwt(now + 60)
+    s.save()
+    with pytest.raises(opencode.CodexReconcileError, match="coordinated Codex refresh unavailable") as error:
+        await s.reconcile()
+    assert s.secret not in str(error.value) and len(calls) == 1
+    assert s.entries[0]["value"]["expires"] == 0
 
 
 async def test_preflight_and_periodic_job_reconcile_on_controller(stores, monkeypatch):

@@ -80,13 +80,24 @@ traffic windows when possible.
 
 The controller (`mimir` uid) reconciles before leaf builds and factory epic launches,
 at startup, and every 15 minutes (`MIMIR_WORKLINK_CODEX_RECONCILE_CRON`, default
-`*/15 * * * *`). Newest access-token JWT expiry wins; equal expiries do not write.
-Daemon-newer tokens replace only the agent access/refresh/account fields and
-`last_refresh`, preserving `id_token`, `oauth_provenance`, `login_owner_id` and all
-unknown keys. Reads and atomic mode-0600 write-back hold the same exclusive
-`auth.json.lock` flock as codex-plus and re-read after acquiring it. Agent-newer
-tokens are imported with their JWT expiry and account id through the supported API.
-No exported payload is logged or written to evidence or temporary export files.
+`*/15 * * * *`). Newest access-token JWT expiry wins when migrating legacy
+credentials. Daemon-newer tokens replace only the agent access/refresh/account
+fields and `last_refresh`, preserving `id_token`, `oauth_provenance`,
+`login_owner_id` and all unknown keys. All daemon imports use `expires: 0`:
+OpenCode 2.2.7's no-refresh sentinel. Equal expiries still normalize legacy
+positive-expiry entries; an identical normalized bundle does not write.
+Reads, atomic mode-0600 write-back and daemon propagation hold the same exclusive
+`auth.json.lock` flock as codex-plus and re-read after acquiring it.
+
+Only codex-plus performs refresh HTTP requests. The controller proactively calls
+its coordinated refresh API when the access JWT expires within 20 minutes, so
+an idle agent does not need to receive a 401 first. That API acquires the lock
+itself and adopts an intervening on-disk rotation instead of reusing its stale
+refresh token. The controller releases its own flock before calling it, then
+reacquires and re-reads both stores to propagate the current bundle. The agent's
+401 recovery uses the same API. Keep the reconcile interval below the 20-minute
+margin for uninterrupted daemon access. No exported payload is logged or written
+to evidence or temporary export files.
 
 The daemon API password has a controller-only mode-0600 copy at
 `/run/mimir-worklink/agent/api.json` inside a mimir-owned 0700 directory; it never
@@ -97,10 +108,12 @@ native Codex login and bot publishing token, intentionally including leaf/spawn.
 This is not a same-uid secret boundary. Other agent secrets, compose.env,
 MIMIR_HOME, `/home/mimir`, the agent Codex file and OTLP headers remain mimir-private.
 Only the shared OAuth access/refresh/account bundle enters the daemon store.
-OpenCode refreshes independently of the Codex flock, so simultaneous rotations
-between reconciles can still revoke the family (the same kind of residual
-window as OpenCode 1's per-build reconciliation). Do not share a deployment's
-login with another deployment.
+The no-refresh sentinel prevents simultaneous rotations by the agent and daemon.
+A delayed job, API failure or reactive agent refresh can temporarily leave a stale
+daemon access token until successful reconciliation, but the daemon cannot spend
+its superseded refresh token. Local health checks the real JWT expiry for sentinel
+credentials and refuses expired ones; zero is not an infinite-health claim.
+Do not share a deployment's login with another deployment.
 
 The daemon projects only equal `GH_TOKEN`/`GITHUB_TOKEN` aliases and optional
 `FACTORY_PUBLISHING_IDENTITY` from canonical `MIMIR_FACTORY_PUBLISHING_IDENTITY`,

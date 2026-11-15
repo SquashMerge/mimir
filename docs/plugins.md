@@ -127,19 +127,26 @@ Codex login guidance. `--no-start` builds/provisions without probing the daemon.
 
 Reconciliation also runs before each leaf build and factory epic launch, and every
 15 minutes by default (`MIMIR_WORKLINK_CODEX_RECONCILE_CRON`, default `*/15 * * * *`).
-The newer access-token JWT expiry wins in either direction; equal expiries do not
-write. Write-back preserves all other Codex fields, takes codex-plus's
-`auth.json.lock` flock, and atomically replaces `auth.json` with mode 0600.
-OpenCode's autonomous refresh does not take that flock: both sides refreshing
-between reconciles can still invalidate the shared single-use token family.
+The newer access-token JWT expiry wins during legacy migration. All imports use
+`expires: 0`, disabling OpenCode's own refresh for ChatGPT OAuth. Equal expiries
+normalize legacy positive-expiry entries; identical normalized bundles do not write.
+Write-back preserves all other Codex fields, takes codex-plus's `auth.json.lock`
+flock, and atomically replaces `auth.json` with mode 0600. The controller proactively
+refreshes within 20 minutes of JWT expiry through codex-plus's coordinated API,
+then re-locks and re-reads before propagation. The agent's reactive 401 path uses
+the same API; only that coordinated provider can spend the refresh token.
+Keep custom reconcile intervals below 20 minutes. Delayed propagation can leave a
+stale daemon access token, but not an independently refreshing token family.
 
 The daemon's private HOME/config/data/state/cache and native credential SQLite
 DB live under `/var/lib/mimir-worklink/daemon`, retained in the `worklink-daemon`
 volume. Do not remove that volume during upgrades. Local health accepts
 `locally_unexpired` or `refreshable_unverified`; the latter warns that refresh
 and provider validity have not been checked. Missing, inactive, malformed,
-zero-expiry or expired-without-refresh credentials refuse workloads. No health
-probe initiates OAuth or checks a subscription with the provider.
+invalid-zero-expiry or expired-without-refresh credentials refuse workloads.
+Intentional sentinel credentials are healthy only while their real JWT is unexpired.
+Local inspection never initiates OAuth or checks a subscription; controller
+preflight reconciliation can proactively refresh through codex-plus.
 
 Daemon telemetry is metrics-only by default when tracing is enabled: logs and
 all three trace types are disabled. Content capture explicitly enables logs,

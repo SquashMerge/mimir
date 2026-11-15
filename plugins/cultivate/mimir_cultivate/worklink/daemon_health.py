@@ -56,7 +56,18 @@ def classify_native(value: object, method: object, *, now: int) -> NativeLogin:
                                         or any(ord(c) < 32 for c in refresh)))):
         return NativeLogin("malformed")
     if expires == 0:
-        return NativeLogin("zero_expiry", expires)
+        # Only this caller's openai ChatGPT OAuth methods support the deliberate
+        # no-refresh sentinel. It does not make an expired JWT healthy.
+        from ..opencode import _jwt_exp
+
+        jwt_expiry = _jwt_exp(access) * 1000
+        metadata = credential.get("metadata")
+        account = metadata.get("accountID") if isinstance(metadata, dict) else None
+        if (jwt_expiry <= 0 or not refresh or not refresh.strip()
+                or not isinstance(account, str) or not account.strip()
+                or any(ord(c) < 32 for c in account)):
+            return NativeLogin("zero_expiry", expires)
+        return NativeLogin("locally_unexpired" if jwt_expiry > now + 5000 else "expired_no_refresh", jwt_expiry)
     if expires > now + 5000:
         return NativeLogin("locally_unexpired", expires)
     if refresh and refresh.strip():

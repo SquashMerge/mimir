@@ -44,7 +44,8 @@ gate enabled workloads, leaving the daemon available when login is missing.
 Setup seeds the daemon automatically from the agent's Codex device login, through
 the authenticated credential API. The mimir controller reconciles both ways before
 builds and epic launches and every 15 minutes; see [credentials](../credentials.md#type-c--oauth-refresh-dance)
-for locking, preservation and the residual simultaneous-refresh race. No separate
+for locking, preservation and the single-refresher contract (`expires: 0` disables
+daemon refresh; codex-plus proactively refreshes within 20 minutes of JWT expiry). No separate
 daemon login is required. Daemon state lives in private worklink-owned directories
 under `/var/lib/mimir-worklink/daemon`, persisted in the `worklink-daemon` volume.
 Keep that volume during recreation. Native DB migrations belong to OpenCode.

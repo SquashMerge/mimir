@@ -154,7 +154,11 @@ def test_daemon_rollout_docs_describe_shared_login_and_rotation_boundary() -> No
         assert "auth.json.lock" in text
         assert "JWT expiry wins" in text
     assert "oauth_provenance" in credentials and "login_owner_id" in credentials
-    assert "simultaneous rotations" in credentials
+    for text in (plugins, credentials, worklink):
+        assert "expires: 0" in text
+        assert "20 minutes" in text
+    assert "coordinated refresh API" in credentials
+    assert "prevents simultaneous rotations" in credentials
     for text in (credentials, worklink, configuration):
         assert "--force-recreate" in text
     assert "reconciles its OAuth store" not in plugins
