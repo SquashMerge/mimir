@@ -8,6 +8,50 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc5] — 2026-11-15
+
+- Keep listing a turn's own evicted tool results from tainting that turn (#2122).
+
+- Keep Chainlink references out of GitHub unfinished-work validation and preserve resolved items when another GitHub reference is not found (#2123).
+
+- Keep search indexer sweeps running when entries disappear during traversal, and warn and skip unreadable subtrees instead of aborting the sweep (#2124).
+
+- Run Worklink leaf, spawn and factory work as authenticated OpenCode 2.2.7 daemon sessions, with the managed factory 0.14.0 pair and OTEL plugin 2.1.0. Add a worklink-owned native Codex login (seeded from the agent's login, below), private persistent daemon state, startup/login gates and sanitized local health. Disable daemon telemetry for sensitive OTLP configuration, and default enabled telemetry to metrics only. Existing deployments must rebuild/recreate; historical V1 runs require safe operator recovery rather than process resumption.
+
+- Cultivate setup can configure optional OTLP tracing, including private collector headers and the `otel` image extra.
+
+- Remove the large Cultivate logo from the Factory Runs overview and stop bundling its unused PNG (#2130).
+
+- Seed the OpenCode 2 daemon from the agent's Codex login and reconcile token rotations both ways before builds, epic launches, and periodically, eliminating the separate daemon login. Accept the OpenCode 2.2.7 credential rows this import writes (no `method_id` column; method in the stored value).
+
+- Exempt only Cultivate's exact, authorized repository cleanup success status from fallback ingest labeling, preserving fail-closed classification for plugin declarations, malformed results and failures.
+
+- Fix Worklink timeout cancellation racing with an already-reaped worker: preserve the timeout and its configured limit, while continuing to reject unknown worker identifiers (#2134).
+
+- Add `mimir worklink clear-incident` to release an inspected dispatch-failure hold without running work, with operator audit details and incident identities in Worklink status.
+
+- Bound factory gate output with retained head/tail samples and observed byte counts, preserving the gate verdict and pytest counts when output is truncated.
+
+- Let the agent start independently of Worklink daemon login readiness; refuse daemon workloads with actionable health reasons, and align CI repair, bootstrap tests and credential-free image proofs with daemon contracts, preserving positive executor/publication coverage under an explicit synthetic session fixture and checking real missing-login refusal separately. Keep static image and wheel coverage running in core-only installs while requiring Cultivate only for daemon setup/session regressions. Start the daemon and image fixture through the worker's irreversible privilege drop with umask 002 so controller cleanup can remove session output, while keeping daemon private state at explicit restrictive modes. Opt real-UID daemon regressions out of synthetic identity isolation so parent assertions and exec descendants resolve the same provisioned accounts. Grant worklink traversal only on controller-owned spawn scope directories so daemon sessions can reach issued checkouts by pathname, preserving private pre-admission boundaries and the repo-test scope policy.
+
+- Replace `scripts/heavy_run.sh`'s host-only kernel lock with a portable directory lease at `$MIMIR_HEAVY_LOCK_FILE.lease` for macOS hosts and Linux containers sharing a writable mount. Heartbeat-counter staleness uses each waiter's monotonic clock (default 600 seconds); stale leases are claimed and renamed before deletion. Commands run in their own process group, killed before release on SIGINT/SIGTERM. Configured but unusable leases or missing timeout tools fail closed; `gtimeout`/`timeout` is selected automatically with explicit and legacy overrides. Unconfigured and ancestor-held runs still execute directly. Factory verification supplies Python through `uv run`.
+
+- Merge bounded factory control output with OpenCode daemon initialization, preserving fail-closed structured responses and requiring the combined v16 executor protocol.
+
+- Fix repository staging and commits for already-staged deletions, including true merge commits that delete files (#2143).
+
+- Make heavy-run lease tests independent of host timeout tools, including macOS runners without coreutils (#2146).
+
+- Raise short Worklink daemon and epic test hang guards to 60 seconds to tolerate gate load while preserving behaviour-specific timeout checks (#2147).
+
+- Make retired heavy-run lease cleanup best-effort and sweep leftovers on later acquisition or release, so losing waiters cannot abort the winner's run (#2148).
+
+- The frontend type-check (`npm run typecheck`, and `tsc` in `npm run build`) now also covers the Cultivate UI sources in `plugins/cultivate/frontend/src`, which were previously not type-checked anywhere.
+
+- The Cultivate `review` skill now reviews dependency PRs from trusted evidence (diff, lockfile, call sites, CI) by default and fetches upstream changelogs or source only when the verdict depends on it, after submitting every review that does not need it, so routine dependency reviews no longer stop on a trust prompt. Delegated reviewers no longer clean up the checkout their parent still needs to submit from.
+
+- Reviews of PRs from operator-trusted bots (`MIMIR_GITHUB_TRUSTED_BOT_LOGINS`, e.g. `dependabot[bot]`) are no longer refused with `no_author_trust`: poller payload redaction treated the forwarded allowlist as a secret and replaced the bot's author login with `[REDACTED]`, so PR authorization saw an author mismatch.
+
 ## [1.0.0rc4] — 2026-11-07
 
 - **Fourth release candidate for 1.0.0.** It is a pre-release, so `pip`/`uv` install it only when asked for explicitly: `mimir-agent==1.0.0rc4 mimir-cultivate==1.0.0rc4`, or `--prerelease allow`.
