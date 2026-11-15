@@ -37,7 +37,11 @@ async def _contract(
         connection = manager.connections[0]
         assert isinstance(connection, MCPConnection)
         by_name = {tool.name.removeprefix("mcp_contract_"): tool for tool in tools}
-        pid = int(await by_name["server_pid"].coroutine())
+        # Setup read straight from the session: the manager's call timeout is the
+        # subject of some contracts (0.1s), and a loaded runner must not spend it here.
+        pid_result = await asyncio.wait_for(
+            connection.session.call_tool("server_pid", {}), timeout=10)
+        pid = int(pid_result.content[0].text)
         await check(connection, by_name)
     finally:
         if cross_task_shutdown:
