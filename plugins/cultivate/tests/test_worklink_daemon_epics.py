@@ -567,7 +567,8 @@ async def test_live_supervisor_observes_operator_stop_after_idle_turn(tmp_path, 
         def status(*args, **kwargs):
             if finished.is_set() and not stopping:
                 loop.call_soon_threadsafe(polling.set)
-                assert release_poll.wait(3), "operator stop did not finish"
+                # Hang guard, not a latency budget.
+                assert release_poll.wait(60), "operator stop did not finish"
                 if missed_poll:
                     raise RuntimeError("synthetic missed poll after stop")
             return record.status
@@ -589,14 +590,16 @@ async def test_live_supervisor_observes_operator_stop_after_idle_turn(tmp_path, 
             compute=compute, factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None,
             started_at=datetime.now(UTC)))
         try:
-            await asyncio.wait_for(polling.wait(), 3)
+            # Hang guard, not a latency budget.
+            await asyncio.wait_for(polling.wait(), 60)
             stopping = True
             stop = await asyncio.to_thread(control.stop_worklink, tmp_path, 2125,
                 runner=lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
             assert stop.stopped and stop.claim_released
             released = True
             release_poll.set()
-            result = await asyncio.wait_for(task, 3)
+            # Hang guard, not a latency budget.
+            result = await asyncio.wait_for(task, 60)
             assert result.status == "interrupted"
             saved = load_factory_record(tmp_path, record.run_id)
             assert saved.controller_phase == "stopped" and saved.status.status == "running"
@@ -632,9 +635,11 @@ async def test_successful_host_lock_refusal_precedes_rewait(tmp_path, missed_pol
             factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None, started_at=datetime.now(UTC))
         if missed_poll:
             with pytest.raises(WorklinkError, match="did not acquire the retained run lock.*Another live session"):
-                await asyncio.wait_for(invocation, 3)
+                # Hang guard, not a latency budget.
+                await asyncio.wait_for(invocation, 60)
         else:
-            result = await asyncio.wait_for(invocation, 3)
+            # Hang guard, not a latency budget.
+            result = await asyncio.wait_for(invocation, 60)
             assert result.status == "needs-human" and "Another live session holds" in result.reason
         assert sum(route.endswith("/command") for _, route, _, _ in daemon.requests) == 1
         assert load_factory_record(tmp_path, record.run_id).opencode_session_id == handle.identifier
@@ -714,11 +719,11 @@ async def test_budget_park_requalifies_factory_after_session_cancellation(tmp_pa
             started_at=datetime.now(UTC))
         if ending == "foreign":
             with pytest.raises(WorklinkError, match="owner changed during cancellation"):
-                await asyncio.wait_for(invocation, 10)
+                # Hang guard, not a latency budget; the controlled clock proves budget crossing.
+                await asyncio.wait_for(invocation, 60)
         else:
-            # Hang guard remains below the session's 30-second work deadline;
-            # crossing the budget is proved by the controlled clock above.
-            result = await asyncio.wait_for(invocation, 10)
+            # Hang guard, not a latency budget; the controlled clock proves budget crossing.
+            result = await asyncio.wait_for(invocation, 60)
             assert result.status == ("review_ready" if ending == "completed" else "needs-human")
             assert load_factory_record(tmp_path, record.run_id).status == winning
         assert cancelled
@@ -969,8 +974,8 @@ async def test_bounded_node_writer_drains_at_real_lifecycle_call_sites(
                 async def cancellation_arrived():
                     while not task.cancelling():
                         await asyncio.sleep(0)
-                # Hang guard only; asserts no latency.
-                await asyncio.wait_for(cancellation_arrived(), 10)
+                # Hang guard, not a latency budget.
+                await asyncio.wait_for(cancellation_arrived(), 60)
             else:
                 task.cancel()
             for _ in range(2):

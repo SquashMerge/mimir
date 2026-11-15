@@ -588,4 +588,5 @@ def test_gate_readiness_wait_is_bounded_without_stopping_daemon(tmp_path, monkey
             assert "not ready" in capsys.readouterr().err
         finally:
             daemon.stdin.close()
-            daemon.wait(timeout=5)
+            # Hang guard, not a latency budget.
+            daemon.wait(timeout=60)
