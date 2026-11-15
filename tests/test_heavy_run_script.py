@@ -188,6 +188,31 @@ def test_timeout_helper_kills_stubborn_command_group_after_grace(tmp_path: Path)
     assert result.returncode == 137, result.stderr
 
 
+def _is_zombie(pid: int) -> bool:
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():  # Linux; slim images ship no ps.
+        return stat.read_text().rpartition(")")[2].split()[0] == "Z"
+    return subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.strip().startswith("Z")
+
+
+def test_timeout_helper_tolerates_a_zombie_only_command_group() -> None:
+    """macOS answers killpg on an all-zombie group with EPERM (chainlink #2146 fallout)."""
+    spec = importlib.util.spec_from_file_location("heavy_timeout_under_test", TIMEOUT_HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not _is_zombie(leader.pid):
+            assert time.monotonic() < deadline, "leader never became a zombie"
+            time.sleep(0.01)
+        helper.signal_group(leader.pid, signal.SIGKILL)  # Zombie-only group.
+    finally:
+        leader.wait(timeout=10)
+    helper.signal_group(leader.pid, signal.SIGKILL)  # Reaped group.
+
+
 def test_heartbeat_stops_when_child_exits(tmp_path: Path, start) -> None:
     release = tmp_path / "release"
     holder = start(sys.executable, "-c", _blocking_payload(release))
