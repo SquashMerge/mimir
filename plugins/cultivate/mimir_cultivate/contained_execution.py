@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import posixpath
+import re
 from typing import TYPE_CHECKING, Any, Callable
 
 from mimir.output_capture import OutputSink, open_output_pair
@@ -35,6 +37,7 @@ __all__ = (
     "SensitiveMaterialScrubber",
     "base_worker_environment",
     "execute_contained",
+    "heavy_lock_environment",
     "opencode_worker_environment",
 )
 
@@ -53,9 +56,35 @@ class CollectedExecutionResult:
     stderr_dropped_bytes: int
 
 
+HEAVY_LOCK_ENV = "MIMIR_HEAVY_LOCK_FILE"
+_HEAVY_LOCK_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,1023}\Z")
+_CONTROLLER_HOME = "/home/mimir"
+
+
+def heavy_lock_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The operator's shared heavy-run lease path, for every Worklink command.
+
+    scripts/heavy_run.sh serializes heavy commands across the host and its
+    containers through a directory both can write. The controller's setting is
+    the only MIMIR_* name a worker receives: it is a path, not a credential, and
+    without it builders and gates cannot join the operator's lease. Unset or
+    empty means no lease. A malformed or controller-home path fails closed
+    rather than silently running heavy work outside the lease.
+    """
+    value = (os.environ if environ is None else environ).get(HEAVY_LOCK_ENV, "")
+    if not value:
+        return {}
+    normalized = posixpath.normpath(value)
+    if (_HEAVY_LOCK_PATH.fullmatch(value) is None or normalized != value
+            or normalized == _CONTROLLER_HOME or normalized.startswith(_CONTROLLER_HOME + "/")):
+        raise ValueError(f"{HEAVY_LOCK_ENV} must be a normalized absolute path outside {_CONTROLLER_HOME}")
+    return {HEAVY_LOCK_ENV: value}
+
+
 def base_worker_environment(identifier: str) -> dict[str, str]:
     home = _RUNTIME_HOME_ROOT / identifier
     return {
+        **heavy_lock_environment(),
         "USER": "worklink",
         "LOGNAME": "worklink",
         "SHELL": "/bin/sh",

@@ -5335,3 +5335,22 @@ def test_recorded_inventory_unresolvable_key_fails_closed(tmp_path, monkeypatch)
         monkeypatch.setattr(project_tests, "_inventory_key", raise_error)
         project_tests.remember_node_inventory(tmp_path, "scope-other", frozenset({"y"}))
         assert project_tests.recorded_node_inventory(tmp_path, "scope-loop") is None
+
+
+@pytest.mark.asyncio
+async def test_repo_test_refuses_a_malformed_heavy_lock_before_execution(tmp_path, monkeypatch):
+    # A lease path that would fail later, inside the contained leg loop, refuses
+    # before any snapshot or runner work so the turn gets a typed refusal.
+    _, _, _, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", "/home/mimir/agent/heavy.lock")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("lease refusal must precede snapshot creation")
+
+    async def runner(*args, **kwargs):
+        pytest.fail("lease refusal must precede execution")
+
+    with pytest.raises(ProjectTestRefusal) as error:
+        await RepoProjectTests(state, runner=runner, checkout_factory=forbidden).execute()
+    assert error.value.code == "heavy_lock_invalid"
+    assert error.value.execution_started is False

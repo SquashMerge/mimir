@@ -220,6 +220,17 @@ saves it in the manifest and `repositories.yaml`, and preserves it on upgrade.
 An existing repository declaration without `auto_review` defaults to `all`;
 setup back-fills the field. Explicit conflicting values require `--force` or
 manual reconciliation.
+Pass `--heavy-lock-dir <host dir>` to join a heavy-run lease shared with other
+agents on the same host. Setup mounts the directory into the agent at
+`/mimir-heavy-locks` and sets `MIMIR_HEAVY_LOCK_FILE=/mimir-heavy-locks/heavy.lock`;
+Worklink passes that one path to builder sessions, gates and `repo_test` legs,
+which otherwise receive no `MIMIR_*` settings. Commands join the lease through
+`scripts/heavy_run.sh` (an atomic-`mkdir` directory lease with heartbeats, which
+works across a VM bind mount where kernel `lockf` locks do not); the repository's
+test command must use it. The directory must already exist and be writable by
+container uids 1001 and 1002; on Linux hosts that means mode `0777`, not a
+sticky `1777`, because waiters retire other holders' stale leases. `none`
+clears the setting; omitting the flag on a rerun preserves it.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
 dimensions on CPU. Its query and document vectors share Voyage 4's embedding

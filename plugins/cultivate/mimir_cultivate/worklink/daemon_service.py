@@ -182,6 +182,10 @@ def protect_agent_paths(environ: dict[str, str], identities: WorklinkIdentities)
 
 def prepare(environ: dict[str, str], identities: WorklinkIdentities,
             paths: RuntimePaths = RuntimePaths()) -> dict[str, str]:
+    from ..contained_execution import heavy_lock_environment
+
+    # Builder shell tools inherit the daemon's environment.
+    heavy_lock = heavy_lock_environment(environ)
     credentials = resolve_daemon_credentials(environ)
     configuration = daemon_configuration(environ, credentials)
     generation = str(uuid4())
@@ -208,7 +212,7 @@ def prepare(environ: dict[str, str], identities: WorklinkIdentities,
                 gid=identities.worklink_gid, mode=0o600)
     atomic_json(paths.snapshot, make_launch_snapshot(credentials, generation).to_dict(),
                 uid=identities.mimir_uid, gid=-1, mode=0o600)
-    return daemon_environment(credentials, api_password=password)
+    return {**daemon_environment(credentials, api_password=password), **heavy_lock}
 
 
 def root_start(environ: dict[str, str]) -> None:
