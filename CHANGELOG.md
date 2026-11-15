@@ -8,6 +8,10 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc6] — 2026-11-15
+
+- Cultivate setup's `--heavy-lock-dir` mounts a host directory shared with other agents, and Worklink passes `MIMIR_HEAVY_LOCK_FILE` to builder sessions, gates and `repo_test` legs so their heavy commands join the `scripts/heavy_run.sh` lease instead of running unserialized.
+
 ## [1.0.0rc5] — 2026-11-15
 
 - Keep listing a turn's own evicted tool results from tainting that turn (#2122).
