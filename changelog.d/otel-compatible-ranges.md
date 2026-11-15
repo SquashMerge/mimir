@@ -1,0 +1,1 @@
+- The `otel` extra (and the dev tracing dependencies) require `opentelemetry-*>=1.45.1,<1.46` instead of exact `==1.45.1` pins, so lockstep OpenTelemetry patch releases update `uv.lock` instead of failing Dependabot resolution.
