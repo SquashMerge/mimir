@@ -453,7 +453,7 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
         dispatcher.enqueue(event)
     # This generous bound is a hang guard, not a latency assertion.
     try:
-        await asyncio.wait_for(publisher.entered.wait(), 10)
+        await asyncio.wait_for(publisher.entered.wait(), 60)
     except TimeoutError:
         pytest.fail("hang guard expired waiting for the worker to enter publish_live")
     # The in-flight publication has freed a slot. Fill it so close cannot
@@ -477,7 +477,7 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
         await asyncio.sleep(0)
         assert not closing.done(), "close did not suspend while the full worker was blocked"
         # This generous bound is a hang guard, not a latency assertion.
-        done, _ = await asyncio.wait({closing}, timeout=10)
+        done, _ = await asyncio.wait({closing}, timeout=60)
         assert closing in done, "hang guard expired waiting for close to complete"
         try:
             await closing
@@ -493,7 +493,7 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
         assert dispatcher.queued_bytes == 0, "close left queued byte accounting nonzero"
         # This generous bound is a hang guard, not a latency assertion.
         try:
-            await asyncio.wait_for(dispatcher.queue.join(), 10)
+            await asyncio.wait_for(dispatcher.queue.join(), 60)
         except TimeoutError:
             pytest.fail("hang guard expired waiting for the emptied queue to join")
     finally:

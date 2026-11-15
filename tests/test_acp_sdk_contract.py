@@ -1009,7 +1009,7 @@ async def test_dispatcher_stop_is_bounded_when_queue_drain_stalls(
     # runner (#2313 CI). Elapsed well under the production default still
     # proves stop() honours the patched bound instead of waiting on the drain.
     started = asyncio.get_running_loop().time()
-    await asyncio.wait_for(dispatcher.stop(), 10)
+    await asyncio.wait_for(dispatcher.stop(), 60)
     assert asyncio.get_running_loop().time() - started < 5
 
     assert stalled.cancelled()

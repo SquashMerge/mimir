@@ -4617,17 +4617,17 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
         ):
             writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
         await writer.drain()
-        # This timeout is a hang guard, not a latency budget.
+        # This 60-second timeout is a hang guard, not a latency budget.
         responses = [
-            json.loads(await asyncio.wait_for(reader.readline(), 10.0))
+            json.loads(await asyncio.wait_for(reader.readline(), 60.0))
             for _ in range(2)
         ]
         assert [response["id"] for response in responses] == [1, 2]
         assert all("error" not in response for response in responses)
 
         writer.transport.abort()
-        # This poll is a ten-second hang guard, not a latency budget.
-        for _ in range(1000):
+        # This poll is a 60-second hang guard, not a latency budget.
+        for _ in range(6000):
             if not daemon._peers and not daemon._connection_runners:
                 break
             await asyncio.sleep(0.01)
@@ -4645,7 +4645,8 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
         try:
             assert await dispatcher.enqueue(event) is True
             channel_queue = dispatcher._queues[event.channel_id]
-            await asyncio.wait_for(channel_queue.join(), 10.0)
+            # This 60-second timeout is a hang guard, not a latency budget.
+            await asyncio.wait_for(channel_queue.join(), 60.0)
             observed_events = []
             while not turn_events.empty():
                 observed_events.append(turn_events.get_nowait())
