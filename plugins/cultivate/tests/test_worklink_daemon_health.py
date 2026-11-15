@@ -61,6 +61,34 @@ def test_native_health_accepts_only_supported_codex_methods(method):
     assert result.state == ("malformed" if method == "unknown" else "locally_unexpired")
 
 
+@pytest.mark.parametrize(("value_method", "column", "expected"), [
+    # OpenCode 2.2.7 POST /api/credential (the controller's import) leaves
+    # method_id NULL; observed live on mimirbot 2026-11-15.
+    ("chatgpt-browser", None, "locally_unexpired"),
+    ("chatgpt-headless", None, "locally_unexpired"),
+    ("unknown", None, "malformed"), (None, None, "malformed"),
+    # A present column must be supported and agree with the value.
+    ("chatgpt-browser", "chatgpt-headless", "malformed"),
+    ("chatgpt-browser", "unknown", "malformed"),
+    ("chatgpt-browser", "", "malformed"),
+])
+def test_native_null_method_column_defers_to_value(tmp_path, value_method, column, expected):
+    path = tmp_path / "opencode.db"
+    database(path, [(json.dumps(native(methodID=value_method)), column, 1)])
+    assert health.inspect_native_login(path, uid=os.getuid(), now=NOW).state == expected
+
+
+def test_api_imported_zero_expiry_credential_is_healthy(tmp_path, monkeypatch):
+    import mimir_cultivate.opencode as opencode
+    monkeypatch.setattr(opencode, "_jwt_exp", lambda access: (NOW + 3_600_000) // 1000)
+    value = native(methodID="chatgpt-browser", expires=0, metadata={"accountID": "synthetic-account"})
+    path = tmp_path / "opencode.db"
+    database(path, [(json.dumps(value), None, 1)])
+    result = health.inspect_native_login(path, uid=os.getuid(), now=NOW)
+    assert result.state == "locally_unexpired"
+    assert result.state in health.ALLOWED_LOGIN
+
+
 @pytest.mark.parametrize(("rows", "expected"), [
     ([], "missing"), ([("{}", "chatgpt-headless", 0)], "inactive"),
     ([("{}", "browser", 1)], "malformed"),
