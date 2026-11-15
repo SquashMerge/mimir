@@ -525,11 +525,15 @@ class SessionController:
 def session_environment(pass_env: object, *, home: Path, git_settings: object,
                         credentials: dict[str, str]) -> dict[str, str]:
     from mimir.otel_credentials import is_sensitive_otlp_env
+    from ..contained_execution import heavy_lock_environment
     from .compute import _validate_dynamic_worker_name, _validate_worker_value
 
     if not isinstance(pass_env, dict) or len(pass_env) > 128:
         raise ValueError("invalid session pass_env")
     environment = {
+        # The operator's shared heavy-run lease: builder shells run whole suites
+        # through scripts/heavy_run.sh. Malformed fails closed (ValueError).
+        **heavy_lock_environment(),
         "PATH": "/opt/mimir-opencode/bin:/usr/local/bin:/usr/bin:/bin",
         "USER": "worklink", "LOGNAME": "worklink", "SHELL": "/bin/sh",
         "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "HOME": str(home),
