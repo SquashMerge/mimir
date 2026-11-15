@@ -151,6 +151,23 @@ def _release(path: Path, fd: int) -> None:
         return
 
 
+def _publish_generation(path: Path) -> None:
+    """Create the generation already open to every participant identity.
+
+    Participants are different uids (host user, mimir, worklink) without a
+    shared group: a waiter must open the generation and a stale waiter must
+    create its breaker claim inside it. A mode fixed after mkdir would expose a
+    umask-restricted directory to concurrent waiters, so create it 0777 under a
+    zero umask. This helper is single-threaded and its command has not started,
+    so the temporary umask is observable by nothing else.
+    """
+    previous = os.umask(0)
+    try:
+        os.mkdir(path, 0o777)
+    finally:
+        os.umask(previous)
+
+
 def _acquire(path: Path, stale: float, interval: float) -> int:
     _sweep_retired(path)
     previous: tuple[tuple[int, int], str | None] | None = None
@@ -158,7 +175,7 @@ def _acquire(path: Path, stale: float, interval: float) -> int:
     while True:
         _check_signal()
         try:
-            path.mkdir()
+            _publish_generation(path)
         except FileExistsError:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -177,17 +194,7 @@ def _acquire(path: Path, stale: float, interval: float) -> int:
                 os.close(fd)
             time.sleep(min(interval, 0.1))
         else:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            # Participants are different uids (host user, mimir, worklink) without
-            # a shared group, and a stale waiter must create its breaker claim
-            # inside this generation. Mode 0777 whatever the holder's umask.
-            try:
-                os.fchmod(fd, 0o777)
-            except OSError:
-                os.close(fd)
-                path.rmdir()  # still empty: nothing else may write before the owner
-                raise
-            return fd
+            return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
 def run(command: list[str]) -> int:

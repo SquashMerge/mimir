@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -672,16 +673,27 @@ def test_lease_generation_is_shared_across_identities_whatever_the_umask(tmp_pat
     assert json.loads(probe.read_text()) == {"lease": 0o777, "owner": 0o644, "heartbeat": 0o644}
 
 
-def test_failed_generation_chmod_releases_the_empty_lease(tmp_path: Path, monkeypatch) -> None:
+def test_generation_is_published_open_and_the_umask_is_restored(tmp_path: Path, monkeypatch) -> None:
+    # Observe the generation at the instant mkdir publishes it: a concurrent
+    # waiter of another identity must never see a umask-restricted directory.
     module = _helper()
+    real_mkdir, modes = module.os.mkdir, []
 
-    def refuse(fd, mode):
-        raise PermissionError(errno.EPERM, "fchmod refused")
+    def observed(path, mode=0o777, **kwargs):
+        real_mkdir(path, mode, **kwargs)
+        if Path(path) == _lease(tmp_path):
+            modes.append((stat.S_IMODE(os.stat(path).st_mode), os.umask(os.umask(0))))
 
-    monkeypatch.setattr(module.os, "fchmod", refuse)
-    with pytest.raises(PermissionError):
-        module._acquire(_lease(tmp_path), 600, 1)
-    assert not _lease(tmp_path).exists()
+    monkeypatch.setattr(module.os, "mkdir", observed)
+    previous = os.umask(0o077)
+    try:
+        fd = module._acquire(_lease(tmp_path), 600, 1)
+        after = os.umask(0o077)
+    finally:
+        os.umask(previous)
+    os.close(fd)
+    assert modes == [(0o777, 0)]
+    assert after == 0o077
 
 
 @pytest.mark.skipif(sys.platform != "linux" or os.geteuid() != 0,
@@ -752,5 +764,73 @@ def test_stale_lease_recovers_across_identities_without_a_shared_group(
         assert done.exists()
         assert err.count("retired stale lease") == 1, err
         assert not _lease(locks).exists()
+    finally:
+        shutil.rmtree(shared, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform != "linux" or os.geteuid() != 0,
+                    reason="two real identities need Linux root")
+def test_waiter_of_another_identity_waits_through_generation_initialization(tmp_path: Path) -> None:
+    # A umask-077 holder of one uid is paused between publishing its generation
+    # and taking ownership; a real waiter of another uid (no shared group) must
+    # keep waiting, then run once the holder releases.
+    import tempfile
+    shared = Path(tempfile.mkdtemp(prefix="heavy-xinit-", dir="/tmp"))
+    try:
+        shared.chmod(0o755)
+        locks, scratch = shared / "locks", shared / "scratch"
+        for directory in (locks, scratch):
+            directory.mkdir()
+            directory.chmod(0o777)
+        tools = shared / "bin"
+        tools.mkdir()
+        for name in ("sh", "dirname", "uname", "sleep"):
+            (tools / name).symlink_to(shutil.which(name, path=os.defpath) or f"/bin/{name}")
+        timeout = shared / "test-timeout"
+        timeout.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
+                           f'{shlex.quote(str(TIMEOUT_HELPER))} "$@"\n')
+        timeout.chmod(0o755)
+        lease = _lease(locks)
+        published, go, done = scratch / "published", scratch / "go", scratch / "waiter-ran"
+        harness = shared / "holder.py"
+        harness.write_text(f"""
+import importlib.util, os, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("heavy_run_holder", {str(SCRIPT.with_suffix('.py'))!r})
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+real_mkdir = module.os.mkdir
+def paused(path, mode=0o777, **kwargs):
+    real_mkdir(path, mode, **kwargs)
+    Path({str(published)!r}).touch()
+    while not Path({str(go)!r}).exists():
+        time.sleep(.01)
+module.os.mkdir = paused
+fd = module._acquire(Path({str(lease)!r}), 600, 1)
+module._release(Path({str(lease)!r}), fd)
+os.close(fd)
+""")
+        harness.chmod(0o644)
+        probe = subprocess.run([sys.executable, "-c", "pass"], user=41001, group=41001,
+                               extra_groups=[], capture_output=True)
+        if probe.returncode:
+            pytest.skip("interpreter is not readable by an unprivileged identity here")
+        holder = subprocess.Popen([sys.executable, str(harness)], user=41001, group=41001,
+                                  extra_groups=[], umask=0o077,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        _wait(published.exists)
+        waiter_log = shared / "waiter.log"
+        with waiter_log.open("wb") as output:
+            waiter = subprocess.Popen(
+                ["sh", str(SCRIPT), sys.executable, "-c", f"open({str(done)!r}, 'w').close()"],
+                env=_env(locks, PATH=str(tools), MIMIR_HEAVY_TIMEOUT_TOOL=str(timeout)),
+                user=41002, group=41002, extra_groups=[], umask=0o022,
+                stdout=output, stderr=subprocess.STDOUT)
+        time.sleep(1.5)  # the waiter observes the initializing generation repeatedly
+        assert waiter.poll() is None, waiter_log.read_text()
+        assert not done.exists()
+        go.touch()
+        assert holder.wait(timeout=30) == 0, holder.stderr.read()
+        assert waiter.wait(timeout=60) == 0, waiter_log.read_text()
+        assert done.exists()
     finally:
         shutil.rmtree(shared, ignore_errors=True)
