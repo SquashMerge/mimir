@@ -1,0 +1,1 @@
+- Cultivate setup's `--heavy-lock-dir` mounts a host directory shared with other agents, and Worklink passes `MIMIR_HEAVY_LOCK_FILE` to builder sessions, gates and `repo_test` legs so their heavy commands join the `scripts/heavy_run.sh` lease instead of running unserialized.

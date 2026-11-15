@@ -4168,6 +4168,7 @@ from .contained_execution import (
     SensitiveMaterialScrubber,
     base_worker_environment,
     execute_contained,
+    heavy_lock_environment,
 )
 from mimir.contained_snapshot import (
     ContainedSnapshotError,
@@ -4965,6 +4966,10 @@ class RepoProjectTests:
                         "use diff-related selectors or a named suite and read pr_checks for full-suite CI evidence",
                         execution_started=False,
                     )
+        try:
+            heavy_lock_environment()
+        except ValueError as exc:
+            raise ProjectTestRefusal("heavy_lock_invalid", str(exc), execution_started=False) from None
         git_tools: RepoGitTools | None = None
         try:
             git_tools = (

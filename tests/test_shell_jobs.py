@@ -284,6 +284,11 @@ def test_redacted_callback_error_does_not_log_values(tmp_path, caplog):
     )
     _wait_until_done(registry, job.job_id)
     assert invoked.is_set()
+    # Join the captured waiter itself: on Python 3.13 a finishing thread leaves
+    # threading.enumerate() before is_alive() turns False, so the helper's
+    # enumerate-based join can miss it. A bounded join still proves the raising
+    # callback does not wedge the waiter.
+    waiter_threads[0].join(timeout=10)
     assert not waiter_threads[0].is_alive()
     assert fired == [job.job_id]
     assert job.exit_code == 0

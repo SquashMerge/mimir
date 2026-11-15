@@ -694,7 +694,34 @@ def render_layer(kind: str, version: str, root_image: str, *,
     return f"FROM {root_image}\nUSER root\n{extra}{install}RUN set -eu; mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
 
 
-def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False) -> str:
+HEAVY_LOCK_MOUNT = "/mimir-heavy-locks"
+_HEAVY_LOCK_DIR = re.compile(r"/[A-Za-z0-9._/@+-]{1,1023}\Z")
+
+
+def _heavy_lock_dir(args: argparse.Namespace, previous: dict) -> str | None:
+    """Host directory shared with other agents for scripts/heavy_run.sh leases.
+
+    Containers mount it at a fixed path: OrbStack refuses host-path mount
+    targets, and the lease needs the same directory, not the same path.
+    """
+    value = getattr(args, "heavy_lock_dir", None)
+    if value is None:
+        value = previous.get("heavy_lock_dir")
+        if value is not None and not isinstance(value, str):
+            raise SetupError("Invalid heavy lock directory in manifest.json; reconcile it before retrying.")
+    if value is None or value.strip() == "none":
+        return None
+    value = value.strip()
+    path = Path(value)
+    if (_HEAVY_LOCK_DIR.fullmatch(value) is None or os.path.normpath(value) != value
+            or path.is_symlink() or not path.is_dir()):
+        raise SetupError("--heavy-lock-dir must be an existing, normalized absolute directory (not a symlink), "
+                         "writable by container uids 1001 and 1002; use none to clear.")
+    return value
+
+
+def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False,
+                   heavy_lock_dir: str | None = None) -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
     try:
         # Scaffold's prose header contains a shell printf example with a literal
@@ -722,7 +749,12 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         if codex:
             volumes.append("./codex:/home/mimir/.codex")
             environment["CODEX_HOME"] = "/home/mimir/.codex"
-        agent["volumes"] = volumes
+        agent_volumes = list(volumes)
+        if heavy_lock_dir is not None:
+            # Agent only: init never chowns or chmods a directory other agents share.
+            agent_volumes.append(f"{heavy_lock_dir}:{HEAVY_LOCK_MOUNT}")
+            environment["MIMIR_HEAVY_LOCK_FILE"] = f"{HEAVY_LOCK_MOUNT}/heavy.lock"
+        agent["volumes"] = agent_volumes
         agent.setdefault("depends_on", {})["init"] = {"condition": "service_completed_successfully"}
         doc["services"]["init"] = {
             "image": layer_tag, "user": "root", "entrypoint": ["/bin/sh", "-c"],
@@ -1539,6 +1571,10 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
     ):
         setup.add_argument("--" + name, help=help_text)
+    setup.add_argument("--heavy-lock-dir",
+                       help="Absolute host directory shared with other agents for heavy-run leases "
+                            "(scripts/heavy_run.sh); mounted at " + HEAVY_LOCK_MOUNT + " with MIMIR_HEAVY_LOCK_FILE set. "
+                            "none clears; omit to preserve the saved directory.")
     setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate; omit to preserve the saved version (fresh setup: latest common stable, then prerelease).")
     setup.add_argument("--platform", choices=tuple(_DOCKER_ARCHITECTURES),
                        help="Docker target platform (linux/amd64 or linux/arm64; default: host architecture, or saved platform on rerun).")
@@ -1665,6 +1701,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         quick_gate_command = validate("quick_gate_command", quick_gate_command)
         if gate != "ci":
             raise SetupError("--quick-gate-command is only valid with --worklink-gate ci.")
+    heavy_lock_dir = _heavy_lock_dir(args, previous)
     if deploy.exists() and (not deploy.is_dir() or deploy.is_symlink()):
         raise SetupError("Deployment directory must be a real directory; choose a new --deploy path.")
     existing_env = (deploy / "compose.env").read_text() if (deploy / "compose.env").is_file() else ""
@@ -1797,7 +1834,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     codex = provider == "codex-plus" or saga_provider == "codex-plus"
     provenance = ("# MIMIR_INSTALL_MODE=pypi MIMIR_VERSION=" + mimir_version + " MIMIR_AGENT_SHA256="
                   + release.agent.sha256 + " MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256 + "\n")
-    compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex)
+    compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex,
+                                          heavy_lock_dir=heavy_lock_dir)
     generated = {"compose.yml": compose, ".gitignore": "*\n", "build_context.py": _BUILD_CONTEXT_HELPER,
                  "provision.py": _PROVISION, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
     _check_generated(deploy, generated, previous, force=bool(getattr(args, "force", False)))
@@ -1856,7 +1894,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
                    "previous_saga_model_spec": previous.get("saga_model_spec"),
-                   "system_packages": system_packages,
+                   "system_packages": system_packages, "heavy_lock_dir": heavy_lock_dir,
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
                     "mimir_install_mode": "pypi", "mimir_version": mimir_version, "wheels": wheels,
                     "toolchain_version": version, "layer_tag": layer_tag, "docker_platform": docker_platform,

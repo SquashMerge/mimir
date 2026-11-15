@@ -1,0 +1,147 @@
+"""The operator's shared heavy-run lease path reaches every Worklink command.
+
+scripts/heavy_run.sh serializes heavy commands across the host and its
+containers. Worklink constructs worker environments from scratch and denies
+MIMIR_* names, so the controller's MIMIR_HEAVY_LOCK_FILE is carried explicitly.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+
+import pytest
+import yaml
+
+from mimir_cultivate import setup as installer
+from mimir_cultivate.contained_execution import base_worker_environment, heavy_lock_environment
+from mimir_cultivate.worklink import compute
+from mimir_cultivate.worklink import daemon_service as service
+from mimir_cultivate.worklink.identities import WorklinkIdentities
+
+LOCK = "/mimir-heavy-locks/heavy.lock"
+IDENTIFIER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+INVALID = (
+    "heavy.lock",                       # relative
+    "/locks/../heavy.lock",             # not normalized
+    "/locks//heavy.lock",
+    "/locks/heavy.lock/",
+    "/home/mimir",                      # controller home
+    "/home/mimir/agent/heavy.lock",
+    "/locks/heavy lock",                # whitespace
+    "/locks/heavy\nlock",
+    "/locks/heavy:lock",
+)
+
+
+def test_unset_or_empty_means_no_lease(monkeypatch):
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE", raising=False)
+    assert heavy_lock_environment() == {}
+    assert "MIMIR_HEAVY_LOCK_FILE" not in base_worker_environment(IDENTIFIER)
+    assert heavy_lock_environment({"MIMIR_HEAVY_LOCK_FILE": ""}) == {}
+
+
+def test_valid_path_is_the_only_mimir_name_a_worker_receives(monkeypatch):
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", LOCK)
+    monkeypatch.setenv("MIMIR_API_KEY", "controller-secret")
+    base = base_worker_environment(IDENTIFIER)
+    assert base["MIMIR_HEAVY_LOCK_FILE"] == LOCK
+    assert {name for name in base if name.startswith("MIMIR_")} == {"MIMIR_HEAVY_LOCK_FILE"}
+    # The neighbouring home path is not the controller home.
+    assert heavy_lock_environment({"MIMIR_HEAVY_LOCK_FILE": "/home/mimirx/heavy.lock"})
+
+
+@pytest.mark.parametrize("value", INVALID)
+def test_malformed_or_controller_home_path_fails_closed(monkeypatch, value):
+    with pytest.raises(ValueError, match="MIMIR_HEAVY_LOCK_FILE"):
+        heavy_lock_environment({"MIMIR_HEAVY_LOCK_FILE": value})
+    monkeypatch.setitem(os.environ, "MIMIR_HEAVY_LOCK_FILE", value)
+    with pytest.raises(ValueError, match="MIMIR_HEAVY_LOCK_FILE"):
+        base_worker_environment(IDENTIFIER)
+
+
+def test_factory_and_local_children_carry_the_lease(monkeypatch):
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", LOCK)
+    assert compute._local_child_env()["MIMIR_HEAVY_LOCK_FILE"] == LOCK
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE")
+    assert "MIMIR_HEAVY_LOCK_FILE" not in compute._local_child_env()
+
+
+def test_local_child_refuses_a_malformed_lease_as_a_launch_error(monkeypatch):
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", "relative.lock")
+    with pytest.raises(compute.ComputeLaunchError, match="MIMIR_HEAVY_LOCK_FILE"):
+        compute._local_child_env()
+
+
+async def test_contained_launch_refuses_a_malformed_lease_before_the_worker_starts(monkeypatch, tmp_path):
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", "/home/mimir/heavy.lock")
+
+    class Client:
+        def __getattr__(self, name):
+            pytest.fail(f"worker client used: {name}")
+
+    backend = compute.LocalSubprocessComputeBackend.for_path_checkout(1002, worker_client=Client())
+    spec = compute.WorkSpec(issue_id=1, attempt=1, repo_url="", base_ref="main", branch="b",
+                            prompt="", rules=None, test_command="true", backend="opencode",
+                            timeout_s=5, local_checkout=tmp_path, local_argv=("true",))
+    with pytest.raises(compute.ComputeLaunchError, match="MIMIR_HEAVY_LOCK_FILE"):
+        await backend._launch_contained(spec, ("true",))
+    assert list(tmp_path.iterdir()) == []
+
+
+def _prepare(tmp_path, monkeypatch, environ):
+    paths = service.RuntimePaths(tmp_path / "daemon", tmp_path / "run")
+    paths.run.mkdir(parents=True)
+    monkeypatch.setattr(service.os, "fchown", lambda fd, uid, gid: None)
+    monkeypatch.setattr(service, "protect_agent_paths", lambda env, identities: None)
+    return paths, service.prepare({"GH_TOKEN": "bot-value", **environ},
+                                  WorklinkIdentities(42001, 42002, 42003), paths)
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="daemon directory preparation is Linux-only")
+def test_daemon_environment_carries_the_lease_to_builder_shells(tmp_path, monkeypatch):
+    _, env = _prepare(tmp_path, monkeypatch, {"MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_API_KEY": "secret"})
+    assert env["MIMIR_HEAVY_LOCK_FILE"] == LOCK
+    assert "MIMIR_API_KEY" not in env
+    _, env = _prepare(tmp_path / "unset", monkeypatch, {})
+    assert "MIMIR_HEAVY_LOCK_FILE" not in env
+
+
+def test_daemon_refuses_a_malformed_lease_before_writing_state(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="MIMIR_HEAVY_LOCK_FILE"):
+        _prepare(tmp_path, monkeypatch, {"MIMIR_HEAVY_LOCK_FILE": "/locks/../x"})
+    assert not (tmp_path / "daemon").exists()
+
+
+def _compose(**kwargs):
+    from mimir.scaffold_docker import render_compose_yml
+    template = render_compose_yml(service_name="agent", web_port=8123, mode="pypi")
+    return yaml.safe_load(installer.render_compose(template, "image:sha", "rust", "repo", **kwargs))
+
+
+def test_compose_mounts_the_shared_directory_into_the_agent_only(tmp_path):
+    result = _compose(heavy_lock_dir=str(tmp_path))
+    agent, init = result["services"]["agent"], result["services"]["init"]
+    assert f"{tmp_path}:/mimir-heavy-locks" in agent["volumes"]
+    assert agent["environment"]["MIMIR_HEAVY_LOCK_FILE"] == LOCK
+    assert not any("mimir-heavy-locks" in volume for volume in init["volumes"])
+    plain = _compose()
+    assert not any("mimir-heavy-locks" in v for v in plain["services"]["agent"]["volumes"])
+    assert "MIMIR_HEAVY_LOCK_FILE" not in plain["services"]["agent"]["environment"]
+
+
+def test_setup_option_validates_preserves_and_clears(tmp_path):
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    args = lambda value: argparse.Namespace(heavy_lock_dir=value)
+    assert installer._heavy_lock_dir(args(str(lock_dir)), {}) == str(lock_dir)
+    assert installer._heavy_lock_dir(args(None), {"heavy_lock_dir": str(lock_dir)}) == str(lock_dir)
+    assert installer._heavy_lock_dir(args("none"), {"heavy_lock_dir": str(lock_dir)}) is None
+    assert installer._heavy_lock_dir(args(None), {}) is None
+    link = tmp_path / "link"
+    link.symlink_to(lock_dir)
+    for bad in ("relative", str(tmp_path / "missing"), str(link), str(lock_dir) + "/",
+                str(lock_dir) + "/../locks", str(lock_dir) + ":/etc"):
+        with pytest.raises(installer.SetupError, match="--heavy-lock-dir"):
+            installer._heavy_lock_dir(args(bad), {})
+    with pytest.raises(installer.SetupError, match="manifest"):
+        installer._heavy_lock_dir(args(None), {"heavy_lock_dir": 7})

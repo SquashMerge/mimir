@@ -57,8 +57,10 @@ def _is_current(path: Path, fd: int) -> bool:
 
 def _write(fd: int, name: str, value: str) -> None:
     # Relative to the held generation, never accidentally update a newer lease.
+    # Waiters running as other identities read the counter: 0644 whatever the umask.
     with open(os.open(name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
                       0o644, dir_fd=fd), "w") as out:
+        os.fchmod(out.fileno(), 0o644)
         out.write(value)
     os.rename(name + ".tmp", name, src_dir_fd=fd, dst_dir_fd=fd)
 
@@ -149,6 +151,23 @@ def _release(path: Path, fd: int) -> None:
         return
 
 
+def _publish_generation(path: Path) -> None:
+    """Create the generation already open to every participant identity.
+
+    Participants are different uids (host user, mimir, worklink) without a
+    shared group: a waiter must open the generation and a stale waiter must
+    create its breaker claim inside it. A mode fixed after mkdir would expose a
+    umask-restricted directory to concurrent waiters, so create it 0777 under a
+    zero umask. This helper is single-threaded and its command has not started,
+    so the temporary umask is observable by nothing else.
+    """
+    previous = os.umask(0)
+    try:
+        os.mkdir(path, 0o777)
+    finally:
+        os.umask(previous)
+
+
 def _acquire(path: Path, stale: float, interval: float) -> int:
     _sweep_retired(path)
     previous: tuple[tuple[int, int], str | None] | None = None
@@ -156,7 +175,7 @@ def _acquire(path: Path, stale: float, interval: float) -> int:
     while True:
         _check_signal()
         try:
-            path.mkdir()
+            _publish_generation(path)
         except FileExistsError:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

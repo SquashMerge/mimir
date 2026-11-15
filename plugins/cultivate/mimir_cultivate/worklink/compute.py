@@ -438,13 +438,22 @@ class _DirectCapture:
     output_overflow: bool = False
 
 
+def _heavy_lock_environment() -> dict[str, str]:
+    from ..contained_execution import heavy_lock_environment
+
+    try:
+        return heavy_lock_environment()
+    except ValueError as exc:
+        raise ComputeLaunchError(str(exc)) from None
+
+
 def _local_child_env() -> dict[str, str]:
     """Allowlisted env for an autonomous local_subprocess worker (#830).
 
     Infra vars + provider-credential families from the parent process; nothing
     else (no bridge/operator secrets). Mirrors ``tools.registry`` spawn-env
     philosophy on the worklink compute path."""
-    env: dict[str, str] = {}
+    env: dict[str, str] = _heavy_lock_environment()
     for key in _LOCAL_ENV_INFRA:
         val = os.environ.get(key)
         if val is not None:
