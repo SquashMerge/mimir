@@ -35,9 +35,20 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+SUPPORTED_METHODS = frozenset({"chatgpt-headless", "chatgpt-browser"})
+
+
 def classify_native(value: object, method: object, *, now: int) -> NativeLogin:
+    """Classify one active ``openai`` credential row.
+
+    ``method`` is the row's ``method_id`` column. A native ``auth login`` sets
+    it; OpenCode 2.2.7's ``POST /api/credential`` (the supported import the
+    controller reconcile uses) leaves it NULL and records the method only as
+    the value's ``methodID``. A NULL column therefore defers to the value; a
+    present column must still be supported and agree with it.
+    """
     if (not isinstance(value, str) or len(value.encode("utf-8")) > 65536
-            or method not in {"chatgpt-headless", "chatgpt-browser"}):
+            or (method is not None and method not in SUPPORTED_METHODS)):
         return NativeLogin("malformed")
     try:
         credential = json.loads(value)
@@ -45,6 +56,10 @@ def classify_native(value: object, method: object, *, now: int) -> NativeLogin:
         return NativeLogin("malformed")
     if not isinstance(credential, dict):
         return NativeLogin("malformed")
+    if method is None:
+        method = credential.get("methodID")
+        if not isinstance(method, str) or method not in SUPPORTED_METHODS:
+            return NativeLogin("malformed")
     expires = credential.get("expires")
     access = credential.get("access")
     refresh = credential.get("refresh")
