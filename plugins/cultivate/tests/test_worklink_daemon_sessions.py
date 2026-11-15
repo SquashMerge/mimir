@@ -399,10 +399,12 @@ async def test_setup_cannot_post_after_persisted_deadline(tmp_path, monkeypatch)
             return await original(*args, **kwargs)
         monkeypatch.setattr(client, "set_environment", slow)
         task = asyncio.create_task(create(client, tmp_path))
-        await asyncio.wait_for(entered.wait(), 10)
+        # Hang guard, not a latency budget.
+        await asyncio.wait_for(entered.wait(), 60)
         clock[0] += 61
         release.set()
-        controller = await asyncio.wait_for(task, 10)
+        # Hang guard, not a latency budget; the owned clock enforces the deadline.
+        controller = await asyncio.wait_for(task, 60)
         assert not any(r[1].endswith(("/prompt", "/command")) for r in daemon.requests)
         assert (await controller.observe()).error.type == "timeout"
 
@@ -483,7 +485,10 @@ async def test_blocked_read_uses_remaining_budget_not_http_timeout(tmp_path, mon
             return await original(*args, **kwargs)
         monkeypatch.setattr(client, "messages", blocked)
         task = asyncio.create_task(controller.observe())
-        await asyncio.wait_for(entered.wait(), 2)
+        # Hang guard, not a latency budget.
+        await asyncio.wait_for(entered.wait(), 60)
+        # Behavioural bound: stay below the client's 30-second HTTP timeout so
+        # completion proves the remaining 50ms session budget interrupted the read.
         outcome = await asyncio.wait_for(task, 4)
         assert outcome.error.type == "timeout"
         assert controller.record.cancellation_state == "verified"

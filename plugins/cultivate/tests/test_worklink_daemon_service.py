@@ -73,7 +73,8 @@ for key in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb', 'CapBnd'):
 assert status['NoNewPrivs'].strip() == '1', status['NoNewPrivs']
 print('daemon child privileges verified')
 '''
-    daemon = f"import subprocess, sys; sys.exit(subprocess.run([sys.executable, '-c', {child!r}], timeout=10).returncode)"
+    # Hang guard, not a latency budget.
+    daemon = f"import subprocess, sys; sys.exit(subprocess.run([sys.executable, '-c', {child!r}], timeout=60).returncode)"
     script = f'''
 from types import SimpleNamespace
 from mimir_cultivate.worklink import daemon_service as service, worker_exec
@@ -295,13 +296,14 @@ async def test_spawn_checkout_real_session_path_and_scope_mutation(
                     checkout = Path(self.sessions[sid].info["location"]["directory"])
                     # Synthetic provider only: actual pathname access and kernel
                     # ownership/umask are exercised by a real worker descendant.
+                    # Hang guard, not a latency budget.
                     child = subprocess.run(
                         ["/usr/bin/python3", "-c",
                          "import os; from pathlib import Path; os.umask(0o002); "
                          f"p=Path({str(checkout)!r})/'worker-hooks'; p.mkdir(); "
                          "(p/'pre-commit').write_text('spawn worker output')"],
                         user=ids.worklink_uid, group=ids.worklink_gid, extra_groups=[],
-                        capture_output=True, text=True, timeout=10,
+                        capture_output=True, text=True, timeout=60,
                     )
                     assert child.returncode == 0, child.stderr
                     self.finish(sid)
@@ -668,8 +670,9 @@ login.assert_worklink_identity = lambda ids: None
 login.LOGIN_ARGV = ({str(fixture)!r}, *login.LOGIN_ARGV[1:])
 login.login(RuntimePaths(Path({str(tmp_path)!r}), Path({str(paths.run)!r})))
 """
+    # Hang guard, not a latency budget.
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
-                            env={**os.environ, "OTHER_AGENT_SECRET": "never-inherit"}, timeout=10)
+                            env={**os.environ, "OTHER_AGENT_SECRET": "never-inherit"}, timeout=60)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "fixture argv and environment accepted"
     assert "fixture-private-password" not in result.stdout + result.stderr

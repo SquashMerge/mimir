@@ -298,7 +298,8 @@ async def test_admission_ack_window_keeps_owned_identity(tmp_path, monkeypatch, 
         else:
             invocation = compute.launch(spec)
         task = asyncio.create_task(invocation)
-        await asyncio.wait_for(boundary.admitted.wait(), 5)
+        # Hang guard, not a latency budget.
+        await asyncio.wait_for(boundary.admitted.wait(), 60)
         sid = boundary.controller.record.opencode_session_id
         if cancelled:
             task.cancel()
@@ -439,7 +440,8 @@ async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path
         task = asyncio.create_task(orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner,
                                                        registry=registry).run(441, backend_name="opencode"))
         admitted = asyncio.create_task(boundary.admitted.wait())
-        done, _ = await asyncio.wait((task, admitted), timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        # Hang guard, not a latency budget.
+        done, _ = await asyncio.wait((task, admitted), timeout=60, return_when=asyncio.FIRST_COMPLETED)
         assert admitted in done, task.result() if task.done() else "admission did not complete"
         sid = boundary.controller.record.opencode_session_id
         assert boundary.creates == (1 if phase == "initial" else 2)
@@ -447,7 +449,8 @@ async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path
             task.cancel()
         boundary.acknowledge.set()
         if failure == "wait_cancel":
-            await asyncio.wait_for(boundary.wait_entered.wait(), 5)
+            # Hang guard, not a latency budget.
+            await asyncio.wait_for(boundary.wait_entered.wait(), 60)
             task.cancel()
         if failure in {"cancel", "wait_cancel", "gate_cancel"}:
             try:
