@@ -56,7 +56,10 @@ async def capture_controller_source_commit(app: Any) -> None:
 
 
 async def executor_health(app: Any) -> dict[str, object]:
-    from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
+    from .worklink.worker_client import (
+        DEFAULT_EXECUTOR_SOCKET, STALE_EXECUTOR_DIAGNOSTIC,
+        StaleWorkerExecutorError, verify_executor_identity,
+    )
 
     if not app.get("check_worker_executor_health"):
         return {}
@@ -65,15 +68,17 @@ async def executor_health(app: Any) -> dict[str, object]:
     if DEFAULT_EXECUTOR_SOCKET.exists():
         try:
             executor_identity = await verify_executor_identity()
-        except (OSError, RuntimeError, ValueError) as exc:
-            result.update(ok=False, error=str(exc))
+        except StaleWorkerExecutorError:
+            result.update(ok=False, error=STALE_EXECUTOR_DIAGNOSTIC)
+        except (OSError, RuntimeError, ValueError):
+            result.update(ok=False, error="Worklink executor identity unavailable")
     controller_identity = app.get("worklink_controller_identity")
     if isinstance(controller_identity, dict) and controller_identity.get("mode") == "pypi":
         try:
             if await asyncio.to_thread(install_identity.controller_identity) != controller_identity:
                 raise install_identity.InstallIdentityError("controller install identity changed since boot")
-        except install_identity.InstallIdentityError as exc:
-            result.update(ok=False, error=str(exc))
+        except install_identity.InstallIdentityError:
+            result.update(ok=False, error="Worklink controller install identity changed since boot")
     if not isinstance(controller_identity, dict) or not isinstance(executor_identity, dict):
         result.update(ok=False, error=result.get("error", "Worklink install identity unavailable"))
     elif controller_identity != executor_identity:
@@ -96,6 +101,13 @@ async def executor_health(app: Any) -> dict[str, object]:
         worklink_executor_distributions=executor_identity.get("distributions") if isinstance(executor_identity, dict) and executor_identity.get("mode") == "pypi" else None,
         worklink_install_status="matched" if result.get("ok", True) else "mismatched",
     )
+    from .worklink.daemon_health import daemon_health
+
+    health = await asyncio.to_thread(daemon_health, dict(os.environ))
+    # Daemon readiness gates workloads and setup, not agent liveness. Retain
+    # its diagnostics without overriding the controller/executor identity gate.
+    health.pop("ok", None)
+    result.update(health)
     return result
 
 
@@ -121,6 +133,8 @@ async def configure_worklink(scheduler: Any, home: Path, alert_channel: str | No
     from . import scheduler as jobs
 
     for job, install in (
+        ("worklink-codex-reconcile", lambda: jobs.add_codex_reconcile_job(
+            scheduler, cron_expr=os.environ.get("MIMIR_WORKLINK_CODEX_RECONCILE_CRON", "*/15 * * * *"))),
         ("worklink-reaper", lambda: jobs.add_reaper_job(
             scheduler, home, cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", "*/30 * * * *"))),
         ("worklink-factory-park-alert", lambda: jobs.add_factory_park_alert_job(
@@ -197,7 +211,10 @@ def reattach_inflight_worklink_runs(
             emit("worklink_reattach_dispatch_failed", **failure)
         factory_records = [
             record for record in listing.records
-            if factory_process_is_verified_dead(record)
+            if (factory_process_is_verified_dead(record) or (
+                record.handle is not None and record.handle.substrate == "opencode_daemon"
+                and record.opencode_session_id == record.handle.opencode_session_id
+                and record.opencode_session_id is not None))
             and record.controller_phase not in {"failed", "parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)
         ]
@@ -214,7 +231,7 @@ def reattach_inflight_worklink_runs(
     state_dir = home / "state" / "worklink" / "runs"
     dispatched: list[int] = []
     for state in states:
-        if state.compute_name == "local_subprocess":
+        if state.compute_name == "local_subprocess" and state.opencode_session_id is None:
             continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
         log_path = state_dir / f"reattach-{state.issue_id}.log"
@@ -267,6 +284,14 @@ def reattach_inflight_worklink_runs(
 
 
 async def reconcile_startup(home: Path, log_event: Any) -> None:
+    from .worklink.daemon_gate import wait_for_daemon
+
+    try:
+        health = await asyncio.to_thread(wait_for_daemon, dict(os.environ))
+        if health.get("codex_error"):
+            await log_event("worklink_codex_reconcile_failed", reason="agent_codex_login_unavailable")
+    except (OSError, ValueError, RuntimeError):
+        await log_event("worklink_codex_reconcile_failed", reason="daemon_unavailable")
     try:
         resumed = reattach_inflight_worklink_runs(home)
         await log_event("worklink_reattach_dispatched", issues=resumed)

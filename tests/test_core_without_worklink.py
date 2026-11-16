@@ -37,6 +37,7 @@ def test_core_only_scaffold_sets_up_no_worklink_identity_or_paths(tmp_path, monk
     scaffold(tmp_path, mode=mode)
     text = _scaffold_text(tmp_path).lower()
     assert not (tmp_path / ".mimir-scaffold" / "cultivate-docker").exists()
+    assert "resolve_activation(dict(os.environ))" not in text
     found = [marker for marker in _WORKLINK_MARKERS if marker in text]
     assert not found, found
 

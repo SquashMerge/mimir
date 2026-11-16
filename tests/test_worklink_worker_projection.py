@@ -41,7 +41,7 @@ def _write_native_files(home: Path) -> None:
 
 
 @pytest.mark.usefixtures("stub_opencode")
-def test_enabled_opencode_spec_contains_worker_local_selected_projections(
+def test_enabled_opencode_spec_has_typed_session_and_no_auth_projection(
     monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
     _write_native_files(tmp_path)
@@ -80,36 +80,19 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
         test_command="true",
     )
 
-    projections = spec.backend_config["worker_projections"]
     assert spec.local_checkout.is_relative_to(enabled_root)
-    assert [projection.path for projection in projections] == [
-        ".config/opencode/opencode.json",
-        ".local/share/opencode/auth.json",
-    ]
-    assert json.loads(projections[0].document) == {
-        "model": "proxy/model",
-        "provider": {"proxy": {"options": {"apiKey": "referenced"}}},
-        # Leaf builds get the same containment default as factory runs and
-        # spawn_open_code: the worker document is built by one function, so the
-        # deny applies to every surface rather than only the one that needed it.
-        "permission": {"external_directory": "deny"},
-    }
-    assert json.loads(projections[1].document) == {
-        "proxy": {"type": "oauth", "access": "access", "refresh": "refresh", "expires": 7}
-    }
+    assert "worker_projections" not in spec.backend_config
+    assert spec.session_request.kind == "leaf"
+    assert spec.session_request.model["providerID"] == "openai"
+    assert spec.session_request.shell_allowlist == ("git *", "uv *")
     assert spec.backend_config["pass_env"] == ()
-    assert spec.env == {
-        "OPENCODE_PERMISSION": spec.env["OPENCODE_PERMISSION"],
-    }
-    assert spec.local_argv is not None
-    assert spec.local_argv[0] == str(opencode_binary)
-    dir_index = spec.local_argv.index("--dir")
-    assert spec.local_argv[dir_index + 1] == "."
-    assert str(order.checkout) not in spec.local_argv
+    assert spec.env == {}
+    assert spec.local_argv is None
+    assert "referenced" not in repr(spec)
 
 
 @pytest.mark.usefixtures("stub_opencode")
-def test_disabled_opencode_spec_preserves_direct_environment(
+def test_disabled_opencode_spec_never_falls_back_to_direct_execution(
     monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
     _write_native_files(tmp_path)
@@ -141,16 +124,13 @@ def test_disabled_opencode_spec_preserves_direct_environment(
 
     assert "worker_projections" not in spec.backend_config
     assert spec.local_checkout == tmp_path / ".worklink" / "repo" / "1410-1"
-    assert spec.env["PROXY_TOKEN"] == "direct"
-    assert spec.env["MIMIR_HOME"] == str(tmp_path)
-    assert spec.local_argv is not None
-    assert spec.local_argv[0] == str(opencode_binary)
-    dir_index = spec.local_argv.index("--dir")
-    assert spec.local_argv[dir_index + 1] == str(order.checkout)
+    assert spec.env == {}
+    assert spec.local_argv is None
+    assert spec.session_request.kind == "leaf"
 
 
 @pytest.mark.usefixtures("stub_opencode")
-def test_enabled_opencode_projects_conventional_ambient_key(
+def test_enabled_opencode_never_projects_conventional_ambient_key(
     monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
     config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
@@ -182,11 +162,8 @@ def test_enabled_opencode_projects_conventional_ambient_key(
         test_command="true",
     )
 
-    assert spec.local_argv is not None
-    assert spec.local_argv[0] == str(opencode_binary)
-    projections = spec.backend_config["worker_projections"]
-    assert json.loads(projections[1].document) == {
-        "proxy": {"type": "api", "key": "ambient-projected-secret"}
-    }
+    assert spec.local_argv is None
+    assert spec.session_request.kind == "leaf"
+    assert "worker_projections" not in spec.backend_config
     assert "PROXY_API_KEY" not in spec.env
     assert "ambient-projected-secret" not in spec.env.values()

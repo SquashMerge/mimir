@@ -39,6 +39,17 @@ def parse_slice_summary(
     return total, dict(counts)
 
 
+def parse_mcp_servers(value: object) -> tuple[str, ...]:
+    """Validate the complete producer list without normalizing order or names."""
+    if not isinstance(value, (list, tuple)) or len(value) > 1000:
+        raise ValueError("factory mcp_servers must be a list of at most 1000 names")
+    for name in value:
+        if (not isinstance(name, str) or not name.strip() or "\x00" in name
+                or len(name.encode("utf-8")) > 1024):
+            raise ValueError("factory mcp_servers contains an invalid name")
+    return tuple(value)
+
+
 def _status_projection(source: object) -> dict[str, object]:
     if not isinstance(source, dict):
         raise ValueError("factory status is not an object")
@@ -48,6 +59,7 @@ def _status_projection(source: object) -> dict[str, object]:
         "pr_url", "park_snapshot", "next", "next_action", "validator",
     )
     result = {key: source[key] for key in fields if key in source}
+    result["mcp_servers"] = list(parse_mcp_servers(source.get("mcp_servers", [])))
     # Drop row history, never progress rows. Keep the complete parser contract,
     # including retry budgets and gate evidence used by completion validation.
     row_fields = {

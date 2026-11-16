@@ -9044,10 +9044,10 @@ def test_worklink_ready_queue_manifest_forwards_model_and_reasoning_effort() -> 
 )
 @pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_spec(
-    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, stub_opencode: Path,
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
     agent_effort: str, override: str | None, source: str,
 ) -> None:
-    """Real env scrub -> queue dispatch -> child -> leaf argv; no dotenv fallback."""
+    """Real env scrub -> queue dispatch -> child -> daemon model; no dotenv fallback."""
     root = Path(__file__).resolve().parents[1]
     skill = root / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator"
     repo = tmp_path / "repo"
@@ -9059,9 +9059,9 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         json.dumps({"openai": {"type": "oauth", "refresh": "synthetic"}}),
         encoding="utf-8",
     )
-    from tests.opencode_fixtures import seed_codex_subscription, seed_opencode_binary
-    seed_codex_subscription(tmp_path, "synthetic")
-    binary = seed_opencode_binary(tmp_path)
+    native = tmp_path / ".codex/auth.json"
+    native.parent.mkdir()
+    native.write_text("agent-login-canary-not-a-valid-credential")
     parent_env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(tmp_path),
@@ -9092,6 +9092,7 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
     leaf = tmp_path / "leaf.py"
     leaf.write_text(
         "import json, os, sys\n"
+        "from dataclasses import asdict\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {str(root)!r})\n"
         "from mimir.plugins.discovery import enabled_plugins\n"
@@ -9101,13 +9102,14 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         "assert 'MIMIR_CODING_ENABLED' not in os.environ\n"
         f"order = WorkOrder(1844, Path({str(repo)!r}), 'prompt', None, 30, "
         "{'MIMIR_HOME': os.environ['MIMIR_HOME']})\n"
-        f"spec = OpenCodeBackend(bin={str(binary)!r}).work_spec(order, attempt=1, repo_url='u', "
+        "spec = OpenCodeBackend().work_spec(order, attempt=1, repo_url='u', "
         "base_ref='main', branch='issue/1844-a1', test_command='true')\n"
         f"Path({str(result_path)!r}).write_text(json.dumps({{"
         "'argv': spec.local_argv, 'variant': spec.backend_config['variant'], "
+        "'request': asdict(spec.session_request), "
         "'source': spec.backend_config['variant_source'], "
         "'provider': type(spec).__module__, "
-        "'projections': [p.path for p in spec.backend_config['worker_projections']], "
+        "'projections': [p.path for p in spec.backend_config.get('worker_projections', ())], "
         "'selected': os.environ['MIMIR_PLUGINS']}), encoding='utf-8')\n",
         encoding="utf-8",
     )
@@ -9157,14 +9159,13 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["selected"] == "cultivate"
     assert result["provider"].startswith("mimir_cultivate.worklink.")
-    assert result["projections"] == [
-        ".config/opencode/opencode.json", ".local/share/opencode/auth.json",
-    ]
+    assert result["projections"] == []
     assert result["variant"] == "high"
     assert result["source"] == source
-    index = result["argv"].index("--variant")
-    assert result["argv"][index + 1] == "high"
-    assert result["argv"].count("--variant") == 1
+    assert result["argv"] is None
+    assert result["request"]["kind"] == "leaf"
+    assert result["request"]["model"] == {"providerID": "openai", "id": "gpt-agent", "variant": "high"}
+    assert native.read_text() == "agent-login-canary-not-a-valid-credential"
     assert not (home / ".env").exists()
 
 

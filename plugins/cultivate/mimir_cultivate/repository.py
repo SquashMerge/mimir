@@ -3755,7 +3755,22 @@ class RepoGitTools:
                 "while conflicts exist, every staged path must be proven by the unmerged index",
             )
         pathspecs = tuple(_validate_path(path) for path in paths)
-        self._command(("add", "--", *pathspecs))
+        staged_deletions = set(filter(None, self._command((
+            "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
+            "--no-renames", "--diff-filter=D", "--", *pathspecs,
+        )).stdout.split("\x00")))
+        # Git add refuses a path absent from both the index and working tree.
+        # Only a proven staged deletion may be skipped; unknown paths must still
+        # fail, and recreated files (including dangling symlinks) must be added.
+        pending = tuple(
+            pathspec for path, pathspec in zip(paths, pathspecs)
+            if not (
+                PurePosixPath(path).as_posix() in staged_deletions
+                and not os.path.lexists(self._root / path)
+            )
+        )
+        if pending:
+            self._command(("add", "--", *pending))
 
     def execute(self, operation: GitOperation) -> GitOperationResult:
         """Authorize one typed operation and execute only server-built argv."""
@@ -4153,6 +4168,7 @@ from .contained_execution import (
     SensitiveMaterialScrubber,
     base_worker_environment,
     execute_contained,
+    heavy_lock_environment,
 )
 from mimir.contained_snapshot import (
     ContainedSnapshotError,
@@ -4950,6 +4966,10 @@ class RepoProjectTests:
                         "use diff-related selectors or a named suite and read pr_checks for full-suite CI evidence",
                         execution_started=False,
                     )
+        try:
+            heavy_lock_environment()
+        except ValueError as exc:
+            raise ProjectTestRefusal("heavy_lock_invalid", str(exc), execution_started=False) from None
         git_tools: RepoGitTools | None = None
         try:
             git_tools = (

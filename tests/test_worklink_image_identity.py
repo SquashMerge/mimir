@@ -81,6 +81,14 @@ def test_live_proofs_initialize_lease_root_before_services(
     ]
 
 
+def test_source_fixture_uses_shared_root_privilege_launch():
+    script = PROOF.read_text()
+    assert "'--detach', '--user', 'root'" in script
+    assert 'from mimir_cultivate.worklink.daemon_service import exec_worklink' in script
+    assert 'exec_worklink(("/opt/mimir-worklink/venv/bin/python", ' in script
+    assert 'printf attacked > {shlex.quote(str(repo / \'tracked\'))}' in script
+
+
 def test_source_mode_keeps_explicit_build_arg_and_live_proof() -> None:
     script = PROOF.read_text()
     assert '"MIMIR_INSTALL_MODE=source"' in script
@@ -153,6 +161,172 @@ def test_pypi_runtime_proof_refuses_root_before_protocol(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['proof', '{}'])
     with pytest.raises(AssertionError, match='must run as mimir'):
         exec(namespace['PYPI_RUNTIME_PROOF'], {})
+
+
+@pytest.mark.parametrize(
+    ("state", "error"),
+    [
+        ({"ok": False, "daemon_enabled": True}, None),
+        ({"ok": True, "daemon_enabled": True}, "unexpectedly passed"),
+        ({"ok": True, "daemon_enabled": False}, "unexpectedly passed"),
+    ],
+)
+def test_setup_daemon_image_proof_requires_refusal(state, error, monkeypatch) -> None:
+    import json
+    setup = pytest.importorskip("mimir_cultivate.setup", reason="daemon setup belongs to Cultivate")
+
+    payload = runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"]
+    calls = []
+
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(state), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", execute)
+    # The embedded payload replaces _run as it does in the image. Restore it
+    # after the test, without substituting the real verification function.
+    monkeypatch.setattr(setup, "_run", setup._run)
+    if error:
+        with pytest.raises(AssertionError, match=error):
+            exec(payload, {})
+    else:
+        exec(payload, {})
+    assert calls == [(
+        ["/command/s6-setuidgid", "mimir", "python", "-c", setup._OPENCODE_DAEMON_PROBE],
+        {"cwd": "/tmp", "capture_output": True, "text": True, "timeout": 30},
+    )]
+
+
+def test_setup_daemon_image_proof_rejects_unrelated_setup_error(monkeypatch) -> None:
+    setup = pytest.importorskip("mimir_cultivate.setup", reason="daemon setup belongs to Cultivate")
+
+    def fail(*args, **kwargs):
+        raise setup.SetupError("unrelated setup failure")
+
+    monkeypatch.setattr(setup, "_verify_opencode_daemon", fail)
+    monkeypatch.setattr(setup, "_run", setup._run)
+    with pytest.raises(AssertionError, match="unrelated setup failure"):
+        exec(runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"], {})
+
+
+def test_setup_daemon_image_proof_rejects_wrong_user_before_execution(monkeypatch) -> None:
+    setup = pytest.importorskip("mimir_cultivate.setup", reason="daemon setup belongs to Cultivate")
+
+    def wrong_user(deploy, *argv):
+        return setup._run(["docker", "compose", "exec", "-T", "-u", "worklink", "agent", *argv], cwd=deploy)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("wrong-user probe reached subprocess execution")
+
+    monkeypatch.setattr(setup, "_agent_exec", wrong_user)
+    monkeypatch.setattr(setup, "_run", setup._run)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    with pytest.raises(AssertionError, match="worklink"):
+        exec(runpy.run_path(str(PROOF))["SETUP_DAEMON_PROOF"], {})
+
+
+@pytest.mark.parametrize("kind", ["leaf", "spawn"])
+async def test_image_daemon_fixture_uses_production_session_controller(kind, tmp_path, monkeypatch):
+    pytest.importorskip("mimir_cultivate", reason="daemon sessions belong to Cultivate")
+    import asyncio
+    from http.server import ThreadingHTTPServer
+    from threading import Thread
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient, DaemonClientError
+    from mimir_cultivate.worklink.daemon_sessions import SessionController
+
+    namespace = {"__name__": "image_fixture"}
+    exec(runpy.run_path(str(PROOF))["DAEMON_FIXTURE"], namespace)
+    namespace["api"] = {"username": "fixture", "password": "fixture-password"}
+    calls = []
+
+    def payload(argv, **kwargs):
+        calls.append((argv, kwargs))
+        assert kwargs["cwd"] == str(tmp_path)
+        assert kwargs["env"]["MIMIR_WORKLINK_GATE"] == "1"
+        assert kwargs["env"]["MIMIR_MODEL_SPEC"] == "proof/model"
+        assert kwargs["timeout"] == 25
+        return subprocess.CompletedProcess(argv, 0, stdout="fixed payload ran", stderr="")
+
+    namespace["subprocess"] = SimpleNamespace(run=payload)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), namespace["Handler"])
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = {"base_url": f"http://127.0.0.1:{server.server_port}", **namespace["api"]}
+    try:
+        async with OpenCodeDaemonClient(**{**connection, "password": "wrong"}) as bad:
+            with pytest.raises(DaemonClientError, match="HTTP 401"):
+                await bad.info()
+        async with OpenCodeDaemonClient(**connection) as client:
+            controller = await SessionController.create(
+                client, tmp_path / "record.json", request=SessionRequest(
+                    kind, {"providerID": "proof", "id": "model"}, "fixed input", ("git *",)),
+                issue_id=1, attempt=1, generation="fixture", checkout=tmp_path,
+                environment={"PATH": "/usr/bin:/bin"}, timeout_s=30)
+            result = await controller.observe()
+            assert result.execution_state == "succeeded"
+            assert result.stdout == "fixed payload ran"
+            assert controller.record.admission_state == "admitted"
+            await controller.release()
+            assert controller.record.cancellation_state == "verified"
+        assert len(namespace["sessions"]) == 1
+        assert calls[0][0] == ["/tmp/opencode-proof" if kind == "leaf" else "/tmp/opencode-spawn-proof"]
+        assert len(calls) == 1
+    finally:
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        thread.join(timeout=5)
+
+
+async def test_missing_login_image_payload_uses_real_health_and_refuses_before_session(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("mimir_cultivate", reason="daemon health belongs to Cultivate")
+    import json
+    import os
+    import time
+    from types import SimpleNamespace
+    from mimir.tools.registry import _STATE
+    from mimir.worklink_daemon_activation import DaemonActivation
+    from mimir_cultivate.worklink import daemon_health as health_module
+    from mimir_cultivate.worklink.daemon_config import make_launch_snapshot, resolve_daemon_credentials
+
+    namespace = {"__name__": "image_refusal"}
+    exec(runpy.run_path(str(PROOF))["MISSING_LOGIN_PROOF"], namespace)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    generation = "12345678-1234-4234-8234-123456789abc"
+    status = {"version": 1, "launch_generation": generation, "checked_at_ms": time.time_ns() // 1_000_000,
+              "daemon_state": "ready", "daemon_version": "2.2.7", "login_state": "missing",
+              "login_expires_at_ms": None, "telemetry_state": "off"}
+    snapshot = make_launch_snapshot(resolve_daemon_credentials(dict(os.environ)), generation).to_dict()
+    monkeypatch.setattr(health_module, "resolve_activation", lambda env: DaemonActivation(True, "enabled"))
+    monkeypatch.setattr(health_module, "get_identities", lambda: SimpleNamespace(worklink_uid=1002, mimir_uid=1001))
+    monkeypatch.setattr(health_module, "read_json", lambda path, **kw: status if path.name == "status.json" else snapshot)
+    monkeypatch.setitem(_STATE, "spawn_config", _STATE["spawn_config"])
+    namespace["os"] = SimpleNamespace(environ=os.environ, geteuid=lambda: 1001)
+    namespace["Path"] = lambda path: tmp_path / "artifacts" if path == "/home/mimir/worklink-refusal-artifacts" else Path(path)
+    await namespace["main"]()
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"proof": "missing_login", "reason_code": "login_missing",
+                      "sessions_started": 0, "native_login_proven": False}
+
+
+def test_positive_image_proofs_keep_session_fixture_boundaries_and_evidence():
+    namespace = runpy.run_path(str(PROOF))
+    for name in ("CONTROLLER_PROOF", "SPAWN_PROOF"):
+        payload = namespace[name]
+        compile(payload, name, "exec")
+        assert 'patch("mimir_cultivate.worklink.daemon_health.daemon_health"' in payload
+        assert '"native_login_proven": False' in payload
+    assert "ControllerGitPublication.capture" in namespace["CONTROLLER_PROOF"]
+    assert '"gate-euid=1002"' in namespace["CONTROLLER_PROOF"]
+    assert '"spawn-euid=1002"' in namespace["SPAWN_PROOF"]
+    assert 'proposal["sha256"]' in namespace["SPAWN_PROOF"] or 'proposal.get("sha256")' in namespace["SPAWN_PROOF"]
+    script = PROOF.read_text()
+    assert script.index("'-c', MISSING_LOGIN_PROOF, user='mimir'") < script.index("input_text=DAEMON_FIXTURE")
+    assert "chmod 0755 /usr/local/bin/opencode" not in script
 
 
 def test_wheel_identity_checks_metadata_and_cultivate_pair(tmp_path: Path) -> None:

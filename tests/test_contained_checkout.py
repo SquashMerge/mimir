@@ -335,7 +335,7 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     scope = issued.path.parent.parent
     boundary = issued.path.parent
     assert stat.S_IMODE(root.stat().st_mode) == 0o771
-    assert stat.S_IMODE(scope.stat().st_mode) == 0o700
+    assert stat.S_IMODE(scope.stat().st_mode) == (0o710 if surface == "opencode" else 0o700)
     assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
     assert stat.S_IMODE(issued.path.stat().st_mode) == 0o2770
     identities = synthetic_worklink_identities
@@ -343,7 +343,8 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     boundary_identity = _identity(boundary)
     checkout_identity = _identity(issued.path)
     assert (
-        "chown", scope_identity, (identities.mimir_uid, identities.mimir_uid)
+        "chown", scope_identity,
+        (identities.mimir_uid, identities.worklink_gid if surface == "opencode" else identities.mimir_uid)
     ) in mutations
     assert (
         "chown", boundary_identity, (identities.mimir_uid, identities.worklink_gid)

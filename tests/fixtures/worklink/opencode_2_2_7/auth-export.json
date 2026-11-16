@@ -1,0 +1,16 @@
+[
+  {
+    "id": "<CREDENTIAL_ID_0>",
+    "integrationID": "openai",
+    "label": "agent Codex",
+    "active": true,
+    "value": {
+      "type": "oauth",
+      "methodID": "chatgpt-browser",
+      "refresh": "synthetic-refresh",
+      "access": "synthetic-access",
+      "expires": 1900000000000,
+      "metadata": {"accountID": "synthetic-account"}
+    }
+  }
+]

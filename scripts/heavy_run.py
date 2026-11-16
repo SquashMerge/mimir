@@ -57,8 +57,10 @@ def _is_current(path: Path, fd: int) -> bool:
 
 def _write(fd: int, name: str, value: str) -> None:
     # Relative to the held generation, never accidentally update a newer lease.
+    # Waiters running as other identities read the counter: 0644 whatever the umask.
     with open(os.open(name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
                       0o644, dir_fd=fd), "w") as out:
+        os.fchmod(out.fileno(), 0o644)
         out.write(value)
     os.rename(name + ".tmp", name, src_dir_fd=fd, dst_dir_fd=fd)
 
@@ -73,10 +75,42 @@ def _counter(fd: int) -> str | None:
         return None
 
 
+def _cleanup_warning(path: Path, exc: OSError) -> None:
+    # Repr escapes control characters in configured paths; don't print arbitrary
+    # exception text (which can also contain paths or embedded newlines).
+    print(f"heavy_run: retired lease cleanup deferred for {str(path)!r} "
+          f"(errno={exc.errno})", file=sys.stderr, flush=True)
+
+
+def _remove_retired(retired: Path) -> None:
+    try:
+        shutil.rmtree(retired)
+    except FileNotFoundError:
+        pass  # Another sweeper already removed it.
+    except OSError as exc:
+        # A losing waiter can still mkdir through its old generation fd while
+        # rmtree runs. The rename already settled ownership; deletion is only
+        # housekeeping. Try once, then leave it for a later acquisition/release.
+        _cleanup_warning(retired, exc)
+
+
+def _sweep_retired(path: Path) -> None:
+    prefix = path.name + ".retired-"
+    try:
+        with os.scandir(path.parent) as entries:
+            for entry in entries:
+                # Literal prefix, not a glob: configured names can contain glob
+                # metacharacters. Never sweep the live lease or follow symlinks.
+                if entry.name.startswith(prefix) and entry.is_dir(follow_symlinks=False):
+                    _remove_retired(Path(entry.path))
+    except OSError as exc:
+        _cleanup_warning(path.parent, exc)
+
+
 def _retire(path: Path) -> None:
     retired = path.with_name(path.name + ".retired-" + uuid.uuid4().hex)
     path.rename(retired)
-    shutil.rmtree(retired)
+    _remove_retired(retired)
 
 
 def _break_stale(path: Path, fd: int, observed: str | None) -> bool:
@@ -87,7 +121,10 @@ def _break_stale(path: Path, fd: int, observed: str | None) -> bool:
     except (FileExistsError, FileNotFoundError):
         return False
     if not _is_current(path, fd) or _counter(fd) != observed:
-        os.rmdir("breaking", dir_fd=fd)
+        try:
+            os.rmdir("breaking", dir_fd=fd)
+        except FileNotFoundError:
+            pass  # A retired-generation cleanup removed our claim already.
         return False
     try:
         _retire(path)
@@ -98,6 +135,7 @@ def _break_stale(path: Path, fd: int, observed: str | None) -> bool:
 
 
 def _release(path: Path, fd: int) -> None:
+    _sweep_retired(path)
     # Release and stale breaking arbitrate on the SAME generation. Otherwise a
     # resuming holder can release/reacquire between a breaker's check and rename.
     while _is_current(path, fd):
@@ -113,13 +151,31 @@ def _release(path: Path, fd: int) -> None:
         return
 
 
+def _publish_generation(path: Path) -> None:
+    """Create the generation already open to every participant identity.
+
+    Participants are different uids (host user, mimir, worklink) without a
+    shared group: a waiter must open the generation and a stale waiter must
+    create its breaker claim inside it. A mode fixed after mkdir would expose a
+    umask-restricted directory to concurrent waiters, so create it 0777 under a
+    zero umask. This helper is single-threaded and its command has not started,
+    so the temporary umask is observable by nothing else.
+    """
+    previous = os.umask(0)
+    try:
+        os.mkdir(path, 0o777)
+    finally:
+        os.umask(previous)
+
+
 def _acquire(path: Path, stale: float, interval: float) -> int:
+    _sweep_retired(path)
     previous: tuple[tuple[int, int], str | None] | None = None
     unchanged_since = time.monotonic()
     while True:
         _check_signal()
         try:
-            path.mkdir()
+            _publish_generation(path)
         except FileExistsError:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
