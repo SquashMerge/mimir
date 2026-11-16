@@ -78,6 +78,35 @@ async def test_daemon_wait_does_not_refresh_expired_launch_budget():
     client.session_cancel.assert_awaited_once_with(handle)
 
 
+@pytest.mark.asyncio
+async def test_daemon_observation_backs_off_to_a_bounded_interval(monkeypatch):
+    """Each observation spawns an executor helper; a long build must not poll every 100 ms."""
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome, SessionTransportLostError
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    running = SessionOutcome("ses_owned", "started")
+    client = SimpleNamespace(session_observe=AsyncMock(side_effect=[
+        running, SessionTransportLostError("lost"), *([running] * 6), SessionOutcome("ses_owned", "succeeded"),
+    ]))
+    sleeps = []
+    async def no_wait(seconds):
+        sleeps.append(seconds)
+    monkeypatch.setattr(compute.asyncio, "sleep", no_wait)
+    result = await compute.OpenCodeDaemonComputeBackend(client=client).wait(handle, 60)
+    assert result.exit_code == 0
+    assert sleeps == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0, 2.0])
+    assert max(sleeps) == compute._OBSERVE_INTERVAL_CAP_S
+
+
+def test_session_helper_timeout_outlasts_its_bounded_work():
+    """The helper backstop must exceed the 25 s cancellation window with load headroom."""
+    import inspect
+    from mimir_cultivate.worklink import worker_exec
+
+    assert worker_exec._SESSION_HELPER_TIMEOUT_S >= 120
+    assert "timeout=_SESSION_HELPER_TIMEOUT_S" in inspect.getsource(worker_exec._handle_session)
+
+
 def test_authorized_checkout_binds_configured_worker_uid(monkeypatch, tmp_path) -> None:
     from mimir_cultivate.worklink import identities
     from mimir_cultivate.worklink.checkout import _mint_checkout_authorization
