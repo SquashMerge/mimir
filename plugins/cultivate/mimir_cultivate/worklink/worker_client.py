@@ -301,7 +301,11 @@ class WorkerClient:
         fd = self.checkout.duplicate_fd() if self.checkout is not None else -1
         sock = None
         try:
-            sock = await asyncio.to_thread(self._connect, 35)
+            from .daemon_config import SESSION_RPC_TIMEOUT_S
+
+            # The helper may legitimately run up to SESSION_HELPER_TIMEOUT_S; a
+            # shorter response budget would abandon it and retain the checkout.
+            sock = await asyncio.to_thread(self._connect, SESSION_RPC_TIMEOUT_S)
             rights = ([fd] if fd >= 0 else []) + ([output.fd] if output is not None else [])
             ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", rights))] if rights else []
             sock.sendmsg([raw], ancillary)
@@ -358,8 +362,10 @@ class WorkerClient:
     async def session_recover_admission(self, generation: str) -> LaunchHandle | None:
         """Read the owned attempt record; never repeat create or input admission."""
         from .backends.base import SessionAdmissionError
+        from .daemon_config import SESSION_RPC_TIMEOUT_S
         try:
-            async with asyncio.timeout(35):
+            # One slow observe RPC must fit: the budget is at least one RPC's.
+            async with asyncio.timeout(SESSION_RPC_TIMEOUT_S):
                 while True:
                     try:
                         response = await self._session_rpc("session_observe", {

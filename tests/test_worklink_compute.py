@@ -99,12 +99,47 @@ async def test_daemon_observation_backs_off_to_a_bounded_interval(monkeypatch):
 
 
 def test_session_helper_timeout_outlasts_its_bounded_work():
-    """The helper backstop must exceed the 25 s cancellation window with load headroom."""
+    """The executor's helper backstop is the shared constant and exceeds the 25 s cancel window."""
     import inspect
-    from mimir_cultivate.worklink import worker_exec
+    from mimir_cultivate.worklink import daemon_config, worker_exec
 
-    assert worker_exec._SESSION_HELPER_TIMEOUT_S >= 120
-    assert "timeout=_SESSION_HELPER_TIMEOUT_S" in inspect.getsource(worker_exec._handle_session)
+    assert daemon_config.SESSION_HELPER_TIMEOUT_S >= 120
+    assert "timeout=SESSION_HELPER_TIMEOUT_S" in inspect.getsource(worker_exec._handle_session)
+
+
+@pytest.mark.asyncio
+async def test_session_rpc_waits_longer_than_the_helper_allowance(monkeypatch, tmp_path):
+    """Review P1 on #103: a 35 s client socket abandoned a helper allowed 120 s."""
+    import json as _json
+    import socket as _socket
+    import threading
+    from mimir_cultivate.worklink import daemon_config
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    client_end, executor_end = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    requested = []
+
+    def connect(self, timeout_s=None):
+        requested.append(timeout_s)
+        client_end.settimeout(timeout_s)
+        return client_end
+
+    def executor():
+        _json.loads(executor_end.recv(1 << 20))
+        executor_end.sendall(_json.dumps({"cancellation_state": "verified"}).encode())
+
+    thread = threading.Thread(target=executor)
+    thread.start()
+    monkeypatch.setattr(WorkerClient, "_connect", connect)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    client = WorkerClient.for_path_checkout(checkout, issue_id=1, attempt=1, run_uid=os.geteuid())
+    response = await client._session_rpc("session_cancel", {"generation": "g", "opencode_session_id": "ses_x"})
+    thread.join(5)
+    executor_end.close()
+    assert response == {"cancellation_state": "verified"}
+    assert requested == [daemon_config.SESSION_RPC_TIMEOUT_S]
+    assert daemon_config.SESSION_RPC_TIMEOUT_S > daemon_config.SESSION_HELPER_TIMEOUT_S
 
 
 def test_authorized_checkout_binds_configured_worker_uid(monkeypatch, tmp_path) -> None:
