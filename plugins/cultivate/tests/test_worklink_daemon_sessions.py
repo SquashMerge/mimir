@@ -779,6 +779,11 @@ async def test_executor_reports_a_session_that_ended_with_its_daemon(tmp_path, m
                 return launch
             raise FileNotFoundError(path)
         monkeypatch.setattr(daemon_service, "read_json", read_json)
+        import hashlib
+        home = root / "sessions" / (hashlib.sha256(f"{checkout}:2151:2".encode()).hexdigest() + ".home")
+        (home / "tmp").mkdir(parents=True)
+        (home / "tmp" / "sentinel").write_text("attempt scratch")
+        (checkout / "work.txt").write_text("retained work")
         output = tmp_path / "stdout"
         output.write_bytes(b"stale")
         fd = os.open(output, os.O_RDWR)
@@ -803,3 +808,7 @@ async def test_executor_reports_a_session_that_ended_with_its_daemon(tmp_path, m
             assert response == {"cancellation_state": "verified"}
         else:
             assert response == {"released": True}
+            assert not home.exists()
+        assert (checkout / "work.txt").read_text() == "retained work"
+        if op != "session_release":
+            assert (home / "tmp" / "sentinel").exists()
