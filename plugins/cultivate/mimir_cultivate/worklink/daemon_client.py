@@ -185,6 +185,18 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("session location mismatch")
         return result
 
+    async def session_exists(self, session_id: str) -> bool:
+        """True when this daemon knows the session; only an explicit 404 means absent."""
+        try:
+            result = _object(await self._request("GET", f"/api/session/{_identifier(session_id, 'ses')}"))
+        except DaemonClientError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        if _object(result.get("data")).get("id") != session_id:
+            raise DaemonClientError("session identity mismatch")
+        return True
+
     async def set_environment(self, session_id: str, variables: Mapping[str, str]) -> None:
         await self._request("PUT", self._path(session_id, "environment"),
                             payload={"variables": dict(variables)}, status=204)
