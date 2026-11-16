@@ -567,6 +567,27 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
     return environment
 
 
+async def _ended_with_previous_daemon(client: OpenCodeDaemonClient, path: Path, *, session_id: str,
+                                      request_generation: str, current_generation: object) -> bool:
+    """Whether a retained session provably ended when its daemon was replaced.
+
+    The daemon's state directory is not persistent: a container restart removes
+    every controller record and the daemon's own sessions, and the daemon process
+    that ran them exits. A run retained across that restart then has no record
+    to recover, so every observe, cancel and release used to fail closed forever.
+    It ended with its daemon only if all three hold: no controller record and no
+    retirement witness exists; the current daemon's launch generation differs
+    from the run's; and the current daemon reports the session absent (404).
+    Anything else, including a daemon error, keeps today's fail-closed path.
+    """
+    retired = path.with_name(f"{path.stem}.{session_id}.retired.json")
+    if path.exists() or retired.exists():
+        return False
+    if not isinstance(current_generation, str) or not current_generation or current_generation == request_generation:
+        return False
+    return not await client.session_exists(session_id)
+
+
 async def _executor_operation(request: dict) -> dict:
     from .daemon_config import DAEMON_ROOT
     from .daemon_health import load_api
@@ -622,14 +643,21 @@ async def _executor_operation(request: dict) -> dict:
                     environment=env, timeout_s=request["timeout_s"],
                 )
                 return {"opencode_session_id": controller.record.opencode_session_id}
-            controller = SessionController.recover_owned(
-                client, path, session_id=request["opencode_session_id"],
-                generation=request["generation"], checkout=checkout)
-            controller.sensitive_values = (api["password"], *(os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ))
-            if controller.record.opencode_session_id != request["opencode_session_id"]:
-                raise ValueError("session ownership mismatch")
+            launch = read_json(paths.daemon / "launch.json", uid=identities.worklink_uid, mode=0o600)
+            controller = None
+            if not await _ended_with_previous_daemon(
+                    client, path, session_id=request["opencode_session_id"],
+                    request_generation=request["generation"], current_generation=launch.get("launch_generation")):
+                controller = SessionController.recover_owned(
+                    client, path, session_id=request["opencode_session_id"],
+                    generation=request["generation"], checkout=checkout)
+                controller.sensitive_values = (api["password"], *(os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ))
+                if controller.record.opencode_session_id != request["opencode_session_id"]:
+                    raise ValueError("session ownership mismatch")
             if request["op"] == "session_observe":
-                outcome = asdict(await controller.observe(stdout_limit=request["stdout_limit"]))
+                ended = SessionOutcome(request["opencode_session_id"], "interrupted", "verified", SessionError(
+                    "daemon_restarted", "OpenCode daemon was replaced; the session ended with its daemon"))
+                outcome = asdict(ended if controller is None else await controller.observe(stdout_limit=request["stdout_limit"]))
                 raw = outcome.pop("stdout").encode()
                 output_fd = int(os.environ["WORKLINK_SESSION_OUTPUT_FD"])
                 os.ftruncate(output_fd, 0)
@@ -642,11 +670,14 @@ async def _executor_operation(request: dict) -> dict:
                 outcome["error_detail"] = outcome.pop("error")
                 return outcome
             if request["op"] == "session_cancel":
+                if controller is None:
+                    return {"cancellation_state": "verified"}
                 await controller.cancel()
                 return {"cancellation_state": controller.record.cancellation_state}
             if request["op"] == "session_release":
-                already_retired = controller._retired
-                await controller.release()
+                already_retired = controller is not None and controller._retired
+                if controller is not None:
+                    await controller.release()
                 from mimir._rmtree import rmtree_missing_ok
                 if not already_retired:
                     rmtree_missing_ok(home)

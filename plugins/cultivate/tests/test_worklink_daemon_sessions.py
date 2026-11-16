@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 import time
 from copy import deepcopy
 from types import SimpleNamespace
@@ -709,3 +710,96 @@ async def test_captured_history_drives_observed_state(tmp_path, scenario, expect
     assert controller.record.last_seq == replay["seq"]
     if scenario == "prompt1":
         assert outcome.stdout.strip() == "ok"
+
+
+async def test_session_exists_is_true_for_a_known_session_and_false_only_on_404(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        assert await client.session_exists(controller.record.opencode_session_id)
+        assert not await client.session_exists("ses_gone")
+        daemon.faults[("GET", "/api/session/ses_broken")].append(SyntheticFault(status=500))
+        with pytest.raises(DaemonClientError):
+            await client.session_exists("ses_broken")
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("orphaned", True), ("same_generation", False), ("session_present", False),
+    ("record_present", False), ("retired_present", False), ("no_current_generation", False),
+])
+async def test_ended_with_previous_daemon_requires_every_proof(tmp_path, case, expected):
+    from mimir_cultivate.worklink.daemon_sessions import _ended_with_previous_daemon
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        path = tmp_path / "controller.json"
+        sid = "ses_previous"
+        if case == "session_present":
+            sid = (await client.create_session(directory=str(tmp_path), model={"providerID": "openai", "id": "x"},
+                                               permissions=[]))["data"]["id"]
+        if case == "record_present":
+            path.write_text("{}")
+        if case == "retired_present":
+            path.with_name(f"{path.stem}.{sid}.retired.json").write_text("{}")
+        current = {"same_generation": "generation-old", "no_current_generation": None}.get(case, "generation-new")
+        assert await _ended_with_previous_daemon(
+            client, path, session_id=sid, request_generation="generation-old",
+            current_generation=current) is expected
+
+
+async def test_ended_with_previous_daemon_fails_closed_on_daemon_error(tmp_path):
+    from mimir_cultivate.worklink.daemon_sessions import _ended_with_previous_daemon
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.faults[("GET", "/api/session/ses_previous")].append(SyntheticFault(status=500))
+        with pytest.raises(DaemonClientError):
+            await _ended_with_previous_daemon(client, tmp_path / "controller.json", session_id="ses_previous",
+                                              request_generation="generation-old", current_generation="generation-new")
+
+
+@pytest.mark.parametrize("op", ["session_observe", "session_cancel", "session_release"])
+@pytest.mark.parametrize("restarted", [True, False])
+async def test_executor_reports_a_session_that_ended_with_its_daemon(tmp_path, monkeypatch, op, restarted):
+    """2026-11-16: every retained leaf failed closed forever after a container restart wiped its record."""
+    from mimir_cultivate.worklink import daemon_config, daemon_health, daemon_service, daemon_sessions, identities
+
+    async with FakeOpenCodeDaemon() as daemon:
+        root = tmp_path / "daemon"
+        (root / "sessions").mkdir(parents=True)
+        checkout = (tmp_path / "checkout").resolve()
+        checkout.mkdir()
+        info = checkout.stat()
+        launch = {"launch_generation": "generation-new" if restarted else "generation-old"}
+        monkeypatch.setattr(daemon_config, "DAEMON_ROOT", str(root))
+        monkeypatch.setattr(identities, "get_identities", lambda: SimpleNamespace(worklink_uid=os.geteuid()))
+        monkeypatch.setattr(identities, "assert_worklink_identity", lambda ids: None)
+        monkeypatch.setattr(daemon_health, "load_api", lambda paths, uid: {
+            "url": daemon.base_url, "username": daemon.username, "password": daemon.password})
+        monkeypatch.setattr(daemon_service, "RuntimePaths", lambda: SimpleNamespace(daemon=root))
+        def read_json(path, uid, mode):
+            if path.name == "launch.json":
+                return launch
+            raise FileNotFoundError(path)
+        monkeypatch.setattr(daemon_service, "read_json", read_json)
+        output = tmp_path / "stdout"
+        output.write_bytes(b"stale")
+        fd = os.open(output, os.O_RDWR)
+        monkeypatch.setenv("WORKLINK_SESSION_OUTPUT_FD", str(fd))
+        request = {"op": op, "issue": 2151, "attempt": 2, "device": info.st_dev, "inode": info.st_ino,
+                   "path": str(checkout), "generation": "generation-old", "opencode_session_id": "ses_gone",
+                   **({"stdout_limit": 1024} if op == "session_observe" else {})}
+        try:
+            if not restarted:
+                with pytest.raises(FileNotFoundError):
+                    await daemon_sessions._executor_operation(request)
+                return
+            response = await daemon_sessions._executor_operation(request)
+        finally:
+            os.close(fd)
+        if op == "session_observe":
+            assert response["execution_state"] == "interrupted"
+            assert response["cancellation_state"] == "verified"
+            assert response["error_detail"]["type"] == "daemon_restarted"
+            assert output.read_bytes() == b""
+        elif op == "session_cancel":
+            assert response == {"cancellation_state": "verified"}
+        else:
+            assert response == {"released": True}
