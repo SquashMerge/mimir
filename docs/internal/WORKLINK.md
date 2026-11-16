@@ -935,6 +935,39 @@ leaf issues with explicit acceptance criteria and review criteria.
 
 ### Prerequisites
 
+#### Test scratch on a separate filesystem
+
+Set `MIMIR_WORKLINK_GATE_TMPDIR` in the controller's service environment to an
+absolute directory on the filesystem intended for test scratch. Provision it
+before starting Worklink: it must already exist, be owned by the `worklink`
+worker uid, and have mode **0700** (no group/other permissions or special mode
+bits). A missing directory, wrong owner, or wrong mode refuses the gate with a
+configuration reason; Worklink does not create, chmod, or fall back from an
+invalid configured directory.
+
+The intended mimirbot deployment is an operator-provisioned **tmpfs mount** at
+this location, visible at the same path to the controller and root executor,
+with mount ownership/mode set to the worker uid and 0700. For example, provision
+`/run/mimir-worklink/gate-scratch` as tmpfs and set
+`MIMIR_WORKLINK_GATE_TMPDIR=/run/mimir-worklink/gate-scratch`. Size the mount for
+concurrent test gates; tests can create substantial temporary data. The mount
+and service setting are deployment configuration.
+Rebuild and restart the root executor with the matching controller release;
+the combined daemon/bounded-output/gate-scratch launch contract uses executor
+protocol v17 (`worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch`).
+
+Each run gets its own derived scratch tree under that directory. The gate's
+`TMPDIR` points at the tree and pytest's `--basetemp` at its `pytest/` child, so
+pytest resetting basetemp cannot delete other temporary files. The worker
+creates the tree after dropping privileges. Failure retention still exports
+bounded scratch artifacts to the existing transcript/evidence destination,
+and cleanup runs under the worker identity. JUnit reports, pytest report cache,
+gate output, evidence, artifacts, and their retention locations stay where they
+were. With the variable unset, existing scratch paths and environment behavior
+are unchanged.
+
+#### Checkout and tools
+
 - Provision a dedicated clone for `WORKLINK_REPO`; do not use the checkout from
   which an editable Mimir controller runs. `mimir worklink run` requires either
   `WORKLINK_REPO` or an explicit `--repo` and never falls back to cwd. Point

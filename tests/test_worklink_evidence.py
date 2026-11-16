@@ -396,6 +396,141 @@ def test_pytest_report_environment_explicit_basetemp_keeps_relative_junit(tmp_pa
     assert not report.exists() and not basetemp.exists()
 
 
+@pytest.fixture
+def configured_gate_scratch(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from mimir_cultivate.worklink import identities
+
+    root = tmp_path / "scratch space"
+    root.mkdir(mode=0o700)
+    worker = replace(identities.get_identities(), worklink_uid=os.getuid())
+    monkeypatch.setattr(identities, "get_identities", lambda: worker)
+    monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", str(root))
+    return root
+
+
+@pytest.mark.asyncio
+async def test_configured_gate_scratch_reaches_worker_command_environment(
+    tmp_path, configured_gate_scratch,
+):
+    from mimir_cultivate.worklink.compute import WorkSpec, ComputeResult, LaunchHandle, _enabled_child_env
+
+    reports = tmp_path / "checkout" / ".worklink-gate-reports"
+    reports.mkdir(parents=True)
+    seen = []
+
+    class Compute:
+        async def _launch_contained(self, spec, argv):
+            seen.append((spec, _enabled_child_env(spec, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")))
+            assert argv == ("/bin/sh", "-c", "pytest -q")
+            return LaunchHandle("local_subprocess", "scratch-test")
+
+        async def wait(self, handle, timeout):
+            return ComputeResult(0, "passed", "")
+
+        async def cleanup(self, handle):
+            pass
+
+    spec = WorkSpec(
+        1, 1, "url", "main", "branch", "prompt", None, "pytest -q", "opencode", 30,
+        backend_config={"pass_env": ()},
+    )
+    await ev._run_compute_gate(
+        "pytest -q", checkout=reports.parent, work_spec=spec, compute=Compute(), report_dir=reports,
+    )
+    launched, environment = seen[0]
+    scratch = Path(environment["TMPDIR"])
+    assert scratch.parent == configured_gate_scratch
+    assert scratch == ev._gate_tmp_directory(reports)
+    assert environment["WORKLINK_GATE_SCRATCH"] == str(scratch)
+    options = shlex.split(environment["PYTEST_ADDOPTS"])
+    assert f"--basetemp={scratch / 'pytest'}" in options
+    assert "--junitxml=.worklink-gate-reports/junit.xml" in options
+    assert "cache_dir=.worklink-gate-reports/cache" in options
+    assert launched.env["TMPDIR"] == environment["TMPDIR"]
+    assert not scratch.exists(), "only the worker may create its private scratch"
+
+
+@pytest.mark.parametrize("command", ["pytest -q && pytest -q", "gate-check && gate-check"])
+def test_configured_shell_gate_exports_scratch_for_entire_command(
+    tmp_path, configured_gate_scratch, command,
+):
+    reports = tmp_path / "reports"
+    # A fixture-owned pytest executable verifies both legs receive the same
+    # environment and that tempfile scratch survives pytest resetting basetemp.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / ("pytest" if "pytest" in command else "gate-check")
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, shlex, tempfile\n"
+        f"root = pathlib.Path({str(configured_gate_scratch)!r})\n"
+        "scratch = pathlib.Path(os.environ['TMPDIR'])\n"
+        "assert scratch.parent == root and scratch.is_dir()\n"
+        "assert pathlib.Path(tempfile.gettempdir()) == scratch\n"
+        "if 'PYTEST_ADDOPTS' in os.environ:\n"
+        " options = shlex.split(os.environ['PYTEST_ADDOPTS'])\n"
+        " assert '--basetemp=' + str(scratch / 'pytest') in options\n"
+        "with (scratch / 'calls').open('a') as output: output.write('called\\n')\n"
+    )
+    executable.chmod(0o700)
+    observed = ev._command_with_pytest_report(command, reports)
+    result = subprocess.run(observed, shell=True, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"}, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert (ev._gate_tmp_directory(reports) / "calls").read_text() == "called\ncalled\n"
+
+
+@pytest.mark.parametrize("invalid,reason", [
+    ("missing", "directory unavailable"),
+    ("owner", "owned by the worker uid"),
+    ("mode", "mode 0700"),
+    ("file", "must be a directory"),
+    ("relative", "absolute directory path"),
+    ("empty", "absolute directory path"),
+])
+def test_configured_gate_scratch_refuses_invalid_directory(
+    tmp_path, monkeypatch, configured_gate_scratch, invalid, reason,
+):
+    from dataclasses import replace
+    from mimir_cultivate.worklink import identities
+
+    root = configured_gate_scratch
+    if invalid == "missing":
+        root.rmdir()
+    elif invalid == "owner":
+        worker = replace(identities.get_identities(), worklink_uid=os.getuid() + 1)
+        monkeypatch.setattr(identities, "get_identities", lambda: worker)
+    elif invalid == "mode":
+        root.chmod(0o770)
+    elif invalid == "file":
+        root.rmdir()
+        root.write_text("not a directory")
+        root.chmod(0o700)
+    elif invalid == "relative":
+        monkeypatch.chdir(root.parent)
+        monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", root.name)
+    else:
+        monkeypatch.chdir(root)
+        monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", "")
+    with pytest.raises(ValueError, match=f"MIMIR_WORKLINK_GATE_TMPDIR.*{reason}"):
+        ev.pytest_report_environment("pytest -q", tmp_path / "reports")
+    assert not (tmp_path / "reports").exists()
+
+
+def test_unset_gate_scratch_preserves_existing_paths(tmp_path, monkeypatch):
+    import hashlib
+
+    monkeypatch.delenv("MIMIR_WORKLINK_GATE_TMPDIR", raising=False)
+    reports = tmp_path / "reports"
+    identity = hashlib.sha256(os.fsencode(reports.absolute())).hexdigest()
+    scratch = Path("/tmp").resolve() / f"worklink-gate-{identity}-tmp"
+    environment = ev.pytest_report_environment("pytest -q", reports)
+    assert set(environment) == {"PYTEST_ADDOPTS"}
+    assert f"--basetemp={scratch}" in shlex.split(environment["PYTEST_ADDOPTS"])
+    assert ev._gate_tmp_directory(reports) == scratch
+    assert ev.pytest_report_environment("true", reports) == {}
+
+
 def test_completed_empty_diff_demotes_to_failed() -> None:
     result = validate_evidence(base_evidence(files_changed=[]))
 

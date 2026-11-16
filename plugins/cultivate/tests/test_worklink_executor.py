@@ -223,7 +223,7 @@ def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(name: 
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
-    expected_protocol = "worklink-executor-v16-opencode-daemon-bounded-control-output"
+    expected_protocol = "worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch"
     assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_exec.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_client.MAX_REQUEST_BYTES == worker_exec.MAX_REQUEST_BYTES == 256 * 1024

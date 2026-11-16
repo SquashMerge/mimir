@@ -2845,6 +2845,63 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
     assert any(e.get("cleanup") == "executor_basetemp" for e in events) is cleanup_failure
 
 
+@pytest.mark.parametrize("leaf", ["directory", "missing", "symlink", "file"])
+def test_configured_executor_scratch_cleanup_delegates_private_parent_checks(tmp_path, monkeypatch, leaf):
+    from dataclasses import replace
+    from mimir_cultivate.worklink import identities
+    import mimir_cultivate.worklink.orchestrator as orch
+
+    root = tmp_path / "scratch"
+    root.mkdir(mode=0o700)
+    worker = replace(identities.get_identities(), worklink_uid=os.getuid())
+    monkeypatch.setattr(identities, "get_identities", lambda: worker)
+    monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", str(root))
+    reports = tmp_path / "reports"
+    tree = orch._gate_tmp_directory(reports)
+    outside = tmp_path / "untouched"
+    outside.mkdir()
+    (outside / "sentinel").write_text("safe")
+    if leaf == "directory":
+        tree.mkdir()
+        (tree / "pytest").mkdir()
+        (tree / "tempfile").write_text("scratch")
+    elif leaf == "symlink":
+        tree.symlink_to(outside, target_is_directory=True)
+    elif leaf == "file":
+        tree.write_text("not a directory")
+    original = Path.lstat
+
+    def private_lstat(path, *args, **kwargs):
+        if path == tree:
+            raise PermissionError("worker-only scratch parent")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", private_lstat)
+    commands = []
+    events = []
+
+    async def worker_command(command, **kwargs):
+        commands.append(command)
+        child = subprocess.run(command, shell=True, capture_output=True, text=True)
+        return ComputeResult(child.returncode, child.stdout, child.stderr)
+
+    monkeypatch.setattr(orch, "_run_compute_gate", worker_command)
+    monkeypatch.setattr(orch, "_log_event", lambda event, **kwargs: events.append(kwargs))
+    asyncio.run(orch._remove_executor_basetemp_best_effort(
+        reports, worker_uid_drop=True, compute=object(), spec=WorkSpec(
+            2142, 1, "url", "main", "branch", "prompt", None, "pytest", "opencode", 30,
+        ), checkout=tmp_path, issue_id=2142, attempt=1,
+    ))
+    assert len(commands) == 1
+    assert (outside / "sentinel").read_text() == "safe"
+    if leaf in {"symlink", "file"}:
+        assert os.path.islink(tree) if leaf == "symlink" else tree.is_file()
+        assert events and events[0]["error"] == "worker executor basetemp cleanup failed"
+    else:
+        assert not tree.exists()
+        assert events == []
+
+
 @pytest.mark.parametrize("interruption", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("via_cli", [False, True])
 def test_interrupted_claim_is_reapable(

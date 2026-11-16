@@ -430,11 +430,31 @@ class ExportCompute:
 
 
 @pytest.mark.asyncio
-async def test_worker_export_executes_isolated_python_and_removes_private_tree(tmp_path):
+@pytest.mark.parametrize("configured", [False, True])
+async def test_worker_export_executes_isolated_python_and_removes_private_tree(tmp_path, monkeypatch, configured):
+    if configured:
+        from mimir_cultivate.worklink import identities
+
+        parent = tmp_path / "scratch"
+        parent.mkdir(mode=0o700)
+        worker = replace(identities.get_identities(), worklink_uid=os.getuid())
+        monkeypatch.setattr(identities, "get_identities", lambda: worker)
+        monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", str(parent))
     tree = ev._gate_tmp_directory(tmp_path / "reports")
     tree.mkdir(mode=0o700)
     (tree / "private").mkdir(mode=0o700)
     (tree / "private/child-progress.stacks").write_bytes(b"whole stack")
+    if configured:
+        # Model the controller's inability to even lstat a child of a foreign
+        # 0700 parent. The real child exporter still runs as the fixture's uid.
+        original = Path.lstat
+
+        def private_lstat(path, *args, **kwargs):
+            if path == tree:
+                raise PermissionError("worker-only scratch parent")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "lstat", private_lstat)
     compute = ExportCompute(tmp_path)
     result = await retain(tmp_path, compute=compute, worker_uid_drop=True)
     assert not result.retention_truncated
@@ -442,6 +462,7 @@ async def test_worker_export_executes_isolated_python_and_removes_private_tree(t
     assert not tree.exists()
     assert "python3 -I -c" in compute.specs[0].local_argv[-1]
     assert "PYTEST_ADDOPTS" not in compute.specs[0].env
+    assert all(Path(path).is_relative_to(tmp_path / "artifacts") for path in result.retained_artifacts)
 
 
 @pytest.mark.asyncio
