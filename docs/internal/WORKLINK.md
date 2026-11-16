@@ -21,9 +21,12 @@ The `local_subprocess` configuration name and autonomous opt-in remain for
 compatibility; process-specific historical architecture notes below do not
 describe daemon-session lifecycle. Each invocation creates one exclusive session,
 sets a closed shell environment and submits one input. Reconnection observes the
-same durable log/history/inbox without replaying admission. Success requires
-correlated execution and outcome witnesses; a connected stream, initial idle,
-HTTP acknowledgment or model turn alone is not completion. Epic status remains
+same durable history/inbox without replaying admission. State comes from the
+message history: the admitted input's `user` message starts the run and the
+`idle` message after it gives the outcome. OpenCode 2.2.7's session log serves
+only a sequence watermark, so log events never decide state. A connected stream,
+an idle before the input, an HTTP acknowledgment or a model turn alone is not
+completion. Epic status remains
 authoritative through node factory.js, with lock session equal to OpenCode
 session ID. Evidence records `opencode_session_id` (null before session creation).
 Unverified cancellation retains checkout/controller state; it never kills or

@@ -161,7 +161,6 @@ class SessionController:
         self.record = record
         self._lock = asyncio.Lock()
         self.sensitive_values: tuple[str, ...] = ()
-        self._failure_error: SessionError | None = None
         self._cancelling = False
 
     async def _bounded(self, operation):
@@ -339,10 +338,18 @@ class SessionController:
             cursor = next_cursor
 
     async def _read_log(self, *, baseline: bool = False) -> None:
+        """Advance the durable sequence watermark; never a source of execution state.
+
+        OpenCode 2.2.7's session log endpoint returns only its ``log.synced``
+        watermark: live follow and ``after=0`` replay both omit every
+        ``session.execution.*`` event (captured live, see
+        ``tests/fixtures/worklink/opencode_2_2_7/session-lifecycle.json``). Execution
+        state therefore comes from the durable message history alone (see
+        ``_execution_state``). Any event a daemon does deliver must still belong to
+        this session, but it cannot change the observed outcome.
+        """
         sid = self.record.opencode_session_id
-        replay = self.record.execution_state == "failed"
-        cursor = self.record.baseline_seq if replay else self.record.last_seq
-        state = "pending" if replay else self.record.execution_state
+        cursor = self.record.last_seq
         stream = self.client.log(sid, after=cursor, follow=True)
         try:
             while True:
@@ -356,57 +363,60 @@ class SessionController:
                 if event.get("type") == "log.synced":
                     if (set(event) != {"type", "aggregateID", "seq"}
                             or event.get("aggregateID") != sid or type(event.get("seq")) is not int
-                            or not max(cursor, self.record.last_seq) <= event["seq"] <= 9007199254740991):
+                            or not cursor <= event["seq"] <= 9007199254740991):
                         raise DaemonClientError("invalid log watermark")
-                    if replay and self._failure_error is None:
-                        raise DaemonClientError("missing durable failure witness")
                     if baseline:
                         self._persist(baseline_seq=event["seq"], last_seq=event["seq"])
+                    elif event["seq"] > self.record.last_seq:
+                        self._persist(last_seq=event["seq"])
                     return
-                durable = event.get("durable", {})
-                if not isinstance(durable, dict) or not isinstance(event.get("data"), dict):
-                    raise DaemonClientError("invalid durable session event")
-                seq = durable.get("seq")
-                if durable.get("aggregateID") != sid or event.get("data", {}).get("sessionID") != sid:
+                durable = event.get("durable")
+                data = event.get("data")
+                if (not isinstance(durable, dict) or not isinstance(data, dict)
+                        or durable.get("aggregateID") != sid or data.get("sessionID") != sid):
                     raise DaemonClientError("foreign session event")
-                if (not _identifier(event.get("id"), "evt") or not _number(event.get("created"))
-                        or event.keys() - {"id", "created", "type", "durable", "data", "metadata", "location"}
-                        or not isinstance(event.get("type"), str) or not event["type"].startswith("session.")
-                        or set(durable) != {"aggregateID", "seq", "version"}
-                        or type(durable["version"]) is not int or durable["version"] != 1
-                        or type(seq) is not int or not 1 <= seq <= 9007199254740991):
-                    raise DaemonClientError("invalid durable session event")
-                kind = event["type"]
-                data = event["data"]
-                if kind.startswith("session.execution."):
-                    fields = {"sessionID"} | ({"error"} if kind == "session.execution.failed" else
-                                             {"reason"} if kind == "session.execution.interrupted" else set())
-                    if kind not in {"session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"} or set(data) != fields:
-                        raise DaemonClientError("invalid execution event")
-                    if kind == "session.execution.failed":
-                        self._failure_error = self._error(data["error"])
-                    if kind == "session.execution.interrupted" and data["reason"] not in {"user", "shutdown", "superseded", "inactivity"}:
-                        raise DaemonClientError("invalid execution interruption")
-                if kind.startswith("session.inbox.") and not _identifier(data.get("inboxID"), "msg"):
-                    raise DaemonClientError("invalid inbox event")
-                if seq <= cursor:
-                    continue
-                cursor = seq
-                if (event.get("type") == "session.inbox.cancelled"
-                        and event.get("data", {}).get("inboxID") == self.record.input_id
-                        and self.record.stop_requested and state == "pending"):
-                    state = "interrupted"
-                if kind == "session.execution.started":
-                    state = "started"
-                elif kind in {"session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"}:
-                    if state != "started":
-                        raise DaemonClientError("execution terminal without start")
-                    state = kind[len("session.execution."):]
-                if seq > self.record.last_seq:
-                    self._persist(last_seq=seq, execution_state=state)
         finally:
             await stream.aclose()
         raise DaemonClientError("missing log watermark")
+
+    def _execution_state(self, messages: list[dict], inbox: list[dict]) -> str:
+        """Derive the owned input's state from durable history.
+
+        The single admitted ``user`` message opens the execution; a trailing
+        ``idle`` message closes it with its ``outcome``. Callers read the inbox
+        before history, so an input absent from both was removed, not in flight.
+        """
+        input_id = self.record.input_id
+        if input_id is None:
+            return "incomplete" if self.record.execution_state == "incomplete" else "pending"
+        history = [m for m in messages if m["id"] not in self.record.baseline_message_ids]
+        admitted = next((i for i, m in enumerate(history)
+                         if m["id"] == input_id and m.get("type") == "user"), None)
+        if admitted is None:
+            if any(item["id"] == input_id for item in inbox):
+                return "pending"
+            return "interrupted" if self.record.stop_requested else "incomplete"
+        after = history[admitted + 1:]
+        if after and after[-1].get("type") == "idle":
+            return after[-1]["outcome"]
+        return "started"
+
+    async def _refresh(self) -> tuple[list[dict], list[dict]]:
+        await self._read_log()
+        inbox = await self._inbox()
+        messages = await self._messages()
+        users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
+                 and m["id"] not in self.record.baseline_message_ids}
+        if len(users) > 1 or (self.record.input_id and users and users != {self.record.input_id}):
+            raise DaemonClientError("ambiguous session admission")
+        if users and self.record.admission_state == "created":
+            raise DaemonClientError("unowned input in fresh session")
+        if users and not self.record.input_id:
+            self._persist(input_id=next(iter(users)), admission_state="admitted")
+        state = self._execution_state(messages, inbox)
+        if state != self.record.execution_state:
+            self._persist(execution_state=state)
+        return messages, inbox
 
     async def observe(self, *, stdout_limit: int = 64 * 1024 * 1024) -> SessionOutcome:
         try:
@@ -418,31 +428,15 @@ class SessionController:
 
     async def _observe(self, *, stdout_limit: int) -> SessionOutcome:
         async with self._lock:
-            await self._read_log()
-            messages = await self._messages()
-            inbox = await self._inbox()
-            users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
-                     and m["id"] not in self.record.baseline_message_ids}
-            if len(users) > 1 or (self.record.input_id and users and users != {self.record.input_id}):
-                raise DaemonClientError("ambiguous session admission")
-            if users and self.record.admission_state == "created":
-                raise DaemonClientError("unowned input in fresh session")
-            if users and not self.record.input_id:
-                self._persist(input_id=next(iter(users)), admission_state="admitted")
+            messages, _ = await self._refresh()
             state = self.record.execution_state
-            if state == "succeeded":
-                history = [m for m in messages if m["id"] not in self.record.baseline_message_ids]
-                admitted = next((i for i, m in enumerate(history) if m["id"] == self.record.input_id and m.get("type") == "user"), None)
-                if admitted is None or not any(m.get("type") == "idle" and m.get("outcome") == "succeeded" for m in history[admitted + 1:]):
-                    state = "incomplete"
-            error = self._failure_error if state == "failed" else None
-            if state == "incomplete":
+            error = None
+            if state == "failed":
+                terminal = messages[-1]
+                error = (self._error(terminal["error"]) if isinstance(terminal.get("error"), dict)
+                         else SessionError("backend_error", "OpenCode reported a failed execution without detail"))
+            elif state == "incomplete":
                 error = SessionError("backend_error", "OpenCode session protocol witness incomplete")
-            for message in reversed(messages):
-                if error is None and message.get("type") == "idle" and isinstance(message.get("error"), dict):
-                    raw = message["error"]
-                    error = self._error(raw)
-                    break
             chunks = []
             size = 0
             overflow = False
@@ -473,16 +467,9 @@ class SessionController:
                 async with asyncio.timeout(min(timeout_s, 25)):
                     while True:
                         try:
-                            await self._read_log()
-                            messages = await self._messages()
-                            inbox = await self._inbox()
-                            users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user" and m["id"] not in self.record.baseline_message_ids}
-                            if len(users) > 1 or (self.record.input_id and users - {self.record.input_id}):
-                                raise DaemonClientError("ambiguous cancellation ownership")
-                            if users and self.record.admission_state == "created":
-                                raise DaemonClientError("unowned input in fresh session")
-                            if users and not self.record.input_id:
-                                self._persist(input_id=next(iter(users)), admission_state="admitted")
+                            messages, inbox = await self._refresh()
+                            users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
+                                     and m["id"] not in self.record.baseline_message_ids}
                             pending = [m for m in inbox if m["id"] == self.record.input_id]
                             for item in pending:
                                 await self.client.delete_inbox(self.record.opencode_session_id, item["id"])

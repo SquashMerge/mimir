@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import time
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ import pytest
 
 from mimir_cultivate.worklink.backends.base import SessionRequest
 from mimir_cultivate.worklink.daemon_client import DaemonClientError, OpenCodeDaemonClient, ServerEvent
-from mimir_cultivate.worklink.daemon_sessions import SessionController, session_environment
+from mimir_cultivate.worklink.daemon_sessions import ControllerRecord, SessionController, session_environment
 from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon, SyntheticFault, effective_permission
 
 
@@ -294,40 +295,56 @@ async def test_captured_per_kind_wire_contract_and_effective_permissions(tmp_pat
                 assert effective("read", resource) == "deny"
 
 
-@pytest.mark.parametrize("defect", ["bare_started", "bare_succeeded", "id", "created", "version", "seq",
-                                    "sessionID", "aggregateID", "data", "durable", "watermark", "error"])
-async def test_malformed_durable_witnesses_cannot_succeed(tmp_path, monkeypatch, defect):
+@pytest.mark.parametrize("defect", ["aggregateID", "foreign", "seq_type", "regressed", "extra"])
+async def test_malformed_watermark_is_refused(tmp_path, monkeypatch, defect):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         controller = await create(client, tmp_path)
         sid = controller.record.opencode_session_id
         daemon.finish(sid)
-        events = deepcopy(daemon.sessions[sid].log)
-        started = next(e for e in events if e["type"] == "session.execution.started")
-        terminal = events[-1]
-        if defect.startswith("bare_"):
-            next(e for e in events if e["type"] == "session.execution." + defect[5:])["type"] = defect[5:]
-        elif defect in {"id", "created"}:
-            started.pop(defect)
-        elif defect in {"version", "seq"}:
-            started["durable"][defect] = True
-        elif defect == "sessionID":
-            started["data"].pop("sessionID")
-        elif defect == "aggregateID":
-            started["durable"].pop("aggregateID")
-        elif defect in {"data", "durable"}:
-            started.pop(defect)
-        elif defect == "error":
-            terminal["type"] = "session.execution.failed"
-            terminal["data"]["error"] = {"message": "missing type"}
-        watermark = {"type": "log.synced", "aggregateID": sid, "seq": len(events)}
-        if defect == "watermark":
+        await controller.observe()
+        watermark = {"type": "log.synced", "aggregateID": sid, "seq": controller.record.last_seq}
+        if defect == "aggregateID":
             watermark.pop("aggregateID")
+        elif defect == "foreign":
+            watermark["aggregateID"] = "ses_foreign"
+        elif defect == "seq_type":
+            watermark["seq"] = True
+        elif defect == "regressed":
+            watermark["seq"] = controller.record.last_seq - 1
+        else:
+            watermark["extra"] = 1
         async def malformed(*args, **kwargs):
-            for event in [*events, watermark]:
-                yield ServerEvent("message", event)
+            yield ServerEvent("message", watermark)
         monkeypatch.setattr(client, "log", malformed)
-        with pytest.raises(DaemonClientError):
+        with pytest.raises(DaemonClientError, match="invalid log watermark"):
             await controller.observe()
+
+
+async def test_log_events_cannot_forge_an_outcome(tmp_path, monkeypatch):
+    """Only the message history decides execution state; log events are inert."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        forged = [{"id": "evt_forged", "created": 1, "type": "session.execution.succeeded",
+                   "durable": {"aggregateID": sid, "seq": 90, "version": 1}, "data": {"sessionID": sid}}]
+        async def forged_log(*args, **kwargs):
+            for event in [*forged, {"type": "log.synced", "aggregateID": sid, "seq": 91}]:
+                yield ServerEvent("message", event)
+        monkeypatch.setattr(client, "log", forged_log)
+        outcome = await controller.observe()
+        assert outcome.execution_state == "started"
+        assert controller.record.last_seq == 91
+
+
+async def test_watermark_advances_last_seq_from_the_daemon(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        baseline = controller.record.baseline_seq
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "succeeded"
+        assert controller.record.baseline_seq == baseline
+        assert controller.record.last_seq == len(daemon.sessions[sid].log) > baseline
 
 
 @pytest.mark.parametrize("defect", ["user_text", "user_time", "idle_outcome", "inbox_payload", "inbox_session", "inbox_delivery"])
@@ -358,32 +375,67 @@ async def test_malformed_history_and_inbox_refused(tmp_path, monkeypatch, defect
 
 
 @pytest.mark.parametrize("error_type", ["provider.auth", "provider.quota", "future.error"])
-async def test_event_only_error_survives_cursor_and_transport_loss(tmp_path, monkeypatch, error_type):
+async def test_idle_error_survives_transport_loss_and_recovery(tmp_path, monkeypatch, error_type):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         controller = await create(client, tmp_path)
         sid = controller.record.opencode_session_id
+        assert (await controller.observe()).execution_state == "started"
         secret = "runtime-" + "error-fragment"
         daemon.finish(sid, outcome="failed", error={"type": error_type, "message": secret + "é" * 3000,
                       "response": {"body": secret + "x" * 9000}, "retryAfterMs": 12345})
-        daemon.sessions[sid].messages[-1].pop("error")
         original = client.messages
         async def disconnected(*args, **kwargs):
             raise DaemonClientError("transport failure")
         monkeypatch.setattr(client, "messages", disconnected)
         with pytest.raises(DaemonClientError, match="transport failure"):
             await controller.observe()
-        assert controller.record.execution_state == "failed"
-        assert controller.record.last_seq == len(daemon.sessions[sid].log)
+        assert controller.record.execution_state == "started"
         recovered = SessionController.recover(client, controller.path, generation="generation-1", checkout=tmp_path)
         recovered.sensitive_values = (secret,)
         monkeypatch.setattr(client, "messages", original)
         result = await recovered.observe()
+        assert result.execution_state == "failed"
         assert result.error.type == error_type
         assert result.error.retry_after_ms == 12345
         assert secret not in repr(result.error)
         assert len(result.error.message.encode()) <= 2048 and len(result.error.body.encode()) <= 8192
         assert secret.encode() not in controller.path.read_bytes()
         assert sum(r[1].endswith("/prompt") for r in daemon.requests) == 1
+
+
+async def test_failed_idle_without_error_still_fails_with_backend_error(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.finish(sid, outcome="failed", error={"type": "provider.auth", "message": "x"})
+        daemon.sessions[sid].messages[-1].pop("error")
+        outcome = await controller.observe()
+        assert outcome.execution_state == "failed"
+        assert outcome.error.type == "backend_error"
+
+
+async def test_new_execution_after_idle_reads_as_started(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "succeeded"
+        daemon.sessions[sid].messages.append({
+            "id": "msg_resumed", "type": "assistant", "time": {"created": 3}, "agent": "build",
+            "model": {"providerID": "openai", "id": "gpt-5"}, "content": []})
+        assert (await controller.observe()).execution_state == "started"
+
+
+async def test_vanished_input_without_stop_is_incomplete_and_with_stop_interrupted(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.auto_deliver = False
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        assert (await controller.observe()).execution_state == "pending"
+        daemon.sessions[sid].inbox.clear()
+        assert (await controller.observe()).execution_state == "incomplete"
+        controller._persist(stop_requested=True, cancellation_state="requested")
+        assert (await controller.observe()).execution_state == "interrupted"
 
 
 async def test_setup_cannot_post_after_persisted_deadline(tmp_path, monkeypatch):
@@ -508,3 +560,95 @@ async def test_utf8_multipart_output_boundaries(tmp_path, parts, limit, overflow
         assert len(outcome.stdout.encode()) <= limit
         if not overflow:
             assert outcome.stdout == "\n".join(parts)
+
+
+@pytest.mark.parametrize("stop_requested", [False, True])
+async def test_delivery_between_inbox_and_history_reads_is_not_removal(tmp_path, monkeypatch, stop_requested):
+    """Delivery at the boundary of the two reads must read as in flight, never vanished."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.auto_deliver = False
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        if stop_requested:
+            controller._persist(stop_requested=True, cancellation_state="requested")
+        input_id = controller.record.input_id
+        delivered = []
+
+        def deliver_once():
+            if not delivered:
+                delivered.append(True)
+                daemon.deliver(sid, input_id)
+
+        for name in ("inbox", "messages"):
+            original = getattr(client, name)
+            async def first_read_then_deliver(*args, _original=original, **kwargs):
+                result = await _original(*args, **kwargs)
+                deliver_once()
+                return result
+            monkeypatch.setattr(client, name, first_read_then_deliver)
+        assert (await controller.observe()).execution_state == "started"
+        assert delivered
+
+
+class _RecordedClient:
+    """Serves one captured 2.2.7 snapshot at a time; no daemon, no provider."""
+
+    def __init__(self, watermark: dict) -> None:
+        self.watermark = watermark
+        self.snapshot: dict = {}
+
+    async def log(self, session_id, *, after=None, follow=True):
+        yield ServerEvent("message", self.watermark)
+
+    async def messages(self, session_id, *, cursor=None, order=None, limit=None, message_type=None):
+        data = [item for page in self.snapshot["pages"] for item in page["data"]]
+        return {"data": deepcopy(data), "cursor": {"previous": None, "next": None}}
+
+    async def inbox(self, session_id):
+        return deepcopy(self.snapshot["inbox"])
+
+
+def _captured_lifecycle():
+    from tests.worklink_daemon_fixtures import FIXTURES
+    return json.loads((FIXTURES / "opencode_2_2_7/session-lifecycle.json").read_bytes())
+
+
+def test_captured_log_endpoint_carries_only_the_watermark():
+    """The recorded defect: execution events reach /api/event, never the session log."""
+    capture = _captured_lifecycle()
+    sid = capture["session"]["data"]["id"]
+    live = [frame["data"] for _, frame in capture["log_live"]]
+    replay = [frame["data"] for frame in capture["log_replay"]]
+    assert live == [{"type": "log.synced", "aggregateID": sid, "seq": 0}]
+    assert [item["type"] for item in replay] == ["log.synced"] and replay[0]["seq"] > 0
+    published = [frame["data"]["type"] for _, frame in capture["events"]]
+    assert {"session.execution.started", "session.execution.succeeded",
+            "session.execution.interrupted"} <= set(published)
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("prompt1", {"after_prompt1": "started", "idle1": "succeeded"}),
+    ("prompt2", {"busy2": "started", "after_interrupt": "interrupted"}),
+])
+async def test_captured_history_drives_observed_state(tmp_path, scenario, expected):
+    capture = _captured_lifecycle()
+    sid = capture["session"]["data"]["id"]
+    snapshots = {snap["label"]: snap for snap in capture["snapshots"]}
+    replay = capture["log_replay"][0]["data"]
+    baseline = ([] if scenario == "prompt1" else
+                [item["id"] for page in snapshots["idle1"]["pages"] for item in page["data"]])
+    client = _RecordedClient(replay)
+    info = tmp_path.stat()
+    record = ControllerRecord(1, "00000000-0000-0000-0000-000000000000", 2125, 1, "leaf", sid,
+                              "generation-1", str(tmp_path), info.st_dev, info.st_ino, 0, 0, baseline,
+                              capture[scenario]["data"]["id"], "admitted", "pending", False, "none",
+                              int(time.time() * 1000) + 600_000)
+    controller = SessionController(client, tmp_path / "controller.json", record)
+    for label, state in expected.items():
+        client.snapshot = snapshots[label]
+        outcome = await controller.observe()
+        assert (label, outcome.execution_state) == (label, state)
+        assert outcome.error is None
+    assert controller.record.last_seq == replay["seq"]
+    if scenario == "prompt1":
+        assert outcome.stdout.strip() == "ok"
