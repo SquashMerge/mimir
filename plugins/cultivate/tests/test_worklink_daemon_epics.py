@@ -832,11 +832,18 @@ async def test_budget_park_verifies_after_exhausted_work_deadline(
         if entrypoint == "outer":
             # Replace external admission/tracker transport, not recovery,
             # supervision, finalization, resource guards or the release decision.
+            preflight = []
             def claim_issue(issue_id, comments, **kwargs):
                 assert issue_id == 2125
+                # The base-permission refusal must already have run, before claim.
+                assert preflight == [Path(record.sandbox)]
                 kwargs["before_claim"]()
                 return SimpleNamespace(claimed=True, record=claim_record, attempts_exhausted=False)
             claims.claim_issue = claim_issue
+            # The fixture base is a bare sandbox directory, not a Git repository;
+            # the permission scan itself is covered by test_worklink_checkout.
+            monkeypatch.setattr(orchestrator, "assert_base_repo_not_worker_writable",
+                                lambda repo, **kw: preflight.append(repo))
             monkeypatch.setattr(orchestrator, "ChainlinkClaims", lambda **kw: claims)
             monkeypatch.setattr(orchestrator.ChainlinkIssueReader, "read", lambda self, selected: issue)
             monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *a, **kw: "https://github.com/owner/repo.git")
