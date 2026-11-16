@@ -341,6 +341,75 @@ def test_unheld_group_write_is_admitted(tmp_path: Path, monkeypatch: pytest.Monk
     checkout_module.assert_base_repo_not_worker_writable(repo)
 
 
+def _repo_with_tracked_dir(tmp_path: Path) -> Path:
+    repo = _repo_with_main(tmp_path)
+    (repo / "pkg" / "sub").mkdir(parents=True)
+    (repo / "pkg" / "sub" / "mod.py").write_text("x = 1\n")
+    _git(repo, "add", "pkg")
+    _git(repo, "commit", "-qm", "track a nested directory")
+    return repo
+
+
+@pytest.mark.parametrize("directory,expected", [(".", "."), ("pkg", "pkg"), ("pkg/sub", "pkg/sub")])
+def test_writable_repo_root_or_tracked_directory_is_refused(
+    tmp_path: Path, directory: str, expected: str,
+) -> None:
+    """A writable directory lets the worker rename or replace the tracked files in it."""
+    repo = _repo_with_tracked_dir(tmp_path)
+    (repo / directory).chmod(0o777)
+    message, (_, payload) = _base_refusal(repo)
+    assert "1 worker-writable path(s)" in message
+    assert payload["writable_paths"] == [expected]
+
+
+@pytest.mark.parametrize("ancestor", ["parent", "grandparent"])
+def test_writable_directory_above_the_repository_is_refused(tmp_path: Path, ancestor: str) -> None:
+    base = tmp_path / "workspace"
+    base.mkdir()
+    repo = _repo_with_main(base)
+    target = base if ancestor == "parent" else tmp_path
+    target.chmod(0o777)
+    try:
+        message, (_, payload) = _base_refusal(repo)
+    finally:
+        target.chmod(0o755)
+    assert payload["writable_paths"] == [str(target.resolve())]
+    assert "by hand" in message
+
+
+def test_sticky_directory_above_the_repository_is_admitted(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    tmp_path.chmod(0o1777)
+    try:
+        checkout_module.assert_base_repo_not_worker_writable(repo)
+    finally:
+        tmp_path.chmod(0o755)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="chown needs root")
+def test_worker_owned_sticky_ancestor_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _repo_with_main(tmp_path)
+    os.chown(tmp_path, 4242, -1)
+    tmp_path.chmod(0o1755)
+    monkeypatch.setattr(checkout_module, "get_identities", lambda: SimpleNamespace(
+        worklink_uid=4242, worklink_gid=4242))
+    monkeypatch.setattr(checkout_module.os, "getgrouplist", lambda user, gid: [4242])
+    with pytest.raises(RuntimeError, match="worker_writable") as raised:
+        checkout_module.assert_base_repo_not_worker_writable(repo)
+    assert repr(str(tmp_path.resolve())) in str(raised.value)
+
+
+def test_remediation_repairs_root_and_tracked_directories(tmp_path: Path) -> None:
+    repo = _repo_with_tracked_dir(tmp_path)
+    for directory in (".", "pkg", "pkg/sub"):
+        (repo / directory).chmod(0o777)
+    subprocess.run(["sh", "-c", checkout_module.BASE_PERMISSIONS_REMEDIATION],
+                   env={**os.environ, "WORKLINK_REPO": str(repo)}, check=True)
+    for directory in (".", "pkg", "pkg/sub"):
+        assert stat.S_IMODE((repo / directory).stat().st_mode) == 0o755
+    checkout_module.assert_base_repo_not_worker_writable(repo)
+
+
 @pytest.mark.parametrize("unsafe", ["marker", "common-head", "worktree-head"])
 def test_linked_base_git_metadata_is_inspected(tmp_path: Path, unsafe: str) -> None:
     repo = _repo_with_main(tmp_path)

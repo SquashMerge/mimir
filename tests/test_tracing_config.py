@@ -66,16 +66,19 @@ def test_tracing_dotenv_precedence_test_restores_environment(tmp_path, monkeypat
 
 def test_tracing_extras_and_dev_install_contract():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    # Compatible-release ranges, not exact pins: the three packages release in
+    # lockstep (the SDK pins the API exactly), and exact pins here made every
+    # single-package Dependabot bump unresolvable. uv.lock still pins exactly.
     pins = {
-        "opentelemetry-api==1.45.1",
-        "opentelemetry-sdk==1.45.1",
-        "opentelemetry-exporter-otlp-proto-http==1.45.1",
+        "opentelemetry-api>=1.45.1,<1.46",
+        "opentelemetry-sdk>=1.45.1,<1.46",
+        "opentelemetry-exporter-otlp-proto-http>=1.45.1,<1.46",
     }
     extras = project["project"]["optional-dependencies"]
     assert pins == set(extras["otel"])
     assert pins.isdisjoint(project["project"]["dependencies"])
     for dev in (extras["dev"], project["dependency-groups"]["dev"]):
-        assert pins - {"opentelemetry-api==1.45.1"} <= set(dev)
+        assert pins - {"opentelemetry-api>=1.45.1,<1.46"} <= set(dev)
         assert "mimir-cultivate" not in dev
     assert "mimir-cultivate" not in project["tool"]["uv"]["sources"]
     assert "plugins/cultivate" in project["tool"]["uv"]["workspace"]["members"]

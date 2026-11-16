@@ -41,6 +41,45 @@ _OTLP_CARRIERS = {
 
 
 @pytest.mark.asyncio
+async def test_factory_projection_record_and_completion_evidence_keep_mcp_and_session(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink.factory_control_output import _status_projection
+    from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record, load_factory_record
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _verify_factory_completion
+
+    secret = "runtime-" + "factory-mcp-header-" + "canary"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", secret)
+    fixture = Path(__file__).parent / "fixtures/worklink/feature_factory_0_14_0/status.raw.stdout.json"
+    source = json.loads(fixture.read_bytes())
+    source.update(run_id="chainlink-2125", sandbox_path=str(tmp_path / "chainlink-2125"),
+                  status="running", mcp_servers=[*source["mcp_servers"], secret, "fixture-mcp"])
+    status = parse_factory_status(_status_projection(source))
+    record = FactoryRunRecord(
+        run_id=status.run_id, issue_id=2125, attempt=1, repository="owner/repo",
+        base_ref=status.pr_base or "main", branch=status.branch or "feature/test",
+        launcher="/opt/factory/bin/factory.js", sandbox=status.sandbox_path,
+        session=None, handle=None, status=None, observed_at=None, controller_phase="running",
+        opencode_session_id="ses_actual",
+    ).observed(status, datetime.now(UTC).isoformat())
+    save_factory_record(tmp_path, record)
+    recovered = load_factory_record(tmp_path, record.run_id)
+    assert recovered is not None
+    with pytest.raises(WorklinkError, match="not authoritative"):
+        await _verify_factory_completion(
+            home=tmp_path, issue=SimpleNamespace(issue_id=2125), record=recovered,
+            test_command="pytest", started_at=datetime.now(UTC),
+            runner=lambda *args, **kwargs: pytest.fail("nonterminal status cannot run completion commands"),
+        )
+    encoded = (tmp_path / "state/worklink/evidence/2125-1.json").read_text()
+    evidence = json.loads(encoded)
+    assert secret not in encoded
+    assert evidence["mcp_servers"] == ["fixture-mcp", "<redacted>", "fixture-mcp"]
+    assert evidence["opencode_session_id"] == "ses_actual"
+    assert evidence["status"] == "failed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["contained", "factory"])
 async def test_gate_child_denies_otlp_carriers_after_spec_and_ambient_merge(
     tmp_path, monkeypatch, route,
@@ -130,59 +169,34 @@ def test_opencode_resolver_filters_otlp_carriers_before_projection(monkeypatch, 
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/ordinary")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-    seen = {}
-    invocation = type("Invocation", (), {"model": "openai/model"})()
-
-    def resolve(*, env):
-        seen["resolver"] = dict(env)
-        return invocation
-
-    def documents(selected, env):
-        assert selected is invocation
-        seen["projection"] = dict(env)
-        return type("Documents", (), {"config_document": json.dumps(dict(env)).encode(), "auth_document": None})()
-
-    monkeypatch.setattr(opencode, "resolve_opencode_invocation", resolve)
-    monkeypatch.setattr(opencode, "opencode_worker_documents", documents)
-    monkeypatch.setattr(opencode, "opencode_model_from_agent_spec", lambda value: "openai/model")
     monkeypatch.setattr(opencode, "model_spec_at_call_time", lambda home: "codex-plus:model")
-    resolution = opencode.resolve_worklink_opencode_invocation({"MIMIR_HOME": str(tmp_path)})
-    assert resolution.invocation is invocation
-    spec = WorkSpec(
-        845, 1, "repo", "main", "issue/845-a1", "", None, "pytest", "opencode", 30,
-        env=dict(_OTLP_CARRIERS), backend_config={"codex": True, "model": invocation.model, "worker_projections": (), "pass_env": ()},
-    )
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    spec = opencode.OpenCodeBackend().work_spec(
+        WorkOrder(845, tmp_path, "build", None, 30, {"MIMIR_MODEL_SPEC": "codex-plus:model", **_OTLP_CARRIERS}),
+        attempt=1, repo_url="repo", base_ref="main", branch="issue/845-a1", test_command="uv run pytest")
     refreshed = opencode.OpenCodeBackend().refresh_codex_projections(spec, {"MIMIR_HOME": str(tmp_path), **_OTLP_CARRIERS})
-    for observed in (seen["resolver"], seen["projection"], resolution.env, refreshed.env):
+    for observed in (spec.env, refreshed.env):
         assert not _OTLP_CARRIERS.keys() & observed.keys()
         assert not any(value in repr(observed) for value in _OTLP_CARRIERS.values())
-    assert resolution.env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
-    assert resolution.env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-    projection = json.loads(refreshed.backend_config["worker_projections"][0].document)
-    assert not _OTLP_CARRIERS.keys() & projection.keys()
-    assert projection["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
+    assert "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" not in spec.env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in spec.env
+    assert "worker_projections" not in refreshed.backend_config
 
-    # The bounded launcher consumes the projection returned by the production
-    # refresh path, rather than a separately constructed test document.
+    # The production gate environment must not recreate any leaf auth document.
     from mimir_cultivate.worklink.compute import _enabled_child_env
 
     worker_home = tmp_path / "worker-home"
-    for item in refreshed.backend_config["worker_projections"]:
-        destination = worker_home / item.path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(item.document)
+    worker_home.mkdir()
     child_env = _enabled_child_env(refreshed, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     child_env["HOME"] = str(worker_home)
     child = subprocess.run(
-        [sys.executable, "-c", "import json,os,pathlib; print(json.dumps({'env': dict(os.environ), 'config': json.loads((pathlib.Path.home()/'.config/opencode/opencode.json').read_text())}))"],
+        [sys.executable, "-c", "import json,os,pathlib; print(json.dumps({'env': dict(os.environ), 'config_exists': (pathlib.Path.home()/'.config/opencode/opencode.json').exists()}))"],
         cwd=tmp_path, env=child_env, capture_output=True, text=True, check=True,
     )
     observed = json.loads(child.stdout)
     assert not _OTLP_CARRIERS.keys() & observed["env"].keys()
-    assert not _OTLP_CARRIERS.keys() & observed["config"].keys()
-    assert observed["config"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
-    assert observed["config"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-    assert not any(value in child.stdout + child.stderr + repr(refreshed.backend_config["worker_projections"]) for value in _OTLP_CARRIERS.values())
+    assert observed["config_exists"] is False
+    assert not any(value in child.stdout + child.stderr + repr(refreshed.backend_config) for value in _OTLP_CARRIERS.values())
 
 
 @pytest.mark.asyncio
@@ -222,15 +236,12 @@ async def test_worklink_runner_filters_retry_environment_after_order_merge(tmp_p
                 backend_config={"codex": False}, local_checkout=order.checkout,
             )
 
-        async def invoke_with_startup_retry(self, invoke, **kwargs):
-            observed.append(dict(kwargs["env"]))
-            return await super().invoke_with_startup_retry(invoke, **kwargs)
-
     class Compute:
         name = "fake_compute"
         shared_filesystem = True
 
         async def launch(self, spec):
+            observed.append(dict(spec.env))
             return LaunchHandle(self.name, "one")
 
         async def wait(self, handle, timeout_s):
@@ -241,6 +252,7 @@ async def test_worklink_runner_filters_retry_environment_after_order_merge(tmp_p
 
     backend = Backend()
     compute = Compute()
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: compute)
 
     class Registry:
         def get(self, name):
@@ -383,6 +395,141 @@ def test_pytest_report_environment_explicit_basetemp_keeps_relative_junit(tmp_pa
     assert f"--junitxml={report / 'junit.xml'}" in options
     assert f"--basetemp={basetemp}" in options
     assert not report.exists() and not basetemp.exists()
+
+
+@pytest.fixture
+def configured_gate_scratch(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from mimir_cultivate.worklink import identities
+
+    root = tmp_path / "scratch space"
+    root.mkdir(mode=0o700)
+    worker = replace(identities.get_identities(), worklink_uid=os.getuid())
+    monkeypatch.setattr(identities, "get_identities", lambda: worker)
+    monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", str(root))
+    return root
+
+
+@pytest.mark.asyncio
+async def test_configured_gate_scratch_reaches_worker_command_environment(
+    tmp_path, configured_gate_scratch,
+):
+    from mimir_cultivate.worklink.compute import WorkSpec, ComputeResult, LaunchHandle, _enabled_child_env
+
+    reports = tmp_path / "checkout" / ".worklink-gate-reports"
+    reports.mkdir(parents=True)
+    seen = []
+
+    class Compute:
+        async def _launch_contained(self, spec, argv):
+            seen.append((spec, _enabled_child_env(spec, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")))
+            assert argv == ("/bin/sh", "-c", "pytest -q")
+            return LaunchHandle("local_subprocess", "scratch-test")
+
+        async def wait(self, handle, timeout):
+            return ComputeResult(0, "passed", "")
+
+        async def cleanup(self, handle):
+            pass
+
+    spec = WorkSpec(
+        1, 1, "url", "main", "branch", "prompt", None, "pytest -q", "opencode", 30,
+        backend_config={"pass_env": ()},
+    )
+    await ev._run_compute_gate(
+        "pytest -q", checkout=reports.parent, work_spec=spec, compute=Compute(), report_dir=reports,
+    )
+    launched, environment = seen[0]
+    scratch = Path(environment["TMPDIR"])
+    assert scratch.parent == configured_gate_scratch
+    assert scratch == ev._gate_tmp_directory(reports)
+    assert environment["WORKLINK_GATE_SCRATCH"] == str(scratch)
+    options = shlex.split(environment["PYTEST_ADDOPTS"])
+    assert f"--basetemp={scratch / 'pytest'}" in options
+    assert "--junitxml=.worklink-gate-reports/junit.xml" in options
+    assert "cache_dir=.worklink-gate-reports/cache" in options
+    assert launched.env["TMPDIR"] == environment["TMPDIR"]
+    assert not scratch.exists(), "only the worker may create its private scratch"
+
+
+@pytest.mark.parametrize("command", ["pytest -q && pytest -q", "gate-check && gate-check"])
+def test_configured_shell_gate_exports_scratch_for_entire_command(
+    tmp_path, configured_gate_scratch, command,
+):
+    reports = tmp_path / "reports"
+    # A fixture-owned pytest executable verifies both legs receive the same
+    # environment and that tempfile scratch survives pytest resetting basetemp.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / ("pytest" if "pytest" in command else "gate-check")
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, shlex, tempfile\n"
+        f"root = pathlib.Path({str(configured_gate_scratch)!r})\n"
+        "scratch = pathlib.Path(os.environ['TMPDIR'])\n"
+        "assert scratch.parent == root and scratch.is_dir()\n"
+        "assert pathlib.Path(tempfile.gettempdir()) == scratch\n"
+        "if 'PYTEST_ADDOPTS' in os.environ:\n"
+        " options = shlex.split(os.environ['PYTEST_ADDOPTS'])\n"
+        " assert '--basetemp=' + str(scratch / 'pytest') in options\n"
+        "with (scratch / 'calls').open('a') as output: output.write('called\\n')\n"
+    )
+    executable.chmod(0o700)
+    observed = ev._command_with_pytest_report(command, reports)
+    result = subprocess.run(observed, shell=True, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"}, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert (ev._gate_tmp_directory(reports) / "calls").read_text() == "called\ncalled\n"
+
+
+@pytest.mark.parametrize("invalid,reason", [
+    ("missing", "directory unavailable"),
+    ("owner", "owned by the worker uid"),
+    ("mode", "mode 0700"),
+    ("file", "must be a directory"),
+    ("relative", "absolute directory path"),
+    ("empty", "absolute directory path"),
+])
+def test_configured_gate_scratch_refuses_invalid_directory(
+    tmp_path, monkeypatch, configured_gate_scratch, invalid, reason,
+):
+    from dataclasses import replace
+    from mimir_cultivate.worklink import identities
+
+    root = configured_gate_scratch
+    if invalid == "missing":
+        root.rmdir()
+    elif invalid == "owner":
+        worker = replace(identities.get_identities(), worklink_uid=os.getuid() + 1)
+        monkeypatch.setattr(identities, "get_identities", lambda: worker)
+    elif invalid == "mode":
+        root.chmod(0o770)
+    elif invalid == "file":
+        root.rmdir()
+        root.write_text("not a directory")
+        root.chmod(0o700)
+    elif invalid == "relative":
+        monkeypatch.chdir(root.parent)
+        monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", root.name)
+    else:
+        monkeypatch.chdir(root)
+        monkeypatch.setenv("MIMIR_WORKLINK_GATE_TMPDIR", "")
+    with pytest.raises(ValueError, match=f"MIMIR_WORKLINK_GATE_TMPDIR.*{reason}"):
+        ev.pytest_report_environment("pytest -q", tmp_path / "reports")
+    assert not (tmp_path / "reports").exists()
+
+
+def test_unset_gate_scratch_preserves_existing_paths(tmp_path, monkeypatch):
+    import hashlib
+
+    monkeypatch.delenv("MIMIR_WORKLINK_GATE_TMPDIR", raising=False)
+    reports = tmp_path / "reports"
+    identity = hashlib.sha256(os.fsencode(reports.absolute())).hexdigest()
+    scratch = Path("/tmp").resolve() / f"worklink-gate-{identity}-tmp"
+    environment = ev.pytest_report_environment("pytest -q", reports)
+    assert set(environment) == {"PYTEST_ADDOPTS"}
+    assert f"--basetemp={scratch}" in shlex.split(environment["PYTEST_ADDOPTS"])
+    assert ev._gate_tmp_directory(reports) == scratch
+    assert ev.pytest_report_environment("true", reports) == {}
 
 
 def test_completed_empty_diff_demotes_to_failed() -> None:

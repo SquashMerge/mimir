@@ -112,9 +112,48 @@ different UID. Login before rerunning setup to start the agent; without a valid
 `auth.json`, setup refuses to start it and repeats the command. `--no-start`
 still builds and provisions before login. Do not copy or mount the host's `~/.codex`: refresh
 tokens are single-use, and sharing one login across deployments can revoke
-the entire token family. Log in separately for **each** deployment. OpenCode
-reconciles its OAuth store from this deployment's Codex login and projects
-OAuth into coding workers without passing an OpenAI API key.
+the entire token family. Log in separately for **each** deployment. This is the
+agent's login: the controller also seeds the Worklink daemon's credential store.
+
+Worklink uses a separate OpenCode 2.2.7 daemon, supervised by the
+`worklink-opencode` s6 longrun as `worklink` (uid 1002). Setup starts the container
+and waits at most 60 seconds for local daemon readiness. The Mimir workload is
+gated, but the daemon remains available when login is missing. As `mimir`, the
+controller automatically imports the agent's ChatGPT login through the authenticated
+credential API; no second device-code login is required. Setup and direct Compose
+startup both seed/reconcile before checking that the daemon has a usable login.
+A missing, API-key-only or invalid agent login repeats the existing deployment
+Codex login guidance. `--no-start` builds/provisions without probing the daemon.
+
+Reconciliation also runs before each leaf build and factory epic launch, and every
+15 minutes by default (`MIMIR_WORKLINK_CODEX_RECONCILE_CRON`, default `*/15 * * * *`).
+The newer access-token JWT expiry wins during legacy migration. All imports use
+`expires: 0`, disabling OpenCode's own refresh for ChatGPT OAuth. Equal expiries
+normalize legacy positive-expiry entries; identical normalized bundles do not write.
+Write-back preserves all other Codex fields, takes codex-plus's `auth.json.lock`
+flock, and atomically replaces `auth.json` with mode 0600. The controller proactively
+refreshes within 20 minutes of JWT expiry through codex-plus's coordinated API,
+then re-locks and re-reads before propagation. The agent's reactive 401 path uses
+the same API; only that coordinated provider can spend the refresh token.
+Keep custom reconcile intervals below 20 minutes. Delayed propagation can leave a
+stale daemon access token, but not an independently refreshing token family.
+
+The daemon's private HOME/config/data/state/cache and native credential SQLite
+DB live under `/var/lib/mimir-worklink/daemon`, retained in the `worklink-daemon`
+volume. Do not remove that volume during upgrades. Local health accepts
+`locally_unexpired` or `refreshable_unverified`; the latter warns that refresh
+and provider validity have not been checked. Missing, inactive, malformed,
+invalid-zero-expiry or expired-without-refresh credentials refuse workloads.
+Intentional sentinel credentials are healthy only while their real JWT is unexpired.
+Local inspection never initiates OAuth or checks a subscription; controller
+preflight reconciliation can proactively refresh through codex-plus.
+
+Daemon telemetry is metrics-only by default when tracing is enabled: logs and
+all three trace types are disabled. Content capture explicitly enables logs,
+traces, prompts and model context. Any sensitive OTLP configuration (including
+headers) disables daemon telemetry, with a setup/health explanation; no headers
+are copied to daemon/build environment or config. Agent Python telemetry is
+unchanged. See [Worklink daemon operation](internal/WORKLINK.md#opencode-2-daemon-operation).
 
 Setup also asks **Where should operator alerts go? [web/discord/slack/none]**.
 `web` delivers to the owner's authenticated `web-<owner>` chat and persists
@@ -181,6 +220,19 @@ saves it in the manifest and `repositories.yaml`, and preserves it on upgrade.
 An existing repository declaration without `auto_review` defaults to `all`;
 setup back-fills the field. Explicit conflicting values require `--force` or
 manual reconciliation.
+Pass `--heavy-lock-dir <host dir>` to join a heavy-run lease shared with other
+agents on the same host. Setup mounts the directory into the agent at
+`/mimir-heavy-locks` and sets `MIMIR_HEAVY_LOCK_FILE=/mimir-heavy-locks/heavy.lock`;
+Worklink passes that one path to builder sessions, gates and `repo_test` legs,
+which otherwise receive no `MIMIR_*` settings. Commands join the lease through
+`scripts/heavy_run.sh` (an atomic-`mkdir` directory lease with heartbeats, which
+works across a VM bind mount where kernel `lockf` locks do not); the repository's
+test command must use it. The directory must already exist and be writable by
+container uids 1001 and 1002; on Linux hosts that means mode `0777`, not a
+sticky `1777`, because waiters retire other holders' stale leases. Each lease
+generation is created `0777` with `0644` files regardless of the holder's
+umask, so participants need no shared group. `none`
+clears the setting; omitting the flag on a rerun preserves it.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
 dimensions on CPU. Its query and document vectors share Voyage 4's embedding
@@ -551,7 +603,7 @@ The repository-root production `Dockerfile` has s6 and the core `mimir` and
 `watchdog` services. With `MIMIR_PLUGIN_SELECTION=cultivate` (or `all`) and
 `CHAINLINK_ARTIFACT_STAGE=chainlink-build` at build time it also assembles the
 trusted first-party fragment: pinned OpenCode and factory adapters, UID 1002 Worklink user, data directories,
-`opencode-bootstrap` and the exact `worklink-execd` s6 service (not a generic
+the exact `worklink-execd` and `worklink-opencode` s6 services (not a generic
 prefixed plugin service). In explicit source mode both venvs run Cultivate built
 from the verified source commit: the root executor venv overlays core and
 `plugins/cultivate` from `MIMIR_EXECUTOR_COMMIT` with `--no-deps` (so the

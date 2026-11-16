@@ -5,5 +5,6 @@ umask 022
 # restart re-runs `mimir run`, so the clean-shutdown marker fires its
 # unclean-restart notice on the way back up. Drops to the unprivileged `mimir`
 # user (/init runs as root to set up /run, services drop down).
+set -eu
 exec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir \
     mimir run --home "${MIMIR_HOME:-/home/mimir/agent}"

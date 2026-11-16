@@ -56,9 +56,12 @@ inputs = (("mimir_agent", Path(sys.argv[2]), agent_hash),
           ("mimir_cultivate", Path(sys.argv[3]), cultivate_hash))
 s6 = ("mimir/type", "mimir/run", "watchdog/type", "watchdog/run",
       "worklink-execd/type", "worklink-execd/run", "worklink-execd/dependencies.d/base",
-      "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd")
+      "user/contents.d/mimir", "user/contents.d/watchdog", "user/contents.d/worklink-execd",
+      "worklink-opencode/type", "worklink-opencode/run", "worklink-opencode/dependencies.d/base",
+      "user/contents.d/worklink-opencode")
 scripts = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh",
-           "service.sh", "verify_wheels.py")
+           "service.sh", "verify_wheels.py", "worklink-opencode-service",
+           "worklink-daemon-gate", "worklink-opencode-login")
 if not version or destination.exists() and any(destination.iterdir()):
     raise SystemExit("invalid Docker context destination or version")
 opened = {}
@@ -84,6 +87,7 @@ try:
         output = destination / target
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(opened[package].read(member))
+        output.chmod((opened[package].getinfo(member).external_attr >> 16) & 0o777)
     wheels = destination / "plugins/cultivate/mimir_cultivate/docker/wheels"
     wheels.mkdir()
     for _, path, _ in inputs:
@@ -690,7 +694,34 @@ def render_layer(kind: str, version: str, root_image: str, *,
     return f"FROM {root_image}\nUSER root\n{extra}{install}RUN set -eu; mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
 
 
-def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False) -> str:
+HEAVY_LOCK_MOUNT = "/mimir-heavy-locks"
+_HEAVY_LOCK_DIR = re.compile(r"/[A-Za-z0-9._/@+-]{1,1023}\Z")
+
+
+def _heavy_lock_dir(args: argparse.Namespace, previous: dict) -> str | None:
+    """Host directory shared with other agents for scripts/heavy_run.sh leases.
+
+    Containers mount it at a fixed path: OrbStack refuses host-path mount
+    targets, and the lease needs the same directory, not the same path.
+    """
+    value = getattr(args, "heavy_lock_dir", None)
+    if value is None:
+        value = previous.get("heavy_lock_dir")
+        if value is not None and not isinstance(value, str):
+            raise SetupError("Invalid heavy lock directory in manifest.json; reconcile it before retrying.")
+    if value is None or value.strip() == "none":
+        return None
+    value = value.strip()
+    path = Path(value)
+    if (_HEAVY_LOCK_DIR.fullmatch(value) is None or os.path.normpath(value) != value
+            or path.is_symlink() or not path.is_dir()):
+        raise SetupError("--heavy-lock-dir must be an existing, normalized absolute directory (not a symlink), "
+                         "writable by container uids 1001 and 1002; use none to clear.")
+    return value
+
+
+def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False,
+                   heavy_lock_dir: str | None = None) -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
     try:
         # Scaffold's prose header contains a shell printf example with a literal
@@ -713,11 +744,17 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                             "MIMIR_WORKLINK_AGENT_ID": "cultivate-worklink"})
         environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
-                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
+                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink",
+                   "worklink-daemon:/var/lib/mimir-worklink/daemon"]
         if codex:
             volumes.append("./codex:/home/mimir/.codex")
             environment["CODEX_HOME"] = "/home/mimir/.codex"
-        agent["volumes"] = volumes
+        agent_volumes = list(volumes)
+        if heavy_lock_dir is not None:
+            # Agent only: init never chowns or chmods a directory other agents share.
+            agent_volumes.append(f"{heavy_lock_dir}:{HEAVY_LOCK_MOUNT}")
+            environment["MIMIR_HEAVY_LOCK_FILE"] = f"{HEAVY_LOCK_MOUNT}/heavy.lock"
+        agent["volumes"] = agent_volumes
         agent.setdefault("depends_on", {})["init"] = {"condition": "service_completed_successfully"}
         doc["services"]["init"] = {
             "image": layer_tag, "user": "root", "entrypoint": ["/bin/sh", "-c"],
@@ -727,7 +764,7 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                         (" && chown -R 1001:1001 /home/mimir/.codex && chmod 0700 /home/mimir/.codex" if codex else "")],
             "volumes": volumes,
         }
-        doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink")}
+        doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon")}
         return yaml.safe_dump(doc, sort_keys=False)
     except (KeyError, TypeError, AttributeError, yaml.YAMLError):
         raise SetupError("Incompatible scaffold Compose template; expected agent build and environment mapping.") from None
@@ -1233,58 +1270,6 @@ def _agent_exec(deploy: Path, *argv: str) -> str:
     return _run(["docker", "compose", "exec", "-T", "-u", "mimir", "agent", *argv], cwd=deploy)
 
 
-# The worklink uid cannot traverse the controller's private venv. Resolve there
-# as mimir, then run a stdlib-only probe with the system interpreter as worklink.
-_OPENCODE_RESOLVE_PROBE = """\
-try:
- from mimir_cultivate.worklink.backends.opencode import resolve_opencode_binary
- print(resolve_opencode_binary())
-except (ImportError, OSError, ValueError):
- print('opencode_missing')
-"""
-_OPENCODE_WORKER_PROBE = """\
-import subprocess
-import sys
-import tempfile
-try:
- with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
-  env = {
-   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
-   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
-   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
-   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
-  }
-  result = subprocess.run([sys.argv[1], '--version'], env=env, cwd='/tmp',
-   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-  print('ok' if result.returncode == 0 else 'opencode_missing')
-except (OSError, subprocess.TimeoutExpired, ValueError):
- print('opencode_missing')
-"""
-_OPENCODE_MODEL_PROBE = """\
-import subprocess
-import sys
-import tempfile
-try:
- with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
-  env = {
-   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
-   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
-   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
-   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
-  }
-  # The catalog command requires a configured provider. This is an inert
-  # placeholder, never the operator's API key and never used for a completion.
-  env[sys.argv[2].upper() + '_API_KEY'] = 'model-catalog-probe'
-  result = subprocess.run([sys.argv[1], 'models', sys.argv[2]], env=env, cwd='/tmp',
-   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-  print('ok' if result.returncode == 0 and sys.argv[3] in result.stdout.splitlines()
-        else 'opencode_model_unknown')
-except (OSError, subprocess.TimeoutExpired, ValueError):
- print('opencode_model_unknown')
-"""
-
 _TOOLCHAIN_WORKER_PROBE = """\
 import json
 from pathlib import Path
@@ -1359,7 +1344,7 @@ with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
 
 def toolchain_probe_environment(config) -> dict[str, str]:
     """Use the gate builder and persisted settings, never probe-only tool vars."""
-    from .worklink.backends.opencode import _permission_override, validate_test_env
+    from .worklink.backends.opencode import validate_test_env
     from .worklink.compute import WorkSpec, _enabled_child_env
 
     settings = config.backend_settings.get('opencode', {})
@@ -1367,8 +1352,7 @@ def toolchain_probe_environment(config) -> dict[str, str]:
     validate_test_env(test_env)
     spec = WorkSpec(issue_id=0, attempt=1, repo_url='', base_ref='', branch='',
                     prompt='', rules=None, test_command='', backend='opencode', timeout_s=30,
-                    env={'OPENCODE_PERMISSION': _permission_override(settings.get('bash_allowlist', [])),
-                         **test_env}, backend_config={'pass_env': tuple(test_env)})
+                    env=dict(test_env), backend_config={'pass_env': tuple(test_env)})
     return _enabled_child_env(spec, 'setup-toolchain-probe')
 
 
@@ -1405,28 +1389,43 @@ def _verify_system_packages(deploy: Path, packages: list[str]) -> None:
             raise SetupError(f"System package verification failed (system_package_missing: {name}); rebuild the agent image and check its package installation.")
 
 
-def _verify_opencode_binary(deploy: Path) -> str:
-    binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
-    check = "opencode_missing"
-    if binary.startswith("/") and "\n" not in binary and "\x00" not in binary:
-        check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
-                      "agent", "/usr/local/bin/python", "-c", _OPENCODE_WORKER_PROBE, binary], cwd=deploy)
-    if check != "ok":
-        raise SetupError("OpenCode leaf executable verification failed (opencode_missing); rebuild the agent image and check its OpenCode installation.")
-    return binary
+_OPENCODE_DAEMON_PROBE = """\
+import json
+import os
+from mimir.worklink_daemon_activation import ActivationError, resolve_activation
+try:
+ activation = resolve_activation(dict(os.environ))
+ if not activation.enabled:
+  result = {'ok': True, 'daemon_enabled': False}
+ else:
+  from mimir_cultivate.opencode import resolve_daemon_model
+  from mimir_cultivate.worklink.daemon_gate import wait_for_daemon
+  resolve_daemon_model(dict(os.environ))
+  health = wait_for_daemon(dict(os.environ))
+  result = {'ok': health.get('ok') is True, 'daemon_enabled': True,
+            'refresh_unverified': health.get('login_state') == 'refreshable_unverified',
+            'sensitive_telemetry_disabled': health.get('telemetry_state') == 'disabled_sensitive_otlp'}
+except (ActivationError, ValueError, OSError):
+ result = {'ok': False, 'daemon_enabled': True}
+print(json.dumps(result))
+"""
 
 
-def _verify_opencode_model(deploy: Path, binary: str, model: str) -> None:
-    # Only the provider/model crosses into the isolated worker probe, never the
-    # configured credential or the controller's private OpenCode config.
-    if not re.fullmatch(r"(openai|anthropic)/[A-Za-z0-9_.-]+", model):
-        raise SetupError("OpenCode model verification failed (opencode_model_unknown); check the configured provider/model.")
-    provider = model.split("/", 1)[0]
-    check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
-                  "agent", "/usr/local/bin/python", "-c", _OPENCODE_MODEL_PROBE,
-                  binary, provider, model], cwd=deploy)
-    if check != "ok":
-        raise SetupError(f"OpenCode model verification failed (opencode_model_unknown): {model}; update the agent image or choose a listed model.")
+def _verify_opencode_daemon(deploy: Path, *, run=None) -> None:
+    try:
+        output = (_agent_exec(deploy, "python", "-c", _OPENCODE_DAEMON_PROBE) if run is None else
+                  run(["docker", "compose", "exec", "-T", "--user", "mimir", "agent",
+                       "python", "-c", _OPENCODE_DAEMON_PROBE], cwd=deploy))
+        state = json.loads(output)
+    except (ValueError, TypeError):
+        state = {}
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        raise SetupError("OpenCode daemon verification failed; inspect installation, readiness, agent Codex login and stale bot-token health. "
+                         "Log in for this deployment: " + _codex_login_command(deploy))
+    if state.get("refresh_unverified") is True:
+        print("Native login refresh is unverified; local health does not prove provider validity.")
+    if state.get("sensitive_telemetry_disabled") is True:
+        print("Worklink telemetry is disabled because sensitive OTLP configuration is present.")
 
 
 def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
@@ -1457,7 +1456,8 @@ def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
 
 def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str,
              system_packages: list[str] | None = None, alert_adapter: str = "none",
-             *, trackers: tuple[str, ...] = ()) -> None:
+              *, trackers: tuple[str, ...] = ()) -> None:
+    _verify_opencode_daemon(deploy)
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -1519,24 +1519,6 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, versi
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
     _verify_toolchain(deploy, kind, version)
     _verify_system_packages(deploy, system_packages or [])
-    binary = _verify_opencode_binary(deploy)
-    # Run in the agent container with its actual HOME, config and compose env.
-    # Only a stable reason code crosses the Docker boundary, never the bundle.
-    auth_check = _agent_exec(deploy, "python", "-c",
-        "from mimir_cultivate.opencode import resolve_opencode_invocation, OpenCodeAuthError, OpenCodeConfigError\n"
-        "try:\n resolve_opencode_invocation()\n print('ok')\n"
-        "except (OpenCodeAuthError, OpenCodeConfigError) as exc:\n print(exc.reason_code)")
-    if auth_check != "ok":
-        raise SetupError(
-            "OpenCode credential resolution failed (" + (
-                auth_check if auth_check in {"auth_missing", "auth_invalid", "auth_malformed", "auth_unreadable"}
-                else "unavailable"
-            ) + "); check the agent container's model API key or Codex OAuth login and OpenCode config."
-        )
-    model = _agent_exec(deploy, "python", "-c",
-        "from mimir_cultivate.opencode import resolve_opencode_invocation; "
-        "print(resolve_opencode_invocation().model)")
-    _verify_opencode_model(deploy, binary, model)
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}
@@ -1589,6 +1571,10 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
     ):
         setup.add_argument("--" + name, help=help_text)
+    setup.add_argument("--heavy-lock-dir",
+                       help="Absolute host directory shared with other agents for heavy-run leases "
+                            "(scripts/heavy_run.sh); mounted at " + HEAVY_LOCK_MOUNT + " with MIMIR_HEAVY_LOCK_FILE set. "
+                            "none clears; omit to preserve the saved directory.")
     setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate; omit to preserve the saved version (fresh setup: latest common stable, then prerelease).")
     setup.add_argument("--platform", choices=tuple(_DOCKER_ARCHITECTURES),
                        help="Docker target platform (linux/amd64 or linux/arm64; default: host architecture, or saved platform on rerun).")
@@ -1715,6 +1701,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         quick_gate_command = validate("quick_gate_command", quick_gate_command)
         if gate != "ci":
             raise SetupError("--quick-gate-command is only valid with --worklink-gate ci.")
+    heavy_lock_dir = _heavy_lock_dir(args, previous)
     if deploy.exists() and (not deploy.is_dir() or deploy.is_symlink()):
         raise SetupError("Deployment directory must be a real directory; choose a new --deploy path.")
     existing_env = (deploy / "compose.env").read_text() if (deploy / "compose.env").is_file() else ""
@@ -1847,7 +1834,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     codex = provider == "codex-plus" or saga_provider == "codex-plus"
     provenance = ("# MIMIR_INSTALL_MODE=pypi MIMIR_VERSION=" + mimir_version + " MIMIR_AGENT_SHA256="
                   + release.agent.sha256 + " MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256 + "\n")
-    compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex)
+    compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex,
+                                          heavy_lock_dir=heavy_lock_dir)
     generated = {"compose.yml": compose, ".gitignore": "*\n", "build_context.py": _BUILD_CONTEXT_HELPER,
                  "provision.py": _PROVISION, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
     _check_generated(deploy, generated, previous, force=bool(getattr(args, "force", False)))
@@ -1906,7 +1894,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
                    "previous_saga_model_spec": previous.get("saga_model_spec"),
-                   "system_packages": system_packages,
+                   "system_packages": system_packages, "heavy_lock_dir": heavy_lock_dir,
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
                     "mimir_install_mode": "pypi", "mimir_version": mimir_version, "wheels": wheels,
                     "toolchain_version": version, "layer_tag": layer_tag, "docker_platform": docker_platform,
@@ -1975,7 +1963,10 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     if not no_start:
         if codex:
             _require_codex_login(deploy, run)
+        # s6 starts the agent and daemon independently; setup and daemon-backed
+        # workloads seed/reconcile the agent's login before checking readiness.
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
+        _verify_opencode_daemon(deploy, run=run)
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
         print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "

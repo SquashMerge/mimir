@@ -1,0 +1,40 @@
+{
+  "run_id": "<RUN_ID>",
+  "issue_key": null,
+  "valid": true,
+  "sandbox_path": "<SANDBOX>",
+  "status": "running",
+  "mode": "interactive",
+  "branch": "feature/fixture-mcp",
+  "pr_base": "main",
+  "max_retries": 3,
+  "publishing_identity": "fixture-bot",
+  "park_snapshot": null,
+  "restore": null,
+  "pr_draft": true,
+  "mcp_servers": [
+    "fixture-mcp"
+  ],
+  "lock": "absent",
+  "dead_lock": false,
+  "lock_session": null,
+  "gates": {},
+  "steps": [],
+  "slices": [],
+  "retry_extensions": [],
+  "remediations": {
+    "opened": 0,
+    "limit": 2,
+    "granted": 0
+  },
+  "handoffs": [],
+  "validator": null,
+  "pr_url": null,
+  "terminal_result": null,
+  "operator_decision": null,
+  "next_action": {
+    "kind": "gate",
+    "subject": "story"
+  },
+  "next": "gate:story"
+}

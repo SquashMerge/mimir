@@ -237,7 +237,7 @@ def test_real_factory_stop_is_live_receipt_for_manual_and_autonomous_runs(
         current = kwargs["factory_record"]
         status = replace(
             _factory_lifecycle_status(Path(current.sandbox), status=ending),
-            run_id=current.run_id, branch=current.branch,
+            run_id=current.run_id, branch=current.branch, lock_session=current.session,
             terminal_result={"reason": f"{ending} needs a decision"},
         )
         stopped = asyncio.Event()

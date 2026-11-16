@@ -768,6 +768,15 @@
       "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
     }
   },
+  "2125-opencode-daemon": {
+    "worklink-tool-pins": {
+      "SKILL.md": "4bb995c86914df0bac1b53c647f22a248bb949c63cfc6372f9ed481d966ba6ce",
+      "pollers.json": "0f1a6281e89ce354681add39dac58a9e95c12c5d4dfa6d3408c0fdf7bd897c4a",
+      "scripts/poller.py": "de83dba8293ac100a723de5398fcae560f083297fb862fd7e0c3438ff7dc972a",
+      "tests/conftest.py": "5df4b16fedf0d178373d2c2196d579d9571ecc0d7c5f1c394360b5b45a937c1a",
+      "tests/test_worklink_tool_pins_poller.py": "1ce74f66db36488f50afcb40ced0b7c45ff44c85a8ca7d5ad720145cd19a3603"
+    }
+  },
   "review-trusted-evidence-first": {
     "review": {"SKILL.md": "b6799f8240d240c960e53279994a1aba5bd282993118d1facc912f8966293f37"}
   }
