@@ -2073,7 +2073,15 @@ def test_opencode_leaf_reasoning_variant(
 
 
 @pytest.mark.usefixtures("stub_opencode")
-def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(tmp_path: Path) -> None:
+def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This case exercises dotenv defaults, not process overrides. The production
+    # loader deliberately preserves process values and adds defaults to os.environ;
+    # own both the starting state and restoration of every key this dotenv writes.
+    for name in ("MIMIR_MODEL_SPEC", "MIMIR_MODEL_REASONING_EFFORT", "MIMIR_WORKLINK_REASONING_EFFORT"):
+        monkeypatch.setenv(name, "fixture-owned-before-dotenv")
+        monkeypatch.delenv(name)
     env = _provider_env(tmp_path, "codex-plus:gpt-agent")
     env.pop("MIMIR_MODEL_SPEC")
     home = Path(env["MIMIR_HOME"])
