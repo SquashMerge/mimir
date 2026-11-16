@@ -614,6 +614,27 @@ async def test_history_larger_than_one_response_is_read_in_narrower_pages(tmp_pa
         assert "100" in limits and any(int(value) < 100 for value in limits if value)
 
 
+async def test_narrowing_after_an_advanced_cursor_keeps_the_exact_ordered_history(tmp_path):
+    """A first page fits; a later page must narrow from its non-null cursor without skipping or reordering."""
+    async with FakeOpenCodeDaemon() as daemon, \
+            OpenCodeDaemonClient(**daemon.connection, max_item_bytes=64 * 1024) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        messages = daemon.sessions[sid].messages
+        texts = [f"small-{index:03d}" for index in range(98)] + [f"large-{index:02d}:" + "y" * 6 * 1024 for index in range(20)]
+        for index, text in enumerate(texts):
+            messages.append({"id": f"msg_order{index:04d}", "type": "assistant", "time": {"created": 2},
+                "agent": "build", "model": {"providerID": "openai", "id": "gpt-5"},
+                "content": [{"type": "text", "text": text}]})
+        daemon.finish(sid)
+        outcome = await controller.observe()
+        assert outcome.execution_state == "succeeded"
+        assert outcome.stdout == "\n".join(texts)
+        pages = [(r[2].get("cursor") is not None, r[2].get("limit")) for r in daemon.requests if r[1].endswith("/message")]
+        # The first page (no cursor) fits at 100; narrowing happens only on cursor-bearing pages.
+        assert pages[0] == (False, "100") and any(cursor and int(limit) < 100 for cursor, limit in pages)
+
+
 async def test_single_message_over_the_response_bound_still_fails_closed(tmp_path):
     async with FakeOpenCodeDaemon() as daemon, \
             OpenCodeDaemonClient(**daemon.connection, max_item_bytes=64 * 1024) as client:
