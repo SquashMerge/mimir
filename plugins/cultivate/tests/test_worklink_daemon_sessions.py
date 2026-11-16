@@ -562,6 +562,34 @@ async def test_utf8_multipart_output_boundaries(tmp_path, parts, limit, overflow
             assert outcome.stdout == "\n".join(parts)
 
 
+@pytest.mark.parametrize("stop_requested", [False, True])
+async def test_delivery_between_inbox_and_history_reads_is_not_removal(tmp_path, monkeypatch, stop_requested):
+    """Delivery at the boundary of the two reads must read as in flight, never vanished."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.auto_deliver = False
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        if stop_requested:
+            controller._persist(stop_requested=True, cancellation_state="requested")
+        input_id = controller.record.input_id
+        delivered = []
+
+        def deliver_once():
+            if not delivered:
+                delivered.append(True)
+                daemon.deliver(sid, input_id)
+
+        for name in ("inbox", "messages"):
+            original = getattr(client, name)
+            async def first_read_then_deliver(*args, _original=original, **kwargs):
+                result = await _original(*args, **kwargs)
+                deliver_once()
+                return result
+            monkeypatch.setattr(client, name, first_read_then_deliver)
+        assert (await controller.observe()).execution_state == "started"
+        assert delivered
+
+
 class _RecordedClient:
     """Serves one captured 2.2.7 snapshot at a time; no daemon, no provider."""
 
