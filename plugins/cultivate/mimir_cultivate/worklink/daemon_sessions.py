@@ -315,9 +315,20 @@ class SessionController:
         messages = []
         cursor = None
         size = 0
+        limit = 100
         while True:
-            page = await self._bounded(self.client.messages(self.record.opencode_session_id, cursor=cursor,
-                                              order="asc" if cursor is None else None, limit=100))
+            try:
+                page = await self._bounded(self.client.messages(self.record.opencode_session_id, cursor=cursor,
+                                                  order="asc" if cursor is None else None, limit=limit))
+            except DaemonClientError as exc:
+                # A real build's history exceeds the client's per-response bound
+                # long before 100 messages (tool output is large). Cursors are
+                # positions, not page offsets, so re-read the same position with a
+                # narrower page. A single message over the bound still fails closed.
+                if exc.reason != "item too large" or limit == 1:
+                    raise
+                limit = max(1, limit // 4)
+                continue
             if (not isinstance(page, dict) or not isinstance(page.get("data"), list)
                     or not isinstance(page.get("cursor"), dict)
                     or set(page["cursor"]) != {"previous", "next"}
