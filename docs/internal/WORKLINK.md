@@ -586,7 +586,9 @@ Per-issue flow (one `run`):
    untracked/ignored worktree paths alone (including symlink targets). A
    directory *above* the repository that the worker can write (listed by
    absolute path in the refusal) must be fixed by hand; a sticky directory such
-   as `/tmp` is accepted unless the worker owns it. Restore controller ownership separately for any worker-owned entries;
+   as `/tmp` is accepted unless the worker owns it. A symlinked base or `.git`
+   is checked at the directory it resolves to, and above both the link and
+   its target. Restore controller ownership separately for any worker-owned entries;
    chmod cannot repair ownership. For a linked base worktree, also remediate its
    referenced Git directory and common Git directory. Controller-side image
    services, generated startup scripts, and the root Worklink executor process

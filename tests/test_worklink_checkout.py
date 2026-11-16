@@ -399,6 +399,43 @@ def test_worker_owned_sticky_ancestor_is_refused(tmp_path: Path, monkeypatch: py
     assert repr(str(tmp_path.resolve())) in str(raised.value)
 
 
+@pytest.mark.parametrize("link", ["base", "dot-git"])
+def test_symlinked_base_or_git_dir_checks_the_resolved_directory(tmp_path: Path, link: str) -> None:
+    repo = _repo_with_main(tmp_path / "real")
+    if link == "base":
+        checked = tmp_path / "base"
+        checked.symlink_to(repo)
+        target = repo
+    else:
+        store = tmp_path / "git-store"
+        (repo / ".git").rename(store)
+        (repo / ".git").symlink_to(store)
+        checked, target = repo, store
+    checkout_module.assert_base_repo_not_worker_writable(checked)
+    target.chmod(0o777)
+    try:
+        with pytest.raises(RuntimeError, match="worker_writable") as raised:
+            checkout_module.assert_base_repo_not_worker_writable(checked)
+    finally:
+        target.chmod(0o755)
+    assert repr(os.path.relpath(target.resolve(), checked)) in str(raised.value)
+
+
+def test_symlinked_base_checks_the_links_own_parent(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path / "real")
+    links = tmp_path / "links"
+    links.mkdir()
+    (links / "base").symlink_to(repo)
+    checkout_module.assert_base_repo_not_worker_writable(links / "base")
+    links.chmod(0o777)
+    try:
+        with pytest.raises(RuntimeError, match="worker_writable") as raised:
+            checkout_module.assert_base_repo_not_worker_writable(links / "base")
+    finally:
+        links.chmod(0o755)
+    assert repr(str(links)) in str(raised.value)
+
+
 def test_remediation_repairs_root_and_tracked_directories(tmp_path: Path) -> None:
     repo = _repo_with_tracked_dir(tmp_path)
     for directory in (".", "pkg", "pkg/sub"):

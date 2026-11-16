@@ -878,7 +878,9 @@ def assert_base_repo_not_worker_writable(
     Ignored/untracked worktree data is never inspected. A writable directory lets the
     worker rename or replace the entries in it, so the repository root, every
     directory holding a tracked path, and each directory above the repository (and
-    above a linked worktree's Git directories) are checked too. Above the
+    above a linked worktree's Git directories) are checked too. A symlinked
+    repository or ``.git`` is checked at its resolved directory and above both the
+    link and its target. Above the
     repository a sticky directory such as /tmp is safe unless the worker owns it:
     it cannot rename an entry it does not own there.
 
@@ -915,8 +917,14 @@ def assert_base_repo_not_worker_writable(
             if git_dir.is_dir():
                 for root, dirs, files in os.walk(git_dir, onerror=walk_error):
                     paths.update(Path(root) / name for name in dirs + files)
-        resolved = repo.resolve()
-        ancestors = {parent for root in (resolved, *git_dirs[1:]) for parent in root.parents}
+        # A symlinked base or .git has mode-less link bits: check the directory it
+        # resolves to as strictly as the repository itself, and walk the ancestors
+        # of both the lexical path (the link's own parents) and the resolved one.
+        roots = [repo, *git_dirs]
+        paths.update(root.resolve() for root in roots)
+        ancestors = {parent for root in roots
+                     for candidate in (Path(os.path.abspath(root)), root.resolve())
+                     for parent in candidate.parents}
         ancestors -= {path.resolve() for path in paths if not path.is_symlink()}
 
         def worker_writable(path: Path, *, sticky_ok: bool) -> bool:
