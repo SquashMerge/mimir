@@ -1,7 +1,8 @@
 """Explicitly imported, offline OpenCode 2.2.7 contract support.
 
-Only the probe responses are recorded. All execution outcomes and fault/race
-controls below are synthetic schema-derived scenarios, not provider captures.
+The probe responses and the session-lifecycle capture are recorded. Execution
+outcomes and fault/race controls below are synthetic scenarios shaped to match
+that capture (message history, inbox and the watermark-only log endpoint).
 """
 from __future__ import annotations
 
@@ -305,29 +306,22 @@ class FakeOpenCodeDaemon:
         }})
 
     async def _log(self, request: web.Request, session_id: str) -> web.StreamResponse:
+        """Captured 2.2.7 behaviour: only the ``log.synced`` watermark is served.
+
+        Live follow and ``after=0`` replay both omitted every durable event on the
+        real daemon (``opencode_2_2_7/session-lifecycle.json``); follow then stays
+        open without further items. ``state.log`` only advances the sequence.
+        """
         state = self.sessions[session_id]
-        after = int(request.query.get("after", "0"))
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
-        async def write(item: dict[str, Any]) -> None:
-            self.schema.named("SessionLogItem", item)
-            await response.write(f"event: {item['type']}\ndata: {json.dumps(item)}\n\n".encode())
+        item = {"type": "log.synced", "aggregateID": session_id, "seq": len(state.log)}
+        self.schema.named("SessionLogItem", item)
         try:
-            snapshot = list(state.log)
-            watermark = len(snapshot)
-            for event in snapshot:
-                if event["durable"]["seq"] > after:
-                    await write(event)
-                    after = event["durable"]["seq"]
-            await write({"type": "log.synced", "aggregateID": session_id, "seq": watermark})
+            await response.write(f"data: {json.dumps(item)}\n\n".encode())
             while request.query.get("follow") == "true" and not self._closing:
                 state.changed.clear()
-                events = [e for e in state.log if e["durable"]["seq"] > after]
-                if not events:
-                    await state.changed.wait()
-                for event in events:
-                    await write(event)
-                    after = event["durable"]["seq"]
+                await state.changed.wait()
         except (ConnectionError, asyncio.CancelledError):
             pass
         return response

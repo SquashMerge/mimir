@@ -102,7 +102,7 @@ async def test_request_shapes_environment_replacement_and_command(fake_opencode_
         assert "synthetic" in daemon.scenario_provenance
 
 
-async def test_durable_replay_watermark_history_and_opaque_cursors(fake_opencode_daemon):
+async def test_watermark_only_log_history_and_opaque_cursors(fake_opencode_daemon):
     daemon = fake_opencode_daemon
     async with OpenCodeDaemonClient(**daemon.connection) as client:
         session_id = await create(client)
@@ -111,10 +111,9 @@ async def test_durable_replay_watermark_history_and_opaque_cursors(fake_opencode
         admitted = (await client.prompt(session_id, "instructions"))["data"]
         assert admitted["sessionID"] == session_id
         daemon.finish(session_id)
+        # Captured 2.2.7 behaviour: replay from zero yields only the advanced watermark.
         events = [e.data async for e in client.log(session_id, after=0, follow=False)]
-        assert [e["type"] for e in events][-3:] == ["session.execution.started", "session.execution.succeeded", "log.synced"]
-        seq = events[-2]["durable"]["seq"]
-        assert [e.data async for e in client.log(session_id, after=seq, follow=False)] == [events[-1]]
+        assert events == [{"type": "log.synced", "aggregateID": session_id, "seq": len(daemon.sessions[session_id].log)}]
         first = await client.messages(session_id, order="asc", limit=1)
         assert first["data"][0]["id"] == admitted["id"]
         second = await client.messages(session_id, cursor=first["cursor"]["next"], limit=1)
@@ -125,7 +124,7 @@ async def test_durable_replay_watermark_history_and_opaque_cursors(fake_opencode
             await client.messages(session_id, cursor="opaque", order="asc")
 
 
-async def test_follow_delivers_new_durable_events(fake_opencode_daemon):
+async def test_follow_holds_open_after_the_watermark(fake_opencode_daemon):
     daemon = fake_opencode_daemon
     async with OpenCodeDaemonClient(**daemon.connection) as client:
         session_id = await create(client)
@@ -134,8 +133,8 @@ async def test_follow_delivers_new_durable_events(fake_opencode_daemon):
             marker = await anext(stream)
             assert marker.data["type"] == "log.synced"
             await client.prompt(session_id, "instructions")
-            event = await asyncio.wait_for(anext(stream), 5)
-            assert event.data["type"] == "session.inbox.enqueued"
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(anext(stream), 0.2)
         finally:
             await stream.aclose()
 
@@ -179,8 +178,7 @@ async def test_synthetic_typed_failure_is_not_http_failure(fake_opencode_daemon,
         await client.prompt(session_id, "instructions")
         error = {"type": error_type, "message": "synthetic failure"}
         daemon.finish(session_id, outcome="failed", error=error)
-        events = [e.data async for e in client.log(session_id, follow=False)]
-        assert events[-2]["data"]["error"] == error
+        assert daemon.sessions[session_id].log[-1]["data"]["error"] == error
         assert (await client.messages(session_id))["data"][0]["error"] == error
 
 
