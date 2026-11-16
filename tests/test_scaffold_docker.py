@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-FACTORY_VERSION = "0.14.0"
+FACTORY_VERSION = "0.14.1"
 OPENCODE_VERSION = "2.2.7"
 from mimir.scaffold_docker import (
     DEFAULT_BASE_IMAGE,
@@ -644,7 +644,7 @@ def test_render_dockerfile_is_structurally_parseable(mode, install_opencode):
 
 def test_render_dockerfile_installs_opencode_when_selected():
     """The selected provider supplies the OpenCode install in both modes."""
-    assert FACTORY_VERSION == "0.14.0"
+    assert FACTORY_VERSION == "0.14.1"
     plugins = _cultivate_or_refusal()
     for mode in ("workspace", "pypi"):
         if plugins and mode == "pypi":
@@ -842,7 +842,7 @@ def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path, mon
     assert oc_config.is_file(), "global opencode.json should be created"
     content = oc_config.read_text()
     assert json.loads(content)["plugins"] == [
-        {"package": "opencode2-feature-factory@0.14.0"},
+        {"package": "opencode2-feature-factory@0.14.1"},
         {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": False}}]
 
 
@@ -866,7 +866,7 @@ def test_ensure_opencode_config_preserves_existing_options_and_deduplicates(tmp_
         "plugins": [
             "operator-plugin",
             existing_factory,
-            {"package": "opencode2-feature-factory@0.14.0"},
+            {"package": "opencode2-feature-factory@0.14.1"},
             ["opencode-project-memory", {"maxIndexLines": 17, "operator": True}],
         ],
     }))
@@ -877,7 +877,7 @@ def test_ensure_opencode_config_preserves_existing_options_and_deduplicates(tmp_
     assert merged["$schema"] == "custom-schema"
     assert merged["theme"] == "tokyonight"
     assert merged["plugins"][0] == "operator-plugin"
-    assert merged["plugins"][1] == {**existing_factory, "package": "opencode2-feature-factory@0.14.0"}
+    assert merged["plugins"][1] == {**existing_factory, "package": "opencode2-feature-factory@0.14.1"}
     assert len(merged["plugins"]) == 3
     assert merged["plugins"][-1] == {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": False}}
     assert "opencode-project-memory" not in config_path.read_text()

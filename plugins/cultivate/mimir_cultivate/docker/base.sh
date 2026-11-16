@@ -1,5 +1,5 @@
 #!/bin/sh
-# factory-version: 0.14.0
+# factory-version: 0.14.1
 set -eu
 case "$MIMIR_ENABLE_OPENCODE" in 0|1) ;; *) exit 1 ;; esac
 install -d -o root -g root -m 0755 /opt/cultivate-docker

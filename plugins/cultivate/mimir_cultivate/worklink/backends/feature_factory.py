@@ -19,7 +19,7 @@ from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, SessionRequest, WorkOrder
 
 
-FACTORY_VERSION = "0.14.0"
+FACTORY_VERSION = "0.14.1"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),

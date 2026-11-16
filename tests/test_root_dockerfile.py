@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-FACTORY_VERSION = "0.14.0"
+FACTORY_VERSION = "0.14.1"
 OPENCODE_VERSION = "2.2.7"
 from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 

@@ -235,6 +235,6 @@ def daemon_configuration(
             "capturePromptInLogs": capture, "captureModelContext": capture,
         }
     return DaemonConfiguration({"plugins": [
-        {"package": "opencode2-feature-factory@0.14.0"},
+        {"package": "opencode2-feature-factory@0.14.1"},
         {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": options},
     ]}, state, explanation)
