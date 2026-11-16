@@ -9,7 +9,7 @@ import pytest
 
 from mimir_cultivate.worklink.daemon_config import (
     CONFIG_PATH, DAEMON_ROOT, DaemonConfigError, PublishingCredentials,
-    daemon_configuration, daemon_environment, make_launch_snapshot,
+    daemon_configuration, daemon_environment, deployment_model, make_launch_snapshot,
     parse_launch_snapshot, resolve_daemon_credentials, resolve_epic_credentials,
     snapshot_matches, telemetry_service_name,
 )
@@ -293,3 +293,55 @@ def test_snapshot_missing_field_and_null_optional_values():
     del payload["bot_token"]
     with pytest.raises(DaemonConfigError):
         parse_launch_snapshot(payload)
+
+
+MODEL = {"providerID": "openai", "id": "gpt-6.1-sol", "variant": "high"}
+
+
+def test_deployment_model_becomes_factory_profile_and_daemon_default():
+    """#2126: with no model configured, specialists fell back to github-copilot and the PAT was refused."""
+    result = daemon_configuration({}, resolve_daemon_credentials({}), model=MODEL)
+    assert result.config["plugins"][0] == {"package": "opencode2-feature-factory@0.14.1", "options": {
+        "profile": {"model": "openai/gpt-6.1-sol"}}}
+    assert result.config["model"] == {"providerID": "openai", "model": "gpt-6.1-sol", "variant": "high"}
+    assert result.config["plugins"][1]["package"] == "@devtheops/opencode-plugin-otel@2.1.0"
+
+
+def test_model_without_variant_omits_it():
+    result = daemon_configuration({}, resolve_daemon_credentials({}),
+                                  model={"providerID": "openai", "id": "gpt-6.1-sol"})
+    assert result.config["plugins"][0]["options"] == {"profile": {"model": "openai/gpt-6.1-sol"}}
+    assert result.config["model"] == {"providerID": "openai", "model": "gpt-6.1-sol"}
+
+
+def test_no_model_keeps_the_unconfigured_shape():
+    result = daemon_configuration({}, resolve_daemon_credentials({}))
+    assert "model" not in result.config and "options" not in result.config["plugins"][0]
+
+
+@pytest.mark.parametrize("model", [{"providerID": "openai"}, {"providerID": "", "id": "x"},
+                                   {"providerID": "openai", "id": "x", "extra": "y"},
+                                   {"providerID": "openai", "id": 1}])
+def test_malformed_model_is_refused(model):
+    with pytest.raises(DaemonConfigError):
+        daemon_configuration({}, resolve_daemon_credentials({}), model=model)
+
+
+def test_deployment_model_matches_the_epic_resolution():
+    env = {"MIMIR_MODEL_SPEC": "codex-plus:gpt-6.1-sol", "MIMIR_MODEL_REASONING_EFFORT": "high"}
+    assert deployment_model(env) == {"providerID": "openai", "id": "gpt-6.1-sol", "variant": "high"}
+
+
+def test_deployment_model_reads_the_home_spec_when_env_has_none(tmp_path, monkeypatch):
+    from mimir import config as mimir_config
+    seen = []
+    def spec(home=None):
+        seen.append(home)
+        return "codex-plus:gpt-6.1-sol"
+    monkeypatch.setattr(mimir_config, "model_spec_at_call_time", spec)
+    assert deployment_model({"MIMIR_HOME": str(tmp_path)}) == {"providerID": "openai", "id": "gpt-6.1-sol"}
+    assert seen == [tmp_path]
+
+
+def test_unresolvable_deployment_model_is_none():
+    assert deployment_model({"MIMIR_MODEL_SPEC": "not a provider spec"}) is None

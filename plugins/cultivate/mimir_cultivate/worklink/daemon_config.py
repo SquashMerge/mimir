@@ -210,10 +210,45 @@ class DaemonConfiguration:
     explanation: str | None = None
 
 
+def deployment_model(environ: Mapping[str, object]) -> dict[str, str] | None:
+    """Resolve the deployment's daemon model exactly as an epic launch does.
+
+    ``MIMIR_MODEL_SPEC`` (else the agent home's configured spec) plus the
+    reasoning-effort variables, through ``resolve_daemon_model``. ``None`` when it
+    cannot be resolved: an epic resolves the same model before it can create a
+    session, so no factory specialist can run without it.
+    """
+    from pathlib import Path
+
+    from mimir.config import model_spec_at_call_time
+    from ..opencode import OpenCodeConfigError, resolve_daemon_model
+
+    values = {name: value for name, value in environ.items() if isinstance(value, str)}
+    try:
+        if not values.get("MIMIR_MODEL_SPEC"):
+            home = values.get("MIMIR_HOME")
+            values["MIMIR_MODEL_SPEC"] = model_spec_at_call_time(Path(home) if home else None)
+        return resolve_daemon_model(values)
+    except (OpenCodeConfigError, ValueError, OSError):
+        return None
+
+
 def daemon_configuration(
     environ: Mapping[str, object], credentials: PublishingCredentials,
+    *, model: Mapping[str, str] | None = None,
 ) -> DaemonConfiguration:
-    """Generate the two pinned plugin entries, with no OTLP carriers in output."""
+    """Generate the two pinned plugin entries, with no OTLP carriers in output.
+
+    ``model`` (from ``deployment_model``) becomes the feature-factory adapter's
+    ``profile`` model (each agent keeps its declared effort as the variant) and
+    the daemon's default ``model``. The adapter ignores
+    an agent's ``model: sonnet`` tier and selects only from its profiles, so
+    without one every specialist falls back to the daemon default. With no
+    default configured, OpenCode 2.2.7 chose ``github-copilot`` from the
+    publishing token in its environment, and Copilot rejects a personal access
+    token: every specialist of #2126 failed with "Personal Access Tokens are not
+    supported for this endpoint".
+    """
     options: dict[str, object] = {"enabled": False}
     state: TelemetryState = "off"
     explanation = None
@@ -234,7 +269,18 @@ def daemon_configuration(
             "disabledTraces": [] if capture else ["session", "llm", "tool"],
             "capturePromptInLogs": capture, "captureModelContext": capture,
         }
-    return DaemonConfiguration({"plugins": [
-        {"package": "opencode2-feature-factory@0.14.1"},
-        {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": options},
-    ]}, state, explanation)
+    factory: dict[str, object] = {"package": "opencode2-feature-factory@0.14.1"}
+    config: dict[str, object] = {"plugins": [
+        factory, {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": options},
+    ]}
+    if model is not None:
+        provider, name, variant = model.get("providerID"), model.get("id"), model.get("variant")
+        if (set(model) - {"providerID", "id", "variant"} or not provider or not name
+                or not all(isinstance(value, str) for value in model.values())):
+            raise DaemonConfigError("invalid daemon model")
+        # Model only: the adapter ranks a profile variant above each agent's own
+        # declared effort, so a variant here would flatten story-reader's "low"
+        # and the drivers' "xhigh" into one setting.
+        factory["options"] = {"profile": {"model": f"{provider}/{name}"}}
+        config["model"] = {"providerID": provider, "model": name, **({"variant": variant} if variant else {})}
+    return DaemonConfiguration(config, state, explanation)
