@@ -133,7 +133,7 @@ running agent can instead activate a newly installed poller through its
 
 Factory epics use the same repository declaration and isolated-checkout allocator,
 but have separate admission and concurrency. The image installs
-`feature-factory@0.14.0` and `opencode2-feature-factory@0.14.0` under
+`feature-factory@0.14.1` and `opencode2-feature-factory@0.14.1` under
 `/opt/mimir-opencode`; `MIMIR_FACTORY_ENTRYPOINT` names the absolute
 `feature-factory/bin/factory.js`. Set `MIMIR_FACTORY_EPICS_ENABLED=1` to let the
 poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults

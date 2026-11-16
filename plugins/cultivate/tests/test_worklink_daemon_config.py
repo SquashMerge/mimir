@@ -172,7 +172,7 @@ def test_exact_telemetry_options_and_plugin_entries(capture):
     result = daemon_configuration(env, resolve_daemon_credentials(env))
     assert result.telemetry_state == ("content_on" if capture else "metrics_only")
     assert result.config == {"plugins": [
-        {"package": "opencode2-feature-factory@0.14.0"},
+        {"package": "opencode2-feature-factory@0.14.1"},
         {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {
             "enabled": True, "endpoint": "https://collector.example/otel", "protocol": "http/protobuf",
             "resourceAttributes": "service.name=agent.bot", "logsEnabled": capture,

@@ -830,7 +830,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
-    assert FACTORY_VERSION == "0.14.0"
+    assert FACTORY_VERSION == "0.14.1"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
@@ -840,7 +840,7 @@ def test_admit_rejects_nonexistent_entrypoint(tmp_path: Path) -> None:
         FeatureFactoryBackend(entrypoint=str(tmp_path / "factory.js")).admit()
 
 
-@pytest.mark.parametrize("dependency", [None, "^0.14.0", "0.12.1", "*", {"version": "0.14.0"}])
+@pytest.mark.parametrize("dependency", [None, "^0.14.1", "0.12.1", "*", {"version": "0.14.1"}])
 def test_resolver_requires_exact_adapter_dependency(tmp_path, dependency):
     entrypoint = package_entrypoint(tmp_path)
     manifest = entrypoint.parents[2] / "opencode2-feature-factory/package.json"

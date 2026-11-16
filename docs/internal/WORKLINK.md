@@ -132,8 +132,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.14.0` through the lockstep
-`opencode2-feature-factory@0.14.0` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.14.1` through the lockstep
+`opencode2-feature-factory@0.14.1` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -191,7 +191,7 @@ executor together by rebuilding the executor image before enabling this layout.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.14.0 verification and
+  Worklink admits the launcher only after package/adapter 0.14.1 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume uses the retained session, while
   heartbeat uses the newly claimed session after recovery; lock actions use
@@ -680,7 +680,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | daemon command `feature`, text `--autonomous --max-retries 5 chainlink-<id>` | Epic adapter with session-supervised OpenCode and absolute 0.14.0 controls. |
+| `feature_factory` | daemon command `feature`, text `--autonomous --max-retries 5 chainlink-<id>` | Epic adapter with session-supervised OpenCode and absolute 0.14.1 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
