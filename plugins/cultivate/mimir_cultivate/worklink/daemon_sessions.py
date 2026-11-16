@@ -146,6 +146,11 @@ def session_permissions(request: SessionRequest) -> list[dict[str, str]]:
     elif request.kind == "epic":
         rules.extend({"action": "read", "resource": rule, "effect": "deny"}
                      for rule in (".env", "**/.env", "**/.env.*"))
+        # The driver's first act is loading the `feature` skill. opencode2-feature-factory
+        # 0.14.0's driver rules don't mention `skill`, so 2.2.7 resolves it to "ask", and
+        # nothing answers an ask in a daemon session: the run hung until the startup
+        # watchdog stopped it (#2126 attempt 1). Grant exactly that skill.
+        rules.append({"action": "skill", "resource": "feature", "effect": "allow"})
     else:
         raise ValueError("invalid session kind")
     return rules

@@ -1,0 +1,1 @@
+- Worklink factory epics on the OpenCode 2 daemon no longer hang loading the `feature` skill. The epic session now allows exactly that skill: opencode2-feature-factory 0.14.0's driver rules don't mention `skill`, so OpenCode 2.2.7 asked for approval that nothing in a daemon session answers, and the run stalled until the startup watchdog stopped it.

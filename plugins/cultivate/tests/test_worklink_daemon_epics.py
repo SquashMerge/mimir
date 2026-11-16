@@ -108,7 +108,8 @@ async def test_epic_production_command_checkout_model_permissions_and_environmen
             "model": {"providerID": "openai", "id": "gpt-test", "variant": "high"},
             "permissions": [{"action": "external_directory", "resource": "*", "effect": "deny"},
                 *[{"action": "read", "resource": pattern, "effect": "deny"}
-                  for pattern in (".env", "**/.env", "**/.env.*")]]}
+                  for pattern in (".env", "**/.env", "**/.env.*")],
+                {"action": "skill", "resource": "feature", "effect": "allow"}]}
         commands = [body for _, route, _, body in daemon.requests if route.endswith("/command")]
         assert commands == [{"name": "feature", "text": "--autonomous --max-retries 5 chainlink-2125"}]
         assert not any(route.endswith("/prompt") for _, route, _, _ in daemon.requests)
@@ -161,6 +162,34 @@ async def test_mutation_epic_shell_deny_added(tmp_path):
 
 async def test_mutation_external_directory_deny_removed(tmp_path):
     await check_permissions(tmp_path, "external")
+
+
+# opencode2-feature-factory 0.14.0 `driverPermissions()` (plugin/agents.js), the rules the
+# `feature-factory` agent carries. It says nothing about `skill`.
+_DRIVER_RULES_0_14_0 = [
+    {"action": "edit", "resource": "*", "effect": "allow"},
+    {"action": "shell", "resource": "*", "effect": "allow"},
+    {"action": "webfetch", "resource": "*", "effect": "allow"},
+    {"action": "subagent", "resource": "*", "effect": "deny"},
+    {"action": "external_directory", "resource": "*", "effect": "deny"},
+]
+
+
+@pytest.mark.parametrize("mutation", [None, "drop_skill_rule"])
+async def test_epic_session_lets_the_driver_load_the_feature_skill(tmp_path, mutation):
+    # An unanswered "ask" hangs a daemon session until the startup watchdog kills it.
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, _ = await admit(tmp_path, daemon, client)
+        rules = next(body["permissions"] for method, route, _, body in daemon.requests
+                     if method == "POST" and route == "/api/session")
+        if mutation == "drop_skill_rule":
+            rules = [rule for rule in rules if rule["action"] != "skill"]
+        decision = effective_permission("skill", "feature", agent=_DRIVER_RULES_0_14_0, session=rules)
+        assert decision == ("allow" if mutation is None else "ask")
+        # The grant names the one skill; others keep the host's decision.
+        assert effective_permission("skill", "other", agent=_DRIVER_RULES_0_14_0, session=rules) == "ask"
+        await compute.cancel(handle)
+        await compute.cleanup(handle)
 
 
 @pytest.mark.parametrize("host_outcome", ["succeeded", "failed", "interrupted", "missing"])
