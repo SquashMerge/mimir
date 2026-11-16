@@ -28,6 +28,17 @@ class DaemonConfigError(ValueError):
     """Invalid policy input, with a fixed credential-free diagnostic."""
 
 
+#: Backstop for one executor session helper (observe, cancel, release, create).
+#: Each operation is bounded inside the helper; this only has to outlast that
+#: work on a loaded host. 32 s did not: on 2026-11-16, at load average ~30,
+#: helpers missed it and four leaves were retained as "quiescence unverified".
+SESSION_HELPER_TIMEOUT_S = 120
+#: The controller's response budget for one session RPC: the helper allowance
+#: plus executor overhead (request validation, FD checks, response), so the
+#: caller never abandons a helper that is still inside its allowance.
+SESSION_RPC_TIMEOUT_S = SESSION_HELPER_TIMEOUT_S + 15
+
+
 def _text(value: object, *, label: str, optional: bool = True) -> str | None:
     if value is None and optional:
         return None

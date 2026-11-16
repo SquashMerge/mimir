@@ -1407,7 +1407,7 @@ def _open_epic_session_checkout(request: dict[str, Any], *, for_launch: bool) ->
 
 
 def _handle_session(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    from .daemon_config import PublishingCredentials, parse_launch_snapshot
+    from .daemon_config import SESSION_HELPER_TIMEOUT_S, PublishingCredentials, parse_launch_snapshot
     from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
 
     common = {"version", "op", "executor_identity", "issue", "attempt", "device", "inode", "path", "generation"}
@@ -1473,7 +1473,7 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
     process = subprocess.run(
         [UID_HELPER, "worklink", PYTHON, "-I", "-m", "mimir_cultivate.worklink.daemon_sessions"],
         input=json.dumps(request).encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        env=environment, cwd="/", timeout=32, check=False,
+        env=environment, cwd="/", timeout=SESSION_HELPER_TIMEOUT_S, check=False,
         pass_fds=(fds[1],) if observe else (),
     )
     if process.returncode != 0 or len(process.stdout) > MAX_REQUEST_BYTES:
