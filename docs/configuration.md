@@ -755,14 +755,14 @@ bypass that gate; the default Python suite remains required.
 | `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
 | `defaults.reaper_ttl_s` | positive int | `86400` | Lost-heartbeat recovery grace in seconds. Minimum `2 * timeout_s` (3600 for a 1800-second leaf); lower values warn and are raised at load. Backend waiting and finalization, including gate reruns, heartbeat throughout; this is not a total-runtime bound or atomic publication fence. Factory claims are excluded from the leaf reaper. | `reaper_ttl_s: 86400` |
 | `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
-| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.14.0 runtime consumes it. | `epic_branch_prefix: "epic/"` |
-| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.14.0 runtime consumes it. | `max_review_retries: 3` |
-| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.14.0 runtime consumes it. | `max_claim_attempts: 5` |
-| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.14.0 runtime consumes it. | `reviewer_backend: opencode` |
+| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.14.1 runtime consumes it. | `epic_branch_prefix: "epic/"` |
+| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.14.1 runtime consumes it. | `max_review_retries: 3` |
+| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.14.1 runtime consumes it. | `max_claim_attempts: 5` |
+| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.14.1 runtime consumes it. | `reviewer_backend: opencode` |
 | `defaults.tiered_review` | mapping | framework defaults | Compatibility-only parsed review classifier; its child keys are described below. | `tiered_review: {multi_vote_reviewer_count: 5}` |
 
 `defaults.trusted_test_retries` is **retired**, not an operator setting in
-0.14.0. It belonged to the removed distributed trusted-test runner. A value in
+0.14.1. It belonged to the removed distributed trusted-test runner. A value in
 YAML has no effect and must not be used as a retry guarantee; for example,
 remove `trusted_test_retries: 1` from an older deployment file.
 
@@ -814,7 +814,7 @@ routes:
 ### Backend blocks
 
 `backends` defaults to `{}`. Only `opencode` and `feature_factory` ship in
-0.14.0. An unknown referenced backend fails configuration loading; stale settings
+0.14.1. An unknown referenced backend fails configuration loading; stale settings
 for an unreferenced backend are warned and dropped.
 
 | Key | Type | Default | Effect | Example |
