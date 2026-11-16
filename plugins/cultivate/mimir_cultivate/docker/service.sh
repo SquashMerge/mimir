@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 install -d -o root -g root -m 0755 /usr/local/libexec
-printf '%s\n' '#!/bin/sh' 'exec /opt/mimir-worklink/venv/bin/python -m mimir_cultivate.worklink.worker_exec "$@"' > /usr/local/libexec/worklink-execd
+printf '%s\n' '#!/bin/sh' 'umask 022' 'exec /opt/mimir-worklink/venv/bin/python -m mimir_cultivate.worklink.worker_exec "$@"' > /usr/local/libexec/worklink-execd
 chmod 0755 /usr/local/libexec/worklink-execd
 install -o root -g root -m 0755 /opt/cultivate-docker/worklink-opencode-service /usr/local/libexec/worklink-opencode-service
 install -o root -g root -m 0755 /opt/cultivate-docker/worklink-daemon-gate /usr/local/libexec/worklink-daemon-gate

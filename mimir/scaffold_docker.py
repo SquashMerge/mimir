@@ -820,6 +820,7 @@ _START_SH_TEMPLATE = """\
 #      files).
 #   5. exec mimir run.
 set -euo pipefail
+umask 022
 
 # MIMIR_GIT_URL — clone source for the mimir runtime. Override in
 # compose.env if you're running a Muninn-like fork or pinning to a
@@ -926,6 +927,7 @@ _START_SH_TEMPLATE_PYPI = """\
 # pre-flight (server.main), so a ``request_mimir_update`` flag gets
 # acted on at container boot without start.sh needing to know.
 set -euo pipefail
+umask 022
 
 # ─── git + gh auth ─────────────────────────────────────────────────
 # Identity for any commits mimir makes from inside the container
@@ -1307,7 +1309,7 @@ def bootstrap_opencode_config(home: Path) -> bool:
 
 
 def _mimir_service_run(*, cultivate: bool) -> str:
-    return ("#!/command/with-contenv sh\nset -eu\n"
+    return ("#!/command/with-contenv sh\numask 022\nset -eu\n"
             + "exec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir /usr/local/bin/start.sh\n")
 
 
@@ -1400,7 +1402,7 @@ def scaffold(
         service.mkdir(parents=True)
         (service / "type").write_text("longrun\n")
         (service / "run").write_text(
-            "#!/command/with-contenv sh\nset -eu\n"
+            "#!/command/with-contenv sh\numask 022\nset -eu\n"
             "install -d -o root -g root -m 0711 /run/mimir-worklink\n"
             "install -d -o root -g mimir -m 0710 /run/mimir-worklink/socket\n"
             "exec /usr/local/libexec/worklink-execd\n"
@@ -1430,7 +1432,7 @@ def scaffold(
             reset.mkdir()
             (reset / "type").write_text("oneshot\n")
             up = reset / "up"
-            up.write_text("#!/bin/sh\ninstall -d -o mimir -g mimir -m 0755 /run/mimir-plugin-services\nrm -f /run/mimir-plugin-services/ready\n")
+            up.write_text("#!/bin/sh\numask 022\ninstall -d -o mimir -g mimir -m 0755 /run/mimir-plugin-services\nrm -f /run/mimir-plugin-services/ready\n")
             up.chmod(0o755)
             for service in selected_services:
                 definition = context / "s6-rc.d" / f"{service.plugin}-{service.name}"
@@ -1438,7 +1440,7 @@ def scaffold(
                 deps.mkdir()
                 (deps / "mimir-plugin-reset").touch()
                 wrapper = definition / "run"
-                wrapper.write_text("#!/bin/sh\nwhile [ ! -f /run/mimir-plugin-services/ready ]; do sleep 1; done\n" +
+                wrapper.write_text("#!/bin/sh\numask 022\nwhile [ ! -f /run/mimir-plugin-services/ready ]; do sleep 1; done\n" +
                                    wrapper.read_text().split("\n", 1)[1])
             # The Mimir process installs and verifies packages before releasing
             # dependent plugin longruns; s6 resets the marker before either starts.

@@ -1751,10 +1751,17 @@ def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path
     }]
 
 
+@pytest.mark.parametrize("inherited_umask", [0o000, 0o022, 0o077])
 def test_drop_worker_uses_irreversible_identity_sequence(
-    monkeypatch, synthetic_worklink_identities
+    tmp_path, monkeypatch, synthetic_worklink_identities, inherited_umask
 ) -> None:
+    """The real drop sets worker umask 002, independent of controller startup."""
     events: list[object] = []
+    real_umask = os.umask
+
+    def record_umask(mode):
+        events.append(("umask", mode))
+        return real_umask(mode)
 
     class Libc:
         def prctl(self, *args: object) -> int:
@@ -1767,16 +1774,29 @@ def test_drop_worker_uses_irreversible_identity_sequence(
     monkeypatch.setattr(worker_exec.os, "setgroups", lambda groups: events.append(("groups", groups)))
     monkeypatch.setattr(worker_exec.os, "setresgid", lambda *ids: events.append(("gid", ids)), raising=False)
     monkeypatch.setattr(worker_exec.os, "setresuid", lambda *ids: events.append(("uid", ids)), raising=False)
-    monkeypatch.setattr(worker_exec.os, "umask", lambda mode: events.append(("umask", mode)))
+    monkeypatch.setattr(worker_exec.os, "umask", record_umask)
     monkeypatch.setattr(worker_exec.os, "setsid", lambda: events.append(("setsid",)))
     monkeypatch.setattr(worker_exec.os, "fchdir", lambda fd: events.append(("cwd", fd)))
     monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: events.append(("verify",)))
-    worker_exec._drop_worker(9)
+    previous_umask = real_umask(inherited_umask)
+    try:
+        worker_exec._drop_worker(9)
+        directory = tmp_path / "worker-created"
+        directory.mkdir(mode=0o777)
+        file = directory / "pre-commit"
+        file.write_text("worker-created hook\n")
+    finally:
+        real_umask(previous_umask)
+    # The controller needs write+execute on worker-created directories to unlink
+    # their entries, while world-write must remain disabled.
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o775
+    assert stat.S_IMODE(file.stat().st_mode) == 0o664
     worker_uid = synthetic_worklink_identities.worklink_uid
     worker_gid = synthetic_worklink_identities.worklink_gid
     assert ("groups", []) in events
     assert ("gid", (worker_gid, worker_gid, worker_gid)) in events
     assert ("uid", (worker_uid, worker_uid, worker_uid)) in events
+    assert [event for event in events if event[0] == "umask"] == [("umask", 0o002)]
     assert events.index(("groups", [])) < events.index(
         ("gid", (worker_gid, worker_gid, worker_gid))
     )
@@ -1785,6 +1805,15 @@ def test_drop_worker_uses_irreversible_identity_sequence(
     )
     assert events[-1] == ("verify",)
     assert events.count(("caps", set())) == 1
+
+
+def test_daemon_sets_umask_before_initialization(monkeypatch) -> None:
+    masks = []
+    monkeypatch.setattr(worker_exec.os, "umask", masks.append)
+    monkeypatch.delattr(worker_exec.socket, "SO_PEERCRED", raising=False)
+    with pytest.raises(RuntimeError, match="requires Linux SO_PEERCRED"):
+        worker_exec.serve()
+    assert masks == [0o022]
 
 
 def test_worker_identity_verifier_rejects_any_retained_authority(

@@ -1,2 +1,3 @@
 #!/command/with-contenv sh
+umask 022
 exec /usr/local/libexec/worklink-opencode-service

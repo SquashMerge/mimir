@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 import errno
 import inspect
 import os
+import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -28,8 +30,13 @@ from mimir_cultivate.worklink.checkout import (
 
 
 @pytest.fixture(autouse=True)
-def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -37,6 +44,7 @@ def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedP
 
 
 def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
     calls: list[list[str]] = []
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -58,6 +66,7 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
             "git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z",
             "--untracked-files=all", "--ignored=no",
         ],
+        ["git", "-C", str(tmp_path), "ls-files", "-z"],
         ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
         ["git", "-C", str(tmp_path), "rev-parse", "--verify", "origin/main"],
         [
@@ -233,6 +242,9 @@ def _repo_with_main(tmp_path: Path) -> Path:
     _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
     exclude = repo / ".git" / "info" / "exclude"
     exclude.write_text(exclude.read_text(encoding="utf-8") + "\n.worklink/\n", encoding="utf-8")
+    # Own the permission baseline; callers selectively make entries unsafe.
+    for entry in [repo, *repo.rglob("*")]:
+        entry.chmod(entry.stat().st_mode & ~0o022)
     return repo
 
 
@@ -262,6 +274,270 @@ def test_clean_base_is_accepted_without_an_event(tmp_path: Path) -> None:
 
     assert lease.path.exists()
     assert events == []
+
+
+@pytest.mark.parametrize("path,mode", [
+    ("shared.txt", 0o666), (".git/HEAD", 0o666),
+    (".git/refs/heads", 0o777), ("shared.txt", 0o664),
+])
+@pytest.mark.parametrize("isolated", [False, True])
+def test_worker_writable_base_is_refused_before_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, mode: int, isolated: bool,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    target = repo / path
+    target.chmod(mode)
+    groups = [checkout_module.get_identities().worklink_gid]
+    if mode == 0o664:
+        groups.append(target.stat().st_gid)  # a worker-held supplementary group
+    monkeypatch.setattr(checkout_module.os, "getgrouplist", lambda user, gid: groups)
+    events = []
+    create = create_isolated_checkout if isolated else create_worktree
+    with pytest.raises(RuntimeError, match=r"base repo refused \(worker_writable\)") as raised:
+        create(repo, issue_id=2140, attempt=1,
+               event_logger=lambda name, **payload: events.append((name, payload)))
+    assert f"1 worker-writable path(s): {path!r}" in str(raised.value)
+    assert checkout_module.BASE_PERMISSIONS_REMEDIATION in str(raised.value)
+    assert events[0][1]["writable_count"] == 1
+    assert events[0][1]["writable_paths"] == [path]
+    assert "issue/2140-a1" not in _git(repo, "branch", "--list")
+    assert not (tmp_path / ".worklink" / repo.name / "2140-1").exists()
+
+
+def test_worker_owned_read_only_base_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / "shared.txt").chmod(0o444)
+    monkeypatch.setattr(checkout_module, "get_identities", lambda: SimpleNamespace(
+        worklink_uid=repo.stat().st_uid, worklink_gid=repo.stat().st_gid,
+    ))
+    message, (_, payload) = _base_refusal(repo)
+    assert "worker_writable" in message
+    assert payload["writable_count"] > 5
+    assert len(payload["writable_paths"]) == 5
+    assert "restore controller ownership" in message
+
+
+def test_writable_base_count_and_examples_are_bounded(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    for i in range(7):
+        (repo / f"file-{i}").write_text("tracked\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "more files")
+    for i in range(7):
+        (repo / f"file-{i}").chmod(0o666)
+    message, (_, payload) = _base_refusal(repo)
+    assert "7 worker-writable path(s)" in message
+    assert payload["writable_count"] == 7
+    assert payload["writable_paths"] == [f"file-{i}" for i in range(5)]
+    assert "file-5" not in message and "file-6" not in message
+
+
+def test_unheld_group_write_is_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / "shared.txt").chmod(0o664)
+    monkeypatch.setattr(checkout_module.os, "getgrouplist", lambda user, gid: [repo.stat().st_gid + 1])
+    checkout_module.assert_base_repo_not_worker_writable(repo)
+
+
+def _repo_with_tracked_dir(tmp_path: Path) -> Path:
+    repo = _repo_with_main(tmp_path)
+    (repo / "pkg" / "sub").mkdir(parents=True)
+    (repo / "pkg" / "sub" / "mod.py").write_text("x = 1\n")
+    _git(repo, "add", "pkg")
+    _git(repo, "commit", "-qm", "track a nested directory")
+    return repo
+
+
+@pytest.mark.parametrize("directory,expected", [(".", "."), ("pkg", "pkg"), ("pkg/sub", "pkg/sub")])
+def test_writable_repo_root_or_tracked_directory_is_refused(
+    tmp_path: Path, directory: str, expected: str,
+) -> None:
+    """A writable directory lets the worker rename or replace the tracked files in it."""
+    repo = _repo_with_tracked_dir(tmp_path)
+    (repo / directory).chmod(0o777)
+    message, (_, payload) = _base_refusal(repo)
+    assert "1 worker-writable path(s)" in message
+    assert payload["writable_paths"] == [expected]
+
+
+@pytest.mark.parametrize("ancestor", ["parent", "grandparent"])
+def test_writable_directory_above_the_repository_is_refused(tmp_path: Path, ancestor: str) -> None:
+    base = tmp_path / "workspace"
+    base.mkdir()
+    repo = _repo_with_main(base)
+    target = base if ancestor == "parent" else tmp_path
+    target.chmod(0o777)
+    try:
+        message, (_, payload) = _base_refusal(repo)
+    finally:
+        target.chmod(0o755)
+    assert payload["writable_paths"] == [str(target.resolve())]
+    assert "by hand" in message
+
+
+def test_sticky_directory_above_the_repository_is_admitted(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    tmp_path.chmod(0o1777)
+    try:
+        checkout_module.assert_base_repo_not_worker_writable(repo)
+    finally:
+        tmp_path.chmod(0o755)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="chown needs root")
+def test_worker_owned_sticky_ancestor_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _repo_with_main(tmp_path)
+    os.chown(tmp_path, 4242, -1)
+    tmp_path.chmod(0o1755)
+    monkeypatch.setattr(checkout_module, "get_identities", lambda: SimpleNamespace(
+        worklink_uid=4242, worklink_gid=4242))
+    monkeypatch.setattr(checkout_module.os, "getgrouplist", lambda user, gid: [4242])
+    with pytest.raises(RuntimeError, match="worker_writable") as raised:
+        checkout_module.assert_base_repo_not_worker_writable(repo)
+    assert repr(str(tmp_path.resolve())) in str(raised.value)
+
+
+@pytest.mark.parametrize("link", ["base", "dot-git"])
+def test_symlinked_base_or_git_dir_checks_the_resolved_directory(tmp_path: Path, link: str) -> None:
+    repo = _repo_with_main(tmp_path / "real")
+    if link == "base":
+        checked = tmp_path / "base"
+        checked.symlink_to(repo)
+        target = repo
+    else:
+        store = tmp_path / "git-store"
+        (repo / ".git").rename(store)
+        (repo / ".git").symlink_to(store)
+        checked, target = repo, store
+    checkout_module.assert_base_repo_not_worker_writable(checked)
+    target.chmod(0o777)
+    try:
+        with pytest.raises(RuntimeError, match="worker_writable") as raised:
+            checkout_module.assert_base_repo_not_worker_writable(checked)
+    finally:
+        target.chmod(0o755)
+    assert repr(os.path.relpath(target.resolve(), checked)) in str(raised.value)
+
+
+def test_symlinked_base_checks_the_links_own_parent(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path / "real")
+    links = tmp_path / "links"
+    links.mkdir()
+    (links / "base").symlink_to(repo)
+    checkout_module.assert_base_repo_not_worker_writable(links / "base")
+    links.chmod(0o777)
+    try:
+        with pytest.raises(RuntimeError, match="worker_writable") as raised:
+            checkout_module.assert_base_repo_not_worker_writable(links / "base")
+    finally:
+        links.chmod(0o755)
+    assert repr(str(links)) in str(raised.value)
+
+
+def test_remediation_repairs_root_and_tracked_directories(tmp_path: Path) -> None:
+    repo = _repo_with_tracked_dir(tmp_path)
+    for directory in (".", "pkg", "pkg/sub"):
+        (repo / directory).chmod(0o777)
+    subprocess.run(["sh", "-c", checkout_module.BASE_PERMISSIONS_REMEDIATION],
+                   env={**os.environ, "WORKLINK_REPO": str(repo)}, check=True)
+    for directory in (".", "pkg", "pkg/sub"):
+        assert stat.S_IMODE((repo / directory).stat().st_mode) == 0o755
+    checkout_module.assert_base_repo_not_worker_writable(repo)
+
+
+@pytest.mark.parametrize("unsafe", ["marker", "common-head", "worktree-head"])
+def test_linked_base_git_metadata_is_inspected(tmp_path: Path, unsafe: str) -> None:
+    repo = _repo_with_main(tmp_path)
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-qb", "linked", str(linked))
+    dot_git = linked / ".git"
+    git_dir = Path(dot_git.read_text().removeprefix("gitdir:").strip())
+    if unsafe == "marker":
+        dot_git.chmod(0o666)
+        expected = ".git"
+    else:
+        path = repo / ".git/HEAD" if unsafe == "common-head" else git_dir / "HEAD"
+        path.chmod(0o666)
+        expected = os.path.relpath(path, linked)
+    with pytest.raises(RuntimeError, match="worker_writable") as raised:
+        checkout_module.assert_base_repo_not_worker_writable(linked)
+    assert repr(expected) in str(raised.value)
+
+
+@pytest.mark.parametrize("failure", ["listing", "stat", "walk", "identity", "groups"])
+def test_base_permission_inspection_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    def broken(*args, **kwargs):
+        raise OSError("inspection unavailable")
+    if failure == "listing":
+        runner = lambda args: subprocess.CompletedProcess(args, 1, "", "listing unavailable")
+    else:
+        runner = checkout_module._default_runner
+        if failure == "stat":
+            monkeypatch.setattr(Path, "lstat", broken)
+        elif failure == "walk":
+            def walk(*args, **kwargs):
+                kwargs["onerror"](OSError("walk unavailable"))
+            monkeypatch.setattr(checkout_module.os, "walk", walk)
+        elif failure == "identity":
+            monkeypatch.setattr(checkout_module, "get_identities", broken)
+        else:
+            monkeypatch.setattr(checkout_module.os, "getgrouplist", broken)
+    with pytest.raises(RuntimeError, match="permissions_check_failed.*unavailable"):
+        checkout_module.assert_base_repo_not_worker_writable(repo, runner=runner)
+
+
+@pytest.mark.parametrize("portable_chmod", [False, True])
+def test_base_permissions_remediation_leaves_ignored_data_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portable_chmod: bool,
+) -> None:
+    if portable_chmod:
+        # Model BSD chmod's missing '--' support even on GNU hosts, but still
+        # execute the real chmod to verify modes and symlink-target preservation.
+        real_chmod = shutil.which("chmod")
+        assert real_chmod is not None
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        wrapper = bin_dir / "chmod"
+        wrapper.write_text(
+            '#!/bin/sh\n'
+            '[ "$#" -eq 2 ] && [ "$1" = go-w ] || exit 2\n'
+            'case "$2" in ./*) ;; *) exit 2 ;; esac\n'
+            f'exec {shlex.quote(real_chmod)} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    repo = _repo_with_main(tmp_path)
+    _git(repo, "config", "core.filemode", "false")
+    (repo / "shared.txt").chmod(0o666)
+    (repo / ".git/HEAD").chmod(0o666)
+    (repo / ".git/refs").chmod(0o777)
+    ignored = repo / ".venv" / "python"
+    ignored.parent.mkdir()
+    ignored.write_text("ignored\n")
+    ignored.chmod(0o666)
+    (repo / "tracked-link").symlink_to(".venv/python")
+    executable = repo / "-executable script\nname"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    _git(repo, "add", "--", "tracked-link", executable.name)
+    _git(repo, "commit", "-qm", "track a symlink and an option-like executable path")
+    executable.chmod(0o777)
+    exclude = repo / ".git/info/exclude"
+    exclude.write_text(exclude.read_text() + "\n.venv/\n")
+    subprocess.run(["sh", "-c", checkout_module.BASE_PERMISSIONS_REMEDIATION],
+                   env={**os.environ, "WORKLINK_REPO": str(repo)}, check=True)
+    assert stat.S_IMODE(ignored.stat().st_mode) == 0o666
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o755
+    docs = Path(__file__).resolve().parents[1] / "docs/internal/WORKLINK.md"
+    assert checkout_module.BASE_PERMISSIONS_REMEDIATION in docs.read_text()
+    assert stat.S_IMODE((repo / "shared.txt").stat().st_mode) == 0o644
+    assert stat.S_IMODE((repo / ".git/HEAD").stat().st_mode) == 0o644
+    assert stat.S_IMODE((repo / ".git/refs").stat().st_mode) == 0o755
+    assert create_worktree(repo, issue_id=2140, attempt=1).path.exists()
 
 
 def test_controller_source_overlap_guard_refuses_same_tree(
@@ -335,6 +611,7 @@ def test_ignored_only_untracked_content_is_accepted(tmp_path: Path) -> None:
     _git(repo, "commit", "-q", "-m", "ignore local directories")
     (repo / ".venv").mkdir()
     (repo / ".venv" / "python").write_text("ignored\n", encoding="utf-8")
+    (repo / ".venv" / "python").chmod(0o666)
     (repo / ".worktrees").mkdir()
     (repo / ".worktrees" / "attempt").write_text("ignored\n", encoding="utf-8")
     events: list[tuple[str, dict[str, object]]] = []
@@ -475,6 +752,7 @@ def test_attempt_base_fetch_uses_fresh_origin_without_mutating_source(
 
 
 def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
     calls: list[list[str]] = []
     events: list[tuple[str, dict[str, object]]] = []
 
@@ -507,6 +785,7 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
             "git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z",
             "--untracked-files=all", "--ignored=no",
         ],
+        ["git", "-C", str(tmp_path), "ls-files", "-z"],
         ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
         ["git", "-C", str(tmp_path), "for-each-ref", "--format=%(refname) %(objectname)"],
     ]
@@ -891,6 +1170,7 @@ def test_isolated_checkout_push_target_failures_clean_up_before_branch_creation(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / ".git").mkdir()
     path = tmp_path / ".worklink" / repo.name / "1125-3"
     calls: list[list[str]] = []
 
@@ -1375,7 +1655,7 @@ def test_enabled_eligible_checkout_is_a_worker_group_path_checkout(
     monkeypatch.setattr(
         checkout_module,
         "get_identities",
-        lambda: SimpleNamespace(mimir_uid=os.getuid(), worklink_gid=os.getgid()),
+        lambda: SimpleNamespace(mimir_uid=os.getuid(), worklink_gid=os.getgid(), worklink_uid=os.getuid() + 1),
     )
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -1545,7 +1825,7 @@ def test_non_linux_issued_checkout_rejects_paths_outside_root(
 def test_factory_checkout_is_private_inner_clone(tmp_path, monkeypatch):
     repo = _repo_with_main(tmp_path)
     monkeypatch.setattr(checkout_module, "get_identities", lambda: SimpleNamespace(
-        mimir_uid=os.getuid(), worklink_gid=os.getgid(),
+        mimir_uid=os.getuid(), worklink_gid=os.getgid(), worklink_uid=os.getuid() + 1,
     ))
     calls = []
 

@@ -1,4 +1,5 @@
 #!/command/with-contenv sh
+umask 022
 # In-container liveness watcher (a separate PROCESS from the agent, so a wedged
 # event loop — even one holding the GIL — can't freeze it). Reads the agent's
 # liveness beat; on a stale beat it alerts (ntfy/webhook) AND, with

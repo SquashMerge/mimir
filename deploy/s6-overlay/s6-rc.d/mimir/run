@@ -1,4 +1,5 @@
 #!/command/with-contenv sh
+umask 022
 # The agent. s6 supervises it: if it exits (crash / OOM / a watchdog SIGKILL),
 # s6 restarts THIS service in place — no full-container restart needed. Each
 # restart re-runs `mimir run`, so the clean-shutdown marker fires its

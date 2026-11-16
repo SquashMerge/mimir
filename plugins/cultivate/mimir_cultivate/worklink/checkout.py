@@ -29,6 +29,12 @@ _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _AUTHORIZATION_FACTORY = object()
 _DIRTY_PATH_SAMPLE_LIMIT = 20
+_WRITABLE_PATH_SAMPLE_LIMIT = 5
+BASE_PERMISSIONS_REMEDIATION = (
+    '(cd "$WORKLINK_REPO" && { printf \'.\\0\'; git ls-files -z; '
+    'git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | '
+    'xargs -0 -r sh -c \'for p do [ -L "$p" ] || chmod go-w "./$p" || exit; done\' sh)'
+)
 
 
 def _cultivate_selected() -> bool:
@@ -737,6 +743,7 @@ def _prepare_fresh_base(
     if not base_fetch:
         raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
     _assert_base_repo_clean(repo, runner=runner, event_logger=event_logger)
+    assert_base_repo_not_worker_writable(repo, runner=runner, event_logger=event_logger)
     _repair_base_alternates(repo, base=base, runner=runner, event_logger=event_logger)
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
         raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
@@ -858,6 +865,99 @@ def _assert_base_repo_clean(
         detail=f"{dirty_count} dirty path(s); {detail}",
         **payload,
     )
+
+
+def assert_base_repo_not_worker_writable(
+    repo: Path,
+    *,
+    runner: Runner = _default_runner,
+    event_logger: EventLogger | None = None,
+) -> None:
+    """Inspect tracked paths, their directories and Git metadata, plus every ancestor.
+
+    Ignored/untracked worktree data is never inspected. A writable directory lets the
+    worker rename or replace the entries in it, so the repository root, every
+    directory holding a tracked path, and each directory above the repository (and
+    above a linked worktree's Git directories) are checked too. A symlinked
+    repository or ``.git`` is checked at its resolved directory and above both the
+    link and its target. Above the
+    repository a sticky directory such as /tmp is safe unless the worker owns it:
+    it cannot rename an entry it does not own there.
+
+    Use the worker's identity, not os.access() as the controller (or root).
+    Ownership alone is unsafe: an owner can chmod a read-only entry back to writable.
+    """
+    try:
+        tracked = runner(["git", "-C", str(repo), "ls-files", "-z"])
+        if tracked.returncode != 0:
+            raise ValueError((tracked.stderr or tracked.stdout).strip() or "git ls-files failed")
+        identities = get_identities()
+        groups = set(os.getgrouplist("worklink", identities.worklink_gid))
+        paths = {repo / name for name in tracked.stdout.split("\0") if name}
+        paths.update(parent for path in list(paths) for parent in path.parents
+                     if parent == repo or repo in parent.parents)
+        paths.add(repo)
+        dot_git = repo / ".git"
+        # A linked base worktree has a .git marker and a separate common store.
+        git_dirs = [dot_git]
+        if dot_git.is_file():
+            marker = dot_git.read_text().strip()
+            # The successful Git listing above already validated this marker.
+            git_dir = (repo / marker.removeprefix("gitdir:").strip()).resolve()
+            git_dirs.append(git_dir)
+            common = git_dir / "commondir"
+            if common.exists():
+                git_dirs.append((git_dir / common.read_text().strip()).resolve())
+
+        def walk_error(exc: OSError) -> None:
+            raise exc
+
+        for git_dir in git_dirs:
+            paths.add(git_dir)
+            if git_dir.is_dir():
+                for root, dirs, files in os.walk(git_dir, onerror=walk_error):
+                    paths.update(Path(root) / name for name in dirs + files)
+        # A symlinked base or .git has mode-less link bits: check the directory it
+        # resolves to as strictly as the repository itself, and walk the ancestors
+        # of both the lexical path (the link's own parents) and the resolved one.
+        roots = [repo, *git_dirs]
+        paths.update(root.resolve() for root in roots)
+        ancestors = {parent for root in roots
+                     for candidate in (Path(os.path.abspath(root)), root.resolve())
+                     for parent in candidate.parents}
+        ancestors -= {path.resolve() for path in paths if not path.is_symlink()}
+
+        def worker_writable(path: Path, *, sticky_ok: bool) -> bool:
+            metadata = path.lstat()
+            if metadata.st_uid == identities.worklink_uid:
+                return True
+            # Symlink mode bits are not access permissions on POSIX. Their
+            # containing directory is checked, as is their ownership.
+            mode = 0 if stat.S_ISLNK(metadata.st_mode) else metadata.st_mode
+            if sticky_ok and mode & stat.S_ISVTX:
+                return False
+            return bool(mode & stat.S_IWOTH or (mode & stat.S_IWGRP and metadata.st_gid in groups))
+
+        writable: list[str] = [os.path.relpath(path, repo) for path in sorted(paths)
+                               if worker_writable(path, sticky_ok=False)]
+        writable += [str(path) for path in sorted(ancestors) if worker_writable(path, sticky_ok=True)]
+    except (OSError, RuntimeError, ValueError) as exc:
+        _refuse_base_repo(
+            repo, event_logger, reason="permissions_check_failed", detail=str(exc),
+        )
+    if writable:
+        examples = writable[:_WRITABLE_PATH_SAMPLE_LIMIT]
+        _refuse_base_repo(
+            repo, event_logger, reason="worker_writable",
+            detail=(
+                f"{len(writable)} worker-writable path(s): {', '.join(map(repr, examples))}; "
+                "operator: restore controller ownership for worker-owned paths, then "
+                f"strip group/other write bits as the base owner: {BASE_PERMISSIONS_REMEDIATION}; "
+                "fix any absolute path listed (a directory above the repository) by hand"
+            ),
+            writable_count=len(writable), writable_paths=examples,
+            sample_limit=_WRITABLE_PATH_SAMPLE_LIMIT,
+        )
 
 
 def _refuse_base_repo(

@@ -97,6 +97,34 @@ def test_ci_python_versions_match_package(job_name: str) -> None:
             assert "--durations=25" in suite["run"]
 
 
+@pytest.mark.parametrize("probe_status", [0, 37])
+def test_macos_installs_and_probes_timeout_before_tests(tmp_path: Path, probe_status: int) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    steps = workflow["jobs"]["pytest-macos"]["steps"]
+    install = next(step for step in steps if step.get("name") == "Install GNU timeout")
+    suite = next(step for step in steps if step.get("name") == "Run mimir test suite")
+    assert steps.index(install) < steps.index(suite)
+    assert [shlex.split(line) for line in install["run"].splitlines() if line.strip()] == [
+        ["brew", "install", "coreutils"], ["gtimeout", "--version"],
+    ]
+    # Execute the shipped step with fixture-owned tools: prove the readiness
+    # probe is reached, and a broken install cannot silently pass its step.
+    log = tmp_path / "calls"
+    for name, status in (("brew", 0), ("gtimeout", probe_status)):
+        tool = tmp_path / name
+        tool.write_text(
+            f'#!/bin/sh\nprintf "%s\\n" "{name} $*" >> "$PROBE_LOG"\nexit {status}\n'
+        )
+        tool.chmod(0o755)
+    result = subprocess.run(
+        ["/bin/bash", "-eo", "pipefail", "-c", install["run"]],
+        env={**os.environ, "PATH": str(tmp_path), "PROBE_LOG": str(log)},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == probe_status, result.stderr
+    assert log.read_text().splitlines() == ["brew install coreutils", "gtimeout --version"]
+
+
 @pytest.mark.parametrize(
     "requires_python, versions",
     [

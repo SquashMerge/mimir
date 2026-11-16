@@ -208,7 +208,7 @@ def test_image_wiring_keeps_daemon_gate_out_of_agent_startup():
 
 def test_reserved_service_and_wrappers_use_immutable_interpreter():
     run = (ROOT / "deploy/s6-overlay/s6-rc.d/worklink-opencode/run").read_text()
-    assert run == "#!/command/with-contenv sh\nexec /usr/local/libexec/worklink-opencode-service\n"
+    assert run == "#!/command/with-contenv sh\numask 022\nexec /usr/local/libexec/worklink-opencode-service\n"
     for name, module in (("worklink-opencode-service", "daemon_service"),
                          ("worklink-opencode-login", "daemon_login")):
         assert (DOCKER / name).read_text() == (

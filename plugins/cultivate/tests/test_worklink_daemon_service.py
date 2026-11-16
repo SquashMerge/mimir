@@ -122,7 +122,15 @@ def test_daemon_cleanup_base_lends_identity_without_ambient_git_config(tmp_path)
                 "WORKLINK_CHECKOUT_ROOT": str(tmp_path / "checkouts")})
     repo = tmp_path / "base"
     script = _daemon_cleanup_base_setup(repo) + f'''
+import os
+from types import SimpleNamespace
+import mimir_cultivate.worklink.checkout as checkout_module
 from mimir_cultivate.worklink.checkout import create_isolated_checkout
+# The base-permission preflight resolves Worklink identities; the child cannot
+# inherit the suite's synthetic_worklink_identities patch, so supply its own.
+checkout_module.get_identities = lambda: SimpleNamespace(
+    mimir_uid=os.geteuid(), worklink_uid=os.geteuid() + 4242, worklink_gid=os.getegid() + 4242)
+os.getgrouplist = lambda user, gid: [gid]
 lease = create_isolated_checkout(Path({str(repo)!r}), issue_id=2138, attempt=1,
                                 base='main', worker_eligible=False)
 for key, expected in (('user.name', 'daemon-cleanup-test'),

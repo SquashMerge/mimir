@@ -566,6 +566,41 @@ Per-issue flow (one `run`):
    bounded samples of staged, unstaged, and non-ignored untracked paths; ignored
    local directories such as `.venv/` and `.worktrees/` do not count. Worklink
    never resets or cleans the shared base automatically.
+
+   Before claiming work, and again before preparing a checkout, Worklink also
+   refuses a base whose tracked files, `.git` entries, repository root,
+   tracked directories, or directories above the repository are writable by the
+   `worklink` account: other-write, group-write for any group the account holds,
+   or worker ownership (even read-only owners can change modes). Inspection
+   failures are refused too. This is an operator-actionable `refused` outcome,
+   without consuming a claim/attempt. The `worklink_base_repo_refused` event
+   names the count and at most five example paths. Untracked/ignored worktree
+   data, including `.venv/` and `node_modules/`, is not permission-scanned.
+
+   **Remediation:** as the base repository's controller owner, with
+   `WORKLINK_REPO` set to that base clone, strip group/other write bits in one line:
+
+   ```sh
+   (cd "$WORKLINK_REPO" && { printf '.\0'; git ls-files -z; git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w "./$p" || exit; done' sh)
+   ```
+
+   This covers the repository root and every tracked directory as well as
+   tracked files and `.git`. It preserves executable bits and leaves
+   untracked/ignored worktree paths alone (including symlink targets). A
+   directory *above* the repository that the worker can write (listed by
+   absolute path in the refusal) must be fixed by hand; a sticky directory such
+   as `/tmp` is accepted unless the worker owns it. A symlinked base or `.git`
+   is checked at the directory it resolves to, and above both the link and
+   its target. Restore controller ownership separately for any worker-owned entries;
+   chmod cannot repair ownership. For a linked base worktree, also remediate its
+   referenced Git directory and common Git directory. Controller-side image
+   services, generated startup scripts, and the root Worklink executor process
+   set umask 022 explicitly, including when launched through `docker exec` with
+   umask 0000. The worker privilege drop and its children instead use umask 002:
+   issued checkouts need group-write for the controller's cleanup via group
+   `worklink`. Neither mask grants other-write; base-repo refusal is unchanged.
+   Operator Git/deployment shells should likewise start with `umask 022` so later
+   writes preserve the boundary. Worklink never changes base permissions itself.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
    Template lives at `mimir_cultivate/prompt_templates/worklink-order.md` (operator-tunable). The
