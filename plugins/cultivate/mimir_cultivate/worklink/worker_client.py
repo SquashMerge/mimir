@@ -5,6 +5,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+import logging
 import math
 import os
 import re
@@ -311,7 +312,14 @@ class WorkerClient:
             sock.sendmsg([raw], ancillary)
             response = json.loads(await asyncio.to_thread(sock.recv, MAX_REQUEST_BYTES + 1))
             if not isinstance(response, dict) or "error" in response:
-                raise RuntimeError("session executor operation failed")
+                from mimir.redaction import redact_text
+
+                detail = response.get("error") if isinstance(response, dict) else None
+                detail = redact_text(detail)[:300] if isinstance(detail, str) else "invalid executor response"
+                # Keep the executor's (bounded, redacted) reason: without it every
+                # quiescence failure surfaced only as "quiescence unverified".
+                logging.getLogger(__name__).warning("worklink session %s failed: %s", operation, detail)
+                raise RuntimeError(f"session executor operation failed: {detail}")
             if output is not None:
                 captured, dropped = output.read_bounded()
                 response["stdout"] = captured.decode("utf-8", "ignore")

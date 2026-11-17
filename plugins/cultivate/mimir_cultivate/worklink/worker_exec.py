@@ -1406,6 +1406,19 @@ def _open_epic_session_checkout(request: dict[str, Any], *, for_launch: bool) ->
     return fd
 
 
+def _helper_failure(stdout: bytes) -> str:
+    """The helper's bounded failure label: an exception class and a code-literal reason."""
+    try:
+        failure = json.loads(stdout[:1024]).get("failure")
+    except (ValueError, AttributeError):
+        return ""
+    if not isinstance(failure, dict):
+        return ""
+    label = [str(failure.get(key))[:80] for key in ("class", "reason", "status") if key in failure]
+    cleaned = " ".join(part for part in label if re.fullmatch(r"[A-Za-z0-9_ .:-]{1,80}", part))
+    return f" ({cleaned})" if cleaned else ""
+
+
 def _handle_session(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     from .daemon_config import SESSION_HELPER_TIMEOUT_S, PublishingCredentials, parse_launch_snapshot
     from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
@@ -1477,7 +1490,8 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
         pass_fds=(fds[1],) if observe else (),
     )
     if process.returncode != 0 or len(process.stdout) > MAX_REQUEST_BYTES:
-        raise RuntimeError("session operation failed; retain controller and checkout")
+        raise RuntimeError("session operation failed" + _helper_failure(process.stdout)
+                           + "; retain controller and checkout")
     response = json.loads(process.stdout)
     if not isinstance(response, dict):
         raise RuntimeError("invalid session helper response")
