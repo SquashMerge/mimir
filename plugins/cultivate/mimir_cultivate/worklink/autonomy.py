@@ -74,6 +74,7 @@ FACTORY_MAX_CONCURRENT_DEFAULT = 1
 log = logging.getLogger(__name__)
 
 # Process-local edge-triggered telemetry; refusal decisions are always rechecked.
+# Ready paths are removed; paths deleted externally can remain until process exit.
 _factory_runtime_prune_refusals: dict[Path, str] = {}
 
 
@@ -373,8 +374,21 @@ def prune_stale_attempt_checkouts_for_home(
             archived_listing = list_factory_records(home, archived=True)
         except Exception:
             return []
-        if listing.failures or archived_listing.failures:
+        if listing.failures:
             return []
+        # Legacy archives may be unreadable without invalidating other attempts.
+        # Use only the filename for containment, never unvalidated record bytes.
+        unreadable_archive_attempts: set[str] = set()
+        unidentified_archive_failure = False
+        for failure in archived_listing.failures:
+            match = re.fullmatch(
+                r"(?:chainlink-)?([0-9]+)-attempt-([0-9]+)(?:-[0-9]+)?\.json",
+                failure.path.name,
+            )
+            if match is None:
+                unidentified_archive_failure = True
+            else:
+                unreadable_archive_attempts.add(f"{int(match[1])}-{int(match[2])}")
         factory_records = listing.records
         runtime_records = factory_records + archived_listing.records
         retained_run_paths = {
@@ -403,7 +417,11 @@ def prune_stale_attempt_checkouts_for_home(
             prepare_prune=lambda child: (
                 _preserve_before_prune(home, Path(repo_raw), child, factory_records,
                                        run=run, defaults=defaults)
-                or _prepare_factory_runtime_prune(child, runtime_records)
+                or _prepare_factory_runtime_prune(
+                    child, runtime_records,
+                    archived_record_unreadable=child.name in unreadable_archive_attempts,
+                    unidentified_archive_failure=unidentified_archive_failure,
+                )
             ),
         )
         for child in pruned:
@@ -500,7 +518,10 @@ def _prune_preserved_for_closed_issues(
             continue
 
 
-def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object]) -> bool:
+def _prepare_factory_runtime_prune(
+    child: Path, factory_records: Sequence[object], *,
+    archived_record_unreadable: bool = False, unidentified_archive_failure: bool = False,
+) -> bool:
     """Empty worker-owned subdirectories before the controller removes the attempt."""
     runtime = child / ".factory-runtime"
     attempt_path = child.resolve()
@@ -531,6 +552,8 @@ def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object
     # legacy records whose children_reaped field defaults to False.
     if not runtime.exists() and not runtime.is_symlink():
         return ready()
+    if archived_record_unreadable or (unidentified_archive_failure and not matching):
+        return refuse("archived factory record unreadable")
     if not matching:
         return refuse("runtime has no authoritative factory record")
     if any(not getattr(record, "children_reaped", False) for record in matching):

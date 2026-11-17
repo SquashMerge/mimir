@@ -1623,6 +1623,79 @@ def test_prune_runtime_refusals_are_independent_per_path(
     assert [fields["attempt_path"] for _, fields in events] == [str(child), str(other)]
 
 
+@pytest.mark.parametrize("archive_name", [
+    "chainlink-842-attempt-1.json", "chainlink-842-attempt-1-2.json",
+    "842-attempt-1.json", "unidentified-legacy.json",
+])
+def test_prune_legacy_archive_failure_is_contained_per_attempt(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+    monkeypatch: pytest.MonkeyPatch, archive_name: str,
+) -> None:
+    repo, readable, record = runtime_prune_attempt
+    save_factory_record(tmp_path, record)
+    readable_archive, = archive_worklink_factory_records(tmp_path, record.issue_id)
+
+    legacy = readable.parent / "842-1"
+    sandbox = legacy / "checkout" / ".factory-sandboxes" / "chainlink-842"
+    sandbox.mkdir(parents=True)
+    (legacy / ".factory-runtime").mkdir()
+    (legacy / ".factory-runtime" / "store").write_text("legacy runtime", encoding="utf-8")
+    legacy_record = replace(
+        _factory_record(sandbox, phase="terminal", status="completed", process="dead"),
+        children_reaped=True,
+    )
+    payload = legacy_record.to_json()
+    # Real-shape historical contract from deployment review: list-valued gates
+    # (as in chainlink-1521-attempt-1/-2), not merely malformed JSON.
+    payload["status"]["gates"] = []
+    unreadable_archive = readable_archive.parent / archive_name
+    unreadable_archive.write_text(json.dumps(payload), encoding="utf-8")
+
+    unrelated = readable.parent / "843-1"
+    unrelated.mkdir()
+    # Unknown archive names also refuse only runtime-bearing attempts without
+    # readable authority, never ordinary attempts without a runtime store.
+    for child in (readable, legacy, unrelated):
+        os.utime(child, (0, 0))
+    listing = list_factory_records(tmp_path, archived=True)
+    assert listing.records == (record,)
+    assert len(listing.failures) == 1
+    assert listing.failures[0].path == unreadable_archive
+    assert "gates must be a bounded object" in listing.failures[0].reason
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+
+    pruned = autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo)
+    assert set(pruned) == {readable, unrelated}
+    assert not readable.exists()
+    assert not unrelated.exists()
+    assert (legacy / ".factory-runtime" / "store").read_text() == "legacy runtime"
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    refusals = [fields for name, fields in events if name == "worklink_factory_runtime_prune_refused"]
+    assert refusals == [{
+        "attempt_path": str(legacy), "reason": "archived factory record unreadable",
+    }]
+    assert readable_archive.is_file()
+    assert unreadable_archive.is_file()
+    assert list_factory_records(tmp_path).records == ()
+
+
+def test_prune_unreadable_live_record_still_blocks_all_attempts(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    path = save_factory_record(tmp_path, record)
+    path.write_text("{", encoding="utf-8")
+    unrelated = child.parent / "842-1"
+    unrelated.mkdir()
+    os.utime(unrelated, (0, 0))
+
+    assert len(list_factory_records(tmp_path).failures) == 1
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert unrelated.is_dir()
+    assert (child / ".factory-runtime" / "data" / "store").read_text() == "retained runtime"
+
+
 @pytest.mark.parametrize("unsafe", ["malformed", "symlink"])
 def test_prune_refuses_unreadable_archived_record(
     tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord], unsafe: str,
