@@ -972,7 +972,7 @@ def _daemon_item(sid: str, kind: str, payload: object) -> dict:
     ("move", {"projectID": "prj_x", "location": {"directory": "/workspace/x"}}),
 ])
 async def test_each_documented_daemon_inbox_item_holds_the_session_open(tmp_path, kind, payload):
-    """``Session.Inbox.Info`` (OpenCode 2.2.7) is user | synthetic | compaction | move."""
+    """``Session.Inbox.Info`` (OpenCode 2.3.0) is user | synthetic | compaction | move."""
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         controller = await create(client, tmp_path)
         sid = controller.record.opencode_session_id

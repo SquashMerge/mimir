@@ -1,4 +1,4 @@
-"""Epic consumers against the schema-backed synthetic 2.2.7 daemon."""
+"""Epic consumers against the schema-backed synthetic 2.3.0 daemon."""
 from __future__ import annotations
 
 import asyncio

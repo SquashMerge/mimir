@@ -29,7 +29,7 @@ def jwt(exp):
 
 @pytest.fixture
 async def stores(tmp_path, monkeypatch, aiohttp_server):
-    root = FIXTURES / "opencode_2_2_7"
+    root = FIXTURES / "opencode_2_3_0"
     template = json.loads((root / "auth-export.json").read_text())[0]
     schema = OpenCodeSchema()
     fixture = SimpleNamespace(entries=[], writes=0, reads=0, locked=[], corrupt=None, validate_export=True)
@@ -348,12 +348,12 @@ async def test_wrong_password_has_no_payload_in_error(stores):
 
 
 def test_pinned_auth_export_import_contract():
-    root = FIXTURES / "opencode_2_2_7"
+    root = FIXTURES / "opencode_2_3_0"
     exported = json.loads((root / "auth-export.json").read_text())
     result = json.loads((root / "auth-import-result.json").read_text())
-    assert result == {"version": "2.2.7", "unauthenticated": 401, "import_stdout": "",
+    assert result == {"version": "2.3.0", "unauthenticated": 401, "import_stdout": "",
                       "create_status": 200, "replacement_method": "chatgpt-headless",
-                      "replacement_status": 200, "remove_status": 204}
+                      "replacement_status": 200, "remove_status": 204, "active_method_id": None}
     for entry in exported:
         OpenCodeSchema().named("Credential.Entry", entry)
     assert exported[0]["value"]["methodID"] == "chatgpt-browser"

@@ -1,0 +1,1831 @@
+{
+  "operations_checked": [
+    "DELETE /api/credential/{credentialID}",
+    "DELETE /api/session/{sessionID}/inbox/{inboxID}",
+    "DELETE /api/shell/{id}",
+    "GET /api/credential",
+    "GET /api/event",
+    "GET /api/experimental/session/{sessionID}/log",
+    "GET /api/info",
+    "GET /api/session",
+    "GET /api/session/{sessionID}",
+    "GET /api/session/{sessionID}/inbox",
+    "GET /api/session/{sessionID}/message",
+    "GET /api/shell",
+    "POST /api/credential",
+    "POST /api/session",
+    "POST /api/session/{sessionID}/command",
+    "POST /api/session/{sessionID}/interrupt",
+    "POST /api/session/{sessionID}/prompt",
+    "PUT /api/session/{sessionID}/environment"
+  ],
+  "schemas_checked": 252,
+  "differences": [
+    {
+      "path": "/operations/GET /api/event/parameters",
+      "before": [
+        {
+          "name": "types",
+          "in": "query",
+          "schema": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "location.shutdown",
+                  "models-dev.refreshed",
+                  "credential.updated",
+                  "credential.switched",
+                  "integration.updated",
+                  "provider.updated",
+                  "model.updated",
+                  "agent.updated",
+                  "session.created",
+                  "session.agent.selected",
+                  "session.model.selected",
+                  "session.moved",
+                  "session.renamed",
+                  "session.metadata.updated",
+                  "session.permissions",
+                  "session.viewed",
+                  "session.archived",
+                  "session.unarchived",
+                  "session.usage.updated",
+                  "session.deleted",
+                  "session.forked",
+                  "session.inbox.delivered",
+                  "session.inbox.enqueued",
+                  "session.inbox.cancelled",
+                  "session.inbox.delivery.changed",
+                  "session.execution.started",
+                  "session.execution.succeeded",
+                  "session.execution.failed",
+                  "session.execution.interrupted",
+                  "session.instructions.updated",
+                  "session.synthetic",
+                  "session.skill.activated",
+                  "session.shell.started",
+                  "session.shell.ended",
+                  "session.step.started",
+                  "session.step.streamed",
+                  "session.step.ended",
+                  "session.step.failed",
+                  "session.text.started",
+                  "session.text.delta",
+                  "session.text.ended",
+                  "session.reasoning.started",
+                  "session.reasoning.delta",
+                  "session.reasoning.ended",
+                  "session.tool.input.started",
+                  "session.tool.input.delta",
+                  "session.tool.input.ended",
+                  "session.tool.called",
+                  "session.tool.progress",
+                  "session.tool.success",
+                  "session.tool.failed",
+                  "session.retry.scheduled",
+                  "session.compaction.started",
+                  "session.compaction.delta",
+                  "session.compaction.ended",
+                  "session.compaction.failed",
+                  "session.revert.staged",
+                  "session.revert.cleared",
+                  "session.revert.committed",
+                  "filesystem.changed",
+                  "reference.updated",
+                  "permission.asked",
+                  "permission.replied",
+                  "plugin.updated",
+                  "project.updated",
+                  "worktree.updated",
+                  "worktree.resolved",
+                  "command.updated",
+                  "config.updated",
+                  "skill.updated",
+                  "pty.created",
+                  "pty.updated",
+                  "pty.exited",
+                  "pty.deleted",
+                  "persistent-pty.added",
+                  "persistent-pty.removed",
+                  "persistent-pty.updated",
+                  "shell.created",
+                  "shell.exited",
+                  "shell.deleted",
+                  "form.created",
+                  "form.replied",
+                  "form.cancelled",
+                  "websearch.updated",
+                  "artifact.updated",
+                  "session.status",
+                  "session.idle",
+                  "tui.prompt.append",
+                  "tui.command.execute",
+                  "tui.toast.show",
+                  "tui.session.select",
+                  "installation.updated",
+                  "installation.update-available",
+                  "vcs.branch.updated",
+                  "mcp.status.changed",
+                  "mcp.resources.changed"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^rpc\\.[\\s\\S]*?$"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "enum": [
+                        "location.shutdown",
+                        "models-dev.refreshed",
+                        "credential.updated",
+                        "credential.switched",
+                        "integration.updated",
+                        "provider.updated",
+                        "model.updated",
+                        "agent.updated",
+                        "session.created",
+                        "session.agent.selected",
+                        "session.model.selected",
+                        "session.moved",
+                        "session.renamed",
+                        "session.metadata.updated",
+                        "session.permissions",
+                        "session.viewed",
+                        "session.archived",
+                        "session.unarchived",
+                        "session.usage.updated",
+                        "session.deleted",
+                        "session.forked",
+                        "session.inbox.delivered",
+                        "session.inbox.enqueued",
+                        "session.inbox.cancelled",
+                        "session.inbox.delivery.changed",
+                        "session.execution.started",
+                        "session.execution.succeeded",
+                        "session.execution.failed",
+                        "session.execution.interrupted",
+                        "session.instructions.updated",
+                        "session.synthetic",
+                        "session.skill.activated",
+                        "session.shell.started",
+                        "session.shell.ended",
+                        "session.step.started",
+                        "session.step.streamed",
+                        "session.step.ended",
+                        "session.step.failed",
+                        "session.text.started",
+                        "session.text.delta",
+                        "session.text.ended",
+                        "session.reasoning.started",
+                        "session.reasoning.delta",
+                        "session.reasoning.ended",
+                        "session.tool.input.started",
+                        "session.tool.input.delta",
+                        "session.tool.input.ended",
+                        "session.tool.called",
+                        "session.tool.progress",
+                        "session.tool.success",
+                        "session.tool.failed",
+                        "session.retry.scheduled",
+                        "session.compaction.started",
+                        "session.compaction.delta",
+                        "session.compaction.ended",
+                        "session.compaction.failed",
+                        "session.revert.staged",
+                        "session.revert.cleared",
+                        "session.revert.committed",
+                        "filesystem.changed",
+                        "reference.updated",
+                        "permission.asked",
+                        "permission.replied",
+                        "plugin.updated",
+                        "project.updated",
+                        "worktree.updated",
+                        "worktree.resolved",
+                        "command.updated",
+                        "config.updated",
+                        "skill.updated",
+                        "pty.created",
+                        "pty.updated",
+                        "pty.exited",
+                        "pty.deleted",
+                        "persistent-pty.added",
+                        "persistent-pty.removed",
+                        "persistent-pty.updated",
+                        "shell.created",
+                        "shell.exited",
+                        "shell.deleted",
+                        "form.created",
+                        "form.replied",
+                        "form.cancelled",
+                        "websearch.updated",
+                        "artifact.updated",
+                        "session.status",
+                        "session.idle",
+                        "tui.prompt.append",
+                        "tui.command.execute",
+                        "tui.toast.show",
+                        "tui.session.select",
+                        "installation.updated",
+                        "installation.update-available",
+                        "vcs.branch.updated",
+                        "mcp.status.changed",
+                        "mcp.resources.changed"
+                      ]
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^rpc\\.[\\s\\S]*?$"
+                    }
+                  ]
+                }
+              }
+            ],
+            "description": "Only send events of these types, plus the initial server.connected event. When omitted, all events are sent."
+          },
+          "required": false
+        }
+      ],
+      "after": [
+        {
+          "name": "types",
+          "in": "query",
+          "schema": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "location.shutdown",
+                  "models-dev.refreshed",
+                  "credential.updated",
+                  "credential.switched",
+                  "integration.updated",
+                  "provider.updated",
+                  "model.updated",
+                  "agent.updated",
+                  "session.created",
+                  "session.agent.selected",
+                  "session.model.selected",
+                  "session.moved",
+                  "session.renamed",
+                  "session.metadata.updated",
+                  "session.permissions",
+                  "session.viewed",
+                  "session.archived",
+                  "session.unarchived",
+                  "session.usage.updated",
+                  "session.deleted",
+                  "session.forked",
+                  "session.inbox.delivered",
+                  "session.inbox.enqueued",
+                  "session.inbox.cancelled",
+                  "session.inbox.delivery.changed",
+                  "session.execution.started",
+                  "session.execution.succeeded",
+                  "session.execution.failed",
+                  "session.execution.interrupted",
+                  "session.instructions.updated",
+                  "session.synthetic",
+                  "session.skill.activated",
+                  "session.shell.started",
+                  "session.shell.ended",
+                  "session.step.started",
+                  "session.step.first-token",
+                  "session.step.streamed",
+                  "session.step.ended",
+                  "session.step.failed",
+                  "session.text.started",
+                  "session.text.delta",
+                  "session.text.ended",
+                  "session.reasoning.started",
+                  "session.reasoning.delta",
+                  "session.reasoning.ended",
+                  "session.tool.input.started",
+                  "session.tool.input.delta",
+                  "session.tool.input.ended",
+                  "session.tool.called",
+                  "session.tool.progress",
+                  "session.tool.success",
+                  "session.tool.failed",
+                  "session.retry.scheduled",
+                  "session.compaction.started",
+                  "session.compaction.delta",
+                  "session.compaction.ended",
+                  "session.compaction.failed",
+                  "session.revert.staged",
+                  "session.revert.cleared",
+                  "session.revert.committed",
+                  "filesystem.changed",
+                  "reference.updated",
+                  "permission.asked",
+                  "permission.replied",
+                  "plugin.updated",
+                  "project.updated",
+                  "worktree.updated",
+                  "worktree.resolved",
+                  "command.updated",
+                  "config.updated",
+                  "skill.updated",
+                  "pty.created",
+                  "pty.updated",
+                  "pty.exited",
+                  "pty.deleted",
+                  "persistent-pty.added",
+                  "persistent-pty.removed",
+                  "persistent-pty.updated",
+                  "shell.created",
+                  "shell.exited",
+                  "shell.deleted",
+                  "form.created",
+                  "form.replied",
+                  "form.cancelled",
+                  "websearch.updated",
+                  "artifact.updated",
+                  "session.status",
+                  "session.idle",
+                  "tui.prompt.append",
+                  "tui.command.execute",
+                  "tui.toast.show",
+                  "tui.session.select",
+                  "installation.updated",
+                  "installation.update-available",
+                  "vcs.branch.updated",
+                  "mcp.status.changed",
+                  "mcp.resources.changed",
+                  "experimental.mcp.event"
+                ]
+              },
+              {
+                "type": "string",
+                "pattern": "^rpc\\.[\\s\\S]*?$"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "enum": [
+                        "location.shutdown",
+                        "models-dev.refreshed",
+                        "credential.updated",
+                        "credential.switched",
+                        "integration.updated",
+                        "provider.updated",
+                        "model.updated",
+                        "agent.updated",
+                        "session.created",
+                        "session.agent.selected",
+                        "session.model.selected",
+                        "session.moved",
+                        "session.renamed",
+                        "session.metadata.updated",
+                        "session.permissions",
+                        "session.viewed",
+                        "session.archived",
+                        "session.unarchived",
+                        "session.usage.updated",
+                        "session.deleted",
+                        "session.forked",
+                        "session.inbox.delivered",
+                        "session.inbox.enqueued",
+                        "session.inbox.cancelled",
+                        "session.inbox.delivery.changed",
+                        "session.execution.started",
+                        "session.execution.succeeded",
+                        "session.execution.failed",
+                        "session.execution.interrupted",
+                        "session.instructions.updated",
+                        "session.synthetic",
+                        "session.skill.activated",
+                        "session.shell.started",
+                        "session.shell.ended",
+                        "session.step.started",
+                        "session.step.first-token",
+                        "session.step.streamed",
+                        "session.step.ended",
+                        "session.step.failed",
+                        "session.text.started",
+                        "session.text.delta",
+                        "session.text.ended",
+                        "session.reasoning.started",
+                        "session.reasoning.delta",
+                        "session.reasoning.ended",
+                        "session.tool.input.started",
+                        "session.tool.input.delta",
+                        "session.tool.input.ended",
+                        "session.tool.called",
+                        "session.tool.progress",
+                        "session.tool.success",
+                        "session.tool.failed",
+                        "session.retry.scheduled",
+                        "session.compaction.started",
+                        "session.compaction.delta",
+                        "session.compaction.ended",
+                        "session.compaction.failed",
+                        "session.revert.staged",
+                        "session.revert.cleared",
+                        "session.revert.committed",
+                        "filesystem.changed",
+                        "reference.updated",
+                        "permission.asked",
+                        "permission.replied",
+                        "plugin.updated",
+                        "project.updated",
+                        "worktree.updated",
+                        "worktree.resolved",
+                        "command.updated",
+                        "config.updated",
+                        "skill.updated",
+                        "pty.created",
+                        "pty.updated",
+                        "pty.exited",
+                        "pty.deleted",
+                        "persistent-pty.added",
+                        "persistent-pty.removed",
+                        "persistent-pty.updated",
+                        "shell.created",
+                        "shell.exited",
+                        "shell.deleted",
+                        "form.created",
+                        "form.replied",
+                        "form.cancelled",
+                        "websearch.updated",
+                        "artifact.updated",
+                        "session.status",
+                        "session.idle",
+                        "tui.prompt.append",
+                        "tui.command.execute",
+                        "tui.toast.show",
+                        "tui.session.select",
+                        "installation.updated",
+                        "installation.update-available",
+                        "vcs.branch.updated",
+                        "mcp.status.changed",
+                        "mcp.resources.changed",
+                        "experimental.mcp.event"
+                      ]
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^rpc\\.[\\s\\S]*?$"
+                    }
+                  ]
+                }
+              }
+            ],
+            "description": "Only send events of these types, plus the initial server.connected event. When omitted, all events are sent."
+          },
+          "required": false
+        }
+      ]
+    },
+    {
+      "path": "/operations/POST /api/session/requestBody/content/application/json/schema/properties/parentID/description",
+      "before": null,
+      "after": "Set parentID to create a subagent session at the parent's location; set agent to choose its agent (otherwise it uses the default) and start it with session.prompt. After each completed round, the child sends a `<subagent>` report to the parent's inbox and wakes the parent unless it has a staged revert."
+    },
+    {
+      "path": "/schemas/Event.VersionEncoded_37",
+      "before": {
+        "type": "number",
+        "enum": [
+          2
+        ]
+      },
+      "after": null
+    },
+    {
+      "path": "/schemas/Event.VersionEncoded_38",
+      "before": null,
+      "after": {
+        "type": "number",
+        "enum": [
+          2
+        ]
+      }
+    },
+    {
+      "path": "/schemas/Event.VersionEncoded_47",
+      "before": {
+        "type": "number",
+        "enum": [
+          1
+        ]
+      },
+      "after": null
+    },
+    {
+      "path": "/schemas/Event.VersionEncoded_48",
+      "before": null,
+      "after": {
+        "type": "number",
+        "enum": [
+          1
+        ]
+      }
+    },
+    {
+      "path": "/schemas/Session.Event.Durable/anyOf",
+      "before": [
+        {
+          "$ref": "#/components/schemas/session.created"
+        },
+        {
+          "$ref": "#/components/schemas/session.agent.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.model.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.moved"
+        },
+        {
+          "$ref": "#/components/schemas/session.renamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.metadata.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.permissions"
+        },
+        {
+          "$ref": "#/components/schemas/session.viewed"
+        },
+        {
+          "$ref": "#/components/schemas/session.archived"
+        },
+        {
+          "$ref": "#/components/schemas/session.unarchived"
+        },
+        {
+          "$ref": "#/components/schemas/session.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/session.forked"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivered"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.enqueued"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.cancelled"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivery.changed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.succeeded"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.interrupted"
+        },
+        {
+          "$ref": "#/components/schemas/session.instructions.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.synthetic"
+        },
+        {
+          "$ref": "#/components/schemas/session.skill.activated"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.streamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.called"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.success"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.retry.scheduled"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.staged"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.cleared"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.committed"
+        },
+        {
+          "$ref": "#/components/schemas/session.usage.recorded"
+        },
+        {
+          "$ref": "#/components/schemas/session.message.content.updated"
+        }
+      ],
+      "after": [
+        {
+          "$ref": "#/components/schemas/session.created"
+        },
+        {
+          "$ref": "#/components/schemas/session.agent.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.model.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.moved"
+        },
+        {
+          "$ref": "#/components/schemas/session.renamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.metadata.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.permissions"
+        },
+        {
+          "$ref": "#/components/schemas/session.viewed"
+        },
+        {
+          "$ref": "#/components/schemas/session.archived"
+        },
+        {
+          "$ref": "#/components/schemas/session.unarchived"
+        },
+        {
+          "$ref": "#/components/schemas/session.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/session.forked"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivered"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.enqueued"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.cancelled"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivery.changed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.succeeded"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.interrupted"
+        },
+        {
+          "$ref": "#/components/schemas/session.instructions.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.synthetic"
+        },
+        {
+          "$ref": "#/components/schemas/session.skill.activated"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.first-token"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.streamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.called"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.success"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.retry.scheduled"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.staged"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.cleared"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.committed"
+        },
+        {
+          "$ref": "#/components/schemas/session.usage.recorded"
+        },
+        {
+          "$ref": "#/components/schemas/session.message.content.updated"
+        }
+      ]
+    },
+    {
+      "path": "/schemas/Session.Message.Assistant/properties/time/properties/firstToken",
+      "before": null,
+      "after": {
+        "type": "number"
+      }
+    },
+    {
+      "path": "/schemas/V2Event/anyOf",
+      "before": [
+        {
+          "$ref": "#/components/schemas/location.shutdown"
+        },
+        {
+          "$ref": "#/components/schemas/models-dev.refreshed"
+        },
+        {
+          "$ref": "#/components/schemas/credential.updated"
+        },
+        {
+          "$ref": "#/components/schemas/credential.switched"
+        },
+        {
+          "$ref": "#/components/schemas/integration.updated"
+        },
+        {
+          "$ref": "#/components/schemas/provider.updated"
+        },
+        {
+          "$ref": "#/components/schemas/model.updated"
+        },
+        {
+          "$ref": "#/components/schemas/agent.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.created"
+        },
+        {
+          "$ref": "#/components/schemas/session.agent.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.model.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.moved"
+        },
+        {
+          "$ref": "#/components/schemas/session.renamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.metadata.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.permissions"
+        },
+        {
+          "$ref": "#/components/schemas/session.viewed"
+        },
+        {
+          "$ref": "#/components/schemas/session.archived"
+        },
+        {
+          "$ref": "#/components/schemas/session.unarchived"
+        },
+        {
+          "$ref": "#/components/schemas/session.usage.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/session.forked"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivered"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.enqueued"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.cancelled"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivery.changed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.succeeded"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.interrupted"
+        },
+        {
+          "$ref": "#/components/schemas/session.instructions.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.synthetic"
+        },
+        {
+          "$ref": "#/components/schemas/session.skill.activated"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.streamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.called"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.progress"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.success"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.retry.scheduled"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.staged"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.cleared"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.committed"
+        },
+        {
+          "$ref": "#/components/schemas/filesystem.changed"
+        },
+        {
+          "$ref": "#/components/schemas/reference.updated"
+        },
+        {
+          "$ref": "#/components/schemas/permission.asked"
+        },
+        {
+          "$ref": "#/components/schemas/permission.replied"
+        },
+        {
+          "$ref": "#/components/schemas/plugin.updated"
+        },
+        {
+          "$ref": "#/components/schemas/project.updated"
+        },
+        {
+          "$ref": "#/components/schemas/worktree.updated"
+        },
+        {
+          "$ref": "#/components/schemas/worktree.resolved"
+        },
+        {
+          "$ref": "#/components/schemas/command.updated"
+        },
+        {
+          "$ref": "#/components/schemas/config.updated"
+        },
+        {
+          "$ref": "#/components/schemas/skill.updated"
+        },
+        {
+          "$ref": "#/components/schemas/pty.created"
+        },
+        {
+          "$ref": "#/components/schemas/pty.updated"
+        },
+        {
+          "$ref": "#/components/schemas/pty.exited"
+        },
+        {
+          "$ref": "#/components/schemas/pty.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/persistent-pty.added"
+        },
+        {
+          "$ref": "#/components/schemas/persistent-pty.removed"
+        },
+        {
+          "$ref": "#/components/schemas/persistent-pty.updated"
+        },
+        {
+          "$ref": "#/components/schemas/shell.created"
+        },
+        {
+          "$ref": "#/components/schemas/shell.exited"
+        },
+        {
+          "$ref": "#/components/schemas/shell.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/form.created"
+        },
+        {
+          "$ref": "#/components/schemas/form.replied"
+        },
+        {
+          "$ref": "#/components/schemas/form.cancelled"
+        },
+        {
+          "$ref": "#/components/schemas/websearch.updated"
+        },
+        {
+          "$ref": "#/components/schemas/artifact.updated"
+        },
+        {
+          "$ref": "#/components/schemas/SessionStatusUpdated"
+        },
+        {
+          "$ref": "#/components/schemas/session.idle"
+        },
+        {
+          "$ref": "#/components/schemas/tui.prompt.append"
+        },
+        {
+          "$ref": "#/components/schemas/tui.command.execute"
+        },
+        {
+          "$ref": "#/components/schemas/tui.toast.show"
+        },
+        {
+          "$ref": "#/components/schemas/tui.session.select"
+        },
+        {
+          "$ref": "#/components/schemas/installation.updated"
+        },
+        {
+          "$ref": "#/components/schemas/installation.update-available"
+        },
+        {
+          "$ref": "#/components/schemas/vcs.branch.updated"
+        },
+        {
+          "$ref": "#/components/schemas/mcp.status.changed"
+        },
+        {
+          "$ref": "#/components/schemas/mcp.resources.changed"
+        },
+        {
+          "$ref": "#/components/schemas/V2Event.rpc"
+        },
+        {
+          "$ref": "#/components/schemas/V2Event.server.connected"
+        }
+      ],
+      "after": [
+        {
+          "$ref": "#/components/schemas/location.shutdown"
+        },
+        {
+          "$ref": "#/components/schemas/models-dev.refreshed"
+        },
+        {
+          "$ref": "#/components/schemas/credential.updated"
+        },
+        {
+          "$ref": "#/components/schemas/credential.switched"
+        },
+        {
+          "$ref": "#/components/schemas/integration.updated"
+        },
+        {
+          "$ref": "#/components/schemas/provider.updated"
+        },
+        {
+          "$ref": "#/components/schemas/model.updated"
+        },
+        {
+          "$ref": "#/components/schemas/agent.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.created"
+        },
+        {
+          "$ref": "#/components/schemas/session.agent.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.model.selected"
+        },
+        {
+          "$ref": "#/components/schemas/session.moved"
+        },
+        {
+          "$ref": "#/components/schemas/session.renamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.metadata.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.permissions"
+        },
+        {
+          "$ref": "#/components/schemas/session.viewed"
+        },
+        {
+          "$ref": "#/components/schemas/session.archived"
+        },
+        {
+          "$ref": "#/components/schemas/session.unarchived"
+        },
+        {
+          "$ref": "#/components/schemas/session.usage.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/session.forked"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivered"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.enqueued"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.cancelled"
+        },
+        {
+          "$ref": "#/components/schemas/session.inbox.delivery.changed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.succeeded"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.execution.interrupted"
+        },
+        {
+          "$ref": "#/components/schemas/session.instructions.updated"
+        },
+        {
+          "$ref": "#/components/schemas/session.synthetic"
+        },
+        {
+          "$ref": "#/components/schemas/session.skill.activated"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.shell.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.first-token"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.streamed"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.step.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.text.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.reasoning.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.input.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.called"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.progress"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.success"
+        },
+        {
+          "$ref": "#/components/schemas/session.tool.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.retry.scheduled"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.started"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.delta"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.ended"
+        },
+        {
+          "$ref": "#/components/schemas/session.compaction.failed"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.staged"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.cleared"
+        },
+        {
+          "$ref": "#/components/schemas/session.revert.committed"
+        },
+        {
+          "$ref": "#/components/schemas/filesystem.changed"
+        },
+        {
+          "$ref": "#/components/schemas/reference.updated"
+        },
+        {
+          "$ref": "#/components/schemas/permission.asked"
+        },
+        {
+          "$ref": "#/components/schemas/permission.replied"
+        },
+        {
+          "$ref": "#/components/schemas/plugin.updated"
+        },
+        {
+          "$ref": "#/components/schemas/project.updated"
+        },
+        {
+          "$ref": "#/components/schemas/worktree.updated"
+        },
+        {
+          "$ref": "#/components/schemas/worktree.resolved"
+        },
+        {
+          "$ref": "#/components/schemas/command.updated"
+        },
+        {
+          "$ref": "#/components/schemas/config.updated"
+        },
+        {
+          "$ref": "#/components/schemas/skill.updated"
+        },
+        {
+          "$ref": "#/components/schemas/pty.created"
+        },
+        {
+          "$ref": "#/components/schemas/pty.updated"
+        },
+        {
+          "$ref": "#/components/schemas/pty.exited"
+        },
+        {
+          "$ref": "#/components/schemas/pty.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/persistent-pty.added"
+        },
+        {
+          "$ref": "#/components/schemas/persistent-pty.removed"
+        },
+        {
+          "$ref": "#/components/schemas/persistent-pty.updated"
+        },
+        {
+          "$ref": "#/components/schemas/shell.created"
+        },
+        {
+          "$ref": "#/components/schemas/shell.exited"
+        },
+        {
+          "$ref": "#/components/schemas/shell.deleted"
+        },
+        {
+          "$ref": "#/components/schemas/form.created"
+        },
+        {
+          "$ref": "#/components/schemas/form.replied"
+        },
+        {
+          "$ref": "#/components/schemas/form.cancelled"
+        },
+        {
+          "$ref": "#/components/schemas/websearch.updated"
+        },
+        {
+          "$ref": "#/components/schemas/artifact.updated"
+        },
+        {
+          "$ref": "#/components/schemas/SessionStatusUpdated"
+        },
+        {
+          "$ref": "#/components/schemas/session.idle"
+        },
+        {
+          "$ref": "#/components/schemas/tui.prompt.append"
+        },
+        {
+          "$ref": "#/components/schemas/tui.command.execute"
+        },
+        {
+          "$ref": "#/components/schemas/tui.toast.show"
+        },
+        {
+          "$ref": "#/components/schemas/tui.session.select"
+        },
+        {
+          "$ref": "#/components/schemas/installation.updated"
+        },
+        {
+          "$ref": "#/components/schemas/installation.update-available"
+        },
+        {
+          "$ref": "#/components/schemas/vcs.branch.updated"
+        },
+        {
+          "$ref": "#/components/schemas/mcp.status.changed"
+        },
+        {
+          "$ref": "#/components/schemas/mcp.resources.changed"
+        },
+        {
+          "$ref": "#/components/schemas/experimental.mcp.event"
+        },
+        {
+          "$ref": "#/components/schemas/V2Event.rpc"
+        },
+        {
+          "$ref": "#/components/schemas/V2Event.server.connected"
+        }
+      ]
+    },
+    {
+      "path": "/schemas/experimental.mcp.event",
+      "before": null,
+      "after": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Event.ID"
+          },
+          "created": {
+            "type": "number"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "experimental.mcp.event"
+            ]
+          },
+          "location": {
+            "$ref": "#/components/schemas/Location.Ref"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "eventId": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string"
+              },
+              "data": {},
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "truncated": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "server",
+              "name",
+              "eventId",
+              "timestamp",
+              "data",
+              "cursor"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "created",
+          "type",
+          "data"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "path": "/schemas/session.agent.selected/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.archived/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.compaction.ended/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.compaction.failed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.compaction.started/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.created/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.deleted/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_37",
+      "after": "#/components/schemas/Event.VersionEncoded_38"
+    },
+    {
+      "path": "/schemas/session.execution.failed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.execution.interrupted/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.execution.started/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.execution.succeeded/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.forked/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_37",
+      "after": "#/components/schemas/Event.VersionEncoded_38"
+    },
+    {
+      "path": "/schemas/session.inbox.cancelled/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.inbox.delivered/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.inbox.delivery.changed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.inbox.enqueued/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.instructions.updated/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_37",
+      "after": "#/components/schemas/Event.VersionEncoded_38"
+    },
+    {
+      "path": "/schemas/session.message.content.updated/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.metadata.updated/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.model.selected/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.moved/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.permissions/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.reasoning.ended/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.reasoning.started/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.renamed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.retry.scheduled/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.revert.cleared/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.revert.committed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.revert.staged/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.shell.ended/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.shell.started/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.skill.activated/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.step.ended/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.step.failed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.step.first-token",
+      "before": null,
+      "after": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Event.ID"
+          },
+          "created": {
+            "type": "number"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "session.step.first-token"
+            ]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "$ref": "#/components/schemas/Event.Seq"
+              },
+              "version": {
+                "$ref": "#/components/schemas/Event.VersionEncoded_48"
+              }
+            },
+            "required": [
+              "aggregateID",
+              "seq",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/Location.Ref"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "$ref": "#/components/schemas/Session.ID"
+              },
+              "assistantMessageID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              }
+            },
+            "required": [
+              "sessionID",
+              "assistantMessageID"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "created",
+          "type",
+          "durable",
+          "data"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "path": "/schemas/session.step.started/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.step.streamed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.synthetic/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.text.ended/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.text.started/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.tool.called/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.tool.failed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_37",
+      "after": "#/components/schemas/Event.VersionEncoded_38"
+    },
+    {
+      "path": "/schemas/session.tool.input.ended/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.tool.input.started/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.tool.success/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_37",
+      "after": "#/components/schemas/Event.VersionEncoded_38"
+    },
+    {
+      "path": "/schemas/session.unarchived/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.usage.recorded/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/session.viewed/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    },
+    {
+      "path": "/schemas/worktree.resolved/properties/durable/properties/version/$ref",
+      "before": "#/components/schemas/Event.VersionEncoded_47",
+      "after": "#/components/schemas/Event.VersionEncoded_48"
+    }
+  ]
+}

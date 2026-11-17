@@ -115,7 +115,7 @@ tokens are single-use, and sharing one login across deployments can revoke
 the entire token family. Log in separately for **each** deployment. This is the
 agent's login: the controller also seeds the Worklink daemon's credential store.
 
-Worklink uses a separate OpenCode 2.2.7 daemon, supervised by the
+Worklink uses a separate OpenCode 2.3.0 daemon, supervised by the
 `worklink-opencode` s6 longrun as `worklink` (uid 1002). Setup starts the container
 and waits at most 60 seconds for local daemon readiness. The Mimir workload is
 gated, but the daemon remains available when login is missing. As `mimir`, the

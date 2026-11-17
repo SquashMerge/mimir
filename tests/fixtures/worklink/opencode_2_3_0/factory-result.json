@@ -1,0 +1,2253 @@
+{
+  "binary_version": "2.3.0",
+  "scratch": "/workspace/.worklink/mimir/2151-6/.factory/opencode-230-37wyenk3",
+  "responses": {},
+  "server_pid": 64542,
+  "plugins": [
+    {
+      "id": "opencode.tool.input.repair",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.worktree",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.mcp",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.mcp.codemode.defaults",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.wellknown",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.vcs.git",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.agent",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.fork-notice",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.plan",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.command",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.goal",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.skill",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.vcs.hg",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.models.dev",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.amazon.bedrock",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.azure",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.cerebras",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.chatgpt",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.cloudflare.ai.gateway",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.cloudflare.workers.ai",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.databricks",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.digitalocean",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.github.copilot",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.gitlab",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.google.vertex",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.kilo",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.llmgateway",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.lmstudio",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.modal",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.neon",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.nvidia",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.ollama",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.opencode",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.snowflake.cortex",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.openai",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.openai-context-caps",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.openrouter",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.poe",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.prompt-cache-key",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.sap.ai.core",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.vllm",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.xai",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.zenmux",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.claude-agent",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.websearch.exa",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.websearch.firecrawl",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.websearch.parallel",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.websearch.tavily",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.websearch.tinyfish",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.patch",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.prompt.openai",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.prompt.anthropic",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.prompt.kimi",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.prompt.arcee",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.prompt.meta",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.prompt.verbosity",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.prompt.identity",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.edit",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.glob",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.grep",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.image-generate",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tools",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tools.mcp-events",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tools.mcp-resources",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.question",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.read",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.artifact",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.schedule",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.shell",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.skill",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.subagent",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.todo",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.webfetch",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.websearch",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.tool.write",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.warming",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "feature-factory",
+      "source": {
+        "type": "local",
+        "path": "/workspace/.worklink/mimir/2151-6/.factory/2151-capture/node_modules/opencode2-feature-factory"
+      },
+      "features": {
+        "server": true,
+        "tui": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "replacement-probe",
+      "source": {
+        "type": "local",
+        "path": "/workspace/.worklink/mimir/2151-6/.factory/opencode-230-37wyenk3/replacement"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.instruction",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.reference",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.agent",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.browser",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.command",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.compaction",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.formatter",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.image",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.location-watcher",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.shell",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.snapshot",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.tool-output",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.compatibility",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.skill",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.provider",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.provider.dynamic",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.websearch",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    },
+    {
+      "id": "opencode.config.policy",
+      "source": {
+        "type": "builtin"
+      },
+      "features": {
+        "server": true
+      },
+      "state": {
+        "status": "active"
+      }
+    }
+  ],
+  "agents": [
+    {
+      "id": "build",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "question",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "general",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "question",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "explore",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "grep",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "glob",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "websearch",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "compaction",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "title",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "plan",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*.env",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.*",
+          "effect": "ask"
+        },
+        {
+          "action": "read",
+          "resource": "*.env.example",
+          "effect": "allow"
+        },
+        {
+          "action": "question",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "edit",
+          "resource": "/workspace/.worklink/mimir/2151-6/.factory/opencode-230-37wyenk3/home/.opencode/plan/*",
+          "effect": "allow"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "feature-factory",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "story-reader",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "story-writer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "codebase-researcher",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "design-interpreter",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "spec-writer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "work-decomposer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "work-reviewer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "test-verifier",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "implementation-validator",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "backend-builder",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "frontend-builder",
+          "effect": "allow"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "run-orchestrator",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "story-reader",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "story-writer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "codebase-researcher",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "design-interpreter",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "spec-writer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "work-decomposer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "work-reviewer",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "test-verifier",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "implementation-validator",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "backend-builder",
+          "effect": "allow"
+        },
+        {
+          "action": "subagent",
+          "resource": "frontend-builder",
+          "effect": "allow"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "backend-builder",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "codebase-researcher",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "design-interpreter",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "frontend-builder",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "implementation-validator",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "spec-writer",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "story-reader",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "story-writer",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "test-verifier",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "work-decomposer",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "work-reviewer",
+      "permissions": [
+        {
+          "action": "*",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "webfetch",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "external_directory",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    },
+    {
+      "id": "replacement-probe",
+      "permissions": [
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "browser",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "skill",
+          "resource": "browser",
+          "effect": "deny"
+        }
+      ]
+    }
+  ],
+  "skills": [
+    "opencode",
+    "report",
+    "feature",
+    "browser"
+  ],
+  "commands": [
+    "init",
+    "review",
+    "goal",
+    "feature"
+  ],
+  "package": {
+    "name": "opencode2-feature-factory",
+    "version": "0.14.1",
+    "engines": {
+      "node": ">=22"
+    },
+    "dependencies": {
+      "feature-factory": "0.14.1"
+    },
+    "peerDependencies": {
+      "solid-js": "^1.9.0",
+      "@opentui/solid": ">=0.5.17"
+    }
+  },
+  "server_exit": 143,
+  "server_awaited": true
+}
