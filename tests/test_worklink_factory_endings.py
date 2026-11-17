@@ -44,7 +44,8 @@ SITES = {
     ("checkout.py", "prune_attempt_checkouts", "shutil.rmtree"): (2, "is_active callback from guarded prune pass; legacy direct caller supplies policy"),
     ("checkout.py", "cleanup_checkout", "rmtree_missing_ok"): (2, "completed checkout transition only"),
     ("orchestrator.py", "_cleanup_checkout_after_transition", "cleanup_checkout"): (1, "completed leaf transition only"),
-    ("orchestrator.py", "_close_attempt_capabilities", "rmtree_missing_ok"): (1, "completed leaf publication, delete_checkout explicitly requested"),
+    ("orchestrator.py", "_close_attempt_capabilities", "WorkerClient.delete_attempt"): (1, "completed leaf publication explicitly requests executor-owned deletion; never controller rmtree"),
+    ("worker_exec.py", "_handle_delete_attempt", "rmtree_missing_ok"): (1, "executor only: exact attempt under trusted FD-anchored parent, symlink-safe deletion"),
     ("checkout.py", "_clone_attempt_checkout", "shutil.rmtree"): (1, "failed checkout construction before launch"),
     ("checkout.py", "create_isolated_checkout", "shutil.rmtree"): (3, "failed checkout construction before launch"),
     ("orchestrator.py", "_remove_executor_report_dir_best_effort", "rmtree_missing_ok"): (1, "temporary test report, not attempt checkout"),
@@ -64,6 +65,7 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
         "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
         "backend.cancel", "session_compute.cancel",
         "OpenCodeDaemonComputeBackend(client=client).cancel",
+        "WorkerClient.delete_attempt",
     }
     for path in (*ROOT.rglob("*.py"), OPERATOR_PARK):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -72,21 +74,31 @@ def test_factory_cancellation_and_attempt_deletion_sites_are_closed() -> None:
                 continue
             # Visit this function's own body only, not nested function calls.
             for child in ast.walk(node):
-                if isinstance(child, ast.Call) and ast.unparse(child.func) in targets:
+                if not isinstance(child, ast.Call):
+                    continue
+                # A typed executor deletion is audited regardless of how the
+                # WorkerClient was constructed (including a chained factory).
+                call = ("WorkerClient.delete_attempt"
+                        if isinstance(child.func, ast.Attribute) and child.func.attr == "delete_attempt"
+                        else ast.unparse(child.func))
+                if call in targets:
                     if any(isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
                            and parent is not node and parent.lineno <= child.lineno <= parent.end_lineno
                            for parent in ast.walk(node)):
                         continue
                     name = "scripts/factory_park.py" if path == OPERATOR_PARK else str(path.relative_to(ROOT))
-                    key = (name, node.name, ast.unparse(child.func))
-                    if ast.unparse(child.func) in {
+                    key = (name, node.name, call)
+                    if call in {
                         "cancel_once", "compute.cancel", "_cancel_and_cleanup_factory_handle",
                         "WorkerClient(None).cancel_factory_handle", "LocalSubprocessComputeBackend().cancel",
                          "prune_attempt_checkouts", "cleanup_checkout",
                           "self._client.session_cancel", "self.client.delete_inbox", "self.client.interrupt",
                                "backend.cancel", "session_compute.cancel",
-                               "OpenCodeDaemonComputeBackend(client=client).cancel",
-                    } or (key[0] in {"checkout.py", "orchestrator.py", "daemon_sessions.py", "factory_store.py"} and key[2] in {"shutil.rmtree", "rmtree_missing_ok"}):
+                                "OpenCodeDaemonComputeBackend(client=client).cancel",
+                                "WorkerClient.delete_attempt",
+                    } or (key[0] in {"checkout.py", "orchestrator.py", "daemon_sessions.py", "factory_store.py"} and key[2] in {"shutil.rmtree", "rmtree_missing_ok"}) or (
+                        key[:2] == ("worker_exec.py", "_handle_delete_attempt") and call == "rmtree_missing_ok"
+                    ):
                         calls[key] += 1
     expected = Counter({key: count for key, (count, reason) in SITES.items() if reason})
     assert sorted((calls - expected).items()) == []
