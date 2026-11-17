@@ -43,7 +43,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-attempt-delete"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -75,6 +75,7 @@ _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _FACTORY_CANCEL_FIELDS = frozenset({"version", "op", "executor_identity", "handle"})
 _FACTORY_HANDLE_FIELDS = frozenset({"substrate", "identifier", "process_start_ticks", "shim_pid"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
+_ATTEMPT_DELETE_FIELDS = _IDENTITY_FIELDS | {"path", "issue", "attempt"}
 _FACTORY_WRITE_FIELDS = frozenset({
     "version", "op", "executor_identity", "path", "issue", "attempt", "run_uid",
     "run_id", "relative_path", "content",
@@ -984,6 +985,74 @@ def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: li
     })
 
 
+def _handle_delete_attempt(
+    connection: socket.socket, request: dict[str, Any], fds: list[int],
+) -> None:
+    """Remove one leaf checkout as the privileged executor, never the controller.
+
+    The repository parent is controller-only. Anchor every ancestor without
+    following links, then let rmtree's fd-based walker unlink worker content.
+    No ownership transfer or privileged chmod/walk of worker paths is needed.
+    """
+    if fds or set(request) != _ATTEMPT_DELETE_FIELDS:
+        raise RuntimeError("attempt deletion requires the exact contract and no FDs")
+    _validate_executor_identity(request)
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    raw = request.get("path")
+    if not isinstance(raw, str) or "\x00" in raw:
+        raise RuntimeError("attempt deletion path is invalid")
+    path = Path(raw)
+    try:
+        relative = path.relative_to(worklink_checkout_root())
+    except ValueError:
+        raise RuntimeError("attempt deletion is outside the Worklink root") from None
+    if (
+        str(path) != raw
+        or len(relative.parts) != 2
+        or re.fullmatch(r"[A-Za-z0-9._-]+", relative.parts[0]) is None
+        or relative.parts[0] in {".", ".."}
+        or relative.parts[1] != f"{issue}-{attempt}"
+    ):
+        raise RuntimeError("attempt deletion shape is invalid")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise RuntimeError("symlink-safe attempt deletion is unavailable")
+    identities = get_identities()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    parent_fd = os.open("/", flags)
+    try:
+        # Include the final repository parent in the trust check. Unlike the
+        # attempt itself, it must not permit a worker to swap a sibling/name.
+        for component in (*path.parent.parts[1:], None):
+            parent = os.fstat(parent_fd)
+            if parent.st_uid not in {0, identities.mimir_uid} or (
+                (parent.st_mode & 0o002 or (
+                    parent.st_gid == identities.worklink_gid and parent.st_mode & 0o020
+                )) and not parent.st_mode & stat.S_ISVTX
+            ):
+                raise RuntimeError("attempt deletion ancestor is worker-writable")
+            if component is not None:
+                child_fd = os.open(component, flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = child_fd
+        try:
+            checkout = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass  # Retrying a completed deletion is harmless.
+        else:
+            if (
+                not stat.S_ISDIR(checkout.st_mode)
+                or checkout.st_uid != identities.mimir_uid
+                or checkout.st_gid != identities.worklink_gid
+                or stat.S_IMODE(checkout.st_mode) != 0o2770
+            ):
+                raise RuntimeError("attempt deletion ownership or mode is invalid")
+            rmtree_missing_ok(path.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    _send(connection, {"status": "deleted", "path": raw})
+
+
 def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     if fds or set(request) != _CANCEL_FIELDS:
         raise RuntimeError("invalid cancel request")
@@ -1529,6 +1598,8 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_cancel_factory_handle(connection, request, fds)
         elif request.get("op") == "identity":
             _handle_identity(connection, request, fds)
+        elif request.get("op") == "delete_attempt":
+            _handle_delete_attempt(connection, request, fds)
         elif request.get("op") in {"write_file", "edit_file", "replace_file"}:
             _handle_factory_file(connection, request, fds)
         else:

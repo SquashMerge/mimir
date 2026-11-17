@@ -9537,6 +9537,12 @@ def resolve_registered_review_state(
     return state
 
 
+_OWN_PR_REVIEW_REFUSAL = (
+    "You authored this PR; GitHub forbids reviewing your own PR. Use pr_comment for findings. "
+    "Expected policy, not a capability gap; don't escalate."
+)
+
+
 def authorize_repo_pr_tool(
     tool_name: str,
     scope: Any,
@@ -9628,6 +9634,15 @@ def authorize_repo_pr_tool(
             review_state, tool_name=protocol.checkout_tool,
         )
     )
+    # Server-issued scopes bind principal to the agent's forge identity. The
+    # write action distinguishes remediation (including CI's reduced set) from
+    # review scopes. This changes guidance only, never the authorization above.
+    own_pr_review = (
+        missing_actions == ("pr.review",)
+        and "repo.write" in granted_actions
+        and bool(getattr(scope, "principal", None))
+        and getattr(scope, "pull_request_author", None) == scope.principal
+    )
     return ToolAuthorization(
         tool_name=tool_name,
         decision=OperationDecision.RESOURCE_SCOPED,
@@ -9644,7 +9659,8 @@ def authorize_repo_pr_tool(
         is_shadow_decision=not enforce and not in_scope,
         would_block=not in_scope,
         refusal_detail=(
-            f"scope does not grant {', '.join(missing_actions)}"
+            (_OWN_PR_REVIEW_REFUSAL if own_pr_review
+             else f"scope does not grant {', '.join(missing_actions)}")
             if report_required_actions and missing_actions
             else "Call repo_checkout(repository, pull_request) for this repository and PR first."
             if checkout_first
