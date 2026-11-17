@@ -15,6 +15,7 @@ import pytest
 from mimir.acp.profiles import Profile, RemoteProfile
 from mimir.acp.proxy import ProxyRouter
 from mimir.acp.ssh import SSH_PATH, SshError, build_ssh_argv, child_environment, run_ssh_proxy, stop_child
+from mimir.acp.transport import close_writer
 
 
 @pytest.fixture(autouse=True)
@@ -376,7 +377,14 @@ async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
 ) -> None:
     base, _ = remote_profile(tmp_path)
     profile = Profile(base.name, base.home, base.remote, timeout_seconds=23)
-    ssh = _fake_ssh(tmp_path, "raise SystemExit(0)\n")
+    # Keep the peer alive until routing closes stdin, as run_router normally does.
+    # An immediately exiting child races the session/new write with pipe teardown.
+    ssh = _fake_ssh(tmp_path, """
+import json,sys
+sys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush()
+messages=[json.loads(line) for line in sys.stdin.buffer]
+assert len(messages)==1 and messages[0]['method']=='session/new'
+""")
     reader = asyncio.StreamReader()
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
@@ -387,6 +395,8 @@ async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
     async def capture_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
         process = await spawn(*args, **kwargs)
         processes.append(process)
+        # Force child startup before routing instead of relying on spawn scheduling.
+        assert await process.stdout.readline() == b"ready\n"
         return process
 
     async def route(
@@ -402,16 +412,19 @@ async def test_ssh_proxy_propagates_only_selected_local_profile_timeout(
     ) -> None:
         assert callable(signal_cleanup)
         router = ProxyRouter(client_writer, daemon_writer, credential, timeout_seconds)
-        await router.route_client({
-            "jsonrpc": "2.0", "id": "new", "method": "session/new",
-            "params": {
-                "cwd": str(tmp_path),
-                "timeoutSeconds": 1,
-            },
-        })
-        hosted_session = next(iter(router._provider._sessions.values()))
-        observed.append(hosted_session.timeout_seconds)
-        await router.close()
+        try:
+            await router.route_client({
+                "jsonrpc": "2.0", "id": "new", "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "timeoutSeconds": 1,
+                },
+            })
+            hosted_session = next(iter(router._provider._sessions.values()))
+            observed.append(hosted_session.timeout_seconds)
+        finally:
+            await router.close()
+            await close_writer(daemon_writer)
 
     monkeypatch.setattr(
         "mimir.acp.ssh.open_stdio",
