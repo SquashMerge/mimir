@@ -491,26 +491,119 @@ def test_base_permission_inspection_fails_closed(
         checkout_module.assert_base_repo_not_worker_writable(repo, runner=runner)
 
 
+def _install_remediation_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, portable_chmod: bool,
+    refused_path: str | None = None,
+) -> None:
+    real_chmod = shutil.which("chmod")
+    assert real_chmod is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = '#!/bin/sh\n'
+    if portable_chmod:
+        # Model BSD chmod's missing '--' support even on GNU hosts, but still
+        # execute the real chmod to verify modes and symlink-target preservation.
+        script += (
+            '[ "$#" -eq 2 ] && [ "$1" = go-w ] || exit 2\n'
+            'case "$2" in ./*) ;; *) exit 2 ;; esac\n'
+        )
+    if refused_path is not None:
+        script += (
+            f'if [ "$2" = {shlex.quote("./" + refused_path)} ]; then\n'
+            '  printf "chmod: %s: Operation not permitted\\n" "$2" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+        )
+    wrapper = bin_dir / "chmod"
+    wrapper.write_text(script + f'exec {shlex.quote(real_chmod)} "$@"\n')
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+
+@pytest.mark.parametrize("portable_chmod", [False, True])
+def test_base_permissions_remediation_tolerates_non_owned_safe_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portable_chmod: bool,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    foreign = repo / "a-foreign file\nname"
+    foreign.write_text("safe but not owned\n")
+    writable = repo / "z-writable.txt"
+    writable.write_text("writable\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "track foreign and writable files")
+    foreign.chmod(0o644)
+    for path in (repo / "shared.txt", writable):
+        path.chmod(0o666)
+    _install_remediation_chmod(
+        tmp_path, monkeypatch, portable_chmod=portable_chmod, refused_path=foreign.name,
+    )
+
+    result = subprocess.run(
+        ["sh", "-c", checkout_module.BASE_PERMISSIONS_REMEDIATION],
+        env={**os.environ, "WORKLINK_REPO": str(repo)}, capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"chmod: ./{foreign.name}: Operation not permitted" in result.stderr
+    for path in (foreign, repo / "shared.txt", writable):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("portable_chmod", [False, True])
+@pytest.mark.parametrize("mode", [0o664, 0o646, 0o666])
+def test_base_permissions_remediation_refuses_non_owned_writable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portable_chmod: bool, mode: int,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    foreign = repo / "shared.txt"
+    foreign.chmod(mode)
+    _install_remediation_chmod(
+        tmp_path, monkeypatch, portable_chmod=portable_chmod, refused_path=foreign.name,
+    )
+
+    result = subprocess.run(
+        ["sh", "-c", checkout_module.BASE_PERMISSIONS_REMEDIATION],
+        env={**os.environ, "WORKLINK_REPO": str(repo)}, capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert f"chmod: ./{foreign.name}: Operation not permitted" in result.stderr
+    assert stat.S_IMODE(foreign.stat().st_mode) == mode
+
+
+def test_base_permissions_remediation_fails_closed_on_inspection_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    (repo / "shared.txt").chmod(0o666)
+    real_find = shutil.which("find")
+    assert real_find is not None
+    _install_remediation_chmod(
+        tmp_path, monkeypatch, portable_chmod=True, refused_path="shared.txt",
+    )
+    wrapper = tmp_path / "bin/find"
+    wrapper.write_text(
+        '#!/bin/sh\n'
+        '[ "$1" != ./shared.txt ] || { echo "inspection unavailable" >&2; exit 1; }\n'
+        f'exec {shlex.quote(real_find)} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", "-c", checkout_module.BASE_PERMISSIONS_REMEDIATION],
+        env={**os.environ, "WORKLINK_REPO": str(repo)}, capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0
+    assert "inspection unavailable" in result.stderr
+
+
 @pytest.mark.parametrize("portable_chmod", [False, True])
 def test_base_permissions_remediation_leaves_ignored_data_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portable_chmod: bool,
 ) -> None:
     if portable_chmod:
-        # Model BSD chmod's missing '--' support even on GNU hosts, but still
-        # execute the real chmod to verify modes and symlink-target preservation.
-        real_chmod = shutil.which("chmod")
-        assert real_chmod is not None
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        wrapper = bin_dir / "chmod"
-        wrapper.write_text(
-            '#!/bin/sh\n'
-            '[ "$#" -eq 2 ] && [ "$1" = go-w ] || exit 2\n'
-            'case "$2" in ./*) ;; *) exit 2 ;; esac\n'
-            f'exec {shlex.quote(real_chmod)} "$@"\n'
-        )
-        wrapper.chmod(0o755)
-        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        _install_remediation_chmod(tmp_path, monkeypatch, portable_chmod=True)
     repo = _repo_with_main(tmp_path)
     _git(repo, "config", "core.filemode", "false")
     (repo / "shared.txt").chmod(0o666)

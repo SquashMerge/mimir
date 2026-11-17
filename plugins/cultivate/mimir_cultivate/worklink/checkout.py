@@ -33,7 +33,9 @@ _WRITABLE_PATH_SAMPLE_LIMIT = 5
 BASE_PERMISSIONS_REMEDIATION = (
     '(cd "$WORKLINK_REPO" && { printf \'.\\0\'; git ls-files -z; '
     'git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | '
-    'xargs -0 -r sh -c \'for p do [ -L "$p" ] || chmod go-w "./$p" || exit; done\' sh)'
+    'xargs -0 -r sh -c \'for p do [ -L "$p" ] || chmod go-w "./$p" || { '
+    'writable=$(find "./$p" -prune \\( -perm -020 -o -perm -002 \\) -print) && '
+    '[ -z "$writable" ]; } || exit 1; done\' sh)'
 )
 
 
