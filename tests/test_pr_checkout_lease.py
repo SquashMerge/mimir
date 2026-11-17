@@ -33,6 +33,7 @@ from mimir_cultivate.policy import (
 from mimir_cultivate.repository import (
     PRCheckoutLease,
     _foreign_candidate_head,
+    _is_own_unpublished_candidate,
     _retained_candidate_head,
     _preserve_checkout_head,
     _preserve_dirty_worktree,
@@ -1048,22 +1049,138 @@ def test_acquire_refuses_scope_mismatch_in_matching_lease_slot(tmp_path: Path) -
     assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
 
 
-def test_acquire_reports_all_divergent_unpublished_candidates(tmp_path: Path) -> None:
+@pytest.mark.parametrize("earlier_scopes", [False, True])
+def test_acquire_reports_all_divergent_unpublished_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, earlier_scopes: bool,
+) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
     candidates = []
     for name in ("first", "second"):
-        lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+        candidate_scope = replace(scope, event_type=name) if earlier_scopes else scope
+        lease = create_pr_checkout_lease(
+            candidate_scope, owner=scope.principal, lease_root=lease_root,
+        )
         (lease.path / f"{name}.txt").write_text(f"{name} fix\n", encoding="utf-8")
         _git(lease.path, "add", f"{name}.txt")
         _git(lease.path, "commit", "-q", "-m", f"{name} fix")
         candidates.append(_git(lease.path, "rev-parse", "HEAD"))
 
+    monkeypatch.setattr(
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
+        lambda: set(lease_root.iterdir()) if earlier_scopes else set(),
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.repository._observe_current_pr_head",
+        lambda _scope: scope.observed_head_sha,
+    )
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
     with pytest.raises(RuntimeError, match="refusing implicit selection") as refusal:
         acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
 
     assert all(candidate in str(refusal.value) for candidate in candidates)
+    assert [kind for kind, _fields in events] == ["pr_checkout_lease_candidates_diverged"]
+
+
+@pytest.mark.parametrize("blocker", ["active", "observation_unavailable"])
+@pytest.mark.parametrize("record_head", [False, True])
+def test_acquire_refuses_own_unpublished_commits_not_foreign_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocker: str, record_head: bool,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    earlier = create_pr_checkout_lease(
+        replace(scope, event_type="pr_review_requested"),
+        owner=scope.principal, lease_root=root,
+    )
+    (earlier.path / "fix.txt").write_text("unpushed fix\n", encoding="utf-8")
+    _git(earlier.path, "add", "fix.txt")
+    _git(earlier.path, "commit", "-qm", "unpushed fix")
+    head = _git(earlier.path, "rev-parse", "HEAD")
+    metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
+    if record_head:
+        # repo_commit records the new HEAD, not just the original checkout head.
+        metadata = json.loads(metadata_path.read_text())
+        metadata["head_sha"] = head
+        metadata_path.write_text(json.dumps(metadata))
+    before = metadata_path.read_bytes()
+    monkeypatch.setattr(
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
+        lambda: {earlier.path} if blocker == "active" else set(),
+    )
+
+    def observe(_scope):
+        if blocker == "observation_unavailable":
+            raise RuntimeError("forge unavailable")
+        return scope.observed_head_sha
+
+    monkeypatch.setattr("mimir_cultivate.repository._observe_current_pr_head", observe)
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    state = RepoReviewState(scope)
+    with pytest.raises(RuntimeError, match="^unpublished_own_commits:") as refusal:
+        acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=root, review_state=state,
+        )
+    reason = str(refusal.value)
+    assert head in reason and scope.observed_head_sha in reason
+    assert "repo_push" in reason and "repo_cleanup" in reason and "re-scope" in reason
+    assert "scope mismatch" not in reason and "another scope" not in reason
+    assert len(reason) < 512
+    assert [kind for kind, _fields in events] == ["pr_checkout_lease_unpublished_own_commits"]
+    assert events[0][1]["reason"] == "unpublished_own_commits"
+    assert events[0][1]["published_head"] == scope.observed_head_sha
+    assert events[0][1]["candidates"] == [{"commit": head, "path": str(earlier.path)}]
+    assert state.checkout_lease is None
+    assert metadata_path.read_bytes() == before
+    assert _git(earlier.path, "rev-parse", "HEAD") == head
+    assert list(root.iterdir()) == [earlier.path]
+
+
+@pytest.mark.parametrize("mismatch", [
+    "owner", "canonical_repo", "canonical_origin", "pr_number", "destination_ref",
+    "source_root", "published_head", "unrelated_head", "ancestry_error",
+])
+def test_own_unpublished_reason_requires_identity_and_ancestry(
+    tmp_path: Path, mismatch: str,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    (lease.path / "fix.txt").write_text("fix\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-qm", "fix")
+    head = _git(lease.path, "rev-parse", "HEAD")
+
+    def runner(args):
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    assert _is_own_unpublished_candidate(lease, scope, head, runner=runner)
+    if mismatch == "published_head":
+        head = scope.observed_head_sha
+    elif mismatch == "unrelated_head":
+        head = scope.observed_base_sha
+    elif mismatch == "ancestry_error":
+        def runner(args):
+            return subprocess.CompletedProcess(args, 128, "", "inspection failed")
+    else:
+        values = {
+            "owner": "other-agent", "canonical_repo": "other/repo",
+            "canonical_origin": "https://example.com/other.git", "pr_number": 8,
+            "destination_ref": "refs/heads/other", "source_root": root,
+        }
+        lease = replace(lease, **{mismatch: values[mismatch]})
+    assert not _is_own_unpublished_candidate(lease, scope, head, runner=runner)
 
 
 def test_acquire_refuses_and_reports_foreign_scope_candidate(

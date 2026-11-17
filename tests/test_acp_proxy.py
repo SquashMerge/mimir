@@ -1852,8 +1852,8 @@ class WriterToFile(Writer):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["stdio", "protocol"])
-async def test_local_proxy_start_and_protocol_failures_close_connection(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
-    home = Path(tempfile.mkdtemp(prefix="mp-"))
+async def test_local_proxy_start_and_protocol_failures_close_connection(monkeypatch: pytest.MonkeyPatch, failure: str, short_proxy_home: Path) -> None:
+    home = short_proxy_home
     socket = home / ".mimir" / "acp" / "daemon.sock"
     socket.parent.mkdir(parents=True, mode=0o700)
     os.chmod(socket.parent, 0o700)
@@ -2042,10 +2042,18 @@ async def _answer_client_request(process: asyncio.subprocess.Process, message: d
     await _send(process, {"jsonrpc": "2.0", "id": message["id"], "result": result})
 
 
+@pytest.fixture
+def short_proxy_home():
+    # Unix sockets have a small path limit; inherited TMPDIR may already exceed
+    # it in a Worklink session, before adding the daemon's socket suffix.
+    with tempfile.TemporaryDirectory(prefix="mp-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
 @pytest.mark.asyncio
-async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Path, caplog: pytest.LogCaptureFixture, short_proxy_home: Path) -> None:
     secret = "raw-sentinel-never-persist"
-    home = Path(tempfile.mkdtemp(prefix="mp-"))
+    home = short_proxy_home
     bundle, core = _integrated_bundle(home, secret)
     daemon = AcpDaemon(bundle)
     await daemon.start()
@@ -2121,8 +2129,8 @@ async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_invalid_key_reaches_actual_daemon_rejection_through_credential_path(tmp_path: Path) -> None:
-    home = Path(tempfile.mkdtemp(prefix="mp-"))
+async def test_invalid_key_reaches_actual_daemon_rejection_through_credential_path(tmp_path: Path, short_proxy_home: Path) -> None:
+    home = short_proxy_home
     bundle, _ = _integrated_bundle(home, "valid-key")
     daemon = AcpDaemon(bundle)
     await daemon.start()

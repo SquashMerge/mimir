@@ -41,7 +41,11 @@ def selected_cultivate():
 
 
 @pytest.fixture(autouse=True)
-def clean_gate_tmp(monkeypatch):
+def clean_gate_tmp(monkeypatch, tmp_path_factory):
+    # Secure capture opens every ancestor; do not inherit a session TMPDIR
+    # whose ancestors permit traversal but deny directory reads.
+    controller_tmp = tmp_path_factory.mktemp("gate-controller")
+    monkeypatch.setattr(ev.tempfile, "tempdir", str(controller_tmp))
     helper = ev._gate_tmp_directory
     rmtree = shutil.rmtree
     trees = set()

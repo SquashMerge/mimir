@@ -337,6 +337,9 @@ async def _cancel_with_trace(controller, daemon, traces, *, timeout_s=None):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recovery", ["terminal", "interrupted", "failed"])
 async def test_failed_leaf_reattach_retains_until_real_session_quiescence(tmp_path, monkeypatch, recovery):
+    # Recovery renders a fresh work spec before observing the retained session;
+    # own its model selection rather than inheriting the executor's model syntax.
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-test")
     from types import SimpleNamespace
     from mimir_cultivate.worklink.backends.base import SessionRequest
     from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend

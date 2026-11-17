@@ -471,9 +471,10 @@ CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
 CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
 CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
 # These fragments come from the checkout controller's ToolPolicyRefusal text.
-# Only refusals whose blockers are removed by lease expiry/reconciliation belong
+# Only refusals cleared by publication/cleanup or lease reconciliation belong
 # here; unknown reasons must retain the permanent-fault backoff.
 _SELF_CLEARING_REFUSAL_REASON_FRAGMENTS = (
+    "unpublished_own_commits:",
     "superseded PR checkout lease has retained work; refusing release:",
     "unpublished PR checkout lease candidates include another scope; refusing reuse:",
     "divergent unpublished PR checkout lease candidates; refusing implicit selection:",
@@ -867,10 +868,12 @@ _REVIEW_SUBMISSION_RULE = (
     "left in turn output and never sent — is a non-review. The "
     "trusted-service shell executes one argv with no shell: use one "
     "command per shell call and never use cd, &&, semicolons, pipes, "
-    "redirects, heredocs, or command substitution. Read `fetch_url` cache "
-    "paths with `read_file` (offset/limit for a line range) or bounded "
-    "`grep` before_context/after_context; shell slicing forms and direct `curl` "
-    "are intentionally refused because they bypass the bounded file/egress tools. "
+    "redirects, heredocs, or command substitution. If checkout refuses with "
+    "`unpublished_own_commits`, push your unpublished commits with `repo_push` "
+    "or discard them with `repo_cleanup`, then re-scope through the normal review "
+    "path for the published head before retrying checkout. Do not bypass a checkout "
+    "refusal with web or direct HTTP reads of PR data; use only the typed PR tools "
+    "after checkout succeeds. "
     "/cultivate-review skill spells out the full flow; this rule is restated "
     "here so it's present in your context before the Skill call "
     "fires."

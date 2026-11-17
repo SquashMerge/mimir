@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import pytest
 from pathlib import Path
@@ -26,6 +27,14 @@ from mimir_cultivate.worklink.evidence import (
     read_pytest_result,
     validate_evidence,
 )
+
+
+@pytest.fixture(autouse=True)
+def gate_test_directories(tmp_path, monkeypatch):
+    # Gate report readers securely open every ancestor. A host TMPDIR can be
+    # traversable but not readable, and host retention paths are not test-owned.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
 
 
 _OTLP_CARRIERS = {

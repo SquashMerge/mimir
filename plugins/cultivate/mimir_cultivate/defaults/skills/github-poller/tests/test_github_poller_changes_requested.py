@@ -647,8 +647,16 @@ def test_hard_refusal_is_uncharged_and_retries_only_at_daily_backstop(
     assert captured_emits[0]["prior_refusal_classification"] == "operator_gated"
 
 
+@pytest.mark.parametrize("reason", [
+    "repository checkout rejected: superseded PR checkout lease has retained "
+    "work; refusing release: deadbeef (/workspace/pr-leases/retained-lease)",
+    "repository checkout rejected: unpublished_own_commits: your PR checkout lease "
+    "HEAD deadbeef has unpushed commits beyond published head aaa111; refusing reuse. "
+    "Push those commits with repo_push, then re-scope for the new head, or discard "
+    "them with repo_cleanup, then re-scope.",
+])
 def test_real_retained_lease_refusal_retries_at_hourly_floor_without_charge(
-    monkeypatch, captured_emits, tmp_path,
+    monkeypatch, captured_emits, tmp_path, reason,
 ):
     _patch_api(
         monkeypatch,
@@ -659,10 +667,6 @@ def test_real_retained_lease_refusal_retries_at_hourly_floor_without_charge(
         commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
     )
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
-    reason = (
-        "repository checkout rejected: superseded PR checkout lease has retained "
-        "work; refusing release: deadbeef (/workspace/pr-leases/retained-lease)"
-    )
     refused = _recovery_entry(
         outcome_at="2026-07-19T12:01:00+00:00",
         disposition="exempt_hard_refusal",
