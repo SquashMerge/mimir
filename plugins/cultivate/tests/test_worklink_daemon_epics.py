@@ -305,6 +305,29 @@ async def test_epic_cancel_reports_surviving_orphan_pids_and_retains_recovery(tm
         assert not await client.running_shells(record.session_checkout)
 
 
+async def test_epic_late_root_shell_waits_for_process_snapshot_before_delete(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import daemon_processes as processes
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        refresh = boundary.controller._refresh
+        spawned = []
+        witnessed = []
+        monkeypatch.setattr(processes, "snapshot_descendants", lambda pid: witnessed.append(pid) or [])
+        async def late_refresh():
+            if not spawned:
+                spawned.append(daemon.start_shell(handle.identifier, record.session_checkout))
+            return await refresh()
+        monkeypatch.setattr(boundary.controller, "_refresh", late_refresh)
+        delete = client.delete_shell
+        async def checked_delete(sid, directory):
+            assert daemon.shells[sid]["pid"] in witnessed
+            await delete(sid, directory)
+        monkeypatch.setattr(client, "delete_shell", checked_delete)
+        await compute.cancel(handle)
+        assert spawned and daemon.shells[spawned[0]]["status"] == "killed"
+
+
 async def test_epic_session_tree_follows_every_page_and_archived_descendants(tmp_path):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, _, compute, handle, record = await admit(tmp_path, daemon, client)

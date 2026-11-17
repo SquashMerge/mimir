@@ -635,8 +635,11 @@ class SessionController:
                                        if m["id"] == self.record.input_id or m["type"] == "synthetic"]
                             for item in pending:
                                 await self.client.delete_inbox(self.record.opencode_session_id, item["id"])
-                            for shell in self._shells:
-                                await self.client.delete_shell(shell["id"], self.record.checkout_path)
+                            # Epic shells discovered by this later refresh need
+                            # the next tree pass's pre-deletion process snapshot.
+                            if self.record.kind != "epic":
+                                for shell in self._shells:
+                                    await self.client.delete_shell(shell["id"], self.record.checkout_path)
                             if tree_clean and not self._shells and not pending and self.record.input_id and self.record.execution_state in {"succeeded", "failed", "interrupted"}:
                                 self._persist(cancellation_state="verified")
                                 return True
@@ -645,7 +648,8 @@ class SessionController:
                                     and self.record.execution_state in {"pending", "incomplete"}):
                                 self._persist(cancellation_state="verified")
                                 return True
-                            await self.client.interrupt(self.record.opencode_session_id)
+                            if self.record.kind != "epic":
+                                await self.client.interrupt(self.record.opencode_session_id)
                         except DaemonClientError as exc:
                             if exc.reason not in {"transport failure", "missing log watermark"}:
                                 raise
