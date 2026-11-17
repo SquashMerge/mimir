@@ -165,12 +165,28 @@ class FakeOpenCodeDaemon:
                   item={key: item[key] for key in ("type", "payload", "delivery")})
         return item
 
+    def enqueue_synthetic(self, session_id: str, shell_id: str) -> dict[str, Any]:
+        """Queue what a finished background shell queues: a ``synthetic`` resume (2.2.7 schema)."""
+        shell = self.shells[shell_id]
+        item = {"id": self._id("msg"), "sessionID": session_id, "time": {"created": 3}, "type": "synthetic",
+                "payload": {"text": f"Background shell {shell_id} finished.", "description": "shell finished",
+                            "metadata": {"source": "shell", "shellID": shell_id, "jobID": shell_id,
+                                         "state": shell["status"], "exit": shell.get("exit"),
+                                         "truncated": False}},
+                "delivery": "steer"}
+        self.schema.named("Session.Inbox.Synthetic", item)
+        self.sessions[session_id].inbox.append(item)
+        self.emit(session_id, "session.inbox.enqueued", inboxID=item["id"],
+                  item={key: item[key] for key in ("type", "payload", "delivery")})
+        return item
+
     def deliver(self, session_id: str, inbox_id: str) -> None:
         state = self.sessions[session_id]
         item = next(item for item in state.inbox if item["id"] == inbox_id)
         state.inbox.remove(item)
-        message = {"id": item["id"], "time": item["time"], "type": "user", **item["payload"]}
-        self.schema.named("Session.Message.User", message)
+        kind = "Synthetic" if item["type"] == "synthetic" else "User"
+        message = {"id": item["id"], "time": item["time"], "type": item["type"], **item["payload"]}
+        self.schema.named(f"Session.Message.{kind}", message)
         state.messages.append(message)
         self.emit(session_id, "session.inbox.delivered", inboxID=inbox_id)
         if not state.active:
@@ -201,8 +217,11 @@ class FakeOpenCodeDaemon:
                                  "metadata": {"sessionID": session_id}, "time": {"started": 1}}
         return shell_id
 
-    def end_shell(self, shell_id: str, status: str = "exited") -> None:
+    def end_shell(self, shell_id: str, status: str = "exited", *, resume: bool = False) -> None:
+        """Finish a shell; ``resume`` queues the daemon's synthetic resume, not yet admitted."""
         self.shells[shell_id].update(status=status, exit=0 if status == "exited" else 1, time={"started": 1, "completed": 2})
+        if resume:
+            self.enqueue_synthetic(self.shells[shell_id]["metadata"]["sessionID"], shell_id)
 
     def _response(self, request: web.Request, body: Any, status: int = 200) -> web.Response:
         operation = self.schema.operation(request.match_info.route.resource.canonical, request.method)

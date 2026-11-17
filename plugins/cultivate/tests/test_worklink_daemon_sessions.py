@@ -935,3 +935,134 @@ def test_helper_failure_reports_only_class_and_code_literal_reason(monkeypatch, 
     out = capsys.readouterr().out
     assert json.loads(out) == {"failure": expected}
     assert "fragment-secret" not in out
+
+
+async def test_a_finished_shells_queued_resume_is_valid_inbox_and_not_quiescent(tmp_path):
+    """2026-11-17: #2151 attempt 5 failed "invalid session inbox" three minutes in.
+
+    Its background suite finished, the daemon queued the 2.2.7 ``synthetic`` resume,
+    and the observe read the inbox before the daemon admitted it (history then showed
+    that ``synthetic`` message at 08:13:12, after the 08:13:08 failure).
+    """
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        daemon.end_shell(shell, resume=True)
+        assert [item["type"] for item in daemon.sessions[sid].inbox] == ["synthetic"]
+        assert (await controller.observe()).execution_state == "started"
+        assert controller.record.execution_state == "started"
+        resume = daemon.sessions[sid].inbox[0]["id"]
+        daemon.deliver(sid, resume)
+        assert (await controller.observe()).execution_state == "started"
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "succeeded"
+        assert controller.record.admission_state == "admitted"
+
+
+def _daemon_item(sid: str, kind: str, payload: object) -> dict:
+    return {"id": f"msg_{kind}_queued", "sessionID": sid, "time": {"created": 3}, "type": kind,
+            "payload": payload, "delivery": "queue"}
+
+
+@pytest.mark.parametrize("kind,payload", [
+    ("synthetic", {"text": "resume"}),
+    ("compaction", {"auto": True}),
+    ("move", {"projectID": "prj_x", "location": {"directory": "/workspace/x"}}),
+])
+async def test_each_documented_daemon_inbox_item_holds_the_session_open(tmp_path, kind, payload):
+    """``Session.Inbox.Info`` (OpenCode 2.2.7) is user | synthetic | compaction | move."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.finish(sid)
+        daemon.sessions[sid].inbox.append(_daemon_item(sid, kind, payload))
+        assert (await controller.observe()).execution_state == "started"
+        daemon.sessions[sid].inbox.clear()
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "unknown", "payload": {"text": "x"}},
+    {"type": "synthetic", "payload": {"text": 7}},
+    {"type": "synthetic", "payload": {"text": "x", "extra": 1}},
+    {"type": "synthetic", "payload": "resume"},
+    {"type": "compaction", "payload": None},
+    {"type": "move", "payload": {"projectID": "prj_x"}},
+    {"type": "synthetic", "payload": {"text": "x"}, "sessionID": "ses_someone_else"},
+    {"type": "synthetic", "payload": {"text": "x"}, "delivery": "later"},
+])
+async def test_malformed_inbox_items_still_fail_closed(tmp_path, monkeypatch, item):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.finish(sid)
+        original = client.inbox
+        async def malformed(*args, **kwargs):
+            # Past the fake's own schema check: the client's validation is under test.
+            page = deepcopy(await original(*args, **kwargs))
+            page["data"].append({**_daemon_item(sid, item["type"], item["payload"]), **item})
+            return page
+        monkeypatch.setattr(client, "inbox", malformed)
+        with pytest.raises(DaemonClientError, match="invalid session inbox"):
+            await controller.observe()
+        assert controller.record.execution_state != "succeeded"
+
+
+async def test_daemon_inbox_items_are_never_owned_input(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        input_id = controller.record.input_id
+        daemon.sessions[sid].inbox.append(_daemon_item(sid, "synthetic", {"text": "resume"}))
+        await controller.observe()
+        assert controller.record.input_id == input_id
+
+
+async def test_cancel_removes_the_resume_its_own_shell_queued(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        daemon.end_shell(shell, resume=True)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.sessions[sid].inbox == []
+        assert not daemon.sessions[sid].active
+
+
+def _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell):
+    """Review P1 on #109: inbox read (empty) -> history (idle) -> shell finishes and
+    queues its resume -> empty shell listing -> history re-read (same idle)."""
+    original = client.running_shells
+    async def finishes_while_listing(directory):
+        if daemon.shells[shell]["status"] == "running":
+            daemon.end_shell(shell, resume=True)
+        return await original(directory)
+    monkeypatch.setattr(client, "running_shells", finishes_while_listing)
+
+
+async def test_resume_queued_between_inbox_read_and_empty_shell_listing_is_not_success(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell)
+        assert (await controller.observe()).execution_state == "started"
+        assert [item["type"] for item in daemon.sessions[sid].inbox] == ["synthetic"]
+
+
+async def test_cancel_cannot_verify_past_a_resume_queued_during_the_shell_listing(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.sessions[sid].inbox == []
+        assert not daemon.sessions[sid].active
