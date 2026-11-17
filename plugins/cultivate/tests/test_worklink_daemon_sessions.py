@@ -665,6 +665,10 @@ class _RecordedClient:
     async def inbox(self, session_id):
         return deepcopy(self.snapshot["inbox"])
 
+    async def running_shells(self, directory):
+        # The capture ran no background shell (prompt 2's `sleep 60` was a foreground tool call).
+        return []
+
 
 def _captured_lifecycle():
     from tests.worklink_daemon_fixtures import FIXTURES
@@ -812,3 +816,103 @@ async def test_executor_reports_a_session_that_ended_with_its_daemon(tmp_path, m
         assert (checkout / "work.txt").read_text() == "retained work"
         if op != "session_release":
             assert (home / "tmp" / "sentinel").exists()
+
+
+async def test_idle_with_an_owned_background_shell_is_not_quiescent(tmp_path):
+    """2026-11-16: #2149 went idle, its background suite finished, and the session resumed under the stop."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "started"
+        daemon.end_shell(shell)
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+async def test_another_sessions_shell_does_not_hold_this_session(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.start_shell("ses_someone_else", str(tmp_path))
+        daemon.start_shell(sid, str(tmp_path / "elsewhere"))
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+async def test_cancel_stops_owned_background_shells_before_verifying(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        owned = daemon.start_shell(sid, str(tmp_path))
+        foreign = daemon.start_shell("ses_someone_else", str(tmp_path))
+        daemon.finish(sid)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.shells[owned]["status"] == "killed"
+        assert daemon.shells[foreign]["status"] == "running"
+
+
+async def test_shell_listing_failure_fails_closed(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        daemon.finish(controller.record.opencode_session_id)
+        daemon.faults[("GET", "/api/shell")].append(SyntheticFault(status=500))
+        with pytest.raises(DaemonClientError):
+            await controller.observe()
+        assert controller.record.execution_state != "succeeded"
+        daemon.faults[("GET", "/api/shell")].extend(SyntheticFault(status=500) for _ in range(500))
+        assert not await controller.cancel(timeout_s=1)
+        assert controller.record.cancellation_state == "unverified"
+
+
+async def test_shell_that_resumes_the_session_between_reads_is_not_success(tmp_path, monkeypatch):
+    """Review P1 on #105: history (idle) -> shell exits and resumes the session -> empty shell list."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        original = client.running_shells
+        async def finish_and_resume(directory):
+            if daemon.shells[shell]["status"] == "running":
+                daemon.end_shell(shell)
+                daemon.sessions[sid].messages.append({
+                    "id": "msg_resumed", "type": "assistant", "time": {"created": 3}, "agent": "build",
+                    "model": {"providerID": "openai", "id": "gpt-5"}, "content": []})
+            return await original(directory)
+        monkeypatch.setattr(client, "running_shells", finish_and_resume)
+        assert (await controller.observe()).execution_state == "started"
+
+
+async def test_a_new_idle_after_the_empty_shell_listing_is_not_success(tmp_path, monkeypatch):
+    """Review P1 on #105: idle A (S1 running) -> S1 exits, listing empty -> resumed turn starts S2, idle B."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        messages = daemon.sessions[sid].messages
+        first = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        second = []
+        original_shells, original_messages = client.running_shells, client.messages
+        async def first_shell_exits(directory):
+            if daemon.shells[first]["status"] == "running":
+                daemon.end_shell(first)
+            return await original_shells(directory)
+        reads = []
+        async def resumed_before_reread(*args, **kwargs):
+            reads.append(1)
+            if daemon.shells[first]["status"] != "running" and not second:
+                # Between the empty listing and the re-read: resume, start S2, reach idle B.
+                messages.append({"id": "msg_resumed", "type": "assistant", "time": {"created": 3},
+                                 "agent": "build", "model": {"providerID": "openai", "id": "gpt-5"}, "content": []})
+                second.append(daemon.start_shell(sid, str(tmp_path)))
+                messages.append({"id": "msg_idle_b", "type": "idle", "time": {"created": 4}, "outcome": "succeeded"})
+            return await original_messages(*args, **kwargs)
+        monkeypatch.setattr(client, "running_shells", first_shell_exits)
+        monkeypatch.setattr(client, "messages", resumed_before_reread)
+        assert (await controller.observe()).execution_state == "started"
+        # S2 is visible on the next refresh and still holds the session.
+        assert (await controller.observe()).execution_state == "started"
+        daemon.end_shell(second[0])
+        assert (await controller.observe()).execution_state == "succeeded"

@@ -260,6 +260,10 @@ class Handler(BaseHTTPRequestHandler):
             info = {'id': sid, **body}
             sessions[sid] = {'info': info, 'kind': kind, 'messages': [], 'events': []}
             return self.send({'data': info})
+        if path == '/api/shell' and self.command == 'GET':
+            # Like the 2.2.7 daemon, list running shell commands; the fixed proof
+            # payloads run in the foreground, so none is ever still running.
+            return self.send({'location': {'directory': '/'}, 'data': []})
         parts = path.split('/')
         sid = parts[4] if path.startswith('/api/experimental/session/') else parts[3]
         state = sessions[sid]

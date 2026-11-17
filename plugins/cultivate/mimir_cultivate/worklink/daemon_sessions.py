@@ -162,6 +162,7 @@ class SessionController:
         self._lock = asyncio.Lock()
         self.sensitive_values: tuple[str, ...] = ()
         self._cancelling = False
+        self._shells: list[dict] = []
 
     async def _bounded(self, operation):
         if self._cancelling:
@@ -390,7 +391,20 @@ class SessionController:
             await stream.aclose()
         raise DaemonClientError("missing log watermark")
 
-    def _execution_state(self, messages: list[dict], inbox: list[dict]) -> str:
+    async def _owned_shells(self) -> list[dict]:
+        """This session's own background shells that are still running.
+
+        OpenCode 2 ends a turn (``idle``) while a shell the agent started in the
+        background keeps running; when it completes, a ``synthetic`` message
+        resumes the session. Until every owned shell has finished, ``idle`` is not
+        quiescence (2026-11-16: #2149 and #2151 were stopped mid-resume).
+        """
+        shells = await self._bounded(self.client.running_shells(self.record.checkout_path))
+        return [shell for shell in shells
+                if shell.get("metadata", {}).get("sessionID") == self.record.opencode_session_id]
+
+    def _execution_state(self, messages: list[dict], inbox: list[dict], shells: list[dict] = (),
+                         *, stable: bool = True) -> str:
         """Derive the owned input's state from durable history.
 
         The single admitted ``user`` message opens the execution; a trailing
@@ -408,7 +422,7 @@ class SessionController:
                 return "pending"
             return "interrupted" if self.record.stop_requested else "incomplete"
         after = history[admitted + 1:]
-        if after and after[-1].get("type") == "idle":
+        if after and after[-1].get("type") == "idle" and not shells and stable:
             return after[-1]["outcome"]
         return "started"
 
@@ -416,6 +430,18 @@ class SessionController:
         await self._read_log()
         inbox = await self._inbox()
         messages = await self._messages()
+        self._shells = await self._owned_shells()
+        stable = True
+        if not self._shells and messages and messages[-1].get("type") == "idle":
+            # The history was read before the shell listing. A shell can finish and
+            # resume the session in between, so take a fresh history witness after
+            # observing that no shell is left, and accept a terminal idle only if it
+            # is the same idle on both sides of that observation. A resumed turn can
+            # start another background shell and reach a *new* idle before the
+            # re-read; the earlier empty listing says nothing about that shell.
+            witnessed = messages[-1]["id"]
+            messages = await self._messages()
+            stable = bool(messages) and messages[-1].get("id") == witnessed
         users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                  and m["id"] not in self.record.baseline_message_ids}
         if len(users) > 1 or (self.record.input_id and users and users != {self.record.input_id}):
@@ -424,7 +450,7 @@ class SessionController:
             raise DaemonClientError("unowned input in fresh session")
         if users and not self.record.input_id:
             self._persist(input_id=next(iter(users)), admission_state="admitted")
-        state = self._execution_state(messages, inbox)
+        state = self._execution_state(messages, inbox, self._shells, stable=stable)
         if state != self.record.execution_state:
             self._persist(execution_state=state)
         return messages, inbox
@@ -484,6 +510,8 @@ class SessionController:
                             pending = [m for m in inbox if m["id"] == self.record.input_id]
                             for item in pending:
                                 await self.client.delete_inbox(self.record.opencode_session_id, item["id"])
+                            for shell in self._shells:
+                                await self.client.delete_shell(shell["id"], self.record.checkout_path)
                             if not pending and self.record.input_id and self.record.execution_state in {"succeeded", "failed", "interrupted"}:
                                 self._persist(cancellation_state="verified")
                                 return True

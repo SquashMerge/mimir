@@ -248,6 +248,26 @@ class OpenCodeDaemonClient:
         await self._request("DELETE", self._path(session_id, "inbox/") + _identifier(inbox_id, "msg"),
                             status=204)
 
+    async def running_shells(self, directory: str) -> list[dict[str, Any]]:
+        """Background shell commands still running in ``directory`` (all sessions)."""
+        result = _object(await self._request("GET", "/api/shell", params={"location[directory]": directory}))
+        self._list(result)
+        shells = []
+        for item in result["data"]:
+            try:
+                _identifier(item.get("id"), "sh")
+            except ValueError:
+                raise DaemonClientError("invalid shell identity") from None
+            if not isinstance(item.get("status"), str) or not isinstance(item.get("metadata", {}), dict):
+                raise DaemonClientError("invalid shell entry")
+            if item["status"] == "running":
+                shells.append(item)
+        return shells
+
+    async def delete_shell(self, shell_id: str, directory: str) -> None:
+        await self._request("DELETE", "/api/shell/" + _identifier(shell_id, "sh"),
+                            params={"location[directory]": directory}, status=204)
+
     async def interrupt(self, session_id: str) -> dict[str, Any]:
         result = _object(await self._request("POST", self._path(session_id, "interrupt"),
                                             params={"resume": "false"}))

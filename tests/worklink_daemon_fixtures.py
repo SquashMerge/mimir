@@ -97,6 +97,8 @@ class FakeOpenCodeDaemon:
         self.delete_race = False
         self.interrupt_noop = False
         self.command_prompts = True
+        #: Background shells by id. A shell outlives its session's turn, as in 2.2.7.
+        self.shells: dict[str, dict[str, Any]] = {}
         self._counter = 0
         self._closing = False
         self.app = web.Application()
@@ -112,6 +114,7 @@ class FakeOpenCodeDaemon:
             "/api/session/{sessionID}/inbox/{inboxID}": ["DELETE"],
             "/api/session/{sessionID}/interrupt": ["POST"],
             "/api/experimental/session/{sessionID}/log": ["GET"],
+            "/api/shell": ["GET"], "/api/shell/{id}": ["DELETE"],
         }
         for route, methods in routes.items():
             for method in methods:
@@ -191,6 +194,16 @@ class FakeOpenCodeDaemon:
         state.active = False
         state.info["outcome"] = outcome
 
+    def start_shell(self, session_id: str, directory: str, command: str = "sh scripts/heavy_run.sh pytest") -> str:
+        shell_id = self._id("sh")
+        self.shells[shell_id] = {"id": shell_id, "status": "running", "command": command, "cwd": directory,
+                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 4242,
+                                 "metadata": {"sessionID": session_id}, "time": {"started": 1}}
+        return shell_id
+
+    def end_shell(self, shell_id: str, status: str = "exited") -> None:
+        self.shells[shell_id].update(status=status, exit=0 if status == "exited" else 1, time={"started": 1, "completed": 2})
+
     def _response(self, request: web.Request, body: Any, status: int = 200) -> web.Response:
         operation = self.schema.operation(request.match_info.route.resource.canonical, request.method)
         response = operation["responses"][str(status)]
@@ -240,6 +253,18 @@ class FakeOpenCodeDaemon:
             info["id"] = self._id("ses")
             self.sessions[info["id"]] = SyntheticSession(info)
             return self._response(request, {"data": info})
+        if path == "/api/shell":
+            directory = request.query.get("location[directory]")
+            return self._response(request, {"location": {"directory": directory or "/"}, "data": [
+                shell for shell in self.shells.values() if directory is None or shell["cwd"] == directory]})
+        if path.startswith("/api/shell/"):
+            shell = self.shells.get(request.match_info["id"])
+            if shell is None:
+                return self._response(request, {"_tag": "ShellNotFoundError", "id": request.match_info["id"],
+                                                "message": "Synthetic shell not found"}, 404)
+            if shell["status"] == "running":
+                self.end_shell(shell["id"], "killed")
+            return self._response(request, None, 204)
         session_id = request.match_info["sessionID"]
         if session_id not in self.sessions:
             return self._response(request, {"_tag": "SessionNotFoundError", "sessionID": session_id,
