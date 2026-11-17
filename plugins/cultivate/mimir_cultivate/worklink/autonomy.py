@@ -73,6 +73,9 @@ FACTORY_MAX_CONCURRENT_DEFAULT = 1
 
 log = logging.getLogger(__name__)
 
+# Process-local edge-triggered telemetry; refusal decisions are always rechecked.
+_factory_runtime_prune_refusals: dict[Path, str] = {}
+
 
 def chainlink_bin() -> str:
     """Resolve the chainlink binary (env override, else ``chainlink`` on PATH)."""
@@ -367,11 +370,13 @@ def prune_stale_attempt_checkouts_for_home(
             return []
         try:
             listing = list_factory_records(home)
+            archived_listing = list_factory_records(home, archived=True)
         except Exception:
             return []
-        if listing.failures:
+        if listing.failures or archived_listing.failures:
             return []
         factory_records = listing.records
+        runtime_records = factory_records + archived_listing.records
         retained_run_paths = {
             Path(state.checkout).resolve() for state in list_run_states(home) if state.checkout
         }
@@ -398,7 +403,7 @@ def prune_stale_attempt_checkouts_for_home(
             prepare_prune=lambda child: (
                 _preserve_before_prune(home, Path(repo_raw), child, factory_records,
                                        run=run, defaults=defaults)
-                or _prepare_factory_runtime_prune(child, factory_records)
+                or _prepare_factory_runtime_prune(child, runtime_records)
             ),
         )
         for child in pruned:
@@ -498,6 +503,7 @@ def _prune_preserved_for_closed_issues(
 def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object]) -> bool:
     """Empty worker-owned subdirectories before the controller removes the attempt."""
     runtime = child / ".factory-runtime"
+    attempt_path = child.resolve()
     # The same interlock protects the record read and this operation. An unknown
     # or unverified process is not authority to clear another run's store.
     matching = [
@@ -505,14 +511,18 @@ def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object
         if Path(record.sandbox).parent.parent.parent.resolve() == child.resolve()
     ]
     def refuse(reason: str) -> bool:
-        try:
-            log_event_sync(
+        if _factory_runtime_prune_refusals.get(attempt_path) != reason:
+            _factory_runtime_prune_refusals[attempt_path] = reason
+            _log_best_effort(
                 "worklink_factory_runtime_prune_refused",
                 attempt_path=str(child), reason=reason,
             )
-        except Exception:
-            pass  # A telemetry failure must not turn refusal into deletion.
         return False
+
+    def ready() -> bool:
+        if _factory_runtime_prune_refusals.pop(attempt_path, None) is not None:
+            _log_best_effort("worklink_factory_runtime_prune_ready", attempt_path=str(child))
+        return True
 
     if any(not factory_process_is_verified_dead(record) for record in matching):
         return refuse("driver death is not verified")
@@ -520,7 +530,7 @@ def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object
     # Preserve the pre-existing verified-dead checkout TTL policy, including
     # legacy records whose children_reaped field defaults to False.
     if not runtime.exists() and not runtime.is_symlink():
-        return True
+        return ready()
     if not matching:
         return refuse("runtime has no authoritative factory record")
     if any(not getattr(record, "children_reaped", False) for record in matching):
@@ -531,7 +541,7 @@ def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object
         clear_prunable_runtime(child)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         return refuse(f"runtime cleanup failed: {type(exc).__name__}: {exc}")
-    return True
+    return ready()
 
 
 def recover_factory_runtime(
