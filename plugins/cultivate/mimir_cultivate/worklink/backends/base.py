@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
+from ..execution_policy import ExecutionPolicy
 
 
 class SessionTransportLostError(RuntimeError):
@@ -102,13 +103,14 @@ class WorkSpec:
     backend: str
     timeout_s: int
     creds_ref: Mapping[str, str] = field(default_factory=dict)
-    env: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict, repr=False)
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     local_checkout: Path | None = None
     local_argv: Sequence[str] | None = None
     output_root: Path | None = None
     factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     session_request: SessionRequest | None = None
+    execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
 
 
 @dataclass(frozen=True)
@@ -181,6 +183,7 @@ class Caps:
     json_output: bool
     native_pr_creation: bool
     quota_pool: str | None
+    execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
 
 
 class CheckoutShape(StrEnum):

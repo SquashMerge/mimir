@@ -30,7 +30,6 @@ from .worker_client import (
     ENABLED_CHECKOUT_ROOT,
     MAX_PROJECTION_BYTES,
     MAX_REQUEST_BYTES,
-    _PROJECTION_PATHS,
     _validate_identifier,
     worklink_checkout_root,
 )
@@ -43,7 +42,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-private-claude-profiles"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -64,12 +63,12 @@ _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
     "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
-    "executor_identity",
+    "executor_identity", "home_projection_profile",
 })
 _PATH_LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "path", "run_uid",
     "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
-    "executor_identity",
+    "executor_identity", "home_projection_profile",
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _FACTORY_CANCEL_FIELDS = frozenset({"version", "op", "executor_identity", "handle"})
@@ -722,7 +721,8 @@ def _validate_command(request: dict[str, Any]) -> list[str]:
     if (
         not isinstance(argv, list)
         or not argv
-        or any(not isinstance(value, str) or not value or "\x00" in value for value in argv)
+        or not argv[0]
+        or any(not isinstance(value, str) or "\x00" in value for value in argv)
     ):
         raise RuntimeError("invalid worker command")
     return argv
@@ -773,6 +773,8 @@ def _validate_environment(value: object) -> dict[str, str]:
         raise RuntimeError("worker environment must be string pairs")
     if "HOME" in value:
         raise RuntimeError("worker HOME is assigned by the executor")
+    if "CLAUDE_CONFIG_DIR" in value:
+        raise RuntimeError("worker Claude config is assigned by the executor")
     if any(
         not isinstance(key, str)
         or not isinstance(item, str)
@@ -797,13 +799,43 @@ def _leaf_git_environment(environment: dict[str, str], checkout: Path) -> None:
     })
 
 
-def _project_home(home: Path, projections: object) -> None:
+def _project_home(home: Path, projections: object, profile: str = "none") -> None:
+    profiles = {
+        "none": {},
+        "claude_leaf": {".claude/.claude.json": {"hasCompletedOnboarding": True},
+                        ".claude/settings.json": {"disableAllHooks": True}},
+        "claude_factory": {".claude/.claude.json": {"hasCompletedOnboarding": True}},
+    }
+    if not isinstance(profile, str) or profile not in profiles:
+        raise RuntimeError("unknown worker projection profile")
     if not isinstance(projections, list) or len(projections) > 2:
         raise RuntimeError("at most two worker projections are allowed")
+    expected = profiles[profile]
+    seen: set[str] = set()
     for projection in projections:
         if not isinstance(projection, dict) or set(projection) != {"path", "document"}:
             raise RuntimeError("invalid projection document")
-        raise RuntimeError("invalid projection destination: worker auth/config projection is retired")
+        path, document = projection["path"], projection["document"]
+        if not isinstance(path, str) or path not in expected or path in seen:
+            raise RuntimeError("invalid projection destination for selected profile")
+        seen.add(path)
+        if not isinstance(document, str) or len(document.encode()) > MAX_PROJECTION_BYTES:
+            raise RuntimeError("invalid projection document size")
+        try:
+            parsed = json.loads(document)
+        except ValueError as exc:
+            raise RuntimeError("invalid projection JSON") from exc
+        if not isinstance(parsed, dict) or parsed != expected[path] or any(type(v) is not bool for v in parsed.values()):
+            raise RuntimeError("worker projection must use generated configuration")
+    if seen != set(expected):
+        raise RuntimeError("worker projections do not match selected profile")
+    if projections:
+        directory = home / ".claude"
+        directory.mkdir(mode=0o700)
+        for projection in projections:
+            fd = os.open(home / projection["path"], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(projection["document"])
     for root, directories, files in os.walk(home):
         for name in directories:
             os.chown(Path(root) / name, get_identities().worklink_uid, get_identities().worklink_gid, follow_symlinks=False)
@@ -1230,6 +1262,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
     factory = request.get("op") in {"launch_factory", "launch_factory_control"}
+    supervised = factory or request["home_projection_profile"] != "none"
     checkout_root = None if path_addressed else _validate_checkout(fds[0], request)
     for fd in fds[0 if path_addressed else 1:]:
         metadata = os.fstat(fd)
@@ -1237,6 +1270,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             raise RuntimeError("worker output FD must be a regular file")
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
+    if request["home_projection_profile"] == "claude_leaf" and {
+        "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY",
+    }.intersection(environment):
+        raise RuntimeError("Claude leaf refuses epic credentials")
     timeout_s = request["timeout_s"]
     if (
         isinstance(timeout_s, bool)
@@ -1276,10 +1313,12 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         home = candidate_home
         if checkout_root == REPO_TEST_CHECKOUT_ROOT and Path(command[0]).name == "uv":
             environment["UV_CACHE_DIR"] = str(_seed_repo_test_uv_cache(home))
-        _project_home(home, request["projections"])
+        _project_home(home, request["projections"], request["home_projection_profile"])
         os.chown(home, get_identities().worklink_uid, get_identities().worklink_gid)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
+        if request["home_projection_profile"] != "none":
+            environment["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
         execution_fd = os.dup(anchored_fd) if factory else _execution_checkout_fd(
             command,
             anchored_fd,
@@ -1290,7 +1329,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         anchored_fd = execution_fd
         fds[0] = anchored_fd
         launch_command = command
-        if factory:
+        if supervised:
             supervisor_parent, supervisor_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             # This filename and interpreter belong to the installed executor,
             # not the writable checkout. -I excludes PYTHONPATH and user sites.
@@ -1307,9 +1346,9 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             env=environment,
             preexec_fn=lambda: _drop_launch_worker(fds[0], home, request["op"], environment),
             close_fds=True,
-            pass_fds=(fds[0], supervisor_child.fileno()) if factory else (fds[0],),
+            pass_fds=(fds[0], supervisor_child.fileno()) if supervised else (fds[0],),
         )
-        if factory:
+        if supervised:
             supervisor_child.close()
             captures = ()
             if control:
@@ -1353,7 +1392,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             "output_overflow": output_overflow,
             "stdout_bytes": stdout_bytes,
             "stderr_bytes": stderr_bytes,
-        }, nonblocking=factory)
+        }, nonblocking=supervised)
     finally:
         with _jobs_lock:
             _launching.discard(identifier)

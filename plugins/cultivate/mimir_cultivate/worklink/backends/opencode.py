@@ -127,12 +127,14 @@ class OpenCodeBackend:
         return replace(spec, env=filter_otlp_env(spec.env))
 
     def capabilities(self) -> Caps:
+        from ..execution_policy import OPENCODE_LEAF
         return Caps(
             tool_category="coding-cli",
             persistent_sessions=False,
             json_output=False,
             native_pr_creation=False,
             quota_pool="opencode",
+            execution=OPENCODE_LEAF,
         )
 
     def work_spec(
@@ -181,6 +183,7 @@ class OpenCodeBackend:
             local_checkout=order.checkout,
             session_request=SessionRequest("leaf", reference, prompt, allowlist),
             output_root=order.transcript_root,
+            execution=self.capabilities().execution,
         )
 
     async def invoke_with_startup_retry(

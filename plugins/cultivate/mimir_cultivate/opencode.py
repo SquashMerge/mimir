@@ -281,7 +281,7 @@ def redact_daemon_output(text: str) -> str:
     from mimir.redaction import redact_text
 
     for name, value in os.environ.items():
-        if value and is_sensitive_otlp_env(name, value):
+        if value and (is_sensitive_otlp_env(name, value) or name == "CLAUDE_CODE_OAUTH_TOKEN"):
             text = text.replace(value, "<redacted>")
     return redact_text(text)
 

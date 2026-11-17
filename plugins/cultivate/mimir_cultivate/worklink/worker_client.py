@@ -32,12 +32,12 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-private-claude-profiles"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
 )
-_PROJECTION_PATHS: frozenset[str] = frozenset()
+_PROJECTION_PATHS = frozenset({".claude/.claude.json", ".claude/settings.json"})
 
 
 def worklink_checkout_root() -> Path:
@@ -203,6 +203,26 @@ class WorkerProjection:
         parsed = json.loads(self.document)
         if not isinstance(parsed, dict):
             raise ValueError("worker projection must be a JSON object")
+
+
+def _validate_projection_profile(profile: str, projections: Sequence[WorkerProjection]) -> None:
+    profiles = {
+        "none": {},
+        "claude_leaf": {".claude/.claude.json": {"hasCompletedOnboarding": True},
+                        ".claude/settings.json": {"disableAllHooks": True}},
+        "claude_factory": {".claude/.claude.json": {"hasCompletedOnboarding": True}},
+    }
+    if not isinstance(profile, str) or profile not in profiles:
+        raise ValueError("unknown worker projection profile")
+    expected = profiles[profile]
+    if (len(projections) > 2 or len({p.path for p in projections}) != len(projections)
+            or {p.path for p in projections} != set(expected)):
+        raise ValueError("worker projections do not match selected profile")
+    for item in projections:
+        checked = WorkerProjection(item.path, item.document)
+        parsed = json.loads(checked.document)
+        if parsed != expected[checked.path] or any(type(v) is not bool for v in parsed.values()):
+            raise ValueError("worker projection must use generated configuration")
 
 
 @dataclass
@@ -585,6 +605,7 @@ class WorkerClient:
         argv: Sequence[str],
         env: Mapping[str, str],
         projections: Sequence[WorkerProjection] = (),
+        home_projection_profile: str = "none",
         identifier: str,
         timeout_s: float,
         stdout_sink: OutputSink | None = None,
@@ -602,13 +623,19 @@ class WorkerClient:
         if (
             not isinstance(argv, (list, tuple))
             or not argv
-            or any(not isinstance(value, str) or not value or "\x00" in value for value in argv)
+            or not argv[0]
+            or any(not isinstance(value, str) or "\x00" in value for value in argv)
         ):
             raise ValueError("worker command must contain non-empty strings")
-        if len(projections) > 2 or len({item.path for item in projections}) != len(projections):
-            raise ValueError("worker projections must use at most two unique destinations")
+        _validate_projection_profile(home_projection_profile, projections)
         if "HOME" in env:
             raise ValueError("worker HOME is assigned by the executor")
+        if "CLAUDE_CONFIG_DIR" in env:
+            raise ValueError("worker Claude config is assigned by the executor")
+        if home_projection_profile == "claude_leaf" and {
+            "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY",
+        }.intersection(env):
+            raise ValueError("Claude leaf refuses epic credentials")
         if (
             isinstance(timeout_s, bool)
             or not isinstance(timeout_s, (int, float))
@@ -629,6 +656,7 @@ class WorkerClient:
             "op": self._launch_op,
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "id": identifier,
+            "home_projection_profile": home_projection_profile,
             "argv": list(argv),
             "env": filter_otlp_env(env),
             "projections": [

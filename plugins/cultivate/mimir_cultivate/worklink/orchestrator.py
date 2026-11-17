@@ -1144,14 +1144,18 @@ class WorklinkRunner:
             else registry.select(labels=issue.labels, repo=repo_slug)
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
-        if isinstance(backend, OpenCodeBackend):
+        from .execution_policy import execution_for_backend
+        execution = execution_for_backend(backend)
+        if execution.substrate == "opencode_daemon":
             from .compute import OpenCodeDaemonComputeBackend
             compute = OpenCodeDaemonComputeBackend()
+        elif execution.home_projection_profile != "none":
+            from .identities import get_identities
+            compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
         selected_name = backend.name
         worker_uid_drop = (
-            _cultivate_selected()
-            and isinstance(backend, OpenCodeBackend)
-            and compute.name == "opencode_daemon"
+            (_cultivate_selected() and execution.retained_state == "opencode_session")
+            or execution.home_projection_profile != "none"
         )
         test_cmd = (
             repository_config.quick_gate_command if gate_mode == "ci" else
@@ -1221,7 +1225,7 @@ class WorklinkRunner:
                 )
                 return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
 
-        if compute.name == "opencode_daemon":
+        if execution.substrate == "opencode_daemon":
             from .daemon_gate import prepare_daemon_health, workload_refusal
 
             reason = workload_refusal(await asyncio.to_thread(prepare_daemon_health, dict(os.environ)))
@@ -1474,7 +1478,8 @@ class WorklinkRunner:
                                 recovery = LaunchHandle("opencode_daemon", "admission", launch_generation=exc.launch_generation)
                             remember_session(recovery, not exc.quiescent and (exc.uncertain or exc.handle is not None))
                         raise
-                    retain_session = handle.substrate == "opencode_daemon"
+                    retain_session = (execution.retained_state == "opencode_session"
+                                      and handle.opencode_session_id is not None)
                     if retain_session:
                         session_handle = handle
                     # Atomically replace the provisional controller record with
@@ -1601,7 +1606,7 @@ class WorklinkRunner:
                 retain_session = True
                 session_handle = exc.handle
             exception_evidence = None
-            if isinstance(backend, OpenCodeBackend):
+            if execution.retained_state == "opencode_session":
                 exception_evidence = _write_session_failure(
                     self.home, issue.issue_id, record.attempt, selected_name,
                     lease.branch if lease else "", str(lease.path) if lease else "", session_handle, exc)
@@ -1668,7 +1673,7 @@ class WorklinkRunner:
             # when the finally block below requests release after teardown.
             terminal_release.retain_for_recovery = True
             preserve_reason = f"interrupted: {type(exc).__name__}: {exc}"
-            if isinstance(backend, OpenCodeBackend):
+            if execution.retained_state == "opencode_session":
                 _write_session_failure(self.home, issue.issue_id, record.attempt, selected_name,
                                        lease.branch if lease else "", str(lease.path) if lease else "",
                                        session_handle, exc, status="interrupted")
@@ -2195,7 +2200,7 @@ class WorklinkRunner:
                                     on_session_state(recovery, not exc.quiescent and (exc.uncertain or exc.handle is not None))
                             raise
                         if on_session_state is not None:
-                            on_session_state(handle, handle.substrate == "opencode_daemon")
+                            on_session_state(handle, spec.execution.retained_state == "opencode_session")
                         current_session_handle = handle
                         _persist_run_state(
                             self.home, issue=issue, attempt=attempt, backend_name=selected_name,
@@ -2358,11 +2363,15 @@ class WorklinkRunner:
         quota_hold = False
         if transition_status == "failed":
             try:
-                quota_failure = selected_name == "opencode" and raw.backend_status == "quota_exhausted"
-                if quota_failure and raw.retry_after_ms is not None:
+                quota_pool = _backend_quota_pool(backend)
+                quota_failure = quota_pool is not None and raw.backend_status == "quota_exhausted"
+                if quota_failure and type(raw.retry_after_ms) is int and 0 <= raw.retry_after_ms <= 8 * 86400 * 1000:
                     from datetime import timedelta
                     reset_at = datetime.now(UTC) + timedelta(milliseconds=raw.retry_after_ms)
                     reset_source = "provider.retryAfterMs"
+                elif quota_failure and quota_pool == "claude_code":
+                    from datetime import timedelta
+                    reset_at, reset_source = datetime.now(UTC) + timedelta(hours=1), "fallback.hour"
                 else:
                     reset_at, reset_source = _worklink_quota_reset(self.home, raw.error or "") if quota_failure else (None, "")
                 incident = incident_owner.record(
@@ -2393,7 +2402,7 @@ class WorklinkRunner:
                     claims._run(
                         "issue", "comment", str(issue.issue_id),
                         QUOTA_HOLD_PREFIX + hold.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
-                        + f"\nOpenCode quota hold until {incident['retry_after']} ({reset_source}).",
+                        + f"\n{'Claude Code' if quota_pool == 'claude_code' else 'OpenCode'} quota hold until {incident['retry_after']} ({reset_source}).",
                     )
                     quota_hold = True
                     transition_status = "quota_hold"
@@ -2524,6 +2533,17 @@ class WorklinkRunner:
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         config = WorklinkConfig.load(self.home / "worklink.yaml")
+        registry = self.registry or BackendRegistry(config)
+        from .execution_policy import execution_for_backend
+        try:
+            execution = execution_for_backend(registry.get(state.backend))
+        except KeyError:
+            execution = None
+        if (execution is not None and execution.home_projection_profile != "none"
+                and execution.retained_state == "none"):
+            reason = ("contained worker is still live; fresh attempt refused" if process_is_alive(state)
+                      else "nonpersistent backend requires a fresh attempt after quiescence verification")
+            return WorklinkRunResult(issue_id, state.attempt, "failed", reason=f"reattach: {reason}")
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
@@ -3128,13 +3148,12 @@ class WorklinkRunner:
         if repo_slug is None:
             raise WorklinkError("factory repository must have a canonical GitHub origin")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
-        if isinstance(compute, LocalSubprocessComputeBackend):
+        execution = selected.capabilities().execution
+        if execution.substrate == "opencode_daemon" and callable(getattr(compute, "_launch_contained", None)):
             runner = _factory_git_runner(runner)
             from .compute import OpenCodeDaemonComputeBackend
 
             compute = OpenCodeDaemonComputeBackend()
-        if compute.name not in {"opencode_daemon", "local_subprocess"}:
-            raise WorklinkError("factory runs require daemon session supervision")
         if autonomous:
             allowed, reason = config.autonomous_compute_allowed(
                 compute.name, compute.capabilities()
@@ -3147,7 +3166,7 @@ class WorklinkRunner:
                     reason=reason,
                 )
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
-        if compute.name == "opencode_daemon":
+        if execution.substrate == "opencode_daemon":
             from .daemon_gate import prepare_daemon_health, workload_refusal
 
             reason = workload_refusal(await asyncio.to_thread(prepare_daemon_health, dict(os.environ)))
@@ -5567,6 +5586,7 @@ async def _verify_factory_completion(
                 repo_url="", base_ref=record.base_ref, branch=record.branch,
                 prompt="", rules=None, test_command=test_command,
                 backend="feature_factory", timeout_s=1800,
+                execution=FeatureFactoryBackend().capabilities().execution,
                 local_checkout=sandbox,
             ),
         )
@@ -6118,6 +6138,19 @@ def _record_run_failure(
             quota_reset_at=quota_reset_at,
         )
     return None
+
+
+def _backend_quota_pool(backend: object) -> str | None:
+    capabilities = getattr(backend, "capabilities", None)
+    if not callable(capabilities):
+        # Older result adapters supply only interpretation and a registered
+        # name. Resolve the server-owned capabilities, not a name-based gate.
+        try:
+            capabilities = BackendRegistry().get(getattr(backend, "name", "")).capabilities
+        except KeyError:
+            return None
+    pool = capabilities().quota_pool
+    return pool if isinstance(pool, str) and pool else None
 
 
 def _worklink_quota_reset(home: Path, error: str) -> tuple[datetime, str]:
@@ -6958,6 +6991,8 @@ def _create_backend_checkout(
     event_logger: Callable[..., None] | None = None,
     worker_eligible: bool = False,
 ) -> CheckoutLease:
+    from .execution_policy import execution_for_backend
+    execution = execution_for_backend(backend)
     shape = checkout_shape_for_backend(backend)
     if shape is not CheckoutShape.ISOLATED_CLONE:
         raise WorklinkError(f"unsupported checkout shape for backend {backend.name}: {shape}")
@@ -6966,12 +7001,12 @@ def _create_backend_checkout(
         issue_id=issue_id,
         attempt=attempt,
         base=base,
-        checkout_branch=base if isinstance(backend, FeatureFactoryBackend) else None,
+        checkout_branch=base if execution.checkout_protocol == "factory_worker" else None,
         base_fetch=base_fetch,
         event_logger=event_logger,
         runner=runner,
         worker_eligible=worker_eligible,
-        factory_worker=worker_eligible and isinstance(backend, FeatureFactoryBackend),
+        factory_worker=worker_eligible and execution.checkout_protocol == "factory_worker",
     )
 
 

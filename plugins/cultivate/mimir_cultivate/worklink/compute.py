@@ -30,6 +30,7 @@ from ..contained_execution import (
     opencode_worker_environment,
 )
 from .backends.base import LaunchHandle, SessionRequest, SessionOutcome, SessionError, SessionTransportLostError
+from .execution_policy import ExecutionPolicy, home_projection_documents
 
 if TYPE_CHECKING:
     from .worker_client import CheckoutCapability, WorkerClient
@@ -67,13 +68,14 @@ class WorkSpec:
     backend: str
     timeout_s: int
     creds_ref: Mapping[str, str] = field(default_factory=dict)
-    env: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict, repr=False)
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     local_checkout: Path | None = None
     local_argv: Sequence[str] | None = None
     output_root: Path | None = None
     factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     session_request: SessionRequest | None = None
+    execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
 
 
 def with_worker_environment(
@@ -496,6 +498,7 @@ _ENABLED_SYNTHESIZED_NAMES = frozenset({
     "OPENCODE_PERMISSION",
     "FACTORY_SESSION_ID",
     "FACTORY_PUBLISHING_IDENTITY",
+    "CLAUDE_CONFIG_DIR",
 })
 _ENABLED_DENIED_PREFIXES = (
     "MIMIR_",
@@ -573,7 +576,11 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
         additions["OPENCODE_PERMISSION"] = _validate_worker_value(
             "OPENCODE_PERMISSION", permission
         )
-    env = opencode_worker_environment(base_worker_environment(identifier), additions)
+    claude = spec.execution.home_projection_profile != "none"
+    env = (base_worker_environment(identifier) if claude else
+           opencode_worker_environment(base_worker_environment(identifier), additions))
+    if claude and permission is not None:
+        raise ComputeLaunchError("Claude worker refuses OpenCode configuration")
     env["HOME"] = home
     env[WORKLINK_GATE_ENV] = "1"
     if permission is not None:
@@ -592,6 +599,10 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
             seen.add(raw_name)
             continue
         name = _validate_dynamic_worker_name(raw_name)
+        if claude:
+            from ..claude_code import OAUTH_ENV, _PROVIDER_ENV_PREFIXES
+            if name.startswith(_PROVIDER_ENV_PREFIXES) and name != OAUTH_ENV:
+                raise ComputeLaunchError("Claude worker refuses caller authentication or configuration")
         if name in seen:
             raise ComputeLaunchError(f"worker environment {name} is duplicated")
         seen.add(name)
@@ -716,9 +727,11 @@ class LocalSubprocessComputeBackend:
         if not command:
             raise ComputeLaunchError("local_subprocess spec.local_argv must not be empty")
         from .checkout import _cultivate_selected
-        if spec.backend == "feature_factory":
+        if spec.execution.checkout_protocol == "factory_worker":
             return await self._launch_contained(spec, command)
-        if _cultivate_selected() and spec.backend == "opencode":
+        if spec.execution.home_projection_profile != "none":
+            return await self._launch_contained(spec, command)
+        if _cultivate_selected():
             return await self._launch_enabled(spec, command)
         # chainlink #830: autonomous local_subprocess builds an allowlisted env
         # from the parent process — infra vars (HOME so a coding CLI finds its
@@ -821,7 +834,7 @@ class LocalSubprocessComputeBackend:
         from .worker_client import WorkerClient, WorkerProjection
 
         authorization = self._authorized_checkout
-        factory = spec.backend == "feature_factory"
+        factory = spec.execution.checkout_protocol == "factory_worker"
         if factory:
             capability = _PathCheckoutCapability(spec.local_checkout)
             client = self._worker_client or WorkerClient.for_factory_checkout(
@@ -844,7 +857,12 @@ class LocalSubprocessComputeBackend:
             raise ComputeLaunchError(
                 "enabled local_subprocess requires an authorized or path-addressed worker checkout"
             )
+        profile = spec.execution.home_projection_profile
+        if profile != "none" and "worker_projections" in spec.backend_config:
+            raise ComputeLaunchError("Claude home projections are server-generated")
         projections_raw = spec.backend_config.get("worker_projections", ())
+        if profile != "none":
+            projections_raw = tuple(WorkerProjection(path, document) for path, document in home_projection_documents(profile))
         if isinstance(projections_raw, (str, bytes)) or not isinstance(
             projections_raw, Sequence
         ):
@@ -855,11 +873,17 @@ class LocalSubprocessComputeBackend:
                 projections.append(WorkerProjection(path=item.path, document=item.document))
         except (AttributeError, TypeError, ValueError) as exc:
             raise ComputeLaunchError("worker projection is invalid") from exc
-        identifier = str(uuid.uuid4())
+        identifier = spec.backend_config.get("worker_identifier") or str(uuid.uuid4())
+        from .worker_client import _validate_identifier
+        _validate_identifier(identifier)
         started: asyncio.Future[object] = asyncio.get_running_loop().create_future()
         capability = _ClientBoundCapability(capability, client, started)
         stdout_limit, stderr_limit = _worklink_output_limits()
         stdout_path, stderr_path = _output_paths(spec, identifier)
+        if profile != "none":
+            # Raw credential-bearing output is captured in anonymous bounded files;
+            # only the backend's redacted transcript is made durable.
+            stdout_path, stderr_path = None, None
         try:
             stdout_sink, stderr_sink = open_output_pair(
                 stdout_path,
@@ -891,6 +915,10 @@ class LocalSubprocessComputeBackend:
                         raise ComputeLaunchError("OpenCode workloads require daemon sessions")
                 else:
                     environment = _enabled_child_env(spec, identifier)
+                scrubber = None
+                if profile != "none":
+                    from ..claude_code import secret_scrubber
+                    scrubber = secret_scrubber(spec.env)
                 return await execute_contained(
                         command,
                         capability,
@@ -901,11 +929,13 @@ class LocalSubprocessComputeBackend:
                         }),
                         projections,
                         identifier=identifier,
+                        home_projection_profile=profile,
                         timeout_s=spec.timeout_s,
                         stdout_limit=stdout_limit,
                         stderr_limit=stderr_limit,
                         stdout_sink=stdout_sink,
                         stderr_sink=stderr_sink,
+                        scrubber=scrubber,
                     )
             except asyncio.CancelledError:
                 if not started.done():
@@ -971,19 +1001,32 @@ class LocalSubprocessComputeBackend:
                     ) from exc
             if not isinstance(collected, CollectedExecutionResult):
                 raise RuntimeError("contained execution returned an invalid result")
+            launch_error = None
+            try:
+                errors = "strict" if _spec.execution.home_projection_profile != "none" else "replace"
+                stdout = collected.stdout.decode(errors=errors)
+                stderr = collected.stderr.decode(errors=errors)
+            except UnicodeDecodeError:
+                stdout, stderr = "", ""
+                launch_error = "Claude output is not UTF-8"
             return ComputeResult(
                 exit_code=collected.exit_code if collected.exit_code is not None else -1,
-                stdout=collected.stdout.decode(errors="replace"),
-                stderr=collected.stderr.decode(errors="replace"),
+                stdout=stdout,
+                stderr=stderr,
+                launch_error=launch_error,
                 timed_out=timed_out or collected.timed_out,
                 output_overflow=collected.output_overflow,
                 handle=handle,
                 command=command,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
-                # Only this factory worker path has the subreaper protocol;
-                # collect_contained raises on lost/refused terminal reports.
-                children_reaped=(_spec.backend == "feature_factory"),
+                # The executor supervises factory workers and private Claude
+                # profiles with its subreaper; lost/refused reports raise.
+                children_reaped=(
+                    _spec.execution.checkout_protocol == "factory_worker"
+                    or (_spec.execution.retirement == "contained_process_tree"
+                        and _spec.execution.home_projection_profile != "none")
+                ),
             )
 
         proc = job
