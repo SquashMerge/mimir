@@ -142,6 +142,59 @@ async def test_session_rpc_waits_longer_than_the_helper_allowance(monkeypatch, t
     assert daemon_config.SESSION_RPC_TIMEOUT_S > daemon_config.SESSION_HELPER_TIMEOUT_S
 
 
+@pytest.mark.parametrize("stdout,label", [
+    (b'{"failure": {"class": "DaemonClientError", "reason": "invalid shell entry"}}', " (DaemonClientError invalid shell entry)"),
+    (b'{"failure": {"class": "TimeoutError"}}', " (TimeoutError)"),
+    (b'{"failure": {"class": "X", "reason": "<script>"}}', " (X)"),
+    (b"not json", ""), (b'{"other": 1}', ""),
+])
+def test_executor_labels_a_failed_session_helper(stdout, label):
+    from mimir_cultivate.worklink.worker_exec import _helper_failure
+
+    assert _helper_failure(stdout) == label
+
+
+def test_executor_error_for_a_failed_helper_carries_its_label():
+    """Review suggestion on #106: pin the producer-to-error wiring inside _handle_session."""
+    import inspect
+    from mimir_cultivate.worklink import worker_exec
+
+    source = inspect.getsource(worker_exec._handle_session)
+    failure = source.index("if process.returncode != 0")
+    assert "_helper_failure(process.stdout)" in source[failure:failure + 300]
+
+
+@pytest.mark.asyncio
+async def test_session_rpc_keeps_the_executor_failure_reason(monkeypatch, tmp_path, caplog):
+    import json as _json
+    import logging
+    import socket as _socket
+    import threading
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    client_end, executor_end = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    reason = "session operation failed (DaemonClientError invalid shell entry); retain controller and checkout"
+
+    def executor():
+        _json.loads(executor_end.recv(1 << 20))
+        executor_end.sendall(_json.dumps({"id": "x", "error": reason + " Bearer " + "fragment-secret"}).encode())
+
+    thread = threading.Thread(target=executor)
+    thread.start()
+    monkeypatch.setattr(WorkerClient, "_connect", lambda self, timeout_s=None: client_end)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    client = WorkerClient.for_path_checkout(checkout, issue_id=1, attempt=1, run_uid=os.geteuid())
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError) as raised:
+        await client._session_rpc("session_observe" if False else "session_cancel",
+                                  {"generation": "g", "opencode_session_id": "ses_x"})
+    thread.join(5)
+    executor_end.close()
+    assert "invalid shell entry" in str(raised.value)
+    assert "fragment-secret" not in str(raised.value) and "fragment-secret" not in caplog.text
+    assert "worklink session session_cancel failed" in caplog.text
+
+
 def test_authorized_checkout_binds_configured_worker_uid(monkeypatch, tmp_path) -> None:
     from mimir_cultivate.worklink import identities
     from mimir_cultivate.worklink.checkout import _mint_checkout_authorization

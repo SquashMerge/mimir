@@ -727,10 +727,14 @@ def main() -> int:
         if exc.reason in {"transport failure", "missing log watermark"}:
             sys.stdout.write('{"transport_lost":true}')
             return 0
+        # DaemonClientError reasons are fixed code literals, never remote bodies.
+        sys.stdout.write(json.dumps({"failure": {"class": "DaemonClientError", "reason": exc.reason,
+                                                 **({"status": exc.status} if type(exc.status) is int else {})}}))
         return 1
-    except Exception:
+    except Exception as exc:
         # Remote/provider bodies and credential-bearing local errors never cross
-        # the helper's stdout protocol or stderr boundary.
+        # the helper's stdout protocol or stderr boundary: only the class name does.
+        sys.stdout.write(json.dumps({"failure": {"class": type(exc).__name__}}))
         return 1
 
 

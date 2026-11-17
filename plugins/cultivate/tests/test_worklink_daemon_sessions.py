@@ -916,3 +916,22 @@ async def test_a_new_idle_after_the_empty_shell_listing_is_not_success(tmp_path,
         assert (await controller.observe()).execution_state == "started"
         daemon.end_shell(second[0])
         assert (await controller.observe()).execution_state == "succeeded"
+
+
+@pytest.mark.parametrize("raised,expected", [
+    (DaemonClientError("invalid shell entry"), {"class": "DaemonClientError", "reason": "invalid shell entry"}),
+    (DaemonClientError("HTTP failure", status=404), {"class": "DaemonClientError", "reason": "HTTP failure", "status": 404}),
+    (ValueError("token=" + "fragment-secret"), {"class": "ValueError"}),
+])
+def test_helper_failure_reports_only_class_and_code_literal_reason(monkeypatch, capsys, raised, expected):
+    import io
+    from mimir_cultivate.worklink import daemon_sessions
+
+    async def fail(request):
+        raise raised
+    monkeypatch.setattr(daemon_sessions, "_executor_operation", fail)
+    monkeypatch.setattr(daemon_sessions.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}")))
+    assert daemon_sessions.main() == 1
+    out = capsys.readouterr().out
+    assert json.loads(out) == {"failure": expected}
+    assert "fragment-secret" not in out
