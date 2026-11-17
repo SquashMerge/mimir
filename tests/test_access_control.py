@@ -10100,6 +10100,173 @@ def test_repo_review_additions_do_not_widen_other_profiles(
     assert parse_service_shell_argv(command, profile) is None
 
 
+@pytest.fixture
+def unbound_checkout_result(tmp_path, selected_repository_policy):
+    from mimir.access_control import ToolAuthorization
+    from mimir.plugins.core import selected_policy_registry
+
+    state = _review_state("squashmerge/mimir", 77, "worklink/77", str(tmp_path))
+    assert state.checkout_lease is None
+    auth = replace(
+        _egress_shadow_auth(tainted=False), repo_review_state=state,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    authorization = ToolAuthorization(
+        "repo_checkout", OperationDecision.RESOURCE_SCOPED, True,
+        policy=selected_policy_registry(), repo_pr_action_scope=state.action_scope,
+    )
+    arguments = {"repository": "SquashMerge/mimir", "pull_request": 77}
+    return auth, authorization, arguments
+
+
+_CHECKOUT_SCOPE_REFUSAL = (
+    "repository checkout rejected: unpublished PR checkout lease candidates include "
+    "another scope; refusing reuse: cb5413f3 "
+    "(/workspace/pr-leases/6403d7d7a708af24-candidate, scope mismatch)"
+)
+
+
+@pytest.mark.parametrize("shape", ["exception", "error_message", "policy_refusal"])
+@pytest.mark.parametrize("provenance_present", [False, True])
+def test_bound_repo_checkout_failure_does_not_taint(
+    unbound_checkout_result, shape, provenance_present,
+):
+    from langchain_core.messages import ToolMessage
+    from langchain_core.tools import ToolException
+    from mimir.access_control import ProtectedResultProvenance
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    auth, authorization, arguments = unbound_checkout_result
+    refusal = ToolPolicyRefusal(_CHECKOUT_SCOPE_REFUSAL) if shape == "policy_refusal" else None
+    result = (
+        ToolException(_CHECKOUT_SCOPE_REFUSAL) if shape == "exception" else
+        ToolMessage(content=f"Error: {_CHECKOUT_SCOPE_REFUSAL}",
+                    tool_call_id="checkout-77", status="error")
+    )
+    # ToolException is the observed denied:true path. A typed provider refusal
+    # also works even when the separate failed flag is not supplied.
+    labels = classify_protected_result(
+        "repo_checkout", arguments, auth, authorization, result=result,
+        failed=shape != "policy_refusal", policy_refusal=refusal,
+        provenance=ProtectedResultProvenance(()) if provenance_present else None,
+    )
+    assert labels is None or not labels.has_untrusted_active_ingest
+
+
+def test_successful_unbound_repo_checkout_still_taints(unbound_checkout_result):
+    auth, authorization, arguments = unbound_checkout_result
+    labels = classify_protected_result(
+        "repo_checkout", arguments, auth, authorization,
+        result={"status": "checked_out", "path": "/workspace/pr-leases/unbound"},
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    assert any(s.resource_id == "<unresolved-resource:protected_tool:repo_checkout>"
+               for s in labels.sources)
+
+
+@pytest.mark.parametrize("attachment", ["provenance", "artifact", "both"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "policy_refusal"])
+def test_repo_checkout_result_preserves_untrusted_sources(unbound_checkout_result, attachment, outcome):
+    from langchain_core.messages import ToolMessage
+    from mimir.access_control import ProtectedResultProvenance
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    auth, authorization, arguments = unbound_checkout_result
+    source = SourceLabel(
+        principal=None, domain="web", resource_id="external", bridge_instance=None,
+        sensitivity="public", source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    untrusted = ProtectedResultProvenance((source,))
+    provenance = untrusted if attachment == "provenance" else None
+    if attachment == "both":
+        provenance = ProtectedResultProvenance((replace(source, integrity="trusted"),))
+    result = ToolMessage(
+        content="checked out" if outcome == "success" else f"Error: {_CHECKOUT_SCOPE_REFUSAL}",
+        tool_call_id="checkout-77", status="success" if outcome == "success" else "error",
+        artifact=untrusted if attachment != "provenance" else None,
+    )
+    labels = classify_protected_result(
+        "repo_checkout", arguments, auth, authorization, result=result,
+        failed=outcome == "failure", provenance=provenance,
+        policy_refusal=ToolPolicyRefusal(_CHECKOUT_SCOPE_REFUSAL) if outcome == "policy_refusal" else None,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    if outcome != "success":
+        assert source in labels.sources
+
+
+@pytest.mark.parametrize("mismatch", ["repository", "pull_request"])
+def test_repo_checkout_refusal_for_other_scope_still_taints(unbound_checkout_result, mismatch):
+    from langchain_core.tools import ToolException
+
+    auth, authorization, arguments = unbound_checkout_result
+    arguments[mismatch] = "other/repository" if mismatch == "repository" else 75
+    labels = classify_protected_result(
+        "repo_checkout", arguments, auth, authorization,
+        result=ToolException(_CHECKOUT_SCOPE_REFUSAL), failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+
+
+@pytest.mark.parametrize("invalid", [
+    "other_owner", "other_tool", "resource_scope", "membership", "disallowed",
+    "would_block", "wrong_decision", "missing_scope", "retained_scope",
+    "scope_repository_type", "scope_pr_type", "repository_type", "pr_type",
+])
+def test_repo_checkout_failure_exemption_fails_closed(unbound_checkout_result, invalid):
+    from copy import copy
+    from langchain_core.tools import ToolException
+
+    auth, authorization, arguments = unbound_checkout_result
+    tool_name = "repo_checkout"
+    if invalid in {"other_owner", "resource_scope", "membership"}:
+        selected = copy(authorization.policy)
+        selected._tools = dict(selected.tools)
+        changes = {
+            "other_owner": {"owner": "other_plugin"},
+            "resource_scope": {"resource_scope": "channel"},
+            "membership": {"memberships": frozenset()},
+        }[invalid]
+        selected._tools[tool_name] = replace(selected.tools[tool_name], **changes)
+        authorization = replace(authorization, policy=selected)
+    elif invalid == "other_tool":
+        tool_name = "repo_fetch"
+    elif invalid == "disallowed":
+        authorization = replace(authorization, allowed=False)
+    elif invalid == "would_block":
+        authorization = replace(authorization, would_block=True)
+    elif invalid == "wrong_decision":
+        authorization = replace(authorization, decision=OperationDecision.OPEN)
+    elif invalid == "missing_scope":
+        authorization = replace(authorization, repo_pr_action_scope=None)
+    elif invalid == "retained_scope":
+        authorization = replace(authorization, repo_pr_action_scope=SimpleNamespace(
+            repository="squashmerge/mimir", issue_id=77,
+        ))
+    elif invalid == "scope_repository_type":
+        authorization = replace(authorization, repo_pr_action_scope=replace(
+            authorization.repo_pr_action_scope, canonical_repo=None,
+        ))
+    elif invalid == "scope_pr_type":
+        authorization = replace(authorization, repo_pr_action_scope=replace(
+            authorization.repo_pr_action_scope, pr_number=77.0,
+        ))
+    elif invalid == "repository_type":
+        arguments["repository"] = None
+    elif invalid == "pr_type":
+        arguments["pull_request"] = True
+        # bool compares equal to 1 but is not a PR number.
+        authorization = replace(authorization, repo_pr_action_scope=replace(
+            authorization.repo_pr_action_scope, pr_number=1,
+        ))
+    labels = classify_protected_result(
+        tool_name, arguments, auth, authorization,
+        result=ToolException(_CHECKOUT_SCOPE_REFUSAL), failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+
+
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     tmp_path: Path,

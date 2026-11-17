@@ -1577,6 +1577,10 @@ def test_unattested_selected_repository_results_never_claim_an_exact_source(
             repo_pr_action_scope=scope, policy=selected_policy_registry(),
         ), result="unattested tool output", failed=failed,
     )
+    if tool_name == "repo_checkout" and failed:
+        # Failure diagnostics bind to the selected PR without a checkout lease.
+        assert labels is None or not labels.has_untrusted_active_ingest
+        return
     assert labels is not None and labels.has_untrusted_active_ingest
     assert labels.sources[0].resource_id == f"<unresolved-resource:protected_tool:{tool_name}>"
     target = f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}:{scope.scope_id}"
