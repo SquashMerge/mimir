@@ -19,6 +19,7 @@ import pytest
 
 from mimir_cultivate.worklink import autonomy, orchestrator
 from mimir_cultivate.worklink.backends.base import LaunchHandle
+from mimir_cultivate.worklink.execution_policy import OPENCODE_FACTORY, OPENCODE_LEAF
 from mimir_cultivate.worklink.checkout import prune_attempt_checkouts
 from mimir_cultivate.worklink.factory_state import (
     FactoryRunRecord, FactoryStatus, process_start_ticks,
@@ -363,14 +364,20 @@ def test_ttl_matches_exact_attempt_path_not_name(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("backend,ack", [("feature_factory", True), ("opencode", False)])
-async def test_compute_reaping_ack_only_for_factory_worker_result(tmp_path, backend, ack):
+@pytest.mark.parametrize("backend,execution,ack", [
+    ("feature_factory", OPENCODE_FACTORY, True), ("opencode", OPENCODE_LEAF, False),
+])
+async def test_compute_reaping_ack_only_for_factory_worker_result(tmp_path, backend, execution, ack):
     from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend, WorkSpec
     from mimir_cultivate.contained_execution import CollectedExecutionResult
     handle = _dead_handle()
     compute = LocalSubprocessComputeBackend()
     compute._handles[handle.identifier] = handle
-    spec = SimpleNamespace(backend=backend)
+    spec = WorkSpec(
+        issue_id=1983, attempt=1, repo_url="repo", base_ref="main", branch="issue/1983-a1",
+        prompt="", rules=None, test_command="", backend=backend, timeout_s=2,
+        local_checkout=tmp_path, execution=execution,
+    )
     async def collected():
         return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
     task = asyncio.create_task(collected())

@@ -30,6 +30,7 @@ from mimir_cultivate.worklink.factory_state import (
     save_factory_record,
 )
 from mimir_cultivate.worklink import identities
+from mimir_cultivate.worklink.execution_policy import OPENCODE_FACTORY
 from mimir_cultivate.worklink.planning import target_branch_from_description
 from mimir_cultivate.worklink.run_state import WorklinkRunState
 from mimir_cultivate.worklink.safe_git import (
@@ -412,6 +413,7 @@ async def test_factory_completion_records_observed_gate_evidence(
         issue_id=1949, attempt=1, repo_url="repo", base_ref="main",
         branch="feature/1949", prompt="", rules=None, test_command="check-gate",
         backend="feature_factory", timeout_s=30, local_checkout=checkout,
+        execution=OPENCODE_FACTORY,
     )
     arguments = dict(
         issue=1949, attempt=1, backend="feature_factory", branch="feature/1949",

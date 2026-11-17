@@ -264,6 +264,8 @@ async def test_external_process_cancel_propagates_probe_permission_error(monkeyp
 async def test_cleanup_after_wait_error_drains_live_monitor(
     monkeypatch, tmp_path, check_raises
 ) -> None:
+    # This owns the legacy core capture path, not the Cultivate worker launcher.
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     backend = compute.LocalSubprocessComputeBackend()
     failure = RuntimeError("process wait failed")
     proc = Mock(pid=None, wait=AsyncMock(side_effect=failure))

@@ -28,6 +28,7 @@ for module in \
     tests/test_claude_code.py \
     tests/test_worklink_claude_code.py \
     tests/test_worklink_backends.py \
+    tests/test_worklink_compute.py \
     tests/test_worklink_worker_exec.py \
     tests/test_worklink_orchestrator.py \
     tests/test_worklink_reattach.py \
@@ -36,6 +37,11 @@ for module in \
     tests/test_worklink_factory_state.py \
     tests/test_worklink_feature_factory.py \
     plugins/cultivate/tests/test_worklink_daemon_epics.py \
+    plugins/cultivate/tests/test_worklink_executor.py \
+    plugins/cultivate/tests/test_worklink_factory.py \
+    plugins/cultivate/tests/test_worklink_records.py \
+    plugins/cultivate/tests/test_worklink_gate_byproducts.py \
+    plugins/cultivate/tests/test_worklink_factory_store.py \
     plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/tests/test_worklink_tool_pins_poller.py
 do
     sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
