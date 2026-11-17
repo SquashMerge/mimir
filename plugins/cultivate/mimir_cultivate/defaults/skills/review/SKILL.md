@@ -1,6 +1,6 @@
 ---
 name: cultivate-review
-description: Review a pull request and POST the review to GitHub via `pr_submit_review` on service turns or `gh pr review` on interactive turns. Always submit after drafting.
+description: Review a pull request and POST findings to GitHub via `pr_submit_review` on service turns or `gh pr review` on interactive turns; use `pr_comment` for your own PRs. Always deliver after drafting.
 ---
 
 <!-- desc: Review a pull request and submit via pr_submit_review or gh pr review. -->
@@ -10,7 +10,8 @@ description: Review a pull request and POST the review to GitHub via `pr_submit_
 Read the diff, draft a verdict, and **submit via `pr_submit_review` on service
 turns or `gh pr review` on interactive operator turns**. The
 submission step is not optional — it is the definition of "done" for this
-skill.
+skill. For a PR you authored, deliver findings with `pr_comment` instead, as
+described below.
 
 ## Contract
 
@@ -50,8 +51,19 @@ diff (`gh pr diff` or the file-list fallback).
   With `full`, the configured full local suite remains available.
 
 **Does not**: Merge PRs; modify source code directly; auto-resolve conversations;
-review PRs it authored (when `$MIMIR_GITHUB_SELF_LOGIN` matches the PR author,
-a different reviewer is needed).
+submit formal reviews on PRs it authored.
+
+### Operator-requested review of your own PR
+
+When `$MIMIR_GITHUB_SELF_LOGIN` matches the PR author, GitHub forbids a formal
+self-review. If the operator asks for review-only, read and assess the PR, then
+deliver the findings as a PR conversation comment with `pr_comment` (verify with
+`pr_comments`), not `pr_submit_review` or `pr_inline_review_comment`. This is the
+own-PR exception to the submission steps below; do not modify the code on a
+review-only request. The remediation scope deliberately lacks `pr.review`:
+its refusal is expected policy, not a broken capability. Do not escalate it as
+`unsupported_operation` or ask the operator to repair review capability. A
+different reviewer is needed for formal approval.
 
 When the trigger is `poller:github-activity`, perform the review in the current
 turn. Do not call `approve_declassification`: the poller is subject to the taint
@@ -71,7 +83,8 @@ request either capability.
 2. Call `pr_metadata`, then `pr_diff` (or `pr_files`), `pr_checks` and
    `pr_comments` as needed. Use `pr_file_content` for extended context at the
    verified PR head. Follow the review and submission guidance below.
-3. Submit via `pr_submit_review` or `pr_inline_review_comment`, verify with
+3. For your own PR, deliver findings with `pr_comment` and verify with
+   `pr_comments`; otherwise submit via `pr_submit_review` or `pr_inline_review_comment`, verify with
    `pr_reviews`, and call `repo_cleanup(repository, pull_request)` when done to
    revoke and remove the lease. Do not clean up before submission. When you
    delegate reading to a subagent, the subagent never calls `repo_cleanup`:

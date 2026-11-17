@@ -289,7 +289,7 @@ def test_factory_runtime_removed_with_prunable_checkout(tmp_path: Path, monkeypa
     record = replace(record, sandbox=str(sandbox), status=None)
     autonomy_prepare = autonomy._prepare_factory_runtime_prune
     monkeypatch.setattr(autonomy, "_prepare_factory_runtime_prune",
-                        lambda child, records: autonomy_prepare(child, [record]))
+                        lambda child, records, **kwargs: autonomy_prepare(child, [record], **kwargs))
     # Inspect immediately before the enclosing rmtree, not after it.
     from mimir_cultivate.worklink import checkout as checkout_module
     real_rmtree = checkout_module.shutil.rmtree
