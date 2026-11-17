@@ -227,8 +227,13 @@ async def test_epic_cancel_verifies_orphan_pid_start_time_not_only_shell_listing
 
 
 @pytest.mark.parametrize("failure,reason", [
-    ("open", "process handle unavailable"),
-    ("signal", "process signal refused"),
+    ("open", "process handle unavailable: errno EPERM"),
+    ("open-denied", "process handle unavailable: errno EACCES"),
+    ("open-unsupported", "process handle unavailable: errno ENOSYS"),
+    ("open-unknown", "process handle unavailable: errno unknown"),
+    ("open-missing", "process handle unavailable: Python API missing"),
+    ("signal", "process signal refused: errno EPERM"),
+    ("signal-missing", "process signal refused: Python API missing"),
     ("read", "process identity unreadable"),
     ("timeout", "TimeoutError"),
 ])
@@ -247,16 +252,30 @@ async def test_epic_cancel_preserves_process_failure_cause_and_retained_pid(tmp_
     monkeypatch.setattr(processes, "_process", process)
     monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
         iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
+    import errno
+
     closed = []
     def open_pid(pid):
-        if failure == "open":
-            raise PermissionError("sensitive OS diagnostic must not escape")
+        if failure.startswith("open"):
+            number = {"open": errno.EPERM, "open-denied": errno.EACCES,
+                      "open-unsupported": errno.ENOSYS, "open-unknown": 987654}.get(failure)
+            raise OSError(number, "sensitive OS diagnostic must not escape")
         return 1234
     def send(fd, sig):
-        raise PermissionError("sensitive OS diagnostic must not escape")
-    monkeypatch.setattr(processes, "os", SimpleNamespace(pidfd_open=open_pid, close=closed.append))
-    monkeypatch.setattr(processes, "signal", SimpleNamespace(
-        SIGTERM=signal.SIGTERM, SIGKILL=signal.SIGKILL, pidfd_send_signal=send))
+        raise PermissionError(errno.EPERM, "sensitive OS diagnostic must not escape")
+    def fallback_kill(pid, sig):
+        raise PermissionError(errno.EPERM, "sensitive OS diagnostic must not escape")
+    os_facade = SimpleNamespace(close=closed.append, kill=fallback_kill,
+        stat=lambda path: SimpleNamespace(st_uid=1002), geteuid=lambda: 1002)
+    if failure != "open-missing":
+        os_facade.pidfd_open = open_pid
+    signal_facade = SimpleNamespace(SIGTERM=signal.SIGTERM, SIGKILL=signal.SIGKILL)
+    if failure != "signal-missing":
+        signal_facade.pidfd_send_signal = send
+    # Simulate CPython build capabilities locally; never remove stdlib APIs
+    # globally, where asyncio's already-selected child watcher uses them.
+    monkeypatch.setattr(processes, "os", os_facade)
+    monkeypatch.setattr(processes, "signal", signal_facade)
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
         shell = daemon.start_shell(handle.identifier, record.session_checkout)
@@ -280,15 +299,26 @@ async def test_epic_cancel_preserves_process_failure_cause_and_retained_pid(tmp_
         assert "PID 201 (start 101)" in recovered.record.cleanup_error
         assert reason in recovered.record.cleanup_error
         assert "sensitive OS diagnostic" not in recovered.record.cleanup_error
-        assert closed == ([1234] if failure == "signal" else [])
+        assert closed == ([1234] if failure.startswith("signal") else [])
         assert not await client.running_shells(record.session_checkout)
 
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux process identity witness")
-async def test_epic_cancel_reaps_real_setsid_child_after_daemon_forgets_shell(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pidfd_mode", ["native", "missing", "refused"])
+async def test_epic_cancel_reaps_real_setsid_child_after_daemon_forgets_shell(tmp_path, monkeypatch, pidfd_mode):
     from mimir_cultivate.worklink import daemon_processes as processes
     import signal
     import sys
+
+    if pidfd_mode != "native":
+        facade = SimpleNamespace(**{name: value for name, value in vars(os).items()
+                                     if name != "pidfd_open"})
+        if pidfd_mode == "refused":
+            def refused(pid):
+                import errno
+                raise PermissionError(errno.EPERM, "synthetic pidfd restriction")
+            facade.pidfd_open = refused
+        monkeypatch.setattr(processes, "os", facade)
 
     # The child acknowledges setsid and TERM handling before exposing its PID.
     child_code = "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(60)"
@@ -334,6 +364,55 @@ async def test_epic_cancel_reaps_real_setsid_child_after_daemon_forgets_shell(tm
         unrelated.kill()
         unrelated.wait(timeout=5)
         parent.stdout.close()
+
+
+@pytest.mark.parametrize("mode", ["missing", "refused"])
+@pytest.mark.parametrize("identity", ["owned", "reused-before", "reused-during", "foreign", "gone"])
+async def test_pidfd_fallback_confines_identity_and_rechecks_after_signal(monkeypatch, mode, identity):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import errno
+    import signal
+
+    table = {201: (1, 777 if identity == "reused-before" else 101, "S")}
+    sent, reads = [], []
+    def process(pid):
+        reads.append((pid, bool(sent)))
+        return table.get(pid)
+    def owner(path):
+        assert path == "/proc/201"
+        if identity == "gone":
+            raise FileNotFoundError
+        return SimpleNamespace(st_uid=2000 if identity == "foreign" else 1002)
+    def kill(pid, sig):
+        sent.append((pid, sig))
+        if identity == "reused-during":
+            table[pid] = (1, 888, "S")
+        else:
+            table.pop(pid)
+    facade = SimpleNamespace(stat=owner, geteuid=lambda: 1002, kill=kill)
+    if mode == "refused":
+        def refused(pid):
+            raise PermissionError(errno.EPERM, "sensitive OS diagnostic")
+        facade.pidfd_open = refused
+    monkeypatch.setattr(processes, "os", facade)
+    monkeypatch.setattr(processes, "_process", process)
+    if identity == "foreign":
+        with pytest.raises(DaemonClientError, match="fallback process owner mismatch"):
+            await processes.terminate_descendants([[201, 101]], wait_s=0)
+        assert sent == []
+    else:
+        # Direct call proves the post-signal read is in the fallback itself,
+        # not only in the later termination loop.
+        processes._signal([201, 101], signal.SIGTERM)
+        if identity in {"owned", "reused-during"}:
+            assert reads[-1] == (201, True)
+        survivors = await processes.terminate_descendants([[201, 101]], wait_s=0)
+        # A disappeared /proc owner entry is not an absence witness in this
+        # fake table: leave cleanup unverified while _process still sees it.
+        assert survivors == ([[201, 101]] if identity == "gone" else [])
+        assert sent == ([(201, signal.SIGTERM)] if identity in {"owned", "reused-during"} else [])
+        if identity in {"owned", "reused-during"}:
+            assert len(reads) >= 5
 
 
 @pytest.mark.parametrize("survives", [False, True])

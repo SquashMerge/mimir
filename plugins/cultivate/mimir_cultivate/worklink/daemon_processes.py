@@ -6,6 +6,7 @@ shells; retained witnesses live in the executor's private controller record.
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 from pathlib import Path
 import signal
@@ -63,21 +64,54 @@ def _alive(witness: list[int]) -> bool:
     return info is not None and info[1] == witness[1] and info[2] not in {'Z', 'X'}
 
 
+def _fallback_signal(witness: list[int], sig: int, cause: str) -> None:
+    """Same-uid fallback when pidfds are unavailable.
+
+    Unlike pidfds, kill(PID) has a reuse window between identity read and signal.
+    Constrain it to same-uid tasks and check start ticks immediately before and
+    after signalling. A changed identity is gone for this witness, never followed.
+    """
+    try:
+        if not _alive(witness):
+            return
+        if os.stat(f'/proc/{witness[0]}').st_uid != os.geteuid():
+            raise DaemonClientError(f'{cause}; fallback process owner mismatch')
+        if not _alive(witness):
+            return
+        os.kill(witness[0], sig)
+        _alive(witness)  # Revalidate after kill; subsequent waits use this same witness.
+    except ProcessLookupError:
+        return
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        name = errno.errorcode.get(exc.errno, 'unknown')
+        raise DaemonClientError(f'{cause}; fallback signal refused: errno {name}') from None
+
+
 def _signal(witness: list[int], sig: int) -> None:
-    """Pin the task before checking start ticks, eliminating kill(PID)'s reuse race."""
+    """Prefer a pinned pidfd; otherwise use the documented same-uid fallback."""
     try:
         fd = os.pidfd_open(witness[0])
     except ProcessLookupError:
         return
-    except (OSError, AttributeError):
-        raise DaemonClientError('process handle unavailable') from None
+    except AttributeError:
+        return _fallback_signal(witness, sig, 'process handle unavailable: Python API missing')
+    except OSError as exc:
+        # Only a stdlib errno name is safe diagnostic data; never render the
+        # exception's free-form message, filename, or an arbitrary errno value.
+        name = errno.errorcode.get(exc.errno, 'unknown')
+        return _fallback_signal(witness, sig, f'process handle unavailable: errno {name}')
     try:
         if _alive(witness):
             signal.pidfd_send_signal(fd, sig)
     except ProcessLookupError:
         pass
-    except (OSError, AttributeError):
-        raise DaemonClientError('process signal refused') from None
+    except AttributeError:
+        _fallback_signal(witness, sig, 'process signal refused: Python API missing')
+    except OSError as exc:
+        name = errno.errorcode.get(exc.errno, 'unknown')
+        raise DaemonClientError(f'process signal refused: errno {name}') from None
     finally:
         os.close(fd)
 
