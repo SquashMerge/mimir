@@ -278,31 +278,65 @@ async def test_epic_cancel_reaps_real_setsid_child_after_daemon_forgets_shell(tm
         parent.stdout.close()
 
 
-async def test_epic_cancel_reports_surviving_orphan_pids_and_retains_recovery(tmp_path, monkeypatch):
+@pytest.mark.parametrize("survives", [False, True])
+async def test_epic_idle_cancel_requires_no_surviving_orphan_pids(tmp_path, monkeypatch, survives):
     from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
 
     table = {200: (1, 100, "S"), 201: (200, 101, "S")}
     monkeypatch.setattr(processes, "_process", lambda pid: table.get(pid))
     monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
         iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
-    monkeypatch.setattr(processes, "_signal", lambda *args: None)
+    sent = []
+    def send(witness, sig):
+        sent.append((witness[0], sig))
+        if not survives:
+            table.pop(witness[0], None)
+    monkeypatch.setattr(processes, "_signal", send)
+    terminate = processes.terminate_descendants
+    completed = []
+    async def terminate_without_wait(witnesses):
+        # Exercise real TERM/KILL and survivor selection without waiting for fake
+        # processes. Cancellation must get past termination, not time out in it.
+        result = await terminate(witnesses, wait_s=0)
+        completed.append(result)
+        return result
+    monkeypatch.setattr(processes, "terminate_descendants", terminate_without_wait)
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
         shell = daemon.start_shell(handle.identifier, record.session_checkout)
         daemon.shells[shell]["pid"] = 200
+        # A real durable idle witness makes the session eligible for verified
+        # cancellation once shells disappear; the orphan is the ONLY blocker.
+        daemon.finish(handle.identifier)
+        assert not daemon.sessions[handle.identifier].active
         delete = client.delete_shell
         async def orphan(sid, directory):
+            assert boundary.controller.record.cleanup_processes == [[201, 101]]
             await delete(sid, directory)
             table.pop(200)
             table[201] = (1, 101, "S")
         monkeypatch.setattr(client, "delete_shell", orphan)
-        assert not await boundary.controller.cancel(timeout_s=0.2)
+        verified = await boundary.controller.cancel(timeout_s=2)
+        assert completed and completed[0] == ([[201, 101]] if survives else [])
+        assert (201, signal.SIGTERM) in sent
+        assert boundary.controller.record.execution_state == "succeeded"
+        assert not await client.running_shells(record.session_checkout)
+        assert daemon.shells[shell]["status"] == "killed"
+        assert verified is (not survives)
         recovered = SessionController.recover(client, boundary.controller.path,
             generation=handle.launch_generation, checkout=Path(record.session_checkout))
-        assert recovered.record.cleanup_processes == [[201, 101]]
-        assert "PID 201" in recovered.record.cleanup_error
-        assert recovered.record.cancellation_state == "unverified"
-        assert not await client.running_shells(record.session_checkout)
+        if survives:
+            assert (201, signal.SIGKILL) in sent
+            assert table[201] == (1, 101, "S")
+            assert recovered.record.cleanup_processes == [[201, 101]]
+            assert "PID 201" in recovered.record.cleanup_error
+            assert recovered.record.cancellation_state == "unverified"
+        else:
+            assert 201 not in table
+            assert recovered.record.cleanup_processes == []
+            assert recovered.record.cleanup_error is None
+            assert recovered.record.cancellation_state == "verified"
 
 
 async def test_epic_late_root_shell_waits_for_process_snapshot_before_delete(tmp_path, monkeypatch):
