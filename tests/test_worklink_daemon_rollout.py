@@ -38,7 +38,7 @@ def startup(tmp_path):
     status = run / "status/status.json"
     status.write_text(json.dumps({"version": 1, "launch_generation": generation,
         "checked_at_ms": int(time.time() * 1000), "daemon_state": "ready",
-        "daemon_version": "2.2.7", "login_state": "locally_unexpired",
+        "daemon_version": "2.3.0", "login_state": "locally_unexpired",
         "login_expires_at_ms": int(time.time() * 1000) + 60000, "telemetry_state": "off"}))
     status.chmod(0o644)
     snapshot = run / "agent/launch.json"

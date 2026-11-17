@@ -62,8 +62,8 @@ def test_native_health_accepts_only_supported_codex_methods(method):
 
 
 @pytest.mark.parametrize(("value_method", "column", "expected"), [
-    # OpenCode 2.2.7 POST /api/credential (the controller's import) leaves
-    # method_id NULL; observed live on mimirbot 2026-11-15.
+    # OpenCode 2.3.0 POST /api/credential (the controller's import) leaves
+    # method_id NULL; see opencode_2_3_0/auth-import-result.json.
     ("chatgpt-browser", None, "locally_unexpired"),
     ("chatgpt-headless", None, "locally_unexpired"),
     ("unknown", None, "malformed"), (None, None, "malformed"),
@@ -120,7 +120,7 @@ def test_native_missing_table_unavailable_and_no_follow(tmp_path):
 
 def status(**updates):
     return {"version": 1, "launch_generation": str(uuid4()), "checked_at_ms": NOW,
-            "daemon_state": "ready", "daemon_version": "2.2.7", "login_state": "locally_unexpired",
+            "daemon_state": "ready", "daemon_version": "2.3.0", "login_state": "locally_unexpired",
             "login_expires_at_ms": NOW + 60000, "telemetry_state": "off", **updates}
 
 
@@ -139,6 +139,11 @@ def test_status_rejects_invalid_stale_future_and_version(updates):
 def test_status_freshness_edges(age):
     payload = status(checked_at_ms=NOW - age)
     assert health.parse_status(payload, now=NOW) == payload
+
+
+def test_status_rejects_ready_opencode_2_2_7():
+    with pytest.raises(ValueError, match="invalid daemon status"):
+        health.parse_status(status(daemon_version="2.2.7"), now=NOW)
 
 
 def fixture_status(tmp_path, monkeypatch, *, login="locally_unexpired"):
@@ -230,7 +235,7 @@ async def test_workloads_refuse_with_real_daemon_health(tmp_path, monkeypatch, s
     paths, ids, env = fixture_status(tmp_path, monkeypatch, login=login)
     bind_gate_fixture(paths, ids, env, monkeypatch)
     payload = json.loads(paths.status.read_text())
-    payload.update(daemon_state=state, daemon_version="2.2.7" if state == "ready" else None)
+    payload.update(daemon_state=state, daemon_version="2.3.0" if state == "ready" else None)
     paths.status.write_text(json.dumps(payload))
     monkeypatch.setattr(health, "daemon_health", partial(health.daemon_health, paths=paths, identities=ids))
     observed = health.daemon_health(dict(os.environ))
@@ -367,7 +372,9 @@ async def test_health_hook_preserves_executor_and_sanitizes_errors(tmp_path, mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("version", "expected"), [("2.2.7", "ready"), ("2.2.6", "version_mismatch"),
+@pytest.mark.parametrize(("version", "expected"), [("2.3.0", "ready"),
+                                                    pytest.param("2.2.7", "version_mismatch", id="reject_opencode_2_2_7"),
+                                                    ("2.2.6", "version_mismatch"), ("2.3.1", "version_mismatch"),
                                                     ("not-a-version-private", "version_mismatch"),
                                                     ("unauthorized", "down"), ("transport", "down"),
                                                     ("server_error", "down")])
@@ -405,7 +412,7 @@ async def test_authenticated_info_status_publication(tmp_path, monkeypatch, caps
         await health.inspect_and_publish(paths, ids)
         result = health.parse_status(json.loads(paths.status.read_text()))
         assert result["daemon_state"] == expected
-        assert result["daemon_version"] == (version if version in {"2.2.7", "2.2.6"} else None)
+        assert result["daemon_version"] == (version if version in {"2.3.0", "2.2.7", "2.2.6", "2.3.1"} else None)
         assert result["login_state"] == "missing"
         assert fake.password not in paths.status.read_text()
         assert "not-a-version-private" not in paths.status.read_text()

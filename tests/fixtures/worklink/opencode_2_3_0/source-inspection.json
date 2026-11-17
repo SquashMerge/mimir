@@ -1,0 +1,30 @@
+{
+  "package": "@opencode/cli-linux-arm64@2.3.0",
+  "sha256": "5c7d89bc2d5fa5d83cc7768b813ca671368e70b8b9eda9d1ca9e6ec6b66d8ce0",
+  "excerpts": {
+    "oauth_stale": {
+      "offset": 176098563,
+      "source": "uZ=(s,g,m=vc(5))=>s.expires!==0&&s.expires<=g+We(m);class w extends Me(\"Credential.Info\")({id:l2,int"
+    },
+    "oauth_resolve": {
+      "offset": 176234642,
+      "source": "if(!x||!uZ(P.value,yield*Tt))return P.value;return yield*U(e.refresh(P.id,{stale:uZ,refresh:x}))}),key:l(\"Integration.connection.k"
+    },
+    "permission_last_match": {
+      "offset": 176332649,
+      "source": "function UN(e,o,...a){return a.flat().findLast((s)=>PN(e,s.action)&&PN(o,s.resource))??{action:e,resource:\"*\",effect:\"ask\"}}function cZ(...e){return e.flat()}class cc extends j()(\"@opencode/Permission\"){}var bS"
+    },
+    "permission_agent_then_session": {
+      "offset": 176333398,
+      "source": "let x=yield*a.resolve(C??P.agent);return cZ(x?.permissions??BS,P.permissions??[])});function J(Y,C){return Y.resources.some((P)=>UN(Y.action,P,C).effect===\"deny\")}function M(Y,C){return C.filter((P)=>PN(Y.action,P.action))}le"
+    },
+    "permission_final_deny": {
+      "offset": 176333621,
+      "source": "let H=u(function*(Y){let C=yield*O(Y.sessionID,Y.agent);if(J(Y,C))return{effect:\"deny\",rules:C};let P=[...C,...yield*D()],de=Y.resources.map((et)=>UN(Y.action,et,P).effect).includes(\"ask\")?\"ask\":\"allow\",_e=yield*T.trigge"
+    },
+    "agent_editor_replacement": {
+      "offset": 176329502,
+      "source": "update:(g,A)=>{let y=T.agents.get(g)??gS.default(g);if(!T.agents.has(g))T.agents.set(g,y);A(y),y.id=g},remove:(g)=>{T.agents.delete(g)}}),notify:"
+    }
+  }
+}

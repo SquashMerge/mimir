@@ -74,7 +74,7 @@ is shed before interactive or high-value pollers under resource pressure.
 tool_pins:
   - name: opencode
     category: coding-cli
-    pin: "2.2.7"
+    pin: "2.3.0"
     smoke: "opencode --version"
     source: npm
     package: "@opencode/cli"
