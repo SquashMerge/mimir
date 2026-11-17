@@ -655,8 +655,13 @@ class SessionController:
                                 raise
                         await asyncio.sleep(0.05)
             except (TimeoutError, DaemonClientError) as exc:
-                self._persist(cancellation_state="unverified", cleanup_error=self.record.cleanup_error or
-                              self._redacted(f"session cleanup incomplete: {type(exc).__name__}", 8192))
+                # A retained shell/PID witness is context, not the cause of this
+                # failure. Preserve both so permission/identity failures cannot
+                # look indistinguishable from reaching the cancellation deadline.
+                reason = exc.reason if isinstance(exc, DaemonClientError) else "TimeoutError"
+                detail = self.record.cleanup_error
+                self._persist(cancellation_state="unverified", cleanup_error=self._redacted(
+                    f"session cleanup incomplete: {reason}" + (f"; {detail}" if detail else ""), 8192))
                 return False
             finally:
                 self._cancelling = False

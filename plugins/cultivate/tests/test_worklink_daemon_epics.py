@@ -226,6 +226,64 @@ async def test_epic_cancel_verifies_orphan_pid_start_time_not_only_shell_listing
             assert (202, signal.SIGKILL) in sent
 
 
+@pytest.mark.parametrize("failure,reason", [
+    ("open", "process handle unavailable"),
+    ("signal", "process signal refused"),
+    ("read", "process identity unreadable"),
+    ("timeout", "TimeoutError"),
+])
+async def test_epic_cancel_preserves_process_failure_cause_and_retained_pid(tmp_path, monkeypatch, failure, reason):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
+
+    table = {200: (1, 100, "S"), 201: (200, 101, "S")}
+    deleted = False
+    def process(pid):
+        if deleted and failure == "timeout":
+            raise TimeoutError
+        if deleted and failure == "read":
+            raise DaemonClientError("process identity unreadable")
+        return table.get(pid)
+    monkeypatch.setattr(processes, "_process", process)
+    monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
+        iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
+    closed = []
+    def open_pid(pid):
+        if failure == "open":
+            raise PermissionError("sensitive OS diagnostic must not escape")
+        return 1234
+    def send(fd, sig):
+        raise PermissionError("sensitive OS diagnostic must not escape")
+    monkeypatch.setattr(processes, "os", SimpleNamespace(pidfd_open=open_pid, close=closed.append))
+    monkeypatch.setattr(processes, "signal", SimpleNamespace(
+        SIGTERM=signal.SIGTERM, SIGKILL=signal.SIGKILL, pidfd_send_signal=send))
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        shell = daemon.start_shell(handle.identifier, record.session_checkout)
+        daemon.shells[shell]["pid"] = 200
+        daemon.finish(handle.identifier)
+        delete = client.delete_shell
+        async def orphan(sid, directory):
+            nonlocal deleted
+            assert boundary.controller.record.cleanup_processes == [[201, 101]]
+            await delete(sid, directory)
+            table.pop(200)
+            table[201] = (1, 101, "S")
+            deleted = True
+        monkeypatch.setattr(client, "delete_shell", orphan)
+        with pytest.raises(ComputeCleanupError, match=reason):
+            await compute.cancel(handle)
+        recovered = SessionController.recover(client, boundary.controller.path,
+            generation=handle.launch_generation, checkout=Path(record.session_checkout))
+        assert recovered.record.cancellation_state == "unverified"
+        assert recovered.record.cleanup_processes == [[201, 101]]
+        assert "PID 201 (start 101)" in recovered.record.cleanup_error
+        assert reason in recovered.record.cleanup_error
+        assert "sensitive OS diagnostic" not in recovered.record.cleanup_error
+        assert closed == ([1234] if failure == "signal" else [])
+        assert not await client.running_shells(record.session_checkout)
+
+
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux process identity witness")
 async def test_epic_cancel_reaps_real_setsid_child_after_daemon_forgets_shell(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import daemon_processes as processes
