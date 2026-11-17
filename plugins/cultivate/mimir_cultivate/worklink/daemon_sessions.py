@@ -429,9 +429,12 @@ class SessionController:
         await self._read_log()
         inbox = await self._inbox()
         messages = await self._messages()
-        # Read after history: a shell that finishes between the reads has already
-        # resumed the session (a non-idle tail), so it is never missed.
         self._shells = await self._owned_shells()
+        if not self._shells and messages and messages[-1].get("type") == "idle":
+            # The history was read before the shell listing. A shell can finish and
+            # resume the session in between, leaving this snapshot's idle tail stale,
+            # so take a fresh history witness after observing that no shell is left.
+            messages = await self._messages()
         users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                  and m["id"] not in self.record.baseline_message_ids}
         if len(users) > 1 or (self.record.input_id and users and users != {self.record.input_id}):

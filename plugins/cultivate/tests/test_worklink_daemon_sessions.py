@@ -864,3 +864,22 @@ async def test_shell_listing_failure_fails_closed(tmp_path):
         daemon.faults[("GET", "/api/shell")].extend(SyntheticFault(status=500) for _ in range(500))
         assert not await controller.cancel(timeout_s=1)
         assert controller.record.cancellation_state == "unverified"
+
+
+async def test_shell_that_resumes_the_session_between_reads_is_not_success(tmp_path, monkeypatch):
+    """Review P1 on #105: history (idle) -> shell exits and resumes the session -> empty shell list."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        original = client.running_shells
+        async def finish_and_resume(directory):
+            if daemon.shells[shell]["status"] == "running":
+                daemon.end_shell(shell)
+                daemon.sessions[sid].messages.append({
+                    "id": "msg_resumed", "type": "assistant", "time": {"created": 3}, "agent": "build",
+                    "model": {"providerID": "openai", "id": "gpt-5"}, "content": []})
+            return await original(directory)
+        monkeypatch.setattr(client, "running_shells", finish_and_resume)
+        assert (await controller.observe()).execution_state == "started"
