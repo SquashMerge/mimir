@@ -1450,6 +1450,77 @@ def test_same_commit_rerun_with_system_packages(upgrade_setup):
     assert json.loads((deploy / 'manifest.json').read_text())['system_packages'] == ['lsof']
 
 
+def test_heavy_lock_timeout_parser():
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["cultivate", "setup", "--heavy-lock-timeout", "86400"])
+    assert args.heavy_lock_timeout == "86400"
+    assert parser.parse_args(["cultivate", "setup"]).heavy_lock_timeout is None
+
+
+@pytest.mark.parametrize("value", ["0", "59", "86401", "999999", "", "-60", "+60", "60.0",
+                                  " 60", "60 ", "60\n", "٦٠", "６０", 14400, True, [], {}])
+@pytest.mark.parametrize("source", ["option", "manifest"])
+def test_heavy_lock_timeout_setup_fails_closed(value, source):
+    args = argparse.Namespace(heavy_lock_timeout=value if source == "option" else None)
+    previous = {"heavy_lock_timeout": value} if source == "manifest" else {}
+    with pytest.raises(installer.SetupError, match="--heavy-lock-timeout.*manifest.json"):
+        installer._heavy_lock_timeout(args, previous, "/locks")
+
+
+@pytest.mark.parametrize("value", ["60", "86400", "00060"])
+def test_heavy_lock_timeout_setup_accepts_boundaries(value):
+    assert installer._heavy_lock_timeout(argparse.Namespace(heavy_lock_timeout=value), {}, "/locks") == value
+
+
+def test_heavy_lock_settings_manifest_default_override_preserve_and_clear(setup_environment, tmp_path):
+    deploy, args, state, calls, invoke = setup_environment
+
+    def check(directory, timeout):
+        manifest = json.loads((deploy / "manifest.json").read_text())
+        assert manifest["heavy_lock_dir"] == directory
+        assert manifest["heavy_lock_timeout"] == timeout
+        env = yaml.safe_load((deploy / "compose.yml").read_text())["services"]["agent"]["environment"]
+        if directory is None:
+            assert "MIMIR_HEAVY_LOCK_FILE" not in env
+            assert "MIMIR_HEAVY_LOCK_TIMEOUT" not in env
+        else:
+            assert env["MIMIR_HEAVY_LOCK_FILE"] == "/mimir-heavy-locks/heavy.lock"
+            assert env["MIMIR_HEAVY_LOCK_TIMEOUT"] == timeout
+
+    args.heavy_lock_timeout = "60"
+    invoke()  # A timeout alone must not enable a lease.
+    check(None, None)
+    args.heavy_lock_dir = str(tmp_path)
+    args.heavy_lock_timeout = None
+    invoke()
+    check(str(tmp_path), "14400")
+    args.heavy_lock_timeout = "86400"
+    invoke()
+    check(str(tmp_path), "86400")
+    args.heavy_lock_dir = args.heavy_lock_timeout = None
+    invoke()
+    check(str(tmp_path), "86400")
+    args.heavy_lock_dir = "none"
+    invoke()
+    check(None, None)
+    args.heavy_lock_dir = str(tmp_path)
+    invoke()
+    check(str(tmp_path), "14400")
+
+
+def test_heavy_lock_existing_directory_without_saved_timeout_gets_default(setup_environment, tmp_path):
+    deploy, args, state, calls, invoke = setup_environment
+    args.heavy_lock_dir = str(tmp_path)
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    del manifest["heavy_lock_timeout"]
+    (deploy / "manifest.json").write_text(json.dumps(manifest))
+    args.heavy_lock_dir = None
+    invoke()
+    assert json.loads((deploy / "manifest.json").read_text())["heavy_lock_timeout"] == "14400"
+
+
 def test_gate_settings_manifest_default_override_and_omission(upgrade_setup):
     deploy, args, state, calls, invoke = upgrade_setup
     manifest = json.loads((deploy / 'manifest.json').read_text())

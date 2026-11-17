@@ -3693,6 +3693,8 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("GITHUB_TOKEN", "never-forwarded")
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", "/mimir-heavy-locks/heavy.lock")
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_TIMEOUT", "14400")
     calls = []
 
     def factory(source, **kwargs):
@@ -3714,6 +3716,8 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     assert "HOME" not in env
     assert "GITHUB_TOKEN" not in env
     assert "MIMIR_HOME" not in env
+    assert env["MIMIR_HEAVY_LOCK_FILE"] == "/mimir-heavy-locks/heavy.lock"
+    assert env["MIMIR_HEAVY_LOCK_TIMEOUT"] == "14400"
     assert env["CI"] == "1"
     assert env["GIT_CONFIG_COUNT"] == "1"
     assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
