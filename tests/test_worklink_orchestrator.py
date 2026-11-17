@@ -2293,9 +2293,12 @@ def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fence
 
         registry = BackendRegistry(WorklinkConfig())
         registry.register(FakeBackend())
+        # Exercise publication's independent fence with the controller-liveness
+        # lease bypassed: a reliable live-controller lock must not be what makes
+        # this test (or its negative control) discriminate.
         result = asyncio.run(WorklinkRunner(
             home=tmp_path, repo=repo, runner=runner, registry=registry,
-        ).run(441, backend_name="fake", test_command="echo ok"))
+        )._run_under_issue_lock(441, backend_name="fake", test_command="echo ok"))
         if attempt == 2 and fenced:
             assert result.status == "refused"
             assert result.reason == "publication_intent_exists"
@@ -3420,6 +3423,62 @@ def test_deadline_before_worker_collection_records_timeout(
         with worker_exec._jobs_lock:
             for identifier in identifiers:
                 worker_exec._exited.discard(identifier)
+
+
+def test_end_of_run_release_contention_clears_within_retry_budget(tmp_path: Path) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    calls, sleeps = [], []
+
+    def runner(args):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(
+            args, 128 if len(calls) < 3 else 0, "",
+            "Another git process seems to be running" if len(calls) < 3 else "",
+        )
+
+    claims = ChainlinkClaims(agent_id="worker", home_path=tmp_path, runner=runner, sleeper=sleeps.append)
+    state = tmp_path / "state/worklink/runs/2152.json"
+    state.parent.mkdir(parents=True)
+    state.write_text("{}")
+    assert orchestrator._release_issue_and_clear_run_state(claims, home=tmp_path, issue_id=2152, attempt=1)
+    assert calls == [["chainlink", "locks", "release", "2152"]] * 3
+    assert sleeps == [0.1, 0.2]
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("operation", ["run", "reattach"])
+def test_leaf_controller_refuses_busy_issue_lock(tmp_path, monkeypatch, operation):
+    from mimir_cultivate.worklink.factory_state import factory_issue_resource_lock
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("busy controller lease admitted another run")
+
+    monkeypatch.setattr(WorklinkRunner, "_run_under_issue_lock" if operation == "run"
+                        else "_reattach_under_issue_lock", forbidden)
+    with factory_issue_resource_lock(tmp_path, 2152) as acquired:
+        assert acquired
+        result = asyncio.run(getattr(WorklinkRunner(home=tmp_path, repo=tmp_path), operation)(2152))
+    assert result.status == "refused" and result.reason == "issue resource lock unavailable"
+
+
+@pytest.mark.parametrize("operation", ["run", "reattach"])
+def test_leaf_controller_holds_issue_lock_before_run_state(tmp_path, monkeypatch, operation):
+    claims = ChainlinkClaims(
+        agent_id="poller", home_path=tmp_path,
+        runner=lambda args: subprocess.CompletedProcess(args, 0, json.dumps({
+            "locks": {"2152": {"agent_id": "mimir-worklink"}},
+        }), "") if args[1:3] == ["locks", "list"] else pytest.fail("released live controller"),
+    )
+
+    async def body(self, issue_id, **kwargs):
+        assert not (tmp_path / "state/worklink/runs/2152.json").exists()
+        assert claims.reconcile_orphan_locks() == []
+        return WorklinkRunResult(issue_id, None, "refused")
+
+    monkeypatch.setattr(WorklinkRunner, "_run_under_issue_lock" if operation == "run"
+                        else "_reattach_under_issue_lock", body)
+    asyncio.run(getattr(WorklinkRunner(home=tmp_path, repo=tmp_path), operation)(2152))
 
 
 def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_path: Path) -> None:
