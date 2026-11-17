@@ -60,7 +60,7 @@ def test_factory_record_round_trips_v2_and_reads_v1(tmp_path: Path) -> None:
     assert path.is_file()
 
 
-def test_factory_record_adds_session_and_mcp_without_changing_version(tmp_path: Path) -> None:
+def test_factory_record_adds_session_checkout_and_mcp_without_changing_version(tmp_path: Path) -> None:
     record = _factory_record(tmp_path)
     payload = record.to_json()
     # Pin the existing strict reader's accepted keys independently of the writer.
@@ -69,13 +69,14 @@ def test_factory_record_adds_session_and_mcp_without_changing_version(tmp_path: 
         "version", "run_id", "issue_id", "attempt", "repository", "base_ref",
         "branch", "launcher", "sandbox", "session", "handle", "status",
         "observed_at", "controller_phase", "controller_error", "transcript",
-        "children_reaped", "opencode_session_id", "mcp_servers",
+        "children_reaped", "opencode_session_id", "mcp_servers", "session_checkout",
     }
     assert FactoryRunRecord.from_json(payload) == record
     assert payload["opencode_session_id"] is None
+    assert payload["session_checkout"] is None
     assert payload["mcp_servers"] == []
     historical = {key: value for key, value in payload.items()
-                  if key not in {"opencode_session_id", "mcp_servers"}}
+                  if key not in {"opencode_session_id", "mcp_servers", "session_checkout"}}
     assert FactoryRunRecord.from_json(historical) == record
     with pytest.raises(FactoryRecordError, match="fields are invalid"):
         FactoryRunRecord.from_json({**payload, "issue_title": "Display only"})

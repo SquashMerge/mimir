@@ -6246,12 +6246,8 @@ def _run_factory_preflight_case(
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     from mimir_cultivate.worklink import daemon_health
     monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True, "launch_generation": "fixture"})
-    def initialize(self, run_id, *, operator_checkout, base_ref, publishing_identity, git_settings=(), timeout_s=60, credentials=None, max_retries=None):
-        sandbox = operator_checkout / ".factory-sandboxes" / run_id
-        sandbox.mkdir(parents=True)
-        return FactoryStatus(run_id=run_id, valid=True, sandbox_path=str(sandbox), status="running",
-            mode="autonomous", branch=f"feature/{run_id}", pr_base=base_ref, pr_draft=False,
-            lock="absent", lock_session=None, dead_lock=False)
+    def initialize(self, *args, **kwargs):
+        pytest.fail("controller must not initialize the driver's run")
     monkeypatch.setattr(FeatureFactoryBackend, "initialize", initialize)
     def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
         before_claim = kwargs.get("before_claim")
@@ -6671,7 +6667,7 @@ def test_factory_failure_is_durable_before_release_and_blocks_concurrent_core_ad
         assert order_seen == ["incident", "release"]
 
 
-def test_factory_initial_launch_delegates_nested_checkout_permissions_to_executor(
+def test_factory_initial_launch_delegates_operator_checkout_permissions_to_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import stat
@@ -6695,9 +6691,8 @@ def test_factory_initial_launch_delegates_nested_checkout_permissions_to_executo
     assert len(launched) == 1
     assert len(checkout_calls) == 1
     assert checkout_calls[0]["worker_eligible"] is True
-    sandbox_root = tmp_path / "factory-checkout" / ".factory-sandboxes"
     assert ownership == []
-    assert launched[0].local_checkout == sandbox_root / "chainlink-700"
+    assert launched[0].local_checkout == tmp_path / "factory-checkout"
     assert launched[0].session_request.kind == "epic"
 
 
@@ -6948,7 +6943,7 @@ def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
     }
     assert not any(key.startswith("GIT_") for key in launched[0].env)
     assert launched[0].branch == "feature/chainlink-700"
-    assert launched[0].local_checkout == tmp_path / "factory-checkout/.factory-sandboxes/chainlink-700"
+    assert launched[0].local_checkout == tmp_path / "factory-checkout"
     checkout_configs = [
         command
         for command in commands
@@ -7238,7 +7233,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     async def stop_after_placement(self: object, spec: WorkSpec) -> LaunchHandle:
         preflight_events.append("launch")
         assert spec.branch == "feature/chainlink-700"
-        assert spec.local_checkout == lease.path / ".factory-sandboxes/chainlink-700"
+        assert spec.local_checkout == lease.path
         assert spec.session_request.kind == "epic" and spec.local_argv is None
         assert spec.env == {
             "MIMIR_WORK_ITEM_JSON": json.dumps(
@@ -7282,12 +7277,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
     monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True})
     def initialize(self, run_id, **kwargs):
-        preflight_events.append("initialize")
-        assert kwargs["operator_checkout"] == lease.path and kwargs["base_ref"] == expected_base
-        sandbox = lease.path / ".factory-sandboxes" / run_id
-        sandbox.mkdir(parents=True)
-        return FactoryStatus(run_id, True, str(sandbox), status="running", mode="autonomous",
-            branch=f"feature/{run_id}", pr_base=expected_base, pr_draft=False, lock="absent", dead_lock=False)
+        pytest.fail("controller must not initialize the driver's run")
     monkeypatch.setattr(FeatureFactoryBackend, "initialize", initialize)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(
@@ -7334,7 +7324,6 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
         "publishing-identity",
         "credential",
         "verify",
-        "initialize",
         "launch",
     ]
     assert worklink_events[-1] == (
@@ -12451,8 +12440,8 @@ def test_factory_recovery_launch_start(
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
-    sandbox = tmp_path / "chainlink-700"
-    sandbox.mkdir()
+    sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-700"
+    sandbox.mkdir(parents=True)
     pre = replace(_factory_lifecycle_status(sandbox, status="needs-human", session="ses_test1", park_snapshot=str(tmp_path / "parked")), run_id="chainlink-700")
     resumed = _factory_lifecycle_status(sandbox, status="running")
     released = replace(pre, lock="absent", lock_session=None)
@@ -12803,7 +12792,7 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
     assert result == "supervised"
     [spec] = launched
     assert spec.local_argv is None
-    assert spec.local_checkout == sandbox
+    assert spec.local_checkout == operator_checkout
     assert spec.session_request.kind == "epic"
     assert spec.session_request.text.split()[-1] == run_id
     work_item = json.loads(spec.env["MIMIR_WORK_ITEM_JSON"])

@@ -1434,10 +1434,11 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
         raise RuntimeError("session operation requires the exact contract and checkout FD")
     _validate_executor_identity(request)
     path_addressed = len(fds) == count - 1
-    if create and request.get("request", {}).get("kind") == "epic":
-        epic_path = Path(request["path"])
-        if epic_path.parent.name != ".factory-sandboxes" or epic_path.name != f"chainlink-{_positive_integer(request, 'issue')}":
-            raise RuntimeError("epic creation requires its exact nested sandbox")
+    epic_create = create and request.get("request", {}).get("kind") == "epic"
+    if epic_create and not path_addressed:
+        # Epics use the factory ownership-transfer boundary, never a leaf/spawn
+        # FD capability (which proves a different checkout layout).
+        raise RuntimeError("epic creation requires a path-addressed factory checkout")
     if create and "MIMIR_WORK_ITEM_JSON" in request.get("pass_env", {}):
         item = json.loads(request["pass_env"]["MIMIR_WORK_ITEM_JSON"])
         if (request.get("request", {}).get("kind") != "epic" or not isinstance(item, dict)
@@ -1445,7 +1446,9 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
             raise RuntimeError("factory work item is outside the admitted epic")
     if path_addressed:
         validated = {**request, "run_uid": get_identities().worklink_uid}
-        if Path(request["path"]).parent.name == ".factory-sandboxes":
+        if epic_create:
+            directory_fd = _open_factory_checkout(validated, for_launch=True)
+        elif Path(request["path"]).parent.name == ".factory-sandboxes":
             directory_fd = _open_epic_session_checkout(validated, for_launch=create)
         elif Path(request["path"]).name == "checkout":
             directory_fd = _open_factory_checkout(validated, for_launch=create)
