@@ -105,6 +105,23 @@ async def admit(tmp_path, daemon, client):
     return spec, boundary, compute, handle, record
 
 
+async def test_epic_child_question_is_an_operator_visible_failure_without_waiting(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        child = daemon.new_session({"parentID": handle.identifier, "agent": "backend-builder"})["id"]
+        form = daemon.question(child, title="Slice paths", text="May I extend be-leaf with six test paths?")
+        result = await compute.wait(handle, 30)
+        order = WorkOrder(2125, Path(record.session_checkout), "", None, 30, {}, tmp_path / "transcripts")
+        raw = await FeatureFactoryBackend().interpret(order, result)
+        assert raw.backend_status == "failed"
+        assert "pending_question" in raw.error
+        assert "Slice paths" in raw.error
+        assert "May I extend be-leaf with six test paths?" in raw.error
+        assert not result.timed_out
+        assert daemon.sessions[child].forms == [form] and not daemon.sessions[child].replies
+
+
 async def test_epic_production_command_checkout_model_permissions_and_environment(tmp_path):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
@@ -112,6 +129,7 @@ async def test_epic_production_command_checkout_model_permissions_and_environmen
         assert create == {"location": {"directory": record.session_checkout},
             "model": {"providerID": "openai", "id": "gpt-test", "variant": "high"},
             "permissions": [{"action": "external_directory", "resource": "*", "effect": "deny"},
+                {"action": "question", "resource": "*", "effect": "deny"},
                 *[{"action": "read", "resource": pattern, "effect": "deny"}
                   for pattern in (".env", "**/.env", "**/.env.*")]]}
         commands = [body for _, route, _, body in daemon.requests if route.endswith("/command")]
