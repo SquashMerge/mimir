@@ -55,12 +55,21 @@ def test_current_repository_skill_release_hash(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     version = {
         "github-poller": GITHUB_POLLER_RELEASE,
-        "review": "review-trusted-evidence-first",
+        "review": "2161-own-pr-review-guidance",
         "tracker-poller": "2066-pr-publication",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
     assert actual == expected, f"{name}/SKILL.md: actual sha256={actual}"
+
+
+def test_review_skill_own_pr_findings_use_conversation_comment():
+    text = (SKILLS / "review/SKILL.md").read_text()
+    own_pr = text.split("### Operator-requested review of your own PR\n", 1)[1].split("\nWhen the trigger", 1)[0]
+    assert "`pr_comment`" in own_pr
+    assert "not `pr_submit_review` or `pr_inline_review_comment`" in own_pr
+    assert "Do not escalate" in own_pr
+    assert "`unsupported_operation`" in own_pr
 
 
 @pytest.mark.parametrize("relative", [

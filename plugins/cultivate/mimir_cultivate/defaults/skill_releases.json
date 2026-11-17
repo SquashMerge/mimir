@@ -789,6 +789,9 @@
       "tests/test_worklink_tool_pins_poller.py": "1ce74f66db36488f50afcb40ced0b7c45ff44c85a8ca7d5ad720145cd19a3603"
     }
   },
+  "2161-own-pr-review-guidance": {
+    "review": {"SKILL.md": "469c464f82bd568a0a68ae0322828327bb0293836b04c37308c22e875e6fd6e2"}
+  },
   "2150-own-unpublished-commits": {
     "github-poller": {
       "SKILL.md": "447fe0837379d781f1d3050bb157990846d42dfbff8a2a96928a986e2c36b6d9",
