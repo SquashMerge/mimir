@@ -665,6 +665,10 @@ class _RecordedClient:
     async def inbox(self, session_id):
         return deepcopy(self.snapshot["inbox"])
 
+    async def running_shells(self, directory):
+        # The capture ran no background shell (prompt 2's `sleep 60` was a foreground tool call).
+        return []
+
 
 def _captured_lifecycle():
     from tests.worklink_daemon_fixtures import FIXTURES
@@ -812,3 +816,51 @@ async def test_executor_reports_a_session_that_ended_with_its_daemon(tmp_path, m
         assert (checkout / "work.txt").read_text() == "retained work"
         if op != "session_release":
             assert (home / "tmp" / "sentinel").exists()
+
+
+async def test_idle_with_an_owned_background_shell_is_not_quiescent(tmp_path):
+    """2026-11-16: #2149 went idle, its background suite finished, and the session resumed under the stop."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "started"
+        daemon.end_shell(shell)
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+async def test_another_sessions_shell_does_not_hold_this_session(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.start_shell("ses_someone_else", str(tmp_path))
+        daemon.start_shell(sid, str(tmp_path / "elsewhere"))
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+async def test_cancel_stops_owned_background_shells_before_verifying(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        owned = daemon.start_shell(sid, str(tmp_path))
+        foreign = daemon.start_shell("ses_someone_else", str(tmp_path))
+        daemon.finish(sid)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.shells[owned]["status"] == "killed"
+        assert daemon.shells[foreign]["status"] == "running"
+
+
+async def test_shell_listing_failure_fails_closed(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        daemon.finish(controller.record.opencode_session_id)
+        daemon.faults[("GET", "/api/shell")].append(SyntheticFault(status=500))
+        with pytest.raises(DaemonClientError):
+            await controller.observe()
+        assert controller.record.execution_state != "succeeded"
+        daemon.faults[("GET", "/api/shell")].extend(SyntheticFault(status=500) for _ in range(500))
+        assert not await controller.cancel(timeout_s=1)
+        assert controller.record.cancellation_state == "unverified"
