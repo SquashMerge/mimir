@@ -154,6 +154,16 @@ def test_executor_labels_a_failed_session_helper(stdout, label):
     assert _helper_failure(stdout) == label
 
 
+def test_executor_error_for_a_failed_helper_carries_its_label():
+    """Review suggestion on #106: pin the producer-to-error wiring inside _handle_session."""
+    import inspect
+    from mimir_cultivate.worklink import worker_exec
+
+    source = inspect.getsource(worker_exec._handle_session)
+    failure = source.index("if process.returncode != 0")
+    assert "_helper_failure(process.stdout)" in source[failure:failure + 300]
+
+
 @pytest.mark.asyncio
 async def test_session_rpc_keeps_the_executor_failure_reason(monkeypatch, tmp_path, caplog):
     import json as _json
