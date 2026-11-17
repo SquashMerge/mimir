@@ -217,6 +217,21 @@ class FakeOpenCodeDaemon:
                                  "metadata": {"sessionID": session_id}, "time": {"started": 1}}
         return shell_id
 
+    def child_session(self, parent_id: str, directory: str) -> str:
+        info = copy.deepcopy(self.sessions[parent_id].info)
+        info.update(id=self._id("ses"), parentID=parent_id, location={"directory": directory})
+        self.schema.named("Session.Info", info)
+        self.sessions[info["id"]] = SyntheticSession(info)
+        return info["id"]
+
+    def move_session(self, session_id: str, directory: str) -> None:
+        state = self.sessions[session_id]
+        message = {"id": self._id("msg"), "time": {"created": 2}, "type": "location-switched",
+                   "location": {"directory": directory}, "previous": {"location": state.info["location"]}}
+        self.schema.named("Session.Message.LocationSwitched", message)
+        state.messages.append(message)
+        state.info["location"] = {"directory": directory}
+
     def end_shell(self, shell_id: str, status: str = "exited", *, resume: bool = False) -> None:
         """Finish a shell; ``resume`` queues the daemon's synthetic resume, not yet admitted."""
         self.shells[shell_id].update(status=status, exit=0 if status == "exited" else 1, time={"started": 1, "completed": 2})
@@ -265,8 +280,12 @@ class FakeOpenCodeDaemon:
             return web.Response(body=self.recorded["responses"][path]["body"].encode(), content_type="text/event-stream")
         if path == "/api/session":
             if request.method == "GET":
-                return self._response(request, {"data": [s.info for s in self.sessions.values()],
-                                                "cursor": {"previous": None, "next": None}})
+                sessions = [s.info for s in self.sessions.values() if
+                            "parentID" not in request.query or s.info.get("parentID") == request.query["parentID"]]
+                offset = int(request.query.get("cursor", "0"))
+                limit = int(request.query.get("limit", "50"))
+                return self._response(request, {"data": sessions[offset:offset + limit], "cursor": {
+                    "previous": None, "next": str(offset + limit) if offset + limit < len(sessions) else None}})
             info = json.loads(self.recorded["responses"]["POST /api/session location"]["body"])["data"]
             info.update(copy.deepcopy(payload))
             info["id"] = self._id("ses")

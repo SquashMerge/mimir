@@ -118,6 +118,7 @@ class ControllerRecord:
     stop_requested: bool
     cancellation_state: str
     deadline_at_ms: int
+    cleanup_error: str | None = None
 
     def validate(self) -> None:
         if (not isinstance(self.operation_id, str)
@@ -132,6 +133,9 @@ class ControllerRecord:
                 or self.execution_state not in {"pending", "started", "succeeded", "failed", "interrupted", "incomplete"}
                 or self.cancellation_state not in {"none", "requested", "verified", "unverified"}):
             raise ValueError("invalid session controller state")
+        if self.cleanup_error is not None and (not isinstance(self.cleanup_error, str)
+                                               or len(self.cleanup_error.encode()) > 8192):
+            raise ValueError("invalid session cleanup diagnostic")
         for value in (self.issue_id, self.attempt, self.checkout_inode, self.deadline_at_ms):
             if type(value) is not int or value <= 0:
                 raise ValueError("invalid session controller binding")
@@ -333,14 +337,14 @@ class SessionController:
             ))
         return controller
 
-    async def _messages(self) -> list[dict]:
+    async def _messages(self, session_id: str | None = None) -> list[dict]:
         messages = []
         cursor = None
         size = 0
         limit = 100
         while True:
             try:
-                page = await self._bounded(self.client.messages(self.record.opencode_session_id, cursor=cursor,
+                page = await self._bounded(self.client.messages(session_id or self.record.opencode_session_id, cursor=cursor,
                                                   order="asc" if cursor is None else None, limit=limit))
             except DaemonClientError as exc:
                 # A real build's history exceeds the client's per-response bound
@@ -423,6 +427,69 @@ class SessionController:
         shells = await self._bounded(self.client.running_shells(self.record.checkout_path))
         return [shell for shell in shells
                 if shell.get("metadata", {}).get("sessionID") == self.record.opencode_session_id]
+
+    async def _tree_shells(self, tree: list[dict]) -> list[tuple[dict, str]]:
+        """List at current and historical locations, but authorize by session ID only."""
+        owners = {session["id"] for session in tree}
+        locations = {self.record.checkout_path}
+
+        def location(value: object) -> None:
+            directory = value.get("directory") if isinstance(value, dict) else None
+            if not isinstance(directory, str) or not directory.startswith("/") or "\x00" in directory:
+                raise DaemonClientError("invalid session location")
+            locations.add(directory)
+
+        for session in tree:
+            location(session.get("location"))
+            for message in await self._messages(session["id"]):
+                if message["type"] == "location-switched":
+                    location(message.get("location"))
+                    if message.get("previous") is not None:
+                        previous = message["previous"]
+                        location(previous.get("location") if isinstance(previous, dict) else None)
+        shells = []
+        for directory in sorted(locations):
+            for shell in await self.client.running_shells(directory):
+                if shell.get("metadata", {}).get("sessionID") in owners:
+                    shells.append((shell, directory))
+        return shells
+
+    async def _cancel_epic_shells(self) -> bool:
+        """Stop producers before shells; a DELETE acknowledgment is not proof of exit."""
+        tree = await self.client.session_tree(self.record.opencode_session_id)
+        await self._interrupt_tree(tree)
+        shells = await self._tree_shells(tree)
+        self._record_remaining_shells(shells)
+        for shell, directory in shells:
+            try:
+                await self.client.delete_shell(shell["id"], directory)
+            except DaemonClientError:
+                # Still try the other shells, then report the fresh witness below.
+                pass
+        fresh_tree = await self.client.session_tree(self.record.opencode_session_id)
+        # Killing a shell can itself queue a synthetic resume. Settle those
+        # deliveries AFTER deletion too, before taking the final shell witness.
+        await self._interrupt_tree(fresh_tree)
+        final_tree = await self.client.session_tree(self.record.opencode_session_id)
+        remaining = await self._tree_shells(final_tree)
+        self._record_remaining_shells(remaining)
+        return not remaining and {s["id"] for s in tree} == {s["id"] for s in fresh_tree} == {s["id"] for s in final_tree}
+
+    async def _interrupt_tree(self, tree: list[dict]) -> None:
+        for session in tree:
+            if session["id"] != self.record.opencode_session_id:
+                # Child input and shell completion resumes must not restart writers.
+                inbox = await self.client.inbox(session["id"])
+                for item in inbox["data"]:
+                    _message(item, session_id=session["id"])
+                    await self.client.delete_inbox(session["id"], item["id"])
+            # A queued delivery can win the DELETE race; interrupt after draining.
+            await self.client.interrupt(session["id"])
+
+    def _record_remaining_shells(self, shells: list[tuple[dict, str]]) -> None:
+        detail = ", ".join(f"{shell['id']} ({shell['metadata']['sessionID']})" for shell, _ in shells)
+        self._persist(cleanup_error=self._redacted("session tree cleanup incomplete: " + detail, 8192)
+                      if shells else None)
 
     def _execution_state(self, messages: list[dict], inbox: list[dict], shells: list[dict] = (),
                          *, stable: bool = True) -> str:
@@ -533,6 +600,7 @@ class SessionController:
                 async with asyncio.timeout(min(timeout_s, 25)):
                     while True:
                         try:
+                            tree_clean = (await self._cancel_epic_shells() if self.record.kind == "epic" else True)
                             messages, inbox = await self._refresh()
                             users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                                      and m["id"] not in self.record.baseline_message_ids}
@@ -544,10 +612,10 @@ class SessionController:
                                 await self.client.delete_inbox(self.record.opencode_session_id, item["id"])
                             for shell in self._shells:
                                 await self.client.delete_shell(shell["id"], self.record.checkout_path)
-                            if not pending and self.record.input_id and self.record.execution_state in {"succeeded", "failed", "interrupted"}:
+                            if tree_clean and not self._shells and not pending and self.record.input_id and self.record.execution_state in {"succeeded", "failed", "interrupted"}:
                                 self._persist(cancellation_state="verified")
                                 return True
-                            if (self.record.admission_state == "created" and not inbox and not users
+                            if (tree_clean and not self._shells and self.record.admission_state == "created" and not inbox and not users
                                     and self.record.last_seq == self.record.baseline_seq
                                     and self.record.execution_state in {"pending", "incomplete"}):
                                 self._persist(cancellation_state="verified")
@@ -557,8 +625,9 @@ class SessionController:
                             if exc.reason not in {"transport failure", "missing log watermark"}:
                                 raise
                         await asyncio.sleep(0.05)
-            except (TimeoutError, DaemonClientError):
-                self._persist(cancellation_state="unverified")
+            except (TimeoutError, DaemonClientError) as exc:
+                self._persist(cancellation_state="unverified", cleanup_error=self.record.cleanup_error or
+                              self._redacted(f"session cleanup incomplete: {type(exc).__name__}", 8192))
                 return False
             finally:
                 self._cancelling = False
@@ -568,7 +637,7 @@ class SessionController:
         if self._retired:
             return
         if not await self.cancel():
-            raise RuntimeError("session cleanup unverified; retaining controller and checkout")
+            raise RuntimeError(self.record.cleanup_error or "session cleanup unverified; retaining controller and checkout")
         retired_path = self.path.with_name(f"{self.path.stem}.{self.record.opencode_session_id}.retired.json")
         self.path.replace(retired_path)
         self._record_path = retired_path
@@ -733,7 +802,8 @@ async def _executor_operation(request: dict) -> dict:
                 if controller is None:
                     return {"cancellation_state": "verified"}
                 await controller.cancel()
-                return {"cancellation_state": controller.record.cancellation_state}
+                return {"cancellation_state": controller.record.cancellation_state,
+                        **({"cleanup_error": controller.record.cleanup_error} if controller.record.cleanup_error else {})}
             if request["op"] == "session_release":
                 already_retired = controller is not None and controller._retired
                 if controller is not None:

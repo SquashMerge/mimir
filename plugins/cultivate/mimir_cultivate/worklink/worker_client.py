@@ -422,7 +422,11 @@ class WorkerClient:
     async def session_cancel(self, handle: LaunchHandle) -> None:
         response = await self._session_handle_rpc("session_cancel", handle)
         if response.get("cancellation_state") != "verified":
-            raise RuntimeError("session cancellation unverified; retain checkout")
+            from ..opencode import redact_daemon_output
+
+            detail = response.get("cleanup_error")
+            raise RuntimeError("session cancellation unverified; retain checkout" +
+                               (": " + redact_daemon_output(detail)[:8192] if isinstance(detail, str) else ""))
 
     async def session_release(self, handle: LaunchHandle) -> None:
         response = await self._session_handle_rpc("session_release", handle)

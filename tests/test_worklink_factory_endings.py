@@ -16,6 +16,8 @@ SITES = {
     ("compute.py", "cancel", "self._client.session_cancel"): (1, "daemon cancellation must verify owned input quiescence"),
     ("daemon_sessions.py", "cancel", "self.client.delete_inbox"): (1, "delete only admitted owned queued input before reconciliation"),
     ("daemon_sessions.py", "cancel", "self.client.interrupt"): (1, "resume=false; response is not cancellation proof"),
+    ("daemon_sessions.py", "_interrupt_tree", "self.client.delete_inbox"): (1, "durable parent-linked epic descendants only; drain queued shell resumes before interrupting writers"),
+    ("daemon_sessions.py", "_interrupt_tree", "self.client.interrupt"): (1, "epic session tree only; settle producers before and after shell deletion, then freshly verify owned shells are absent"),
     ("daemon_sessions.py", "_executor_operation", "rmtree_missing_ok"): (1, "attempt HOME only after verified session release"),
     ("control.py", "stop_worklink", "WorkerClient(None).cancel_factory_handle"): (1, "explicit operator stop; verified process identity"),
     ("control.py", "stop_worklink", "LocalSubprocessComputeBackend().cancel"): (2, "explicit operator stop for factory or leaf; verified process identity"),

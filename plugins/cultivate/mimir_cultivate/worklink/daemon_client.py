@@ -197,6 +197,43 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("session identity mismatch")
         return True
 
+    async def session_tree(self, session_id: str) -> list[dict[str, Any]]:
+        """Read durable parent links, including archived children and every page."""
+        root = _object(await self._request("GET", f"/api/session/{_identifier(session_id, 'ses')}"))
+        tree = [_object(root.get("data"))]
+        if tree[0].get("id") != session_id:
+            raise DaemonClientError("session identity mismatch")
+        seen = {session_id}
+        for parent in tree:
+            cursor = None
+            cursors = set()
+            while True:
+                params = {"parentID": parent["id"], "limit": "100"}
+                params.update({"cursor": cursor} if cursor is not None else {"order": "asc"})
+                page = _object(await self._request("GET", "/api/session", params=params))
+                self._list(page)
+                for child in page["data"]:
+                    try:
+                        _identifier(child.get("id"), "ses")
+                    except ValueError:
+                        raise DaemonClientError("invalid session identity") from None
+                    if child.get("parentID") != parent["id"] or child["id"] in seen:
+                        raise DaemonClientError("invalid session parent link")
+                    seen.add(child["id"])
+                    tree.append(child)
+                    if len(tree) > 4096:
+                        raise DaemonClientError("session tree exceeds bound")
+                pagination = _object(page.get("cursor"))
+                if "next" not in pagination:
+                    raise DaemonClientError("invalid session cursor")
+                cursor = pagination["next"]
+                if cursor is None:
+                    break
+                if not isinstance(cursor, str) or len(cursor.encode()) > 4096 or cursor in cursors:
+                    raise DaemonClientError("invalid session cursor")
+                cursors.add(cursor)
+        return tree
+
     async def set_environment(self, session_id: str, variables: Mapping[str, str]) -> None:
         await self._request("PUT", self._path(session_id, "environment"),
                             payload={"variables": dict(variables)}, status=204)

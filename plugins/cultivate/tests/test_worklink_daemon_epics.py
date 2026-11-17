@@ -70,7 +70,7 @@ class EpicBoundary:
 
     async def session_cancel(self, handle):
         if not self.cancel_verified or not await self.controller.cancel():
-            raise RuntimeError("unverified owned quiescence")
+            raise RuntimeError(self.controller.record.cleanup_error or "unverified owned quiescence")
 
     async def session_release(self, handle):
         await self.controller.release()
@@ -103,6 +103,282 @@ async def admit(tmp_path, daemon, client):
         session_checkout=str(checkout))
     save_factory_record(tmp_path, record)
     return spec, boundary, compute, handle, record
+
+
+def specialist_shells(daemon, handle, record):
+    """Two direct children plus a nested specialist that has moved locations."""
+    sandbox = record.sandbox
+    slice_path = str(Path(sandbox) / "worktrees/be-leaf")
+    first = daemon.child_session(handle.identifier, sandbox)
+    second = daemon.child_session(handle.identifier, slice_path)
+    nested = daemon.child_session(first, slice_path + "/old")
+    owned = [daemon.start_shell(first, sandbox), daemon.start_shell(second, slice_path),
+             daemon.start_shell(nested, slice_path + "/old"),
+             daemon.start_shell(handle.identifier, record.session_checkout)]
+    daemon.move_session(nested, slice_path)
+    return owned
+
+
+@pytest.mark.parametrize("anonymous", [False, True])
+async def test_epic_cancel_never_touches_unrelated_session_shells_at_same_location(tmp_path, anonymous):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
+        foreign = [daemon.start_shell("ses_unrelated_leaf", daemon.shells[shell]["cwd"]) for shell in owned]
+        # Include missing ownership metadata: location alone must never authorize deletion.
+        if anonymous:
+            shell = daemon.start_shell("ses_unknown", record.sandbox)
+            daemon.shells[shell]["metadata"] = {}
+            foreign.append(shell)
+        await compute.cancel(handle)
+        assert boundary.controller.record.cancellation_state == "verified"
+        assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+        assert all(daemon.shells[s]["status"] == "running" for s in foreign)
+        deleted = {route.rsplit("/", 1)[-1] for method, route, _, _ in daemon.requests
+                   if method == "DELETE" and route.startswith("/api/shell/")}
+        assert deleted == set(owned)
+
+
+@pytest.mark.parametrize("fault", ["delete-failure", "lying-ack", "listing-failure"])
+async def test_epic_shell_cleanup_incomplete_names_remaining_shell_and_session(tmp_path, monkeypatch, fault):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
+        retained = owned[1]
+        delete = client.delete_shell
+        async def failing_delete(shell_id, directory):
+            if shell_id == retained:
+                if fault == "delete-failure":
+                    daemon.faults[("DELETE", f"/api/shell/{shell_id}")].append(SyntheticFault(status=500))
+                elif fault == "lying-ack":
+                    daemon.faults[("DELETE", f"/api/shell/{shell_id}")].append(SyntheticFault(status=204))
+                else:
+                    daemon.faults[("GET", "/api/shell")].append(SyntheticFault(status=500))
+                    return
+            await delete(shell_id, directory)
+        monkeypatch.setattr(client, "delete_shell", failing_delete)
+        cancel = boundary.controller.cancel
+        async def bounded_cancel():
+            return await cancel(timeout_s=0.3)
+        monkeypatch.setattr(boundary.controller, "cancel", bounded_cancel)
+        with pytest.raises(ComputeCleanupError, match=retained):
+            await compute.cancel(handle)
+        recovered = SessionController.recover(client, boundary.controller.path,
+            generation=handle.launch_generation, checkout=Path(record.session_checkout))
+        assert recovered.record.cancellation_state == "unverified"
+        assert retained in recovered.record.cleanup_error
+        assert daemon.shells[retained]["metadata"]["sessionID"] in recovered.record.cleanup_error
+        assert daemon.shells[retained]["status"] == "running"
+        assert not load_factory_record(tmp_path, record.run_id).children_reaped
+
+
+async def test_epic_session_tree_follows_every_page_and_archived_descendants(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        for _ in range(101):
+            last = daemon.child_session(handle.identifier, record.sandbox)
+        daemon.sessions[last].info["time"]["archived"] = 3
+        nested = daemon.child_session(last, str(Path(record.sandbox) / "worktrees/last"))
+        shell = daemon.start_shell(nested, daemon.sessions[nested].info["location"]["directory"])
+        await compute.cancel(handle)
+        assert daemon.shells[shell]["status"] == "killed"
+        assert any(query.get("cursor") == "100" for _, route, query, _ in daemon.requests if route == "/api/session")
+
+
+async def test_epic_cancel_drains_child_resume_queued_by_shell_deletion(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.delete_race = True
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        shell = daemon.start_shell(child, record.sandbox)
+        delete = client.delete_shell
+        async def delete_and_resume(shell_id, directory):
+            await delete(shell_id, directory)
+            daemon.enqueue_synthetic(child, shell_id)
+            daemon.deliver(child, daemon.sessions[child].inbox[0]["id"])
+            # Model both an admitted and a still-queued completion delivery.
+            daemon.enqueue_synthetic(child, shell_id)
+        monkeypatch.setattr(client, "delete_shell", delete_and_resume)
+        await compute.cancel(handle)
+        assert boundary.controller.record.cancellation_state == "verified"
+        assert daemon.shells[shell]["status"] == "killed"
+        assert not daemon.sessions[child].active
+        assert not daemon.sessions[child].inbox
+
+
+async def test_epic_cancel_rediscovers_child_spawned_during_final_interrupt(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        interrupt = client.interrupt
+        root_interrupts = 0
+        spawned = []
+        async def spawning_interrupt(session_id):
+            nonlocal root_interrupts
+            result = await interrupt(session_id)
+            if session_id == handle.identifier:
+                root_interrupts += 1
+                if root_interrupts == 2:
+                    child = daemon.child_session(session_id, str(Path(record.sandbox) / "worktrees/late"))
+                    spawned.append(daemon.start_shell(child, daemon.sessions[child].info["location"]["directory"]))
+            return result
+        monkeypatch.setattr(client, "interrupt", spawning_interrupt)
+        await compute.cancel(handle)
+        assert spawned and daemon.shells[spawned[0]]["status"] == "killed"
+        assert boundary.controller.record.cancellation_state == "verified"
+
+
+async def test_epic_session_tree_rejects_foreign_parent_link_before_deletion(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        foreign = daemon.sessions[child].info
+        foreign["parentID"] = "ses_another_run"
+        shell = daemon.start_shell(child, record.sandbox)
+        daemon.faults[("GET", "/api/session")].append(SyntheticFault(body=json.dumps({
+            "data": [foreign], "cursor": {"previous": None, "next": None}}).encode()))
+        assert not await boundary.controller.cancel()
+        assert boundary.controller.record.cancellation_state == "unverified"
+        assert daemon.shells[shell]["status"] == "running"
+        assert not any(method == "DELETE" and route.startswith("/api/shell/")
+                       for method, route, _, _ in daemon.requests)
+
+
+async def test_epic_session_tree_rejects_foreign_root_identity_before_deletion(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        foreign = daemon.child_session(handle.identifier, record.sandbox)
+        shell = daemon.start_shell(foreign, record.sandbox)
+        daemon.faults[("GET", f"/api/session/{handle.identifier}")].append(SyntheticFault(
+            body=json.dumps({"data": daemon.sessions[foreign].info}).encode()))
+        assert not await boundary.controller.cancel()
+        assert boundary.controller.record.cancellation_state == "unverified"
+        assert daemon.shells[shell]["status"] == "running"
+        assert not any(method == "DELETE" and route.startswith("/api/shell/")
+                       for method, route, _, _ in daemon.requests)
+
+
+async def test_epic_terminal_recovery_stops_descendant_shells_before_finalization(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
+        completed = replace(record.status, status="completed")
+        monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: Path(record.sandbox))
+        async def finished(self, **kwargs):
+            assert kwargs["factory_record"].children_reaped
+            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+            return WorklinkRunResult(2125, 1, "review_ready")
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finished)
+        result = await WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._recover_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)), claims=object(),
+            backend=SimpleNamespace(status=lambda *a, **kw: completed), compute=compute,
+            retained=record, launcher=Path(record.launcher), repo_slug=record.repository,
+            base="main", test_cmd="pytest", runner=lambda *a, **kw: None, work_item_json="{}")
+        assert result.status == "review_ready"
+
+
+async def test_session_cancel_executor_diagnostic_reaches_caller(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, _, handle, _ = await admit(tmp_path, daemon, client)
+        peer = WorkerClient(None)
+        async def rpc(*args, **kwargs):
+            return {"cancellation_state": "unverified", "cleanup_error":
+                    "session tree cleanup incomplete: sh_retained (ses_specialist)"}
+        monkeypatch.setattr(peer, "_session_handle_rpc", rpc)
+        with pytest.raises(RuntimeError, match=r"sh_retained \(ses_specialist\)"):
+            await peer.session_cancel(handle)
+
+
+@pytest.mark.parametrize("cause", ["budget", "idle", "startup", "already-parked", "terminal", "delete-failure"])
+async def test_epic_park_stops_descendant_shells_at_sandbox_and_slice_locations(
+    tmp_path, monkeypatch, supervisor_clock, cause,
+):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
+        foreign = daemon.start_shell("ses_unrelated", record.sandbox)
+        boundary.finish = False
+        current = record.status
+        polls = 0
+        terminal_calls = []
+        if cause == "idle":
+            monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20000.0)
+        if cause == "startup":
+            record = replace(record, status=None, observed_at=None)
+            monkeypatch.setattr(orchestrator, "_factory_startup_status_timeout_s", lambda: 10.0)
+        if cause == "delete-failure":
+            delete = client.delete_shell
+            async def refuse(shell_id, directory):
+                if shell_id == owned[1]:
+                    daemon.faults[("DELETE", f"/api/shell/{shell_id}")].append(SyntheticFault(status=500))
+                await delete(shell_id, directory)
+            monkeypatch.setattr(client, "delete_shell", refuse)
+            cancel = boundary.controller.cancel
+            async def bounded_cancel():
+                return await cancel(timeout_s=0.3)
+            monkeypatch.setattr(boundary.controller, "cancel", bounded_cancel)
+
+        def status(*args, **kwargs):
+            nonlocal polls
+            polls += 1
+            if cause == "startup":
+                supervisor_clock.now += 6
+                return FactoryStatus(record.run_id, False, record.sandbox)
+            if cause in {"already-parked", "terminal"}:
+                return replace(current, status="needs-human" if cause == "already-parked" else "completed",
+                               park_snapshot=str(tmp_path / "snapshot") if cause == "already-parked" else None)
+            if boundary.controller.record.cancellation_state == "none":
+                if cause == "idle":
+                    # First observe progress, then cross the idle threshold without
+                    # advancing the work budget or changing the snapshot.
+                    supervisor_clock.now = 1 if polls == 1 else 8000
+                else:
+                    supervisor_clock.now = 60
+            return current
+
+        def terminal(*args, **kwargs):
+            nonlocal current
+            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+            terminal_calls.append(kwargs["reason"])
+            current = replace(current, status="needs-human", park_snapshot=str(tmp_path / "snapshot"))
+
+        async def finished(self, **kwargs):
+            assert kwargs["factory_record"].children_reaped
+            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+            return WorklinkRunResult(2125, 1, "needs-human")
+
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finished)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None),
+            backend=SimpleNamespace(status=status, heartbeat=lambda *a, **kw: None,
+                                    terminal=terminal, poll_interval_s=0.001),
+            compute=compute, factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None,
+            started_at=datetime.now(UTC))
+        if cause == "delete-failure":
+            with pytest.raises(ComputeCleanupError, match=owned[1]):
+                await asyncio.wait_for(invocation, 60)
+            saved = load_factory_record(tmp_path, record.run_id)
+            assert not saved.children_reaped and owned[1] in saved.controller_error
+            assert not terminal_calls
+        elif cause == "startup":
+            with pytest.raises(WorklinkError, match="startup deadline"):
+                await asyncio.wait_for(invocation, 60)
+            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+        else:
+            assert (await asyncio.wait_for(invocation, 60)).status == "needs-human"
+            if cause in {"budget", "idle"}:
+                assert len(terminal_calls) == 1
+                if cause == "idle":
+                    assert "driver idle" in terminal_calls[0]
+        assert daemon.shells[foreign]["status"] == "running"
 
 
 async def test_epic_production_command_checkout_model_permissions_and_environment(tmp_path):
@@ -471,6 +747,7 @@ async def test_explicit_epic_stop_is_bound_to_the_actual_host(tmp_path, requeste
     from mimir_cultivate.worklink.control import _mark_operator_stop
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
         boundary.outcome = "interrupted"
         _mark_operator_stop(tmp_path, 2125, 1, opencode_session_id=handle.identifier if requested else "ses_old_host")
         class Factory:
@@ -495,6 +772,7 @@ async def test_explicit_epic_stop_is_bound_to_the_actual_host(tmp_path, requeste
         evidence = json.loads((tmp_path / "state/worklink/evidence/2125-1.json").read_text())
         assert evidence["opencode_session_id"] == handle.identifier
         assert evidence["status"] == ("interrupted" if requested else "failed")
+        assert all(daemon.shells[s]["status"] == "killed" for s in owned)
 
 
 @pytest.mark.parametrize("ending", ["running", "completed", "foreign", "unverified"])
@@ -504,6 +782,7 @@ async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quies
     from mimir_cultivate.worklink.worker_client import WorkerClient
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
         loop = asyncio.get_running_loop()
         lookups = 0
         def status(self, *a, **kw):
@@ -546,6 +825,7 @@ async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quies
                 assert boundary.controller.path.exists()
             else:
                 assert result.stopped and result.claim_released and retained.children_reaped
+                assert all(daemon.shells[s]["status"] == "killed" for s in owned)
                 assert retained.controller_phase == ("terminal" if ending == "completed" else "stopped")
                 if verified_evidence:
                     assert proof.read_bytes() == prior
