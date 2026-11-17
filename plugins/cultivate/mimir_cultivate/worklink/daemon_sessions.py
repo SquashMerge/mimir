@@ -42,6 +42,28 @@ def _structured_error(value: object) -> dict:
     return value
 
 
+# ``Session.Inbox.Info`` in the OpenCode 2.2.7 schema is the union of these four
+# items, all with one envelope. Only ``user`` is input Worklink owns; the daemon
+# enqueues the others itself (a finished background shell queues ``synthetic``
+# to resume the session), and each means the session still has work to admit.
+_INBOX_PAYLOAD_KEYS = {
+    "user": ({"text"}, {"text", "files", "agents", "skills", "metadata"}),
+    "synthetic": ({"text"}, {"text", "description", "metadata"}),
+    "move": ({"projectID", "location"}, {"projectID", "location", "subpath"}),
+}
+
+
+def _inbox_payload(kind: object, payload: object) -> bool:
+    if kind == "compaction":
+        return payload is not None
+    if kind not in _INBOX_PAYLOAD_KEYS or not isinstance(payload, dict):
+        return False
+    required, allowed = _INBOX_PAYLOAD_KEYS[kind]
+    if not required <= payload.keys() or payload.keys() - allowed:
+        return False
+    return kind == "move" or isinstance(payload["text"], str)
+
+
 def _message(value: object, *, session_id: str | None = None) -> dict:
     if (not isinstance(value, dict) or not _identifier(value.get("id"), "msg")
             or not isinstance(value.get("time"), dict) or not _number(value["time"].get("created"))
@@ -50,10 +72,9 @@ def _message(value: object, *, session_id: str | None = None) -> dict:
     if session_id is not None:
         if (set(value) != {"id", "time", "type", "sessionID", "payload", "delivery"}
                 or set(value["time"]) != {"created"}
-                or value.get("sessionID") != session_id or value["type"] != "user"
-                or not isinstance(value.get("payload"), dict)
-                or not isinstance(value["payload"].get("text"), str)
-                or value.get("delivery") not in {"queue", "steer"}):
+                or value.get("sessionID") != session_id
+                or value.get("delivery") not in {"queue", "steer"}
+                or not _inbox_payload(value["type"], value.get("payload"))):
             raise DaemonClientError("invalid session inbox")
     elif value["type"] in {"user", "idle"}:
         allowed = {"id", "time", "type", "metadata"} | (
@@ -422,7 +443,10 @@ class SessionController:
                 return "pending"
             return "interrupted" if self.record.stop_requested else "incomplete"
         after = history[admitted + 1:]
-        if after and after[-1].get("type") == "idle" and not shells and stable:
+        # A daemon-queued item (a finished shell's ``synthetic`` resume, a
+        # compaction, a move) has not been admitted yet: the session will run again.
+        daemon_pending = any(item["type"] != "user" for item in inbox)
+        if after and after[-1].get("type") == "idle" and not shells and not daemon_pending and stable:
             return after[-1]["outcome"]
         return "started"
 
@@ -507,7 +531,10 @@ class SessionController:
                             messages, inbox = await self._refresh()
                             users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                                      and m["id"] not in self.record.baseline_message_ids}
-                            pending = [m for m in inbox if m["id"] == self.record.input_id]
+                            # Our input, and the resumes our own shells queued, would
+                            # restart the session after the interrupt below.
+                            pending = [m for m in inbox
+                                       if m["id"] == self.record.input_id or m["type"] == "synthetic"]
                             for item in pending:
                                 await self.client.delete_inbox(self.record.opencode_session_id, item["id"])
                             for shell in self._shells:
