@@ -2075,9 +2075,9 @@ def test_interrupted_pr_lease_bounds_recovery_metadata(tmp_path, monkeypatch):
     from mimir_cultivate import repository
 
     lease, scope, _, _ = _interrupted_lease(tmp_path, monkeypatch)
-    branch = "/".join(["long-branch"] * 100)
-    destination = f"refs/heads/{branch}"
-    _git(lease.path, "update-ref", destination, scope.observed_head_sha)
+    # The size check precedes ref resolution. Do not create a loose ref whose
+    # pathname exceeds macOS PATH_MAX; oversize only the metadata file contents.
+    destination = "refs/heads/" + "long-branch/" * 100
     (lease.path / ".git/rebase-merge/head-name").write_text(destination)
     scope = replace(scope, destination_ref=destination)
     lease = replace(lease, destination_ref=destination)
