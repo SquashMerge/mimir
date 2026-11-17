@@ -352,6 +352,132 @@ async def test_real_poller_review_sequence(tmp_path, monkeypatch, channel, exter
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("stub_opencode")
+async def test_refused_checkout_then_other_pr_review_in_same_turn(tmp_path, monkeypatch):
+    """Run the native checkout error and review write through the real graph/IFC."""
+    from mimir import access_control, event_logger, trust_approval
+    from mimir_cultivate import repository
+    from tests.test_access_control import _CHECKOUT_SCOPE_REFUSAL
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:test")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("GITHUB_REPOS", "SquashMerge/trellis")
+    selected = load_plugins(enable="cultivate")
+    repo, template = _repo_and_scope(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin",
+                    "HEAD:refs/pull/75/head"], check=True)
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(leases))
+    monkeypatch.setattr(access_control, "_canonical_repo_binding_resolution", lambda _:
+        RepoBindingResolution((str(repo.resolve()), template.canonical_origin),
+                              (str(repo.resolve()),), 1))
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
+    real_remote_repo = access_control._github_repo_from_remote
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda remote:
+        "squashmerge/trellis" if remote == template.canonical_origin else real_remote_repo(remote))
+    events, prompts, posted, attempts = [], [], [], []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **kw: events.append((name, kw)))
+    monkeypatch.setattr(trust_approval, "register_chat_request", lambda *args: prompts.append(args))
+
+    acquire_lease = repository.acquire_pr_checkout_lease
+
+    def refuse_lease(scope, **kwargs):
+        if scope.pr_number == 75:
+            return acquire_lease(scope, **kwargs)
+        # Inject the observed lease-store failure, not a tool result or a graph
+        # replacement. checkout_scoped_pr converts it to the real ToolException;
+        # BudgetGate records denied:true and invokes classify_protected_result.
+        assert scope.pr_number == 77
+        assert kwargs["review_state"].checkout_lease is None
+        attempts.append(scope.pr_number)
+        raise RuntimeError(_CHECKOUT_SCOPE_REFUSAL.removeprefix("repository checkout rejected: "))
+
+    monkeypatch.setattr(repository, "acquire_pr_checkout_lease", refuse_lease)
+    client = SimpleNamespace(
+        get_pull_request_snapshot=lambda repository, number: NormalizedPullRequestSnapshot(
+            repo="squashmerge/trellis", number=number, state="open", author="collaborator",
+            head_repo="squashmerge/trellis", head_remote="origin", head_ref=template.head_ref,
+            head_sha=template.observed_head_sha, base_ref=template.base_ref,
+            base_sha=template.observed_base_sha),
+        author_is_trusted=lambda *_: True,
+        submit_review=lambda scope, verdict, body: (
+            posted.append(scope.pr_number) or forge.ReviewProjection(
+                "1", "mimir-bot", "COMMENTED", body, "now", scope.observed_head_sha)),
+    )
+    client.get_pull_request_identity = client.get_pull_request_snapshot
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+    agent = _make_agent(tmp_path, monkeypatch)
+    agent._config = replace(agent._config, plugin_manager=selected)
+    agent._session_manager = _FakeSessionManager()
+
+    class Model(GenericFakeChatModel):
+        requests: list = Field(default_factory=list)
+        labels: list = Field(default_factory=list)
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, *args, **kwargs):
+            turn = get_current_turn()
+            self.requests.append(list(messages))
+            self.labels.append(turn.auth_context.ifc_state.current())
+            return super()._generate(messages, *args, **kwargs)
+
+    def call(name, number, **kwargs):
+        return AIMessage(content="", tool_calls=[{
+            "name": name, "args": {"repository": "SquashMerge/trellis", "pull_request": number, **kwargs},
+            "id": f"{name}-{number}", "type": "tool_call",
+        }])
+
+    model = Model(messages=iter([
+        call("repo_checkout", 77),
+        call("pr_submit_review", 75, verdict="comment", body="Reviewed collaborator PR"),
+        AIMessage(content="reviewed"),
+    ]), disable_streaming=True)
+    agent._agent_model = model
+    authority = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("repo_checkout", "pr_metadata", "pr_submit_review", "pr_review_others"),
+        creation_path="test", policy=selected.policy, poller_owner="cultivate",
+    )
+    # PR 75 gets the real framework checkout; PR 77 is selected by native
+    # server-side discovery when the model requests it later in the same turn.
+    item = {
+        "event_type": "pr_opened", "repo": "SquashMerge/trellis", "number": 75,
+        "author": "collaborator", "pr_author_is_trusted": True,
+        "head_repo": "SquashMerge/trellis", "head_remote": "origin",
+        "head_ref": template.head_ref, "head_sha": template.observed_head_sha,
+        "base_ref": template.base_ref, "base_sha": template.observed_base_sha,
+    }
+    await agent.run_turn(AgentEvent(
+        trigger="poller", channel_id=authority.canonical, source="poller",
+        service_principal=authority.canonical, service_authority=authority,
+        content="Review collaborator PRs 77 and 75",
+        extra={"poller_name": "github-activity", "items": [item]},
+        ifc_labels=InformationFlowLabels().with_source(SourceLabel(
+            principal=authority.canonical, domain="channel", resource_id=authority.canonical,
+            bridge_instance="poller", sensitivity="internal", source_kind="service",
+            authorized_principals=frozenset({authority.canonical}),
+            integrity="trusted", integrity_effect="active_ingest")),
+    ), turn_id="refused-checkout-review", saga_session_id="review-session")
+
+    results = {m.tool_call_id: m for request in model.requests for m in request
+               if isinstance(m, ToolMessage)}
+    assert attempts == [77], {key: m.content for key, m in results.items()}
+    assert results["repo_checkout-77"].status == "error"
+    assert _CHECKOUT_SCOPE_REFUSAL in results["repo_checkout-77"].content
+    assert results["pr_submit_review-75"].status != "error", results["pr_submit_review-75"].content
+    assert posted == [75]
+    assert all(not labels.has_untrusted_active_ingest for labels in model.labels)
+    assert not any(name == "write_blocked_by_untrusted_ingest" for name, _ in events)
+    assert prompts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("stub_opencode")
 async def test_real_review_sequence_detects_case_binding_regression(tmp_path, monkeypatch):
     from mimir import access_control
 

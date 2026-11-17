@@ -8261,7 +8261,7 @@ def test_real_repo_execution_fault_taints_turn(
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_repo_checkout_post_fetch_failure_taints_turn(
+def test_bound_repo_checkout_post_fetch_failure_does_not_taint_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -8329,7 +8329,8 @@ def test_repo_checkout_post_fetch_failure_taints_turn(
 
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
-    assert auth.ifc_state.current(auth.ifc_labels).sources
+    assert "git fetch failed after contacting origin" in str(result.content)
+    assert not auth.ifc_state.current(auth.ifc_labels).has_untrusted_active_ingest
 
 
 @pytest.mark.usefixtures("selected_repository_policy")

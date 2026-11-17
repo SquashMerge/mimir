@@ -12332,6 +12332,32 @@ def _bound_tracker_status_result(
     )
 
 
+def _bound_repository_checkout_failure(
+    tool_name: str, arguments: dict[str, Any],
+    authorization: ToolAuthorization, registered: Any, failed: bool,
+) -> bool:
+    """Bind configured-repo failure diagnostics without requiring a checkout lease.
+
+    A refused checkout may never acquire a lease. Success still requires the
+    ordinary lease binding; the caller must retain any published content labels.
+    """
+    scope = authorization.repo_pr_action_scope
+    return (
+        registered.owner == "cultivate" and tool_name == "repo_checkout"
+        and registered.resource_scope == "repo_pr"
+        and "repo_actions" in registered.memberships
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        and failed
+        and isinstance(getattr(scope, "canonical_repo", None), str)
+        and type(getattr(scope, "pr_number", None)) is int
+        and isinstance(arguments.get("repository"), str)
+        and type(arguments.get("pull_request")) is int
+        and arguments["repository"].lower() == scope.canonical_repo.lower()
+        and arguments["pull_request"] == scope.pr_number
+    )
+
+
 def _bound_repository_cleanup_result(
     tool_name: str, arguments: dict[str, Any], auth_context: Any,
     authorization: ToolAuthorization, registered: Any, result: Any,
@@ -12515,6 +12541,20 @@ def classify_protected_result(
         )
     retained_verified = False
     if registered is not None and registered.owner != "core":
+        if _bound_repository_checkout_failure(
+            tool_name, arguments or {}, authorization, registered,
+            failed or policy_refusal is not None,
+        ):
+            # Diagnostics need no checkout attestation, but cannot erase ingested
+            # content, including an independently labelled artifact.
+            artifact = getattr(result, "artifact", None)
+            sources = tuple(provenance.sources) if provenance is not None else ()
+            if isinstance(artifact, ProtectedResultProvenance):
+                sources += tuple(artifact.sources)
+            labels = InformationFlowLabels()
+            for source in sources:
+                labels = labels.with_source(source)
+            return labels if sources else None
         if tool_name == "repo_cleanup":
             if _bound_repository_cleanup_result(
                 tool_name, arguments or {}, auth_context, authorization,
