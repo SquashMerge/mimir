@@ -1878,6 +1878,301 @@ def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) ->
     assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
 
 
+def _interrupted_lease(tmp_path, monkeypatch, *, kind="rebase", foreign=True):
+    from mimir_cultivate import forge, repository
+
+    _, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    lease = old_state.checkout_lease
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("conflicting base\n")
+    _git(source, "commit", "-qam", "conflicting base")
+    base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    _git(lease.path, "fetch", "origin", "main")
+    conflict = subprocess.run(
+        ["git", "-C", str(lease.path), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         kind, "origin/main"], capture_output=True, text=True, env=_fixture_git_env(),
+    )
+    assert conflict.returncode == 1, conflict.stderr
+    assert "tracked.txt" in _git(lease.path, "ls-files", "--unmerged")
+    if foreign:
+        scope = replace(scope, event_type="pr_review_requested", observed_base_sha=base)
+    state = RepoReviewState(scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr(repository, "_observe_current_pr_head", lambda _: scope.observed_head_sha)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
+    runtime = _history_runtime(scope, state)
+    return lease, scope, state, runtime
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+@pytest.mark.parametrize("foreign", [False, True])
+def test_interrupted_pr_lease_checkout_abort_and_diff(tmp_path, monkeypatch, kind, foreign):
+    from mimir.access_control import protected_result_source
+    from mimir_cultivate.policy import _live_scoped_pr_lease
+    from mimir_cultivate import repository
+
+    old, scope, state, runtime = _interrupted_lease(tmp_path, monkeypatch, kind=kind, foreign=foreign)
+    result = repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+    assert result["status"] == "recovery"
+    assert result["path"] == str(old.path)
+    assert result["interrupted_operation"] == {
+        "kind": kind, "branch": scope.head_ref, "original_head": scope.observed_head_sha,
+    }
+    assert "tracked.txt" in result["repo_unmerged"]["stdout"]
+    assert f"repo_{kind}_abort" in result["message"]
+    lease = state.checkout_lease
+    assert _live_scoped_pr_lease(scope, state) is lease
+    assert_lease_attested(runtime.context, scope, lease)
+    label = protected_result_source(
+        runtime.context, principal=None, domain="filesystem", resource_id=str(lease.path / "tracked.txt"),
+        bridge_instance="filesystem",
+    )
+    assert label.integrity == "untrusted"
+    assert repository.repo_status.func(scope.canonical_repo, scope.pr_number, runtime=runtime)["ok"]
+    assert repository.repo_unmerged.func(scope.canonical_repo, scope.pr_number, runtime=runtime)["ok"]
+    abort = repository.repo_rebase_abort if kind == "rebase" else repository.repo_merge_abort
+    assert abort.func(scope.canonical_repo, scope.pr_number, runtime=runtime)["ok"]
+    assert lease.interrupted_operation is None
+    assert _git(lease.path, "symbolic-ref", "--short", "HEAD") == scope.head_ref
+    assert not _git(lease.path, "status", "--porcelain")
+    assert _live_scoped_pr_lease(scope, state) is lease
+    assert repository.repo_diff.func(scope.canonical_repo, scope.pr_number, runtime=runtime)["ok"]
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+@pytest.mark.parametrize("invalid", ["detached", "other_branch"])
+def test_interrupted_pr_lease_refuses_unproven_branch(tmp_path, monkeypatch, foreign, invalid):
+    from mimir_cultivate import repository
+
+    lease, scope, state, runtime = _interrupted_lease(tmp_path, monkeypatch, foreign=foreign)
+    _git(lease.path, "rebase", "--abort")
+    if invalid == "detached":
+        _git(lease.path, "checkout", "--detach")
+        message = "detached without an interrupted"
+        with pytest.raises(RuntimeError, match=message):
+            repository._foreign_candidate_head(lease, scope, owner=scope.principal, runner=repository._default_runner)
+    else:
+        _git(lease.path, "checkout", "-b", "other-branch")
+        result = subprocess.run(
+            ["git", "-C", str(lease.path), "rebase", "origin/main"],
+            capture_output=True, env=_fixture_git_env(),
+        )
+        assert result.returncode == 1
+        message = "not PR branch"
+    metadata = (lease.path / ".git/mimir-pr-checkout-lease.json").read_bytes()
+    with pytest.raises(ToolException, match=message):
+        repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+    # The host's pre-turn hook reports the same refusal instead of crashing run_turn.
+    preturn = SimpleNamespace(context=runtime.context, pre_turn_checkout=True)
+    result = repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, preturn)
+    assert result["status"] == "attestation_refused"
+    assert message in result["message"]
+    assert state.checkout_lease is None
+    assert (lease.path / ".git/mimir-pr-checkout-lease.json").read_bytes() == metadata
+
+
+@pytest.mark.parametrize("operation", [
+    GitDiff(), GitPush(), GitFetch(), GitStage(("tracked.txt",)),
+    GitCommit(("tracked.txt",), "forbidden"), GitMerge(), GitRebase(), GitRevert("a" * 40), GitRevertAbort(),
+])
+def test_interrupted_pr_lease_refuses_non_recovery_tools(tmp_path, monkeypatch, operation):
+    from mimir_cultivate import repository
+
+    _, scope, state, runtime = _interrupted_lease(tmp_path, monkeypatch)
+    repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+    with pytest.raises(GitRefusal, match="repo_rebase_abort") as refusal:
+        RepoGitTools(state).execute(operation)
+    assert refusal.value.code == "checkout_recovery_required"
+    with pytest.raises(GitRefusal, match="repo_rebase_abort"):
+        RepoGitTools(state).validated_checkout_root()
+    with pytest.raises(GitRefusal, match="repo_rebase_abort"):
+        repository.repo_cleanup.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("owner", "other-owner"), ("canonical_repo", "other/repo"),
+    ("canonical_origin", "/other/origin"), ("pr_number", 8),
+    ("destination_ref", "refs/heads/other"), ("source_root", "other-source"),
+])
+def test_interrupted_pr_lease_identity_guards(tmp_path, monkeypatch, field, value):
+    from mimir_cultivate.repository import interrupted_pr_checkout
+
+    lease, scope, _, _ = _interrupted_lease(tmp_path, monkeypatch)
+    if field == "source_root":
+        value = tmp_path / value
+        value.mkdir()
+    altered = replace(lease, **{field: value})
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        interrupted_pr_checkout(altered, scope)
+
+
+@pytest.mark.parametrize("tamper", [
+    "origin", "original_head", "branch_head", "symlink", "ambiguous", "wrong_branch",
+    "directory_symlink", "oversized_metadata", "missing_metadata",
+])
+def test_interrupted_pr_lease_revalidates_git_metadata(tmp_path, monkeypatch, tamper):
+    from mimir_cultivate import repository
+
+    lease, scope, _, runtime = _interrupted_lease(tmp_path, monkeypatch)
+    git = lease.path / ".git"
+    if tamper == "origin":
+        _git(lease.path, "remote", "set-url", "origin", "/wrong/origin")
+    elif tamper == "original_head":
+        (git / "rebase-merge/orig-head").write_text("invalid\n")
+    elif tamper == "branch_head":
+        _git(lease.path, "update-ref", scope.destination_ref, scope.observed_base_sha)
+    elif tamper == "symlink":
+        path = git / "rebase-merge/head-name"
+        value = path.read_text()
+        target = tmp_path / "head-name"
+        target.write_text(value)
+        path.unlink()
+        path.symlink_to(target)
+    elif tamper == "directory_symlink":
+        path = git / "rebase-merge"
+        target = git / "saved-rebase"
+        path.rename(target)
+        path.symlink_to(target, target_is_directory=True)
+    elif tamper == "wrong_branch":
+        (git / "rebase-merge/head-name").write_text("refs/heads/other")
+        _git(lease.path, "update-ref", "refs/heads/other", scope.observed_head_sha)
+    elif tamper == "oversized_metadata":
+        (git / "rebase-merge/head-name").write_text("refs/heads/" + "x" * 1024)
+    elif tamper == "missing_metadata":
+        (git / "rebase-merge/head-name").unlink()
+    else:
+        (git / "MERGE_HEAD").write_text(scope.observed_head_sha)
+    with pytest.raises(RuntimeError):
+        repository.interrupted_pr_checkout(lease, scope)
+    with pytest.raises(ToolException):
+        repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+
+
+def test_interrupted_merge_branch_and_continue_guards(tmp_path, monkeypatch):
+    from mimir.access_control import _recovery_tool_refusal
+    from mimir_cultivate import repository
+
+    lease, scope, _, _ = _interrupted_lease(tmp_path, monkeypatch, kind="merge")
+    _git(lease.path, "branch", "other", "HEAD")
+    _git(lease.path, "symbolic-ref", "HEAD", "refs/heads/other")
+    with pytest.raises(RuntimeError, match="not PR branch"):
+        repository.interrupted_pr_checkout(lease, scope)
+    _git(lease.path, "symbolic-ref", "HEAD", scope.destination_ref)
+    scope = replace(scope, event_type="pr_mergeability_conflicting")
+    state = RepoReviewState(scope)
+    monkeypatch.setattr("mimir_cultivate.forge.remediation_checkout_preflight", lambda *_: (state, None))
+    runtime = _history_runtime(scope, state)
+    repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+    assert "repo_merge_abort" in _recovery_tool_refusal(state, "repo_rebase")
+    with pytest.raises(GitRefusal, match="repo_merge_abort"):
+        RepoGitTools(state).execute(GitRebase())
+
+
+def test_interrupted_pr_lease_bounds_recovery_metadata(tmp_path, monkeypatch):
+    from mimir_cultivate import repository
+
+    lease, scope, _, _ = _interrupted_lease(tmp_path, monkeypatch)
+    branch = "/".join(["long-branch"] * 100)
+    destination = f"refs/heads/{branch}"
+    _git(lease.path, "update-ref", destination, scope.observed_head_sha)
+    (lease.path / ".git/rebase-merge/head-name").write_text(destination)
+    scope = replace(scope, destination_ref=destination)
+    lease = replace(lease, destination_ref=destination)
+    with pytest.raises(RuntimeError, match="invalid interrupted rebase metadata"):
+        repository.interrupted_pr_checkout(lease, scope)
+
+
+def test_interrupted_pr_lease_changed_operation_fails_closed(tmp_path, monkeypatch):
+    from mimir_cultivate import repository
+    from mimir_cultivate.policy import _live_scoped_pr_lease
+
+    lease, scope, state, runtime = _interrupted_lease(tmp_path, monkeypatch)
+    repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+    _git(lease.path, "rebase", "--abort")
+    with pytest.raises(RuntimeError, match="operation changed"):
+        state.checkout_lease.recovery_checkout_state(scope)
+    assert _live_scoped_pr_lease(scope, state) is None
+    with pytest.raises(GitRefusal, match="operation changed"):
+        RepoGitTools(state).execute(GitStatus())
+
+
+def test_interrupted_pr_lease_abort_checks_restored_branch(tmp_path, monkeypatch):
+    from mimir_cultivate import repository
+
+    lease, scope, state, runtime = _interrupted_lease(tmp_path, monkeypatch)
+    repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+
+    def wrong_branch_after_abort(argv, **kwargs):
+        result = _bounded_subprocess_runner(argv, **kwargs)
+        if argv[-2:] == ("rebase", "--abort") and result.returncode == 0:
+            _git(lease.path, "checkout", "-b", "wrong-restored-branch")
+        return result
+
+    with pytest.raises(GitRefusal, match="PR branch"):
+        RepoGitTools(state, runner=wrong_branch_after_abort).execute(GitRebaseAbort())
+    assert state.checkout_lease.interrupted_operation is not None
+    with pytest.raises(GitRefusal, match="repo_rebase_abort"):
+        RepoGitTools(state).execute(GitDiff())
+
+
+@pytest.mark.parametrize("event", ["pr_review_requested", "pr_mergeability_conflicting"])
+def test_interrupted_pr_lease_scoped_grants_and_continue(tmp_path, monkeypatch, event):
+    from mimir.access_control import (
+        ScopedPRGrants, _SCOPED_PR_ISSUER, _valid_scoped_pr_grant,
+        authorize_repo_pr_tool, consume_scoped_pr_checkout, observe_scoped_pr_checkout,
+        ToolFlowDirection,
+    )
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import repository
+
+    _, scope, _, _ = _interrupted_lease(tmp_path, monkeypatch)
+    scope = replace(scope, event_type=event)
+    state = RepoReviewState(scope)
+    monkeypatch.setattr("mimir_cultivate.forge.remediation_checkout_preflight", lambda *_: (state, None))
+    runtime = _history_runtime(scope, state)
+    policy = selected_policy_registry()
+    protocol = policy.scoped_actions["cultivate"]
+    auth = replace(runtime.context, scoped_pr_grants=ScopedPRGrants(
+        runtime.context.canonical_principal, (scope,), protocols=policy.scoped_actions, _issuer=_SCOPED_PR_ISSUER,
+    ))
+    runtime = SimpleNamespace(context=auth)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, runtime)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    for tool_name in ("repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort", "repo_diff", "repo_push", "repo_test", "repo_cleanup", "repo_stage", "repo_rebase"):
+        action = RepoPRAction.INSPECT if tool_name != "repo_rebase" else RepoPRAction.WRITE
+        expected = tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"} or (
+            tool_name == "repo_rebase" and event == "pr_mergeability_conflicting"
+        )
+        assert _valid_scoped_pr_grant(auth, "cultivate", action, protocol, scope, state, tool_name=tool_name) is expected
+        for enforce in (False, True):
+            decision = authorize_repo_pr_tool(
+                tool_name, scope, service_principal=None, enforce=enforce, registered_plugin=True,
+                required_actions=(action.value,), auth_context=auth, owner="cultivate", action=action,
+                protocol=protocol, review_state=state, flow_direction=ToolFlowDirection.UNKNOWN,
+            )
+            assert decision.allowed is expected
+            if not expected:
+                assert "repo_rebase_abort" in decision.refusal_detail
+    lease = state.checkout_lease
+    if event == "pr_mergeability_conflicting":
+        # Resolution is external; recovery itself only permits continue, not staging.
+        (lease.path / "tracked.txt").write_text("conflicting base\npull request\n")
+        _git(lease.path, "add", "tracked.txt")
+        assert RepoGitTools(state, auth_context=auth).execute(GitRebase(
+            "base", "base check", "head", "head check",
+        )).ok
+        assert lease.interrupted_operation is None
+    else:
+        assert RepoGitTools(state).execute(GitRebaseAbort()).ok
+        assert _valid_scoped_pr_grant(auth, "cultivate", RepoPRAction.INSPECT, protocol, scope, state, tool_name="repo_diff")
+    assert RepoGitTools(state).execute(GitDiff()).ok
+
+
 def _two_sided_conflict_tools(
     tmp_path: Path,
 ) -> tuple[Path, RepoPRActionScope, RepoReviewState, RepoGitTools]:
