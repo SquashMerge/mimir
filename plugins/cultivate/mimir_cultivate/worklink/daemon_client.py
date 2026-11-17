@@ -197,6 +197,55 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("session identity mismatch")
         return True
 
+    async def session_info(self, session_id: str) -> dict[str, Any]:
+        result = _object(await self._request("GET", f"/api/session/{_identifier(session_id, 'ses')}"))
+        data = _object(result.get("data"))
+        if data.get("id") != session_id:
+            raise DaemonClientError("session identity mismatch")
+        return data
+
+    async def children(self, session_id: str) -> list[dict[str, Any]]:
+        """All direct children, including archived/moved sessions, with bounded pagination."""
+        _identifier(session_id, "ses")
+        children: list[dict[str, Any]] = []
+        cursors: set[str] = set()
+        cursor = None
+        limit = 100
+        while True:
+            params = {"parentID": session_id, "limit": str(limit)}
+            params.update({"order": "asc"} if cursor is None else {"cursor": cursor})
+            try:
+                result = _object(await self._request("GET", "/api/session", params=params))
+            except DaemonClientError as exc:
+                if exc.reason != "item too large" or limit == 1:
+                    raise
+                limit = max(1, limit // 4)
+                continue
+            self._list(result)
+            for child in result["data"]:
+                if child.get("parentID") != session_id:
+                    raise DaemonClientError("foreign child session")
+            children.extend(result["data"])
+            page = _object(result.get("cursor"))
+            if (set(page) != {"previous", "next"} or any(
+                    v is not None and (not isinstance(v, str) or len(v.encode()) > 4096)
+                    for v in page.values()) or len(children) > 4096):
+                raise DaemonClientError("invalid session page")
+            cursor = page["next"]
+            if cursor is None:
+                return children
+            if cursor in cursors:
+                raise DaemonClientError("repeated session cursor")
+            cursors.add(cursor)
+
+    async def pending_forms(self, session_id: str) -> list[dict[str, Any]]:
+        result = _object(await self._request("GET", self._path(session_id, "form")))
+        self._list(result)
+        for form in result["data"]:
+            if form.get("sessionID") != session_id:
+                raise DaemonClientError("foreign session form")
+        return result["data"]
+
     async def set_environment(self, session_id: str, variables: Mapping[str, str]) -> None:
         await self._request("PUT", self._path(session_id, "environment"),
                             payload={"variables": dict(variables)}, status=204)

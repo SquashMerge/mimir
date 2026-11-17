@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -71,6 +71,10 @@ class EpicBoundary:
     async def session_cancel(self, handle):
         if not self.cancel_verified or not await self.controller.cancel():
             raise RuntimeError("unverified owned quiescence")
+
+    async def session_tree_activity(self, handle):
+        assert handle.identifier == self.controller.record.opencode_session_id
+        return await self.controller.tree_activity()
 
     async def session_release(self, handle):
         await self.controller.release()
@@ -770,6 +774,99 @@ def supervisor_clock(monkeypatch):
     }))
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 100.0)
     return clock
+
+
+@pytest.mark.parametrize("observation_path", ["normal", "missed-status"])
+@pytest.mark.parametrize("activity", ["driver", "child", "grandchild", "quiet", "question", "shell", "budget"])
+async def test_factory_idle_uses_session_tree_activity(
+    tmp_path, monkeypatch, supervisor_clock, activity, observation_path,
+):
+    from mimir_cultivate.worklink import orchestrator
+
+    base = datetime(2026, 11, 17, tzinfo=UTC)
+    class ClockDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return base + timedelta(seconds=supervisor_clock.now)
+    monkeypatch.setattr(orchestrator, "datetime", ClockDate)
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20000.0)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 900.0)
+    # Own the liveness witnesses; this test concerns daemon activity, not Git IO.
+    monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda *a: None)
+    monkeypatch.setattr(orchestrator, "_factory_transcript_snapshot", lambda *a: {})
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        baseline = base.timestamp() * 1000
+        daemon.sessions[handle.identifier].info["time"]["updated"] = baseline
+        child = daemon.child(handle.identifier, updated_ms=baseline)
+        grandchild = daemon.child(child, updated_ms=baseline + 500000)
+        source = {"driver": handle.identifier, "child": child}.get(activity, grandchild)
+        # Fresh unrelated roots must never keep this run alive.
+        unrelated = await client.create_session(directory=str(tmp_path), model={"providerID": "openai", "id": "gpt-test"}, permissions=[])
+        daemon.activity(unrelated["data"]["id"], baseline + 30000000)
+        if activity == "shell":
+            daemon.start_shell(grandchild, str(tmp_path / "moved-specialist"))
+            daemon.sessions[grandchild].info["location"] = {"directory": str(tmp_path / "moved-specialist")}
+        current = record.status
+        reasons = []
+        missed = False
+        activity_reads = []
+        real_activity = boundary.session_tree_activity
+        async def tree_activity(selected):
+            activity_reads.append(supervisor_clock.now)
+            return await real_activity(selected)
+        monkeypatch.setattr(boundary, "session_tree_activity", tree_activity)
+
+        class Factory:
+            poll_interval_s = 0.001
+            def status(self, *args, **kwargs):
+                nonlocal current, missed
+                if (observation_path == "missed-status" and not missed
+                        and supervisor_clock.now == 7000):
+                    missed = True
+                    supervisor_clock.now = 8000
+                    raise RuntimeError("synthetic factory observation failure")
+                if current.status == "running" and supervisor_clock.now >= (21000 if activity == "budget" else 10000):
+                    # Bound a regressed watchdog too: a missed park becomes a
+                    # discriminating result assertion, not a real-time hang.
+                    current = replace(current, status="completed")
+                return current
+            def heartbeat(self, *args, **kwargs):
+                supervisor_clock.now += 1000
+                if activity in {"driver", "child", "grandchild", "budget"}:
+                    daemon.activity(source, baseline + supervisor_clock.now * 1000)
+                elif activity == "question":
+                    daemon.question(source, baseline + supervisor_clock.now * 1000)
+            def terminal(self, *args, **kwargs):
+                nonlocal current
+                reasons.append(kwargs["reason"])
+                current = replace(current, status="needs-human", park_snapshot=str(tmp_path / "snapshot"))
+
+        async def finish(self, **kwargs):
+            return WorklinkRunResult(2125, 1, kwargs["factory_record"].status.status)
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finish)
+        result = await asyncio.wait_for(WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", base),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None), backend=Factory(), compute=compute,
+            factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None, started_at=base), 60)
+        assert activity_reads and min(activity_reads) >= 7200
+        assert missed == (observation_path == "missed-status")
+        if activity in {"quiet", "question", "budget"}:
+            assert result.status == "needs-human" and len(reasons) == 1
+            if activity == "budget":
+                assert reasons[0].startswith("budget exhausted")
+                assert supervisor_clock.now == 20000
+            else:
+                assert "factory driver idle" in reasons[0]
+                assert source in reasons[0]
+                stamp = daemon.sessions[source].info["time"]["updated"]
+                assert datetime.fromtimestamp(stamp / 1000, UTC).isoformat() in reasons[0]
+                assert ("pending form is not progress" in reasons[0]) == (activity == "question")
+                assert supervisor_clock.now == 8000
+        else:
+            assert result.status == "completed" and reasons == []
 
 
 def test_epic_launch_at_operator_checkout_without_controller_init(tmp_path, monkeypatch):

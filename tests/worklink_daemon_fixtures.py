@@ -68,6 +68,7 @@ class SyntheticSession:
     inbox: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     log: list[dict[str, Any]] = field(default_factory=list)
+    forms: list[dict[str, Any]] = field(default_factory=list)
     active: bool = False
     changed: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -99,6 +100,7 @@ class FakeOpenCodeDaemon:
         self.command_prompts = True
         #: Synthetic background shells by id, using the 2.3.0 shell contract.
         self.shells: dict[str, dict[str, Any]] = {}
+        self.session_page_limit = 100
         self._counter = 0
         self._closing = False
         self.app = web.Application()
@@ -111,6 +113,7 @@ class FakeOpenCodeDaemon:
             "/api/session/{sessionID}/command": ["POST"],
             "/api/session/{sessionID}/message": ["GET"],
             "/api/session/{sessionID}/inbox": ["GET"],
+            "/api/session/{sessionID}/form": ["GET"],
             "/api/session/{sessionID}/inbox/{inboxID}": ["DELETE"],
             "/api/session/{sessionID}/interrupt": ["POST"],
             "/api/experimental/session/{sessionID}/log": ["GET"],
@@ -164,6 +167,32 @@ class FakeOpenCodeDaemon:
         self.emit(session_id, "session.inbox.enqueued", inboxID=item["id"],
                   item={key: item[key] for key in ("type", "payload", "delivery")})
         return item
+
+    def child(self, parent_id: str, *, updated_ms: float, directory: str | None = None) -> str:
+        info = copy.deepcopy(self.sessions[parent_id].info)
+        sid = self._id("ses")
+        info.update(id=sid, parentID=parent_id, time={"created": updated_ms, "updated": updated_ms})
+        if directory is not None:
+            info["location"] = {"directory": directory}
+        self.schema.named("Session.Info", info)
+        self.sessions[sid] = SyntheticSession(info)
+        return sid
+
+    def activity(self, session_id: str, updated_ms: float) -> None:
+        """A durable assistant message also advances Session.Info.time.updated."""
+        state = self.sessions[session_id]
+        message = {"id": self._id("msg"), "type": "assistant", "time": {"created": updated_ms},
+                   "agent": "build", "model": {"providerID": "openai", "id": "gpt-test"}, "content": []}
+        self.schema.named("Session.Message.Assistant", message)
+        state.messages.append(message)
+        state.info["time"]["updated"] = updated_ms
+
+    def question(self, session_id: str, updated_ms: float) -> None:
+        form = {"id": self._id("frm"), "sessionID": session_id, "title": "Which approach?",
+                "fields": [{"key": "approach", "type": "multiselect", "options": []}]}
+        self.schema.named("Form.Info", form)
+        self.sessions[session_id].forms.append(form)
+        self.sessions[session_id].info["time"]["updated"] = updated_ms
 
     def enqueue_synthetic(self, session_id: str, shell_id: str) -> dict[str, Any]:
         """Queue what a finished background shell queues: a ``synthetic`` resume (2.3.0 schema)."""
@@ -265,8 +294,13 @@ class FakeOpenCodeDaemon:
             return web.Response(body=self.recorded["responses"][path]["body"].encode(), content_type="text/event-stream")
         if path == "/api/session":
             if request.method == "GET":
-                return self._response(request, {"data": [s.info for s in self.sessions.values()],
-                                                "cursor": {"previous": None, "next": None}})
+                sessions = [s.info for s in self.sessions.values()
+                            if request.query.get("parentID", s.info.get("parentID")) == s.info.get("parentID")]
+                offset = int(request.query.get("cursor", "0"))
+                limit = min(int(request.query.get("limit", "50")), self.session_page_limit)
+                return self._response(request, {"data": sessions[offset:offset + limit],
+                    "cursor": {"previous": str(max(0, offset - limit)) if offset else None,
+                               "next": str(offset + limit) if offset + limit < len(sessions) else None}})
             info = json.loads(self.recorded["responses"]["POST /api/session location"]["body"])["data"]
             info.update(copy.deepcopy(payload))
             info["id"] = self._id("ses")
@@ -309,6 +343,8 @@ class FakeOpenCodeDaemon:
             return self._messages(request, state)
         if path.endswith("/inbox"):
             return self._response(request, {"data": state.inbox})
+        if path.endswith("/form"):
+            return self._response(request, {"data": state.forms})
         if request.method == "DELETE":
             inbox_id = request.match_info["inboxID"]
             item = next((item for item in state.inbox if item["id"] == inbox_id), None)

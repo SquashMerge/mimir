@@ -32,7 +32,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-opencode-daemon-session-tree-activity"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -258,7 +258,7 @@ class WorkerProcess:
 
 class WorkerClient:
     async def _session_rpc(self, operation: str, payload: Mapping[str, object]) -> dict[str, Any]:
-        if operation not in {"session_create", "session_observe", "session_cancel", "session_release"}:
+        if operation not in {"session_create", "session_observe", "session_cancel", "session_release", "session_tree_activity"}:
             raise ValueError("invalid session operation")
         if self.checkout is None and self.path_checkout is None:
             raise ValueError("session operation requires an issued checkout capability")
@@ -423,6 +423,20 @@ class WorkerClient:
         response = await self._session_handle_rpc("session_cancel", handle)
         if response.get("cancellation_state") != "verified":
             raise RuntimeError("session cancellation unverified; retain checkout")
+
+    async def session_tree_activity(self, handle: LaunchHandle) -> dict[str, Any]:
+        from .daemon_sessions import _identifier, _number
+
+        response = await self._session_handle_rpc("session_tree_activity", handle)
+        if (set(response) != {"opencode_session_id", "last_activity_at_ms", "last_activity_session_id",
+                              "pending_form", "running_shell"}
+                or response["opencode_session_id"] != handle.identifier
+                or not _identifier(response["last_activity_session_id"], "ses")
+                or not _number(response["last_activity_at_ms"])
+                or not 0 <= response["last_activity_at_ms"] <= 253402300799999
+                or type(response["pending_form"]) is not bool or type(response["running_shell"]) is not bool):
+            raise RuntimeError("invalid session tree activity")
+        return response
 
     async def session_release(self, handle: LaunchHandle) -> None:
         response = await self._session_handle_rpc("session_release", handle)
