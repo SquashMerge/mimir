@@ -1031,3 +1031,38 @@ async def test_cancel_removes_the_resume_its_own_shell_queued(tmp_path):
         assert controller.record.cancellation_state == "verified"
         assert daemon.sessions[sid].inbox == []
         assert not daemon.sessions[sid].active
+
+
+def _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell):
+    """Review P1 on #109: inbox read (empty) -> history (idle) -> shell finishes and
+    queues its resume -> empty shell listing -> history re-read (same idle)."""
+    original = client.running_shells
+    async def finishes_while_listing(directory):
+        if daemon.shells[shell]["status"] == "running":
+            daemon.end_shell(shell, resume=True)
+        return await original(directory)
+    monkeypatch.setattr(client, "running_shells", finishes_while_listing)
+
+
+async def test_resume_queued_between_inbox_read_and_empty_shell_listing_is_not_success(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell)
+        assert (await controller.observe()).execution_state == "started"
+        assert [item["type"] for item in daemon.sessions[sid].inbox] == ["synthetic"]
+
+
+async def test_cancel_cannot_verify_past_a_resume_queued_during_the_shell_listing(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.sessions[sid].inbox == []
+        assert not daemon.sessions[sid].active

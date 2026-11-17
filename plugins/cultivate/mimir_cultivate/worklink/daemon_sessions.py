@@ -463,7 +463,12 @@ class SessionController:
             # is the same idle on both sides of that observation. A resumed turn can
             # start another background shell and reach a *new* idle before the
             # re-read; the earlier empty listing says nothing about that shell.
+            # The inbox snapshot above predates that listing too: a shell that finishes
+            # between them queues its ``synthetic`` resume where only a fresh inbox
+            # read sees it. Read inbox before history, so a resume admitted in
+            # between still shows up after the idle.
             witnessed = messages[-1]["id"]
+            inbox = await self._inbox()
             messages = await self._messages()
             stable = bool(messages) and messages[-1].get("id") == witnessed
         users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
