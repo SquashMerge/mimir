@@ -216,6 +216,13 @@ class OpenCodeDaemonComputeBackend:
             if (self._client.path_checkout, self._client.issue_id, self._client.attempt) != (checkout, issue_id, attempt):
                 raise ComputeLaunchError("daemon compute retained checkout binding mismatch")
 
+    def prepare_fresh_checkout(self) -> None:
+        """A parked host was cancelled and released; its replacement binds anew."""
+        from .worker_client import WorkerClient
+
+        if isinstance(self._client, WorkerClient) and self._client.path_checkout is not None:
+            self._bind_on_launch = True
+
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
         from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
         if spec.session_request is None:

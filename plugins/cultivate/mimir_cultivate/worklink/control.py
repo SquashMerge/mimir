@@ -388,7 +388,7 @@ def stop_worklink(
                     from .backends.feature_factory import FeatureFactoryBackend
                     from .factory_state import load_factory_record
 
-                    client = WorkerClient.for_path_checkout(Path(factory.sandbox), issue_id=issue_id,
+                    client = WorkerClient.for_path_checkout(Path(factory.session_checkout or factory.sandbox), issue_id=issue_id,
                         attempt=factory.attempt, run_uid=get_identities().worklink_uid)
                     backend = FeatureFactoryBackend(entrypoint=factory.launcher)
                     try:
