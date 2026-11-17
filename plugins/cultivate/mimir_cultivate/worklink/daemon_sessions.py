@@ -403,7 +403,8 @@ class SessionController:
         return [shell for shell in shells
                 if shell.get("metadata", {}).get("sessionID") == self.record.opencode_session_id]
 
-    def _execution_state(self, messages: list[dict], inbox: list[dict], shells: list[dict] = ()) -> str:
+    def _execution_state(self, messages: list[dict], inbox: list[dict], shells: list[dict] = (),
+                         *, stable: bool = True) -> str:
         """Derive the owned input's state from durable history.
 
         The single admitted ``user`` message opens the execution; a trailing
@@ -421,7 +422,7 @@ class SessionController:
                 return "pending"
             return "interrupted" if self.record.stop_requested else "incomplete"
         after = history[admitted + 1:]
-        if after and after[-1].get("type") == "idle" and not shells:
+        if after and after[-1].get("type") == "idle" and not shells and stable:
             return after[-1]["outcome"]
         return "started"
 
@@ -430,11 +431,17 @@ class SessionController:
         inbox = await self._inbox()
         messages = await self._messages()
         self._shells = await self._owned_shells()
+        stable = True
         if not self._shells and messages and messages[-1].get("type") == "idle":
             # The history was read before the shell listing. A shell can finish and
-            # resume the session in between, leaving this snapshot's idle tail stale,
-            # so take a fresh history witness after observing that no shell is left.
+            # resume the session in between, so take a fresh history witness after
+            # observing that no shell is left, and accept a terminal idle only if it
+            # is the same idle on both sides of that observation. A resumed turn can
+            # start another background shell and reach a *new* idle before the
+            # re-read; the earlier empty listing says nothing about that shell.
+            witnessed = messages[-1]["id"]
             messages = await self._messages()
+            stable = bool(messages) and messages[-1].get("id") == witnessed
         users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                  and m["id"] not in self.record.baseline_message_ids}
         if len(users) > 1 or (self.record.input_id and users and users != {self.record.input_id}):
@@ -443,7 +450,7 @@ class SessionController:
             raise DaemonClientError("unowned input in fresh session")
         if users and not self.record.input_id:
             self._persist(input_id=next(iter(users)), admission_state="admitted")
-        state = self._execution_state(messages, inbox, self._shells)
+        state = self._execution_state(messages, inbox, self._shells, stable=stable)
         if state != self.record.execution_state:
             self._persist(execution_state=state)
         return messages, inbox
