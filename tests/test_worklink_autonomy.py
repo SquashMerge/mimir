@@ -2624,6 +2624,34 @@ def _load_poller_module():
     return module
 
 
+def test_stale_worklink_lock_released_on_next_tick(tmp_path, monkeypatch):
+    poller = _load_poller_module()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _: (set(), []))
+    # Reconciliation must run even when incident delivery suppresses ready dispatch.
+    monkeypatch.setattr(poller, "_deliver_failure_alerts", lambda *args: False)
+    locks = {"2152": {"issue_id": 2152, "agent_id": "mimir-worklink"}}
+    calls, events = [], []
+
+    def run(args, **kwargs):
+        assert kwargs["cwd"] == str(tmp_path)
+        calls.append(args)
+        if args[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"locks": locks}), "")
+        assert args == [poller._chainlink_bin(), "locks", "release", "2152"]
+        locks.clear()
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(poller.subprocess, "run", run)
+    monkeypatch.setattr(poller, "_emit", events.append)
+    assert poller.main() == 0
+    assert not locks
+    assert len([c for c in calls if c[1:3] == ["locks", "release"]]) == 1
+    assert any(e.get("signal") == "worklink_lock_reconciled" and e["issue_id"] == 2152 for e in events)
+
+
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
     if not cultivate_selected():
         pytest.skip("Cultivate poller is not selected")

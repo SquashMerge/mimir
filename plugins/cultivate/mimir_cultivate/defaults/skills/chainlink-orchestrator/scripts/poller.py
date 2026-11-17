@@ -48,7 +48,7 @@ _ensure_mimir_import_path()
 
 from mimir_cultivate.worklink.autonomy import factory_max_concurrent
 from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
-from mimir_cultivate.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
+from mimir_cultivate.worklink.claims import ChainlinkClaims, WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
 from mimir_cultivate.worklink.continuation import consume_worklink_budget_continuations
 from mimir_cultivate.worklink.dispatch_failures import (
     POLLER_NAME,
@@ -628,6 +628,20 @@ def main() -> int:
         )
         return 0
     repo = os.environ.get("WORKLINK_REPO")
+    # Repair leaked terminal locks even when incident delivery suppresses dispatch.
+    # Commands use this trusted home's tracker and the existing bounded retry budget.
+    claims = ChainlinkClaims(
+        agent_id="worklink-ready-queue", chainlink_bin=_chainlink_bin(), home_path=home,
+        runner=lambda args: subprocess.run(
+            args, cwd=str(home), capture_output=True, text=True, check=False,
+            timeout=_CHAINLINK_READ_TIMEOUT_SECONDS,
+        ),
+        event_logger=lambda event, **payload: _emit({"signal": event, **payload}),
+    )
+    try:
+        claims.reconcile_orphan_locks(should_stop=tick_budget.hard_exhausted)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _emit({"signal": "worklink_lock_reconciliation_degraded", "reason": str(exc)})
     # Detached workers and this reader must resolve the ledger from the same trusted home.
     try:
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
