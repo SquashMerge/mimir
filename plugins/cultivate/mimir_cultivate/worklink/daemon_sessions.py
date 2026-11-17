@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import hashlib
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
 import math
 import os
@@ -119,6 +119,7 @@ class ControllerRecord:
     cancellation_state: str
     deadline_at_ms: int
     cleanup_error: str | None = None
+    cleanup_processes: list[list[int]] = field(default_factory=list)
 
     def validate(self) -> None:
         if (not isinstance(self.operation_id, str)
@@ -136,6 +137,11 @@ class ControllerRecord:
         if self.cleanup_error is not None and (not isinstance(self.cleanup_error, str)
                                                or len(self.cleanup_error.encode()) > 8192):
             raise ValueError("invalid session cleanup diagnostic")
+        if (not isinstance(self.cleanup_processes, list) or len(self.cleanup_processes) > 4096
+                or any(not isinstance(w, list) or len(w) != 2
+                       or any(type(v) is not int or v <= 0 for v in w) or w[0] <= 1
+                       for w in self.cleanup_processes)):
+            raise ValueError("invalid cleanup process witnesses")
         for value in (self.issue_id, self.attempt, self.checkout_inode, self.deadline_at_ms):
             if type(value) is not int or value <= 0:
                 raise ValueError("invalid session controller binding")
@@ -456,9 +462,15 @@ class SessionController:
 
     async def _cancel_epic_shells(self) -> bool:
         """Stop producers before shells; a DELETE acknowledgment is not proof of exit."""
+        from .daemon_processes import terminate_descendants
+
         tree = await self.client.session_tree(self.record.opencode_session_id)
+        # Interrupt can itself stop a shell. Capture lineage before either
+        # interrupt or DELETE, then persist before any destructive operation.
+        await self._snapshot_shell_processes(await self._tree_shells(tree))
         await self._interrupt_tree(tree)
         shells = await self._tree_shells(tree)
+        await self._snapshot_shell_processes(shells)
         self._record_remaining_shells(shells)
         for shell, directory in shells:
             try:
@@ -469,11 +481,23 @@ class SessionController:
         fresh_tree = await self.client.session_tree(self.record.opencode_session_id)
         # Killing a shell can itself queue a synthetic resume. Settle those
         # deliveries AFTER deletion too, before taking the final shell witness.
+        await self._snapshot_shell_processes(await self._tree_shells(fresh_tree))
         await self._interrupt_tree(fresh_tree)
+        survivors = await terminate_descendants(self.record.cleanup_processes)
+        self._persist(cleanup_processes=survivors)
         final_tree = await self.client.session_tree(self.record.opencode_session_id)
         remaining = await self._tree_shells(final_tree)
         self._record_remaining_shells(remaining)
-        return not remaining and {s["id"] for s in tree} == {s["id"] for s in fresh_tree} == {s["id"] for s in final_tree}
+        return not survivors and not remaining and {s["id"] for s in tree} == {s["id"] for s in fresh_tree} == {s["id"] for s in final_tree}
+
+    async def _snapshot_shell_processes(self, shells: list[tuple[dict, str]]) -> None:
+        from .daemon_processes import snapshot_descendants
+
+        witnesses = {tuple(w) for w in self.record.cleanup_processes}
+        for shell, _ in shells:
+            witnesses.update(tuple(w) for w in snapshot_descendants(shell.get("pid")))
+        self._persist(cleanup_processes=[list(w) for w in sorted(witnesses)])
+        self._record_remaining_shells(shells)
 
     async def _interrupt_tree(self, tree: list[dict]) -> None:
         for session in tree:
@@ -487,9 +511,10 @@ class SessionController:
             await self.client.interrupt(session["id"])
 
     def _record_remaining_shells(self, shells: list[tuple[dict, str]]) -> None:
-        detail = ", ".join(f"{shell['id']} ({shell['metadata']['sessionID']})" for shell, _ in shells)
+        detail = ", ".join([*(f"{shell['id']} ({shell['metadata']['sessionID']})" for shell, _ in shells),
+                            *(f"PID {pid} (start {ticks})" for pid, ticks in self.record.cleanup_processes)])
         self._persist(cleanup_error=self._redacted("session tree cleanup incomplete: " + detail, 8192)
-                      if shells else None)
+                      if detail else None)
 
     def _execution_state(self, messages: list[dict], inbox: list[dict], shells: list[dict] = (),
                          *, stable: bool = True) -> str:

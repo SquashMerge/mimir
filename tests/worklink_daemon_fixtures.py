@@ -213,7 +213,7 @@ class FakeOpenCodeDaemon:
     def start_shell(self, session_id: str, directory: str, command: str = "sh scripts/heavy_run.sh pytest") -> str:
         shell_id = self._id("sh")
         self.shells[shell_id] = {"id": shell_id, "status": "running", "command": command, "cwd": directory,
-                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 4242,
+                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 1073741824,
                                  "metadata": {"sessionID": session_id}, "time": {"started": 1}}
         return shell_id
 

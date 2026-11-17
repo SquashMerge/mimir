@@ -172,6 +172,139 @@ async def test_epic_shell_cleanup_incomplete_names_remaining_shell_and_session(t
         assert not load_factory_record(tmp_path, record.run_id).children_reaped
 
 
+@pytest.mark.parametrize("reused", [False, True])
+async def test_epic_cancel_verifies_orphan_pid_start_time_not_only_shell_listing(tmp_path, monkeypatch, reused):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
+
+    # A faithful /proc tree: child escaped into its own process group, then
+    # DELETE reparents it to init and removes all daemon shell visibility.
+    table = {200: (1, 100, "S"), 201: (200, 101, "S"), 202: (201, 102, "S"),
+             999: (1, 999, "S")}
+    monkeypatch.setattr(processes, "_process", lambda pid: table.get(pid))
+    monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
+        iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
+    sent = []
+    handles = {}
+    def open_pid(pid):
+        handles[pid + 1000] = pid
+        return pid + 1000
+    def send(fd, sig):
+        pid = handles[fd]
+        sent.append((pid, sig))
+        if pid == 202 and sig == signal.SIGKILL:
+            table.pop(pid, None)
+        elif pid == 201:
+            table.pop(pid, None)
+    # Patch only this module's os/signal facades, not process-global stdlib.
+    monkeypatch.setattr(processes, "os", SimpleNamespace(pidfd_open=open_pid, close=lambda fd: None))
+    monkeypatch.setattr(processes, "signal", SimpleNamespace(
+        SIGTERM=signal.SIGTERM, SIGKILL=signal.SIGKILL, pidfd_send_signal=send))
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        shell = daemon.start_shell(child, record.sandbox)
+        daemon.shells[shell]["pid"] = 200
+        delete = client.delete_shell
+        async def delete_and_orphan(sid, directory):
+            # Witnesses must already be durable before lineage disappears.
+            assert boundary.controller.record.cleanup_processes == [[201, 101], [202, 102]]
+            await delete(sid, directory)
+            table.pop(200)
+            table[201] = (1, 101, "S")
+            table[202] = (1, 777 if reused else 102, "S")
+        monkeypatch.setattr(client, "delete_shell", delete_and_orphan)
+        await compute.cancel(handle)
+        assert boundary.controller.record.cancellation_state == "verified"
+        assert boundary.controller.record.cleanup_processes == []
+        assert (201, signal.SIGTERM) in sent
+        assert 999 in table and not any(pid == 999 for pid, _ in sent)
+        if reused:
+            assert table[202][1] == 777 and not any(pid == 202 for pid, _ in sent)
+        else:
+            assert 202 not in table
+            assert (202, signal.SIGKILL) in sent
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux process identity witness")
+async def test_epic_cancel_reaps_real_setsid_child_after_daemon_forgets_shell(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
+    import sys
+
+    # The child acknowledges setsid and TERM handling before exposing its PID.
+    child_code = "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(60)"
+    parent_code = ("import subprocess,sys,time; "
+                   "p=subprocess.Popen([sys.executable,'-u','-c',sys.argv[1]],start_new_session=True,stdout=subprocess.PIPE,text=True); "
+                   "print(p.stdout.readline(),end='',flush=True); time.sleep(60)")
+    parent = subprocess.Popen([sys.executable, "-u", "-c", parent_code, child_code],
+                              stdout=subprocess.PIPE, text=True)
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    child_pid = None
+    try:
+        child_pid = int(await asyncio.wait_for(asyncio.to_thread(parent.stdout.readline), 5))
+        assert os.getpgid(child_pid) == child_pid != os.getpgid(parent.pid)
+        async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+            _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+            shell = daemon.start_shell(handle.identifier, record.session_checkout)
+            daemon.shells[shell]["pid"] = parent.pid
+            delete = client.delete_shell
+            async def delete_parent(sid, directory):
+                assert any(w[0] == child_pid for w in boundary.controller.record.cleanup_processes)
+                parent.terminate()
+                await asyncio.to_thread(parent.wait, 5)
+                await delete(sid, directory)
+                assert processes._process(child_pid)[0] != parent.pid
+            monkeypatch.setattr(client, "delete_shell", delete_parent)
+            await compute.cancel(handle)
+            assert boundary.controller.record.cancellation_state == "verified"
+            assert not await client.running_shells(record.session_checkout)
+            state = processes._process(child_pid)
+            assert state is None or state[2] == "Z"
+            assert unrelated.poll() is None
+    finally:
+        # Test-owned interlocks: even a cleanup-removal mutation cannot leak
+        # its spawned processes, and no production process is selected.
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(timeout=5)
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        unrelated.kill()
+        unrelated.wait(timeout=5)
+        parent.stdout.close()
+
+
+async def test_epic_cancel_reports_surviving_orphan_pids_and_retains_recovery(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import daemon_processes as processes
+
+    table = {200: (1, 100, "S"), 201: (200, 101, "S")}
+    monkeypatch.setattr(processes, "_process", lambda pid: table.get(pid))
+    monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
+        iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
+    monkeypatch.setattr(processes, "_signal", lambda *args: None)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        shell = daemon.start_shell(handle.identifier, record.session_checkout)
+        daemon.shells[shell]["pid"] = 200
+        delete = client.delete_shell
+        async def orphan(sid, directory):
+            await delete(sid, directory)
+            table.pop(200)
+            table[201] = (1, 101, "S")
+        monkeypatch.setattr(client, "delete_shell", orphan)
+        assert not await boundary.controller.cancel(timeout_s=0.2)
+        recovered = SessionController.recover(client, boundary.controller.path,
+            generation=handle.launch_generation, checkout=Path(record.session_checkout))
+        assert recovered.record.cleanup_processes == [[201, 101]]
+        assert "PID 201" in recovered.record.cleanup_error
+        assert recovered.record.cancellation_state == "unverified"
+        assert not await client.running_shells(record.session_checkout)
+
+
 async def test_epic_session_tree_follows_every_page_and_archived_descendants(tmp_path):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, _, compute, handle, record = await admit(tmp_path, daemon, client)
