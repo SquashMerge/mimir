@@ -15,6 +15,13 @@ notes below describe the original architecture, not the current package boundary
 
 ## OpenCode 2 daemon operation
 
+OpenCode 2.3.0 combines agent permissions then session permissions and uses the
+last matching rule, with final deny before persisted project grants. An agent's
+own `permissions` replace the host default list, rather than inheriting its broad
+allow baseline. Factory 0.14.1 explicitly supplies that baseline before its own
+narrower denies. Native source excerpts and a credential-free registration probe
+are retained in `tests/fixtures/worklink/opencode_2_3_0/PROVENANCE.md`.
+
 Current OpenCode execution uses `OpenCodeDaemonComputeBackend` and
 `opencode_daemon` handles identified by `ses_...`, not per-build OpenCode PIDs.
 The `local_subprocess` configuration name and autonomous opt-in remain for
@@ -23,8 +30,9 @@ describe daemon-session lifecycle. Each invocation creates one exclusive session
 sets a closed shell environment and submits one input. Reconnection observes the
 same durable history/inbox without replaying admission. State comes from the
 message history: the admitted input's `user` message starts the run and the
-`idle` message after it gives the outcome. OpenCode 2.2.7's session log serves
-only a sequence watermark, so log events never decide state. A connected stream,
+`idle` message after it gives the outcome. OpenCode 2.3.0's queued-input log probe
+serves only a sequence watermark, consistent with the historical 2.2.7 live-provider
+capture, so log events never decide state. A connected stream,
 an idle before the input, an HTTP acknowledgment or a model turn alone is not
 completion. Epic status remains
 authoritative through node factory.js, with lock session equal to OpenCode
@@ -1606,7 +1614,7 @@ even if another signal is absent.
 tool_pins:
   - name: opencode               # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
-    pin: "2.2.7"               # required: version, tag, or SHA currently expected
+    pin: "2.3.0"               # required: version, tag, or SHA currently expected
     smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
     package: "@opencode/cli"     # optional upstream package/repo identifier

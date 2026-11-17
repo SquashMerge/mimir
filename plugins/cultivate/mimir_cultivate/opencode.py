@@ -365,7 +365,8 @@ async def _reconcile_codex_locked(path: Path, client: Any) -> str:
         tokens.update(access_token=value["access"], refresh_token=value["refresh"], account_id=account)
         document["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         _atomic_auth_write(path, document)
-    # expires=0 disables OpenCode 2.2.7's on-use refresh. Normalize legacy
+    # expires=0 disables OpenCode 2.3.0's on-use refresh (native predicate
+    # captured in opencode_2_3_0/source-inspection.json). Normalize legacy
     # positive-expiry entries even when their JWT expiry equals the agent's.
     # This is scoped to the ChatGPT OAuth methods in the openai integration.
     imported = {"type": "oauth", "methodID": "chatgpt-browser", "access": tokens["access_token"],

@@ -42,7 +42,7 @@ def classify_native(value: object, method: object, *, now: int) -> NativeLogin:
     """Classify one active ``openai`` credential row.
 
     ``method`` is the row's ``method_id`` column. A native ``auth login`` sets
-    it; OpenCode 2.2.7's ``POST /api/credential`` (the supported import the
+    it; OpenCode 2.3.0's ``POST /api/credential`` (the supported import the
     controller reconcile uses) leaves it NULL and records the method only as
     the value's ``methodID``. A NULL column therefore defers to the value; a
     present column must still be supported and agree with it.
@@ -151,7 +151,7 @@ def parse_status(payload: object, *, now: int | None = None) -> dict[str, object
             or (version is not None and (not isinstance(version, str) or len(version.encode()) > 128
                                         or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None))
             or (expiry is not None and (type(expiry) is not int or not 0 <= expiry <= 9007199254740991))
-            or (payload["daemon_state"] == "ready" and version != "2.2.7")):
+            or (payload["daemon_state"] == "ready" and version != "2.3.0")):
         raise ValueError("invalid daemon status")
     return dict(payload)
 
@@ -184,7 +184,7 @@ async def inspect_and_publish(paths: RuntimePaths, identities: WorklinkIdentitie
             version = info["version"]
             if len(version.encode()) > 128 or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
                 version = None
-            state = "ready" if version == "2.2.7" else "version_mismatch"
+            state = "ready" if version == "2.3.0" else "version_mismatch"
         except (OSError, ValueError, DaemonClientError):
             pass
     login = inspect_native_login(paths.daemon / "data/opencode/opencode.db", uid=identities.worklink_uid)

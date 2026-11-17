@@ -2150,7 +2150,7 @@ def test_setup_daemon_probe_uses_actual_activation_and_gate(tmp_path, monkeypatc
                                         'bot_token': token, 'publishing_identity': None}))
     paths.snapshot.chmod(0o600)
     paths.status.write_text(json.dumps({'version': 1, 'launch_generation': generation,
-        'checked_at_ms': int(time.time() * 1000), 'daemon_state': 'ready', 'daemon_version': '2.2.7',
+        'checked_at_ms': int(time.time() * 1000), 'daemon_state': 'ready', 'daemon_version': '2.3.0',
         'login_state': 'missing' if state == 'missing_login' else 'refreshable_unverified' if state == 'refreshable' else 'locally_unexpired',
         'login_expires_at_ms': None, 'telemetry_state': 'off'}))
     paths.status.chmod(0o644)

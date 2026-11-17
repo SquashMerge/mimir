@@ -211,6 +211,42 @@ print('real-image setup OpenCode missing-login refusal passed')
 '''
 
 
+# Prove the installed factory loads on the native pinned CLI before replacing
+# only its wire peer below. This requires no provider credentials or model turn.
+FACTORY_PLUGIN_PROOF = r'''
+import asyncio
+import os
+from mimir_cultivate.worklink.daemon_client import OpenCodeDaemonClient
+from mimir_cultivate.worklink.daemon_health import load_api
+from mimir_cultivate.worklink.daemon_service import RuntimePaths
+
+async def main():
+    assert os.geteuid() == 1001
+    api = load_api(RuntimePaths(), uid=1001, controller=True)
+    async with OpenCodeDaemonClient(base_url=api['url'], username=api['username'], password=api['password']) as client:
+        assert (await client.info())['version'] == '2.3.0'
+        for _ in range(150):
+            plugins = (await client._request('GET', '/api/plugin'))['data']
+            factory = next((p for p in plugins if p['id'] == 'feature-factory'), None)
+            if factory is not None and factory['state']['status'] == 'active':
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise AssertionError('image factory plugin did not register')
+        agents = {a['id'] for a in (await client._request('GET', '/api/agent'))['data']}
+        assert {'feature-factory', 'run-orchestrator', 'backend-builder', 'frontend-builder',
+                'story-reader', 'story-writer', 'codebase-researcher', 'design-interpreter',
+                'spec-writer', 'work-decomposer', 'work-reviewer', 'test-verifier',
+                'implementation-validator'} <= agents
+        assert 'feature' in {s['id'] for s in (await client._request('GET', '/api/skill'))['data']}
+        assert 'feature' in {c['name'] for c in (await client._request('GET', '/api/command'))['data']}
+    print('real-image OpenCode 2.3.0 factory registration passed (no provider login)')
+
+if __name__ == '__main__':
+    asyncio.run(main())
+'''
+
+
 # Synthetic OpenCode wire peer only: production WorkerClient, root executor,
 # SessionController, UID drop, checkout and publication paths remain real.
 # No provider request or native login is established by this fixture.
@@ -246,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split('?')[0]
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
         if path == '/api/info':
-            return self.send({'version': '2.2.7'})
+            return self.send({'version': '2.3.0'})
         if path == '/api/session' and self.command == 'POST':
             sid = 'ses_image_' + str(len(sessions) + 1)
             rules = body['permissions']
@@ -261,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
             sessions[sid] = {'info': info, 'kind': kind, 'messages': [], 'events': []}
             return self.send({'data': info})
         if path == '/api/shell' and self.command == 'GET':
-            # Like the 2.2.7 daemon, list running shell commands; the fixed proof
+            # Use the 2.3.0 shell-list contract; the fixed proof
             # payloads run in the foreground, so none is ever still running.
             return self.send({'location': {'directory': '/'}, 'data': []})
         parts = path.split('/')
@@ -1070,6 +1106,7 @@ PY
         # installed below. Only Docker's transport is adapted: the production
         # argv, named users, private controller venv and installed CLI are real.
         docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', SETUP_DAEMON_PROOF)
+        print(docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', FACTORY_PLUGIN_PROOF, user='mimir'))
         print(docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', MISSING_LOGIN_PROOF, user='mimir'))
 
         # Replace only the wire peer after proving refusal with real health.

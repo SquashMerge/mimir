@@ -42,7 +42,7 @@ def _structured_error(value: object) -> dict:
     return value
 
 
-# ``Session.Inbox.Info`` in the OpenCode 2.2.7 schema is the union of these four
+# ``Session.Inbox.Info`` in the OpenCode 2.3.0 schema is the union of these four
 # items, all with one envelope. Only ``user`` is input Worklink owns; the daemon
 # enqueues the others itself (a finished background shell queues ``synthetic``
 # to resume the session), and each means the session still has work to admit.
@@ -373,9 +373,9 @@ class SessionController:
     async def _read_log(self, *, baseline: bool = False) -> None:
         """Advance the durable sequence watermark; never a source of execution state.
 
-        OpenCode 2.2.7's session log endpoint returns only its ``log.synced``
-        watermark: live follow and ``after=0`` replay both omit every
-        ``session.execution.*`` event (captured live, see
+        OpenCode 2.3.0's queued-input probe returns only its ``log.synced``
+        watermark. The historical 2.2.7 live-provider capture also omitted every
+        ``session.execution.*`` event on follow and replay (see
         ``tests/fixtures/worklink/opencode_2_2_7/session-lifecycle.json``). Execution
         state therefore comes from the durable message history alone (see
         ``_execution_state``). Any event a daemon does deliver must still belong to

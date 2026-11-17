@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import runpy
 
 import aiohttp
 import pytest
@@ -46,9 +47,9 @@ def test_recorded_factory_bytes_and_normalization():
 
 
 def test_recorded_api_evidence_and_synthetic_labels():
-    root = FIXTURES / "opencode_2_2_7"
+    root = FIXTURES / "opencode_2_3_0"
     record = json.loads((root / "probe-result.json").read_bytes())
-    assert record["binary_version"] == "2.2.7"
+    assert record["binary_version"] == "2.3.0"
     assert record["server_awaited"] is True
     schema = OpenCodeSchema()
     for path in ("/api/session", "/api/event"):
@@ -78,7 +79,7 @@ async def test_basic_auth_session_and_event(fake_opencode_daemon):
             await create(client)
         assert failure.value.status == 401
     async with OpenCodeDaemonClient(**daemon.connection) as client:
-        assert (await client.info())["version"] == "2.2.7"
+        assert (await client.info())["version"] == "2.3.0"
         events = [event async for event in client.events()]
         assert events[0].data["type"] == "server.connected"
 
@@ -111,7 +112,7 @@ async def test_watermark_only_log_history_and_opaque_cursors(fake_opencode_daemo
         admitted = (await client.prompt(session_id, "instructions"))["data"]
         assert admitted["sessionID"] == session_id
         daemon.finish(session_id)
-        # Captured 2.2.7 behaviour: replay from zero yields only the advanced watermark.
+        # Historical live-provider behaviour; 2.3.0 queued capture also has only a watermark.
         events = [e.data async for e in client.log(session_id, after=0, follow=False)]
         assert events == [{"type": "log.synced", "aggregateID": session_id, "seq": len(daemon.sessions[session_id].log)}]
         first = await client.messages(session_id, order="asc", limit=1)
@@ -297,7 +298,71 @@ def test_effective_permission_order_and_final_deny_before_project_grants():
 @pytest.mark.parametrize("model", [None, {"providerID": "openai", "id": "gpt-6.1-sol", "variant": "high"},
                                    {"providerID": "openai", "id": "gpt-6.1-sol"}])
 def test_generated_daemon_config_matches_the_pinned_config_schema(model):
-    """A config 2.2.7 rejects would stop the daemon from starting at all."""
+    """A config 2.3.0 rejects would stop the daemon from starting at all."""
     from mimir_cultivate.worklink.daemon_config import daemon_configuration, resolve_daemon_credentials
     config = daemon_configuration({}, resolve_daemon_credentials({}), model=model).config
     OpenCodeSchema().named("Config.InfoEncoded", config)
+
+
+def test_opencode_2_3_0_contract_comparison_is_reproducible():
+    root = FIXTURES / "opencode_2_3_0"
+    compare = runpy.run_path(str(root / "compare-contract.py"))
+    old = compare["contract"](json.loads((FIXTURES / "opencode_2_2_7/openapi.json").read_text()))
+    new = compare["contract"](OpenCodeSchema().document)
+    result = json.loads((root / "contract-diff.json").read_text())
+    assert result == {"operations_checked": sorted(new["operations"]), "schemas_checked": len(new["schemas"]),
+                      "differences": compare["differences"](old, new)}
+    assert len(new["operations"]) == 18 and len(new["schemas"]) == 252
+
+
+def test_opencode_2_3_0_source_and_factory_permission_claims():
+    root = FIXTURES / "opencode_2_3_0"
+    source = json.loads((root / "source-inspection.json").read_text())
+    excerpts = {key: value["source"] for key, value in source["excerpts"].items()}
+    assert "s.expires!==0&&s.expires<=g+We(m)" in excerpts["oauth_stale"]
+    assert "if(!x||!uZ(P.value,yield*Tt))return P.value" in excerpts["oauth_resolve"]
+    assert "findLast" in excerpts["permission_last_match"]
+    assert "cZ(x?.permissions??BS,P.permissions??[])" in excerpts["permission_agent_then_session"]
+    assert 'if(J(Y,C))return{effect:"deny",rules:C};let P=[...C,...yield*D()]' in excerpts["permission_final_deny"]
+    assert "A(y),y.id=g" in excerpts["agent_editor_replacement"]
+    factory = json.loads((root / "factory-result.json").read_text())
+    assert factory["binary_version"] == "2.3.0" and factory["server_awaited"] is True
+    assert factory["package"]["version"] == "0.14.1"
+    assert factory["package"]["dependencies"]["feature-factory"] == "0.14.1"
+    assert factory["package"]["peerDependencies"] == {"solid-js": "^1.9.0", "@opentui/solid": ">=0.5.17"}
+    assert "feature" in factory["skills"] and "feature" in factory["commands"]
+    agents = {agent["id"]: agent["permissions"] for agent in factory["agents"]}
+    for action in ("read", "skill"):
+        assert effective_permission(action, "feature", agent=agents["replacement-probe"], session=[]) == "ask"
+        assert effective_permission(action, "feature", agent=agents["feature-factory"], session=[]) == "allow"
+        assert effective_permission(action, "feature", agent=agents["backend-builder"], session=[]) == "allow"
+
+
+async def test_opencode_2_3_0_additive_assistant_first_token_is_preserved(fake_opencode_daemon):
+    daemon = fake_opencode_daemon
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        session_id = await create(client)
+        message = {"id": "msg_synthetic", "time": {"created": 1, "firstToken": 2}, "type": "assistant",
+                   "agent": "build", "model": {"providerID": "openai", "id": "synthetic-model"}, "content": []}
+        daemon.schema.named("Session.Message.Assistant", message)
+        daemon.sessions[session_id].messages.append(message)
+        assert (await client.messages(session_id))["data"] == [message]
+
+
+@pytest.mark.parametrize("event_type", ["session.step.first-token", "experimental.mcp.event"])
+async def test_opencode_2_3_0_additive_events_are_preserved(fake_opencode_daemon, event_type):
+    daemon = fake_opencode_daemon
+    schema = daemon.schema.document["components"]["schemas"][event_type]
+    # Explicit synthetic instances of the two newly captured event shapes.
+    data = ({"sessionID": "ses_synthetic", "assistantMessageID": "msg_synthetic"}
+            if event_type == "session.step.first-token" else
+            {"id": "synthetic", "server": "synthetic", "name": "synthetic", "eventId": "synthetic",
+             "timestamp": "synthetic", "data": {}, "cursor": None})
+    event = {"id": "evt_synthetic", "created": 1, "type": event_type, "data": data}
+    if "durable" in schema["properties"]:
+        event["durable"] = {"aggregateID": "ses_synthetic", "seq": 1, "version": 1}
+    daemon.schema.named(event_type, event)
+    daemon.faults[("GET", "/api/event")].append(SyntheticFault(
+        body=("data: " + json.dumps(event) + "\n\n").encode(), content_type="text/event-stream"))
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        assert [e.data async for e in client.events()] == [event]

@@ -13,7 +13,7 @@ curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash -
 apt-get install -y --no-install-recommends nodejs
 if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then
     npm install --global --prefix /opt/mimir-opencode \
-        @opencode/cli@2.2.7 \
+        @opencode/cli@2.3.0 \
         @openai/codex@0.139.0 \
         "feature-factory@${FACTORY_VERSION}" \
         "opencode2-feature-factory@${FACTORY_VERSION}" \

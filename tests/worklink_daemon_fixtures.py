@@ -1,6 +1,6 @@
-"""Explicitly imported, offline OpenCode 2.2.7 contract support.
+"""Explicitly imported, offline OpenCode 2.3.0 contract support.
 
-The probe responses and the session-lifecycle capture are recorded. Execution
+The 2.3.0 probe responses and historical 2.2.7 lifecycle capture are recorded. Execution
 outcomes and fault/race controls below are synthetic scenarios shaped to match
 that capture (message history, inbox and the watermark-only log endpoint).
 """
@@ -27,7 +27,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "worklink"
 
 class OpenCodeSchema:
     def __init__(self) -> None:
-        self.document = json.loads((FIXTURES / "opencode_2_2_7/openapi.json").read_bytes())
+        self.document = json.loads((FIXTURES / "opencode_2_3_0/openapi.json").read_bytes())
 
     def validate(self, value: Any, schema: dict[str, Any]) -> None:
         Draft202012Validator({**schema, "components": self.document["components"]}).validate(value)
@@ -45,7 +45,7 @@ def effective_permission(
 ) -> str:
     """Finite native-core model: agent then session, final deny before grants.
 
-    Source: retained supplement F3, embedded uD/H/YQ/findLast in 2.2.7.
+    Source: opencode_2_3_0/source-inspection.json (native findLast evaluator).
     This is test support for the enumerated wildcard policies, not a public
     evaluator or a claim of live provider/tool execution.
     """
@@ -83,11 +83,11 @@ class SyntheticFault:
 
 
 class FakeOpenCodeDaemon:
-    scenario_provenance = "synthetic: OpenCode 2.2.7 schema and inspected source"
+    scenario_provenance = "synthetic: OpenCode 2.3.0 schema and inspected source"
 
     def __init__(self) -> None:
         self.schema = OpenCodeSchema()
-        self.recorded = json.loads((FIXTURES / "opencode_2_2_7/probe-result.json").read_bytes())
+        self.recorded = json.loads((FIXTURES / "opencode_2_3_0/probe-result.json").read_bytes())
         self.username = "opencode"
         self.password = secrets.token_urlsafe(24)
         self.sessions: dict[str, SyntheticSession] = {}
@@ -97,7 +97,7 @@ class FakeOpenCodeDaemon:
         self.delete_race = False
         self.interrupt_noop = False
         self.command_prompts = True
-        #: Background shells by id. A shell outlives its session's turn, as in 2.2.7.
+        #: Synthetic background shells by id, using the 2.3.0 shell contract.
         self.shells: dict[str, dict[str, Any]] = {}
         self._counter = 0
         self._closing = False
@@ -166,7 +166,7 @@ class FakeOpenCodeDaemon:
         return item
 
     def enqueue_synthetic(self, session_id: str, shell_id: str) -> dict[str, Any]:
-        """Queue what a finished background shell queues: a ``synthetic`` resume (2.2.7 schema)."""
+        """Queue what a finished background shell queues: a ``synthetic`` resume (2.3.0 schema)."""
         shell = self.shells[shell_id]
         item = {"id": self._id("msg"), "sessionID": session_id, "time": {"created": 3}, "type": "synthetic",
                 "payload": {"text": f"Background shell {shell_id} finished.", "description": "shell finished",
@@ -350,7 +350,7 @@ class FakeOpenCodeDaemon:
         }})
 
     async def _log(self, request: web.Request, session_id: str) -> web.StreamResponse:
-        """Captured 2.2.7 behaviour: only the ``log.synced`` watermark is served.
+        """Watermark-only model, also observed by the 2.3.0 queued-input probe.
 
         Live follow and ``after=0`` replay both omitted every durable event on the
         real daemon (``opencode_2_2_7/session-lifecycle.json``); follow then stays
