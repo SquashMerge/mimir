@@ -581,12 +581,15 @@ Per-issue flow (one `run`):
    `WORKLINK_REPO` set to that base clone, strip group/other write bits in one line:
 
    ```sh
-   (cd "$WORKLINK_REPO" && { printf '.\0'; git ls-files -z; git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w "./$p" || exit; done' sh)
+   (cd "$WORKLINK_REPO" && { printf '.\0'; git ls-files -z; git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w "./$p" || { writable=$(find "./$p" -prune \( -perm -020 -o -perm -002 \) -print) && [ -z "$writable" ]; } || exit 1; done' sh)
    ```
 
    This covers the repository root and every tracked directory as well as
    tracked files and `.git`. It preserves executable bits and leaves
-   untracked/ignored worktree paths alone (including symlink targets). A
+   untracked/ignored worktree paths alone (including symlink targets). A refused
+   `chmod` is tolerated only if inspection confirms that the path has neither
+   group- nor other-write permission; otherwise the command exits non-zero.
+   This allows safe foreign-owned entries without requiring ownership repair. A
    directory *above* the repository that the worker can write (listed by
    absolute path in the refusal) must be fixed by hand; a sticky directory such
    as `/tmp` is accepted unless the worker owns it. A symlinked base or `.git`
