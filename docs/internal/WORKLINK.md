@@ -1002,8 +1002,12 @@ with mount ownership/mode set to the worker uid and 0700. For example, provision
 concurrent test gates; tests can create substantial temporary data. The mount
 and service setting are deployment configuration.
 Rebuild and restart the root executor with the matching controller release;
-the combined daemon/bounded-output/gate-scratch launch contract uses executor
-protocol v17 (`worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch`).
+the combined daemon/bounded-output/gate-scratch/attempt-delete contract uses executor
+protocol v18 (`worklink-executor-v18-attempt-delete`).
+Completed leaf checkouts are deleted by the executor through an anchored,
+symlink-safe walk of that one attempt, including worker-owned content. The
+controller has no local deletion fallback; failures are logged while claim and
+run-state cleanup continue.
 
 Each run gets its own derived scratch tree under that directory. The gate's
 `TMPDIR` points at the tree and pytest's `--basetemp` at its `pytest/` child, so

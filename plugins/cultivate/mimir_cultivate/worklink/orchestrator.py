@@ -1725,6 +1725,8 @@ class WorklinkRunner:
                             lease.authorization if lease is not None else None,
                             lease.path if lease is not None else None,
                             delete_checkout=delete_authorized_checkout,
+                            issue_id=issue.issue_id,
+                            attempt=record.attempt,
                         )
                     except Exception as exc:  # noqa: BLE001 - teardown must continue
                         _log_event(
@@ -5754,6 +5756,8 @@ def _close_attempt_capabilities(
     checkout: Path | None,
     *,
     delete_checkout: bool,
+    issue_id: int,
+    attempt: int,
 ) -> None:
     try:
         if publication is not None:
@@ -5764,9 +5768,14 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                # Path-addressed attempts are siblings under one repository root.
-                # Delete only this attempt; removing the parent destroys concurrent runs.
-                rmtree_missing_ok(checkout)
+                from .worker_client import WorkerClient
+
+                # Worker-owned content is opaque to controller-side cleanup.
+                # The executor confines deletion to this one issued attempt.
+                WorkerClient.for_path_checkout(
+                    checkout, issue_id=issue_id, attempt=attempt,
+                    run_uid=get_identities().worklink_uid,
+                ).delete_attempt()
 
 
 def _release_issue_and_clear_run_state(
