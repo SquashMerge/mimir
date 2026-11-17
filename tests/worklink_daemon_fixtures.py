@@ -97,6 +97,8 @@ class FakeOpenCodeDaemon:
         self.delete_race = False
         self.interrupt_noop = False
         self.command_prompts = True
+        #: Background shells by id. A shell outlives its session's turn, as in 2.2.7.
+        self.shells: dict[str, dict[str, Any]] = {}
         self._counter = 0
         self._closing = False
         self.app = web.Application()
@@ -112,6 +114,7 @@ class FakeOpenCodeDaemon:
             "/api/session/{sessionID}/inbox/{inboxID}": ["DELETE"],
             "/api/session/{sessionID}/interrupt": ["POST"],
             "/api/experimental/session/{sessionID}/log": ["GET"],
+            "/api/shell": ["GET"], "/api/shell/{id}": ["DELETE"],
         }
         for route, methods in routes.items():
             for method in methods:
@@ -162,12 +165,28 @@ class FakeOpenCodeDaemon:
                   item={key: item[key] for key in ("type", "payload", "delivery")})
         return item
 
+    def enqueue_synthetic(self, session_id: str, shell_id: str) -> dict[str, Any]:
+        """Queue what a finished background shell queues: a ``synthetic`` resume (2.2.7 schema)."""
+        shell = self.shells[shell_id]
+        item = {"id": self._id("msg"), "sessionID": session_id, "time": {"created": 3}, "type": "synthetic",
+                "payload": {"text": f"Background shell {shell_id} finished.", "description": "shell finished",
+                            "metadata": {"source": "shell", "shellID": shell_id, "jobID": shell_id,
+                                         "state": shell["status"], "exit": shell.get("exit"),
+                                         "truncated": False}},
+                "delivery": "steer"}
+        self.schema.named("Session.Inbox.Synthetic", item)
+        self.sessions[session_id].inbox.append(item)
+        self.emit(session_id, "session.inbox.enqueued", inboxID=item["id"],
+                  item={key: item[key] for key in ("type", "payload", "delivery")})
+        return item
+
     def deliver(self, session_id: str, inbox_id: str) -> None:
         state = self.sessions[session_id]
         item = next(item for item in state.inbox if item["id"] == inbox_id)
         state.inbox.remove(item)
-        message = {"id": item["id"], "time": item["time"], "type": "user", **item["payload"]}
-        self.schema.named("Session.Message.User", message)
+        kind = "Synthetic" if item["type"] == "synthetic" else "User"
+        message = {"id": item["id"], "time": item["time"], "type": item["type"], **item["payload"]}
+        self.schema.named(f"Session.Message.{kind}", message)
         state.messages.append(message)
         self.emit(session_id, "session.inbox.delivered", inboxID=inbox_id)
         if not state.active:
@@ -190,6 +209,19 @@ class FakeOpenCodeDaemon:
         state.messages.append(idle)
         state.active = False
         state.info["outcome"] = outcome
+
+    def start_shell(self, session_id: str, directory: str, command: str = "sh scripts/heavy_run.sh pytest") -> str:
+        shell_id = self._id("sh")
+        self.shells[shell_id] = {"id": shell_id, "status": "running", "command": command, "cwd": directory,
+                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 4242,
+                                 "metadata": {"sessionID": session_id}, "time": {"started": 1}}
+        return shell_id
+
+    def end_shell(self, shell_id: str, status: str = "exited", *, resume: bool = False) -> None:
+        """Finish a shell; ``resume`` queues the daemon's synthetic resume, not yet admitted."""
+        self.shells[shell_id].update(status=status, exit=0 if status == "exited" else 1, time={"started": 1, "completed": 2})
+        if resume:
+            self.enqueue_synthetic(self.shells[shell_id]["metadata"]["sessionID"], shell_id)
 
     def _response(self, request: web.Request, body: Any, status: int = 200) -> web.Response:
         operation = self.schema.operation(request.match_info.route.resource.canonical, request.method)
@@ -240,6 +272,18 @@ class FakeOpenCodeDaemon:
             info["id"] = self._id("ses")
             self.sessions[info["id"]] = SyntheticSession(info)
             return self._response(request, {"data": info})
+        if path == "/api/shell":
+            directory = request.query.get("location[directory]")
+            return self._response(request, {"location": {"directory": directory or "/"}, "data": [
+                shell for shell in self.shells.values() if directory is None or shell["cwd"] == directory]})
+        if path.startswith("/api/shell/"):
+            shell = self.shells.get(request.match_info["id"])
+            if shell is None:
+                return self._response(request, {"_tag": "ShellNotFoundError", "id": request.match_info["id"],
+                                                "message": "Synthetic shell not found"}, 404)
+            if shell["status"] == "running":
+                self.end_shell(shell["id"], "killed")
+            return self._response(request, None, 204)
         session_id = request.match_info["sessionID"]
         if session_id not in self.sessions:
             return self._response(request, {"_tag": "SessionNotFoundError", "sessionID": session_id,

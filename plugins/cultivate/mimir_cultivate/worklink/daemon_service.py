@@ -21,7 +21,7 @@ from uuid import uuid4
 from mimir.worklink_daemon_activation import resolve_activation
 from .daemon_config import (
     DAEMON_ROOT, DAEMON_URL, daemon_configuration, daemon_environment,
-    make_launch_snapshot, resolve_daemon_credentials,
+    deployment_model, make_launch_snapshot, resolve_daemon_credentials,
 )
 from .identities import WorklinkIdentities, assert_worklink_identity, get_identities
 
@@ -187,7 +187,7 @@ def prepare(environ: dict[str, str], identities: WorklinkIdentities,
     # Builder shell tools inherit the daemon's environment.
     heavy_lock = heavy_lock_environment(environ)
     credentials = resolve_daemon_credentials(environ)
-    configuration = daemon_configuration(environ, credentials)
+    configuration = daemon_configuration(environ, credentials, model=deployment_model(environ))
     generation = str(uuid4())
     password = secrets.token_urlsafe(48)
     protect_agent_paths(environ, identities)

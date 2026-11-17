@@ -176,6 +176,9 @@ async def admit_session(client: WorkerClient, request: SessionRequest, **kwargs:
         return handle
 
 
+_OBSERVE_INTERVAL_CAP_S = 2.0
+
+
 class OpenCodeDaemonComputeBackend:
     """Session identity and authoritative outcomes, not helper PIDs or exits."""
 
@@ -212,6 +215,13 @@ class OpenCodeDaemonComputeBackend:
         elif isinstance(self._client, WorkerClient) and self._client.path_checkout is not None:
             if (self._client.path_checkout, self._client.issue_id, self._client.attempt) != (checkout, issue_id, attempt):
                 raise ComputeLaunchError("daemon compute retained checkout binding mismatch")
+
+    def prepare_fresh_checkout(self) -> None:
+        """A parked host was cancelled and released; its replacement binds anew."""
+        from .worker_client import WorkerClient
+
+        if isinstance(self._client, WorkerClient) and self._client.path_checkout is not None:
+            self._bind_on_launch = True
 
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
         from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
@@ -280,11 +290,17 @@ class OpenCodeDaemonComputeBackend:
             if remaining <= 0:
                 raise TimeoutError
             async with asyncio.timeout(min(timeout_s, max(0, remaining))):
+                # Every observation runs a fresh executor helper process. Back off
+                # from 100 ms to a 2 s cap so a long build does not keep a core busy
+                # spawning helpers, which on a loaded host pushed helpers past their
+                # executor deadline (2026-11-16, #2151-#2154).
+                interval = 0.1
                 while True:
                     try:
                         outcome = await self._observe(handle)
                     except SessionTransportLostError:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(interval)
+                        interval = min(interval * 2, _OBSERVE_INTERVAL_CAP_S)
                         continue
                     if asyncio.get_running_loop().time() >= deadline:
                         raise TimeoutError
@@ -302,7 +318,8 @@ class OpenCodeDaemonComputeBackend:
                             timed_out=(outcome.execution_state == "incomplete" and outcome.error is not None
                                        and outcome.error.type == "timeout"),
                         )
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(interval)
+                    interval = min(interval * 2, _OBSERVE_INTERVAL_CAP_S)
         except TimeoutError:
             cancellation = "verified"
             try:

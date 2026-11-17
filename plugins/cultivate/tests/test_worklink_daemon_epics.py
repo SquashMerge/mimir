@@ -79,13 +79,17 @@ class EpicBoundary:
 async def admit(tmp_path, daemon, client):
     sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-2125"
     sandbox.mkdir(parents=True)
-    order = WorkOrder(2125, sandbox, "not a second prompt", None, 30,
+    checkout = sandbox.parent.parent
+    order = WorkOrder(2125, checkout, "not a second prompt", None, 30,
         {"MIMIR_MODEL_SPEC": "codex-plus:gpt-test#high",
          "MIMIR_WORK_ITEM_JSON": json.dumps({"run_id": "chainlink-2125", "title": "epic", "body": "build"}),
          "FACTORY_PUBLISHING_IDENTITY": "fixture-bot"}, tmp_path / "transcripts")
     spec = FeatureFactoryBackend().work_spec(order, attempt=1, repo_url="repo", base_ref="main",
         branch="feature/chainlink-2125", test_command="uv run pytest")
-    boundary = EpicBoundary(daemon, client, sandbox)
+    spec = replace(spec, factory_credential_settings=(("credential.helper", ""),
+        ("credential.helper", "!fixture-credential-helper"),
+        ("user.name", "Fixture Bot"), ("user.email", "fixture@example.invalid")))
+    boundary = EpicBoundary(daemon, client, checkout)
     compute = OpenCodeDaemonComputeBackend(client=boundary)
     handle = await compute.launch(spec)
     status = FactoryStatus(run_id="chainlink-2125", valid=True, sandbox_path=str(sandbox),
@@ -95,7 +99,8 @@ async def admit(tmp_path, daemon, client):
     record = FactoryRunRecord(run_id=status.run_id, issue_id=2125, attempt=1, repository="owner/repo",
         base_ref="main", branch=status.branch, launcher="/opt/factory/bin/factory.js", sandbox=str(sandbox),
         session=handle.identifier, opencode_session_id=handle.identifier, handle=handle, status=status,
-        mcp_servers=status.mcp_servers, observed_at=datetime.now(UTC).isoformat(), controller_phase="running")
+        mcp_servers=status.mcp_servers, observed_at=datetime.now(UTC).isoformat(), controller_phase="running",
+        session_checkout=str(checkout))
     save_factory_record(tmp_path, record)
     return spec, boundary, compute, handle, record
 
@@ -104,7 +109,7 @@ async def test_epic_production_command_checkout_model_permissions_and_environmen
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
         create = next(body for method, route, _, body in daemon.requests if method == "POST" and route == "/api/session")
-        assert create == {"location": {"directory": record.sandbox},
+        assert create == {"location": {"directory": record.session_checkout},
             "model": {"providerID": "openai", "id": "gpt-test", "variant": "high"},
             "permissions": [{"action": "external_directory", "resource": "*", "effect": "deny"},
                 *[{"action": "read", "resource": pattern, "effect": "deny"}
@@ -116,6 +121,11 @@ async def test_epic_production_command_checkout_model_permissions_and_environmen
         environment = daemon.sessions[handle.identifier].environment
         assert environment["GH_TOKEN"] == environment["GITHUB_TOKEN"] == "synthetic-bot-token"
         assert environment["FACTORY_PUBLISHING_IDENTITY"] == "fixture-bot"
+        settings = [(environment[f"GIT_CONFIG_KEY_{i}"], environment[f"GIT_CONFIG_VALUE_{i}"])
+                    for i in range(int(environment["GIT_CONFIG_COUNT"]))]
+        assert settings[1:] == list(spec.factory_credential_settings)
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert environment["GIT_CONFIG_GLOBAL"] == "/dev/null"
         assert "FACTORY_SESSION_ID" not in environment
         assert "OPENCODE_PERMISSION" not in environment and "OPENCODE_CONFIG" not in environment
         assert record.session == record.opencode_session_id == handle.identifier
@@ -234,7 +244,7 @@ async def test_epic_lost_command_ack_and_log_eof_restart_never_replay(tmp_path, 
         daemon.faults[("GET", f"/api/experimental/session/{handle.identifier}/log")].append(
             SyntheticFault(body=b"", content_type="text/event-stream"))
         boundary.controller = SessionController.recover(client, boundary.controller.path,
-            generation=handle.launch_generation, checkout=Path(record.sandbox))
+            generation=handle.launch_generation, checkout=Path(record.session_checkout))
         reattached = OpenCodeDaemonComputeBackend(client=boundary)
         result = await reattached.wait(handle, 30)
         assert result.session_outcome.execution_state == "succeeded"
@@ -376,7 +386,8 @@ async def test_fresh_park_recovery_uses_actual_new_context_after_old_quiescence(
         monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kwargs: Path(record.sandbox))
         monkeypatch.setattr(orchestrator, "_git_credential_settings", lambda *a: ())
         def order(self, **kwargs):
-            return WorkOrder(2125, Path(record.sandbox), "not a resume prompt", None, 30,
+            assert kwargs["checkout"] == Path(record.session_checkout)
+            return WorkOrder(2125, kwargs["checkout"], "not a resume prompt", None, 30,
                 {"MIMIR_MODEL_SPEC": "codex-plus:gpt-test#high", "MIMIR_WORK_ITEM_JSON": spec.env["MIMIR_WORK_ITEM_JSON"],
                  "FACTORY_PUBLISHING_IDENTITY": "fixture-bot", "GIT_AUTHOR_NAME": "Fixture Bot",
                  "GIT_AUTHOR_EMAIL": "fixture@example.invalid"}), "fixture-bot"
@@ -386,6 +397,8 @@ async def test_fresh_park_recovery_uses_actual_new_context_after_old_quiescence(
         post_resume_reads = 0
         class Factory(FeatureFactoryBackend):
             poll_interval_s = 0.001
+            def initialize(self, *args, **kwargs):
+                pytest.fail("recovery must not initialize a retained run")
             def status(self, *args, **kwargs):
                 nonlocal post_resume_reads
                 if boundary.create_calls == 1:
@@ -420,6 +433,7 @@ async def test_fresh_park_recovery_uses_actual_new_context_after_old_quiescence(
             fresh = kwargs["factory_record"]
             assert fresh.session == fresh.opencode_session_id == boundary.controller.record.opencode_session_id
             assert fresh.session != old_handle.identifier
+            assert fresh.session_checkout == record.session_checkout
             assert fresh.status.terminal_result == record.status.terminal_result
             return WorklinkRunResult(2125, 1, "review_ready")
         monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finished)
@@ -756,6 +770,157 @@ def supervisor_clock(monkeypatch):
     }))
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 100.0)
     return clock
+
+
+def test_epic_launch_at_operator_checkout_without_controller_init(tmp_path, monkeypatch):
+    from tests.test_worklink_orchestrator import _run_factory_preflight_case
+
+    async def launch(compute, spec):
+        checkout = tmp_path / "factory-checkout"
+        assert spec.local_checkout == checkout
+        record = load_factory_record(tmp_path, "chainlink-700")
+        assert record.status is None and record.observed_at is None
+        assert record.sandbox == str(checkout / ".factory-sandboxes/chainlink-700")
+        assert record.session_checkout == str(checkout)
+        assert not Path(record.sandbox).exists()
+        raise RuntimeError("driver owns init")
+
+    # The helper's initialize stub fails the test if any host calls it.
+    result, launched, _, _ = _run_factory_preflight_case(tmp_path, monkeypatch,
+        credentials={"GITHUB_TOKEN": "fixture-token"}, compute_launch=launch)
+    assert result.reason == "driver owns init" and len(launched) == 1
+
+
+@pytest.mark.parametrize("missing", ["absent-directory", "uninitialized-status"])
+@pytest.mark.parametrize("initializes", [True, False])
+async def test_absent_factory_run_waits_for_driver_init_until_startup_deadline(
+    tmp_path, monkeypatch, supervisor_clock, missing, initializes,
+):
+    from mimir_cultivate.worklink import orchestrator
+
+    monkeypatch.setattr(orchestrator, "_factory_startup_status_timeout_s", lambda: 10.0)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        pending = replace(record, status=None, observed_at=None)
+        save_factory_record(tmp_path, pending)
+        reads = []
+
+        def status(*args, **kwargs):
+            reads.append(supervisor_clock.now)
+            if initializes and len(reads) == 3:
+                return replace(record.status, status="completed")
+            supervisor_clock.now += 2
+            if missing == "absent-directory":
+                raise FileNotFoundError("driver has not created its sandbox")
+            return FactoryStatus(record.run_id, False, record.sandbox)
+
+        async def finish(self, **kwargs):
+            assert kwargs["factory_record"].status.status == "completed"
+            return WorklinkRunResult(2125, 1, "review_ready")
+
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finish)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.session_checkout))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None),
+            backend=SimpleNamespace(status=status, heartbeat=lambda *a, **kw: None, poll_interval_s=0.001),
+            compute=compute, factory_record=pending, test_cmd="pytest", runner=lambda *a, **kw: None,
+            started_at=datetime.now(UTC))
+        if initializes:
+            assert (await asyncio.wait_for(invocation, 60)).status == "review_ready"
+            assert reads == [0, 2, 4]
+        else:
+            with pytest.raises(WorklinkError, match="factory driver did not acquire the run lock before startup deadline"):
+                await asyncio.wait_for(invocation, 60)
+            assert reads == [0, 2, 4, 6, 8]
+
+
+async def test_driver_initialized_sandbox_must_equal_deterministic_path(tmp_path):
+    from mimir_cultivate.worklink.orchestrator import _require_factory_status
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        with pytest.raises(WorklinkError, match="sandbox mismatch"):
+            _require_factory_status(replace(record.status, sandbox_path=str(tmp_path / "foreign")),
+                                    replace(record, status=None))
+        await compute.cancel(handle)
+        await compute.cleanup(handle)
+
+
+async def test_recorded_epic_location_cannot_escape_operator_checkout(tmp_path):
+    from mimir_cultivate.worklink.factory_state import FactoryRecordError
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        assert FactoryRunRecord.from_json(record.to_json()).session_checkout == record.session_checkout
+        legacy = record.to_json()
+        legacy.pop("session_checkout")
+        assert FactoryRunRecord.from_json(legacy).session_checkout is None
+        with pytest.raises(FactoryRecordError, match="session checkout"):
+            FactoryRunRecord.from_json({**record.to_json(), "session_checkout": str(tmp_path / "outside")})
+        await compute.cancel(handle)
+        await compute.cleanup(handle)
+
+
+@pytest.mark.parametrize("entrypoint", ["target", "binding"])
+@pytest.mark.parametrize("location", ["missing-boundary", "outside-root", "wrong-attempt", "nested-boundary"])
+async def test_factory_recovery_refuses_sandbox_outside_attempt_boundary(tmp_path, monkeypatch, entrypoint, location):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        root = tmp_path / "attempts"
+        sandbox = {
+            "missing-boundary": root / "checkout/.factory-sandboxes/chainlink-2125",
+            "outside-root": Path(record.sandbox),
+            "wrong-attempt": root / "repo/2125-2/checkout/.factory-sandboxes/chainlink-2125",
+            "nested-boundary": root / "repo/2125-1/checkout/nested/.factory-sandboxes/chainlink-2125",
+        }[location]
+        sandbox.mkdir(parents=True, exist_ok=True)
+        record = replace(record, sandbox=str(sandbox), session_checkout=str(sandbox.parent.parent),
+                         status=replace(record.status, sandbox_path=str(sandbox)))
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+        monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *a, **kw: "https://github.com/owner/repo.git")
+        monkeypatch.setattr(orchestrator, "_verify_factory_checkout", lambda *a, **kw: "verified-head")
+        kwargs = dict(runner=WorklinkRunner(home=tmp_path, repo=tmp_path, agent_id="mimir"),
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}), retained=record,
+            launcher=Path(record.launcher), repo_slug=record.repository, base="main", command_runner=lambda *a, **kw: None)
+        if entrypoint == "binding":
+            kwargs.update(claim_record=ClaimRecord(2125, 1, "mimir", datetime.now(UTC)),
+                claims=SimpleNamespace(agent_id="mimir", _lock_still_held_by=lambda claim: True))
+        reason = ("no private ownership-transfer boundary" if location in {"missing-boundary", "outside-root"}
+                  else "outside the recorded worker checkout")
+        with pytest.raises(WorklinkError, match=reason):
+            getattr(orchestrator, f"_verify_factory_recovery_{entrypoint}")(**kwargs)
+        await compute.cancel(handle)
+        await compute.cleanup(handle)
+
+
+@pytest.mark.parametrize("location", ["outside-root", "wrong-attempt", "nested-boundary"])
+async def test_factory_completion_refuses_sandbox_outside_recorded_attempt(tmp_path, monkeypatch, location):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        root = tmp_path / "attempts"
+        sandbox = {"outside-root": Path(record.sandbox),
+            "wrong-attempt": root / "repo/2125-2/checkout/.factory-sandboxes/chainlink-2125",
+            "nested-boundary": root / "repo/2125-1/checkout/nested/.factory-sandboxes/chainlink-2125"}[location]
+        record = replace(record, sandbox=str(sandbox), session_checkout=str(sandbox.parent.parent),
+                         status=replace(record.status, sandbox_path=str(sandbox)))
+        status = replace(record.status, status="completed", pr_url="https://github.com/owner/repo/pull/1",
+                         slices=({"id": "one", "status": "merged", "attempts": 1,
+                                  "extra_attempts": 0, "retry_limit": 5},))
+        record = replace(record, status=status)
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+        with pytest.raises(WorklinkError, match="outside the recorded worker checkout"):
+            await orchestrator._verify_factory_completion(home=tmp_path,
+                issue=IssueContext(2125, "epic", "build", {"worklink:epic"}), record=record,
+                test_command="pytest", runner=lambda *a, **kw: pytest.fail("unbound sandbox reached Git"),
+                started_at=datetime.now(UTC))
+        await compute.cancel(handle)
+        await compute.cleanup(handle)
 
 
 @pytest.mark.parametrize("deadline_phase", ["before-verification", "during-snapshot"])

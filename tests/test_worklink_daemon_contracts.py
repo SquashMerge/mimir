@@ -292,3 +292,12 @@ def test_effective_permission_order_and_final_deny_before_project_grants():
         assert effective_permission("read", path, agent=[], session=epic, project=[{"action": "read", "resource": "*", "effect": "allow"}]) == "deny"
     assert effective_permission("external_directory", "/outside", agent=[], session=epic) == "deny"
     assert effective_permission("shell", "node factory.js", agent=[allow], session=epic) == "allow"
+
+
+@pytest.mark.parametrize("model", [None, {"providerID": "openai", "id": "gpt-6.1-sol", "variant": "high"},
+                                   {"providerID": "openai", "id": "gpt-6.1-sol"}])
+def test_generated_daemon_config_matches_the_pinned_config_schema(model):
+    """A config 2.2.7 rejects would stop the daemon from starting at all."""
+    from mimir_cultivate.worklink.daemon_config import daemon_configuration, resolve_daemon_credentials
+    config = daemon_configuration({}, resolve_daemon_credentials({}), model=model).config
+    OpenCodeSchema().named("Config.InfoEncoded", config)

@@ -3496,40 +3496,9 @@ class WorklinkRunner:
                     repository=repo_slug, base_ref=lease.base_ref, branch=f"feature/{run_id}",
                     launcher=str(launcher), sandbox=str(lease.path / ".factory-sandboxes" / run_id),
                     session=None, handle=None, status=None, observed_at=None, controller_phase="running")
-                save_factory_record(self.home, pending)
-                factory_launch_uncertain = True
-                initialized = await _await_factory_control(
-                    selected.initialize, run_id, operator_checkout=lease.path,
-                    base_ref=lease.base_ref, publishing_identity=publishing_identity,
-                    git_settings=spec.factory_credential_settings,
-                    timeout_s=_factory_startup_status_timeout_s(),
-                    credentials={key: order.env[key] for key in ("GH_TOKEN", "GITHUB_TOKEN")},
-                    max_retries=retry_budget,
-                )
-                factory_launch_uncertain = False
-                pending = replace(pending, children_reaped=True)
-                save_factory_record(self.home, pending)
-                _require_factory_status(initialized, pending)
-                if initialized.status != "running" or initialized.lock != "absent" or initialized.lock_session is not None:
-                    raise WorklinkError("factory initialization did not return an unowned running sandbox")
-                spec = replace(spec, local_checkout=Path(initialized.sandbox_path))
-                factory_record = FactoryRunRecord(
-                    run_id=run_id,
-                    issue_id=issue_id,
-                    attempt=claim_record.attempt,
-                    repository=repo_slug,
-                    base_ref=base,
-                    branch=f"feature/{run_id}",
-                    launcher=str(launcher),
-                    sandbox=str(lease.path / ".factory-sandboxes" / run_id),
-                    session=None,
-                    handle=None,
-                    status=initialized,
-                    mcp_servers=initialized.mcp_servers,
-                    observed_at=datetime.now(UTC).isoformat(),
-                    controller_phase="running",
-                    transcript=None,
-                )
+                # The driver owns init, from O. Bind the future sandbox now and
+                # accept it only after qualified status confirms that exact path.
+                factory_record = replace(pending, session_checkout=str(lease.path))
                 save_factory_record(self.home, factory_record)
                 try:
                     handle = await compute.launch(spec)
@@ -3810,8 +3779,8 @@ class WorklinkRunner:
         """Build the order for a fresh ``/feature`` driver.
 
         Capture original agent credentials and trusted Git identity before any
-        initialization/lock effect. Initialization creates the nested sandbox;
-        both initial admission and fresh recovery place the driver there.
+        initialization/lock effect. Both initial admission and fresh recovery
+        start at the operator checkout; only the driver initializes a new run.
         """
         source = dict(os.environ) if environ is None else dict(environ)
         git_name, git_email = _read_checkout_git_identity(checkout, runner)
@@ -3893,7 +3862,8 @@ class WorklinkRunner:
                 pre.is_parked and retained.run_id == epic_run_id(retained.issue_id)))):
             raise WorklinkError("legacy factory host requires operator parking and fresh daemon recovery")
         if isinstance(compute, OpenCodeDaemonComputeBackend):
-            compute.bind_retained_checkout(sandbox, issue_id=retained.issue_id, attempt=retained.attempt)
+            compute.bind_retained_checkout(Path(retained.session_checkout or retained.sandbox),
+                issue_id=retained.issue_id, attempt=retained.attempt)
         if pre.lock_session not in {None, retained.session}:
             raise WorklinkError("factory recovery lock session does not match the OpenCode host")
         if pre.lock == "absent" and pre.lock_session is not None:
@@ -3920,7 +3890,8 @@ class WorklinkRunner:
         prior_park_time = (retained.observed_at if retained.status is not None and retained.status.is_parked
                            and retained.status.park_snapshot == pre.park_snapshot else None)
         epic_environment = dict(os.environ)
-        order, publishing_identity = self._factory_launch_order(issue=issue, checkout=sandbox,
+        operator_checkout = sandbox.parent.parent
+        order, publishing_identity = self._factory_launch_order(issue=issue, checkout=operator_checkout,
             work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id), runner=runner,
             environ=epic_environment)
         from .daemon_health import daemon_health
@@ -3961,8 +3932,11 @@ class WorklinkRunner:
         from .control import clear_legacy_factory_stop
         clear_legacy_factory_stop(self.home, retained.issue_id, retained.attempt)
         pending = replace(retained.observed(released, prior_park_time), handle=None,
-            session=None, opencode_session_id=None, children_reaped=False, controller_phase="running", transcript=None)
+            session=None, opencode_session_id=None, children_reaped=False, controller_phase="running", transcript=None,
+            session_checkout=str(operator_checkout))
         save_factory_record(self.home, pending)
+        if isinstance(compute, OpenCodeDaemonComputeBackend):
+            compute.prepare_fresh_checkout()
         try:
             handle = await compute.launch(spec)
         except BaseException as exc:
@@ -3982,7 +3956,7 @@ class WorklinkRunner:
                 save_factory_record(self.home, pending)
             _write_factory_host_evidence(self.home, pending, "backend_error", _factory_controller_error(exc))
             raise
-        relaunched = replace(retained.observed(released, prior_park_time),
+        relaunched = replace(pending,
             handle=handle, session=handle.opencode_session_id, opencode_session_id=handle.opencode_session_id,
             controller_phase="running", transcript=None, children_reaped=False)
         try:
@@ -4286,7 +4260,10 @@ class WorklinkRunner:
 
         async def repark_startup_failure(reason: str) -> WorklinkRunResult:
             if handle.opencode_session_id is not None:
-                raise WorklinkError(reason)
+                # No manifest is normal while the driver performs intake/init.
+                # It has the same bounded startup budget as acquiring its lock;
+                # never invent a host-owned run just to park an absent one.
+                raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
             # The park helper cancels and drains the driver, verifies its birth
             # marker, then reads run state again before invoking the factory CLI.
             # With no manifest even then, the original failure remains the diagnosis,
@@ -4821,7 +4798,7 @@ class WorklinkRunner:
                     raise WorklinkError(
                         f"OpenCode host stopped while factory status was running{suffix}"
                     )
-                if loop.time() >= park_deadline:
+                if last_status is not None and loop.time() >= park_deadline:
                     assert last_status is not None
                     return await park_for_reason(
                         last_status, _factory_budget_park_reason(last_status, factory_record)
@@ -5258,11 +5235,17 @@ def _verify_factory_recovery_target(
     sandbox = Path(retained.sandbox)
     from .worker_client import worklink_checkout_root, factory_checkout_for_path
 
-    if sandbox.is_relative_to(worklink_checkout_root()) and factory_checkout_for_path(sandbox) is None:
+    binding = factory_checkout_for_path(sandbox)
+    if (sandbox.is_relative_to(worklink_checkout_root()) or retained.opencode_session_id is not None) and binding is None:
         raise WorklinkError(
             "legacy factory checkout has no private ownership-transfer boundary; "
             "retain it for offline migration, not privileged in-place normalization"
         )
+    if binding is not None and (
+        binding[1:] != (retained.issue_id, retained.attempt)
+        or sandbox != binding[0] / ".factory-sandboxes" / retained.run_id
+    ):
+        raise WorklinkError("factory recovery sandbox is outside the recorded worker checkout")
     if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
         raise WorklinkError("retained factory sandbox is unavailable")
     _verify_factory_checkout(

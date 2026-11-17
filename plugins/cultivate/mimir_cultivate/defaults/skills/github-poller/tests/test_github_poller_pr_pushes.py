@@ -268,14 +268,12 @@ def test_review_needed_event_carries_submission_rule_and_marker(monkeypatch):
         "never use cd, &&, semicolons, pipes, redirects, heredocs, or command substitution"
         in prompt
     )
-    assert (
-        "Read `fetch_url` cache paths with `read_file` (offset/limit for a line range) "
-        "or bounded `grep` before_context/after_context" in prompt
-    )
-    assert (
-        "shell slicing forms and direct `curl` are intentionally refused because "
-        "they bypass the bounded file/egress tools" in prompt
-    )
+    assert "`unpublished_own_commits`" in prompt
+    assert "push your unpublished commits with `repo_push`" in prompt
+    assert "or discard them with `repo_cleanup`, then re-scope" in prompt
+    assert "normal review path for the published head before retrying checkout" in prompt
+    assert "Do not bypass a checkout refusal with web or direct HTTP reads of PR data" in prompt
+    assert "fetch_url" not in prompt
     marker = ev.get("expected_tool_call")
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"

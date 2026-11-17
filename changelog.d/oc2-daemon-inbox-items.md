@@ -1,0 +1,5 @@
+- A Worklink leaf no longer fails with "invalid session inbox" when its background shell finishes. OpenCode 2.2.7's session inbox holds four item types, per its own schema: `user`, `synthetic`, `compaction` and `move`. A finished background shell queues a `synthetic` resume there before the daemon admits it. Worklink accepted only `user` items, so a leaf whose inbox was read in that window failed as "daemon session quiescence unverified". The session kept working with no controller, as #2151 did on 2026-11-17. Now:
+  - Every documented item is validated against its schema shape.
+  - Only `user` counts as Worklink's own input.
+  - A pending daemon-queued item means the session is not quiescent yet.
+  - Cancelling removes the resumes the session's own shells queued.

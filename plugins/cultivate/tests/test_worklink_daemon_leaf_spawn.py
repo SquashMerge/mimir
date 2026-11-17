@@ -276,6 +276,7 @@ class AdmissionBoundary(SessionBoundary):
 @pytest.mark.parametrize("consumer", ["leaf", "repair", "spawn"])
 @pytest.mark.parametrize("cancelled", [False, True])
 async def test_admission_ack_window_keeps_owned_identity(tmp_path, monkeypatch, consumer, cancelled):
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-test")
     from types import SimpleNamespace
     from mimir_cultivate import contained_execution
     from mimir_cultivate.worklink.backends.base import SessionAdmissionCancelled
@@ -346,6 +347,7 @@ async def test_controller_redacts_current_api_and_publishing_credentials(tmp_pat
                                             ("repair", "lost_ack"), ("repair", "exception"),
                                             ("repair", "stop"), ("initial", "gate_cancel"), ("repair", "gate_cancel")])
 async def test_runner_admission_and_repair_evidence_use_current_session(tmp_path, monkeypatch, phase, failure):
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-test")
     from types import SimpleNamespace
     from mimir_cultivate.worklink import orchestrator as orch
     from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig

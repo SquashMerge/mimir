@@ -42,6 +42,28 @@ def _structured_error(value: object) -> dict:
     return value
 
 
+# ``Session.Inbox.Info`` in the OpenCode 2.2.7 schema is the union of these four
+# items, all with one envelope. Only ``user`` is input Worklink owns; the daemon
+# enqueues the others itself (a finished background shell queues ``synthetic``
+# to resume the session), and each means the session still has work to admit.
+_INBOX_PAYLOAD_KEYS = {
+    "user": ({"text"}, {"text", "files", "agents", "skills", "metadata"}),
+    "synthetic": ({"text"}, {"text", "description", "metadata"}),
+    "move": ({"projectID", "location"}, {"projectID", "location", "subpath"}),
+}
+
+
+def _inbox_payload(kind: object, payload: object) -> bool:
+    if kind == "compaction":
+        return payload is not None
+    if kind not in _INBOX_PAYLOAD_KEYS or not isinstance(payload, dict):
+        return False
+    required, allowed = _INBOX_PAYLOAD_KEYS[kind]
+    if not required <= payload.keys() or payload.keys() - allowed:
+        return False
+    return kind == "move" or isinstance(payload["text"], str)
+
+
 def _message(value: object, *, session_id: str | None = None) -> dict:
     if (not isinstance(value, dict) or not _identifier(value.get("id"), "msg")
             or not isinstance(value.get("time"), dict) or not _number(value["time"].get("created"))
@@ -50,10 +72,9 @@ def _message(value: object, *, session_id: str | None = None) -> dict:
     if session_id is not None:
         if (set(value) != {"id", "time", "type", "sessionID", "payload", "delivery"}
                 or set(value["time"]) != {"created"}
-                or value.get("sessionID") != session_id or value["type"] != "user"
-                or not isinstance(value.get("payload"), dict)
-                or not isinstance(value["payload"].get("text"), str)
-                or value.get("delivery") not in {"queue", "steer"}):
+                or value.get("sessionID") != session_id
+                or value.get("delivery") not in {"queue", "steer"}
+                or not _inbox_payload(value["type"], value.get("payload"))):
             raise DaemonClientError("invalid session inbox")
     elif value["type"] in {"user", "idle"}:
         allowed = {"id", "time", "type", "metadata"} | (
@@ -162,6 +183,7 @@ class SessionController:
         self._lock = asyncio.Lock()
         self.sensitive_values: tuple[str, ...] = ()
         self._cancelling = False
+        self._shells: list[dict] = []
 
     async def _bounded(self, operation):
         if self._cancelling:
@@ -315,9 +337,20 @@ class SessionController:
         messages = []
         cursor = None
         size = 0
+        limit = 100
         while True:
-            page = await self._bounded(self.client.messages(self.record.opencode_session_id, cursor=cursor,
-                                              order="asc" if cursor is None else None, limit=100))
+            try:
+                page = await self._bounded(self.client.messages(self.record.opencode_session_id, cursor=cursor,
+                                                  order="asc" if cursor is None else None, limit=limit))
+            except DaemonClientError as exc:
+                # A real build's history exceeds the client's per-response bound
+                # long before 100 messages (tool output is large). Cursors are
+                # positions, not page offsets, so re-read the same position with a
+                # narrower page. A single message over the bound still fails closed.
+                if exc.reason != "item too large" or limit == 1:
+                    raise
+                limit = max(1, limit // 4)
+                continue
             if (not isinstance(page, dict) or not isinstance(page.get("data"), list)
                     or not isinstance(page.get("cursor"), dict)
                     or set(page["cursor"]) != {"previous", "next"}
@@ -379,7 +412,20 @@ class SessionController:
             await stream.aclose()
         raise DaemonClientError("missing log watermark")
 
-    def _execution_state(self, messages: list[dict], inbox: list[dict]) -> str:
+    async def _owned_shells(self) -> list[dict]:
+        """This session's own background shells that are still running.
+
+        OpenCode 2 ends a turn (``idle``) while a shell the agent started in the
+        background keeps running; when it completes, a ``synthetic`` message
+        resumes the session. Until every owned shell has finished, ``idle`` is not
+        quiescence (2026-11-16: #2149 and #2151 were stopped mid-resume).
+        """
+        shells = await self._bounded(self.client.running_shells(self.record.checkout_path))
+        return [shell for shell in shells
+                if shell.get("metadata", {}).get("sessionID") == self.record.opencode_session_id]
+
+    def _execution_state(self, messages: list[dict], inbox: list[dict], shells: list[dict] = (),
+                         *, stable: bool = True) -> str:
         """Derive the owned input's state from durable history.
 
         The single admitted ``user`` message opens the execution; a trailing
@@ -397,7 +443,10 @@ class SessionController:
                 return "pending"
             return "interrupted" if self.record.stop_requested else "incomplete"
         after = history[admitted + 1:]
-        if after and after[-1].get("type") == "idle":
+        # A daemon-queued item (a finished shell's ``synthetic`` resume, a
+        # compaction, a move) has not been admitted yet: the session will run again.
+        daemon_pending = any(item["type"] != "user" for item in inbox)
+        if after and after[-1].get("type") == "idle" and not shells and not daemon_pending and stable:
             return after[-1]["outcome"]
         return "started"
 
@@ -405,6 +454,23 @@ class SessionController:
         await self._read_log()
         inbox = await self._inbox()
         messages = await self._messages()
+        self._shells = await self._owned_shells()
+        stable = True
+        if not self._shells and messages and messages[-1].get("type") == "idle":
+            # The history was read before the shell listing. A shell can finish and
+            # resume the session in between, so take a fresh history witness after
+            # observing that no shell is left, and accept a terminal idle only if it
+            # is the same idle on both sides of that observation. A resumed turn can
+            # start another background shell and reach a *new* idle before the
+            # re-read; the earlier empty listing says nothing about that shell.
+            # The inbox snapshot above predates that listing too: a shell that finishes
+            # between them queues its ``synthetic`` resume where only a fresh inbox
+            # read sees it. Read inbox before history, so a resume admitted in
+            # between still shows up after the idle.
+            witnessed = messages[-1]["id"]
+            inbox = await self._inbox()
+            messages = await self._messages()
+            stable = bool(messages) and messages[-1].get("id") == witnessed
         users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                  and m["id"] not in self.record.baseline_message_ids}
         if len(users) > 1 or (self.record.input_id and users and users != {self.record.input_id}):
@@ -413,7 +479,7 @@ class SessionController:
             raise DaemonClientError("unowned input in fresh session")
         if users and not self.record.input_id:
             self._persist(input_id=next(iter(users)), admission_state="admitted")
-        state = self._execution_state(messages, inbox)
+        state = self._execution_state(messages, inbox, self._shells, stable=stable)
         if state != self.record.execution_state:
             self._persist(execution_state=state)
         return messages, inbox
@@ -470,9 +536,14 @@ class SessionController:
                             messages, inbox = await self._refresh()
                             users = {m["id"] for m in [*messages, *inbox] if m.get("type") == "user"
                                      and m["id"] not in self.record.baseline_message_ids}
-                            pending = [m for m in inbox if m["id"] == self.record.input_id]
+                            # Our input, and the resumes our own shells queued, would
+                            # restart the session after the interrupt below.
+                            pending = [m for m in inbox
+                                       if m["id"] == self.record.input_id or m["type"] == "synthetic"]
                             for item in pending:
                                 await self.client.delete_inbox(self.record.opencode_session_id, item["id"])
+                            for shell in self._shells:
+                                await self.client.delete_shell(shell["id"], self.record.checkout_path)
                             if not pending and self.record.input_id and self.record.execution_state in {"succeeded", "failed", "interrupted"}:
                                 self._persist(cancellation_state="verified")
                                 return True
@@ -556,6 +627,27 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
     return environment
 
 
+async def _ended_with_previous_daemon(client: OpenCodeDaemonClient, path: Path, *, session_id: str,
+                                      request_generation: str, current_generation: object) -> bool:
+    """Whether a retained session provably ended when its daemon was replaced.
+
+    The daemon's state directory is not persistent: a container restart removes
+    every controller record and the daemon's own sessions, and the daemon process
+    that ran them exits. A run retained across that restart then has no record
+    to recover, so every observe, cancel and release used to fail closed forever.
+    It ended with its daemon only if all three hold: no controller record and no
+    retirement witness exists; the current daemon's launch generation differs
+    from the run's; and the current daemon reports the session absent (404).
+    Anything else, including a daemon error, keeps today's fail-closed path.
+    """
+    retired = path.with_name(f"{path.stem}.{session_id}.retired.json")
+    if path.exists() or retired.exists():
+        return False
+    if not isinstance(current_generation, str) or not current_generation or current_generation == request_generation:
+        return False
+    return not await client.session_exists(session_id)
+
+
 async def _executor_operation(request: dict) -> dict:
     from .daemon_config import DAEMON_ROOT
     from .daemon_health import load_api
@@ -611,14 +703,21 @@ async def _executor_operation(request: dict) -> dict:
                     environment=env, timeout_s=request["timeout_s"],
                 )
                 return {"opencode_session_id": controller.record.opencode_session_id}
-            controller = SessionController.recover_owned(
-                client, path, session_id=request["opencode_session_id"],
-                generation=request["generation"], checkout=checkout)
-            controller.sensitive_values = (api["password"], *(os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ))
-            if controller.record.opencode_session_id != request["opencode_session_id"]:
-                raise ValueError("session ownership mismatch")
+            launch = read_json(paths.daemon / "launch.json", uid=identities.worklink_uid, mode=0o600)
+            controller = None
+            if not await _ended_with_previous_daemon(
+                    client, path, session_id=request["opencode_session_id"],
+                    request_generation=request["generation"], current_generation=launch.get("launch_generation")):
+                controller = SessionController.recover_owned(
+                    client, path, session_id=request["opencode_session_id"],
+                    generation=request["generation"], checkout=checkout)
+                controller.sensitive_values = (api["password"], *(os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ))
+                if controller.record.opencode_session_id != request["opencode_session_id"]:
+                    raise ValueError("session ownership mismatch")
             if request["op"] == "session_observe":
-                outcome = asdict(await controller.observe(stdout_limit=request["stdout_limit"]))
+                ended = SessionOutcome(request["opencode_session_id"], "interrupted", "verified", SessionError(
+                    "daemon_restarted", "OpenCode daemon was replaced; the session ended with its daemon"))
+                outcome = asdict(ended if controller is None else await controller.observe(stdout_limit=request["stdout_limit"]))
                 raw = outcome.pop("stdout").encode()
                 output_fd = int(os.environ["WORKLINK_SESSION_OUTPUT_FD"])
                 os.ftruncate(output_fd, 0)
@@ -631,11 +730,14 @@ async def _executor_operation(request: dict) -> dict:
                 outcome["error_detail"] = outcome.pop("error")
                 return outcome
             if request["op"] == "session_cancel":
+                if controller is None:
+                    return {"cancellation_state": "verified"}
                 await controller.cancel()
                 return {"cancellation_state": controller.record.cancellation_state}
             if request["op"] == "session_release":
-                already_retired = controller._retired
-                await controller.release()
+                already_retired = controller is not None and controller._retired
+                if controller is not None:
+                    await controller.release()
                 from mimir._rmtree import rmtree_missing_ok
                 if not already_retired:
                     rmtree_missing_ok(home)
@@ -657,10 +759,14 @@ def main() -> int:
         if exc.reason in {"transport failure", "missing log watermark"}:
             sys.stdout.write('{"transport_lost":true}')
             return 0
+        # DaemonClientError reasons are fixed code literals, never remote bodies.
+        sys.stdout.write(json.dumps({"failure": {"class": "DaemonClientError", "reason": exc.reason,
+                                                 **({"status": exc.status} if type(exc.status) is int else {})}}))
         return 1
-    except Exception:
+    except Exception as exc:
         # Remote/provider bodies and credential-bearing local errors never cross
-        # the helper's stdout protocol or stderr boundary.
+        # the helper's stdout protocol or stderr boundary: only the class name does.
+        sys.stdout.write(json.dumps({"failure": {"class": type(exc).__name__}}))
         return 1
 
 

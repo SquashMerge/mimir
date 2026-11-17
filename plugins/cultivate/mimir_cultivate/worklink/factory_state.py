@@ -290,6 +290,8 @@ class FactoryRunRecord:
     version: int = FACTORY_RECORD_VERSION
     opencode_session_id: str | None = None
     mcp_servers: tuple[str, ...] = ()
+    # Absent on pre-2156 records, whose host lived in the sandbox.
+    session_checkout: str | None = None
 
     def __post_init__(self) -> None:
         from .factory_control_output import parse_mcp_servers
@@ -323,6 +325,12 @@ class FactoryRunRecord:
             raise FactoryRecordError("factory record identity is invalid")
         if not Path(self.launcher).is_absolute() or not Path(self.sandbox).is_absolute():
             raise FactoryRecordError("factory launcher and sandbox must be absolute")
+        if self.session_checkout is not None and (
+            not isinstance(self.session_checkout, str)
+            or Path(self.sandbox).parent.name != ".factory-sandboxes"
+            or self.session_checkout != str(Path(self.sandbox).parent.parent)
+        ):
+            raise FactoryRecordError("factory record session checkout is outside the operator checkout")
         for name, value in (
             ("repository", self.repository),
             ("base_ref", self.base_ref),
@@ -373,6 +381,7 @@ class FactoryRunRecord:
             "children_reaped": self.children_reaped,
             "opencode_session_id": self.opencode_session_id,
             "mcp_servers": list(self.mcp_servers),
+            "session_checkout": self.session_checkout,
         }
 
     @classmethod
@@ -399,6 +408,7 @@ class FactoryRunRecord:
         }
         data = dict(data)
         opencode_session_id = data.pop("opencode_session_id", None)
+        session_checkout = data.pop("session_checkout", None)
         from .factory_control_output import parse_mcp_servers
 
         try:
@@ -481,6 +491,7 @@ class FactoryRunRecord:
             raise FactoryRecordError("factory record transcript path is invalid")
         return cls(
             version=FACTORY_RECORD_VERSION,
+            session_checkout=session_checkout,
             run_id=str(data["run_id"]),
             issue_id=int(data["issue_id"]),
             attempt=int(data["attempt"]),

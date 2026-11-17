@@ -265,14 +265,21 @@ async def test_spawn_factory_crosses_executor_and_retires_before_checkout_cleanu
     assert not scope.exists()
 
 
-async def test_epic_nested_checkout_crosses_real_executor_and_controller(session_boundary, tmp_path, monkeypatch, request):
+async def test_epic_operator_checkout_lifecycle_refuses_unrecorded_locations(session_boundary, tmp_path, monkeypatch, request):
     import tempfile
-    from mimir_cultivate.worklink import daemon_health
+    from dataclasses import replace
+    from mimir_cultivate.worklink import daemon_health, daemon_service
     from mimir_cultivate.worklink.backends.base import WorkOrder
     from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
     from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
 
     boundary = session_boundary
+    daemon_service.RuntimePaths().snapshot.write_text(json.dumps({
+        "version": 1, "launch_generation": boundary.generation,
+        "bot_token": "generation-bot-token", "publishing_identity": "generation-bot",
+    }))
+    monkeypatch.setenv("GH_TOKEN", "wrong-ambient-token")
+    monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "wrong-ambient-identity")
     errors = []
     operation = worker_exec._handle_session
     def observed(*args, **kwargs):
@@ -294,44 +301,76 @@ async def test_epic_nested_checkout_crosses_real_executor_and_controller(session
     outer.parent.chmod(0o2700)
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(daemon_health, "daemon_health", lambda env: {"ok": True, "launch_generation": boundary.generation})
-    client = WorkerClient.for_path_checkout(sandbox, issue_id=41, attempt=2, run_uid=boundary.identities.worklink_uid)
+    client = WorkerClient.for_path_checkout(outer, issue_id=41, attempt=2, run_uid=boundary.identities.worklink_uid)
     monkeypatch.setattr(client, "_connect", boundary.connect)
-    spec = FeatureFactoryBackend().work_spec(WorkOrder(41, sandbox, "ignored", None, 30,
+    spec = FeatureFactoryBackend().work_spec(WorkOrder(41, outer, "ignored", None, 30,
         {"MIMIR_MODEL_SPEC": "codex-plus:gpt-test#high", "MIMIR_WORK_ITEM_JSON":
          json.dumps({"run_id": "chainlink-41", "title": "epic", "body": "build"})}),
         attempt=2, repo_url="repo", base_ref="main", branch="feature/chainlink-41", test_command="pytest")
+    settings = (("credential.helper", ""), ("credential.helper", "!fixture-helper"),
+                ("user.name", "Fixture Bot"), ("user.email", "fixture@example.invalid"))
+    spec = replace(spec, factory_credential_settings=settings)
     backend = OpenCodeDaemonComputeBackend(client=client)
     try:
         handle = await backend.launch(spec)
     except RuntimeError as exc:
         pytest.fail(f"synthetic executor refused epic: {errors[:3]} ({exc})")
     create = next(body for method, path, _, body in boundary.daemon.requests if method == "POST" and path == "/api/session")
-    assert create["location"] == {"directory": str(sandbox)}
+    assert create["location"] == {"directory": str(outer)}
     assert create["model"] == {"providerID": "openai", "id": "gpt-test", "variant": "high"}
     assert create["permissions"] == [{"action": "external_directory", "resource": "*", "effect": "deny"},
         *[{"action": "read", "resource": name, "effect": "deny"} for name in (".env", "**/.env", "**/.env.*")]]
+    environment = boundary.daemon.sessions[handle.identifier].environment
+    assert environment["GH_TOKEN"] == environment["GITHUB_TOKEN"] == "generation-bot-token"
+    assert environment["FACTORY_PUBLISHING_IDENTITY"] == "generation-bot"
+    assert environment["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert [(environment[f"GIT_CONFIG_KEY_{i}"], environment[f"GIT_CONFIG_VALUE_{i}"])
+            for i in range(int(environment["GIT_CONFIG_COUNT"]))] == [("safe.directory", str(outer)), *settings]
     assert next(body for _, path, _, body in boundary.daemon.requests if path.endswith("/command")) == {
         "name": "feature", "text": "--autonomous --max-retries 5 chainlink-41"}
+    unrecorded = WorkerClient.for_path_checkout(sandbox, issue_id=41, attempt=2,
+                                               run_uid=boundary.identities.worklink_uid)
+    monkeypatch.setattr(unrecorded, "_connect", boundary.connect)
+    for unrecorded_operation in (unrecorded.session_observe, unrecorded.session_cancel, unrecorded.session_release):
+        with pytest.raises(RuntimeError, match="session executor"):
+            await unrecorded_operation(handle)
     boundary.daemon.finish(handle.identifier)
     result = await backend.wait(handle, 30)
     assert result.session_outcome.execution_state == "succeeded"
     assert result.handle.opencode_session_id == handle.identifier
     await backend.cancel(handle)
     await backend.cleanup(handle)
-    _assert_session_retired(SimpleNamespace(checkout=sandbox, records=boundary.records,
+    _assert_session_retired(SimpleNamespace(checkout=outer, records=boundary.records,
                                           generation=boundary.generation), handle)
     assert stat.S_IMODE(outer.parent.stat().st_mode) == 0o2750
 
 
-@pytest.mark.parametrize("relative", ["checkout", "checkout/.factory-sandboxes/chainlink-42",
-                                      "checkout/.factory-sandboxes/41"])
-async def test_epic_rpc_refuses_nonmatching_sandbox_before_api(session_boundary, tmp_path, monkeypatch, relative):
+@pytest.mark.parametrize("relative", ["checkout/.factory-sandboxes/chainlink-41",
+    "checkout/.factory-sandboxes/chainlink-42", "checkout/.factory-sandboxes/41", "arbitrary", ".", "../41-3/checkout"])
+async def test_epic_creation_refuses_nested_sandbox_and_non_attempt_paths(session_boundary, tmp_path, monkeypatch, relative, request):
+    import tempfile
     from dataclasses import asdict
     from mimir_cultivate.worklink.backends.base import SessionRequest
 
-    root = tmp_path / "factory-checkouts"
+    # A valid factory boundary must not have pytest's worker-writable ancestors:
+    # otherwise an ancestor refusal masks mutations of the attempt path check.
+    temporary = tempfile.TemporaryDirectory(prefix="epic-refusals-", dir="/tmp")
+    request.addfinalizer(temporary.cleanup)
+    root = Path(temporary.name) / "factory-checkouts"
     path = root / "repo/41-2" / relative
     path.mkdir(parents=True)
+    root.chmod(0o750)
+    (root / "repo").chmod(0o750)
+    path = path.resolve()
+    outer = root / "repo/41-2/checkout"
+    outer.mkdir(exist_ok=True)
+    outer.chmod(0o2770)
+    outer.parent.chmod(0o2700)
+    if path != outer:
+        path.chmod(0o2770)
+    if relative == "../41-3/checkout":
+        path.parent.chmod(0o2700)
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     client = WorkerClient.for_path_checkout(path, issue_id=41, attempt=2, run_uid=session_boundary.identities.worklink_uid)
     monkeypatch.setattr(client, "_connect", session_boundary.connect)
@@ -340,6 +379,20 @@ async def test_epic_rpc_refuses_nonmatching_sandbox_before_api(session_boundary,
             "request": asdict(SessionRequest("epic", {"providerID": "openai", "id": "test"},
                                              "--autonomous --max-retries 5 chainlink-41")),
             "timeout_s": 30, "pass_env": {}, "git_settings": []})
+    assert not any(path == "/api/session" for _, path, _, _ in session_boundary.daemon.requests)
+
+
+async def test_epic_creation_refuses_leaf_checkout_fd(session_boundary):
+    from dataclasses import asdict
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+
+    with pytest.raises(RuntimeError, match="session executor"):
+        await session_boundary.client._session_rpc("session_create", {
+            "generation": session_boundary.generation,
+            "request": asdict(SessionRequest("epic", {"providerID": "openai", "id": "test"},
+                                            "--autonomous --max-retries 5 chainlink-41")),
+            "timeout_s": 30, "pass_env": {}, "git_settings": [],
+        })
     assert not any(path == "/api/session" for _, path, _, _ in session_boundary.daemon.requests)
 
 

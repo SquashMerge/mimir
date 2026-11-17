@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 import time
 from copy import deepcopy
 from types import SimpleNamespace
@@ -590,6 +591,63 @@ async def test_delivery_between_inbox_and_history_reads_is_not_removal(tmp_path,
         assert delivered
 
 
+def _bulky(sid_messages, count, size):
+    for index in range(count):
+        sid_messages.append({"id": f"msg_bulk{index:04d}", "type": "assistant", "time": {"created": 2},
+            "agent": "build", "model": {"providerID": "openai", "id": "gpt-5"},
+            "content": [{"type": "text", "text": f"{index}:" + "x" * size}]})
+
+
+async def test_history_larger_than_one_response_is_read_in_narrower_pages(tmp_path):
+    """Captured 2026-11-16: 98 messages / 1.46 MB broke a 100-message page against the 1 MiB bound."""
+    async with FakeOpenCodeDaemon() as daemon, \
+            OpenCodeDaemonClient(**daemon.connection, max_item_bytes=64 * 1024) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        _bulky(daemon.sessions[sid].messages, 40, 6 * 1024)
+        daemon.finish(sid)
+        outcome = await controller.observe()
+        assert outcome.execution_state == "succeeded"
+        assert outcome.stdout.count("\n") == 39 and outcome.stdout.startswith("0:")
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        limits = [r[2].get("limit") for r in daemon.requests if r[1].endswith("/message")]
+        assert "100" in limits and any(int(value) < 100 for value in limits if value)
+
+
+async def test_narrowing_after_an_advanced_cursor_keeps_the_exact_ordered_history(tmp_path):
+    """A first page fits; a later page must narrow from its non-null cursor without skipping or reordering."""
+    async with FakeOpenCodeDaemon() as daemon, \
+            OpenCodeDaemonClient(**daemon.connection, max_item_bytes=64 * 1024) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        messages = daemon.sessions[sid].messages
+        texts = [f"small-{index:03d}" for index in range(98)] + [f"large-{index:02d}:" + "y" * 6 * 1024 for index in range(20)]
+        for index, text in enumerate(texts):
+            messages.append({"id": f"msg_order{index:04d}", "type": "assistant", "time": {"created": 2},
+                "agent": "build", "model": {"providerID": "openai", "id": "gpt-5"},
+                "content": [{"type": "text", "text": text}]})
+        daemon.finish(sid)
+        outcome = await controller.observe()
+        assert outcome.execution_state == "succeeded"
+        assert outcome.stdout == "\n".join(texts)
+        pages = [(r[2].get("cursor") is not None, r[2].get("limit")) for r in daemon.requests if r[1].endswith("/message")]
+        # The first page (no cursor) fits at 100; narrowing happens only on cursor-bearing pages.
+        assert pages[0] == (False, "100") and any(cursor and int(limit) < 100 for cursor, limit in pages)
+
+
+async def test_single_message_over_the_response_bound_still_fails_closed(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, \
+            OpenCodeDaemonClient(**daemon.connection, max_item_bytes=64 * 1024) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        _bulky(daemon.sessions[sid].messages, 1, 80 * 1024)
+        daemon.finish(sid)
+        with pytest.raises(DaemonClientError, match="item too large"):
+            await controller.observe()
+        assert controller.record.execution_state != "succeeded"
+
+
 class _RecordedClient:
     """Serves one captured 2.2.7 snapshot at a time; no daemon, no provider."""
 
@@ -606,6 +664,10 @@ class _RecordedClient:
 
     async def inbox(self, session_id):
         return deepcopy(self.snapshot["inbox"])
+
+    async def running_shells(self, directory):
+        # The capture ran no background shell (prompt 2's `sleep 60` was a foreground tool call).
+        return []
 
 
 def _captured_lifecycle():
@@ -652,3 +714,355 @@ async def test_captured_history_drives_observed_state(tmp_path, scenario, expect
     assert controller.record.last_seq == replay["seq"]
     if scenario == "prompt1":
         assert outcome.stdout.strip() == "ok"
+
+
+async def test_session_exists_is_true_for_a_known_session_and_false_only_on_404(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        assert await client.session_exists(controller.record.opencode_session_id)
+        assert not await client.session_exists("ses_gone")
+        daemon.faults[("GET", "/api/session/ses_broken")].append(SyntheticFault(status=500))
+        with pytest.raises(DaemonClientError):
+            await client.session_exists("ses_broken")
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("orphaned", True), ("same_generation", False), ("session_present", False),
+    ("record_present", False), ("retired_present", False), ("no_current_generation", False),
+])
+async def test_ended_with_previous_daemon_requires_every_proof(tmp_path, case, expected):
+    from mimir_cultivate.worklink.daemon_sessions import _ended_with_previous_daemon
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        path = tmp_path / "controller.json"
+        sid = "ses_previous"
+        if case == "session_present":
+            sid = (await client.create_session(directory=str(tmp_path), model={"providerID": "openai", "id": "x"},
+                                               permissions=[]))["data"]["id"]
+        if case == "record_present":
+            path.write_text("{}")
+        if case == "retired_present":
+            path.with_name(f"{path.stem}.{sid}.retired.json").write_text("{}")
+        current = {"same_generation": "generation-old", "no_current_generation": None}.get(case, "generation-new")
+        assert await _ended_with_previous_daemon(
+            client, path, session_id=sid, request_generation="generation-old",
+            current_generation=current) is expected
+
+
+async def test_ended_with_previous_daemon_fails_closed_on_daemon_error(tmp_path):
+    from mimir_cultivate.worklink.daemon_sessions import _ended_with_previous_daemon
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.faults[("GET", "/api/session/ses_previous")].append(SyntheticFault(status=500))
+        with pytest.raises(DaemonClientError):
+            await _ended_with_previous_daemon(client, tmp_path / "controller.json", session_id="ses_previous",
+                                              request_generation="generation-old", current_generation="generation-new")
+
+
+@pytest.mark.parametrize("op", ["session_observe", "session_cancel", "session_release"])
+@pytest.mark.parametrize("restarted", [True, False])
+async def test_executor_reports_a_session_that_ended_with_its_daemon(tmp_path, monkeypatch, op, restarted):
+    """2026-11-16: every retained leaf failed closed forever after a container restart wiped its record."""
+    from mimir_cultivate.worklink import daemon_config, daemon_health, daemon_service, daemon_sessions, identities
+
+    async with FakeOpenCodeDaemon() as daemon:
+        root = tmp_path / "daemon"
+        (root / "sessions").mkdir(parents=True)
+        checkout = (tmp_path / "checkout").resolve()
+        checkout.mkdir()
+        info = checkout.stat()
+        launch = {"launch_generation": "generation-new" if restarted else "generation-old"}
+        monkeypatch.setattr(daemon_config, "DAEMON_ROOT", str(root))
+        monkeypatch.setattr(identities, "get_identities", lambda: SimpleNamespace(worklink_uid=os.geteuid()))
+        monkeypatch.setattr(identities, "assert_worklink_identity", lambda ids: None)
+        monkeypatch.setattr(daemon_health, "load_api", lambda paths, uid: {
+            "url": daemon.base_url, "username": daemon.username, "password": daemon.password})
+        monkeypatch.setattr(daemon_service, "RuntimePaths", lambda: SimpleNamespace(daemon=root))
+        def read_json(path, uid, mode):
+            if path.name == "launch.json":
+                return launch
+            raise FileNotFoundError(path)
+        monkeypatch.setattr(daemon_service, "read_json", read_json)
+        import hashlib
+        home = root / "sessions" / (hashlib.sha256(f"{checkout}:2151:2".encode()).hexdigest() + ".home")
+        (home / "tmp").mkdir(parents=True)
+        (home / "tmp" / "sentinel").write_text("attempt scratch")
+        (checkout / "work.txt").write_text("retained work")
+        output = tmp_path / "stdout"
+        output.write_bytes(b"stale")
+        fd = os.open(output, os.O_RDWR)
+        monkeypatch.setenv("WORKLINK_SESSION_OUTPUT_FD", str(fd))
+        request = {"op": op, "issue": 2151, "attempt": 2, "device": info.st_dev, "inode": info.st_ino,
+                   "path": str(checkout), "generation": "generation-old", "opencode_session_id": "ses_gone",
+                   **({"stdout_limit": 1024} if op == "session_observe" else {})}
+        try:
+            if not restarted:
+                with pytest.raises(FileNotFoundError):
+                    await daemon_sessions._executor_operation(request)
+                return
+            response = await daemon_sessions._executor_operation(request)
+        finally:
+            os.close(fd)
+        if op == "session_observe":
+            assert response["execution_state"] == "interrupted"
+            assert response["cancellation_state"] == "verified"
+            assert response["error_detail"]["type"] == "daemon_restarted"
+            assert output.read_bytes() == b""
+        elif op == "session_cancel":
+            assert response == {"cancellation_state": "verified"}
+        else:
+            assert response == {"released": True}
+            assert not home.exists()
+        assert (checkout / "work.txt").read_text() == "retained work"
+        if op != "session_release":
+            assert (home / "tmp" / "sentinel").exists()
+
+
+async def test_idle_with_an_owned_background_shell_is_not_quiescent(tmp_path):
+    """2026-11-16: #2149 went idle, its background suite finished, and the session resumed under the stop."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "started"
+        daemon.end_shell(shell)
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+async def test_another_sessions_shell_does_not_hold_this_session(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.start_shell("ses_someone_else", str(tmp_path))
+        daemon.start_shell(sid, str(tmp_path / "elsewhere"))
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+async def test_cancel_stops_owned_background_shells_before_verifying(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        owned = daemon.start_shell(sid, str(tmp_path))
+        foreign = daemon.start_shell("ses_someone_else", str(tmp_path))
+        daemon.finish(sid)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.shells[owned]["status"] == "killed"
+        assert daemon.shells[foreign]["status"] == "running"
+
+
+async def test_shell_listing_failure_fails_closed(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        daemon.finish(controller.record.opencode_session_id)
+        daemon.faults[("GET", "/api/shell")].append(SyntheticFault(status=500))
+        with pytest.raises(DaemonClientError):
+            await controller.observe()
+        assert controller.record.execution_state != "succeeded"
+        daemon.faults[("GET", "/api/shell")].extend(SyntheticFault(status=500) for _ in range(500))
+        assert not await controller.cancel(timeout_s=1)
+        assert controller.record.cancellation_state == "unverified"
+
+
+async def test_shell_that_resumes_the_session_between_reads_is_not_success(tmp_path, monkeypatch):
+    """Review P1 on #105: history (idle) -> shell exits and resumes the session -> empty shell list."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        original = client.running_shells
+        async def finish_and_resume(directory):
+            if daemon.shells[shell]["status"] == "running":
+                daemon.end_shell(shell)
+                daemon.sessions[sid].messages.append({
+                    "id": "msg_resumed", "type": "assistant", "time": {"created": 3}, "agent": "build",
+                    "model": {"providerID": "openai", "id": "gpt-5"}, "content": []})
+            return await original(directory)
+        monkeypatch.setattr(client, "running_shells", finish_and_resume)
+        assert (await controller.observe()).execution_state == "started"
+
+
+async def test_a_new_idle_after_the_empty_shell_listing_is_not_success(tmp_path, monkeypatch):
+    """Review P1 on #105: idle A (S1 running) -> S1 exits, listing empty -> resumed turn starts S2, idle B."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        messages = daemon.sessions[sid].messages
+        first = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        second = []
+        original_shells, original_messages = client.running_shells, client.messages
+        async def first_shell_exits(directory):
+            if daemon.shells[first]["status"] == "running":
+                daemon.end_shell(first)
+            return await original_shells(directory)
+        reads = []
+        async def resumed_before_reread(*args, **kwargs):
+            reads.append(1)
+            if daemon.shells[first]["status"] != "running" and not second:
+                # Between the empty listing and the re-read: resume, start S2, reach idle B.
+                messages.append({"id": "msg_resumed", "type": "assistant", "time": {"created": 3},
+                                 "agent": "build", "model": {"providerID": "openai", "id": "gpt-5"}, "content": []})
+                second.append(daemon.start_shell(sid, str(tmp_path)))
+                messages.append({"id": "msg_idle_b", "type": "idle", "time": {"created": 4}, "outcome": "succeeded"})
+            return await original_messages(*args, **kwargs)
+        monkeypatch.setattr(client, "running_shells", first_shell_exits)
+        monkeypatch.setattr(client, "messages", resumed_before_reread)
+        assert (await controller.observe()).execution_state == "started"
+        # S2 is visible on the next refresh and still holds the session.
+        assert (await controller.observe()).execution_state == "started"
+        daemon.end_shell(second[0])
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+@pytest.mark.parametrize("raised,expected", [
+    (DaemonClientError("invalid shell entry"), {"class": "DaemonClientError", "reason": "invalid shell entry"}),
+    (DaemonClientError("HTTP failure", status=404), {"class": "DaemonClientError", "reason": "HTTP failure", "status": 404}),
+    (ValueError("token=" + "fragment-secret"), {"class": "ValueError"}),
+])
+def test_helper_failure_reports_only_class_and_code_literal_reason(monkeypatch, capsys, raised, expected):
+    import io
+    from mimir_cultivate.worklink import daemon_sessions
+
+    async def fail(request):
+        raise raised
+    monkeypatch.setattr(daemon_sessions, "_executor_operation", fail)
+    monkeypatch.setattr(daemon_sessions.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}")))
+    assert daemon_sessions.main() == 1
+    out = capsys.readouterr().out
+    assert json.loads(out) == {"failure": expected}
+    assert "fragment-secret" not in out
+
+
+async def test_a_finished_shells_queued_resume_is_valid_inbox_and_not_quiescent(tmp_path):
+    """2026-11-17: #2151 attempt 5 failed "invalid session inbox" three minutes in.
+
+    Its background suite finished, the daemon queued the 2.2.7 ``synthetic`` resume,
+    and the observe read the inbox before the daemon admitted it (history then showed
+    that ``synthetic`` message at 08:13:12, after the 08:13:08 failure).
+    """
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        daemon.end_shell(shell, resume=True)
+        assert [item["type"] for item in daemon.sessions[sid].inbox] == ["synthetic"]
+        assert (await controller.observe()).execution_state == "started"
+        assert controller.record.execution_state == "started"
+        resume = daemon.sessions[sid].inbox[0]["id"]
+        daemon.deliver(sid, resume)
+        assert (await controller.observe()).execution_state == "started"
+        daemon.finish(sid)
+        assert (await controller.observe()).execution_state == "succeeded"
+        assert controller.record.admission_state == "admitted"
+
+
+def _daemon_item(sid: str, kind: str, payload: object) -> dict:
+    return {"id": f"msg_{kind}_queued", "sessionID": sid, "time": {"created": 3}, "type": kind,
+            "payload": payload, "delivery": "queue"}
+
+
+@pytest.mark.parametrize("kind,payload", [
+    ("synthetic", {"text": "resume"}),
+    ("compaction", {"auto": True}),
+    ("move", {"projectID": "prj_x", "location": {"directory": "/workspace/x"}}),
+])
+async def test_each_documented_daemon_inbox_item_holds_the_session_open(tmp_path, kind, payload):
+    """``Session.Inbox.Info`` (OpenCode 2.2.7) is user | synthetic | compaction | move."""
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.finish(sid)
+        daemon.sessions[sid].inbox.append(_daemon_item(sid, kind, payload))
+        assert (await controller.observe()).execution_state == "started"
+        daemon.sessions[sid].inbox.clear()
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "unknown", "payload": {"text": "x"}},
+    {"type": "synthetic", "payload": {"text": 7}},
+    {"type": "synthetic", "payload": {"text": "x", "extra": 1}},
+    {"type": "synthetic", "payload": "resume"},
+    {"type": "compaction", "payload": None},
+    {"type": "move", "payload": {"projectID": "prj_x"}},
+    {"type": "synthetic", "payload": {"text": "x"}, "sessionID": "ses_someone_else"},
+    {"type": "synthetic", "payload": {"text": "x"}, "delivery": "later"},
+])
+async def test_malformed_inbox_items_still_fail_closed(tmp_path, monkeypatch, item):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        daemon.finish(sid)
+        original = client.inbox
+        async def malformed(*args, **kwargs):
+            # Past the fake's own schema check: the client's validation is under test.
+            page = deepcopy(await original(*args, **kwargs))
+            page["data"].append({**_daemon_item(sid, item["type"], item["payload"]), **item})
+            return page
+        monkeypatch.setattr(client, "inbox", malformed)
+        with pytest.raises(DaemonClientError, match="invalid session inbox"):
+            await controller.observe()
+        assert controller.record.execution_state != "succeeded"
+
+
+async def test_daemon_inbox_items_are_never_owned_input(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        input_id = controller.record.input_id
+        daemon.sessions[sid].inbox.append(_daemon_item(sid, "synthetic", {"text": "resume"}))
+        await controller.observe()
+        assert controller.record.input_id == input_id
+
+
+async def test_cancel_removes_the_resume_its_own_shell_queued(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        daemon.end_shell(shell, resume=True)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.sessions[sid].inbox == []
+        assert not daemon.sessions[sid].active
+
+
+def _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell):
+    """Review P1 on #109: inbox read (empty) -> history (idle) -> shell finishes and
+    queues its resume -> empty shell listing -> history re-read (same idle)."""
+    original = client.running_shells
+    async def finishes_while_listing(directory):
+        if daemon.shells[shell]["status"] == "running":
+            daemon.end_shell(shell, resume=True)
+        return await original(directory)
+    monkeypatch.setattr(client, "running_shells", finishes_while_listing)
+
+
+async def test_resume_queued_between_inbox_read_and_empty_shell_listing_is_not_success(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell)
+        assert (await controller.observe()).execution_state == "started"
+        assert [item["type"] for item in daemon.sessions[sid].inbox] == ["synthetic"]
+
+
+async def test_cancel_cannot_verify_past_a_resume_queued_during_the_shell_listing(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        sid = controller.record.opencode_session_id
+        shell = daemon.start_shell(sid, str(tmp_path))
+        daemon.finish(sid)
+        _resume_queued_during_shell_listing(daemon, client, monkeypatch, shell)
+        assert await controller.cancel(timeout_s=5)
+        assert controller.record.cancellation_state == "verified"
+        assert daemon.sessions[sid].inbox == []
+        assert not daemon.sessions[sid].active

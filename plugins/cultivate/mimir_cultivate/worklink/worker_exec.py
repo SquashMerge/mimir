@@ -1406,8 +1406,21 @@ def _open_epic_session_checkout(request: dict[str, Any], *, for_launch: bool) ->
     return fd
 
 
+def _helper_failure(stdout: bytes) -> str:
+    """The helper's bounded failure label: an exception class and a code-literal reason."""
+    try:
+        failure = json.loads(stdout[:1024]).get("failure")
+    except (ValueError, AttributeError):
+        return ""
+    if not isinstance(failure, dict):
+        return ""
+    label = [str(failure.get(key))[:80] for key in ("class", "reason", "status") if key in failure]
+    cleaned = " ".join(part for part in label if re.fullmatch(r"[A-Za-z0-9_ .:-]{1,80}", part))
+    return f" ({cleaned})" if cleaned else ""
+
+
 def _handle_session(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    from .daemon_config import PublishingCredentials, parse_launch_snapshot
+    from .daemon_config import SESSION_HELPER_TIMEOUT_S, PublishingCredentials, parse_launch_snapshot
     from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
 
     common = {"version", "op", "executor_identity", "issue", "attempt", "device", "inode", "path", "generation"}
@@ -1421,10 +1434,11 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
         raise RuntimeError("session operation requires the exact contract and checkout FD")
     _validate_executor_identity(request)
     path_addressed = len(fds) == count - 1
-    if create and request.get("request", {}).get("kind") == "epic":
-        epic_path = Path(request["path"])
-        if epic_path.parent.name != ".factory-sandboxes" or epic_path.name != f"chainlink-{_positive_integer(request, 'issue')}":
-            raise RuntimeError("epic creation requires its exact nested sandbox")
+    epic_create = create and request.get("request", {}).get("kind") == "epic"
+    if epic_create and not path_addressed:
+        # Epics use the factory ownership-transfer boundary, never a leaf/spawn
+        # FD capability (which proves a different checkout layout).
+        raise RuntimeError("epic creation requires a path-addressed factory checkout")
     if create and "MIMIR_WORK_ITEM_JSON" in request.get("pass_env", {}):
         item = json.loads(request["pass_env"]["MIMIR_WORK_ITEM_JSON"])
         if (request.get("request", {}).get("kind") != "epic" or not isinstance(item, dict)
@@ -1432,7 +1446,9 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
             raise RuntimeError("factory work item is outside the admitted epic")
     if path_addressed:
         validated = {**request, "run_uid": get_identities().worklink_uid}
-        if Path(request["path"]).parent.name == ".factory-sandboxes":
+        if epic_create:
+            directory_fd = _open_factory_checkout(validated, for_launch=True)
+        elif Path(request["path"]).parent.name == ".factory-sandboxes":
             directory_fd = _open_epic_session_checkout(validated, for_launch=create)
         elif Path(request["path"]).name == "checkout":
             directory_fd = _open_factory_checkout(validated, for_launch=create)
@@ -1473,11 +1489,12 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
     process = subprocess.run(
         [UID_HELPER, "worklink", PYTHON, "-I", "-m", "mimir_cultivate.worklink.daemon_sessions"],
         input=json.dumps(request).encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        env=environment, cwd="/", timeout=32, check=False,
+        env=environment, cwd="/", timeout=SESSION_HELPER_TIMEOUT_S, check=False,
         pass_fds=(fds[1],) if observe else (),
     )
     if process.returncode != 0 or len(process.stdout) > MAX_REQUEST_BYTES:
-        raise RuntimeError("session operation failed; retain controller and checkout")
+        raise RuntimeError("session operation failed" + _helper_failure(process.stdout)
+                           + "; retain controller and checkout")
     response = json.loads(process.stdout)
     if not isinstance(response, dict):
         raise RuntimeError("invalid session helper response")

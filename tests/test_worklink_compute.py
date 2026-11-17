@@ -78,6 +78,123 @@ async def test_daemon_wait_does_not_refresh_expired_launch_budget():
     client.session_cancel.assert_awaited_once_with(handle)
 
 
+@pytest.mark.asyncio
+async def test_daemon_observation_backs_off_to_a_bounded_interval(monkeypatch):
+    """Each observation spawns an executor helper; a long build must not poll every 100 ms."""
+    from mimir_cultivate.worklink.backends.base import LaunchHandle, SessionOutcome, SessionTransportLostError
+
+    handle = LaunchHandle("opencode_daemon", "ses_owned", opencode_session_id="ses_owned", launch_generation="generation")
+    running = SessionOutcome("ses_owned", "started")
+    client = SimpleNamespace(session_observe=AsyncMock(side_effect=[
+        running, SessionTransportLostError("lost"), *([running] * 6), SessionOutcome("ses_owned", "succeeded"),
+    ]))
+    sleeps = []
+    async def no_wait(seconds):
+        sleeps.append(seconds)
+    monkeypatch.setattr(compute.asyncio, "sleep", no_wait)
+    result = await compute.OpenCodeDaemonComputeBackend(client=client).wait(handle, 60)
+    assert result.exit_code == 0
+    assert sleeps == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0, 2.0])
+    assert max(sleeps) == compute._OBSERVE_INTERVAL_CAP_S
+
+
+def test_session_helper_timeout_outlasts_its_bounded_work():
+    """The executor's helper backstop is the shared constant and exceeds the 25 s cancel window."""
+    import inspect
+    from mimir_cultivate.worklink import daemon_config, worker_exec
+
+    assert daemon_config.SESSION_HELPER_TIMEOUT_S >= 120
+    assert "timeout=SESSION_HELPER_TIMEOUT_S" in inspect.getsource(worker_exec._handle_session)
+
+
+@pytest.mark.asyncio
+async def test_session_rpc_waits_longer_than_the_helper_allowance(monkeypatch, tmp_path):
+    """Review P1 on #103: a 35 s client socket abandoned a helper allowed 120 s."""
+    import json as _json
+    import socket as _socket
+    import threading
+    from mimir_cultivate.worklink import daemon_config
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    client_end, executor_end = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    requested = []
+
+    def connect(self, timeout_s=None):
+        requested.append(timeout_s)
+        client_end.settimeout(timeout_s)
+        return client_end
+
+    def executor():
+        _json.loads(executor_end.recv(1 << 20))
+        executor_end.sendall(_json.dumps({"cancellation_state": "verified"}).encode())
+
+    thread = threading.Thread(target=executor)
+    thread.start()
+    monkeypatch.setattr(WorkerClient, "_connect", connect)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    client = WorkerClient.for_path_checkout(checkout, issue_id=1, attempt=1, run_uid=os.geteuid())
+    response = await client._session_rpc("session_cancel", {"generation": "g", "opencode_session_id": "ses_x"})
+    thread.join(5)
+    executor_end.close()
+    assert response == {"cancellation_state": "verified"}
+    assert requested == [daemon_config.SESSION_RPC_TIMEOUT_S]
+    assert daemon_config.SESSION_RPC_TIMEOUT_S > daemon_config.SESSION_HELPER_TIMEOUT_S
+
+
+@pytest.mark.parametrize("stdout,label", [
+    (b'{"failure": {"class": "DaemonClientError", "reason": "invalid shell entry"}}', " (DaemonClientError invalid shell entry)"),
+    (b'{"failure": {"class": "TimeoutError"}}', " (TimeoutError)"),
+    (b'{"failure": {"class": "X", "reason": "<script>"}}', " (X)"),
+    (b"not json", ""), (b'{"other": 1}', ""),
+])
+def test_executor_labels_a_failed_session_helper(stdout, label):
+    from mimir_cultivate.worklink.worker_exec import _helper_failure
+
+    assert _helper_failure(stdout) == label
+
+
+def test_executor_error_for_a_failed_helper_carries_its_label():
+    """Review suggestion on #106: pin the producer-to-error wiring inside _handle_session."""
+    import inspect
+    from mimir_cultivate.worklink import worker_exec
+
+    source = inspect.getsource(worker_exec._handle_session)
+    failure = source.index("if process.returncode != 0")
+    assert "_helper_failure(process.stdout)" in source[failure:failure + 300]
+
+
+@pytest.mark.asyncio
+async def test_session_rpc_keeps_the_executor_failure_reason(monkeypatch, tmp_path, caplog):
+    import json as _json
+    import logging
+    import socket as _socket
+    import threading
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    client_end, executor_end = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    reason = "session operation failed (DaemonClientError invalid shell entry); retain controller and checkout"
+
+    def executor():
+        _json.loads(executor_end.recv(1 << 20))
+        executor_end.sendall(_json.dumps({"id": "x", "error": reason + " Bearer " + "fragment-secret"}).encode())
+
+    thread = threading.Thread(target=executor)
+    thread.start()
+    monkeypatch.setattr(WorkerClient, "_connect", lambda self, timeout_s=None: client_end)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    client = WorkerClient.for_path_checkout(checkout, issue_id=1, attempt=1, run_uid=os.geteuid())
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError) as raised:
+        await client._session_rpc("session_observe" if False else "session_cancel",
+                                  {"generation": "g", "opencode_session_id": "ses_x"})
+    thread.join(5)
+    executor_end.close()
+    assert "invalid shell entry" in str(raised.value)
+    assert "fragment-secret" not in str(raised.value) and "fragment-secret" not in caplog.text
+    assert "worklink session session_cancel failed" in caplog.text
+
+
 def test_authorized_checkout_binds_configured_worker_uid(monkeypatch, tmp_path) -> None:
     from mimir_cultivate.worklink import identities
     from mimir_cultivate.worklink.checkout import _mint_checkout_authorization

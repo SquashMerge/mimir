@@ -2011,6 +2011,28 @@ def _foreign_candidate_head(
     return head, False
 
 
+def _is_own_unpublished_candidate(
+    lease: PRCheckoutLease, scope: RepoPRActionScope, head: str, *, runner: Runner,
+) -> bool:
+    """Explain a refusal only; this never grants reuse or publication authority."""
+    if (
+        lease.owner != scope.principal
+        or lease.canonical_repo != scope.canonical_repo
+        or lease.canonical_origin != scope.canonical_origin
+        or lease.pr_number != scope.pr_number
+        or lease.destination_ref != scope.destination_ref
+        or lease.source_root.resolve(strict=True) != Path(scope.canonical_root).resolve(strict=True)
+        or head == scope.observed_head_sha.lower()
+    ):
+        return False
+    # A different HEAD alone is not unpublished work beyond the scoped head.
+    # Unrelated histories and failed inspections retain the foreign refusal.
+    return runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor",
+        scope.observed_head_sha.lower(), head,
+    ]).returncode == 0
+
+
 def _attest_resume_candidate(
     lease: PRCheckoutLease,
     scope: RepoPRActionScope,
@@ -2414,6 +2436,7 @@ def acquire_pr_checkout_lease(
             for path in paths
         ]
         foreign_candidates: list[tuple[Path, str]] = []
+        foreign_by_path = {lease.path: lease for lease in foreign_leases}
         rebound_candidates: dict[Path, PRCheckoutLease] = {}
         if foreign_leases:
             from .scheduler import active_pr_checkout_lease_paths
@@ -2536,29 +2559,52 @@ def acquire_pr_checkout_lease(
             (path, head) for path, head in candidates
             if head != scope.observed_head_sha.lower()
         ]
+        own_unpublished = [
+            (path, head) for path, head in foreign_candidates
+            if _is_own_unpublished_candidate(
+                foreign_by_path[path], scope, head, runner=runner,
+            )
+        ]
+        foreign_candidates = [
+            candidate for candidate in foreign_candidates if candidate not in own_unpublished
+        ]
+        refused_unpublished = [*unpublished, *own_unpublished]
         if foreign_candidates:
             _report_retained_candidates(
                 "pr_checkout_lease_scope_conflict",
                 scope,
-                [*unpublished, *foreign_candidates],
+                [*refused_unpublished, *foreign_candidates],
             )
             named = ", ".join(
                 f"{head} ({path}, scope mismatch)"
-                for path, head in [*unpublished, *foreign_candidates]
+                for path, head in [*refused_unpublished, *foreign_candidates]
             )
             raise RuntimeError(
                 "unpublished PR checkout lease candidates include another scope; "
                 f"refusing reuse: {named}"
             )
-        distinct = sorted({head for _path, head in unpublished})
+        distinct = sorted({head for _path, head in refused_unpublished})
         if len(distinct) > 1:
             _report_retained_candidates(
-                "pr_checkout_lease_candidates_diverged", scope, unpublished,
+                "pr_checkout_lease_candidates_diverged", scope, refused_unpublished,
             )
-            named = ", ".join(f"{head} ({path})" for path, head in unpublished)
+            named = ", ".join(f"{head} ({path})" for path, head in refused_unpublished)
             raise RuntimeError(
                 "divergent unpublished PR checkout lease candidates; "
                 f"refusing implicit selection: {named}"
+            )
+        if own_unpublished:
+            _report_retained_candidates(
+                "pr_checkout_lease_unpublished_own_commits", scope, own_unpublished,
+                reason="unpublished_own_commits",
+                published_head=scope.observed_head_sha.lower(),
+            )
+            # One distinct head, no paths or unbounded candidate list in the reason.
+            raise RuntimeError(
+                f"unpublished_own_commits: your PR checkout lease HEAD {distinct[0]} "
+                f"has unpushed commits beyond published head {scope.observed_head_sha.lower()}; "
+                "refusing reuse. Push those commits with repo_push, then re-scope for the "
+                "new head, or discard them with repo_cleanup, then re-scope."
             )
         if candidates:
             chosen_path, chosen_head = unpublished[0] if unpublished else candidates[0]

@@ -185,6 +185,18 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("session location mismatch")
         return result
 
+    async def session_exists(self, session_id: str) -> bool:
+        """True when this daemon knows the session; only an explicit 404 means absent."""
+        try:
+            result = _object(await self._request("GET", f"/api/session/{_identifier(session_id, 'ses')}"))
+        except DaemonClientError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        if _object(result.get("data")).get("id") != session_id:
+            raise DaemonClientError("session identity mismatch")
+        return True
+
     async def set_environment(self, session_id: str, variables: Mapping[str, str]) -> None:
         await self._request("PUT", self._path(session_id, "environment"),
                             payload={"variables": dict(variables)}, status=204)
@@ -235,6 +247,26 @@ class OpenCodeDaemonClient:
     async def delete_inbox(self, session_id: str, inbox_id: str) -> None:
         await self._request("DELETE", self._path(session_id, "inbox/") + _identifier(inbox_id, "msg"),
                             status=204)
+
+    async def running_shells(self, directory: str) -> list[dict[str, Any]]:
+        """Background shell commands still running in ``directory`` (all sessions)."""
+        result = _object(await self._request("GET", "/api/shell", params={"location[directory]": directory}))
+        self._list(result)
+        shells = []
+        for item in result["data"]:
+            try:
+                _identifier(item.get("id"), "sh")
+            except ValueError:
+                raise DaemonClientError("invalid shell identity") from None
+            if not isinstance(item.get("status"), str) or not isinstance(item.get("metadata", {}), dict):
+                raise DaemonClientError("invalid shell entry")
+            if item["status"] == "running":
+                shells.append(item)
+        return shells
+
+    async def delete_shell(self, shell_id: str, directory: str) -> None:
+        await self._request("DELETE", "/api/shell/" + _identifier(shell_id, "sh"),
+                            params={"location[directory]": directory}, status=204)
 
     async def interrupt(self, session_id: str) -> dict[str, Any]:
         result = _object(await self._request("POST", self._path(session_id, "interrupt"),

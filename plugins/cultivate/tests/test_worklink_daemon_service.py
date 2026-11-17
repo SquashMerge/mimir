@@ -480,6 +480,20 @@ def test_preparation_private_layout_and_socket_preservation(tmp_path, monkeypatc
     assert secret not in contents
 
 
+def test_preparation_writes_the_deployment_model_into_the_daemon_config(tmp_path, monkeypatch):
+    """The daemon's container environment carries MIMIR_MODEL_SPEC; specialists must inherit that model."""
+    paths = service.RuntimePaths(tmp_path / "daemon", tmp_path / "run")
+    paths.run.mkdir()
+    monkeypatch.setattr(service.os, "fchown", lambda fd, uid, gid: None)
+    monkeypatch.setattr(service, "protect_agent_paths", lambda env, identities: None)
+    service.prepare({"GH_TOKEN": "bot-value", "MIMIR_FACTORY_PUBLISHING_IDENTITY": "bot",
+                     "MIMIR_MODEL_SPEC": "codex-plus:gpt-6.1-sol", "MIMIR_MODEL_REASONING_EFFORT": "high"},
+                    WorklinkIdentities(42001, 42002, 42003), paths)
+    config = json.loads((paths.daemon / "config/opencode/opencode.json").read_text())
+    assert config["model"] == {"providerID": "openai", "model": "gpt-6.1-sol", "variant": "high"}
+    assert config["plugins"][0]["options"] == {"profile": {"model": "openai/gpt-6.1-sol"}}
+
+
 @pytest.mark.parametrize("kind", ["leaf", "parent", "oversize", "mode", "hardlink"])
 def test_private_reader_rejects_substitution(tmp_path, kind):
     directory = tmp_path / "state"
