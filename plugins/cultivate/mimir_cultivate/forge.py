@@ -21,7 +21,7 @@ class ForgeReadUnavailable(ForgeError):
     """A fixed server diagnostic raised without exposing forge content."""
 
     def __init__(self) -> None:
-        super().__init__("run is still in progress; retry after completion")
+        super().__init__("job is still running; retry after it completes")
 
 
 class ForgeResponseTooLarge(ForgeError):
@@ -969,10 +969,10 @@ class GitHubForgeClient:
             or run.get("head_sha") != scope.observed_head_sha
         ):
             raise ForgeError("run is outside the scoped repository/run/head")
-        if run.get("status") != "completed":
-
+        # A finished job's log is available even while sibling jobs are queued.
+        if job.get("status") != "completed":
             raise ForgeReadUnavailable()
-        if job.get("status") != "completed" or job.get("conclusion") not in {
+        if job.get("conclusion") not in {
             "failure", "timed_out", "startup_failure", "action_required", "cancelled",
         }:
             raise ForgeError("job is not a completed failing job")
