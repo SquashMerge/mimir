@@ -29,11 +29,22 @@ try:
         env[f"GIT_CONFIG_KEY_{index}"] = key
         env[f"GIT_CONFIG_VALUE_{index}"] = value
     if "GIT_CONFIG_PARAMETERS" in env:
-        parameters = shlex.split(env["GIT_CONFIG_PARAMETERS"])
-        env["GIT_CONFIG_PARAMETERS"] = " ".join(
-            "'" + item.replace("'", "'\\''") + "'" for item in parameters
-            if item.partition("=")[0].lower() not in identity_keys
-        )
+        raw = env["GIT_CONFIG_PARAMETERS"]
+        parameters = shlex.shlex(raw, posix=True)
+        parameters.whitespace_split = True
+        parameters.commenters = ""
+        retained_parameters = []
+        while True:
+            start = parameters.instream.tell()
+            item = parameters.get_token()
+            if item is None:
+                break
+            end = parameters.instream.tell()
+            if item.partition("=")[0].lower() not in identity_keys:
+                # Preserve Git's original key/value quoting, including '=' in
+                # credential URL subsections and empty reset entries.
+                retained_parameters.append(raw[start:end])
+        env["GIT_CONFIG_PARAMETERS"] = "".join(retained_parameters)
 except (KeyError, ValueError):
     sys.exit("invalid inherited Git test configuration")
 if len(sys.argv) < 2:

@@ -1950,12 +1950,15 @@ def test_subscription_verification_isolates_only_inherited_git_identity(tmp_path
     repo = tmp_path / "operator's repo"
     repo.mkdir()
     env = _clean_git_env()
+    url_key = ("credential.https://example.test/repo.helper" if injection == "legacy-parameters"
+               else "credential.https://example.test/repo?scope=fixture.helper")
     entries = [
         ("user.name", "Controller Name"),
         ("credential.helper", "!fixture-helper --scope=test"),
         ("safe.directory", str(repo)),
         ("USER.email", "controller@example.test"),
         ("credential.helper", ""),
+        (url_key, "!fixture-url-helper --label=operator's"),
         ("fixture.enabled", "true"),
     ]
     if injection in {"count", "both"}:
@@ -1989,6 +1992,8 @@ checks = {
                                     == "!fixture-helper --scope=test\n\n" * copies,
     "safe_directory_preserved": git("config", "--get-all", "safe.directory").stdout == (repo + "\n") * copies,
     "boolean_config_preserved": git("config", "--bool", "--get", "fixture.enabled").stdout == "true\n",
+    "url_helper_preserved": git("config", "--get", sys.argv[3]).stdout
+                            == "!fixture-url-helper --label=operator's\n",
 }
 git("config", "user.name", "Fixture Name")
 git("config", "user.email", "fixture@example.test")
@@ -2001,7 +2006,7 @@ print(json.dumps(checks))
 '''
     observed = subprocess.run(
         ["sh", str(script), "--test-env", sys.executable, "-c", child, str(repo),
-         "2" if injection == "both" else "1"],
+         "2" if injection == "both" else "1", url_key],
         env=env, capture_output=True, text=True, check=True,
     )
     checks = json.loads(observed.stdout)
@@ -2009,6 +2014,7 @@ print(json.dumps(checks))
     assert checks["credential_helpers_preserved"]
     assert checks["safe_directory_preserved"]
     assert checks["boolean_config_preserved"]
+    assert checks["url_helper_preserved"]
     assert checks["fixture_identity_observed"]
     assert checks["fixture_can_commit"]
 
