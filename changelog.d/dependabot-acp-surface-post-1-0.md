@@ -1,0 +1,1 @@
+- Dependabot skips `agent-client-protocol` 0.12.x patches and exactly 1.0.0, but later 1.x releases (1.0.1, 1.1, ...) open review-only PRs so ACP spec/SDK changes stay visible while the 1.0 migration is on the backlog (chainlink #2171).

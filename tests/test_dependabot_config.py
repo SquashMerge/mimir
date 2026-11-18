@@ -58,10 +58,14 @@ def test_capped_and_pinned_requirements_still_produce_prs() -> None:
 def test_acp_held_at_0_12_until_redesign() -> None:
     uv = _updates()["uv"]
     ignores = [entry for entry in uv.get("ignore", []) if entry.get("dependency-name") == "agent-client-protocol"]
-    # Exactly one ignore, unbounded above: ACP 1.0 needs a redesigned adapter
-    # (chainlink #2170), not a version bump, so no newer release opens a PR.
-    # The #2170 migration plan lifts this ignore in its final step.
-    assert ignores == [{"dependency-name": "agent-client-protocol", "versions": [">=0.12.1"]}]
+    # Exactly one ignore: skip the 0.12.x patches and exactly 1.0.0 (ACP 1.0
+    # needs a redesigned adapter, backlog chainlink #2171), but stay bounded so
+    # later 1.x releases still open a PR as a spec-evolution notification.
+    # The ACP 1.0 migration plan lifts this ignore in its final step.
+    assert ignores == [{"dependency-name": "agent-client-protocol",
+                        "versions": [">=0.12.1, <1.0.0", "1.0.0"]}]
+    # Never an unbounded range: that would silently hide every later release.
+    assert not any(v.strip().startswith(">") and "<" not in v for v in ignores[0]["versions"])
     assert "agent-client-protocol" in uv["groups"]["agent-protocols"]["patterns"]
     # No other protocol dependency is silenced.
     silenced = {entry.get("dependency-name") for entry in uv.get("ignore", [])}
