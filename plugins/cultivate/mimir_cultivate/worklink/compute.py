@@ -1133,7 +1133,8 @@ class LocalSubprocessComputeBackend:
         if known is None:
             return
         interrupted = False
-        job, _spec, _command = self._job(handle)
+        entry = self._jobs.get(handle.identifier)
+        job = entry[0] if entry is not None else None
         if isinstance(job, asyncio.Task):
             async def retire() -> None:
                 try:
