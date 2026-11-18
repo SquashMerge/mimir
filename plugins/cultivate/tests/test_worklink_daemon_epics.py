@@ -193,8 +193,12 @@ async def test_conflict_admission_freshens_only_dead_owned_epic(tmp_path, monkey
     from mimir_cultivate.worklink import daemon_gate
     from mimir_cultivate.worklink.backends.base import SessionAdmissionError
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
-        spec, boundary, _, old, _ = await admit(tmp_path, daemon, client)
+        spec, boundary, _, old, record = await admit(tmp_path, daemon, client)
         peer = wire_retained_executor(tmp_path, monkeypatch, daemon, boundary)
+        retained_path = boundary.controller.path
+        retired_path = retained_path.with_name(f"{retained_path.stem}.{old.identifier}.retired.json")
+        assert json.loads(retained_path.read_text())["opencode_session_id"] == old.identifier
+        assert not retired_path.exists()
         monkeypatch.setattr(daemon_gate, "prepare_daemon_health",
                             lambda env: {"ok": True, "launch_generation": "epic-generation"})
         if not live:
@@ -203,10 +207,21 @@ async def test_conflict_admission_freshens_only_dead_owned_epic(tmp_path, monkey
             with pytest.raises(SessionAdmissionError) as error:
                 await peer.session_create(spec.session_request, timeout_s=30)
             assert error.value.handle.identifier == old.identifier
+            assert json.loads(retained_path.read_text())["opencode_session_id"] == old.identifier
+            assert not retired_path.exists()
         else:
+            # Exercise session_create's retained-record conflict branch, not the
+            # orchestrator's separate session_rearm -> session_create sequence.
             fresh = await peer.session_create(spec.session_request, timeout_s=30)
-            assert fresh.identifier != old.identifier
+            assert fresh.identifier == fresh.opencode_session_id != old.identifier
+            assert json.loads(retained_path.read_text())["opencode_session_id"] == fresh.identifier
+            retired = json.loads(retired_path.read_text())
+            assert retired["opencode_session_id"] == old.identifier
+            assert retired["cancellation_state"] == "verified"
+            assert retired["issue_id"] == record.issue_id
+            assert retired["attempt"] == record.attempt
         assert len([1 for method, route, _, _ in daemon.requests if method == "POST" and route == "/api/session"]) == (1 if live else 2)
+        assert load_factory_record(tmp_path, record.run_id) == record
 
 
 def specialist_shells(daemon, handle, record):
