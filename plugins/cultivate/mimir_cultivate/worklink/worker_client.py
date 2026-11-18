@@ -32,7 +32,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v19-session-tree-activity-attempt-delete"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v20-controller-busy"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -320,6 +320,11 @@ class WorkerClient:
                 # quiescence failure surfaced only as "quiescence unverified".
                 logging.getLogger(__name__).warning("worklink session %s failed: %s", operation, detail)
                 raise RuntimeError(f"session executor operation failed: {detail}")
+            if set(response) == {"controller_busy"} and response["controller_busy"] is True:
+                # No session outcome was observed. The durable-session wait loop
+                # retries this just like a lost transport, without cancelling the
+                # host or manufacturing a backend_error. Other failures stay fatal.
+                raise SessionTransportLostError("controller_busy")
             if output is not None:
                 captured, dropped = output.read_bounded()
                 response["stdout"] = captured.decode("utf-8", "ignore")

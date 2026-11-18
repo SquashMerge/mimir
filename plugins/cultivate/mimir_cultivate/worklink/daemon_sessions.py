@@ -19,6 +19,11 @@ from .backends.base import SessionError, SessionOutcome, SessionRequest
 from .daemon_client import DaemonClientError, OpenCodeDaemonClient
 
 
+# Leave ample time for the operation itself before the executor kills the helper.
+CONTROLLER_LOCK_TIMEOUT_S = 10.0
+CONTROLLER_LOCK_RETRY_S = 0.05
+
+
 def _number(value: object) -> bool:
     return type(value) in {int, float} and math.isfinite(value)
 
@@ -839,12 +844,21 @@ async def _executor_operation(request: dict) -> dict:
     lock = os.open(root / f"{key}.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         recovering_admission = request["op"] == "session_observe" and request["opencode_session_id"] is None
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            if recovering_admission:
-                return {"admission_state": "busy"}
-            raise
+        deadline = time.monotonic() + CONTROLLER_LOCK_TIMEOUT_S
+        # Even read-only tree activity holds the exclusive lock: recovery and
+        # controller replacement must not race its snapshot. Never unlink this
+        # lock file; record replacement/retirement uses the same stable lock.
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if recovering_admission:
+                    return {"admission_state": "busy"}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"controller_busy": True}
+                await asyncio.sleep(min(CONTROLLER_LOCK_RETRY_S, remaining))
         async with OpenCodeDaemonClient(base_url=api["url"], username=api["username"], password=api["password"], timeout=5) as client:
             path = root / f"{key}.json"
             checkout = Path(request["path"])
