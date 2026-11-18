@@ -197,84 +197,92 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("session identity mismatch")
         return True
 
-    async def session_tree(self, session_id: str) -> list[dict[str, Any]]:
-        """Read durable parent links, including archived children and every page."""
-        root = _object(await self._request("GET", f"/api/session/{_identifier(session_id, 'ses')}"))
-        tree = [_object(root.get("data"))]
-        if tree[0].get("id") != session_id:
+    async def session_info(self, session_id: str) -> dict[str, Any]:
+        result = _object(await self._request("GET", f"/api/session/{_identifier(session_id, 'ses')}"))
+        data = _object(result.get("data"))
+        if data.get("id") != session_id:
             raise DaemonClientError("session identity mismatch")
+        return data
+
+    async def session_tree(self, session_id: str) -> list[dict[str, Any]]:
+        """One bounded walker for activity, questions, and cancellation.
+
+        ``children`` includes archived/moved descendants and owns pagination,
+        opaque cursors, adaptive page sizing, and direct parent validation.
+        Keep cross-page/parent identity and whole-tree bounds here.
+        """
+        tree = [await self.session_info(session_id)]
         seen = {session_id}
+        size = len(json.dumps(tree[0]).encode())
         for parent in tree:
-            cursor = None
-            cursors = set()
-            while True:
-                params = {"parentID": parent["id"], "limit": "100"}
-                params.update({"cursor": cursor} if cursor is not None else {"order": "asc"})
-                page = _object(await self._request("GET", "/api/session", params=params))
-                self._list(page)
-                for child in page["data"]:
-                    try:
-                        _identifier(child.get("id"), "ses")
-                    except ValueError:
-                        raise DaemonClientError("invalid session identity") from None
-                    if child.get("parentID") != parent["id"] or child["id"] in seen:
-                        raise DaemonClientError("invalid session parent link")
-                    seen.add(child["id"])
-                    tree.append(child)
-                    if len(tree) > 4096:
-                        raise DaemonClientError("session tree exceeds bound")
-                pagination = _object(page.get("cursor"))
-                if "next" not in pagination:
-                    raise DaemonClientError("invalid session cursor")
-                cursor = pagination["next"]
-                if cursor is None:
-                    break
-                if not isinstance(cursor, str) or len(cursor.encode()) > 4096 or cursor in cursors:
-                    raise DaemonClientError("invalid session cursor")
-                cursors.add(cursor)
+            for child in await self.children(parent["id"]):
+                if child["id"] in seen:
+                    raise DaemonClientError("invalid session descendant tree")
+                seen.add(child["id"])
+                tree.append(child)
+                size += len(json.dumps(child).encode())
+                if len(tree) > 4096 or size > 16 * MAX_ITEM_BYTES:
+                    raise DaemonClientError("session tree exceeds bound")
         return tree
 
-    async def set_environment(self, session_id: str, variables: Mapping[str, str]) -> None:
-        await self._request("PUT", self._path(session_id, "environment"),
-                            payload={"variables": dict(variables)}, status=204)
-
     async def children(self, session_id: str) -> list[dict[str, Any]]:
-        """All direct children, not merely the default newest 50 sessions."""
+        """All direct children, including archived/moved sessions, with bounded pagination."""
         _identifier(session_id, "ses")
-        children = []
+        children: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
-        seen_cursors: set[str] = set()
+        cursors: set[str] = set()
         cursor = None
+        limit = 100
         size = 0
         while True:
-            result = _object(await self._request("GET", "/api/session", params=(
-                {"cursor": cursor, "limit": "100"} if cursor is not None else
-                {"parentID": session_id, "order": "asc", "limit": "100"})))
+            # Native cursors retain the original query; do not repeat parent/order.
+            params = {"cursor": cursor, "limit": str(limit)} if cursor is not None else {
+                "parentID": session_id, "order": "asc", "limit": str(limit)}
+            try:
+                result = _object(await self._request("GET", "/api/session", params=params))
+            except DaemonClientError as exc:
+                if exc.reason != "item too large" or limit == 1:
+                    raise
+                limit = max(1, limit // 4)
+                continue
             self._list(result)
             size += len(json.dumps(result).encode())
+            if len(children) + len(result["data"]) > 4096 or size > 16 * MAX_ITEM_BYTES:
+                raise DaemonClientError("session children exceed bound")
             for child in result["data"]:
                 try:
                     _identifier(child.get("id"), "ses")
                 except ValueError:
                     raise DaemonClientError("invalid child session identity") from None
-                if child.get("parentID") != session_id or child["id"] in seen_ids:
+                if child.get("parentID") != session_id:
+                    raise DaemonClientError("foreign child session")
+                if child["id"] in seen_ids:
                     raise DaemonClientError("invalid child session binding")
                 seen_ids.add(child["id"])
-                children.append(child)
-            if len(children) > 4096 or size > 16 * MAX_ITEM_BYTES:
-                raise DaemonClientError("session children exceed bound")
+            children.extend(result["data"])
             page = _object(result.get("cursor"))
-            if set(page) != {"previous", "next"} or any(
-                v is not None and (not isinstance(v, str) or len(v.encode()) > 4096)
-                for v in page.values()
-            ):
-                raise DaemonClientError("invalid session cursor")
+            if (set(page) != {"previous", "next"} or any(
+                    v is not None and (not isinstance(v, str) or len(v.encode()) > 4096)
+                    for v in page.values())):
+                raise DaemonClientError("invalid session page")
             cursor = page["next"]
             if cursor is None:
                 return children
-            if cursor in seen_cursors:
+            if cursor in cursors:
                 raise DaemonClientError("repeated session cursor")
-            seen_cursors.add(cursor)
+            cursors.add(cursor)
+
+    async def pending_forms(self, session_id: str) -> list[dict[str, Any]]:
+        result = _object(await self._request("GET", self._path(session_id, "form")))
+        self._list(result)
+        for form in result["data"]:
+            if form.get("sessionID") != session_id:
+                raise DaemonClientError("foreign session form")
+        return result["data"]
+
+    async def set_environment(self, session_id: str, variables: Mapping[str, str]) -> None:
+        await self._request("PUT", self._path(session_id, "environment"),
+                            payload={"variables": dict(variables)}, status=204)
 
     async def forms(self, session_id: str) -> list[dict[str, Any]]:
         """Pending Form.Info entries only. Worklink deliberately has no reply API."""

@@ -4388,6 +4388,24 @@ class WorklinkRunner:
                 and wait_task.result().session_outcome is not None
                 and wait_task.result().session_outcome.execution_state == "succeeded")
 
+        async def idle_park_reason() -> str | None:
+            if handle.substrate != "opencode_daemon":
+                return f"factory driver idle: no progress since {last_change_at}"
+            activity = await compute.session_tree_activity(handle)
+            # A descendant specialist's shell is useful work even while its
+            # session is quiet (#105); the activity reader excludes driver shells.
+            # Forms are not heartbeats: do not mask #2164 with their timestamps
+            # (or updates to a driver waiting for the blocked specialist).
+            if activity["running_shell"]:
+                return None
+            updated = activity["last_activity_at_ms"] / 1000
+            if not activity["pending_form"] and datetime.now(UTC).timestamp() - updated < idle_after:
+                return None
+            timestamp = datetime.fromtimestamp(updated, UTC).isoformat()
+            suffix = "; pending form is not progress" if activity["pending_form"] else ""
+            return (f"factory driver idle: no progress since {last_change_at}; "
+                    f"last session activity at {timestamp} from {activity['last_activity_session_id']}{suffix}")
+
         async def missed_poll(exc: Exception) -> None:
             nonlocal error_polls, error_incident, status, wait_task
             # Only a verified ending may leave supervision. A control-plane
@@ -4452,13 +4470,17 @@ class WorklinkRunner:
                     )
                 ):
                     if loop.time() < park_deadline:
-                        end_stale_episode("driver_idle")
-                        reason = f"factory driver idle: no progress since {last_change_at}"
+                        try:
+                            reason = await idle_park_reason()
+                        except Exception as exc:
+                            await missed_poll(exc)
+                            continue
+                        if reason is not None:
+                            end_stale_episode("driver_idle")
                     else:
                         reason = _factory_budget_park_reason(last_status, factory_record)
-                    return await park_for_reason(
-                        last_status, reason
-                    )
+                    if reason is not None:
+                        return await park_for_reason(last_status, reason)
                 if (recovery_session is not None or host_lock_pending) and loop.time() >= startup_deadline:
                     return await repark_startup_failure(
                         "factory driver did not acquire the run lock before startup deadline"
@@ -4708,9 +4730,14 @@ class WorklinkRunner:
                                 and now - last_change >= idle_after
                                 and compute.job_alive(handle)
                             ):
-                                reason = f"factory driver idle: no progress since {last_change_at}"
-                                end_stale_episode("driver_idle")
-                                return await park_for_reason(status, reason)
+                                try:
+                                    reason = await idle_park_reason()
+                                except Exception as exc:
+                                    await missed_poll(exc)
+                                    continue
+                                if reason is not None:
+                                    end_stale_episode("driver_idle")
+                                    return await park_for_reason(status, reason)
                     if (
                         stale_failure is None
                         and dead_windows >= 2

@@ -437,6 +437,46 @@ class SessionController:
         return [shell for shell in shells
                 if shell.get("metadata", {}).get("sessionID") == self.record.opencode_session_id]
 
+    async def tree_activity(self) -> dict:
+        """Read durable activity for the owned driver and its entire descendant tree.
+
+        Do not use execution state, log delivery, or controller-file mtimes as a
+        heartbeat. A pending human form (including the question tool) blocks the
+        tree: its creation/update must not buy another idle window (#2164).
+        This read neither answers forms nor changes session state.
+        """
+        root = self.record.opencode_session_id
+        sessions = await self._bounded(self.client.session_tree(root))
+        seen: set[str] = set()
+        directories: set[str] = set()
+        latest = -1
+        source = root
+        pending_form = False
+        for session in sessions:
+            sid = session.get("id")
+            updated = session.get("time", {}).get("updated")
+            directory = session.get("location", {}).get("directory")
+            if (not _identifier(sid, "ses") or sid in seen
+                    or not _number(updated) or not 0 <= updated <= 253402300799999
+                    or not isinstance(directory, str) or not Path(directory).is_absolute()):
+                raise DaemonClientError("invalid session activity")
+            seen.add(sid)
+            directories.add(directory)
+            if updated > latest:
+                latest, source = updated, sid
+            pending_form = bool(await self._bounded(self.client.pending_forms(sid))) or pending_form
+        # The driver owns a lifetime lock-refresh shell. It is not work and
+        # must not disable the idle watchdog; only descendant specialists'
+        # running shells are activity. Ownership is metadata, not command text.
+        specialists = seen - {root}
+        running_shell = False
+        for directory in sorted(directories):
+            shells = await self._bounded(self.client.running_shells(directory))
+            running_shell |= any(shell.get("metadata", {}).get("sessionID") in specialists for shell in shells)
+        return {"opencode_session_id": root, "last_activity_at_ms": latest,
+                "last_activity_session_id": source, "pending_form": pending_form,
+                "running_shell": running_shell}
+
     async def _tree_shells(self, tree: list[dict]) -> list[tuple[dict, str]]:
         """List at current and historical locations, but authorize by session ID only."""
         owners = {session["id"] for session in tree}
@@ -593,10 +633,8 @@ class SessionController:
         Forms belong to sessions, not just the observed driver. Walk every depth,
         including archived children; never grant, cancel, or answer a form here.
         """
-        pending = [self.record.opencode_session_id]
-        seen = set(pending)
-        while pending:
-            sid = pending.pop()
+        for session in await self._bounded(self.client.session_tree(self.record.opencode_session_id)):
+            sid = session["id"]
             forms = await self._bounded(self.client.forms(sid))
             for form in forms:
                 if form.get("metadata", {}).get("kind") == "question":
@@ -610,11 +648,6 @@ class SessionController:
                                        + self._redacted(text, 1024), 2048),
                         self._redacted(text, 8192),
                     )
-            for child in await self._bounded(self.client.children(sid)):
-                if child["id"] in seen or len(seen) >= 4096:
-                    raise DaemonClientError("invalid session descendant tree")
-                seen.add(child["id"])
-                pending.append(child["id"])
         return None
 
     async def _observe(self, *, stdout_limit: int) -> SessionOutcome:
@@ -857,6 +890,10 @@ async def _executor_operation(request: dict) -> dict:
                 controller.sensitive_values = (api["password"], *(os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ))
                 if controller.record.opencode_session_id != request["opencode_session_id"]:
                     raise ValueError("session ownership mismatch")
+            if request["op"] == "session_tree_activity":
+                if controller is None:
+                    raise ValueError("session activity unavailable after daemon replacement")
+                return await controller.tree_activity()
             if request["op"] == "session_observe":
                 ended = SessionOutcome(request["opencode_session_id"], "interrupted", "verified", SessionError(
                     "daemon_restarted", "OpenCode daemon was replaced; the session ended with its daemon"))

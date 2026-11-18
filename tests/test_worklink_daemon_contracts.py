@@ -112,8 +112,8 @@ async def test_children_listing_fails_closed_on_invalid_binding_or_pagination(fa
         body = json.dumps({"data": data, "cursor": cursor}).encode()
         for _ in range(2):
             daemon.faults[("GET", "/api/session")].append(SyntheticFault(body=body))
-        reason = {"foreign_parent": "invalid child session binding", "duplicate_child": "invalid child session binding",
-                  "bad_child_id": "invalid child session identity", "bad_cursor": "invalid session cursor",
+        reason = {"foreign_parent": "foreign child session", "duplicate_child": "invalid child session binding",
+                  "bad_child_id": "invalid child session identity", "bad_cursor": "invalid session page",
                   "repeated_cursor": "repeated session cursor"}[case]
         with pytest.raises(DaemonClientError, match=reason):
             await client.children(root)

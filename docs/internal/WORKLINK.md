@@ -1002,8 +1002,9 @@ with mount ownership/mode set to the worker uid and 0700. For example, provision
 concurrent test gates; tests can create substantial temporary data. The mount
 and service setting are deployment configuration.
 Rebuild and restart the root executor with the matching controller release;
-the combined daemon/bounded-output/gate-scratch/attempt-delete contract uses executor
-protocol v18 (`worklink-executor-v18-attempt-delete`).
+the combined daemon/bounded-output/gate-scratch/session-tree-read/attempt-delete
+contract uses executor protocol v19
+(`worklink-executor-v19-session-tree-activity-attempt-delete`).
 Completed leaf checkouts are deleted by the executor through an anchored,
 symlink-safe walk of that one attempt, including worker-owned content. The
 controller has no local deletion fallback; failures are logged while claim and

@@ -347,6 +347,9 @@ class OpenCodeDaemonComputeBackend:
         outcome = await self._observe(handle)
         return outcome.stdout
 
+    async def session_tree_activity(self, handle: LaunchHandle) -> dict[str, Any]:
+        return await self._client.session_tree_activity(handle)
+
     def job_alive(self, handle: LaunchHandle) -> bool:
         """Conservative supervision hint; only observation proves a host outcome."""
         return handle.substrate == self.name and handle.identifier not in self._quiescent

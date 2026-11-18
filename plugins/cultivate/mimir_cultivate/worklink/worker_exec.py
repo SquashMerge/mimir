@@ -43,7 +43,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-attempt-delete"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v19-session-tree-activity-attempt-delete"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -1586,7 +1586,7 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker request")
         raw_identifier = request.get("id")
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
-        if request.get("op") in {"session_create", "session_observe", "session_cancel", "session_release"}:
+        if request.get("op") in {"session_create", "session_observe", "session_cancel", "session_release", "session_tree_activity"}:
             _handle_session(connection, request, fds)
         elif request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)

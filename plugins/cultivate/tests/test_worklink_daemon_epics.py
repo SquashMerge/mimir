@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -71,6 +71,10 @@ class EpicBoundary:
     async def session_cancel(self, handle):
         if not self.cancel_verified or not await self.controller.cancel():
             raise RuntimeError(self.controller.record.cleanup_error or "unverified owned quiescence")
+
+    async def session_tree_activity(self, handle):
+        assert handle.identifier == self.controller.record.opencode_session_id
+        return await self.controller.tree_activity()
 
     async def session_release(self, handle):
         await self.controller.release()
@@ -629,7 +633,17 @@ async def test_epic_park_stops_descendant_shells_at_sandbox_and_slice_locations(
 
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
-        owned = specialist_shells(daemon, handle, record)
+        # Running owned shells now correctly prevent an idle park (#2165).
+        # For that case, model a shell launch racing the already-made idle
+        # decision: cancellation must still discover and stop every descendant.
+        owned = [] if cause == "idle" else specialist_shells(daemon, handle, record)
+        if cause == "idle":
+            cancel = compute.cancel
+            async def launch_before_cancel(selected):
+                assert not owned
+                owned.extend(specialist_shells(daemon, handle, record))
+                await cancel(selected)
+            monkeypatch.setattr(compute, "cancel", launch_before_cancel)
         foreign = daemon.start_shell("ses_unrelated", record.sandbox)
         boundary.finish = False
         current = record.status
@@ -672,7 +686,7 @@ async def test_epic_park_stops_descendant_shells_at_sandbox_and_slice_locations(
 
         def terminal(*args, **kwargs):
             nonlocal current
-            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+            assert owned and all(daemon.shells[s]["status"] == "killed" for s in owned)
             terminal_calls.append(kwargs["reason"])
             current = replace(current, status="needs-human", park_snapshot=str(tmp_path / "snapshot"))
 
@@ -1396,6 +1410,121 @@ def supervisor_clock(monkeypatch):
     }))
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 100.0)
     return clock
+
+
+@pytest.mark.parametrize("observation_path", ["normal", "missed-status"])
+@pytest.mark.parametrize("activity", ["driver", "child", "grandchild", "quiet", "question", "pending-form", "shell", "driver-shell", "foreign-shell", "budget"])
+async def test_factory_idle_uses_session_tree_activity(
+    tmp_path, monkeypatch, supervisor_clock, activity, observation_path,
+):
+    from mimir_cultivate.worklink import orchestrator
+
+    base = datetime(2026, 11, 17, tzinfo=UTC)
+    class ClockDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return base + timedelta(seconds=supervisor_clock.now)
+    monkeypatch.setattr(orchestrator, "datetime", ClockDate)
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20000.0)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 900.0)
+    # Own the liveness witnesses; this test concerns daemon activity, not Git IO.
+    monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda *a: None)
+    monkeypatch.setattr(orchestrator, "_factory_transcript_snapshot", lambda *a: {})
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        baseline = base.timestamp() * 1000
+        daemon.sessions[handle.identifier].info["time"]["updated"] = baseline
+        child = daemon.child(handle.identifier, updated_ms=baseline)
+        grandchild = daemon.child(child, updated_ms=baseline + 500000)
+        source = {"driver": handle.identifier, "child": child}.get(activity, grandchild)
+        if activity == "question":
+            # Publish before the compute wait task starts, rather than racing its
+            # HTTP observation against the supervisor's synthetic clock.
+            daemon.question(source, baseline + 1000)
+        # Fresh unrelated roots must never keep this run alive.
+        unrelated = await client.create_session(directory=str(tmp_path), model={"providerID": "openai", "id": "gpt-test"}, permissions=[])
+        daemon.activity(unrelated["data"]["id"], baseline + 30000000)
+        if activity == "shell":
+            daemon.start_shell(grandchild, str(tmp_path / "moved-specialist"))
+            daemon.sessions[grandchild].info["location"] = {"directory": str(tmp_path / "moved-specialist")}
+        elif activity in {"driver-shell", "foreign-shell"}:
+            # A long-lived driver lock-refresh shell is not progress. Authorize
+            # specialist work by metadata.sessionID, never by command text.
+            owner = handle.identifier if activity == "driver-shell" else unrelated["data"]["id"]
+            daemon.start_shell(owner, record.session_checkout)
+        current = record.status
+        reasons = []
+        missed = False
+        activity_reads = []
+        real_activity = boundary.session_tree_activity
+        async def tree_activity(selected):
+            activity_reads.append(supervisor_clock.now)
+            return await real_activity(selected)
+        monkeypatch.setattr(boundary, "session_tree_activity", tree_activity)
+
+        class Factory:
+            poll_interval_s = 0.001
+            def status(self, *args, **kwargs):
+                nonlocal current, missed
+                if (observation_path == "missed-status" and not missed
+                        and supervisor_clock.now == 7000):
+                    missed = True
+                    supervisor_clock.now = 8000
+                    raise RuntimeError("synthetic factory observation failure")
+                if current.status == "running" and supervisor_clock.now >= (21000 if activity == "budget" else 10000):
+                    # Bound a regressed watchdog too: a missed park becomes a
+                    # discriminating result assertion, not a real-time hang.
+                    current = replace(current, status="completed")
+                return current
+            def heartbeat(self, *args, **kwargs):
+                supervisor_clock.now += 1000
+                if activity in {"driver", "child", "grandchild", "budget"}:
+                    daemon.activity(source, baseline + supervisor_clock.now * 1000)
+                elif activity in {"question", "pending-form"}:
+                    form = daemon.question(source, baseline + supervisor_clock.now * 1000)
+                    if activity == "pending-form":
+                        # Non-question human forms still exercise the idle backstop;
+                        # questions take #2164's earlier operator-visible error path.
+                        form["metadata"]["kind"] = "other"
+            def terminal(self, *args, **kwargs):
+                nonlocal current
+                reasons.append(kwargs["reason"])
+                current = replace(current, status="needs-human", park_snapshot=str(tmp_path / "snapshot"))
+
+        async def finish(self, **kwargs):
+            return WorklinkRunResult(2125, 1, kwargs["factory_record"].status.status)
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finish)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", base),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None), backend=Factory(), compute=compute,
+            factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None, started_at=base)
+        if activity == "question":
+            with pytest.raises(WorklinkError, match="pending_question"):
+                await asyncio.wait_for(invocation, 60)
+            assert supervisor_clock.now < 7200
+            assert reasons == [] and activity_reads == []
+            assert daemon.sessions[source].forms
+            assert not daemon.sessions[source].replies
+            return
+        result = await asyncio.wait_for(invocation, 60)
+        assert activity_reads and min(activity_reads) >= 7200
+        assert missed == (observation_path == "missed-status")
+        if activity in {"quiet", "pending-form", "driver-shell", "foreign-shell", "budget"}:
+            assert result.status == "needs-human" and len(reasons) == 1
+            if activity == "budget":
+                assert reasons[0].startswith("budget exhausted")
+                assert supervisor_clock.now == 20000
+            else:
+                assert "factory driver idle" in reasons[0]
+                assert source in reasons[0]
+                stamp = daemon.sessions[source].info["time"]["updated"]
+                assert datetime.fromtimestamp(stamp / 1000, UTC).isoformat() in reasons[0]
+                assert ("pending form is not progress" in reasons[0]) == (activity == "pending-form")
+                assert supervisor_clock.now == 8000
+        else:
+            assert result.status == "completed" and reasons == []
 
 
 def test_epic_launch_at_operator_checkout_without_controller_init(tmp_path, monkeypatch):

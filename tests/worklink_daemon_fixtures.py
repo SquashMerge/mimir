@@ -68,8 +68,8 @@ class SyntheticSession:
     inbox: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     log: list[dict[str, Any]] = field(default_factory=list)
-    active: bool = False
     forms: list[dict[str, Any]] = field(default_factory=list)
+    active: bool = False
     replies: list[dict[str, Any]] = field(default_factory=list)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -101,6 +101,7 @@ class FakeOpenCodeDaemon:
         self.command_prompts = True
         #: Synthetic background shells by id, using the 2.3.0 shell contract.
         self.shells: dict[str, dict[str, Any]] = {}
+        self.session_page_limit = 100
         self._counter = 0
         self._closing = False
         self.app = web.Application()
@@ -168,7 +169,7 @@ class FakeOpenCodeDaemon:
         self.sessions[info["id"]] = SyntheticSession(info)
         return info
 
-    def question(self, session_id: str, *, title: str = "Questions",
+    def question(self, session_id: str, updated_ms: float | None = None, *, title: str = "Questions",
                  text: str = "Extend the slice with six test paths?") -> dict[str, Any]:
         """Inject a pending question despite policy, to test the read-only backstop."""
         form = {"id": self._id("frm"), "sessionID": session_id, "title": title,
@@ -178,6 +179,8 @@ class FakeOpenCodeDaemon:
                          "Approve test-path amendment", "Keep current paths")], "custom": True}]}
         self.schema.named("Form.Info", form)
         self.sessions[session_id].forms.append(form)
+        if updated_ms is not None:
+            self.sessions[session_id].info["time"]["updated"] = updated_ms
         return form
 
     def emit(self, session_id: str, event_type: str, **data: Any) -> dict[str, Any]:
@@ -200,6 +203,25 @@ class FakeOpenCodeDaemon:
         self.emit(session_id, "session.inbox.enqueued", inboxID=item["id"],
                   item={key: item[key] for key in ("type", "payload", "delivery")})
         return item
+
+    def child(self, parent_id: str, *, updated_ms: float, directory: str | None = None) -> str:
+        info = copy.deepcopy(self.sessions[parent_id].info)
+        sid = self._id("ses")
+        info.update(id=sid, parentID=parent_id, time={"created": updated_ms, "updated": updated_ms})
+        if directory is not None:
+            info["location"] = {"directory": directory}
+        self.schema.named("Session.Info", info)
+        self.sessions[sid] = SyntheticSession(info)
+        return sid
+
+    def activity(self, session_id: str, updated_ms: float) -> None:
+        """A durable assistant message also advances Session.Info.time.updated."""
+        state = self.sessions[session_id]
+        message = {"id": self._id("msg"), "type": "assistant", "time": {"created": updated_ms},
+                   "agent": "build", "model": {"providerID": "openai", "id": "gpt-test"}, "content": []}
+        self.schema.named("Session.Message.Assistant", message)
+        state.messages.append(message)
+        state.info["time"]["updated"] = updated_ms
 
     def enqueue_synthetic(self, session_id: str, shell_id: str) -> dict[str, Any]:
         """Queue what a finished background shell queues: a ``synthetic`` resume (2.3.0 schema)."""
@@ -325,7 +347,7 @@ class FakeOpenCodeDaemon:
                         if "parentID" not in query or s.info.get("parentID") == query["parentID"]]
                 if query.get("order", "desc") == "desc":
                     data.reverse()
-                limit = int(query.get("limit", "50"))
+                limit = min(int(query.get("limit", "50")), self.session_page_limit)
                 cursor = (base64.urlsafe_b64encode(json.dumps([query, offset + limit]).encode()).decode()
                           if offset + limit < len(data) else None)
                 return self._response(request, {"data": data[offset:offset + limit],
