@@ -230,9 +230,22 @@ def reattach_inflight_worklink_runs(
     run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
     state_dir = home / "state" / "worklink" / "runs"
     dispatched: list[int] = []
+    from .worklink.backends.registry import BackendRegistry
+    from .worklink.execution_policy import execution_for_backend
+    registry = BackendRegistry()
     for state in states:
-        if state.compute_name == "local_subprocess" and state.opencode_session_id is None:
-            continue
+        try:
+            policy = execution_for_backend(registry.get(state.backend))
+        except KeyError:
+            # Preserve extension-owned recovery. Its reattach handler still has
+            # to prove liveness and resumability before admitting any work.
+            policy = None
+        if policy is not None:
+            if policy.retained_state == "none":
+                continue
+            if (policy.retained_state == "opencode_session" and state.opencode_session_id is None
+                    and state.launch_generation is None):
+                continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
         log_path = state_dir / f"reattach-{state.issue_id}.log"
         try:

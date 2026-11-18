@@ -237,6 +237,10 @@ async def test_worklink_runner_filters_retry_environment_after_order_merge(tmp_p
     monkeypatch.setattr(orch, "WorkOrder", order_with_overrides)
 
     class Backend(OpenCodeBackend):
+        def capabilities(self):
+            from mimir_cultivate.worklink.backends.base import Caps
+            return Caps("coding-cli", False, False, False, None)
+
         def work_spec(self, order: WorkOrder, *, attempt, repo_url, base_ref, branch, test_command):
             return WorkSpec(
                 order.issue_id, attempt, repo_url, base_ref, branch, order.prompt,
@@ -776,7 +780,9 @@ async def test_factory_gate_large_output_preserves_verdict(tmp_path, monkeypatch
         + f"raise SystemExit({exit_code})\n"
     )
     command = shlex.join([sys.executable, str(script), "pytest"])
-    spec = WorkSpec(1482, 1, "repo", "main", "issue/1482-a1", "", None, command, "feature_factory", 30, local_checkout=repo)
+    from mimir_cultivate.worklink.execution_policy import OPENCODE_FACTORY
+    spec = WorkSpec(1482, 1, "repo", "main", "issue/1482-a1", "", None, command, "feature_factory", 30,
+                    local_checkout=repo, execution=OPENCODE_FACTORY)
     result = await observe_evidence(
         issue=1482, attempt=1, backend="feature_factory", branch=spec.branch,
         checkout=repo, started_at=datetime.now(UTC), base_ref="main", backend_status="completed",
@@ -1348,6 +1354,7 @@ def test_gate_timeout_is_persisted_and_counts_as_divergence():
 @pytest.mark.asyncio
 async def test_controller_gate_yields_to_heartbeat_and_records_timeout(tmp_path):
     from mimir_cultivate.worklink.compute import WorkSpec
+    from mimir_cultivate.worklink.execution_policy import OPENCODE_FACTORY
 
     entered = threading.Event()
     heartbeat = threading.Event()
@@ -1372,7 +1379,8 @@ async def test_controller_gate_yields_to_heartbeat_and_records_timeout(tmp_path)
             issue=1696, attempt=1, backend="feature_factory", branch="branch",
             checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
             backend_status="completed", test_command="pytest -q", runner=runner,
-            work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "feature_factory", 7),
+            work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "feature_factory", 7,
+                              execution=OPENCODE_FACTORY),
         )
     finally:
         task.cancel()

@@ -474,6 +474,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
             issue_id=record.issue_id, attempt=record.attempt, repo_url="", base_ref=record.base_ref,
             branch=record.branch, prompt="", rules=None, test_command=gate_command,
             backend="feature_factory", timeout_s=30, local_checkout=sandbox,
+            execution=FeatureFactoryBackend().capabilities().execution,
         )
         for invalid_checkout, compute in (
             (sandbox / ".factory" / "worktrees" / "leaf", LocalSubprocessComputeBackend()),

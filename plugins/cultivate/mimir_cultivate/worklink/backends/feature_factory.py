@@ -707,12 +707,14 @@ class FeatureFactoryBackend:
     runner: Runner = field(default=subprocess.run, compare=False, repr=False)
 
     def capabilities(self) -> Caps:
+        from ..execution_policy import OPENCODE_FACTORY
         return Caps(
             tool_category="feature-factory",
             persistent_sessions=True,
             json_output=True,
             native_pr_creation=True,
             quota_pool=None,
+            execution=OPENCODE_FACTORY,
         )
 
     def admit(self) -> Path:
@@ -782,6 +784,7 @@ class FeatureFactoryBackend:
             local_checkout=order.checkout,
             session_request=SessionRequest("epic", model, self.feature_text(run_id, max_retries=max_retries)),
             output_root=order.transcript_root,
+            execution=self.capabilities().execution,
         )
 
     @staticmethod

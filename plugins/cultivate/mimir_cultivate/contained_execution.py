@@ -322,6 +322,7 @@ async def execute_contained(
     projections: Sequence[WorkerProjection] = (),
     *,
     identifier: str,
+    home_projection_profile: str = "none",
     timeout_s: float,
     stdout_limit: int,
     stderr_limit: int,
@@ -335,12 +336,18 @@ async def execute_contained(
         raise ValueError("worker output limits must be positive")
     if timeout_s <= 0:
         raise ValueError("worker timeout must be positive")
-    if isinstance(argv, (str, bytes)) or not argv or any(
-        not isinstance(arg, str) or not arg or "\x00" in arg for arg in argv
+    if isinstance(argv, (str, bytes)) or not argv or not argv[0] or any(
+        not isinstance(arg, str) or "\x00" in arg for arg in argv
     ):
         raise ValueError("worker command must contain non-empty NUL-free strings")
     if "HOME" in worker_env:
         raise ValueError("worker HOME is assigned by the executor")
+    if "CLAUDE_CONFIG_DIR" in worker_env:
+        raise ValueError("worker Claude config is assigned by the executor")
+    if home_projection_profile == "claude_leaf" and {
+        "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY",
+    }.intersection(worker_env):
+        raise ValueError("Claude leaf refuses epic credentials")
     client_class, projection_class = _worker_classes()
     try:
         checked_projections = tuple(
@@ -352,6 +359,23 @@ async def execute_contained(
         {item.path for item in checked_projections}
     ) != len(checked_projections):
         raise ValueError("worker projections must use at most two unique destinations")
+    profiles = {
+        "none": {},
+        "claude_leaf": {".claude/.claude.json": {"hasCompletedOnboarding": True},
+                        ".claude/settings.json": {"disableAllHooks": True}},
+        "claude_factory": {".claude/.claude.json": {"hasCompletedOnboarding": True}},
+    }
+    if not isinstance(home_projection_profile, str) or home_projection_profile not in profiles:
+        raise ValueError("unknown worker projection profile")
+    expected = profiles[home_projection_profile]
+    if {p.path for p in checked_projections} != set(expected):
+        raise ValueError("worker projections do not match selected profile")
+    for projection in checked_projections:
+        if len(projection.document) > 1024 * 1024:
+            raise ValueError("worker projection exceeds size limit")
+        parsed = json.loads(projection.document)
+        if parsed != expected[projection.path] or any(type(v) is not bool for v in parsed.values()):
+            raise ValueError("worker projection must use generated configuration")
 
     opened_here = stdout_sink is None and stderr_sink is None
     if (stdout_sink is None) != (stderr_sink is None):
@@ -369,6 +393,7 @@ async def execute_contained(
             argv=tuple(argv),
             env=dict(worker_env),
             projections=checked_projections,
+            **({"home_projection_profile": home_projection_profile} if home_projection_profile != "none" else {}),
             identifier=identifier,
             timeout_s=timeout_s,
             stdout_sink=stdout_sink,

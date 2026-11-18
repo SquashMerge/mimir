@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime
 import json
 import subprocess
 import sys
@@ -144,7 +145,7 @@ class FakeBackend:
     name = "fake"
 
     def capabilities(self) -> Caps:
-        return Caps("fake", False, False, False, True, None)
+        return Caps("fake", False, False, False, None)
 
     def work_spec(
         self,
@@ -1902,6 +1903,44 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     )
     assert dispatched == []
     assert spawned == []
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_claude_leaf_cannot_reattach_or_gain_a_daemon_session(tmp_path, monkeypatch, live):
+    import mimir_cultivate.worklink.orchestrator as orch
+    import uuid
+
+    state = WorklinkRunState(
+        issue_id=2126, attempt=1, backend="claude_code", compute_name="opencode_daemon",
+        handle_substrate="local_subprocess", handle_identifier=str(uuid.uuid4()),
+        shim_pid=12345, process_start_ticks=42, branch="issue/2126-a1", base_ref="main",
+        local_base="main", repo=str(tmp_path), repo_url="repo", test_command="uv run pytest -q",
+        started_at=datetime.now(UTC).isoformat(), checkout=str(tmp_path / "checkout"),
+    )
+    save_run_state(tmp_path, state)
+    monkeypatch.setattr(orch, "process_is_alive", lambda current: current == state and live)
+    runner = lambda *_args, **_kwargs: pytest.fail("nonpersistent reattach crossed a transport boundary")
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path, runner=runner).reattach(2126))
+    assert result.status == "failed"
+    assert ("still live" if live else "fresh attempt") in result.reason
+    assert load_run_state(tmp_path, 2126) == state
+    assert state.opencode_session_id is None
+
+
+def test_claude_startup_retention_uses_backend_capability_not_compute_name(tmp_path, monkeypatch):
+    from mimir_cultivate import server
+    from mimir_cultivate.worklink import control
+
+    state = WorklinkRunState(
+        issue_id=2126, attempt=1, backend="claude_code", compute_name="opencode_daemon",
+        handle_substrate="controller", handle_identifier="12345", branch="issue/2126-a1", base_ref="main",
+        local_base="main", repo=str(tmp_path), repo_url="repo", test_command=None,
+        started_at=datetime.now(UTC).isoformat(),
+    )
+    monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [state])
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    assert server.reattach_inflight_worklink_runs(
+        tmp_path, popen=lambda *args, **kwargs: pytest.fail("Claude leaf was dispatched for daemon reattach")) == []
 
 
 @pytest.mark.asyncio

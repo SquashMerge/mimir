@@ -121,6 +121,8 @@ def test_detached_launch_drops_each_credential_carrier(
 async def test_local_compute_filters_spec_env_in_child_and_logs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Direct-capture filtering is independent of Cultivate's contained launcher.
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "plain-canary")
     backend = compute.LocalSubprocessComputeBackend()
     spec = compute.WorkSpec(
@@ -143,8 +145,9 @@ async def test_local_compute_filters_spec_env_in_child_and_logs(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("name", "endpoint"), _SENSITIVE_ENDPOINTS)
 async def test_local_compute_drops_sensitive_endpoint_without_safe_override(
-    tmp_path: Path, name: str, endpoint: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, endpoint: str,
 ) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     backend = compute.LocalSubprocessComputeBackend()
     spec = compute.WorkSpec(
         1949, 1, "repo", "main", "issue/1949", "prompt", None, "true", "local", 30,
@@ -167,8 +170,9 @@ async def test_local_compute_drops_sensitive_endpoint_without_safe_override(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("name", "value"), tuple(_OTLP_CARRIERS.items()))
 async def test_local_compute_drops_each_credential_carrier(
-    tmp_path: Path, name: str, value: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str,
 ) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     backend = compute.LocalSubprocessComputeBackend()
     spec = compute.WorkSpec(
         1949, 1, "repo", "main", "issue/1949", "prompt", None, "true", "local", 30,
@@ -223,7 +227,7 @@ def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(name: 
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
-    expected_protocol = "worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch"
+    expected_protocol = "worklink-executor-v18-private-claude-profiles"
     assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_exec.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_client.MAX_REQUEST_BYTES == worker_exec.MAX_REQUEST_BYTES == 256 * 1024
@@ -869,7 +873,8 @@ async def test_provider_worker_wire_fd_identity_launch_wait_cancel(
 
 
 @pytest.mark.asyncio
-async def test_provider_compute_launch_wait_and_cancel(tmp_path: Path) -> None:
+async def test_provider_compute_launch_wait_and_cancel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     backend = compute.LocalSubprocessComputeBackend()
     def spec(command):
         return compute.WorkSpec(

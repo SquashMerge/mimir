@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import errno
 import inspect
+import json
 import os
 import shlex
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
@@ -32,6 +34,13 @@ from mimir_cultivate.worklink.checkout import (
 @pytest.fixture(autouse=True)
 def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+    # Setup, production calls and assertions must resolve the same fixture-owned
+    # identity, including when the invoking controller supplies command config.
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     previous = os.umask(0o022)
     try:
         yield
@@ -1933,6 +1942,139 @@ def _clean_git_env() -> dict[str, str]:
     env["HOME"] = "/nonexistent"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     return env
+
+
+@pytest.mark.parametrize("injection", ["count", "parameters", "legacy-parameters", "both"])
+def test_subscription_verification_isolates_only_inherited_git_identity(tmp_path: Path, injection: str) -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts/verify_claude_subscription.sh"
+    repo = tmp_path / "operator's repo"
+    repo.mkdir()
+    env = _clean_git_env()
+    url_key = ("credential.https://example.test/repo.helper" if injection == "legacy-parameters"
+               else "credential.https://example.test/repo?scope=fixture.helper")
+    entries = [
+        ("user.name", "Controller Name"),
+        ("credential.helper", "!fixture-helper --scope=test"),
+        ("safe.directory", str(repo)),
+        ("USER.email", "controller@example.test"),
+        ("credential.helper", ""),
+        (url_key, "!fixture-url-helper --label=operator's"),
+        ("fixture.enabled", "true"),
+    ]
+    if injection in {"count", "both"}:
+        env["GIT_CONFIG_COUNT"] = str(len(entries))
+        for index, (key, value) in enumerate(entries):
+            env[f"GIT_CONFIG_KEY_{index}"] = key
+            env[f"GIT_CONFIG_VALUE_{index}"] = value
+    if injection != "count":
+        def quoted(value: str) -> str:
+            return "'" + value.replace("'", "'\\''") + "'"
+        env["GIT_CONFIG_PARAMETERS"] = " ".join(
+            quoted(key + "=" + value) if injection == "legacy-parameters"
+            else quoted(key) + "=" + quoted(value)
+            for key, value in entries[:-1]
+        ) + " 'fixture.enabled'"
+    child = r'''
+import json
+import subprocess
+import sys
+
+repo = sys.argv[1]
+copies = int(sys.argv[2])
+def git(*args):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+
+git("init", "-q")
+checks = {
+    "inherited_identity_removed": all(git("config", "--get", key).returncode == 1
+                                      for key in ("user.name", "user.email")),
+    "credential_helpers_preserved": git("config", "--get-all", "credential.helper").stdout
+                                    == "!fixture-helper --scope=test\n\n" * copies,
+    "safe_directory_preserved": git("config", "--get-all", "safe.directory").stdout == (repo + "\n") * copies,
+    "boolean_config_preserved": git("config", "--bool", "--get", "fixture.enabled").stdout == "true\n",
+    "url_helper_preserved": git("config", "--get", sys.argv[3]).stdout
+                            == "!fixture-url-helper --label=operator's\n",
+}
+git("config", "user.name", "Fixture Name")
+git("config", "user.email", "fixture@example.test")
+checks["fixture_identity_observed"] = (
+    git("config", "--get", "user.name").stdout == "Fixture Name\n"
+    and git("config", "--get", "user.email").stdout == "fixture@example.test\n"
+)
+checks["fixture_can_commit"] = git("commit", "-q", "--allow-empty", "-m", "fixture").returncode == 0
+print(json.dumps(checks))
+'''
+    observed = subprocess.run(
+        ["sh", str(script), "--test-env", sys.executable, "-c", child, str(repo),
+         "2" if injection == "both" else "1", url_key],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    checks = json.loads(observed.stdout)
+    assert checks["inherited_identity_removed"]
+    assert checks["credential_helpers_preserved"]
+    assert checks["safe_directory_preserved"]
+    assert checks["boolean_config_preserved"]
+    assert checks["url_helper_preserved"]
+    assert checks["fixture_identity_observed"]
+    assert checks["fixture_can_commit"]
+
+
+def test_subscription_verification_filters_identity_before_every_pytest(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts/verify_claude_subscription.sh"
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "package.json").write_text("{}")
+    repo = tmp_path / "repo"
+    env = _clean_git_env()
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    report = tmp_path / "report.jsonl"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+import subprocess
+import sys
+
+if "pytest" in sys.argv:
+    def config(key):
+        return subprocess.run(["git", "-C", os.environ["TEST_GIT_REPO"], "config", "--get", key],
+                              capture_output=True, text=True)
+    checks = {
+        "identity_removed": all(config(key).returncode == 1 for key in ("user.name", "user.email")),
+        "helper_preserved": config("credential.helper").stdout == "!fixture-helper\n",
+        "safe_directory_preserved": config("safe.directory").stdout == os.environ["TEST_GIT_REPO"] + "\n",
+        "full_suite": "tests" in sys.argv,
+        "cultivate": os.environ.get("MIMIR_PLUGINS") == "cultivate",
+        "acl": os.environ.get("MIMIR_ACCESS_CONTROL_ENFORCED") == "1",
+    }
+    with open(os.environ["TEST_VERIFICATION_REPORT"], "a") as output:
+        output.write(json.dumps(checks) + "\n")
+''')
+    uv.chmod(0o755)
+    entries = [("user.name", "Controller Name"), ("credential.helper", "!fixture-helper"),
+               ("user.email", "controller@example.test"), ("safe.directory", str(repo))]
+    env.update({
+        "PATH": str(bin_dir) + os.pathsep + env["PATH"],
+        "GIT_CONFIG_COUNT": str(len(entries)),
+        "TEST_GIT_REPO": str(repo),
+        "TEST_VERIFICATION_REPORT": str(report),
+        # The fixture uv does not run heavy work or acquire a host lease.
+        "MIMIR_HEAVY_LOCK_FILE": "",
+    })
+    for index, (key, value) in enumerate(entries):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    subprocess.run(["sh", str(script), "leaf", str(package)], env=env,
+                   capture_output=True, text=True, check=True)
+    checks = [json.loads(line) for line in report.read_text().splitlines()]
+    assert len(checks) == 22
+    assert all(item["identity_removed"] for item in checks)
+    assert all(item["helper_preserved"] and item["safe_directory_preserved"] for item in checks)
+    assert [(item["cultivate"], item["acl"]) for item in checks if item["full_suite"]] == [
+        (False, False), (False, True), (True, False), (True, True),
+    ]
 
 
 def test_isolated_checkout_can_commit_without_an_ambient_identity(tmp_path: Path) -> None:
