@@ -844,6 +844,7 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
                 "id": requests[0]["id"],
                 "status": "started",
                 "pid": 123,
+                "process_start_ticks": 456,
             }).encode()
 
         def close(self) -> None:
@@ -869,6 +870,7 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     process._socket.close()
 
     request = requests[0]
+    assert process.process_start_ticks == 456
     assert request["op"] == ("launch_factory" if factory else "launch_path")
     assert request["path"] == str(checkout)
     assert request["run_uid"] == (synthetic_worklink_identities.worklink_uid if factory else 1002)
@@ -3192,6 +3194,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
         return SimpleNamespace(pid=123, returncode=0)
 
     monkeypatch.setattr(worker_exec.subprocess, "Popen", popen)
+    monkeypatch.setattr(worker_exec, "process_start_ticks", lambda pid: 456)
     responses = []
     send_flags = []
 
@@ -3220,6 +3223,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
     assert events[-1] == "supervisor-exec"
     assert factory_request["argv"] == payload
     assert [response["status"] for response in responses] == ["started", "event", "terminal"]
+    assert responses[0]["process_start_ticks"] == 456
     assert send_flags == [0, socket.MSG_DONTWAIT, socket.MSG_DONTWAIT]
     assert responses[1] == {
         "kind": "event", "event": "worklink_factory_orphan_adopted", "pid": 456,

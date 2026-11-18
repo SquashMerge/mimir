@@ -69,6 +69,7 @@ async def test_claude_containment_does_not_depend_on_compute_name(order, monkeyp
 
     class Process:
         pid = os.getpid()
+        process_start_ticks = 123
         timed_out = output_overflow = False
 
         async def wait(self):
@@ -84,12 +85,14 @@ async def test_claude_containment_does_not_depend_on_compute_name(order, monkeyp
             pass
 
     monkeypatch.setattr(compute, "_local_child_env", lambda: pytest.fail("controller fallback"))
+    monkeypatch.setattr("mimir_cultivate.worklink.run_state.process_start_ticks", lambda pid: None)
     backend = compute.LocalSubprocessComputeBackend(name="renamed-substrate", _worker_uid=os.getuid(), _worker_client=Client())
     handle = await backend.launch(spec)
     result = await backend.wait(handle, 30)
     await backend.cleanup(handle)
     assert result.children_reaped
     assert handle.substrate == "renamed-substrate"
+    assert handle.process_start_ticks == 123
     assert len(launches) == 1
     launch = launches[0]
     assert launch["home_projection_profile"] == "claude_leaf"

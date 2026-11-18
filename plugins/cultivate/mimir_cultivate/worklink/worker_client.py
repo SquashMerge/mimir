@@ -235,6 +235,7 @@ class WorkerProcess:
     output_overflow: bool = False
     stdout_bytes: int = 0
     stderr_bytes: int = 0
+    process_start_ticks: int | None = None
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -725,7 +726,10 @@ class WorkerClient:
                 raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "started":
                 raise RuntimeError("worker executor returned an invalid launch response")
-            return WorkerProcess(identifier, int(response["pid"]), sock)
+            ticks = response.get("process_start_ticks")
+            if ticks is not None and (type(ticks) is not int or ticks < 0):
+                raise RuntimeError("worker executor returned an invalid process identity")
+            return WorkerProcess(identifier, int(response["pid"]), sock, process_start_ticks=ticks)
         except Exception:
             sock.close()
             raise

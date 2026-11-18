@@ -1368,7 +1368,12 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         with _jobs_lock:
             _jobs[identifier] = proc
             _launching.remove(identifier)
-        _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
+        # Capture birth identity while the executor still owns the unreaped PID.
+        # The controller may receive this after a short-lived supervisor exits.
+        _send(connection, {
+            "id": identifier, "status": "started", "pid": proc.pid,
+            "process_start_ticks": process_start_ticks(proc.pid),
+        })
         exit_code, timed_out, output_overflow, stdout_bytes, stderr_bytes = _wait_with_output_limits(
             proc,
             timeout_s,

@@ -964,8 +964,8 @@ class LocalSubprocessComputeBackend:
                 await asyncio.gather(task, return_exceptions=True)
                 raise ComputeLaunchError(str(exc)) from exc
         pid = getattr(process, "pid", None)
-        ticks = None
-        if isinstance(pid, int):
+        ticks = getattr(process, "process_start_ticks", None)
+        if ticks is None and isinstance(pid, int):
             from .run_state import process_start_ticks
 
             ticks = process_start_ticks(pid)
