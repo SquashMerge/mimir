@@ -9481,12 +9481,27 @@ def _valid_scoped_pr_grant(
             return refuse(code)
         if grant.lease_identity != (str(live.path), live.recovery_id):
             return refuse("grant_lease_mismatch")
+        if _recovery_tool_refusal(review_state, tool_name):
+            return False
     try:
         if protocol.validate_scope(action, scope, grant) is not True:
             return refuse("grant_scope_validation_failed")
         return True
     except (TypeError, ValueError, AttributeError):
         return refuse("grant_scope_validation_failed")
+
+
+def _recovery_tool_refusal(review_state: Any, tool_name: str | None) -> str | None:
+    interrupted = getattr(getattr(review_state, "checkout_lease", None), "interrupted_operation", None)
+    if interrupted is None or tool_name is None or not tool_name.startswith("repo_"):
+        return None
+    if tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"}:
+        return None
+    scope = getattr(review_state, "action_scope", None)
+    if (tool_name == "repo_rebase" and interrupted.kind == "rebase"
+            and getattr(scope, "event_type", None) == "pr_mergeability_conflicting"):
+        return None
+    return f"Interrupted {interrupted.kind} on {interrupted.branch}; call {interrupted.abort_tool} first."
 
 
 def register_server_discovered_review_grant(auth_context: AuthContext, state: Any) -> None:
@@ -9640,6 +9655,7 @@ def authorize_repo_pr_tool(
         auth_context, owner, action, protocol, scope, review_state, tool_name=tool_name,
         diagnostics=grant_diagnostics,
     )
+    recovery_refusal = _recovery_tool_refusal(review_state, tool_name)
     in_scope = (
         scope is not None
         and not missing_actions
@@ -9681,7 +9697,7 @@ def authorize_repo_pr_tool(
     return ToolAuthorization(
         tool_name=tool_name,
         decision=OperationDecision.RESOURCE_SCOPED,
-        allowed=in_scope or not enforce,
+        allowed=bool((in_scope or not enforce) and not recovery_refusal),
         reason=None if in_scope else (
             "repo_pr_grant_denied" if registered_plugin and (
                 scope is None or missing_actions or not grant_valid
@@ -9694,12 +9710,14 @@ def authorize_repo_pr_tool(
         is_shadow_decision=not enforce and not in_scope,
         would_block=not in_scope,
         refusal_detail=(
-            (_OWN_PR_REVIEW_REFUSAL if own_pr_review
-             else f"scope does not grant {', '.join(missing_actions)}")
-            if report_required_actions and missing_actions
-            else "Call repo_checkout(repository, pull_request) for this repository and PR first."
-            if checkout_first
-            else None
+            recovery_refusal or (
+                (_OWN_PR_REVIEW_REFUSAL if own_pr_review
+                 else f"scope does not grant {', '.join(missing_actions)}")
+                if report_required_actions and missing_actions
+                else "Call repo_checkout(repository, pull_request) for this repository and PR first."
+                if checkout_first
+                else None
+            )
         ),
         flow_direction=flow_direction,
         repo_pr_action_scope=scope,
@@ -11227,6 +11245,9 @@ def _pr_checkout_lease_attestation(
     if not recorded_head:
         return verdict(False, LeaseAttestationReason.MISSING_RECORDED_HEAD)
     observed_state = _observed_checkout_state(path)
+    recovery_state = getattr(lease, "recovery_checkout_state", None)
+    if callable(recovery_state):
+        observed_state = recovery_state(scope) or observed_state
     if observed_state is None:
         reason = _lease_refusal_reason.get()
         return verdict(False, reason or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
@@ -11636,6 +11657,9 @@ def protected_result_source(
         if scope is not None or lease is not None:
             lease_attestation = pr_checkout_lease_attestation(auth_context, scope, lease)
             trusted_lease = lease_attestation.ok
+            # Recovery attests the pre-operation branch, never interrupted files.
+            if getattr(getattr(review_state, "checkout_lease", None), "interrupted_operation", None) is not None:
+                trusted_lease = False
             if not trusted_lease:
                 log_pr_checkout_lease_attestation_refused(
                     auth_context, scope if scope is not None else lease,

@@ -8401,6 +8401,100 @@ def test_real_repo_execution_fault_taints_turn(
     assert auth.ifc_state.current(auth.ifc_labels).sources
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+@pytest.mark.parametrize("contamination", [None, "outside", "interrupted_file"])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_recovery_diagnostics_allow_same_turn_abort_through_ifc(
+    tmp_path, monkeypatch, async_mode, kind, contamination,
+):
+    from mimir.access_control import protected_result_source
+    from mimir_cultivate import repository
+    from tests.test_repo_tools import _interrupted_lease
+
+    old, scope, state, runtime = _interrupted_lease(tmp_path, monkeypatch, kind=kind)
+    # The local bare remote stands in for this exact configured GitHub origin.
+    # Keep real Git, lease attestation, tool authorization and IFC result capture.
+    monkeypatch.setattr(
+        "mimir.access_control._github_repo_from_remote",
+        lambda origin: scope.canonical_repo if origin == scope.canonical_origin else None,
+    )
+    auth = _repo_granted_auth(runtime.context, scope, state, follow_on=False)
+    assert auth.enforcement_enabled and auth.ifc_state is not None
+    turn = _ifc_turn(auth)
+    gate = _selected_repo_middleware()
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    executed = []
+
+    def handler(request):
+        name = request.tool_call["name"]
+        executed.append(name)
+        value = getattr(repository, name).func(**args, runtime=request.runtime)
+        return ToolMessage(content=json.dumps(value), tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request):
+        return handler(request)
+
+    async def invoke(name):
+        request = _make_request(name, f"recovery-{name}", auth, args)
+        if async_mode:
+            return await gate.awrap_tool_call(request, async_handler)
+        return gate.wrap_tool_call(request, handler)
+
+    async def sequence():
+        checkout = await invoke("repo_checkout")
+        assert checkout.status != "error", checkout.content
+        assert json.loads(checkout.content)["status"] == "recovery"
+        assert state.checkout_lease.path == old.path
+        for name in ("repo_status", "repo_unmerged"):
+            diagnostic = await invoke(name)
+            assert diagnostic.status != "error", diagnostic.content
+            assert json.loads(diagnostic.content)["ok"]
+        assert "tracked.txt" in json.loads(diagnostic.content)["stdout"]
+        labels = auth.ifc_state.current(auth.ifc_labels)
+        assert labels.sources
+        assert not labels.has_untrusted_active_ingest
+        assert all(source.domain == "repository" and source.resource_id == (
+            f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"
+        ) for source in labels.sources)
+
+        if contamination == "interrupted_file":
+            # The diagnostics' attested scope must NOT make interrupted file
+            # contents trusted or exempt them from the ordinary write veto.
+            source = protected_result_source(
+                auth, principal=None, domain="filesystem",
+                resource_id=str(old.path / "tracked.txt"), bridge_instance="filesystem",
+            )
+            assert source.integrity == "untrusted"
+            assert source.integrity_effect == "active_ingest"
+            auth.ifc_state.merge(InformationFlowLabels().with_source(source))
+        elif contamination == "outside":
+            auth.ifc_state.merge(_active_ingest_result_labels())
+
+        abort_name = f"repo_{kind}_abort"
+        aborted = await invoke(abort_name)
+        if contamination:
+            assert aborted.status == "error"
+            assert "untrusted" in str(aborted.content)
+            assert abort_name not in executed
+            assert state.checkout_lease.interrupted_operation is not None
+            return
+        assert aborted.status != "error", aborted.content
+        assert json.loads(aborted.content)["ok"]
+        assert state.checkout_lease.interrupted_operation is None
+        diff = await invoke("repo_diff")
+        assert diff.status != "error", diff.content
+        assert json.loads(diff.content)["ok"]
+        assert executed == ["repo_checkout", "repo_status", "repo_unmerged", abort_name, "repo_diff"]
+        assert not auth.ifc_state.current(auth.ifc_labels).has_untrusted_active_ingest
+
+    token = set_current_turn(turn)
+    try:
+        asyncio.run(sequence())
+    finally:
+        reset_current_turn(token)
+
+
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_bound_repo_checkout_post_fetch_failure_does_not_taint_turn(
     monkeypatch: pytest.MonkeyPatch,

@@ -594,7 +594,10 @@ def _live_scoped_pr_lease(
             or attached.destination_ref != scope.destination_ref
             or getattr(review_state, "action_scope", None) is not scope):
         return refuse("lease identity or bound review state differs from scope")
-    observed = _observed_checkout_state(path)
+    try:
+        observed = attached.recovery_checkout_state(scope) or _observed_checkout_state(path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return refuse(f"invalid interrupted checkout: {exc}")
     if isinstance(observed, str):
         return refuse(f"checkout Git state differs from scope: {observed}")
     if observed != (
