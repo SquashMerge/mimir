@@ -4134,7 +4134,8 @@ class WorklinkRunner:
             try:
                 await compute.cancel(handle)
             except BaseException as exc:
-                factory_record = replace(factory_record, controller_error=_factory_controller_error(exc))
+                factory_record = replace(factory_record, children_reaped=False,
+                                         controller_error=_factory_controller_error(exc))
                 save_factory_record(self.home, factory_record)
                 _write_factory_host_evidence(self.home, factory_record, "failed", _factory_controller_error(exc))
                 raise
