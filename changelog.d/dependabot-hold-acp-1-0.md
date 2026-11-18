@@ -1,0 +1,1 @@
+- Hold `agent-client-protocol` at 0.12.0 in Dependabot until mimir's ACP 1.0 support is redesigned (chainlink #2170); a version bump cannot migrate the adapter.

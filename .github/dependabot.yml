@@ -26,13 +26,15 @@ updates:
       - dependency-name: "claude-agent-sdk"
     open-pull-requests-limit: 10
     ignore:
-      # Stay on agent-client-protocol==0.12.0 until a planned migration to ACP
-      # 1.0. The 0.12.1 SDK refactor (python-sdk#132) removed the acp.task
-      # internals mimir/acp/sdk.py builds on, so mimir.acp would not import
-      # (Dependabot #2281). The range also skips 1.0 pre-releases; the final
-      # 1.0.0 still opens a PR in the agent-protocols group.
+      # Stay on agent-client-protocol==0.12.0 until mimir's ACP 1.0 support is
+      # redesigned (chainlink #2170). The 0.12.1 SDK refactor (python-sdk#132)
+      # removed the acp.task internals mimir/acp/sdk.py builds on (Dependabot
+      # #2281), and 1.0.0 removed the Connection hooks (state_store, queue,
+      # dispatcher_factory) that carry mimir's request bounds and pre-auth
+      # refusal (Dependabot #99/#118, leaf #2160). A version bump cannot do
+      # this migration; lift this ignore in the #2170 plan's final step.
       - dependency-name: "agent-client-protocol"
-        versions: [">=0.12.1, <1.0.0"]
+        versions: [">=0.12.1"]
     groups:
       # Protocol/adapter surfaces get their own PR, all update types, so they
       # are never buried in the rolling minor/patch PR. First matching group
