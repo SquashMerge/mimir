@@ -266,6 +266,9 @@ async def test_tree_activity_paginates_all_descendants_and_ignores_unowned_shell
         leaf = daemon.child(sibling, updated_ms=4000, directory=str(tmp_path / "moved"))
         daemon.activity(leaf, 5000)
         daemon.start_shell("ses_foreign", str(tmp_path))
+        # The root driver's lifetime heartbeat shell must not mask either the
+        # idle tree or the later specialist-shell completion.
+        daemon.start_shell(root, str(tmp_path))
         result = await controller.tree_activity()
         assert result == {"opencode_session_id": root, "last_activity_session_id": leaf,
                           "last_activity_at_ms": 5000, "pending_form": False, "running_shell": False}

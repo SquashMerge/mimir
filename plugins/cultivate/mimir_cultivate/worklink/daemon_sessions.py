@@ -465,10 +465,14 @@ class SessionController:
             if updated > latest:
                 latest, source = updated, sid
             pending_form = bool(await self._bounded(self.client.pending_forms(sid))) or pending_form
+        # The driver owns a lifetime lock-refresh shell. It is not work and
+        # must not disable the idle watchdog; only descendant specialists'
+        # running shells are activity. Ownership is metadata, not command text.
+        specialists = seen - {root}
         running_shell = False
         for directory in sorted(directories):
             shells = await self._bounded(self.client.running_shells(directory))
-            running_shell |= any(shell.get("metadata", {}).get("sessionID") in seen for shell in shells)
+            running_shell |= any(shell.get("metadata", {}).get("sessionID") in specialists for shell in shells)
         return {"opencode_session_id": root, "last_activity_at_ms": latest,
                 "last_activity_session_id": source, "pending_form": pending_form,
                 "running_shell": running_shell}

@@ -1413,7 +1413,7 @@ def supervisor_clock(monkeypatch):
 
 
 @pytest.mark.parametrize("observation_path", ["normal", "missed-status"])
-@pytest.mark.parametrize("activity", ["driver", "child", "grandchild", "quiet", "question", "pending-form", "shell", "budget"])
+@pytest.mark.parametrize("activity", ["driver", "child", "grandchild", "quiet", "question", "pending-form", "shell", "driver-shell", "foreign-shell", "budget"])
 async def test_factory_idle_uses_session_tree_activity(
     tmp_path, monkeypatch, supervisor_clock, activity, observation_path,
 ):
@@ -1448,6 +1448,11 @@ async def test_factory_idle_uses_session_tree_activity(
         if activity == "shell":
             daemon.start_shell(grandchild, str(tmp_path / "moved-specialist"))
             daemon.sessions[grandchild].info["location"] = {"directory": str(tmp_path / "moved-specialist")}
+        elif activity in {"driver-shell", "foreign-shell"}:
+            # A long-lived driver lock-refresh shell is not progress. Authorize
+            # specialist work by metadata.sessionID, never by command text.
+            owner = handle.identifier if activity == "driver-shell" else unrelated["data"]["id"]
+            daemon.start_shell(owner, record.session_checkout)
         current = record.status
         reasons = []
         missed = False
@@ -1506,7 +1511,7 @@ async def test_factory_idle_uses_session_tree_activity(
         result = await asyncio.wait_for(invocation, 60)
         assert activity_reads and min(activity_reads) >= 7200
         assert missed == (observation_path == "missed-status")
-        if activity in {"quiet", "pending-form", "budget"}:
+        if activity in {"quiet", "pending-form", "driver-shell", "foreign-shell", "budget"}:
             assert result.status == "needs-human" and len(reasons) == 1
             if activity == "budget":
                 assert reasons[0].startswith("budget exhausted")

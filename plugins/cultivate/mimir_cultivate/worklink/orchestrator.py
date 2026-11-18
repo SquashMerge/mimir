@@ -4392,7 +4392,8 @@ class WorklinkRunner:
             if handle.substrate != "opencode_daemon":
                 return f"factory driver idle: no progress since {last_change_at}"
             activity = await compute.session_tree_activity(handle)
-            # A shell is useful work even while its session is quiet (#105).
+            # A descendant specialist's shell is useful work even while its
+            # session is quiet (#105); the activity reader excludes driver shells.
             # Forms are not heartbeats: do not mask #2164 with their timestamps
             # (or updates to a driver waiting for the blocked specialist).
             if activity["running_shell"]:
