@@ -2,6 +2,51 @@
 # Offline subscription-route evidence. Never invoke a live coding CLI here.
 set -eu
 
+# This wrapper is also usable around the separate repository test command.
+# Never use it around publishing, factory controls or deployment commands.
+if [ "${1:-}" = --test-env ]; then
+    shift
+    exec python3 - "$@" <<'PY'
+import os
+import shlex
+import sys
+
+env = dict(os.environ)
+identity_keys = {"user.name", "user.email"}
+try:
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    if count < 0:
+        raise ValueError
+    retained = []
+    for index in range(count):
+        key = env.pop(f"GIT_CONFIG_KEY_{index}")
+        value = env.pop(f"GIT_CONFIG_VALUE_{index}")
+        if key.lower() not in identity_keys:
+            retained.append((key, value))
+    if "GIT_CONFIG_COUNT" in env:
+        env["GIT_CONFIG_COUNT"] = str(len(retained))
+    for index, (key, value) in enumerate(retained):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    if "GIT_CONFIG_PARAMETERS" in env:
+        parameters = shlex.split(env["GIT_CONFIG_PARAMETERS"])
+        env["GIT_CONFIG_PARAMETERS"] = " ".join(
+            "'" + item.replace("'", "'\\''") + "'" for item in parameters
+            if item.partition("=")[0].lower() not in identity_keys
+        )
+except (KeyError, ValueError):
+    sys.exit("invalid inherited Git test configuration")
+if len(sys.argv) < 2:
+    sys.exit("test environment wrapper requires a command")
+os.execvpe(sys.argv[1], sys.argv[1:], env)
+PY
+fi
+
+isolated=0
+if [ "${1:-}" = --isolated-tests ]; then
+    isolated=1
+    shift
+fi
 if [ "$#" -ne 2 ] || [ "$1" != leaf ]; then
     echo "usage: sh scripts/verify_claude_subscription.sh leaf <inspected-plugin-package>" >&2
     exit 64
@@ -11,6 +56,9 @@ case "$2" in
     *) echo "inspected package root must be absolute" >&2; exit 64 ;;
 esac
 test -r "$2/package.json"
+if [ "$isolated" = 0 ]; then
+    exec sh "$0" --test-env sh "$0" --isolated-tests "$@"
+fi
 export MIMIR_TEST_CLAUDE_FACTORY_ROOT="$2"
 cd "$(dirname "$0")/.."
 # Secure output readers open ancestors for reading, not merely traversal. The
