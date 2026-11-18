@@ -148,8 +148,11 @@ class ComputeBackend(Protocol):
 
 
 class ComputeCleanupError(RuntimeError):
-    def __init__(self, handle: LaunchHandle) -> None:
-        super().__init__("daemon session quiescence unverified; retain checkout and recovery state")
+    def __init__(self, handle: LaunchHandle, detail: str = "") -> None:
+        from mimir_cultivate.opencode import redact_daemon_output
+
+        super().__init__("daemon session quiescence unverified; retain checkout and recovery state" +
+                         (": " + redact_daemon_output(detail)[:8192] if detail else ""))
         self.handle = handle
 
 
@@ -370,14 +373,14 @@ class OpenCodeDaemonComputeBackend:
         try:
             await self._client.session_cancel(handle)
         except (OSError, RuntimeError, ValueError) as exc:
-            raise ComputeCleanupError(handle) from exc
+            raise ComputeCleanupError(handle, str(exc)) from exc
         self._quiescent.add(handle.identifier)
 
     async def cleanup(self, handle: LaunchHandle) -> None:
         try:
             await self._client.session_release(handle)
         except (OSError, RuntimeError, ValueError) as exc:
-            raise ComputeCleanupError(handle) from exc
+            raise ComputeCleanupError(handle, str(exc)) from exc
         self._deadlines.pop(handle.identifier, None)
 
 

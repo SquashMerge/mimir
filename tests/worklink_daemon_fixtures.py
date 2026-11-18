@@ -271,9 +271,24 @@ class FakeOpenCodeDaemon:
     def start_shell(self, session_id: str, directory: str, command: str = "sh scripts/heavy_run.sh pytest") -> str:
         shell_id = self._id("sh")
         self.shells[shell_id] = {"id": shell_id, "status": "running", "command": command, "cwd": directory,
-                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 4242,
+                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 1073741824,
                                  "metadata": {"sessionID": session_id}, "time": {"started": 1}}
         return shell_id
+
+    def child_session(self, parent_id: str, directory: str) -> str:
+        info = copy.deepcopy(self.sessions[parent_id].info)
+        info.update(id=self._id("ses"), parentID=parent_id, location={"directory": directory})
+        self.schema.named("Session.Info", info)
+        self.sessions[info["id"]] = SyntheticSession(info)
+        return info["id"]
+
+    def move_session(self, session_id: str, directory: str) -> None:
+        state = self.sessions[session_id]
+        message = {"id": self._id("msg"), "time": {"created": 2}, "type": "location-switched",
+                   "location": {"directory": directory}, "previous": {"location": state.info["location"]}}
+        self.schema.named("Session.Message.LocationSwitched", message)
+        state.messages.append(message)
+        state.info["location"] = {"directory": directory}
 
     def end_shell(self, shell_id: str, status: str = "exited", *, resume: bool = False) -> None:
         """Finish a shell; ``resume`` queues the daemon's synthetic resume, not yet admitted."""

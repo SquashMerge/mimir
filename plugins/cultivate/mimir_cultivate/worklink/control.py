@@ -404,10 +404,15 @@ def stop_worklink(
                         latest = load_factory_record(home, factory.run_id)
                         if after.lock_session not in {None, actual} or latest is None or latest.handle != factory.handle:
                             raise RuntimeError("factory host ownership changed during stop")
-                    except (RuntimeError, OSError, ValueError):
-                        _write_factory_host_evidence(home, factory, "failed", "session cancellation or ownership unverified")
+                    except (RuntimeError, OSError, ValueError) as exc:
+                        from .orchestrator import _factory_controller_error
+
+                        detail = _factory_controller_error(f"session cancellation or ownership unverified: {exc}")
+                        factory = replace(factory, children_reaped=False, controller_error=detail)
+                        save_factory_record(home, factory)
+                        _write_factory_host_evidence(home, factory, "failed", detail)
                         uncertain = True
-                        problems.append(f"factory {factory.run_id}: session cancellation or ownership unverified; state and claim retained")
+                        problems.append(f"factory {factory.run_id}: {detail}; state and claim retained")
                         continue
                     stopped = replace(latest.observed(after, datetime.now(UTC).isoformat()),
                         controller_phase="terminal" if after.is_terminal else "parked" if after.is_parked else "stopped",

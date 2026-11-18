@@ -204,6 +204,27 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("session identity mismatch")
         return data
 
+    async def session_tree(self, session_id: str) -> list[dict[str, Any]]:
+        """One bounded walker for activity, questions, and cancellation.
+
+        ``children`` includes archived/moved descendants and owns pagination,
+        opaque cursors, adaptive page sizing, and direct parent validation.
+        Keep cross-page/parent identity and whole-tree bounds here.
+        """
+        tree = [await self.session_info(session_id)]
+        seen = {session_id}
+        size = len(json.dumps(tree[0]).encode())
+        for parent in tree:
+            for child in await self.children(parent["id"]):
+                if child["id"] in seen:
+                    raise DaemonClientError("invalid session descendant tree")
+                seen.add(child["id"])
+                tree.append(child)
+                size += len(json.dumps(child).encode())
+                if len(tree) > 4096 or size > 16 * MAX_ITEM_BYTES:
+                    raise DaemonClientError("session tree exceeds bound")
+        return tree
+
     async def children(self, session_id: str) -> list[dict[str, Any]]:
         """All direct children, including archived/moved sessions, with bounded pagination."""
         _identifier(session_id, "ses")

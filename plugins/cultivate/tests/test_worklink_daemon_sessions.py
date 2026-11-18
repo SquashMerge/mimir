@@ -142,7 +142,8 @@ async def test_question_observation_rejects_unbounded_descendant_tree(tmp_path, 
             return ([{"id": root}] if case == "cycle" else
                     [{"id": f"ses_child{i}"} for i in range(4096)])
         monkeypatch.setattr(client, "children", children)
-        with pytest.raises(DaemonClientError, match="invalid session descendant tree"):
+        reason = "invalid session descendant tree" if case == "cycle" else "session tree exceeds bound"
+        with pytest.raises(DaemonClientError, match=reason):
             await controller.observe()
 
 
@@ -278,6 +279,61 @@ async def test_tree_activity_paginates_all_descendants_and_ignores_unowned_shell
         assert blocked["last_activity_at_ms"] == 6000
         daemon.end_shell(shell)
         assert (await controller.tree_activity())["running_shell"] is False
+
+
+async def test_activity_question_and_epic_cancel_share_the_session_tree_walker(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        daemon.sessions[root].info["time"]["updated"] = 1000
+        daemon.session_page_limit = 1
+        daemon.child(root, updated_ms=2000)
+        archived = daemon.child(root, updated_ms=3000)
+        daemon.sessions[archived].info["time"]["archived"] = 3
+        leaf = daemon.child(archived, updated_ms=4000)
+        shell = daemon.start_shell(leaf, str(tmp_path))
+        read_tree = client.session_tree
+        witnesses = []
+
+        async def tracked_tree(sid):
+            tree = await read_tree(sid)
+            witnesses.append({session["id"] for session in tree})
+            return tree
+
+        monkeypatch.setattr(client, "session_tree", tracked_tree)
+        activity = await controller.tree_activity()
+        assert activity["last_activity_session_id"] == leaf
+        assert activity["last_activity_at_ms"] == 4000 and activity["running_shell"]
+        assert len(witnesses) == 1 and leaf in witnesses[-1]
+        assert (await controller.observe()).error is None
+        assert len(witnesses) == 2 and witnesses[-1] == witnesses[0]
+        daemon.question(leaf, 5000)
+        assert (await controller.observe()).error.type == "pending_question"
+        before_cancel = len(witnesses)
+        assert await controller.cancel()
+        assert len(witnesses) > before_cancel
+        assert all(tree == witnesses[0] for tree in witnesses)
+        assert daemon.shells[shell]["status"] == "killed"
+        assert not any(method != "GET" and "/form" in route for method, route, _, _ in daemon.requests)
+
+
+async def test_shared_session_tree_narrows_pages_and_keeps_archived_descendants(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, \
+            OpenCodeDaemonClient(**daemon.connection, max_item_bytes=64 * 1024) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        children = [daemon.child(root, updated_ms=2000 + i) for i in range(30)]
+        for sid in children:
+            daemon.sessions[sid].info["title"] = "x" * 6000
+        daemon.sessions[children[-1]].info["time"]["archived"] = 3
+        leaf = daemon.child(children[-1], updated_ms=5000)
+        tree = await client.session_tree(root)
+        assert [session["id"] for session in tree] == [root, *children, leaf]
+        pages = [params for method, route, params, _ in daemon.requests
+                 if method == "GET" and route == "/api/session"]
+        assert any(int(page["limit"]) < 100 for page in pages)
+        assert any("cursor" in page for page in pages)
+        assert all(set(page) == {"cursor", "limit"} for page in pages if "cursor" in page)
 
 
 @pytest.mark.parametrize("boundary", ["root", "child", "form", "timestamp", "duplicate", "cursor", "page"])
@@ -964,9 +1020,9 @@ class _RecordedClient:
         # The historical capture predates form observation; no questions were asked.
         return []
 
-    async def children(self, session_id):
+    async def session_tree(self, session_id):
         # Both captured inputs ran on this single root session.
-        return []
+        return [{"id": session_id}]
 
 
 def _captured_lifecycle():
