@@ -2199,6 +2199,7 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
 
     permission = session_permissions(spec.session_request)
     assert permission == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        {"action": "question", "resource": "*", "effect": "deny"},
         *[{"action": "read", "resource": pattern, "effect": "deny"}
           for pattern in (".env", "**/.env", "**/.env.*")]]
 
