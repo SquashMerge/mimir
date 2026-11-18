@@ -69,6 +69,8 @@ class SyntheticSession:
     messages: list[dict[str, Any]] = field(default_factory=list)
     log: list[dict[str, Any]] = field(default_factory=list)
     active: bool = False
+    forms: list[dict[str, Any]] = field(default_factory=list)
+    replies: list[dict[str, Any]] = field(default_factory=list)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -113,6 +115,8 @@ class FakeOpenCodeDaemon:
             "/api/session/{sessionID}/inbox": ["GET"],
             "/api/session/{sessionID}/inbox/{inboxID}": ["DELETE"],
             "/api/session/{sessionID}/interrupt": ["POST"],
+            "/api/session/{sessionID}/form": ["GET"],
+            "/api/session/{sessionID}/form/{formID}/reply": ["POST"],
             "/api/experimental/session/{sessionID}/log": ["GET"],
             "/api/shell": ["GET"], "/api/shell/{id}": ["DELETE"],
         }
@@ -143,6 +147,38 @@ class FakeOpenCodeDaemon:
     def _id(self, prefix: str) -> str:
         self._counter += 1
         return f"{prefix}_{self._counter:024d}"
+
+    def new_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Native Session.create model; explicit rules replace inherited rules.
+
+        Pinned by source-inspection's session_parent_lookup and
+        session_permission_inheritance; subagent_session_create omits rules.
+        """
+        operation = self.schema.operation("/api/session", "POST")
+        self.schema.validate(payload, operation["requestBody"]["content"]["application/json"]["schema"])
+        info = json.loads(self.recorded["responses"]["POST /api/session location"]["body"])["data"]
+        info.update(copy.deepcopy(payload))
+        if payload.get("parentID"):
+            parent = self.sessions[payload["parentID"]].info
+            info["location"] = copy.deepcopy(parent["location"])
+            if payload.get("permissions") is None:
+                info["permissions"] = copy.deepcopy(parent.get("permissions", []))
+        info["id"] = self._id("ses")
+        self.schema.named("Session.Info", info)
+        self.sessions[info["id"]] = SyntheticSession(info)
+        return info
+
+    def question(self, session_id: str, *, title: str = "Questions",
+                 text: str = "Extend the slice with six test paths?") -> dict[str, Any]:
+        """Inject a pending question despite policy, to test the read-only backstop."""
+        form = {"id": self._id("frm"), "sessionID": session_id, "title": title,
+                "metadata": {"kind": "question"}, "fields": [
+                    {"key": "q0", "type": "string", "title": "Test paths", "description": text,
+                     "options": [{"value": label, "label": label} for label in (
+                         "Approve test-path amendment", "Keep current paths")], "custom": True}]}
+        self.schema.named("Form.Info", form)
+        self.sessions[session_id].forms.append(form)
+        return form
 
     def emit(self, session_id: str, event_type: str, **data: Any) -> dict[str, Any]:
         state = self.sessions[session_id]
@@ -280,17 +316,21 @@ class FakeOpenCodeDaemon:
             return web.Response(body=self.recorded["responses"][path]["body"].encode(), content_type="text/event-stream")
         if path == "/api/session":
             if request.method == "GET":
-                sessions = [s.info for s in self.sessions.values() if
-                            "parentID" not in request.query or s.info.get("parentID") == request.query["parentID"]]
-                offset = int(request.query.get("cursor", "0"))
-                limit = int(request.query.get("limit", "50"))
-                return self._response(request, {"data": sessions[offset:offset + limit], "cursor": {
-                    "previous": None, "next": str(offset + limit) if offset + limit < len(sessions) else None}})
-            info = json.loads(self.recorded["responses"]["POST /api/session location"]["body"])["data"]
-            info.update(copy.deepcopy(payload))
-            info["id"] = self._id("ses")
-            self.sessions[info["id"]] = SyntheticSession(info)
-            return self._response(request, {"data": info})
+                # Opaque cursor retains the original query, as the native list does.
+                query = dict(request.query)
+                offset = 0
+                if "cursor" in query:
+                    query, offset = json.loads(base64.urlsafe_b64decode(query["cursor"]))
+                data = [s.info for s in self.sessions.values()
+                        if "parentID" not in query or s.info.get("parentID") == query["parentID"]]
+                if query.get("order", "desc") == "desc":
+                    data.reverse()
+                limit = int(query.get("limit", "50"))
+                cursor = (base64.urlsafe_b64encode(json.dumps([query, offset + limit]).encode()).decode()
+                          if offset + limit < len(data) else None)
+                return self._response(request, {"data": data[offset:offset + limit],
+                                                "cursor": {"previous": None, "next": cursor}})
+            return self._response(request, {"data": self.new_session(payload)})
         if path == "/api/shell":
             directory = request.query.get("location[directory]")
             return self._response(request, {"location": {"directory": directory or "/"}, "data": [
@@ -308,6 +348,14 @@ class FakeOpenCodeDaemon:
             return self._response(request, {"_tag": "SessionNotFoundError", "sessionID": session_id,
                                             "message": "Synthetic session not found"}, 404)
         state = self.sessions[session_id]
+        if path.endswith("/form"):
+            return self._response(request, {"data": state.forms})
+        if path.endswith("/reply"):
+            # The request validator above pins this to Form.Reply, not a made-up
+            # answers array. Recording and removing it makes auto-reply observable.
+            state.replies.append(copy.deepcopy(payload))
+            state.forms[:] = [f for f in state.forms if f["id"] != request.match_info["formID"]]
+            return self._response(request, None, 204)
         if path.endswith("/log"):
             return await self._log(request, session_id)
         if path.endswith("/environment"):

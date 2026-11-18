@@ -238,6 +238,67 @@ class OpenCodeDaemonClient:
         await self._request("PUT", self._path(session_id, "environment"),
                             payload={"variables": dict(variables)}, status=204)
 
+    async def children(self, session_id: str) -> list[dict[str, Any]]:
+        """All direct children, not merely the default newest 50 sessions."""
+        _identifier(session_id, "ses")
+        children = []
+        seen_ids: set[str] = set()
+        seen_cursors: set[str] = set()
+        cursor = None
+        size = 0
+        while True:
+            result = _object(await self._request("GET", "/api/session", params=(
+                {"cursor": cursor, "limit": "100"} if cursor is not None else
+                {"parentID": session_id, "order": "asc", "limit": "100"})))
+            self._list(result)
+            size += len(json.dumps(result).encode())
+            for child in result["data"]:
+                try:
+                    _identifier(child.get("id"), "ses")
+                except ValueError:
+                    raise DaemonClientError("invalid child session identity") from None
+                if child.get("parentID") != session_id or child["id"] in seen_ids:
+                    raise DaemonClientError("invalid child session binding")
+                seen_ids.add(child["id"])
+                children.append(child)
+            if len(children) > 4096 or size > 16 * MAX_ITEM_BYTES:
+                raise DaemonClientError("session children exceed bound")
+            page = _object(result.get("cursor"))
+            if set(page) != {"previous", "next"} or any(
+                v is not None and (not isinstance(v, str) or len(v.encode()) > 4096)
+                for v in page.values()
+            ):
+                raise DaemonClientError("invalid session cursor")
+            cursor = page["next"]
+            if cursor is None:
+                return children
+            if cursor in seen_cursors:
+                raise DaemonClientError("repeated session cursor")
+            seen_cursors.add(cursor)
+
+    async def forms(self, session_id: str) -> list[dict[str, Any]]:
+        """Pending Form.Info entries only. Worklink deliberately has no reply API."""
+        result = _object(await self._request("GET", self._path(session_id, "form")))
+        self._list(result)
+        seen = set()
+        for form in result["data"]:
+            try:
+                _identifier(form.get("id"), "frm")
+            except ValueError:
+                raise DaemonClientError("invalid form identity") from None
+            if (form.get("sessionID") != session_id or form["id"] in seen
+                    or not isinstance(form.get("title"), str)
+                    or not isinstance(form.get("metadata", {}), dict)
+                    or not isinstance(form.get("fields"), list) or not form["fields"]):
+                raise DaemonClientError("invalid session form")
+            for field in form["fields"]:
+                if (not isinstance(field, dict) or not isinstance(field.get("key"), str)
+                        or field.get("type") not in {"string", "number", "integer", "boolean", "multiselect", "external"}
+                        or any(not isinstance(field[key], str) for key in ("title", "description") if key in field)):
+                    raise DaemonClientError("invalid form field")
+            seen.add(form["id"])
+        return result["data"]
+
     async def prompt(self, session_id: str, text: str, *, resume: bool = True) -> dict[str, Any]:
         result = _object(await self._request("POST", self._path(session_id, "prompt"),
                                             payload={"text": text, "resume": resume}))

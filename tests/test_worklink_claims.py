@@ -23,13 +23,221 @@ from mimir_cultivate.worklink.claims import (
     claim_records_from_comments,
     record_clean_park,
 )
-from mimir_cultivate.worklink.factory_state import FactoryRunRecord, FactoryStatus, save_factory_record
+from mimir_cultivate.worklink.factory_state import (
+    FactoryRunRecord, FactoryStatus, factory_issue_resource_lock, save_factory_record,
+)
 from mimir_cultivate.worklink.evidence import TestResult, WorklinkEvidence
 from mimir_cultivate.worklink.orchestrator import _write_evidence
 
 
 def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(list(args), returncode, stdout="", stderr="")
+
+
+@pytest.fixture
+def orphan_claims(tmp_path):
+    locks = {"2152": {"issue_id": 2152, "agent_id": "mimir-worklink"}}
+    releases, events = [], []
+
+    def runner(args):
+        if args[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"locks": locks}), "")
+        assert args[1:3] == ["locks", "release"], "reconciliation must not steal or change labels"
+        releases.append(int(args[3]))
+        locks.pop(args[3])
+        return completed(args)
+
+    claims = ChainlinkClaims(
+        agent_id="poller", home_path=tmp_path, runner=runner,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
+    return claims, locks, releases, events
+
+
+def test_orphan_lock_reconciliation_releases_and_logs_own_lock(orphan_claims, caplog):
+    claims, locks, releases, events = orphan_claims
+    with caplog.at_level("INFO"):
+        assert claims.reconcile_orphan_locks() == [2152]
+    assert not locks and releases == [2152]
+    assert events == [("worklink_lock_reconciled", {
+        "issue_id": 2152, "claimant": "mimir-worklink",
+        "reason": "no_run_state_or_live_controller_factory_absent_or_terminal",
+    })]
+    assert "issue_id=2152 claimant=mimir-worklink reason=" in caplog.text
+
+
+@pytest.mark.parametrize("claimant", ["human", "another-agent", None, ""])
+def test_orphan_lock_reconciliation_foreign_claimant_untouched(orphan_claims, claimant):
+    claims, locks, releases, _ = orphan_claims
+    locks["2152"]["agent_id"] = claimant
+    assert claims.reconcile_orphan_locks() == []
+    assert releases == [] and "2152" in locks
+
+
+def test_orphan_lock_reconciliation_rechecks_claimant_under_mutex(orphan_claims):
+    claims, locks, releases, _ = orphan_claims
+    original = claims.runner
+    reads = 0
+
+    def runner(args):
+        nonlocal reads
+        if args[1:3] == ["locks", "list"]:
+            reads += 1
+            if reads == 2:
+                locks["2152"]["agent_id"] = "human"
+        return original(args)
+
+    claims.runner = runner
+    assert claims.reconcile_orphan_locks() == []
+    assert reads == 2 and releases == []
+
+
+def test_orphan_lock_reconciliation_revalidates_after_backoff(orphan_claims):
+    claims, locks, releases, _ = orphan_claims
+    original = claims.runner
+    attempts = []
+
+    def runner(args):
+        if args[1:3] == ["locks", "release"]:
+            attempts.append(args)
+            return subprocess.CompletedProcess(args, 128, "", "Another git process seems to be running")
+        return original(args)
+
+    def sleep(_seconds):
+        locks["2152"]["agent_id"] = "human"
+
+    claims.runner = runner
+    claims.sleeper = sleep
+    assert claims.reconcile_orphan_locks() == []
+    assert len(attempts) == 1 and releases == []
+    assert locks["2152"]["agent_id"] == "human"
+
+
+def test_orphan_lock_reconciliation_failed_read_is_not_trusted(orphan_claims):
+    claims, _, releases, _ = orphan_claims
+    original = claims.runner
+    reads = 0
+
+    def runner(args):
+        nonlocal reads
+        result = original(args)
+        if args[1:3] == ["locks", "list"]:
+            reads += 1
+            if reads == 2:
+                return subprocess.CompletedProcess(args, 1, result.stdout, "lock read failed")
+        return result
+
+    claims.runner = runner
+    assert claims.reconcile_orphan_locks() == []
+    assert reads == 2 and releases == []
+
+
+@pytest.mark.parametrize("phase", ["spawned", "retained", "malformed", "symlink"])
+def test_orphan_lock_reconciliation_retained_run_untouched(tmp_path, orphan_claims, phase):
+    claims, _, releases, _ = orphan_claims
+    path = tmp_path / "state/worklink/runs/2152.json"
+    path.parent.mkdir(parents=True)
+    if phase == "symlink":
+        path.symlink_to(tmp_path / "missing")
+    else:
+        path.write_text("{" if phase == "malformed" else json.dumps({"phase": phase}))
+    assert claims.reconcile_orphan_locks() == []
+    assert releases == []
+
+
+def test_orphan_lock_reconciliation_live_controller_untouched(tmp_path, orphan_claims):
+    claims, _, releases, _ = orphan_claims
+    # A distinct descriptor owns the actual OS lease, with no run state at all.
+    with factory_issue_resource_lock(tmp_path, 2152) as acquired:
+        assert acquired
+        assert claims.reconcile_orphan_locks() == []
+        assert releases == []
+    assert claims.reconcile_orphan_locks() == [2152]
+
+
+@pytest.mark.parametrize("status,valid,release", [
+    ("running", True, False), ("needs-human", True, False),
+    ("completed", False, False), (None, True, False),
+    ("completed", True, True), ("blocked", True, True), ("partial", True, True),
+])
+@pytest.mark.parametrize("run_id", ["chainlink-2152", "2152"])
+def test_orphan_lock_reconciliation_factory_must_be_terminal(
+    tmp_path, orphan_claims, status, valid, release, run_id,
+):
+    claims, _, releases, _ = orphan_claims
+    sandbox = str(tmp_path / ".factory-sandboxes" / run_id)
+    record = FactoryRunRecord(
+        run_id=run_id, issue_id=2152, attempt=1, repository="owner/repo", base_ref="main",
+        branch="issue/2152", launcher=str(tmp_path / "launcher"), sandbox=sandbox,
+        session=None, handle=None, observed_at=None, controller_phase="terminal",
+        status=FactoryStatus(run_id=run_id, valid=valid, sandbox_path=sandbox, status=status)
+        if status is not None else None,
+    )
+    save_factory_record(tmp_path, record)
+    assert claims.reconcile_orphan_locks() == ([2152] if release else [])
+    assert releases == ([2152] if release else [])
+
+
+@pytest.mark.parametrize("damaged", ["factory", "run_directory", "factory_directory"])
+def test_orphan_lock_reconciliation_unreadable_state_fails_closed(tmp_path, orphan_claims, damaged):
+    claims, _, releases, _ = orphan_claims
+    root = tmp_path / "state/worklink"
+    root.mkdir(parents=True)
+    if damaged == "factory":
+        (root / "factory-runs").mkdir()
+        (root / "factory-runs/chainlink-2152.json").write_text("{")
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (root / ("runs" if damaged == "run_directory" else "factory-runs")).symlink_to(outside)
+    assert claims.reconcile_orphan_locks() == []
+    assert releases == []
+
+
+def test_orphan_lock_reconciliation_archived_factory_is_absent(tmp_path, orphan_claims):
+    claims, _, releases, _ = orphan_claims
+    archive = tmp_path / "state/worklink/factory-runs/archive"
+    archive.mkdir(parents=True)
+    # An archived unfinished record is historical, not a retained recovery handle.
+    (archive / "chainlink-2152.json").write_text('{"status":"running"}')
+    assert claims.reconcile_orphan_locks() == [2152]
+    assert releases == [2152]
+
+
+@pytest.mark.parametrize("contention", [True, False])
+def test_release_issue_failure_is_bounded_and_later_reconciled(tmp_path, orphan_claims, contention):
+    claims, _, releases, _ = orphan_claims
+    original = claims.runner
+    calls, sleeps = [], []
+
+    def runner(args):
+        if args[1:3] == ["locks", "release"]:
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1, "", "Another git process seems to be running"
+                                               if contention else "release not confirmed")
+        return original(args)
+
+    claims.runner = runner
+    claims.sleeper = sleeps.append
+    if contention:
+        with pytest.raises(_ChainlinkContentionExhausted):
+            claims.release_issue(2152)
+        assert len(calls) == 7 and sleeps == [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+    else:
+        assert claims.release_issue(2152) is False
+        assert len(calls) == 1 and sleeps == []
+    claims.runner = original
+    assert claims.reconcile_orphan_locks() == [2152]
+    assert releases == [2152]
+
+
+@pytest.mark.parametrize("payload", ["{", "{}", '{"locks":null}', '{"locks":[{}]}',
+                                      '{"locks":{"2152":true}}'])
+def test_orphan_lock_reconciliation_invalid_lock_table_fails_closed(orphan_claims, payload):
+    claims, _, releases, _ = orphan_claims
+    claims.runner = lambda args: subprocess.CompletedProcess(args, 0, payload, "")
+    assert claims.reconcile_orphan_locks() == []
+    assert releases == []
 
 
 @pytest.mark.parametrize("epic", [False, True])
