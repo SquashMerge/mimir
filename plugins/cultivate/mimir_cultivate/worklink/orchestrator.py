@@ -1094,6 +1094,25 @@ class WorklinkRunner:
         base_branch: str | None = None,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
+        # Fence reconciliation even before admission publishes durable run state.
+        with factory_issue_resource_lock(self.home, issue_id) as acquired:
+            if not acquired:
+                return WorklinkRunResult(issue_id, None, "refused", reason="issue resource lock unavailable")
+            return await self._run_under_issue_lock(
+                issue_id, backend_name=backend_name, dry_run=dry_run,
+                test_command=test_command, base_branch=base_branch, autonomous=autonomous,
+            )
+
+    async def _run_under_issue_lock(
+        self,
+        issue_id: int,
+        *,
+        backend_name: str | None = None,
+        dry_run: bool = False,
+        test_command: str | None = None,
+        base_branch: str | None = None,
+        autonomous: bool = False,
+    ) -> WorklinkRunResult:
         incident_owner = self._begin_incident_invocation(autonomous)
         if autonomous and not dry_run:
             admission_reason = _autonomous_leaf_block_reason(self.home, issue_id)
@@ -1725,6 +1744,8 @@ class WorklinkRunner:
                             lease.authorization if lease is not None else None,
                             lease.path if lease is not None else None,
                             delete_checkout=delete_authorized_checkout,
+                            issue_id=issue.issue_id,
+                            attempt=record.attempt,
                         )
                     except Exception as exc:  # noqa: BLE001 - teardown must continue
                         _log_event(
@@ -2509,6 +2530,14 @@ class WorklinkRunner:
         )
 
     async def reattach(
+        self, issue_id: int, *, autonomous: bool = False
+    ) -> WorklinkRunResult:
+        with factory_issue_resource_lock(self.home, issue_id) as acquired:
+            if not acquired:
+                return WorklinkRunResult(issue_id, None, "refused", reason="issue resource lock unavailable")
+            return await self._reattach_under_issue_lock(issue_id, autonomous=autonomous)
+
+    async def _reattach_under_issue_lock(
         self, issue_id: int, *, autonomous: bool = False
     ) -> WorklinkRunResult:
         """Observe an owned durable session without admitting another input.
@@ -5780,6 +5809,8 @@ def _close_attempt_capabilities(
     checkout: Path | None,
     *,
     delete_checkout: bool,
+    issue_id: int,
+    attempt: int,
 ) -> None:
     try:
         if publication is not None:
@@ -5790,9 +5821,14 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                # Path-addressed attempts are siblings under one repository root.
-                # Delete only this attempt; removing the parent destroys concurrent runs.
-                rmtree_missing_ok(checkout)
+                from .worker_client import WorkerClient
+
+                # Worker-owned content is opaque to controller-side cleanup.
+                # The executor confines deletion to this one issued attempt.
+                WorkerClient.for_path_checkout(
+                    checkout, issue_id=issue_id, attempt=attempt,
+                    run_uid=get_identities().worklink_uid,
+                ).delete_attempt()
 
 
 def _release_issue_and_clear_run_state(
@@ -5803,7 +5839,12 @@ def _release_issue_and_clear_run_state(
     attempt: int,
     trigger_ready_scan: bool = False,
 ) -> bool:
-    """Release a claim, clear local state, then notify waiting autonomous work."""
+    """Release with bounded contention retry, clear state, then notify the queue.
+
+    Unconfirmed release is not a free slot. Once terminal cleanup clears the
+    run state and drops the controller lease, the dispatcher can reconcile it.
+    Retained recovery state remains a fence against that reconciliation.
+    """
     try:
         released = claims.release_issue(issue_id)
     except BaseException as exc:

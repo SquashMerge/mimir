@@ -25,6 +25,30 @@
     "agent_editor_replacement": {
       "offset": 176329502,
       "source": "update:(g,A)=>{let y=T.agents.get(g)??gS.default(g);if(!T.agents.has(g))T.agents.set(g,y);A(y),y.id=g},remove:(g)=>{T.agents.delete(g)}}),notify:"
+    },
+    "question_permission_and_form": {
+      "offset": 177072912,
+      "source": "execute:(d,y)=>o.assert({action:\"question\",resources:[\"*\"],...$u(y)}).pipe(b((A)=>new Ct({message:\"Permission denied: question\",error:A})),W(T.ask({sessionID:y.sessionID,title:\"Questions\",metadata:{kind:\"question\",tool:{messageID:y.messageID,id:y.id}},fields:[i_(d.questions[0],0),...d.questions.slice(1).map((A,s)=>i_(A,s+1))]}).pipe(I)),h((A)=>{if(A.status===\"cancelled\"&&A.message!==void 0)return m(new"
+    },
+    "question_field_text": {
+      "offset": 177073636,
+      "source": "function i_(e,T){return{key:`q${T}`,title:e.header,description:e.question,type:e.multiple===!0?\"multiselect\":\"string\",options:e.options.map((o)=>({value:o.label,label:o.label,description:o.description})),custom:!0}}var NQ=(e)=>e.parentID??e.f"
+    },
+    "session_parent_lookup": {
+      "offset": 177168432,
+      "source": "let pe=H.parentID?yield*C.get(H.parentID):void 0;if(H.parentID&&pe===void 0)return yield*new FN({sessionID:H.parentID});let Ne=pe?.location??(H.location&&Tb(H.location));if(Ne===void 0)return yield*oe(Error(\"Session.create requires either location or an existing parentID\"));let Ze=yield*d.re"
+    },
+    "session_permission_inheritance": {
+      "offset": 177168938,
+      "source": "title:H.title,agent:H.agent,metadata:H.metadata??pe?.metadata,permissions:H.permissions??pe?.permissions,model:H.model},{location:N"
+    },
+    "subagent_session_create": {
+      "offset": 177969895,
+      "source": "de=ee??(yield*a.create({parentID:O.sessionID,title:C.description,agent:Y.id,model:H}).pipe(b((_e)=>new Ct({message:`Parent session not found: ${O.sessionID}`,error:_e})))),he=ee!==void 0&&((yield*a.active).h"
+    },
+    "command_subagent_session_create": {
+      "offset": 177824374,
+      "source": "_e=yield*x.create({parentID:he.id,title:z.description??P,agent:ie.id,model:H??ie.info?.model??he.model});yield*x.prompt({...Y.prompt,"
     }
   }
 }

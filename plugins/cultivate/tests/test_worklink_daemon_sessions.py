@@ -13,7 +13,7 @@ import pytest
 from mimir_cultivate.worklink.backends.base import SessionRequest
 from mimir_cultivate.worklink.daemon_client import DaemonClientError, OpenCodeDaemonClient, ServerEvent
 from mimir_cultivate.worklink.daemon_sessions import ControllerRecord, SessionController, session_environment
-from tests.worklink_daemon_fixtures import FakeOpenCodeDaemon, SyntheticFault, effective_permission
+from tests.worklink_daemon_fixtures import FIXTURES, FakeOpenCodeDaemon, SyntheticFault, effective_permission
 
 
 async def create(client, tmp_path, kind="leaf"):
@@ -25,6 +25,136 @@ async def create(client, tmp_path, kind="leaf"):
         ), issue_id=2125, attempt=1, generation="generation-1", checkout=tmp_path,
         environment={"PATH": "/usr/bin:/bin"}, timeout_s=60,
     )
+
+
+@pytest.mark.parametrize("kind", ["leaf", "spawn", "epic"])
+async def test_every_session_kind_denies_question(tmp_path, kind):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, kind)
+        rules = daemon.sessions[controller.record.opencode_session_id].info["permissions"]
+        assert {"action": "question", "resource": "*", "effect": "deny"} in rules
+        assert effective_permission("question", "*", agent=[
+            {"action": "*", "resource": "*", "effect": "allow"}], session=rules,
+            project=[{"action": "question", "resource": "*", "effect": "allow"}]) == "deny"
+
+
+async def test_epic_children_inherit_question_deny_for_factory_agents(tmp_path):
+    agents = json.loads((FIXTURES / "opencode_2_3_0/factory-result.json").read_bytes())["agents"]
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        checked = set()
+        for agent in agents:
+            child = daemon.new_session({"parentID": root, "agent": agent["id"]})
+            grandchild = daemon.new_session({"parentID": child["id"], "agent": agent["id"]})
+            for info in (child, grandchild):
+                assert {"action": "question", "resource": "*", "effect": "deny"} in info["permissions"]
+                assert effective_permission("question", "*", agent=agent.get("permissions", []),
+                                            session=info["permissions"]) == "deny"
+            checked.add(agent["id"])
+        assert {"backend-builder", "frontend-builder", "run-orchestrator"} <= checked
+
+
+@pytest.mark.parametrize("depth", [0, 1, 3])
+async def test_pending_question_surfaces_in_first_supervisor_observation(tmp_path, depth):
+    from mimir_cultivate.worklink.backends.base import LaunchHandle
+    from mimir_cultivate.worklink.compute import OpenCodeDaemonComputeBackend
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        sid = controller.record.opencode_session_id
+        for _ in range(depth):
+            sid = daemon.new_session({"parentID": sid, "agent": "backend-builder"})["id"]
+        form = daemon.question(sid, title="Slice amendment", text="May I add the six test paths?")
+        observed = []
+        async def observe(handle):
+            observed.append(handle)
+            assert len(observed) == 1, "must surface in the first observe, not wait for the deadline"
+            return await controller.observe()
+        backend = OpenCodeDaemonComputeBackend(client=SimpleNamespace(session_observe=observe))
+        handle = LaunchHandle("opencode_daemon", controller.record.opencode_session_id)
+        result = await backend.wait(handle, timeout_s=60)
+        assert result.exit_code == 1 and not result.timed_out
+        assert result.session_error.type == "pending_question"
+        assert sid in result.session_error.message and form["id"] in result.session_error.message
+        assert "Slice amendment" in result.session_error.message
+        assert "May I add the six test paths?" in result.session_error.message
+        assert result.session_outcome.cancellation_state == "none"
+        assert controller.record.execution_state == "pending"  # no false terminal/quiescent checkpoint
+        assert daemon.sessions[sid].forms == [form]
+        assert not daemon.sessions[sid].replies
+        assert not any("/form/" in r[1] and r[0] != "GET" for r in daemon.requests)
+
+
+async def test_worklink_never_replies_to_question_forms(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        child = daemon.new_session({"parentID": root})["id"]
+        forms = [daemon.question(sid) for sid in (root, child)]
+        before = len(daemon.requests)
+        for _ in range(2):
+            assert (await controller.observe()).error.type == "pending_question"
+        assert await controller.cancel()
+        await controller.release()
+        assert all(r[0] == "GET" for r in daemon.requests[before:] if "/form" in r[1])
+        assert [daemon.sessions[sid].forms[0] for sid in (root, child)] == forms
+        assert not any(state.replies for state in daemon.sessions.values())
+
+
+async def test_question_diagnostics_are_bounded_redacted_and_not_persisted(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        secret = "synthetic-" + "question-private-token"
+        controller.sensitive_values = (secret,)
+        daemon.question(controller.record.opencode_session_id, title=secret + "é" * 3000,
+                        text="Question text " + secret + "é" * 10000)
+        outcome = await controller.observe()
+        assert outcome.error.type == "pending_question"
+        assert secret not in repr(outcome)
+        assert "Question text <redacted>" in outcome.error.message
+        assert len(outcome.error.message.encode()) <= 2048
+        assert len(outcome.error.body.encode()) <= 8192
+        assert secret.encode() not in controller.path.read_bytes()
+
+
+async def test_unrelated_and_non_question_forms_do_not_block_observed_session(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        other = daemon.new_session({"location": {"directory": str(tmp_path)}})["id"]
+        daemon.question(other)
+        form = daemon.question(controller.record.opencode_session_id)
+        form["metadata"]["kind"] = "other"
+        assert (await controller.observe()).error is None
+        daemon.finish(controller.record.opencode_session_id)
+        assert (await controller.observe()).execution_state == "succeeded"
+
+
+@pytest.mark.parametrize("case", ["cycle", "too_many"])
+async def test_question_observation_rejects_unbounded_descendant_tree(tmp_path, monkeypatch, case):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        calls = []
+        async def children(sid):
+            calls.append(sid)
+            assert len(calls) < 3, "cyclic tree must fail closed, not revisit the root"
+            return ([{"id": root}] if case == "cycle" else
+                    [{"id": f"ses_child{i}"} for i in range(4096)])
+        monkeypatch.setattr(client, "children", children)
+        with pytest.raises(DaemonClientError, match="invalid session descendant tree"):
+            await controller.observe()
+
+
+async def test_question_on_later_child_page_is_observed(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        for _ in range(101):
+            child = daemon.new_session({"parentID": root})
+        daemon.question(child["id"])
+        assert (await controller.observe()).error.type == "pending_question"
+        assert any("cursor" in r[2] for r in daemon.requests if r[1] == "/api/session")
 
 
 @pytest.mark.parametrize("kind", ["leaf", "spawn", "epic"])
@@ -174,7 +304,7 @@ async def test_tree_activity_rejects_foreign_or_incomplete_witness(tmp_path, bou
             daemon.sessions[child].info["time"]["updated"] = True
             route, body, reason = "/api/session", {"data": [daemon.sessions[child].info], "cursor": {"previous": None, "next": None}}, "invalid session activity"
         elif boundary == "duplicate":
-            route, body, reason = "/api/session", {"data": [daemon.sessions[child].info] * 2, "cursor": {"previous": None, "next": None}}, "invalid session activity"
+            route, body, reason = "/api/session", {"data": [daemon.sessions[child].info] * 2, "cursor": {"previous": None, "next": None}}, "invalid child session binding"
         elif boundary == "cursor":
             route, body, reason = "/api/session", {"data": [], "cursor": {"previous": None, "next": "same"}}, "repeated session cursor"
         else:
@@ -197,7 +327,7 @@ async def test_tree_activity_bounds_session_enumeration(tmp_path, monkeypatch, b
                 return {"data": [{"parentID": root}] * 4097, "cursor": {"previous": None, "next": None}}
             monkeypatch.setattr(client, "_request", request)
             operation = client.children(root)
-            reason = "invalid session page"
+            reason = "session children exceed bound"
         else:
             async def children(sid):
                 return [{**daemon.sessions[root].info, "id": f"ses_child{i}", "parentID": root}
@@ -430,7 +560,8 @@ async def test_captured_per_kind_wire_contract_and_effective_permissions(tmp_pat
         ), issue_id=2125, attempt=1, generation="generation-1", checkout=tmp_path,
             environment={}, timeout_s=60)
         actual = next(r[3] for r in daemon.requests if r[:2] == ("POST", "/api/session"))
-        rules = [{"action": "external_directory", "resource": "*", "effect": "deny"}]
+        rules = [{"action": "external_directory", "resource": "*", "effect": "deny"},
+                 {"action": "question", "resource": "*", "effect": "deny"}]
         if kind == "leaf":
             rules += [{"action": "shell", "resource": "*", "effect": "deny"},
                       {"action": "shell", "resource": "git *", "effect": "allow"},
@@ -827,6 +958,14 @@ class _RecordedClient:
 
     async def running_shells(self, directory):
         # The capture ran no background shell (prompt 2's `sleep 60` was a foreground tool call).
+        return []
+
+    async def forms(self, session_id):
+        # The historical capture predates form observation; no questions were asked.
+        return []
+
+    async def children(self, session_id):
+        # Both captured inputs ran on this single root session.
         return []
 
 

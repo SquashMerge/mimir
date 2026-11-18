@@ -109,6 +109,23 @@ async def admit(tmp_path, daemon, client):
     return spec, boundary, compute, handle, record
 
 
+async def test_epic_child_question_is_an_operator_visible_failure_without_waiting(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        child = daemon.new_session({"parentID": handle.identifier, "agent": "backend-builder"})["id"]
+        form = daemon.question(child, title="Slice paths", text="May I extend be-leaf with six test paths?")
+        result = await compute.wait(handle, 30)
+        order = WorkOrder(2125, Path(record.session_checkout), "", None, 30, {}, tmp_path / "transcripts")
+        raw = await FeatureFactoryBackend().interpret(order, result)
+        assert raw.backend_status == "failed"
+        assert "pending_question" in raw.error
+        assert "Slice paths" in raw.error
+        assert "May I extend be-leaf with six test paths?" in raw.error
+        assert not result.timed_out
+        assert daemon.sessions[child].forms == [form] and not daemon.sessions[child].replies
+
+
 async def test_epic_production_command_checkout_model_permissions_and_environment(tmp_path):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
@@ -116,6 +133,7 @@ async def test_epic_production_command_checkout_model_permissions_and_environmen
         assert create == {"location": {"directory": record.session_checkout},
             "model": {"providerID": "openai", "id": "gpt-test", "variant": "high"},
             "permissions": [{"action": "external_directory", "resource": "*", "effect": "deny"},
+                {"action": "question", "resource": "*", "effect": "deny"},
                 *[{"action": "read", "resource": pattern, "effect": "deny"}
                   for pattern in (".env", "**/.env", "**/.env.*")]]}
         commands = [body for _, route, _, body in daemon.requests if route.endswith("/command")]
@@ -777,7 +795,7 @@ def supervisor_clock(monkeypatch):
 
 
 @pytest.mark.parametrize("observation_path", ["normal", "missed-status"])
-@pytest.mark.parametrize("activity", ["driver", "child", "grandchild", "quiet", "question", "shell", "budget"])
+@pytest.mark.parametrize("activity", ["driver", "child", "grandchild", "quiet", "question", "pending-form", "shell", "budget"])
 async def test_factory_idle_uses_session_tree_activity(
     tmp_path, monkeypatch, supervisor_clock, activity, observation_path,
 ):
@@ -802,6 +820,10 @@ async def test_factory_idle_uses_session_tree_activity(
         child = daemon.child(handle.identifier, updated_ms=baseline)
         grandchild = daemon.child(child, updated_ms=baseline + 500000)
         source = {"driver": handle.identifier, "child": child}.get(activity, grandchild)
+        if activity == "question":
+            # Publish before the compute wait task starts, rather than racing its
+            # HTTP observation against the supervisor's synthetic clock.
+            daemon.question(source, baseline + 1000)
         # Fresh unrelated roots must never keep this run alive.
         unrelated = await client.create_session(directory=str(tmp_path), model={"providerID": "openai", "id": "gpt-test"}, permissions=[])
         daemon.activity(unrelated["data"]["id"], baseline + 30000000)
@@ -836,8 +858,12 @@ async def test_factory_idle_uses_session_tree_activity(
                 supervisor_clock.now += 1000
                 if activity in {"driver", "child", "grandchild", "budget"}:
                     daemon.activity(source, baseline + supervisor_clock.now * 1000)
-                elif activity == "question":
-                    daemon.question(source, baseline + supervisor_clock.now * 1000)
+                elif activity in {"question", "pending-form"}:
+                    form = daemon.question(source, baseline + supervisor_clock.now * 1000)
+                    if activity == "pending-form":
+                        # Non-question human forms still exercise the idle backstop;
+                        # questions take #2164's earlier operator-visible error path.
+                        form["metadata"]["kind"] = "other"
             def terminal(self, *args, **kwargs):
                 nonlocal current
                 reasons.append(kwargs["reason"])
@@ -846,14 +872,23 @@ async def test_factory_idle_uses_session_tree_activity(
         async def finish(self, **kwargs):
             return WorklinkRunResult(2125, 1, kwargs["factory_record"].status.status)
         monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finish)
-        result = await asyncio.wait_for(WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
             issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(2125, 1, "fixture", base),
             claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None), backend=Factory(), compute=compute,
-            factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None, started_at=base), 60)
+            factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None, started_at=base)
+        if activity == "question":
+            with pytest.raises(WorklinkError, match="pending_question"):
+                await asyncio.wait_for(invocation, 60)
+            assert supervisor_clock.now < 7200
+            assert reasons == [] and activity_reads == []
+            assert daemon.sessions[source].forms
+            assert not daemon.sessions[source].replies
+            return
+        result = await asyncio.wait_for(invocation, 60)
         assert activity_reads and min(activity_reads) >= 7200
         assert missed == (observation_path == "missed-status")
-        if activity in {"quiet", "question", "budget"}:
+        if activity in {"quiet", "pending-form", "budget"}:
             assert result.status == "needs-human" and len(reasons) == 1
             if activity == "budget":
                 assert reasons[0].startswith("budget exhausted")
@@ -863,7 +898,7 @@ async def test_factory_idle_uses_session_tree_activity(
                 assert source in reasons[0]
                 stamp = daemon.sessions[source].info["time"]["updated"]
                 assert datetime.fromtimestamp(stamp / 1000, UTC).isoformat() in reasons[0]
-                assert ("pending form is not progress" in reasons[0]) == (activity == "question")
+                assert ("pending form is not progress" in reasons[0]) == (activity == "pending-form")
                 assert supervisor_clock.now == 8000
         else:
             assert result.status == "completed" and reasons == []

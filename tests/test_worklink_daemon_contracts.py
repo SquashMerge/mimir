@@ -33,6 +33,135 @@ async def test_interrupt_never_resumes_queued_input(fake_opencode_daemon):
     assert daemon.requests[-1][2] == {"resume": "false"}
 
 
+def test_question_action_and_child_inheritance_are_pinned_to_native_source():
+    root = FIXTURES / "opencode_2_3_0"
+    record = json.loads((root / "source-inspection.json").read_bytes())
+    assert record["sha256"] == "5c7d89bc2d5fa5d83cc7768b813ca671368e70b8b9eda9d1ca9e6ec6b66d8ce0"
+    source = {k: v["source"] for k, v in record["excerpts"].items()}
+    assert 'o.assert({action:"question",resources:["*"]' in source["question_permission_and_form"]
+    assert 'metadata:{kind:"question"' in source["question_permission_and_form"]
+    assert 'title:e.header,description:e.question' in source["question_field_text"]
+    assert 'let pe=H.parentID?yield*C.get(H.parentID)' in source["session_parent_lookup"]
+    assert 'permissions:H.permissions??pe?.permissions' in source["session_permission_inheritance"]
+    for name in ("subagent_session_create", "command_subagent_session_create"):
+        assert "parentID:" in source[name] and "permissions:" not in source[name]
+    assert 'cZ(x?.permissions??BS,P.permissions??[])' in source["permission_agent_then_session"]
+    assert 'findLast' in source["permission_last_match"]
+    # Reproducible extractor pins offsets and lengths, not hand-written claims.
+    markers = runpy.run_path(str(root / "inspect-source.py"))["MARKERS"]
+    for name, (marker, length) in markers.items():
+        assert source[name].encode().startswith(marker)
+        assert len(source[name].encode()) == length
+
+
+async def test_children_listing_pages_beyond_default_fifty_and_preserves_parent_filter(fake_opencode_daemon):
+    daemon = fake_opencode_daemon
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        root = await create(client)
+        other = await create(client)
+        children = [daemon.new_session({"parentID": root})["id"] for _ in range(101)]
+        daemon.new_session({"parentID": other})
+        assert [c["id"] for c in await client.children(root)] == children
+        requests = [r for r in daemon.requests if r[0] == "GET" and r[1] == "/api/session"]
+        assert requests[0][2] == {"parentID": root, "order": "asc", "limit": "100"}
+        assert len(requests) == 2 and "cursor" in requests[1][2]
+
+
+async def test_fake_form_info_and_reply_match_captured_schema(fake_opencode_daemon):
+    daemon = fake_opencode_daemon
+    schema = daemon.schema
+    assert schema.operation("/api/session/{sessionID}/form", "GET")["description"] == "Retrieve pending forms for a session."
+    reply_op = schema.operation("/api/session/{sessionID}/form/{formID}/reply", "POST")
+    assert reply_op["requestBody"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/Form.Reply"}
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        sid = await create(client)
+        form = daemon.question(sid)
+        schema.named("Form.Info", form)
+        assert await client.forms(sid) == [form]
+        # Fixture-only manual reply proves that the fake would record a regression.
+        answer = {"answer": {"q0": "Keep current paths"}}
+        schema.named("Form.Reply", answer)
+        with pytest.raises(ValidationError):
+            schema.named("Form.Reply", {"answers": [["Keep current paths"]]})
+        async with aiohttp.ClientSession(auth=aiohttp.BasicAuth(daemon.username, daemon.password)) as connection:
+            async with connection.post(f"{daemon.base_url}/api/session/{sid}/form/{form['id']}/reply", json=answer) as response:
+                assert response.status == 204
+        assert daemon.sessions[sid].replies == [answer]
+        assert await client.forms(sid) == []
+
+
+@pytest.mark.parametrize("case", ["foreign_parent", "duplicate_child", "bad_child_id", "bad_cursor", "repeated_cursor"])
+async def test_children_listing_fails_closed_on_invalid_binding_or_pagination(fake_opencode_daemon, case):
+    daemon = fake_opencode_daemon
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        root = await create(client)
+        child = daemon.new_session({"parentID": root})
+        data = [dict(child)]
+        cursor = {"previous": None, "next": None}
+        if case == "foreign_parent":
+            data[0]["parentID"] = "ses_other"
+        elif case == "duplicate_child":
+            data *= 2
+        elif case == "bad_child_id":
+            data[0]["id"] = "../foreign"
+        elif case == "bad_cursor":
+            cursor = {}
+        else:
+            data = []
+            cursor["next"] = "same"
+        body = json.dumps({"data": data, "cursor": cursor}).encode()
+        for _ in range(2):
+            daemon.faults[("GET", "/api/session")].append(SyntheticFault(body=body))
+        reason = {"foreign_parent": "foreign child session", "duplicate_child": "invalid child session binding",
+                  "bad_child_id": "invalid child session identity", "bad_cursor": "invalid session page",
+                  "repeated_cursor": "repeated session cursor"}[case]
+        with pytest.raises(DaemonClientError, match=reason):
+            await client.children(root)
+
+
+@pytest.mark.parametrize("case", ["foreign_session", "duplicate", "bad_id", "bad_title", "bad_metadata", "bad_fields", "bad_field_text"])
+async def test_forms_fail_closed_on_invalid_identity_or_shape(fake_opencode_daemon, case):
+    daemon = fake_opencode_daemon
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        root = await create(client)
+        form = daemon.question(root)
+        data = [form]
+        if case == "foreign_session":
+            form["sessionID"] = "ses_other"
+        elif case == "duplicate":
+            data *= 2
+        elif case == "bad_id":
+            form["id"] = "../foreign"
+        elif case == "bad_title":
+            form["title"] = 42
+        elif case == "bad_metadata":
+            form["metadata"] = []
+        elif case == "bad_fields":
+            form["fields"] = []
+        else:
+            form["fields"][0]["description"] = 42
+        daemon.faults[("GET", f"/api/session/{root}/form")].append(SyntheticFault(body=json.dumps({"data": data}).encode()))
+        with pytest.raises(DaemonClientError):
+            await client.forms(root)
+
+
+@pytest.mark.parametrize("bound", ["count", "bytes"])
+async def test_children_listing_has_aggregate_bounds(fake_opencode_daemon, monkeypatch, bound):
+    daemon = fake_opencode_daemon
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        root = await create(client)
+        calls = []
+        async def pages(*args, **kwargs):
+            calls.append(kwargs)
+            assert len(calls) < 20, "aggregate bound must fire before this synthetic sentinel"
+            data = ([{"id": f"ses_{i}", "parentID": root} for i in range(4097)] if bound == "count" else [])
+            return {"data": data, "cursor": {"previous": None, "next": str(len(calls))},
+                    "padding": "x" * (1024 * 1024 - 1024) if bound == "bytes" else ""}
+        monkeypatch.setattr(client, "_request", pages)
+        with pytest.raises(DaemonClientError, match="session children exceed bound"):
+            await client.children(root)
+
+
 def test_recorded_factory_bytes_and_normalization():
     root = FIXTURES / "feature_factory_0_14_0"
     raw = (root / "status.raw.stdout.json").read_bytes()

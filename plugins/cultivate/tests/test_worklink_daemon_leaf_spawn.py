@@ -78,6 +78,7 @@ async def test_leaf_production_create_prompt_model_and_permissions(tmp_path):
             "model": {"providerID": "openai", "id": "gpt-test", "variant": "high"},
             "permissions": [
                 {"action": "external_directory", "resource": "*", "effect": "deny"},
+                {"action": "question", "resource": "*", "effect": "deny"},
                 {"action": "shell", "resource": "*", "effect": "deny"},
                 {"action": "shell", "resource": "git *", "effect": "allow"},
                 {"action": "shell", "resource": "uv *", "effect": "allow"}],
@@ -189,6 +190,7 @@ async def test_contained_spawn_wire_agent_and_broad_shell(tmp_path, monkeypatch,
             assert "agent" not in create
         assert create["permissions"] == [
             {"action": "external_directory", "resource": "*", "effect": "deny"},
+            {"action": "question", "resource": "*", "effect": "deny"},
             {"action": "shell", "resource": "*", "effect": "allow"}]
         assert "variant" not in create["model"]
 

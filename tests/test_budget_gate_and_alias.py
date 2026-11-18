@@ -133,6 +133,147 @@ def _selected_repo_middleware():
     return BudgetGateMiddleware(policy=selected_policy_registry())
 
 
+def _issued_refusal_scope(*, remediation=True, author="mimir-bot", event_type="pr_changes_requested_stale"):
+    from mimir_cultivate.policy import issue_repo_scope
+    from tests.test_repo_tool_wiring import _scope
+
+    template = _scope(event_type=event_type)
+    scope_fields = {
+        item.name: getattr(template, item.name) for item in fields(template)
+        if item.init and item.name != "allowed_operations"
+    }
+    return issue_repo_scope(
+        is_remediation=remediation,
+        **{**scope_fields, "pull_request_author": author},
+    )
+
+
+def _refusal_auth(scope):
+    from tests.test_repo_tool_wiring import _auth
+
+    original = _auth(scope)
+    labels = replace(original.ifc_labels, sources=tuple(
+        replace(source, integrity="trusted", integrity_effect="active_ingest")
+        for source in original.ifc_labels.sources
+    ))
+    return replace(
+        original, trigger="poller", canonical_principal="mimir-bot",
+        ifc_labels=labels, ifc_state=InformationFlowState(labels),
+        service_authority=replace(
+            original.service_authority, canonical="mimir-bot", trigger="poller",
+            authority_profile="github",
+            capabilities=("pr_submit_review", "pr_inline_review_comment", "pr_comment", "repo_push"),
+        ),
+    )
+
+
+@pytest.fixture
+def refusal_forge(monkeypatch):
+    from mimir_cultivate import forge
+    from tests.test_repo_tool_wiring import _snapshot
+
+    class Forge:
+        def get_pull_request_snapshot(self, repository, number):
+            assert (repository, number) == ("owner/repo", 7)
+            return _snapshot("a" * 40)
+
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _repository: Forge())
+
+
+@pytest.mark.usefixtures("selected_repository_policy", "refusal_forge")
+@pytest.mark.parametrize("tool_name", ["pr_submit_review", "pr_inline_review_comment"])
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("event_type", ["pr_changes_requested_stale", "pr_ci_failure"])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_own_pr_review_refusal_reaches_budget_gate(tool_name, async_mode, event_type, enforce):
+    scope = _issued_refusal_scope(event_type=event_type)
+    auth = _refusal_auth(scope)
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    decision = ToolRegistry().authorize_tool(tool_name, auth, enforce=True, arguments=args)
+    expected = (
+        "You authored this PR; GitHub forbids reviewing your own PR. Use pr_comment for findings. "
+        "Expected policy, not a capability gap; don't escalate."
+    )
+    assert decision.allowed is False
+    assert decision.reason == "repo_pr_grant_denied"
+    assert decision.would_block is True
+    assert decision.refusal_detail == expected
+    assert len(expected) <= 160 and "\n" not in expected
+
+    def never_called(_request):
+        pytest.fail("own-PR review authorization allowed execution")
+
+    async def never_called_async(request):
+        never_called(request)
+
+    request = _make_request(tool_name, "own-pr-refusal", replace(auth, enforcement_enabled=enforce), args)
+    gate = _selected_repo_middleware()
+    result = (asyncio.run(gate.awrap_tool_call(request, never_called_async))
+              if async_mode else gate.wrap_tool_call(request, never_called))
+    assert result.status == "error"
+    assert expected in result.content
+    if not enforce:
+        # Shadow compatibility still hits the hard scoped-PR refusal formatter.
+        assert result.content == expected
+
+
+@pytest.mark.usefixtures("selected_repository_policy", "refusal_forge")
+@pytest.mark.parametrize("case", [
+    "non-own", "unknown-author", "unknown-identity", "other-action", "review-scope", "review-missing-review",
+])
+def test_other_missing_actions_keep_generic_refusal(case):
+    scope = _issued_refusal_scope(
+        remediation=not case.startswith("review-"),
+        author="another-author" if case == "non-own" else None if case == "unknown-author" else "mimir-bot",
+    )
+    tool_name, action = "pr_submit_review", "pr.review"
+    if case == "other-action":
+        scope = replace(scope, allowed_operations=scope.allowed_operations - {"pr.comment"})
+        tool_name, action = "pr_comment", "pr.comment"
+    elif case == "review-scope":
+        tool_name, action = "repo_push", "repo.push"
+    elif case == "review-missing-review":
+        scope = replace(scope, allowed_operations=scope.allowed_operations - {"pr.review"})
+    elif case == "unknown-identity":
+        scope = replace(scope, principal="", pull_request_author="")
+    auth = _refusal_auth(scope)
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    decision = ToolRegistry().authorize_tool(tool_name, auth, enforce=True, arguments=args)
+    assert decision.allowed is False
+    assert decision.reason == "repo_pr_grant_denied"
+    assert decision.would_block is True
+    assert decision.refusal_detail == f"scope does not grant {action}"
+    result = _selected_repo_middleware().wrap_tool_call(
+        _make_request(tool_name, "generic-pr-refusal", auth, args),
+        lambda _request: pytest.fail("missing action was authorized"),
+    )
+    assert result.status == "error"
+    assert decision.refusal_detail in result.content
+
+
+@pytest.mark.parametrize("reason", ["repo_pr_grant_denied", "repo_pr_scope_denied"])
+def test_scoped_pr_refusal_guidance_is_allowlisted_and_bounded(reason):
+    from mimir.access_control import _OWN_PR_REVIEW_REFUSAL
+    from mimir.tools.budget_gate import _scoped_pr_refusal_text
+
+    assert _scoped_pr_refusal_text(SimpleNamespace(
+        reason=reason, refusal_detail=_OWN_PR_REVIEW_REFUSAL,
+    )) == _OWN_PR_REVIEW_REFUSAL
+    for detail in (
+        _OWN_PR_REVIEW_REFUSAL + " forge content",
+        "You authored this PR; injected forge content",
+        "scope does not grant " + "x" * 160,
+        "scope does not grant pr.review\nforge content",
+        None,
+    ):
+        assert _scoped_pr_refusal_text(SimpleNamespace(
+            reason=reason, refusal_detail=detail,
+        )) == "scoped PR grant refused before execution"
+    assert _scoped_pr_refusal_text(SimpleNamespace(
+        reason="unrelated_denial", refusal_detail=_OWN_PR_REVIEW_REFUSAL,
+    )) == "scoped PR grant refused before execution"
+
+
 @pytest.mark.usefixtures("selected_repository_policy")
 @pytest.mark.parametrize("async_mode", [False, True])
 def test_scoped_pr_checkout_order_refusal_surfaces_server_hint(async_mode):

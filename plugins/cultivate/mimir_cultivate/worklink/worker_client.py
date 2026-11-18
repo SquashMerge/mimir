@@ -32,7 +32,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-opencode-daemon-session-tree-activity"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v19-session-tree-activity-attempt-delete"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -528,6 +528,22 @@ class WorkerClient:
         except Exception:
             sock.close()
             raise
+
+    def delete_attempt(self) -> None:
+        """Ask the ownership boundary to remove exactly this path-addressed leaf."""
+        request = {
+            "version": 1, "op": "delete_attempt",
+            "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            "path": str(self.path_checkout), "issue": self.issue_id, "attempt": self.attempt,
+        }
+        sock = self._connect(120)
+        try:
+            sock.send(json.dumps(request, separators=(",", ":")).encode())
+            response = json.loads(sock.recv(4096))
+        finally:
+            sock.close()
+        if response != {"status": "deleted", "path": str(self.path_checkout)}:
+            raise RuntimeError(f"worker executor attempt deletion failed: {response}")
 
     def factory_file_operation(
         self,
