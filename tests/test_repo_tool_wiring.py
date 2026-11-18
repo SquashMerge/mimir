@@ -282,7 +282,7 @@ def test_repository_read_wrappers_publish_lease_attestation(
     monkeypatch.setattr(repo_module, "RepoGitTools", FakeGitTools)
     monkeypatch.setattr(
         repo_module, "_publish_attested_lease_result",
-        lambda runtime, published_state: published.append(published_state),
+        lambda runtime, published_state, **kwargs: published.append(published_state),
     )
     runtime = SimpleNamespace(context=context)
 
